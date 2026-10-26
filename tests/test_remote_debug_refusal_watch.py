@@ -867,8 +867,8 @@ def _second_cause(tmp_path: Path, mode: str) -> dict[str, Any]:
 
 def test_a_guard_that_reads_as_missing_but_refuses_still_gets_its_row(tmp_path: Path) -> None:
     """An earlier audit hook raises on the engine's probe event. The posture then reads the guard
-    as missing and the guard starts no reporter, so no WARNING is written. The hook is in place
-    all the same: it refuses and counts, and the watch reads the count."""
+    as missing. The hook is in place all the same: it refuses and counts, and the watch reads the
+    count. Its WARNING is pinned in tests/test_remote_debug_guard.py (vault BACKLOG #3463)."""
     reading = _second_cause(tmp_path, "probe")
     assert reading["guard_installed"] is False
     assert reading["refused"] == 3

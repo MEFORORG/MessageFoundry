@@ -39,8 +39,8 @@ that means, in its ``remote_debug_refused`` points.
 
 **It reads the count, not whether the guard answers.** The count rises wherever the hook runs. That
 includes the state where an earlier audit hook raises on the engine's probe event: the posture then
-reads the guard as missing and no WARNING is written, but the hook still refuses and counts, so the
-row and the alert still come. Where the hook is truly missing nothing is refused and nothing is
+reads the guard as missing, but the hook still refuses, counts and writes its WARNING, so the row
+and the alert still come (vault BACKLOG #3463). Where the hook is truly missing nothing is refused and nothing is
 counted.
 
 **Each is owed each refusal once.** The row and the alert keep a mark each, and a mark moves only

@@ -147,9 +147,10 @@ _install_lock = threading.Lock()
 _reports: queue.SimpleQueue[str] = queue.SimpleQueue()
 _refused = 0
 _reporter_started = False
-#: Set once ``sys.addaudithook(_guard)`` has returned. :func:`install_remote_debug_guard` says why
-#: this, and not the probe, decides whether to add the hook again.
-_hook_added = False
+#: Set once ``sys.addaudithook(_guard)`` has returned and another hook then cut the probe off, so
+#: the hook may be in without answering. :func:`install_remote_debug_guard` says why no later call
+#: adds it again.
+_probe_cut_off = False
 
 
 class RemoteScriptRefused(RuntimeError):
@@ -265,22 +266,34 @@ def _without_own_refusals(
     return hook
 
 
-def _guard_answers() -> bool:
+def _probe() -> bool | None:
+    """Ask the hook whether it is in the interpreter's hook list.
+
+    True: it answered. False: the probe passed every hook and none answered, so it is not in the
+    list. None: a hook raised before the probe reached this one, so the list cannot be read (vault
+    BACKLOG #3463). The interpreter calls hooks in the order they were added and stops at the
+    first that raises, so only an earlier hook can cut the probe off."""
     answer: list[bool] = []
     # never-raise: another audit hook may raise on an event it does not know. That must not stop
-    # `serve` at its first statement or fail the posture route. The reading is then whatever this
-    # hook managed to say, and a hook that could not answer is reported as not installed.
-    with contextlib.suppress(Exception):
+    # `serve` at its first statement or fail the posture route.
+    try:
         sys.audit(_PROBE_EVENT, answer)
+    except Exception:
+        return True if answer else None
     return bool(answer)
+
+
+def _guard_answers() -> bool:
+    """Whether the hook answered. A probe another hook cut off reads as not installed."""
+    return _probe() is True
 
 
 def install_remote_debug_guard() -> None:
     """Add the hook to this process, once, when the interpreter accepts injected scripts.
 
-    Call it as early in the process as possible: a script injected before the call runs. Once
-    ``sys.addaudithook`` has returned, no later call adds the hook again, and an audit hook cannot
-    be removed. Each call starts the reporter thread if no earlier call managed to.
+    Call it as early in the process as possible: a script injected before the call runs. A later
+    call adds nothing once the hook answers, and an audit hook cannot be removed. Each call starts
+    the reporter thread if no earlier call managed to.
 
     A hook that another hook refused, and a reporter thread the interpreter could not start, do
     not raise here. The command line makes this call at import, ahead of everything that could
@@ -290,48 +303,60 @@ def install_remote_debug_guard() -> None:
     Nothing is added where ``sys.is_remote_debug_enabled()`` is False, which is every child started
     through :func:`messagefoundry.childenv.python_child_argv`. The event cannot fire there.
 
-    "Returned" and not "answers", because the probe cannot tell two states apart (vault BACKLOG
-    #3463). In both an audit hook added earlier is in the way, and the hook does not answer:
+    Where the hook does not answer, an audit hook added earlier is in the way, in one of two ways
+    (vault BACKLOG #3463):
 
-    1. That hook raised on ``sys.addaudithook``. The interpreter drops the new hook without an
-       error, so the engine's hook is missing and an injected script runs.
-    2. That hook raises on the probe event. The engine's hook is in place behind it and refuses.
+    1. That hook raised on ``sys.addaudithook``, so the interpreter dropped the new hook without
+       an error. The probe passes every hook and reads False. The hook is not in, so the quiet
+       ``sys.unraisablehook`` is put back, no reporter starts, and the next call tries again.
+       Nothing can stack, because a hook the interpreter dropped is not in the list.
+    2. That hook raises on the probe event, which cuts the probe off: it reads None. The hook may
+       be in behind it, refusing. Each later call would then add another copy, so once
+       ``sys.addaudithook`` has returned into a cut-off probe, no call adds the hook again, and the
+       quiet wrapper and the reporter stay, so a refusal is logged and its full path is kept off
+       standard error. What this gives up is a retry where the same earlier hook also refused the
+       add. Against that same hook a retry was probably futile anyway, and the posture reads the
+       hook as missing either way.
 
-    A flag set when ``sys.addaudithook`` returns covers both. In state 2, retrying would stack a
-    copy of the hook on each call, and dropping the reporter and the quiet ``sys.unraisablehook``
-    would leave a refusal unlogged and its full path on standard error. So both stay, in both
-    states. What this gives up is a retry in state 1. Against the same objecting hook that retry
-    was probably futile anyway, and the posture still reads the hook as missing there. Where
-    ``sys.addaudithook`` raised instead of returning, the hook is not in, so the quiet wrapper is
-    put back and the next call tries again.
+    Where ``sys.addaudithook`` raised instead of returning, the hook is not in, so the quiet
+    wrapper is put back and the next call tries again.
 
-    One case is out of reach in state 2. Where the earlier hook also raises on
-    ``cpython.remote_debugger_script``, the interpreter stops at it and never calls the engine's
-    hook. That hook refuses the script, so it does not run, but the engine's count, WARNING and
-    audit row never hear of it. The interpreter's report on standard error, with the script's full
-    path, is then the only trace of the refusal, and it is the other hook's exception, so the
-    quiet wrapper passes it on rather than hide the one record that exists.
+    One refusal is out of reach in any state. An audit hook added earlier that raises on
+    ``cpython.remote_debugger_script`` refuses the script before the interpreter calls this
+    module's hook. The script does not run, but this module's count, WARNING and audit row never
+    hear of it. The interpreter's report on standard error, with the script's full path, is then
+    the only trace of the refusal. It carries the other hook's exception, so the quiet wrapper
+    passes it on rather than hide the one record that exists.
     """
-    global _hook_added
+    global _probe_cut_off
     if not sys.is_remote_debug_enabled():
         return
     with _install_lock:
-        if not _hook_added and not _guard_answers():
+        if not _probe_cut_off and _probe() is not True:
             # Quiet first, so no refusal is ever reported with its full path.
             previous = sys.unraisablehook
             quiet = sys.unraisablehook = _without_own_refusals(previous)
             # never-raise: a hook already installed may object to this one. The documented
             # contract is that the interpreter swallows a RuntimeError from it and passes on any
             # other exception. Measured on CPython 3.14.6 it swallows a ValueError too, so this
-            # holds the line for an interpreter that does what the documentation says.
+            # holds the line for an interpreter that does what the documentation says. A
+            # BaseException such as KeyboardInterrupt still leaves, with the wrapper put back.
             try:
                 sys.addaudithook(_guard)
-            except Exception:
-                # Not added: there is nothing to report for, and nothing to quiet.
+            except BaseException as exc:
+                if sys.unraisablehook is quiet:
+                    sys.unraisablehook = previous
+                if isinstance(exc, Exception):
+                    return
+                raise
+            after = _probe()
+            if after is False:
+                # Dropped: there is nothing to report for, and nothing to quiet.
                 if sys.unraisablehook is quiet:
                     sys.unraisablehook = previous
                 return
-            _hook_added = True
+            if after is None:
+                _probe_cut_off = True
         _ensure_reporter()
 
 
@@ -374,17 +399,13 @@ def remote_debug_loosening(posture: RemoteDebugPosture) -> tuple[str, str] | Non
     cannot say different things. Two names, because the two states ask for different actions."""
     if not posture.interpreter_enabled:
         return None
-    refused = (
-        f" It has refused {posture.refused_scripts} since this process started."
-        if posture.refused_scripts
-        else ""
-    )
     if not posture.guard_installed:
-        # A count here means the hook is in and an earlier hook stops the probe, which is the
-        # second state install_remote_debug_guard describes.
+        # A count here says the hook was in at some point, which a hook that never went in cannot
+        # produce. It does not say the hook is in now: a process that can write this one's memory
+        # can remove it. So the entry still says to read it as missing.
         seen = (
-            f" Yet the hook has refused {posture.refused_scripts} since this process started, so "
-            "it is in place and another audit hook keeps it from answering."
+            f" The hook has refused {posture.refused_scripts} since this process started. That "
+            "says it was in at some point, not that it still is."
             if posture.refused_scripts
             else ""
         )
@@ -393,13 +414,19 @@ def remote_debug_loosening(posture: RemoteDebugPosture) -> tuple[str, str] | Non
             "the interpreter's remote debugging (PEP 768) is enabled in this process and the "
             "engine's refusal hook did NOT answer. Either it is NOT installed (nothing installed "
             "it, or an audit hook added earlier refused it), or an audit hook added earlier stops "
-            "it from answering. Read it as not installed: a process the operating system lets attach to this one, which on Windows "
-            "includes one running as the same account, could run Python inside it with "
-            "sys.remote_exec, with everything it holds (the store key, connection secrets, "
-            f"messages in flight).{seen} The `messagefoundry` command line installs the hook as "
-            "it starts. Look for what else in the process adds an audit hook. Start the "
-            "interpreter with -X disable-remote-debug to turn the interface off",
+            "it from answering. Read it as not installed: a process the operating system lets "
+            "attach to this one, which on Windows includes one running as the same account, "
+            "could run Python inside it with sys.remote_exec, with everything it holds (the store "
+            f"key, connection secrets, messages in flight).{seen} The `messagefoundry` command "
+            "line installs the hook as it starts. Look for what else in the process adds an "
+            "audit hook. Start the interpreter with -X disable-remote-debug to turn the "
+            "interface off",
         )
+    refused = (
+        f" It has refused {posture.refused_scripts} since this process started."
+        if posture.refused_scripts
+        else ""
+    )
     return (
         "remote_debug_enabled",
         "the interpreter's remote debugging (PEP 768) is enabled in this process. The engine "

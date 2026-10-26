@@ -1746,9 +1746,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
     caller who can restart the engine adds a read at each start and stop.
   - **No file name.** The injecting process chooses the script's name, so neither the row nor
     the alert carries it. The engine's log output can still hold the name. Usually it is in the
-    refusal's WARNING line, bounded and escaped. In the one case below where another audit hook
-    refuses the script ahead of the guard, the interpreter writes the full path to standard error
-    instead. Some refusals have
+    refusal's WARNING line, bounded and escaped. Where another audit hook refuses the script
+    ahead of the guard, as a point below says, the interpreter writes the full path to standard
+    error instead. Some refusals have
     no line with the name at all. At least these do: one past the backlog of 64, one still
     waiting to be logged when the process exits, and every one where the thread that writes the
     lines could not start.
@@ -1837,15 +1837,20 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   ask whether its own hook is there. The engine's hook is then in place and refuses a script,
   but the entry still reads as unguarded. A refusal in that state is logged as a WARNING and
   counted like any other, so under `serve` the `remote_debug_refused` audit row and alert come
-  too, and the entry carries the count, which tells the second case from the first (vault
-  BACKLOG #3463). One refusal in the second case is out of the engine's reach: where that hook
-  also raises on the interpreter's injection event, it refuses the script itself and the
-  engine's hook is never asked. There is then no WARNING, no count, no row and no alert, and the
-  interpreter writes the script's full path on standard error. The engine leaves that line, as
-  it is the other hook's and the only record of the refusal. In neither case does a later
-  install call add the hook again, so the engine does not retry against the hook that refused
-  it. Without a count, the entry cannot tell the two cases apart, so read it as the first, and
-  look for what else in the process adds an audit hook.
+  too (vault BACKLOG #3463). Once a refusal is counted, the entry as `GET /security/posture`
+  reads it carries the count, which the first case cannot produce. The serve-time warning is
+  read once, at start, so it carries a count only for a refusal before then. A count says
+  the hook was in at some point, not that it still is, so read the entry as missing either way.
+  In the first case a later install call tries again, and nothing stacks, because the
+  interpreter dropped the hook. In the second, no later call adds the hook again, so no copy
+  stacks there either. Without a count, the entry cannot tell the two cases apart, so read it
+  as the first, and look for what else in the process adds an audit hook.
+- **An audit hook added earlier can refuse a script ahead of the engine's, in any state.** Where
+  it raises on the interpreter's injection event, it refuses the script itself and the engine's
+  hook is never asked, whichever entry the engine reports. The script does not run, but there is
+  no WARNING, no count, no row and no alert, and the interpreter writes the script's full path on
+  standard error. The engine leaves that line, as it is the other hook's and the only record of
+  the refusal.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
   It logs the line a second time once its off-box log forwarder is installed, so the collector's

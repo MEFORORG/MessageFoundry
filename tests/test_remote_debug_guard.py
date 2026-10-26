@@ -75,8 +75,8 @@ _REPO = Path(messagefoundry.__file__).resolve().parents[1]
 _WAIT = 20.0
 
 #: The injection test's own watchdog, above the sum of its waits. The suite default is shorter
-#: than three child interpreters can need on a starved runner.
-_INJECTION_TEST_TIMEOUT = 240
+#: than four child interpreters can need on a starved runner.
+_INJECTION_TEST_TIMEOUT = 300
 
 # The target process. It idles in Python, so the interpreter reaches the point where it looks for
 # an injected script. It writes its OWN process id: on Windows a virtual environment's python.exe
@@ -93,7 +93,16 @@ logging.basicConfig(filename=log, level=logging.WARNING)
 
 from messagefoundry.remotedebug import install_remote_debug_guard, remote_debug_posture
 
-if mode in ("guarded", "loud"):
+if mode == "cut-off":
+    # An earlier hook that raises on the engine's probe event and on nothing else (vault BACKLOG
+    # #3463, state 2). Installed twice, as the command line and `serve` both call it.
+    def objects(event, args):
+        if event == "messagefoundry.remotedebug.probe":
+            raise ValueError("this hook refuses an event it does not know")
+
+    sys.addaudithook(objects)
+    install_remote_debug_guard()
+if mode in ("guarded", "loud", "cut-off"):
     install_remote_debug_guard()
 if mode == "loud":
     # Undo the one thing the install does to the interpreter's own report of a refusal.
@@ -249,8 +258,10 @@ def test_an_injected_script_runs_without_the_hook_and_not_with_it(
         _skip_unmeasured(
             "this test process was started with remote debugging off, so it cannot inject"
         )
-    control, guarded, loud = (start_target(mode) for mode in ("unguarded", "guarded", "loud"))
-    for target in (control, guarded, loud):
+    control, guarded, loud, cut_off = (
+        start_target(mode) for mode in ("unguarded", "guarded", "loud", "cut-off")
+    )
+    for target in (control, guarded, loud, cut_off):
         target.wait_until_ready()
 
     # CONTROL: no hook. The injected script runs. This is what the engine parent would allow.
@@ -282,6 +293,17 @@ def test_an_injected_script_runs_without_the_hook_and_not_with_it(
     # path is on standard error, so the check on the guarded target could have failed.
     assert directory in loud.stderr.read_text("utf-8", errors="replace")
     assert directory not in guarded.stderr.read_text("utf-8", errors="replace")
+
+    # Vault BACKLOG #3463: behind a hook that cuts the probe off, the guard reads as missing but
+    # refuses, logs its WARNING and keeps the path off standard error, like the guarded target.
+    # Until then no reporter ran there, so no line came, and the path went to standard error.
+    assert cut_off.interpreter_enabled and not cut_off.guard_installed
+    _inject(cut_off)
+    _wait_for(cut_off.logged_the_refusal, "the cut-off target to log the refusal")
+    assert cut_off.close() == "1", "the hook did not count exactly one refused script"
+    assert not cut_off.marker.exists(), "the injected script ran although the hook raised"
+    assert cut_off.script.name in cut_off.log.read_text("utf-8")
+    assert directory not in cut_off.stderr.read_text("utf-8", errors="replace")
 
 
 def test_a_refused_attach_skips_with_a_warning(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -607,8 +629,8 @@ class _Installs:
         monkeypatch.setattr(remotedebug, "_start_reporter", self._start)
         # This process started its reporter when the suite imported the command line.
         monkeypatch.setattr(remotedebug, "_reporter_started", False)
-        # And added its hook then.
-        monkeypatch.setattr(remotedebug, "_hook_added", False)
+        # No probe was cut off there, and none may be here unless a test says so.
+        monkeypatch.setattr(remotedebug, "_probe_cut_off", False)
 
     def _start(self) -> None:
         self.reporters += 1
@@ -619,9 +641,9 @@ def test_install_adds_one_hook_and_a_second_call_adds_nothing(
 ) -> None:
     installs = _Installs(monkeypatch)
     before = sys.unraisablehook
-    # Not there, then there once added, then there on each later call.
+    # Not there, then there once added, then there on each later call, which adds nothing.
     answers = iter([False, True, True, True])
-    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: next(answers))
+    monkeypatch.setattr(remotedebug, "_probe", lambda: next(answers))
     install_remote_debug_guard()
     wrapped = sys.unraisablehook
     install_remote_debug_guard()
@@ -631,7 +653,7 @@ def test_install_adds_one_hook_and_a_second_call_adds_nothing(
     assert wrapped is not before and sys.unraisablehook is wrapped
 
 
-def test_a_hook_that_does_not_answer_is_added_once_and_still_reported(
+def test_a_hook_behind_a_cut_off_probe_is_added_once_and_still_reported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Vault BACKLOG #3463, state 2 of ``install_remote_debug_guard``: an earlier audit hook raises
@@ -640,7 +662,7 @@ def test_a_hook_that_does_not_answer_is_added_once_and_still_reported(
     so a refusal was not logged and its full path went to standard error."""
     installs = _Installs(monkeypatch)
     before = sys.unraisablehook
-    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: False)
+    monkeypatch.setattr(remotedebug, "_probe", lambda: None)
     install_remote_debug_guard()
     quiet = sys.unraisablehook
     install_remote_debug_guard()
@@ -650,22 +672,58 @@ def test_a_hook_that_does_not_answer_is_added_once_and_still_reported(
     assert quiet is not before and sys.unraisablehook is quiet
 
 
-def test_a_hook_the_interpreter_dropped_is_not_added_again(
+def test_a_hook_the_interpreter_dropped_is_tried_again_and_gets_no_reporter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """State 1, and the control for the test above: an earlier hook raises on
-    ``sys.addaudithook``, so the interpreter drops the engine's without an error. The stand-in
-    records the call and adds nothing, so the probe never answers here either. The install cannot
-    tell this from state 2, and the docstring records the retry given up. A real interpreter in
-    this state is measured further down, where the posture still reads the hook as missing."""
+    ``sys.addaudithook``, so the interpreter drops the engine's without an error, and the probe
+    passes every hook unanswered. The hook is not in, so a retry cannot stack a copy, and a later
+    call tries again. The stand-in records each call and adds nothing, as the interpreter does."""
     installs = _Installs(monkeypatch)
+    before = sys.unraisablehook
     calls: list[object] = []
     monkeypatch.setattr(sys, "addaudithook", calls.append)  # returns, adds nothing
-    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: False)
+    monkeypatch.setattr(remotedebug, "_probe", lambda: False)
     install_remote_debug_guard()
     install_remote_debug_guard()
-    assert calls == [remotedebug._guard]
+    assert calls == [remotedebug._guard, remotedebug._guard]
+    assert installs.reporters == 0 and sys.unraisablehook is before
+
+
+def test_a_hook_that_answers_once_the_objecting_hook_stops_is_added_then(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What the retry in state 1 is kept for: an earlier hook that objected at import and stopped
+    objecting by the time ``serve`` makes its own call."""
+    installs = _Installs(monkeypatch)
+    # Dropped at the first call (before, after); added at the second (before, after); answering
+    # at the third.
+    answers = iter([False, False, False, True, True])
+    monkeypatch.setattr(remotedebug, "_probe", lambda: next(answers))
+    install_remote_debug_guard()
+    assert installs.reporters == 0
+    install_remote_debug_guard()
+    install_remote_debug_guard()
+    assert installs.hooks == [remotedebug._guard, remotedebug._guard]
     assert installs.reporters == 1
+
+
+def test_install_lets_a_base_exception_out_with_the_unraisable_hook_put_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``Exception`` from an objecting hook is contained, and the test below pins that. A
+    ``KeyboardInterrupt`` is not the install's to swallow, and it must not leave the wrapper in."""
+    _Installs(monkeypatch)
+    before = sys.unraisablehook
+
+    def interrupted(hook: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sys, "addaudithook", interrupted)
+    monkeypatch.setattr(remotedebug, "_probe", lambda: False)
+    with pytest.raises(KeyboardInterrupt):
+        install_remote_debug_guard()
+    assert sys.unraisablehook is before
 
 
 def test_install_does_not_raise_when_a_hook_objects_with_any_exception(
@@ -682,7 +740,7 @@ def test_install_does_not_raise_when_a_hook_objects_with_any_exception(
         raise ValueError("an audit hook already installed refused this one")
 
     monkeypatch.setattr(sys, "addaudithook", objecting)
-    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: False)
+    monkeypatch.setattr(remotedebug, "_probe", lambda: False)
     install_remote_debug_guard()  # returns
     assert installs.reporters == 0 and sys.unraisablehook is before
 
@@ -702,7 +760,7 @@ def test_a_reporter_that_cannot_start_is_tried_again_by_the_next_call(
 
     monkeypatch.setattr(remotedebug, "_start_reporter", start)
     answers = iter([False, True, True, True])
-    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: next(answers))
+    monkeypatch.setattr(remotedebug, "_probe", lambda: next(answers))
     install_remote_debug_guard()  # the hook is in, and the failed start did not get out
     assert installs.hooks == [remotedebug._guard] and len(attempts) == 1
     install_remote_debug_guard()  # the hook answers, and the reporter is tried again
@@ -722,7 +780,7 @@ def test_the_unraisable_hook_is_wrapped_before_the_audit_hook_is_added(
         sys, "addaudithook", lambda hook: seen.append(sys.unraisablehook is not before)
     )
     answers = iter([False, True])
-    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: next(answers))
+    monkeypatch.setattr(remotedebug, "_probe", lambda: next(answers))
     install_remote_debug_guard()
     assert seen == [True] and installs.reporters == 1
 
@@ -739,6 +797,10 @@ def test_a_probe_another_hook_objects_to_reads_as_not_installed(
     monkeypatch.setattr(sys, "audit", objecting)
     assert remotedebug._guard_answers() is False
     assert remote_debug_posture().guard_installed is False
+    # Cut off, which the install tells apart from a probe nothing answered (vault BACKLOG #3463).
+    assert remotedebug._probe() is None
+    monkeypatch.setattr(sys, "audit", lambda event, *args: None)
+    assert remotedebug._probe() is False
 
     # CONTROL: a hook that objects AFTER this one answered still reads as installed, so the
     # False above is the probe's answer and not a blanket result of catching the error.
@@ -756,7 +818,7 @@ def test_install_adds_nothing_where_the_interpreter_refuses_injection_already(
     # Every child the engine starts is in this state, so none of them pays for a hook whose
     # event cannot fire.
     installs = _Installs(monkeypatch, enabled=False)
-    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: False)
+    monkeypatch.setattr(remotedebug, "_probe", lambda: False)
     install_remote_debug_guard()
     assert installs.hooks == [] and installs.reporters == 0
 
@@ -844,11 +906,13 @@ def test_the_entry_follows_the_reading() -> None:
     unguarded = remote_debug_loosening(_UNGUARDED)
     assert unguarded is not None and unguarded[0] == "remote_debug_unguarded"
     assert "NOT installed" in unguarded[1] and "has refused" not in unguarded[1]
-    # A count while the hook does not answer means it is in, behind a hook that stops the probe
-    # (vault BACKLOG #3463), and the entry says so.
+    # A count while the hook does not answer says it was in at some point, behind a hook that cuts
+    # the probe off (vault BACKLOG #3463), and the entry says so. It does not say the hook is in
+    # now, because a process that can write this one's memory can remove it.
     behind = remote_debug_loosening(RemoteDebugPosture(True, False, refused_scripts=2))
     assert behind is not None and behind[0] == "remote_debug_unguarded"
-    assert "the hook has refused 2 since this process started" in behind[1]
+    assert "The hook has refused 2 since this process started" in behind[1]
+    assert "not that it still is" in behind[1] and "Read it as not installed" in behind[1]
 
 
 def _names(remote_debug: RemoteDebugPosture | None) -> list[str]:
@@ -1062,8 +1126,11 @@ def test_the_command_line_still_imports_when_another_hook_refuses_the_guard(
     does not show that the install contains it. The stand-in test further up does."""
     reading = _install_probe(tmp_path, "objecting")
     assert reading["before"] is False and reading["after"] is False
-    # Tried once, and not again by the two later calls (vault BACKLOG #3463, state 1).
-    assert len(cast("list[object]", reading["loaded_at_install"])) == 1
+    # Tried by the import and again by each later call, since nothing answers and nothing cut the
+    # probe off: the interpreter dropped each copy (vault BACKLOG #3463, state 1). No reporter for
+    # a hook that is not there, and the interpreter's own unraisable hook is back.
+    assert len(cast("list[object]", reading["loaded_at_install"])) == 3
+    assert reading["reporter"] is False and reading["quiet"] is False
 
 
 def test_a_hook_behind_one_that_stops_the_probe_is_added_once_and_reported(
