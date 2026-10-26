@@ -875,8 +875,9 @@ _MUST_CHOOSE = frozenset(
         # verify's host cipher policy probes (BACKLOG #3277): PowerShell by its pinned path takes
         # the start-up names, with PATH and PSModulePath pinned; openssl takes the start-up names
         # plus the OPENSSL_* names OpenSSL reads (OPENSSL_CONF), and no PYTHON* name (#3803).
+        # Both openssl runs, the suite list and the OPENSSLDIR read, start in _openssl_lines.
         ("verify/cipher_policy.py", "_windows_enabled_suites", "subprocess.run"),
-        ("verify/cipher_policy.py", "_openssl_suites", "subprocess.run"),
+        ("verify/cipher_policy.py", "_openssl_lines", "subprocess.run"),
         # The dependency auditor's pip and pip-audit, with hook_environment: no MEFOR_* secret.
         ("security/audit_all_platforms.py", "_run", "subprocess.run"),
     }

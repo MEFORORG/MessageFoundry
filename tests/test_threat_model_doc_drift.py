@@ -1406,7 +1406,8 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
     "tray/branding.py": "tray's branded-launcher relaunch, fixed argv, close_fds=True",
     "verify/cipher_policy.py": (
         "verify's host cipher policy read (BACKLOG #3277): Get-TlsCipherSuite through the System32 "
-        "powershell.exe, or `openssl ciphers` on PATH; fixed argv, bounded by _PROBE_TIMEOUT_S"
+        "powershell.exe, or `openssl ciphers` and `openssl version -d` on PATH (BACKLOG #3803); "
+        "fixed argv, each start bounded by _PROBE_TIMEOUT_S"
     ),
 }
 

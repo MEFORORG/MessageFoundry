@@ -69,7 +69,7 @@ def _linux(
     monkeypatch.setattr(
         cipher_policy,
         "_openssl_policy_lines",
-        lambda: (cipher_policy._OPENSSL_CNF, section, _give(settings)),
+        lambda: (Path("/etc/ssl/openssl.cnf"), section, _give(settings)),
     )
     return cipher_policy.read_host_cipher_policy("linux")
 
@@ -624,11 +624,40 @@ def test_linux_missing_openssl_is_manual(monkeypatch: pytest.MonkeyPatch) -> Non
     assert r.status is Status.MANUAL
 
 
-def test_linux_missing_policy_file_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
-    missing = FileNotFoundError(2, "No such file", "/etc/ssl/openssl.cnf")
-    r = _linux(monkeypatch, _SSL_AEAD, missing)
-    assert r.status is Status.MANUAL
-    assert "confirm MinProtocol by hand" in r.detail
+def test_linux_missing_policy_file_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    missing = tmp_path / "absent.cnf"
+    monkeypatch.setenv("OPENSSL_CONF", str(missing))
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.MANUAL, r.detail
+    assert f"(no file at {missing}); run the commands by hand" in r.detail
+
+
+def test_an_unreadable_policy_file_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A file that is there and cannot be read is a reading that broke, not one not taken."""
+    monkeypatch.setenv("OPENSSL_CONF", str(tmp_path))  # a folder: reading it as a file fails
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.ERROR, r.detail
+    assert f"OpenSSL file not read: {tmp_path} could not be read" in r.detail
+
+
+@pytest.mark.parametrize(
+    ("raised", "status", "text"),
+    [
+        (ProbeUnavailable("x not found"), Status.MANUAL, "what not read (x not found); hint"),
+        (ProbeFailed("x exited 1"), Status.ERROR, "what not read: x exited 1"),
+    ],
+)
+def test_each_probe_exception_becomes_one_reading(
+    raised: Exception, status: Status, text: str
+) -> None:
+    """BACKLOG #3803 item 9: the one place a probe's two exceptions become MANUAL and ERROR."""
+    taken = cipher_policy._taken("what", lambda: _give(raised), "; hint")
+    assert taken == cipher_policy._Reading(status, text)
+    assert cipher_policy._taken("what", lambda: 7) == 7
 
 
 def test_no_system_default_section_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -657,11 +686,16 @@ def _read_cnf(
     return cipher_policy._openssl_policy_lines()
 
 
+def _linux_row(monkeypatch: pytest.MonkeyPatch) -> CheckResult:
+    """The whole Linux row, with the suite probe stubbed healthy and the policy file read."""
+    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
+    return cipher_policy.read_host_cipher_policy("linux")
+
+
 def _linux_from_file(monkeypatch: pytest.MonkeyPatch, cnf: Path, text: str) -> CheckResult:
     """The whole Linux row over a real file, with the suite probe stubbed healthy."""
     _point_openssl_conf_at(monkeypatch, cnf, text)
-    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
-    return cipher_policy.read_host_cipher_policy("linux")
+    return _linux_row(monkeypatch)
 
 
 def test_policy_lines_read_the_openssl_conf_file(
@@ -779,6 +813,11 @@ def test_other_module_lines_do_not_name_the_ssl_module(
         ('" spaced "  ', " spaced "),
         ("TLSv1.2   ", "TLSv1.2"),
         ("", ""),
+        # OpenSSL's whitespace is space, tab and carriage return, and no other (BACKLOG #3803 T5).
+        ("\tTLSv1.2\t\r", "TLSv1.2"),
+        ("TLSv1.2\N{NO-BREAK SPACE}", "TLSv1.2\N{NO-BREAK SPACE}"),
+        ("\N{EM SPACE}TLSv1.2", "\N{EM SPACE}TLSv1.2"),
+        ("TLSv1.2\v", "TLSv1.2\v"),
     ],
 )
 def test_config_values_are_read_as_openssl_reads_them(raw: str, value: str) -> None:
@@ -804,6 +843,12 @@ _BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
             "section::name",
         ),
         (_BOM + ".include /etc/ssl/more.cnf\n" + _CHAIN + _HEALTHY_SECTION, ".include"),
+        # OpenSSL reads a name that starts with .include as the directive: measured on OpenSSL
+        # 3.5.7, both of these included the named file (BACKLOG #3803 T5).
+        (_CHAIN + _HEALTHY_SECTION + ".include_x /etc/ssl/more.cnf\n", ".include"),
+        (_CHAIN + _HEALTHY_SECTION + ".includex=/etc/ssl/more.cnf\n", ".include"),
+        (_CHAIN + _HEALTHY_SECTION + "\t.include /etc/ssl/more.cnf\n", ".include"),
+        (".pragma_x dollarid:on\n" + _CHAIN + _HEALTHY_SECTION, ".pragma"),
     ],
 )
 def test_a_file_using_what_the_check_does_not_follow_is_manual(
@@ -836,12 +881,70 @@ def test_a_byte_order_mark_is_dropped_as_openssl_drops_it(
     assert _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)[1] == "system_default_sect"
 
 
+_NBSP = "\N{NO-BREAK SPACE}"
+
+
+def test_a_no_break_space_stays_in_a_value_as_openssl_keeps_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #3803 T5. Measured on OpenSSL 3.5.7: a ``CipherString`` ending in a no-break space
+    was not applied, so OpenSSL keeps that character. Python's ``strip`` dropped it, and this
+    floor read as ``TLSv1.2`` and PASS."""
+    text = _CHAIN + _HEALTHY_SECTION.replace("TLSv1.2", f"TLSv1.2{_NBSP}")
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.FAIL, r.detail
+    assert "MinProtocol = TLSv1.2\\u00a0, not TLSv1.2 or higher" in r.detail
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"{_NBSP}MinProtocol = TLSv1.2",  # indented with a no-break space
+        f"MinProtocol{_NBSP}= TLSv1.2",
+        "\vMinProtocol = TLSv1.2",  # a vertical tab is not OpenSSL whitespace either
+        f"[other{_NBSP}]",
+        "[other]\njunk",
+        "[other]\nMin Protocol = TLSv1",
+        "[other]\na$b = 1",
+        "[other\n",
+    ],
+)
+def test_a_line_openssl_may_refuse_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, line: str
+) -> None:
+    """BACKLOG #3803 T5. Measured on OpenSSL 3.5.7, with each line after this healthy file: every
+    one made OpenSSL apply none of the file, so a PASS on the lines read here would not hold.
+    Before, the row read PASS on each: Python's ``\\s`` took the no-break space and the vertical
+    tab as space, and a line matching no pattern was skipped."""
+    cnf = tmp_path / "openssl.cnf"
+    r = _linux_from_file(monkeypatch, cnf, _CHAIN + _HEALTHY_SECTION + line + "\n")
+    assert r.status is Status.MANUAL, r.detail
+    assert f"{cnf} has line " in r.detail
+    assert "cannot read as OpenSSL does" in r.detail
+
+
+def test_lines_openssl_reads_are_not_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The control for the test above: CRLF ends, tabs, a comment after a header, a spaced
+    section name and the punctuation OpenSSL allows in a name all read, and the row still PASSes.
+    OpenSSL 3.5.7 applied this file, measured."""
+    text = (
+        "# a comment\r\n\t\r\n"
+        + _CHAIN.replace("\n", "\r\n")
+        + "[system_default_sect] # the policy\r\n"
+        + "\tCipherString = ECDHE+AESGCM\t\r\nMinProtocol = TLSv1.2 \r\n"
+        + "[ spaced name ]\na!%&*+,-./;?@^_|~b = 1\nesc\\=aped = 2\n"
+    )
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.PASS, r.detail
+
+
 def test_an_empty_openssl_conf_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
     """``openssl`` gets the empty name, so the file it read is not known; the system file is not
     read in its place."""
     monkeypatch.setenv("OPENSSL_CONF", "")
-    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
-    r = cipher_policy.read_host_cipher_policy("linux")
+    r = _linux_row(monkeypatch)
     assert r.status is Status.MANUAL, r.detail
     assert "OPENSSL_CONF is set but empty" in r.detail
 
@@ -855,18 +958,76 @@ def test_a_quoted_min_protocol_passes(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert r.status is Status.PASS, r.detail
 
 
-def test_without_openssl_conf_the_system_file_is_read(
+def _openssl_returns(monkeypatch: pytest.MonkeyPatch, stdout: str) -> list[list[str]]:
+    """Stub every ``openssl`` start to print ``stdout``; returns the argument lists it was given."""
+    argvs: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        argvs.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return argvs
+
+
+def test_without_openssl_conf_the_binarys_own_file_is_read(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    cnf = tmp_path / "system.cnf"
+    """BACKLOG #3803 item 2: without ``OPENSSL_CONF``, ``openssl`` loads ``openssl.cnf`` in the
+    ``OPENSSLDIR`` it was built with, which need not be ``/etc/ssl``. Before, the row read
+    ``/etc/ssl/openssl.cnf`` whatever the binary loaded, and could judge the floor from it."""
+    cnf = tmp_path / "openssl.cnf"
     cnf.write_text(_CHAIN + "[system_default_sect]\nMinProtocol = TLSv1.2\n", encoding="utf-8")
     monkeypatch.delenv("OPENSSL_CONF", raising=False)
-    monkeypatch.setattr(cipher_policy, "_OPENSSL_CNF", cnf)
+    argvs = _openssl_returns(monkeypatch, f'OPENSSLDIR: "{tmp_path}"\n')
     assert cipher_policy._openssl_policy_lines() == (
         cnf,
         "system_default_sect",
         [("MinProtocol", "TLSv1.2")],
     )
+    assert argvs == [["openssl", "version", "-d"]]
+
+
+def test_with_openssl_conf_no_directory_is_asked_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``OPENSSL_CONF`` wins over ``OPENSSLDIR`` in OpenSSL, so the row starts no second probe."""
+    argvs = _openssl_returns(monkeypatch, 'OPENSSLDIR: "/elsewhere"\n')
+    _point_openssl_conf_at(monkeypatch, tmp_path / "named.cnf", _CHAIN + _HEALTHY_SECTION)
+    assert cipher_policy._openssl_policy_lines()[0] == tmp_path / "named.cnf"
+    assert argvs == []
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["", "OPENSSLDIR: /usr/lib/ssl\n", 'OPENSSLDIR: "/a"\nOPENSSLDIR: "/b"\n', 'OPENSSLDIR: ""\n'],
+)
+def test_a_directory_reading_that_is_not_one_openssldir_line_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    """Which file ``openssl`` loaded is then unknown, so the row neither guesses nor PASSes."""
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    _openssl_returns(monkeypatch, stdout)
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.ERROR, r.detail
+    assert "openssl version -d printed" in r.detail
+
+
+def test_no_openssl_for_the_directory_reading_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError(2, "No such file", argv[0])
+
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    monkeypatch.setattr(subprocess, "run", run)
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.MANUAL, r.detail
+    assert "OpenSSL file not read (openssl not found)" in r.detail
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="no openssl on PATH")
+def test_the_openssl_directory_command_runs_on_this_host() -> None:
+    """A real ``openssl version -d`` prints the one line the row reads its file from."""
+    assert cipher_policy._openssl_default_file().name == "openssl.cnf"
 
 
 def test_a_form_feed_does_not_end_a_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -878,13 +1039,6 @@ def test_a_form_feed_does_not_end_a_line(monkeypatch: pytest.MonkeyPatch, tmp_pa
     )
     r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
     assert r.status is Status.FAIL, r.detail
-
-
-def _openssl_returns(monkeypatch: pytest.MonkeyPatch, stdout: str) -> None:
-    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(subprocess, "run", run)
 
 
 def test_openssl_suite_lines_are_read(monkeypatch: pytest.MonkeyPatch) -> None:

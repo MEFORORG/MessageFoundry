@@ -18,8 +18,9 @@ and the TLS 1.0 and 1.1 client switches come from the registry through stdlib ``
 needs no subprocess. Linux runs the ``openssl`` command
 rather than Python's ``ssl`` module: section 5.4 measured that the CLI offers what the driver
 offers, and Python sets its own default cipher string over the host's ``CipherString``. It reads
-the policy lines from the section OpenSSL applies as the system default, found the way OpenSSL
-finds it (:func:`_system_default_section`).
+the policy lines from the file that ``openssl`` loads (:func:`_openssl_policy_lines`), in the
+section OpenSSL applies as the system default, found the way OpenSSL finds it
+(:func:`_system_default_section`).
 """
 
 from __future__ import annotations
@@ -31,11 +32,13 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 from messagefoundry.childenv import system_tool_environment
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.service_status import _NO_WINDOW, _system_exe
+from messagefoundry.terminal_text import escape_for_terminal
 from messagefoundry.verify.model import CheckResult, Status
 
 RID = "host.ciphers"
@@ -105,19 +108,34 @@ _SCHANNEL_SUITE_NAME = re.compile(r"(?:TLS|SSL)_[A-Za-z0-9_]+")
 #: fields. Any other line is an ERROR, as on Windows.
 _OPENSSL_SUITE_LINE = re.compile(r"\S+\s+\S+\s+Kx=\S+\s+Au=\S+\s+Enc=\S+\s+Mac=\S+")
 
-_OPENSSL_CNF = Path("/etc/ssl/openssl.cnf")
+#: The one line ``openssl version -d`` prints: the ``OPENSSLDIR`` the binary was built with, whose
+#: ``openssl.cnf`` it loads when ``OPENSSL_CONF`` is not set.
+_OPENSSLDIR_LINE = re.compile(r'OPENSSLDIR: "(.+)"')
+_OPENSSL_CNF_NAME = "openssl.cnf"
 #: The variables OpenSSL reads to find its configuration file and the provider modules and engines
 #: it loads. They cross to the probe on top of the platform's start-up names, which on POSIX hold
 #: ``LD_LIBRARY_PATH``. No Python variable crosses, because ``openssl`` is not Python and reads
 #: none (BACKLOG #3803 item 5).
 _OPENSSL_ENV = ("OPENSSL_CONF", "OPENSSL_CONF_INCLUDE", "OPENSSL_MODULES", "OPENSSL_ENGINES")
 _POLICY_KEYS = {key.lower(): key for key in ("CipherString", "Ciphersuites", "MinProtocol")}
+#: What a MANUAL reading tells the operator to do.
+_BY_HAND = "; run the commands by hand"
 #: The policy lines the verdict rests on. ``Ciphersuites`` is read for the evidence only.
 _JUDGED_KEYS = frozenset({"CipherString", "MinProtocol"})
-_SECTION_HEADER = re.compile(r"^\s*\[\s*([^\]]*?)\s*\]")
-_ASSIGNMENT = re.compile(r"^\s*([^\s=#]+)\s*=(.*)$")
-#: ``.include path``, ``.include = path`` and the ``.pragma`` forms.
-_DIRECTIVE = re.compile(r"^\s*(\.include|\.pragma)(?![\w.])")
+#: The whitespace of an OpenSSL configuration line: space, tab and carriage return. Python's
+#: ``\s`` and ``str.strip`` take more, such as a no-break space, which OpenSSL keeps in a value and
+#: refuses in a name (measured on OpenSSL 3.5.7, BACKLOG #3803 T5).
+_WS = " \t\r"
+#: A name, or one word of a section name, as OpenSSL reads it: letters, digits, the punctuation
+#: below, and a backslash with the character it escapes. Measured on OpenSSL 3.5.7, one other
+#: character in a name or a section name, in any section, made it apply none of the file.
+_NAME = r"(?:[A-Za-z0-9_!%&*+,\-./;?@^|~]|\\.)+"
+_SECTION_HEADER = re.compile(rf"\[[{_WS}]*((?:{_NAME}(?:[{_WS}]+{_NAME})*)?)[{_WS}]*\]")
+_ASSIGNMENT = re.compile(rf"({_NAME}(?:::{_NAME})?)[{_WS}]*=(.*)")
+#: OpenSSL reads a name that starts with ``.include`` as that directive, so ``.include_x path``
+#: includes ``path`` (measured on OpenSSL 3.5.7, BACKLOG #3803 T5). ``.pragma`` is refused the same
+#: way, as a prefix; that is not measured.
+_DIRECTIVE = re.compile(r"\.(?:include|pragma)")
 #: The names OpenSSL follows from the default section to the system-default policy section.
 _SYSTEM_DEFAULT_CHAIN = ("openssl_conf", "ssl_conf", "system_default")
 #: The one link that names a configuration MODULE rather than a fixed name. OpenSSL reads a module
@@ -184,9 +202,9 @@ def _every_entry_shaped(
     return entries
 
 
-# Each probe makes its own subprocess.run call rather than sharing one helper that takes an
+# Each program has its own subprocess.run call rather than sharing one helper that takes an
 # environment: tests/test_child_process_environment.py trusts env= only as a builder call at the
-# start itself, and the two probes pass that builder different arguments.
+# start itself, and the two programs pass that builder different arguments.
 
 
 #: The Windows PowerShell folder under the system directory, which ``$PSHOME`` names.
@@ -213,8 +231,9 @@ def _windows_enabled_suites() -> list[str]:
 
     ``(Get-TlsCipherSuite).Name`` and not a pipe into ``Where-Object Name``: section 5.4 measured
     that pipe passing the whole list through unfiltered. The filtering happens here, in Python.
-    PowerShell is a fixed system tool run by its pinned path, so it takes the start-up names only
-    (vault BACKLOG #2716), with ``PATH`` and ``PSModulePath`` pinned (:func:`_powershell_pins`).
+    PowerShell is a fixed system tool run by its pinned path, so it gets the platform's start-up
+    names (vault BACKLOG #2716), with a fixed ``PATH`` in place of the operator's and a fixed
+    ``PSModulePath`` added (:func:`_powershell_pins`).
     A host without the cmdlet is :class:`ProbeUnavailable`, as a host without PowerShell is. A line not
     shaped like a suite name, such as a stream line the command did not silence, is
     :class:`ProbeFailed`: it is neither counted as a suite nor dropped."""
@@ -227,7 +246,7 @@ def _windows_enabled_suites() -> list[str]:
                 "-Command",
                 _SUITES_COMMAND,
             ],
-            # The platform's start-up names only (#2716), PATH and PSModulePath pinned (#3803).
+            # The platform's start-up names (#2716), with PATH and PSModulePath fixed (#3803).
             env=system_tool_environment(pinned=_powershell_pins()),
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -294,17 +313,17 @@ def _schannel_policy_order() -> list[str] | None:
     )
 
 
-def _openssl_suites() -> list[str]:
-    """``openssl ciphers -s -v``: one line per suite this host's OpenSSL configuration allows.
+def _openssl_lines(*args: str) -> list[str]:
+    """The non-blank output lines of ``openssl`` run with ``args``, each call site's fixed list.
 
     Found on ``PATH`` by bare name, as section 5.4's own command is. It gets the platform's
     start-up names and the variables OpenSSL reads to find its configuration, providers and
     engines (``_OPENSSL_ENV``): section 5.4 asks for the check to run with the engine's
     environment, and without ``OPENSSL_CONF`` it would read a different policy from the one the
-    driver takes."""
+    driver takes. Both ``openssl`` runs start here, so they find the same binary."""
     with _probe_errors("openssl"):
         proc = subprocess.run(  # nosec B603 B607 - argv list (no shell), fixed arguments
-            ["openssl", "ciphers", "-s", "-v"],
+            ["openssl", *args],
             env=system_tool_environment(extra_names=_OPENSSL_ENV),
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -315,8 +334,28 @@ def _openssl_suites() -> list[str]:
             check=False,
             creationflags=_NO_WINDOW,
         )
-    lines = _stdout_lines("openssl", proc)
+    return _stdout_lines("openssl", proc)
+
+
+def _openssl_suites() -> list[str]:
+    """``openssl ciphers -s -v``: one line per suite this host's OpenSSL configuration allows."""
+    lines = _openssl_lines("ciphers", "-s", "-v")
     return _every_entry_shaped("openssl", lines, _OPENSSL_SUITE_LINE, "a suite line")
+
+
+def _openssl_default_file() -> Path:
+    """The file ``openssl`` loads when ``OPENSSL_CONF`` is not set: ``openssl.cnf`` in the
+    ``OPENSSLDIR`` the binary was built with, as ``openssl version -d`` prints it.
+
+    Not a fixed path such as ``/etc/ssl/openssl.cnf``, because a binary built with another
+    ``OPENSSLDIR`` loads another file, and the floor would be judged from a file the suite probe
+    did not load (BACKLOG #3803 item 2). Output other than one ``OPENSSLDIR`` line is
+    :class:`ProbeFailed`: which file was loaded is then not known."""
+    lines = _openssl_lines("version", "-d")
+    if len(lines) == 1 and (found := _OPENSSLDIR_LINE.fullmatch(lines[0])):
+        return Path(found[1]) / _OPENSSL_CNF_NAME
+    printed = f"{len(lines)} lines, the first {lines[0][:80]!r}" if lines else "nothing"
+    raise ProbeFailed(f"openssl version -d printed {printed}, not one OPENSSLDIR line")
 
 
 def _config_value(raw: str) -> str:
@@ -324,11 +363,13 @@ def _config_value(raw: str) -> str:
 
     A quote, single or double, is removed, and a ``#`` or a space inside one is kept. A backslash
     keeps the next character as it is. A ``#`` outside quotes starts a comment. Unquoted space at
-    the end is dropped. ``$name`` expansion is not done; :func:`_expanded_nowhere` refuses it."""
+    the end is dropped, and only what OpenSSL takes as space (``_WS``): a no-break space stays in
+    the value, as OpenSSL keeps it. ``$name`` expansion is not done; :func:`_expanded_nowhere`
+    refuses it."""
     out: list[str] = []
     kept = 0  # out[:kept] ends with a quoted or escaped character, which no trim may drop
     quote = ""
-    chars = iter(raw.strip())
+    chars = iter(raw.strip(_WS))
     for char in chars:
         if char == "\\":
             out.append(next(chars, ""))
@@ -345,7 +386,7 @@ def _config_value(raw: str) -> str:
             break
         else:
             out.append(char)
-    return "".join(out[:kept]) + "".join(out[kept:]).rstrip()
+    return "".join(out[:kept]) + "".join(out[kept:]).rstrip(_WS)
 
 
 def _not_followed(construct: str) -> ProbeUnavailable:
@@ -363,25 +404,36 @@ def _config_sections(text: str) -> dict[str, list[tuple[str, str]]]:
     """Each section's ``name = value`` lines, in file order. Lines above the first header are in
     ``default``, which is where OpenSSL files them.
 
-    An ``.include``, a ``.pragma``, a line continued with a backslash or a ``section::name``
-    assignment raises :class:`ProbeUnavailable`, wherever it is in the file: each can add to, or
-    change how OpenSSL reads, the section this check reads, so a reading taken without it could
-    PASS on lines OpenSSL does not apply. These are the constructs known here, not all of them."""
+    An ``.include`` or ``.pragma`` (any name that starts with either), a line continued with a
+    backslash or a ``section::name`` assignment raises :class:`ProbeUnavailable`, wherever it is
+    in the file: each can add to, or change how OpenSSL reads, the section this check reads, so a
+    reading taken without it could PASS on lines OpenSSL does not apply. These are the constructs
+    known here, not all of them. So does a line that is none of blank, comment, section header and
+    ``name = value`` as OpenSSL spells them, such as one indented with a no-break space: measured
+    on OpenSSL 3.5.7, one such line anywhere made it apply none of the file (BACKLOG #3803 T5)."""
     sections: dict[str, list[tuple[str, str]]] = {"default": []}
     current = sections["default"]
     # OpenSSL ends a line only at a newline; splitlines() would also break at a form feed and
     # other separators, showing this reader a line OpenSSL never sees.
-    for line in text.split("\n"):
-        if directive := _DIRECTIVE.match(line):
-            raise _not_followed(directive[1])
+    for number, line in enumerate(text.split("\n"), start=1):
+        stripped = line.lstrip(_WS)
+        if directive := _DIRECTIVE.match(stripped):
+            raise _not_followed(directive[0])
         if line.rstrip().endswith("\\"):
             raise _not_followed("a line continued with a backslash")
-        if header := _SECTION_HEADER.match(line):
+        if not stripped or stripped.startswith("#"):
+            continue
+        if header := _SECTION_HEADER.match(stripped):
             current = sections.setdefault(header[1], [])
-        elif assignment := _ASSIGNMENT.match(line):
+        elif assignment := _ASSIGNMENT.fullmatch(stripped):
             if "::" in assignment[1]:
                 raise _not_followed("a section::name assignment")
             current.append((assignment[1], _config_value(assignment[2])))
+        else:
+            raise ProbeUnavailable(
+                f"has line {number}, which this check cannot read as OpenSSL does; OpenSSL may "
+                "apply none of the file"
+            )
     return sections
 
 
@@ -424,18 +476,25 @@ def _names_the_ssl_module(name: str) -> bool:
 def _openssl_policy_lines() -> tuple[Path, str | None, list[tuple[str, str]]]:
     """The ``CipherString``, ``Ciphersuites`` and ``MinProtocol`` settings OpenSSL applies.
 
-    Reads the file ``OPENSSL_CONF`` names when this environment sets it, so the file read is the one
-    the ``openssl`` probe above loaded. Returns the file, the system-default section, and that
-    section's policy lines; no section means the file sets no system-default policy. OpenSSL
-    matches a file-form command name without case, so this does too. A file using what this
-    check does not follow raises :class:`ProbeUnavailable` naming the file, and so does an
-    ``OPENSSL_CONF`` that is set but empty, because which file ``openssl`` read is then not known.
-    A leading byte-order mark is dropped, as OpenSSL drops it."""
+    Reads the file the probed ``openssl`` loads: the one ``OPENSSL_CONF`` names when this
+    environment sets it, which the probe gets too, and otherwise ``openssl.cnf`` in the binary's
+    ``OPENSSLDIR`` (:func:`_openssl_default_file`). Returns the file, the system-default section,
+    and that section's policy lines; no section means the file sets no system-default policy.
+    OpenSSL matches a file-form command name without case, so this does too. A file using what
+    this check does not follow raises :class:`ProbeUnavailable` naming the file, and so do a file
+    that is not there and an ``OPENSSL_CONF`` that is set but empty, because which file
+    ``openssl`` read is then not known. A file that is there and cannot be read raises
+    :class:`ProbeFailed`. A leading byte-order mark is dropped, as OpenSSL drops it."""
     named = os.environ.get("OPENSSL_CONF")
     if named == "":
         raise ProbeUnavailable("OPENSSL_CONF is set but empty, so the file openssl read is unknown")
-    path = Path(named) if named else _OPENSSL_CNF
-    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    path = Path(named) if named else _openssl_default_file()
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except FileNotFoundError as exc:
+        raise ProbeUnavailable(f"no file at {path}") from exc
+    except OSError as exc:
+        raise ProbeFailed(f"{path} could not be read: {codec_safe_str(exc)}") from exc
     try:
         sections = _config_sections(text)
         section = _system_default_section(sections)
@@ -450,15 +509,26 @@ def _openssl_policy_lines() -> tuple[Path, str | None, list[tuple[str, str]]]:
     return path, section, settings
 
 
+def _taken[T](what: str, probe: Callable[[], T], hint: str = "") -> T | _Reading:
+    """``probe()``, or the reading that says why it was not taken: MANUAL where the probe cannot
+    run here, ERROR where it ran and gave no usable reading. Every probe's two exceptions become
+    readings here and nowhere else (BACKLOG #3803 item 9)."""
+    try:
+        return probe()
+    except ProbeUnavailable as exc:
+        return _Reading(Status.MANUAL, f"{what} not read ({exc}){hint}")
+    except ProbeFailed as exc:
+        return _Reading(Status.ERROR, f"{what} not read: {exc}")
+
+
 def _suite_reading(
     what: str, probe: Callable[[], list[str]], is_aead: Callable[[str], bool]
 ) -> _Reading:
-    try:
-        lines = probe()
-    except ProbeUnavailable as exc:
-        return _Reading(Status.MANUAL, f"{what} not read ({exc}); run the commands by hand")
-    except ProbeFailed as exc:
-        return _Reading(Status.ERROR, f"{what} not read: {exc}")
+    lines = _taken(what, probe, _BY_HAND)
+    return lines if isinstance(lines, _Reading) else _judged_suites(what, lines, is_aead)
+
+
+def _judged_suites(what: str, lines: list[str], is_aead: Callable[[str], bool]) -> _Reading:
     if not lines:
         return _Reading(
             Status.ERROR,
@@ -485,30 +555,22 @@ def _windows_policy_order_readings() -> list[_Reading]:
     Which list SChannel takes when the policy and the local table disagree was not measured, so a
     suite that is not AEAD in either is a FAIL. That keeps a trimmed local table from reading as a
     PASS beneath a policy that still lists CBC suites."""
-    try:
-        order = _schannel_policy_order()
-    except ProbeUnavailable as exc:
-        return [_Reading(Status.MANUAL, f"Group Policy suite order not read ({exc})")]
-    except ProbeFailed as exc:
-        return [_Reading(Status.ERROR, f"Group Policy suite order not read: {exc}")]
+    order = _taken("Group Policy suite order", _schannel_policy_order)
+    if isinstance(order, _Reading):
+        return [order]
     if order is None:
         return []
-    return [_suite_reading("Group Policy suite-order suites", lambda: order, _is_schannel_aead)]
+    return [_judged_suites("Group Policy suite-order suites", order, _is_schannel_aead)]
 
 
 def _windows_protocol_readings() -> list[_Reading]:
     """One reading per legacy version, so a broken read never hides a finding on the other."""
     readings: list[_Reading] = []
     for version in _LEGACY_VERSIONS:
-        try:
-            value = _schannel_client_enabled(version)
-        except ProbeUnavailable as exc:
-            readings.append(_Reading(Status.MANUAL, f"{version} client Enabled not read ({exc})"))
-            continue
-        except ProbeFailed as exc:
-            readings.append(_Reading(Status.ERROR, f"{version} client Enabled not read: {exc}"))
-            continue
-        if value is None:
+        value = _taken(f"{version} client Enabled", partial(_schannel_client_enabled, version))
+        if isinstance(value, _Reading):
+            readings.append(value)
+        elif value is None:
             readings.append(
                 _Reading(
                     Status.FAIL, f"{version} client Enabled is not set (section 5.4 asks for 0)"
@@ -524,16 +586,10 @@ def _windows_protocol_readings() -> list[_Reading]:
 
 
 def _linux_policy_reading() -> _Reading:
-    try:
-        path, section, settings = _openssl_policy_lines()
-    except FileNotFoundError as exc:
-        return _Reading(
-            Status.MANUAL, f"no OpenSSL file at {exc.filename}; confirm MinProtocol by hand"
-        )
-    except ProbeUnavailable as exc:
-        return _Reading(Status.MANUAL, f"{exc}; run the manual commands")
-    except OSError as exc:
-        return _Reading(Status.ERROR, f"OpenSSL file not read: {codec_safe_str(exc)}")
+    taken = _taken("OpenSSL file", _openssl_policy_lines, _BY_HAND)
+    if isinstance(taken, _Reading):
+        return taken
+    path, section, settings = taken
     if section is None:
         return _Reading(
             Status.FAIL,
@@ -552,7 +608,9 @@ def _linux_policy_reading() -> _Reading:
     if not min_protocols:
         problems.append("no MinProtocol line")
     elif min_protocols[-1] not in _TLS12_OR_HIGHER:  # OpenSSL takes the last one
-        problems.append(f"MinProtocol = {min_protocols[-1]}, not TLSv1.2 or higher")
+        # Escaped, so a no-break space OpenSSL keeps in the value shows in the detail.
+        shown = escape_for_terminal(min_protocols[-1], single_line=True)
+        problems.append(f"MinProtocol = {shown}, not TLSv1.2 or higher")
     if problems:
         return _Reading(Status.FAIL, f"{where}: " + "; ".join(problems), evidence=evidence)
     return _Reading(

@@ -841,35 +841,44 @@ It runs the commands of this step. It differs from them in at least the ways nam
   local list that `Get-TlsCipherSuite` prints still holds a suite that is not AEAD. Whether that
   local list follows the policy is **unmeasured**; until it is measured, read such a FAIL against
   the policy list the row prints.
-- Linux: `openssl ciphers -s -v` from the `PATH`, and the `CipherString`, `Ciphersuites` and
-  `MinProtocol` lines of `/etc/ssl/openssl.cnf`. It differs from the manual `grep` in at least
-  these ways. Where `OPENSSL_CONF` is set in the environment, it reads the file that variable
-  names, which is the file `openssl` itself loaded, so there the row and the manual `grep` read
-  different files. It reads only the section OpenSSL applies as the system default: it follows
+- Linux: Linux is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target),
+  so this branch is only for a Linux host outside that support, such as the container image. It
+  runs `openssl ciphers -s -v` from the `PATH`. It reads the `CipherString`, `Ciphersuites` and
+  `MinProtocol` lines of the file that `openssl` loads, which is not always the file the manual
+  `grep` reads. Where `OPENSSL_CONF` is set in the environment, that is the file the variable
+  names. Otherwise it is `openssl.cnf` in the `OPENSSLDIR` folder that `openssl version -d`
+  prints, which the row runs as a second `openssl` start. That folder is fixed when `openssl` is
+  built, so it may not be `/etc/ssl`. It differs from the manual `grep` in at least
+  these ways too. It reads only the section OpenSSL applies as the system default: it follows
   `openssl_conf` in the top of the file, then that section's `ssl_conf`, then that section's
   `system_default`, which is `[system_default_sect]` on the stock Ubuntu file measured above. The
   `ssl_conf` line names a module, so as in OpenSSL it may carry a suffix after its last `.`, such
   as `ssl_conf.0`. A shorter name OpenSSL may match to that module as a prefix, such as `ssl`,
   reads MANUAL. A file where that chain leads nowhere sets no policy, and reads FAIL. It matches the three names without
   regard to case, as OpenSSL does. It accepts an indented line, removes quotes around a value,
-  drops a `#` comment outside quotes, and drops a leading byte-order mark. It ends a line only at a
-  newline, as OpenSSL does. Any `openssl ciphers` output line not shaped like a suite line makes
-  the row ERROR, as on Windows. It does not follow at
-  least these: an `.include` or `.pragma` line, a line that ends in a backslash, a
-  `section::name` assignment, or a `$name` value. A file with any of the first four anywhere, or
-  with `$` in a `CipherString` or `MinProtocol` value or in the section chain, reads MANUAL. So does
-  an `OPENSSL_CONF` that is set but empty. A PASS still rests on this reading matching OpenSSL's
-  for every construct the file uses. RHEL-family hosts, which set the policy through
-  `update-crypto-policies` and an included file, are outside what this row was written and
-  measured for. On a stock one, expect MANUAL: its file pulls the policy in through `.include`, and
-  it is not at `/etc/ssl/openssl.cnf`. That is **unmeasured**.
+  drops a `#` comment outside quotes, and drops a leading byte-order mark. As in OpenSSL, it ends
+  a line only at a newline, and only a space, a tab or a carriage return counts as space. So a
+  no-break space after `TLSv1.2` stays in the value, and that `MinProtocol` reads FAIL. Any
+  `openssl ciphers` output line not shaped like a suite line makes the row ERROR, as on Windows.
+  It does not follow at least these: an `.include` or `.pragma` line, a line that ends in a
+  backslash, a `section::name` assignment, or a `$name` value. OpenSSL reads any name that starts
+  with `.include` as that line, such as `.include_x`, so the row does too. A file with any of the
+  first four anywhere, or with `$` in a `CipherString` or `MinProtocol` value or in the section
+  chain, reads MANUAL. So does a file with a line the row cannot read as OpenSSL does, such as a
+  line with no `=` or one indented with a no-break space. With the OpenSSL 3.5.7 that Git for
+  Windows ships, one such line anywhere made OpenSSL apply none of the file (measured
+  2026-10-26). An `OPENSSL_CONF` that is set but empty reads MANUAL too. A PASS still rests on
+  this reading matching OpenSSL's for every construct the file uses. RHEL-family hosts, which set
+  the policy through `update-crypto-policies` and an included file, are outside what this row was
+  written and measured for. On a stock one, expect MANUAL, because its file pulls the policy in
+  through `.include`. That is **unmeasured**.
 
 | Status | When |
 |---|---|
 | PASS | The control is above 0 and every enabled suite is AEAD. On Windows, both `Enabled` values read `0`, and every suite in a Group Policy suite order is AEAD. On Linux, the system-default section holds one `CipherString` line and its last `MinProtocol` is `TLSv1.2` or `TLSv1.3`. |
 | FAIL | Any of those does not hold. The row names the suites that are not AEAD. An `Enabled` value that is not set fails too, as on the stock host measured above. |
-| ERROR | A reading was attempted and gave no usable answer. At least these: a command ran and failed or timed out; the system TLS module is there but did not import; PowerShell or `openssl` printed a line, or the Group Policy order held an entry, that is not a suite; a suite list, enabled or Group Policy, read empty; a registry value could not be read or held the wrong type; the OpenSSL file could not be read. An empty list is a control of 0, so it never reads as healthy. |
-| MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no system TLS module folder or no `Get-TlsCipherSuite` cmdlet in it, no `openssl`, no OpenSSL file at the path read, an empty `OPENSSL_CONF`, or an OpenSSL file that uses what the row does not follow (above). Run the commands above by hand. Also a FAIL or ERROR reading on a host whose configuration could not be read, so whether it takes an ODBC hop is not known (above). |
+| ERROR | A reading was attempted and gave no usable answer. At least these: a command ran and failed or timed out; the system TLS module is there but did not import; PowerShell or `openssl` printed a line, or the Group Policy order held an entry, that is not a suite; `openssl version -d` printed other than one `OPENSSLDIR` line; a suite list, enabled or Group Policy, read empty; a registry value could not be read or held the wrong type; the OpenSSL file could not be read. An empty list is a control of 0, so it never reads as healthy. |
+| MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no system TLS module folder or no `Get-TlsCipherSuite` cmdlet in it, no `openssl`, no OpenSSL file at the path read, an empty `OPENSSL_CONF`, or an OpenSSL file that uses what the row does not follow or holds a line it cannot read (above). Run the commands above by hand. Also a FAIL or ERROR reading on a host whose configuration could not be read, so whether it takes an ODBC hop is not known (above). |
 | SKIP | `pyodbc` is not installed in the Python that runs `verify`, so no ODBC Driver 18 hop can run from it. Or the configuration takes no ODBC hop. Or the host is neither Windows nor Linux. |
 
 When readings disagree, the row takes the worst: FAIL, then ERROR, then MANUAL, then PASS. So a

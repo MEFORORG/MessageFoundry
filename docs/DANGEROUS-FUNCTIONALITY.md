@@ -291,7 +291,7 @@ debugging on, because a launcher passes no interpreter option.
 | `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
 | `store/store.py` | `icacls.exe` | Setting owner-only permissions on store files, which hold no key | argument list |
 | `checks.py` | `ruff` and `mypy`, found on `PATH` | `messagefoundry check`, when they are installed | argument list |
-| `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` from the system TLS module on Windows; `openssl ciphers`, found on `PATH`, on Linux | `messagefoundry verify`, in its host section, which runs by default, when that row reads the policy ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 says when) | argument list |
+| `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` from the system TLS module on Windows; `openssl ciphers` and `openssl version -d`, found on `PATH`, on Linux | `messagefoundry verify`, in its host section, which runs by default, when that row reads the policy ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 says when) | argument list |
 | `security/audit_all_platforms.py` | `pip` and `pip-audit`, as modules of the running interpreter | A dependency audit in CI or by hand, never in the service | argument list |
 | `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
 | `tray/app.py` | The default editor | Opening `tray.toml` from the tray | os.startfile |
@@ -372,11 +372,12 @@ and the builders, and a test checks that each module named calls each builder na
 - The engine shards and the config-loading child, in `pipeline/supervisor.py`, and the tray's
   branded relaunch, in `tray/branding.py`, get the whole environment, secrets included, less any
   empty or relative `PYTHONPATH` entry (`engine_environment`).
-- The `openssl` start in `verify/cipher_policy.py` gets the platform's start-up names and the
-  variables OpenSSL reads to find its configuration file, `OPENSSL_CONF` and
-  `OPENSSL_CONF_INCLUDE`, and the provider modules and engines it loads, `OPENSSL_MODULES` and
-  `OPENSSL_ENGINES` (`system_tool_environment`). No other variable reaches it, and no Python
-  variable, since `openssl` is not Python.
+- The two `openssl` starts in `verify/cipher_policy.py`, `openssl ciphers` and
+  `openssl version -d`, get the platform's start-up names and the variables OpenSSL reads to find
+  its configuration file, `OPENSSL_CONF` and `OPENSSL_CONF_INCLUDE`, and the provider modules and
+  engines it loads, `OPENSSL_MODULES` and `OPENSSL_ENGINES` (`system_tool_environment`). No other
+  variable reaches them, and no Python variable, since `openssl` is not Python. Both start
+  through one call, so they find the same `openssl` on the same `PATH`.
 - The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get what the
   disaster-recovery hook gets, less any empty or relative `PYTHONPATH` entry (`hook_environment`
   over `engine_environment`). So they keep the index, proxy and certificate settings they read
@@ -422,9 +423,9 @@ setting or message reaches it, and it calls `Get-TlsCipherSuite` through the sys
 imported by its path, never by name. No command it runs is looked up by a bare name, so a
 program or script of that name on the `PATH` cannot answer for one. Its argument list is still the form in the table above. The
 site check in the test suite counts a `-Command` start as a shell start, as it counts these two.
-Each of the module's two starts, `powershell.exe` and `openssl`, is bounded at 30 s
-(`_PROBE_TIMEOUT_S`): `subprocess.run` kills a probe that runs longer, and that reading is an
-ERROR.
+Each start the module makes, `powershell.exe` on Windows and the two `openssl` runs on Linux, is
+bounded at 30 s (`_PROBE_TIMEOUT_S`): `subprocess.run` kills a probe that runs longer, and that
+reading is an ERROR. The Linux row can so take up to 60 s.
 
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
 run whatever program is registered for the file type or URL scheme. The tray opens its log file,
