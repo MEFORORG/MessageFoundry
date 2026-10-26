@@ -487,7 +487,7 @@ def _rows_by_crl_file(
         if row.path not in keys:
             try:
                 keys[row.path] = crl_path_key(row.path)
-            except Exception:
+            except (OSError, TypeError, ValueError):
                 log.error(
                     "cert_expiry: could not key CRL %s, so its rows share with none",
                     row.path,
@@ -566,8 +566,8 @@ class _HeldCopyLog:
         the row no date and no alert (vault BACKLOG #3548). An account counts as logged only once
         its line is, so a failure leaves the next row sharing the file to log it."""
         try:
-            key = self._keys.get(cert.path, "")
-            fold_key = key if key in self._sharing else None
+            # Every keyed path is in the grouping, so a key is the fold's key.
+            fold_key = self._keys.get(cert.path)
             if fold_key is not None and (fold_key, account) in self._logged:
                 return
             # The alert's own words for the rows sharing a file, without its clause that each of
@@ -607,7 +607,12 @@ def held_crl_label(path: str) -> str:
 
 
 def _ca_file_crl_refusal(
-    pem: bytes, now: float, file_facts: CrlFacts | None, *, ca_file_only: bool, may_wait: bool
+    pem: bytes,
+    now: float,
+    file_facts: CrlFacts | None,
+    *,
+    ca_file_only: bool,
+    held_lapse: datetime.datetime,
 ) -> tuple[str, str] | None:
     """Why a restart into this CA file would refuse peers, or might, as ``(why, remedy)``, or
     ``None`` when its CRLs pass the checks below, or it holds none (BACKLOG #3176). "Might" is a
@@ -621,8 +626,8 @@ def _ca_file_crl_refusal(
     from this file for its issuer. Only a signature proven bad says handshakes fail;
     one the engine could not confirm asks for a check (BACKLOG #3512). With ``ca_file_only``, that
     remedy then says to restart. Otherwise a CRL setting names the file too. The caller then orders
-    the restart, after the reload's verdict. Without ``may_wait``, a CRL not yet in effect is
-    offered no wait: a refused reload stands beside it. A CRL
+    the restart, after the reload's verdict. A CRL not yet in effect is offered a wait only when
+    ``held_lapse``, the soonest a stale held copy lapses, is no earlier than it takes effect. A CRL
     whose issuer this file does not hold is not refused: the issuer can be an intermediate the peer
     sends, which the reload treats the same way. ``file_facts`` is the lenient reading, which tells
     an expired CRL from one that cannot be judged. Each remedy leads, because the alert instance
@@ -649,9 +654,14 @@ def _ca_file_crl_refusal(
     # OpenSSL allows none, so a restart before it takes effect refuses peers until then.
     if (early := crl_not_in_effect(blocks, now=now, skew=0.0)) is not None:
         # The wait is its own sentence, after the fix and its reason, so the alert list's cut
-        # keeps both (BACKLOG #3512). It is left out beside a refused reload, whose remedy can
-        # say that waiting refuses every peer, as LAPSES_FIRST does.
-        wait = f". Or wait until {log_timestamp(early.this_update)} to restart" if may_wait else ""
+        # keeps both. A hop's copy that lapses before the CRL takes effect refuses every peer in
+        # between, wait or restart, so then no wait is offered: the reload's LAPSES_FIRST rule,
+        # read from the held copies' soonest nextUpdate (BACKLOG #3512).
+        wait = (
+            f". Or wait until {log_timestamp(early.this_update)} to restart"
+            if held_lapse >= early.this_update
+            else ". Do not wait: the hop's copy lapses before it takes effect"
+        )
         return (
             "whose CA file now holds a CRL that is not yet in effect",
             "Replace the CRL in the CA file with one in effect now before restarting: until it "
@@ -663,9 +673,15 @@ def _ca_file_crl_refusal(
             scratch = crl_scratch_context(str(copy), blocks, label="the CA file")
         # The states of the file's CRLs, merged. pki.crl_signature_refusal's flag is True for
         # three of them, and only ``bad`` proves a failure (BACKLOG #3512).
-        states = {
-            sig.state for sig in judge_crl_signatures(pem, scratch.get_ca_certs(binary_form=True))
-        }
+        states: set[str] = set()
+        try:
+            for sig in judge_crl_signatures(pem, scratch.get_ca_certs(binary_form=True)):
+                states.add(sig.state)
+        except ValueError:
+            # main's check stopped at the first unconfirmed block, so a later block it cannot
+            # read never cost that verdict. Keep the verdict the earlier blocks gave.
+            if not states - {"verified", "unlisted"}:
+                raise
     except ValueError:
         return unjudged  # OpenSSL loads other CRLs than were judged
     except ssl.SSLError as exc:
@@ -834,7 +850,7 @@ def _judge_crl(
                         now,
                         file_facts,
                         ca_file_only=not crl_setting_too,
-                        may_wait=refused is None,
+                        held_lapse=datetime.datetime.fromisoformat(oldest.next_update_iso),
                     )
                 )
                 is not None

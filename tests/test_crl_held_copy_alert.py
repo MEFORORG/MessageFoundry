@@ -24,6 +24,7 @@ import gc
 import logging
 import ssl
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -706,6 +707,33 @@ def test_the_ca_file_remedy_follows_the_strongest_signature_state(
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+@pytest.mark.parametrize(
+    ("first", "lead"),
+    [
+        ("unproven", "Check that the CRL in the CA file"),
+        ("verified", "Replace the CRL in the CA file with one the engine can judge"),
+    ],
+)
+def test_a_later_block_the_signature_check_cannot_read_keeps_an_earlier_verdict(
+    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: Any, lead: str
+) -> None:
+    # BACKLOG #3512: main's check stopped at the first unconfirmed block, so a later block that
+    # raised never cost that verdict. Draining every block must not change that. The control: a
+    # verified block before the raise leaves nothing to keep, so the file cannot be judged.
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3))
+
+    def _states(pem: bytes, cas: object) -> Iterator[CrlSignature]:
+        yield CrlSignature("CRL block 1", first)
+        raise ValueError("synthetic unreadable issuer")
+
+    monkeypatch.setattr("messagefoundry.pipeline.cert_expiry.judge_crl_signatures", _states)
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith(lead), detail
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
 @pytest.mark.parametrize("kind", ["delta", "garbled"])
 def test_a_crl_the_engine_cannot_judge_in_the_ca_file_is_fixed_before_a_restart(
     ca: _Ca, tmp_path: Path, kind: str
@@ -859,11 +887,12 @@ def test_a_refused_reload_keeps_its_remedy_beside_a_ca_file_fix(ca: _Ca, tmp_pat
     # which the 0.5.2 CHANGELOG.md entry for #3176 promised. The CA-file fix still leads, as a
     # refusal's remedy can be a restart, which would load this CRL into the CA-file hop. The reason
     # follows the remedy, as in the plain refused arm: one policy for the alert (BACKLOG #3512).
-    # A refusal stands, so the CA-file step offers no wait.
+    # The hop's copy outlasts the new CRL's start, so the reload waits and the step offers the
+    # same wait: the two agree.
     hops, both = _shared_as_crl_and_ca_file(
         ca, tmp_path, ca.crl(days=90, number=3, starts_in_days=2)
     )
-    remedy = "Restart the engine to apply the file"
+    remedy = crl_reload.WAIT
     reason = "synthetic reload reason"
     record_reload_refusal(both, ReloadRefusal(crl_fingerprint(both.read_bytes()), reason, remedy))
     try:
@@ -874,37 +903,53 @@ def test_a_refused_reload_keeps_its_remedy_beside_a_ca_file_fix(ca: _Ca, tmp_pat
     assert detail.startswith(
         "Replace the CRL in the CA file with one in effect now before restarting: "
     )
-    assert "wait until" not in detail.lower()
+    assert ". Or wait until " in detail, detail
+    assert "Do not wait" not in detail, detail
     assert (
         ". Do that first. The reload refused the file for a hop that loads it as its CRL" in detail
     )
-    assert f": {remedy}. Reason: {reason}. Held by: " in detail
+    assert f": {remedy}. Reason: {reason}. {_CA_FILE_HOP_RESTARTS}. Held by: " in detail, detail
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
-def test_a_ca_file_crl_not_yet_in_effect_offers_no_wait_beside_a_lapses_first_refusal(
-    ca: _Ca, tmp_path: Path
+@pytest.mark.parametrize("shared", [True, False], ids=["crl-setting-too", "ca-file-only"])
+def test_a_ca_file_crl_taking_effect_after_the_held_copy_lapses_offers_no_wait(
+    ca: _Ca, tmp_path: Path, shared: bool
 ) -> None:
-    # BACKLOG #3512 (vault #4151): the CA-file step offered "or wait until X", and beside a
-    # LAPSES_FIRST refusal waiting refuses every peer. A standing refusal now drops the wait, and
-    # the refusal's remedy follows the step. The control, with no refusal, still offers the wait.
-    hops, both = _shared_as_crl_and_ca_file(
-        ca, tmp_path, ca.crl(days=90, number=3, starts_in_days=2)
-    )
-    control = _row_detail(both)
-    remedy = crl_reload.LAPSES_FIRST
-    record_reload_refusal(both, ReloadRefusal(crl_fingerprint(both.read_bytes()), "why", remedy))
-    try:
-        detail = _row_detail(both)
-    finally:
-        clear_reload_refusal(both)
+    # BACKLOG #3512 (vault #4151): the CA-file step offered "or wait until X" whatever the hop
+    # held. Its copy lapses in about five days, and this CRL takes effect in ten, so waiting
+    # refuses every peer in between: the reload's LAPSES_FIRST case. A CA-file-only hop never
+    # gets that refusal, as the reload does not judge its copy, so the step reads the held copy's
+    # date itself. The control, a CRL taking effect in two days, is still offered the wait.
+    def _detail(starts_in_days: float, where: Path) -> str:
+        where.mkdir()
+        crl = ca.crl(days=90, number=3, starts_in_days=starts_in_days)
+        if shared:
+            hops, both = _shared_as_crl_and_ca_file(ca, where, crl)
+            remedy = crl_reload.LAPSES_FIRST if starts_in_days > 5.5 else crl_reload.WAIT
+            fp = crl_fingerprint(both.read_bytes())
+            record_reload_refusal(both, ReloadRefusal(fp, "why", remedy))
+            try:
+                detail = _row_detail(both)
+            finally:
+                clear_reload_refusal(both)
+        else:
+            hops = [_replaced_bundle(ca, where, crl)[0]]
+            detail = _bundle_detail(where / "ca-bundle.pem")
+        assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
+        return detail
+
+    control = _detail(2, tmp_path / "control")
+    detail = _detail(10, tmp_path / "lapses")
 
     assert ". Or wait until " in control, control
     lead = "Replace the CRL in the CA file with one in effect now before restarting: "
     assert detail.startswith(lead), detail
     assert "wait until" not in detail.lower(), detail
-    assert f": {remedy}. Reason: why. {_CA_FILE_HOP_RESTARTS}." in detail, detail
-    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
+    assert ". Do not wait: the hop's copy lapses before it takes effect" in detail, detail
+    if shared:
+        remedy = crl_reload.LAPSES_FIRST
+        assert f": {remedy}. Reason: why. {_CA_FILE_HOP_RESTARTS}." in detail, detail
 
 
 def _alert_list_reason(detail: str) -> str:
@@ -1156,7 +1201,7 @@ def test_a_failure_keying_a_crl_path_costs_only_the_shared_rows_note(
     crl.write_bytes(ca.crl(days=5.5, number=1))
 
     def _broken(path: object) -> str:
-        raise RuntimeError("synthetic path-key failure")
+        raise OSError("synthetic path-key failure")
 
     monkeypatch.setattr("messagefoundry.pipeline.cert_expiry.crl_path_key", _broken)
     rows = [MonitoredCert("tls.crl_file", str(crl), kind="crl")]
@@ -1187,7 +1232,7 @@ def test_one_crl_path_that_cannot_be_keyed_costs_only_its_own_grouping(
 
     def _key(path: str) -> str:
         if path == str(bad):
-            raise RuntimeError("synthetic path-key failure")
+            raise OSError("synthetic path-key failure")
         return real(path)
 
     monkeypatch.setattr("messagefoundry.pipeline.cert_expiry.crl_path_key", _key)

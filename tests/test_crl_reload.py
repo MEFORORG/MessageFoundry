@@ -950,6 +950,10 @@ def test_a_reload_applies_a_replacement_whose_issuer_differs_only_in_ascii_case(
     assert _accepts(hop, pki.server()) is not applies
 
 
+#: A held copy that outlasts any CRL a test puts in a CA file (BACKLOG #3512).
+_NEVER_LAPSES = datetime.datetime.max.replace(tzinfo=datetime.UTC)
+
+
 def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_restarts(
     pki: _Pki,
 ) -> None:
@@ -959,13 +963,17 @@ def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_re
     future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_in_other_case(pki))
     assert (
         _ca_file_crl_refusal(
-            pki.ca_pem + current + future, time.time(), None, ca_file_only=True, may_wait=True
+            pki.ca_pem + current + future,
+            time.time(),
+            None,
+            ca_file_only=True,
+            held_lapse=_NEVER_LAPSES,
         )
         is None
     )
     stray = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_OTHER_CA)
     refusal = _ca_file_crl_refusal(
-        pki.ca_pem + current + stray, time.time(), None, ca_file_only=True, may_wait=True
+        pki.ca_pem + current + stray, time.time(), None, ca_file_only=True, held_lapse=_NEVER_LAPSES
     )
     assert refusal is not None and "not yet in effect" in refusal[0], refusal
 
