@@ -4,8 +4,8 @@
 
 Two parts, shared by the MLLP listener, the HTTP intake listener and the API:
 
-* :class:`HandshakeFailures` is the counter and the throttle, one per listener. It was the MLLP
-  listener's own until #3302 lifted it here. What it throttles, and how, is stated once, in
+* :class:`HandshakeFailures` is the counter and the throttle, one per listener, and the DICOM C-STORE
+  SCP's too since #3784. It was the MLLP listener's own until #3302 lifted it here. What it throttles, and how, is stated once, in
   ``docs/PHI.md`` section 7, row 7 (vault BACKLOG #3785 item 2).
 * :func:`watch_loop_handshakes` sees a failure the EVENT LOOP had, where no listener code runs.
 
@@ -32,15 +32,16 @@ protocol class is replaced.
 * **A handshake past its bound, where the loop runs it. A known limit, declined by owner ruling
   2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
   ``do_handshake`` again, so nothing raises, and a peer that opens sockets and stays silent is not
-  counted there. Where the MLLP listener runs its own handshakes, the stdlib loop, it still counts
-  that case itself. A wrong certificate, a missing client certificate, a protocol downgrade and
+  counted there. Where a listener runs its own handshakes, it still counts that case itself: the
+  MLLP listener on the stdlib loop, and the DICOM SCP always. A wrong certificate, a missing client certificate, a protocol downgrade and
   plaintext on a TLS port all raise, so all are counted.
 * **A peer that hangs up mid-handshake. A known limit, declined by owner ruling 2026-10-26 (vault
   BACKLOG #3785 item 8).** Not counted on any surface, as on MLLP since #2613: that is what a load
   balancer's TCP health check does.
 * **A failure outside ``do_handshake``**, such as one in ``wrap_bio`` itself, and any context driven
-  through ``wrap_socket`` rather than by an event loop, which is how the DICOM SCP runs its
-  handshakes.
+  through ``wrap_socket`` rather than by an event loop. The DICOM SCP drives its handshakes that way,
+  so the hook never sees them; its ``_handshake`` counts them itself, on the connection's thread,
+  and hands each to the loop (vault BACKLOG #3784).
 
 Stdlib only, so the API can import it without pulling in a transport.
 """

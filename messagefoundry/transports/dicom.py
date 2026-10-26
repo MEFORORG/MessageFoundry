@@ -106,6 +106,7 @@ from messagefoundry.parsing.dicom._inflate import (
 from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.redaction import safe_exc
+from messagefoundry.tls_handshake_failures import HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
     REFUSAL_LOG_WINDOW_SECONDS,
@@ -228,6 +229,21 @@ _REFUSAL_LOG_MAX_PER_WINDOW = REFUSAL_LOG_MAX_PER_WINDOW
 #: Why the allowlist refuses a peer. One wording for the accept gate and for the C-STORE backstop.
 _NOT_IN_ALLOWLIST = "peer IP not in source_ip_allowlist"
 
+#: What a blocking server handshake raises when the peer hangs up before finishing it, which is
+#: what a load balancer's TCP health check does. Measured 2026-10-26 on CPython 3.14 for Windows:
+#: a peer that closes raises ``SSLEOFError``, and one that resets raises ``ConnectionResetError``.
+#: The MLLP listener counts none of these either (vault BACKLOG #2613), and the owner ruled on
+#: 2026-10-26 that a mid-handshake hang-up is not counted (vault BACKLOG #3785 item 8).
+#: ``ConnectionAbortedError`` is here too: on a plain socket it is the OS reporting the connection
+#: gone, not a bound this listener set, which is what it means on MLLP.
+_HUNG_UP = (
+    ssl.SSLEOFError,
+    ssl.SSLZeroReturnError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+)
+
 
 def _address_host(client_address: Any) -> str:
     """The host part of a socket peer address, as ``accept()`` returns it. ``"?"`` when there is none."""
@@ -307,11 +323,15 @@ def _admitting_server_class() -> type[Any]:
             *args: Any,
             admit: Callable[[Any], bool],
             refused: Callable[[str, str, str], None],
+            handshake_failed: Callable[[str, str], None],
             stopping: threading.Event,
             **kwargs: Any,
         ) -> None:
             self._admit = admit
             self._refused = refused
+            #: Called on the connection's thread with the peer address and the cause, for each
+            #: handshake :meth:`_handshake` counts as failed (vault BACKLOG #3784).
+            self._handshake_failed = handshake_failed
             #: The SCP's own stop signal, set before it calls shutdown(). shutdown() joins every
             #: connection thread, so a thread inside a handshake has to see this to end early.
             self._stopping = stopping
@@ -426,8 +446,12 @@ def _admitting_server_class() -> type[Any]:
             the next slice resumes it. A ``TimeoutError`` that does carry one is the connection
             itself timing out, and ends the handshake.
 
-            A handshake that fails is logged at DEBUG only. A peer can fail one as often as it can
-            connect, so a line at a higher level would be a way to fill the log."""
+            A handshake that fails is logged at DEBUG with its detail, and handed to
+            ``handshake_failed`` to be counted (vault BACKLOG #3784), as the MLLP listener counts
+            the handshakes it runs itself: a TLS error and the bound count, and so does the
+            connection timing out. A peer that hung up (:data:`_HUNG_UP`) does not, nor does a stop.
+            A peer can fail a handshake as often as it can connect, so the SCP's record is the
+            throttled WARNING that ``docs/PHI.md`` section 7, row 7 states, never a line each."""
             tls: ssl.SSLSocket | None = None
             try:
                 restore = plain.gettimeout()  # None: accept() returns a blocking socket
@@ -459,6 +483,10 @@ def _admitting_server_class() -> type[Any]:
                     _TLS_HANDSHAKE_TIMEOUT,
                     safe_exc(exc),
                 )
+                # A ValueError is a socket this thread could not wrap, not a peer's handshake.
+                counted = isinstance(exc, OSError) and not isinstance(exc, _HUNG_UP)
+                if counted and not self._stopping.is_set():
+                    self._handshake_failed(host, handshake_cause(exc))
             with contextlib.suppress(OSError):
                 (plain if tls is None else tls).close()
             return None
@@ -616,6 +644,11 @@ class DicomScpSource(SourceConnector):
         )
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
         self._ssl = _server_ssl_context(s, name=config.name or "")
+        # Failed inbound TLS handshakes and their throttled WARNING (vault BACKLOG #3784). Before,
+        # a failed one left no record above DEBUG. A log line rather than a connection event: this
+        # SCP emits none, and #3784 adds no event kind. Driven on the loop only; the connection
+        # threads hand a failure over through `_note_tls_failure`.
+        self._tls_failures = HandshakeFailures(self._log_tls_failures)
         # Fail-closed peer controls (SEC-012, deny-by-default; tightened by BACKLOG #316):
         # a non-loopback SCP with no VERIFIABLE peer control is refused at construction. DIMSE has no
         # transport auth of its own, so a remotely-reachable SCP must gate peers by the per-connection
@@ -709,6 +742,7 @@ class DicomScpSource(SourceConnector):
         # shared-resource double-read to gate (accepted only so the runner's call is uniform).
         self._handler = handler
         self._stopping.clear()  # a restart must not inherit the previous stop's cut-short signal
+        self._tls_failures.open()
         self._loop = asyncio.get_running_loop()  # captured ON the loop, before any off-loop work
         # start_server binds a socket + spawns acceptor threads — do it OFF the loop, then it is live.
         await asyncio.to_thread(self._start_server)
@@ -760,6 +794,7 @@ class DicomScpSource(SourceConnector):
             server_class=_admitting_server_class(),
             admit=self._admit_connection,
             refused=self._log_refused_peer,
+            handshake_failed=self._note_tls_failure,
             stopping=self._stopping,
         )
         server.start_serving()
@@ -772,6 +807,32 @@ class DicomScpSource(SourceConnector):
         assert self._server is not None
         port: int = self._server.socket.getsockname()[1]
         return port
+
+    @property
+    def tls_handshake_failures(self) -> int:
+        """Failed inbound TLS handshakes this SCP has seen since it was built, outside its stop()s
+        (vault BACKLOG #3784)."""
+        return self._tls_failures.count
+
+    def _note_tls_failure(self, peer_ip: str, cause: str) -> None:
+        """Hand a failed handshake from a connection thread to the loop, which owns the counter
+        and its timer. Never raises into the connection thread."""
+        loop = self._loop
+        if loop is None:
+            return
+        # A closed loop has no stop() left to report to, so the failure goes with it.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(self._tls_failures.note_soon, peer_ip, cause)
+
+    def _log_tls_failures(self, peer_ip: str | None, reason: str) -> None:
+        """The SCP's record of failed handshakes: a WARNING, throttled by its counter. It names the
+        peer address, a routing-safe identifier, only for a single failure."""
+        logger.warning(
+            "TLS handshake failed on DICOM server (SCP) %s%s: %s",
+            self._ae_title,
+            "" if peer_ip is None else f" from {peer_ip}",
+            reason,
+        )
 
     def _admit_connection(self, client_address: Any) -> bool:
         """Whether a connection the listener has just accepted may go on (vault BACKLOG #2583).
@@ -1193,6 +1254,13 @@ class DicomScpSource(SourceConnector):
             await asyncio.to_thread(server.shutdown)
             self._server = None
         self._ae = None
+        # Report the handshake failures the trailing line still held (vault BACKLOG #3784). Closed
+        # here, not first as the socket listeners close theirs: the connection threads hand a
+        # failure over through the loop, and shutdown() has joined them, so whatever they handed
+        # over before it returned has run by now. `_stopping` already keeps a failure that the stop
+        # caused out of the count.
+        self._tls_failures.close()
+        await self._tls_failures.flush()
 
 
 def _client_ssl_context(

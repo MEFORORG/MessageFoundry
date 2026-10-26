@@ -389,13 +389,21 @@ async def test_a_handshake_that_does_not_finish_is_dropped_at_the_bound(
     async with _running_scp(_tls_settings(tmp_path)) as scp:
         with caplog.at_level(logging.DEBUG, logger=_LOG):
             took = await asyncio.to_thread(_closed_after, scp.sockport, wait=5.0)
-        assert took is not None, "a peer that never starts its handshake must be dropped"
-        # CONTROL on the cause: it was dropped AT the bound, not refused on arrival.
-        assert took >= 0.4, f"closed after {took:.2f}s, before the 0.5s bound"
-        assert scp._server.active_associations == []
-        # A flood of silent sockets must not fill the log: the drop is a DEBUG line, never a WARNING.
-        assert _warnings(caplog) == []
-        assert any("handshake" in r.getMessage() for r in caplog.records)
+            assert took is not None, "a peer that never starts its handshake must be dropped"
+            # CONTROL on the cause: it was dropped AT the bound, not refused on arrival.
+            assert took >= 0.4, f"closed after {took:.2f}s, before the 0.5s bound"
+            assert scp._server.active_associations == []
+            # Vault BACKLOG #3784 CHANGED THIS ON PURPOSE. It asserted no WARNING at all, because a
+            # failed handshake was a DEBUG line only. The SCP runs its own handshakes, and the MLLP
+            # listener counts a handshake that runs past its bound where it runs its own
+            # (tests/test_mllp_tls.py, test_a_failed_handshake_gives_its_slot_back...), so the SCP
+            # counts this one too. A flood still cannot fill the log: the record is throttled.
+            await _until(lambda: scp.tls_handshake_failures == 1)
+        assert _warnings(caplog) == [
+            f"TLS handshake failed on DICOM server (SCP) {_SCP_AE} from 127.0.0.1: 1 failed "
+            "handshake(s) since the last report; last cause TimeoutError"
+        ]
+        assert any("did not complete" in r.getMessage() for r in caplog.records)  # the DEBUG line
 
 
 def _send_a_handshake_slowly(port: int, *, gap: float, give_up: float) -> float | None:
@@ -595,6 +603,97 @@ async def test_an_mtls_listener_still_refuses_a_peer_with_no_client_certificate(
         )
         assert established is False, "mTLS must still require a client certificate"
         assert captured == []
+
+
+# --- A failed handshake leaves a record above DEBUG (vault BACKLOG #3784) -------------------------
+
+
+_PLAINTEXT = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+
+
+def _send_plaintext(port: int) -> None:
+    """Send plaintext where a ClientHello belongs, then wait for the SCP to drop the socket."""
+    with socket.create_connection(("127.0.0.1", port), timeout=5.0) as sock:
+        sock.sendall(_PLAINTEXT)
+        with contextlib.suppress(OSError):
+            while sock.recv(1024):
+                pass
+
+
+def _hang_up(port: int) -> None:
+    """Connect and close at once, as a load balancer's TCP health check does."""
+    socket.create_connection(("127.0.0.1", port), timeout=5.0).close()
+
+
+def _refuse_the_certificate(port: int) -> bool:
+    """A client that does not trust the SCP's certificate, so the SCP's handshake fails on its
+    alert. True when the client refused, as it must."""
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # stated floor; see _unverified_client_context
+    with socket.create_connection(("127.0.0.1", port), timeout=5.0) as raw:
+        try:
+            with ctx.wrap_socket(raw, server_hostname="127.0.0.1"):
+                return False
+        except ssl.SSLCertVerificationError:
+            return True
+
+
+def _handshake_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [m for m in _warnings(caplog) if m.startswith("TLS handshake failed on DICOM")]
+
+
+async def test_a_failed_handshake_on_the_scp_is_counted_and_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Before #3784 a failed handshake on the SCP was a DEBUG line and nothing else. Now it is
+    counted and written as a throttled WARNING: the first at once, and a second inside the window
+    held and logged at stop(). Each line holds one failure, so each names its peer. A completed
+    handshake, and a peer that hangs up, are the controls; the client in the first one closes as
+    soon as it finishes, which the SCP's side can see as an aborted connection, also not counted."""
+    captured: list[bytes] = []
+    scp = _build_scp(captured, **_tls_settings(tmp_path))
+
+    async def handler(data: bytes) -> str | None:
+        captured.append(data)
+        return "mid-1"
+
+    with caplog.at_level(logging.DEBUG, logger=_LOG):
+        await scp.start(handler)
+        try:
+            port = scp.sockport
+            # The control: a completed handshake is no failure.
+            completed, _ = await asyncio.to_thread(_tls_handshake, port, budget=5.0)
+            assert completed
+            # The second control: a peer that hangs up mid-handshake is not counted (owner ruling
+            # 2026-10-26, vault BACKLOG #3785 item 8), as on MLLP.
+            await asyncio.to_thread(_hang_up, port)
+            await _until(lambda: _handshakes_in_flight(scp) == 0)
+            await asyncio.sleep(0.2)  # a counted failure would reach the loop well inside this
+            assert scp.tls_handshake_failures == 0
+            assert _handshake_lines(caplog) == []
+
+            await asyncio.to_thread(_send_plaintext, port)
+            await _until(lambda: scp.tls_handshake_failures == 1)
+            assert _handshake_lines(caplog) == [
+                f"TLS handshake failed on DICOM server (SCP) {_SCP_AE} from 127.0.0.1: 1 failed "
+                "handshake(s) since the last report; last cause SSLError HTTP_REQUEST"
+            ]
+
+            # A client refusing the SCP's certificate fails the SCP's handshake too. Inside the
+            # window it is counted and held.
+            assert await asyncio.to_thread(_refuse_the_certificate, port)
+            await _until(lambda: scp.tls_handshake_failures == 2)
+            assert len(_handshake_lines(caplog)) == 1
+        finally:
+            await scp.stop()
+    lines = _handshake_lines(caplog)
+    assert len(lines) == 2
+    assert lines[1] == (
+        f"TLS handshake failed on DICOM server (SCP) {_SCP_AE} from 127.0.0.1: 1 failed "
+        "handshake(s) since the last report; last cause SSLError TLSV1_ALERT_UNKNOWN_CA"
+    )
+    assert all("GET" not in line for line in lines)  # a cause, never the peer's bytes
+    assert captured == []
 
 
 # --- The pins ------------------------------------------------------------------------------------
