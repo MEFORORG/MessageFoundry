@@ -35,6 +35,7 @@ from pathlib import Path
 import pytest
 
 import messagefoundry.service as svc
+import messagefoundry.service_status as svc_status
 
 _INSTALL_SERVICE = svc.install_script_path()
 _DIR = _INSTALL_SERVICE.parent if _INSTALL_SERVICE is not None else None
@@ -98,7 +99,8 @@ foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1')) {{
     # Bind the REAL declaration, lifted verbatim out of the script's own param block.
     foreach ($probe in @(
         @{{ key = 'spaced'; value = 'MessageFoundry Prod' }},
-        @{{ key = 'quoted'; value = "MessageFoundry'" }})) {{
+        @{{ key = 'quoted'; value = "MessageFoundry'" }},
+        @{{ key = 'trailing_lf'; value = "MessageFoundry`n" }})) {{
       $sb = [scriptblock]::Create("param($($p.Extent.Text))`n`$$pname")
       $splat = @{{ $pname = $probe.value }}
       try {{ $null = & $sb @splat; $row[$probe.key] = $true }}
@@ -247,7 +249,7 @@ def test_the_uninstaller_releases_the_address_only_when_asked(
 def test_both_scripts_take_the_same_service_names(ast_report: dict[str, object]) -> None:
     """Whatever the installer will accept as a service name, the uninstaller must accept too.
 
-    ONE DEFINITION, ``messagefoundry/service.py``'s ``_SAFE_SERVICE_NAME``, and two literal copies of
+    ONE DEFINITION, ``messagefoundry/service_status.py``'s ``_SAFE_SERVICE_NAME``, and two literal copies of
     it in ``param()`` blocks. The copies cannot be dot-sourced away: a PowerShell attribute argument
     must be a compile-time constant, and ``[ValidatePattern($pattern)]`` is refused at parse with
     *"Attribute argument must be a constant or a script block"*. So the copies are pinned here
@@ -265,7 +267,7 @@ def test_both_scripts_take_the_same_service_names(ast_report: dict[str, object])
     """
     rows = ast_report["service_names"]
     assert isinstance(rows, dict)
-    expected = svc._SAFE_SERVICE_NAME.pattern
+    expected = svc_status._SAFE_SERVICE_NAME.pattern
     assert set(rows) == {
         "install-net-helper.ps1::ServiceName",
         "install-net-helper.ps1::EngineServiceName",
@@ -277,7 +279,7 @@ def test_both_scripts_take_the_same_service_names(ast_report: dict[str, object])
     for key, row in sorted(rows.items()):
         assert isinstance(row, dict)
         assert row["pattern"] == expected, (
-            f"{key} validates against {row['pattern']!r}, not messagefoundry/service.py's "
+            f"{key} validates against {row['pattern']!r}, not messagefoundry/service_status.py's "
             f"_SAFE_SERVICE_NAME ({expected!r}). Both scripts must take the same names: a helper "
             "installed under a name one of them rejects cannot be removed by the other."
         )
@@ -289,6 +291,10 @@ def test_both_scripts_take_the_same_service_names(ast_report: dict[str, object])
             f"CONTROL FAILED: {key} accepts a single quote. The name is interpolated into a WQL "
             "filter, where a quote ends the literal -- and an unvalidated parameter would pass the "
             "space assertion above for the wrong reason."
+        )
+        assert row["trailing_lf"] is False, (
+            f"{key} accepts a name ending in a line feed. `$` matches before a final line feed in "
+            ".NET as in Python, so the pattern must end in `\\z` (BACKLOG #1680)."
         )
 
 

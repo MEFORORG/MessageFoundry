@@ -1279,7 +1279,8 @@ if (-not $Environment) {
     throw ("specify the active environment with -Environment <name> (e.g. -Environment prod). It " +
         "selects environments/<name>.toml and the instance's PHI posture (ADR 0017).")
 }
-if ($Environment -notmatch '^[A-Za-z0-9._-]+$') {
+# `\z`, not `$`: `$` also matches before a trailing line feed (BACKLOG #1680).
+if ($Environment -notmatch '^[A-Za-z0-9._-]+\z') {
     throw ("invalid -Environment '$Environment': use letters, digits, '.', '_' or '-' (it selects " +
         "environments/<name>.toml).")
 }

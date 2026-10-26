@@ -42,7 +42,12 @@ ServiceState = str
 # never reach the subprocess as anything but a plain service name (defense-in-depth; mirrors the
 # console's elevated-path guard). The name MUST start with an alphanumeric — so a leading '-'/space
 # (which `sc` could read as a token) or a whitespace-only name is rejected outright.
-_SAFE_SERVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+#
+# This is the ONE service-name guard; messagefoundry.service imports it (BACKLOG #1680). It is
+# applied with `fullmatch` and ends in `\z`, never `$`, which also matches before a trailing line
+# feed. `\z` also lets the text be pinned verbatim into the net-helper scripts' ValidatePattern
+# (tests/test_net_helper_install_scripts.py), because .NET reads it as the absolute end too.
+_SAFE_SERVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*\z")
 
 
 # ``ctypes.windll`` is Windows-only; probed by getattr so this module still imports and type-checks
@@ -94,7 +99,7 @@ _NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def is_safe_service_name(name: str) -> bool:
     """True iff ``name`` is a non-empty, plain Windows service name (no shell metacharacters)."""
-    return bool(name) and bool(_SAFE_SERVICE_NAME.match(name))
+    return _SAFE_SERVICE_NAME.fullmatch(name) is not None
 
 
 # `sc query` prints one field per line, and the run state is the STATE field, whose value is the

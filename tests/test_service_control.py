@@ -296,7 +296,9 @@ def test_install_params_rejects_unsafe_paths(bad: str, field: str) -> None:
         _install_params("script.ps1", "dev", config=config, service_config=service_config)
 
 
-@pytest.mark.parametrize("bad", [";", "&", '"', "a b", "$x", "`", "a/b", "a\\b", "a&b", ""])
+@pytest.mark.parametrize(
+    "bad", [";", "&", '"', "a b", "$x", "`", "a/b", "a\\b", "a&b", "", "dev\n", "dev\r\n", "\ndev"]
+)
 def test_install_params_rejects_unsafe_environment(bad: str) -> None:
     """The env name is interpolated into an elevated PowerShell line — reject shell metacharacters."""
     with pytest.raises(ValueError, match="unsafe environment name"):
@@ -318,6 +320,32 @@ def test_control_service_rejects_unsafe_name_before_platform_check(
 def test_control_service_rejects_unsafe_names(bad: str) -> None:
     with pytest.raises(ValueError, match="unsafe service name"):
         control_service("start", bad)
+
+
+# BACKLOG #1680: names the one guard refuses by their first character or by a trailing line feed,
+# which `$` with `.match` used to admit. control_service_ex's are in test_service_control_outcome.
+_EDGE_NAMES = [" MyEngine", ".MyEngine", "-MyEngine", "MyEngine\n", "My Engine\n", "MyEngine\r\n"]
+
+
+def test_service_uses_the_one_guard_from_service_status() -> None:
+    """No second copy to drift: service.py imports the sibling's guard."""
+    assert service_control.is_safe_service_name is service_status.is_safe_service_name
+    assert not hasattr(service_control, "_is_safe_service_name")
+
+
+@pytest.mark.parametrize("bad", _EDGE_NAMES)
+def test_control_service_refuses_edge_names(bad: str) -> None:
+    with pytest.raises(ValueError, match="unsafe service name"):
+        control_service("restart", bad)
+
+
+@pytest.mark.parametrize("bad", _EDGE_NAMES)
+def test_service_state_refuses_edge_names_without_running_sc(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    run = _fake_sc_query(monkeypatch)
+    assert service_state(bad) == "unavailable"
+    assert run.args == []
 
 
 def test_control_service_off_windows_returns_false_without_dispatch(
@@ -394,7 +422,7 @@ def test_is_safe_environment_accepts_valid(name: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "name", ["", "a b", "a;b", "a&b", 'a"b', "a/b", "a\\b", "a$b", "a`b", "a|b"]
+    "name", ["", "a b", "a;b", "a&b", 'a"b', "a/b", "a\\b", "a$b", "a`b", "a|b", "dev\n", "dev\r\n"]
 )
 def test_is_safe_environment_rejects_invalid(name: str) -> None:
     assert is_safe_environment(name) is False
