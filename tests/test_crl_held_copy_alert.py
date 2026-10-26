@@ -75,10 +75,12 @@ class _Ca:
         starts_in_days: float = 0.0,
         key: ec.EllipticCurvePrivateKey | None = None,
         delta: bool = False,
+        names_key: bool = False,
     ) -> bytes:
         """A CRL naming this CA, revoking nothing, whose nextUpdate is ``days`` from now. It takes
         effect ``starts_in_days`` from now, is signed by ``key`` in place of the CA's own, and is a
-        delta CRL when ``delta`` (the last three for BACKLOG #3176)."""
+        delta CRL when ``delta`` (those three for BACKLOG #3176). With ``names_key`` its authority
+        key identifier names this CA's key, whoever signed it (BACKLOG #3512)."""
         now = datetime.datetime.now(datetime.UTC)
         builder = (
             x509.CertificateRevocationListBuilder()
@@ -93,6 +95,9 @@ class _Ca:
         )
         if delta:
             builder = builder.add_extension(x509.DeltaCRLIndicator(number - 1), True)
+        if names_key:
+            akid = x509.AuthorityKeyIdentifier.from_issuer_public_key(self.key.public_key())
+            builder = builder.add_extension(akid, False)
         crl = builder.sign(key or self.key, hashes.SHA256())
         return crl.public_bytes(serialization.Encoding.PEM)
 
@@ -102,11 +107,13 @@ def ca() -> _Ca:
     return _another_ca("mefor-2319-ca")
 
 
-def _another_ca(cn: str = "mefor-2319-other-ca") -> _Ca:
+def _another_ca(cn: str = "mefor-2319-other-ca", *, ski: bool = False) -> _Ca:
+    """A self-signed CA. With ``ski`` it carries a Subject Key Identifier, which a CRL must match
+    for the engine to prove its signature bad (BACKLOG #3512)."""
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     now = datetime.datetime.now(datetime.UTC)
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(name)
         .issuer_name(name)
@@ -115,8 +122,12 @@ def _another_ca(cn: str = "mefor-2319-other-ca") -> _Ca:
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=400))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .sign(key, hashes.SHA256())
     )
+    if ski:
+        builder = builder.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False
+        )
+    cert = builder.sign(key, hashes.SHA256())
     return _Ca(key, name, cert.public_bytes(serialization.Encoding.PEM))
 
 
@@ -618,15 +629,38 @@ def test_a_not_yet_valid_crl_put_in_the_ca_file_is_not_answered_with_a_restart(
 
 
 def test_a_badly_signed_crl_put_in_the_ca_file_is_not_answered_with_a_restart(
-    ca: _Ca, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
-    # The CRL names this CA but another key signed it. OpenSSL checks that only at the handshake,
-    # so a restart loads it and then every handshake it judges fails. Before the fix: "Restart".
-    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3, key=_another_ca().key))
+    # The CRL names this CA's key but another key signed it: the proven case, state ``bad``.
+    # OpenSSL checks that only at the handshake, so a restart loads it and then every handshake it
+    # judges fails. Before #3176: "Restart". The CA carries the key identifier the CRL names.
+    ca = _another_ca("mefor-3512-ca", ski=True)
+    forged = ca.crl(days=90, number=3, key=_another_ca().key, names_key=True)
+    hop, bundle = _replaced_bundle(ca, tmp_path, forged)
 
     detail = _bundle_detail(bundle)
 
     assert detail.startswith("Replace the CRL in the CA file with one its CA signed")
+    assert "every handshake it judges would fail" in detail
+    assert "Restart the engine" not in detail
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_ca_file_crl_from_a_renewed_ca_key_is_unconfirmed_not_failing(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # BACKLOG #3512: the CA renewed its key under the same name, and the CRL, which carries no key
+    # identifier, was signed by the old key. That is state ``unproven``, and handshakes can still
+    # pass (docs/CONFIGURATION.md). Before the fix the remedy said "every handshake it judges would
+    # fail" for it, as for a proven bad signature.
+    old_key = ec.generate_private_key(ec.SECP256R1())
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3, key=old_key))
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith("Check that the CRL in the CA file is one its CA signed")
+    assert "could not confirm" in detail
+    assert "where that key did not sign it, every handshake" in detail
     assert "Restart the engine" not in detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
@@ -698,8 +732,11 @@ def test_control_a_good_crl_from_an_issuer_the_ca_file_does_not_list_still_resta
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
-def _shared_as_crl_and_ca_file(ca: _Ca, tmp_path: Path) -> tuple[list[ssl.SSLContext], Path]:
-    """One file that hop A loads as its CRL setting and hop B as its CA file, then refreshed."""
+def _shared_as_crl_and_ca_file(
+    ca: _Ca, tmp_path: Path, new_crl: bytes | None = None
+) -> tuple[list[ssl.SSLContext], Path]:
+    """One file that hop A loads as its CRL setting and hop B as its CA file, then refreshed with
+    ``new_crl``, by default a good one."""
     ca_file = tmp_path / "ca.pem"
     ca_file.write_bytes(ca.pem)
     both = tmp_path / "ca-and-crl.pem"
@@ -707,7 +744,7 @@ def _shared_as_crl_and_ca_file(ca: _Ca, tmp_path: Path) -> tuple[list[ssl.SSLCon
     crl = tmp_path / "crl.pem"
     crl.write_bytes(ca.crl(days=90, number=2))
     hops = [_hop(ca_file, both), _hop(both, crl)]
-    both.write_bytes(ca.pem + ca.crl(days=80, number=3))
+    both.write_bytes(ca.pem + (new_crl or ca.crl(days=80, number=3)))
     return hops, both
 
 
@@ -773,6 +810,26 @@ def test_a_refusal_that_already_says_restart_gets_no_second_restart(
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
+def test_a_refused_reload_keeps_its_reason_beside_a_ca_file_fix(ca: _Ca, tmp_path: Path) -> None:
+    # BACKLOG #3512: the CA-file arm outranked a recorded refusal and dropped the reload's remedy
+    # and reason. The CA-file fix still leads, because a refusal's remedy can be a restart, which
+    # would load this CRL into the CA-file hop unjudged.
+    hops, both = _shared_as_crl_and_ca_file(
+        ca, tmp_path, ca.crl(days=90, number=3, starts_in_days=2)
+    )
+    remedy = "Restart the engine to apply the file"
+    reason = "synthetic reload reason"
+    record_reload_refusal(both, ReloadRefusal(crl_fingerprint(both.read_bytes()), reason, remedy))
+    try:
+        detail = _row_detail(both)
+    finally:
+        clear_reload_refusal(both)
+
+    assert detail.startswith("Replace the CRL in the CA file with one in effect now, or wait")
+    assert f": {remedy}. Reason: {reason}. Held by: " in detail
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
+
+
 # --- BACKLOG #3176: a failure grouping the rows, or recording a CA-file CRL -------------------------
 
 
@@ -803,6 +860,33 @@ def test_a_failure_grouping_the_crl_rows_costs_only_the_shared_rows_note(
     assert sink.crl_notes == [(False, "", ())]
     errors = [r for r in caplog.records if "could not group the CRL rows" in r.getMessage()]
     assert len(errors) == 1
+
+
+def test_a_failure_keying_a_crl_path_costs_only_the_shared_rows_note(
+    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # BACKLOG #3512: the grouping's guard cannot help when crl_path_key itself raises, because the
+    # alert's shared_with keys the path again inside the guard around the sink. Before the fix the
+    # row's alert was lost under a "crl_expiry alert sink failed" line.
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=5.5, number=1))
+
+    def _broken(path: object) -> str:
+        raise RuntimeError("synthetic path-key failure")
+
+    monkeypatch.setattr("messagefoundry.pipeline.cert_expiry.crl_path_key", _broken)
+    rows = [MonitoredCert("tls.crl_file", str(crl), kind="crl")]
+    sink = _RecordingSink()
+    runner = CertExpiryRunner(lambda: rows, CertMonitorSettings(warn_days=500), alert_sink=sink)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.cert_expiry"):
+        runner.run_once(now=time.time())
+
+    assert [c[0] for c in sink.crl_calls] == ["tls.crl_file"]
+    assert sink.crl_notes == [(False, "", ())]
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("alert sink failed" in m for m in messages), messages
+    assert sum("could not group the CRL rows" in m for m in messages) == 1, messages
 
 
 def test_a_failure_recording_a_ca_file_crl_is_logged_as_a_defect_not_a_bad_crl(
