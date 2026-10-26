@@ -110,6 +110,7 @@ tests/test_coord_cloud_refusal.py
 tests/test_coord_handoff_clear.py
 tests/test_coord_handoff_pointer.py
 tests/test_coord_handoff_report.py
+tests/test_coord_lane_no_ceiling.py
 tests/test_coord_lane_statement.py
 tests/test_coord_lock.py
 tests/test_coord_migrate.py
