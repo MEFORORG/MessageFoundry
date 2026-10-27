@@ -629,8 +629,9 @@ def build_site(site: str, kit: Kit, seen: list[GateCall]) -> tuple[ssl.SSLContex
     """Run the site's real builder; return the one context it handed the gate, and what it built.
 
     The call must come from the site the key names, file and function, and with the key's connector
-    when that is a literal, else the label :data:`_PASSED_LABELS` gives it. Otherwise a factory that reaches the gate through another function (a builder delegating to a
-    sibling), or another arm of the same one, would be filed under a site it never measured."""
+    when that is a literal, else the label :data:`_PASSED_LABELS` gives it. Otherwise a factory
+    that reaches the gate through another function (a builder delegating to a sibling), or another
+    arm of the same one, would be filed under a site it never measured."""
     built = _SITES[site](kit)
     assert len(seen) == 1, f"{site}: the gate saw {len(seen)} contexts, expected exactly one"
     call = seen[0]

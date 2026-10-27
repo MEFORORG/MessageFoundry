@@ -626,7 +626,8 @@ def _mllp_ssl_context(
 
     ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142),
     and for the TLS refusal labels below (vault BACKLOG #3514), as the DICOM destination's suite
-    refusal does. The DICOM listener's labels and the DICOM destination's pin refusal do not yet.
+    refusal does. Not every refusal names it yet: at least a certificate or key load failure here,
+    the DICOM listener's labels and the DICOM destination's pin refusal do not.
     ``listener_family`` names the listener in those labels: the inbound HTTP listener builds its
     context here too, and passes its own."""
     refuse_an_unread_ca_pin(
@@ -684,8 +685,9 @@ def _mllp_ssl_context(
     verify = bool_setting(s, "tls_verify", default=True)
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
-            "MLLP tls_verify=false disables server-certificate verification (MITM risk). Use a trusted "
-            f"CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+            f"{_tls_label('MLLP destination', name)}: tls_verify=false disables server-certificate "
+            "verification (MITM risk). Use a trusted CA (tls_ca_file), or set "
+            f"{INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
             "[security].enforcement = warn to allow it on a trusted-network bind (the escape has no "
             "effect while enforcing, the default, or with no posture)."
         )

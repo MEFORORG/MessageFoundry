@@ -768,7 +768,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="import a PKCS#12/.pfx bundle into cert.pem / key.pem / ca-chain.pem. The passphrase is "
         "read ONLY from MEFOR_PFX_PASSWORD (never a CLI arg); key.pem is written owner-only (mode 0600 "
         "on POSIX, a restrictive access list on Windows). It refuses to overwrite an existing "
-        "cert.pem, key.pem or ca-chain.pem, and removes the files it wrote if one cannot be written",
+        "cert.pem, key.pem or ca-chain.pem, refuses a directory holding a ca-chain.pem when the "
+        "bundle carries no CA, since that chain would not chain the new key, and removes the files "
+        "it wrote if one cannot be written",
     )
     cert_import.add_argument(
         "--pfx", required=True, help="path to the PKCS#12/.pfx bundle to import"
@@ -815,8 +817,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "chain of trust: better than cleartext, worse than an operator-supplied chain, so replace "
         "it); key.pem is written owner-only (mode 0600 on POSIX, a restrictive access list on "
         "Windows). It refuses to overwrite an existing cert.pem or key.pem, refuses a directory "
-        "holding a ca-chain.pem, which would not chain the new key, and removes the key it wrote if "
-        "cert.pem cannot be written",
+        "holding a ca-chain.pem, which would not chain the new key, and removes the files it wrote "
+        "if one cannot be written",
     )
     cert_self_signed.add_argument(
         "--cn",
@@ -6007,8 +6009,9 @@ def _refusal_for_existing(files: list[tuple[Path, str]]) -> str | None:
 def _refuse_a_stale_ca_chain(ca_path: Path, verb: str, why: str) -> str | None:
     """The refusal for a run that writes no ca-chain.pem into a directory that holds one, else
     ``None``. That chain would sit beside a key it does not chain (vault BACKLOG #3514). ``why``
-    is the sentence saying why this run has no chain to write."""
-    if not ca_path.exists():
+    is the sentence saying why this run has no chain to write. A dangling link at that name is
+    refused too, rather than read as absent."""
+    if not (ca_path.is_symlink() or ca_path.exists()):
         return None
     return (
         f"refusing to {verb} beside an existing CA chain file: {ca_path}. {why}, so that chain "
@@ -6397,8 +6400,8 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
 
     Writes cert.pem + key.pem to ``--out-dir``. It refuses an existing cert.pem, key.pem or
     ca-chain.pem before it mints, and both writes are exclusive, so a file that appears meanwhile
-    is still never replaced. If cert.pem is not written, the files this run wrote are removed, and the failure
-    line names any it could not remove. Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
+    is still never replaced. If cert.pem is not written, the files this run wrote are removed,
+    and the failure line names any it could not remove. Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
 
     if args.days <= 0:

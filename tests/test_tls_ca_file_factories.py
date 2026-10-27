@@ -518,6 +518,14 @@ def test_an_unread_mllp_ca_pin_refusal_names_the_connection() -> None:
         mllp._mllp_ssl_context(settings, server=False, name="OB_MLLP")
 
 
+def test_an_mllp_verify_off_refusal_names_the_connection() -> None:
+    """Vault BACKLOG #3514 item 1. The ``tls_verify=false`` refusal names the connection too. With
+    no posture stamped, the escape is refused (vault BACKLOG #2354), so the refusal fires here."""
+    settings = {"tls": True, "host": "mllp.internal.example.org", "tls_verify": False}
+    with pytest.raises(ValueError, match=r"^MLLP destination 'OB_MLLP': tls_verify=false disables"):
+        mllp._mllp_ssl_context(settings, server=False, name="OB_MLLP")
+
+
 def test_an_http_listener_refusal_names_its_own_family(tmp_path: Path) -> None:
     """The inbound HTTP listener builds its context through the MLLP builder. Built the way the
     runner builds it, a refusal names it an HTTP listener, not an MLLP one, with its connection."""

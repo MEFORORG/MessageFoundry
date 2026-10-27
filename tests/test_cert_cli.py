@@ -916,6 +916,26 @@ def test_self_signed_refuses_beside_an_existing_ca_chain(
     assert sorted(p.name for p in out.iterdir()) == ["ca-chain.pem"]
 
 
+def test_self_signed_refuses_beside_a_dangling_ca_chain_link(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ca-chain.pem that is a link to nothing is not absent: it is refused, as a file is.
+
+    Mutation: test the name with ``exists()`` alone. Red: rc 0, minted beside the link."""
+    out = tmp_path / "o"
+    out.mkdir()
+    try:
+        (out / "ca-chain.pem").symlink_to(tmp_path / "gone.pem")
+    except OSError as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+
+    rc = main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
+    assert rc == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("refusing to mint beside an existing CA chain file"), error
+    assert sorted(p.name for p in out.iterdir()) == ["ca-chain.pem"]
+
+
 def _cert_open_dies_midway(monkeypatch: pytest.MonkeyPatch, name: str = "cert.pem") -> None:
     real_open = Path.open
 
