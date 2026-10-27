@@ -41,7 +41,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 #: Distributions this repository builds that are **not yet published to any index**. Until a name is
 #: claimed, no shipped text may tell a user to install it by bare name.
 #:
-#: All four distributions this repo builds are registered on PyPI, so the set is empty. An empty set
+#: Every distribution this repo builds is registered on PyPI, so the set is empty. An empty set
 #: is the goal state, not a disabled guard. `messagefoundry-webconsole` was claimed 2026-07-29 by the
 #: first `webconsole-v*` release, closing the ASVS 15.2.4 exposure where README.md instructed an index
 #: install of an unclaimed name.
