@@ -737,6 +737,35 @@ Tests: [`tests/test_worktree_hygiene_report.py`](../tests/test_worktree_hygiene_
 parse the script and fail on any git verb outside a read-only list, with a positive control. They
 also drive it against a temp repository with a fake gh.
 
+## A seat locks its worktree on arrival, and unlocks it on a clean exit
+
+BACKLOG #2524. A Claude Desktop instance's worktree GC (`[reapUntrackedWorktreeDir]`) runs
+`git worktree remove --force` on another instance's worktree when it looks quiet and clean. On
+Windows that empties and deregisters a folder a live session still holds. The GC keeps a worktree
+whose admin directory holds a `locked` file, and so do `prune-merged.ps1`, `claim-reconcile.ps1`
+and `hygiene-report.ps1`'s removal list.
+
+So `seat.ps1` runs `git worktree lock --reason "<seat> <session id>"` on the session's worktree. It
+does so on the SessionStart `-Prompt` path, with the seat `undeclared`, and again on `-Declare`,
+which relabels the same session's lock in place. `seat.ps1 -Close` and the SessionEnd hook
+[`seat-unlock.ps1`](../scripts/hooks/seat-unlock.ps1) unlock it. They remove only a seat lock that
+names their own session id. The rules are in
+[`seat-lock.ps1`](../scripts/worktree/seat-lock.ps1):
+
+- Another holder's lock is kept. Claude Code locks an `isolation: worktree` agent's tree while it
+  runs, and that reason reads `claude agent <name> (pid <n>)`.
+- A seat lock whose session reads DEAD or STALE, or has no registry record, is taken over by the
+  seat that arrives there. It is rewritten in place, so the tree is never unlocked in between.
+- The primary checkout is skipped, because git refuses to lock it. A cloud session is skipped too.
+
+A session that dies without unlocking leaves its tree locked, and every reclaimer then keeps it.
+`hygiene-report.ps1` lists those locks in section e, with a `git worktree unlock` command for each.
+"No registry record" cannot tell an exited session from one that never registered, so check it first.
+`remove.ps1` and `prune-merged.ps1` refusing a locked tree is the intended effect. Unlock it first
+when you mean to remove it.
+
+Tests: [`tests/test_seat_worktree_lock.py`](../tests/test_seat_worktree_lock.py).
+
 ## A PR-state cache for read-only panes — `pr_state.py`
 
 One poller per PC writes the open pull requests and the merge queue to one file. A fleet pane reads

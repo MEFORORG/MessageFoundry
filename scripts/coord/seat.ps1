@@ -1150,6 +1150,35 @@ try {
         }
     }
 
+    # ------------------------------------------------------------ the worktree lock (BACKLOG #2524)
+    # ARRIVAL LOCKS THE WORKTREE, A CLEAN EXIT UNLOCKS IT. A Claude Desktop instance's worktree GC
+    # empties and deregisters another instance's quiet, clean worktree with its session still inside,
+    # and it keeps any tree that carries a `locked` file. -Prompt is the SessionStart path, so every
+    # session is covered before it declares; -Declare relabels the lock with the declared seat; -Close
+    # releases it. The rules (another holder's lock is kept, the primary and a cloud VM are skipped)
+    # are scripts/worktree/seat-lock.ps1's. Rule 2 above: a failure here is recorded, never thrown.
+    # A copy of this script with no seat-lock.ps1 beside it (a test sandbox that copies seat.ps1
+    # alone) says so on the CLI paths and records nothing: the lock is not this record's to fail.
+    # The line is printed AFTER `wrote <path>`, which callers parse as stdout's first line.
+    $lockLine = ''
+    $lockLib = Join-Path (Split-Path -Parent $PSScriptRoot) 'worktree\seat-lock.ps1'
+    if (($Declare -or $Prompt -or $Close) -and -not (Test-Path -LiteralPath $lockLib -PathType Leaf)) {
+        $lockLine = 'worktree lock: not attempted (scripts/worktree/seat-lock.ps1 is missing beside this script)'
+    }
+    elseif ($Declare -or $Prompt -or $Close) {
+        try {
+            . $lockLib
+            $lock = if ($Close) { Remove-SeatWorktreeLock -Worktree $wt -SessionKey $sk.Key }
+                    else { Set-SeatWorktreeLock -Worktree $wt -Seat ([string]$rec.seat) -SessionKey $sk.Key }
+            if ($lock.Action -eq 'failed') { Write-WriterError -Stage 'worktree-lock' -Message $lock.Detail }
+            $lockLine = "worktree lock: $($lock.Action)$(if ($lock.Detail) { " ($($lock.Detail))" })"
+        }
+        catch {
+            Write-WriterError -Stage 'worktree-lock' -Message $_.Exception.Message
+            $lockLine = "worktree lock: failed ($($_.Exception.Message))"
+        }
+    }
+
     # Said AFTER the write, so the declaration is safely recorded before anything is said about it.
     # Not gated on -Record/-Prompt: a retired seat arriving through a hook is the same defect as one
     # typed at the CLI, and the whole point is that no path stays silent about it.
@@ -1164,7 +1193,10 @@ try {
 
     # -Prompt is a hook path like -Record: it must not narrate into a session's context. What the
     # session should SEE is the prompt itself, and that is the hook's line to write, not this one's.
-    if (-not $Record -and -not $Prompt) { Write-Host "wrote $recPath" }
+    if (-not $Record -and -not $Prompt) {
+        Write-Host "wrote $recPath"
+        if ($lockLine) { Write-Host $lockLine }
+    }
 } catch {
     Write-WriterError -Stage 'main' -Message $_.Exception.Message
     Write-Error "seat.ps1: $($_.Exception.Message)" -EA Continue

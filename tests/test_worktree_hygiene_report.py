@@ -151,6 +151,7 @@ def _violations(path: Path) -> list[str]:
 DOT_SOURCED = (
     ROOT / "scripts" / "coord" / "occupancy.ps1",
     ROOT / "scripts" / "coord" / "session-registry.ps1",
+    ROOT / "scripts" / "worktree" / "worktree-audit.ps1",
 )
 
 
@@ -568,6 +569,59 @@ def test_a_dead_session_record_in_a_worktree_holds_it_back(fx: Fx) -> None:
     assert any("session record" in r for r in rows["repo-m-venv"]["reasons"])
     assert rows["repo-m-clean"]["verdict"] == "REMOVE"
     assert (fx.out / "last-run.txt").read_text(encoding="utf-8").startswith("OK ")
+
+
+def test_seat_locks_whose_session_is_gone_are_listed_and_left_locked(fx: Fx, sleeper: int) -> None:
+    """BACKLOG #2524: a seat that died keeps its lock, and every reclaimer then keeps the tree.
+
+    Only a SEAT lock (``<seat> <session id>``) whose session is gone is listed. A live seat's lock,
+    Claude Code's own agent lock and a hand-written two-word lock are each a control that must not be.
+    """
+    gone, dead, live = (
+        "aaaaaaaa-0000-0000-0000-000000000001",
+        "aaaaaaaa-0000-0000-0000-000000000002",
+        "aaaaaaaa-0000-0000-0000-000000000003",
+    )
+    elsewhere = str(fx.root / "elsewhere")
+    sessions = fx.cfg / "sessions"
+    (sessions / "999997.json").write_text(
+        json.dumps({"pid": 999997, "sessionId": dead, "cwd": elsewhere}), encoding="utf-8"
+    )
+    (sessions / f"{sleeper}.json").write_text(
+        json.dumps(
+            {
+                "pid": sleeper,
+                "sessionId": live,
+                "cwd": elsewhere,
+                "startedAt": int(time.time() * 1000),
+            }
+        ),
+        encoding="utf-8",
+    )
+    locks = {
+        "wip": f"builder {gone}",
+        "m-unpushed": f"manager {dead}",
+        "m-dirty": f"lander {live}",
+        "m-fork": "claude agent agent-x (pid 4242)",
+        "m-stacked": "manual hold",
+    }
+    for slug, reason in locks.items():
+        _git(fx.primary, "worktree", "lock", "--reason", reason, str(fx.paths[slug]))
+
+    proc = _run(fx, "-SkipGh", "-SkipFetch")
+    assert proc.returncode == 0, proc.stderr
+    stale = {Path(s["path"]).name: s for s in _report(fx)["clones"][0]["staleSeatLocks"]}
+    assert set(stale) == {"repo-wip", "repo-m-unpushed"}, stale
+    assert stale["repo-wip"]["state"] == "NO RECORD"
+    assert stale["repo-m-unpushed"]["state"] == "DEAD"
+    assert stale["repo-wip"]["command"].endswith(f"worktree unlock '{fx.paths['wip'].as_posix()}'")
+    md = (fx.out / "latest.md").read_text(encoding="utf-8")
+    assert "### e. Seat locks whose session is gone (2)" in md
+
+    # Listed, never unlocked: every lock is still in place.
+    listed = _git(fx.primary, "worktree", "list", "--porcelain")
+    for reason in locks.values():
+        assert f"locked {reason}" in listed
 
 
 def test_hook_drift_is_read_through_the_installers_status_mode(fx: Fx) -> None:

@@ -32,6 +32,9 @@
       c. Installed-hook drift, read by running that clone's own scripts\coord\install-git-hooks.ps1
          -Status. Nothing here re-implements that check; this only picks out the lines worth reading.
       d. A proposed cleanup list, and a separate NEEDS A HUMAN LOOK list.
+      e. Seat locks whose session is gone (BACKLOG #2524). seat.ps1 locks a seat's worktree on arrival
+         and the SessionEnd hook unlocks it, so a lock left behind names a seat that died. The rule
+         for what counts as a seat lock and as gone is worktree-audit.ps1's.
 
     "MERGED" COMES FROM GITHUB, ONE BULK CALL PER CLONE PER RUN. This repository squash-merges, so
     `merge-base --is-ancestor` cannot see a landing, and the clone is shallow as well. One
@@ -149,6 +152,8 @@ $env:GIT_TERMINAL_PROMPT = '0'
 $env:GCM_INTERACTIVE = 'never'
 
 . "$PSScriptRoot\..\coord\occupancy.ps1"
+# Read-only by the same rule as this file; the lock WRITES live in seat-lock.ps1, which is not loaded.
+. "$PSScriptRoot\worktree-audit.ps1"
 
 if (-not $Gh) { $Gh = if ($env:MEFOR_HYGIENE_GH) { $env:MEFOR_HYGIENE_GH } else { 'gh' } }
 if (-not $RepoRoot) { $RepoRoot = $PSScriptRoot }
@@ -479,6 +484,14 @@ function Get-CloneReport($R) {
         human  = @($rows | Where-Object { $_.verdict -eq 'HUMAN' })
         missing = @($rows | Where-Object { $_.verdict -eq 'MISSING' })
     }
+    # A seat locks its worktree on arrival and unlocks it on a clean exit (worktree-audit.ps1 says why).
+    # One that died keeps the lock, and then every reclaimer keeps the tree. Listed, never unlocked here.
+    $rep.staleSeatLocks = @(foreach ($s in (Get-StaleSeatLocks -Worktrees $others -ConfigRoot $ConfigRoot)) {
+            [ordered]@{
+                path = $s.Path; reason = $s.Reason; seat = $s.Seat; session = $s.SessionKey; state = $s.State; detail = $s.Detail
+                command = "git -C '$($root -replace "'", "''")' worktree unlock '$($s.Path -replace "'", "''")'"
+            }
+        })
     $reconcile = Join-Path $root 'scripts/coord/claim-reconcile.ps1'
     $rep.claimReconcile = if (Test-Path -LiteralPath $reconcile -PathType Leaf) { "pwsh -NoProfile -File `"$reconcile`"" } else { '' }
 
@@ -632,6 +645,20 @@ foreach ($c in $report.clones) {
         $md.Add("``git worktree prune`` would deregister these, and also any OTHER worktree whose directory is briefly missing at that moment. Decide per entry.")
         $md.Add("")
         foreach ($w in $c.cleanup.missing) { $md.Add("- ``$($w.path)`` (``$($w.branch)``)") }
+    }
+
+    $md.Add("")
+    $md.Add("### e. Seat locks whose session is gone ($($c.staleSeatLocks.Count))")
+    $md.Add("")
+    if ($c.staleSeatLocks.Count -eq 0) { $md.Add("None. A seat lock reads ``<seat> <session id>``; only those whose session reads DEAD, STALE or has no registry record are listed.") }
+    else {
+        $md.Add("A seat locks its worktree on arrival and unlocks it on a clean exit. These sessions did not, so every reclaimer, the Desktop GC included, keeps the tree. ``No registry record`` cannot tell an exited session from one that never registered, so check before unlocking:")
+        $md.Add("")
+        foreach ($s in $c.staleSeatLocks) { $md.Add("- ``$($s.path)``: ``$($s.reason)``, $($s.state) ($($s.detail))") }
+        $md.Add("")
+        $md.Add('```powershell')
+        foreach ($s in $c.staleSeatLocks) { $md.Add($s.command) }
+        $md.Add('```')
     }
 }
 
