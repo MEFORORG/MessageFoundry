@@ -71,6 +71,24 @@ def _ad_settings(**over: Any) -> AuthSettings:
     return AuthSettings(**base)
 
 
+def _over_plain_loopback(settings: AuthSettings) -> LdapAuthenticator:
+    """An authenticator for a loopback fake domain controller that speaks plain LDAP.
+
+    For tests whose property is not the hop's TLS: a decode, a referral, a result code. The engine
+    refuses a plain ``ldap://`` bind at every posture (vault BACKLOG #3533 item 1), so this builds a
+    verifying LDAPS authenticator from ``settings``, whose ``ad_server`` must be
+    ``ldaps://127.0.0.1:<port>``, then re-points the built instance at ``ldap://`` on the same port
+    and drops its ``Tls``. Test-only: no setting reaches this state.
+    """
+    server = str(settings.ad_server)
+    assert server.startswith("ldaps://127.0.0.1:"), server
+    authenticator = LdapAuthenticator(settings)
+    plain = settings.model_copy(update={"ad_server": "ldap://" + server.removeprefix("ldaps://")})
+    authenticator._s = plain
+    authenticator._tls = None
+    return authenticator
+
+
 # --- recording ldap3 doubles --------------------------------------------------------------------
 
 

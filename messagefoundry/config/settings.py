@@ -3341,11 +3341,9 @@ class AuthSettings(_Section):
     # independent of [security].enforcement (a substituted AD anchor permits an LDAPS MITM). Dormant
     # when None. Block-scoped (direct-read by the preflight, not desugared).
     ad_tls_ca_cert_pin: str | None = None
-    # Explicit opt-in to a non-ldaps:// bind (trusted-net dev). Honoured only under
-    # [security].enforcement = warn, and named as a loosening there (vault BACKLOG #2354). Under enforce it
-    # is inert: ServiceSettings refuses the plain bind at load, as the MEFOR_ALLOW_INSECURE_TLS escape is
-    # inert there.
-    ad_allow_insecure_ldap: bool = False
+    # A plain ldap:// bind is refused at every posture (vault BACKLOG #3533 item 1). The opt-in that once
+    # released it at [security].enforcement = warn, ad_allow_insecure_ldap, is a REMOVED key
+    # (_REMOVED_KEYS), so a config that still sets it is refused by name rather than ignored.
     # Finite network timeouts for EVERY ldap3 Server/Connection the authenticator builds (ASVS 13.1.3).
     # ldap3's own defaults are None on both, and the engine never calls socket.setdefaulttimeout, so
     # without these an unresponsive domain controller made the TCP connect and every LDAP response read
@@ -3959,9 +3957,9 @@ class AuthSettings(_Section):
     def plain_ldap_bind(self) -> bool:
         """Whether AD is on and its ``ad_server`` is not an LDAPS address (vault BACKLOG #2354).
 
-        Read by at least the opt-in check below, the ``enforce`` refusal in :class:`ServiceSettings`
-        and :func:`security_loosenings`. The scheme test is :func:`is_ldaps_address`, which
-        ``LdapAuthenticator`` shares."""
+        Read by at least the refusal below, which turns it away at every posture (vault BACKLOG
+        #3533 item 1). The scheme test is :func:`is_ldaps_address`, which ``LdapAuthenticator``
+        shares."""
         return (
             self.ad_enabled and self.ad_server is not None and not is_ldaps_address(self.ad_server)
         )
@@ -3988,11 +3986,14 @@ class AuthSettings(_Section):
         """AD/SSO need their connection essentials present when enabled."""
         if self.ad_enabled and (self.ad_server is None or self.ad_user_search_base is None):
             raise ValueError("ad_enabled requires: ad_server, ad_user_search_base")
-        if self.plain_ldap_bind and not self.ad_allow_insecure_ldap:
+        if self.plain_ldap_bind:
+            # Vault BACKLOG #3533 item 1: refused at every posture, with no escape, as verify-off
+            # LDAPS is. A loopback ldap:// (an on-box LDAPS proxy) is refused too.
             raise ValueError(
-                "ad_enabled requires an ldaps:// ad_server (credentials go over a SIMPLE bind); "
-                "ad_allow_insecure_ldap=true overrides this only under [security].enforcement = warn, "
-                "for a trusted-network dev box"
+                "ad_enabled requires an ldaps:// ad_server: a plain ldap:// SIMPLE bind would send the "
+                "service-account and user passwords in cleartext, and it is refused with no escape. "
+                "Use an ldaps:// ad_server, and pin an internal CA with ad_tls_ca_cert_file if the "
+                "directory needs one"
             )
         if self.ad_enabled and self.ad_bind_dn is None:
             raise ValueError("ad_enabled requires a service account: ad_bind_dn")
@@ -7176,33 +7177,6 @@ class ServiceSettings(_InputHidingModel):
         return self
 
     @model_validator(mode="after")
-    def _plain_ldap_refused_under_enforce(self) -> ServiceSettings:
-        """Under ``[security].enforcement = enforce``, ``[auth].ad_allow_insecure_ldap`` is inert, so a
-        plain ``ldap://`` AD bind is refused (vault BACKLOG #2354).
-
-        The ``MEFOR_ALLOW_INSECURE_TLS`` escape is clamped this way, honoured only at
-        ``[security].enforcement = warn`` (ADR 0092 decision 2, and
-        ``weakened_tls_escape_permitted``). This one was honoured at any dial, so on a first deployment
-        at the shipped ``enforce`` it would have sent the service-account and user passwords over a
-        cleartext SIMPLE bind. The dial and the bind live in different sections, so the check lives
-        here, where the existing ``ldap://`` check already runs at load. ``LdapAuthenticator`` repeats
-        it at build for a caller that hands it an ``AuthSettings`` alone. Under ``warn`` the opt-in is
-        honoured, warned at build and named by :func:`security_loosenings`.
-
-        A loopback ``ldap://`` (an on-box LDAPS proxy) is refused too; the cleartext-hop gradient's
-        loopback ALLOW was not extended to this hop."""
-        if self.auth.plain_ldap_bind and self.security.enforcement is SecurityEnforcement.ENFORCE:
-            raise ValueError(
-                "[auth].ad_server is not an ldaps:// address, and [auth].ad_allow_insecure_ldap is "
-                "inert under [security].enforcement = enforce: the service-account and user passwords "
-                "would cross the network in cleartext. Use an ldaps:// ad_server, and anchor an "
-                "internal CA with ad_tls_ca_cert_file if the directory needs one. The opt-in is "
-                "honoured only under enforcement = warn, and that relaxes every serve gate, not only "
-                "this one"
-            )
-        return self
-
-    @model_validator(mode="after")
     def _client_allowlist_requires_pinned_proxies(self) -> ServiceSettings:
         """A host inside ``[api].trusted_proxies`` can set ``X-Forwarded-For`` to ANY value and uvicorn
         hands that value to us as ``scope["client"]`` — so every trusted host can forge itself into
@@ -7940,6 +7914,14 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "`serve` always requires sign-in, and the switch that turned it off was removed (vault "
         "BACKLOG #2719). ADR 0118 had relocated it to [security].require_sign_in, and that key is "
         "retired too"
+    ),
+    # Vault BACKLOG #3533 item 1. Named here so a config that still sets it is refused with the
+    # decision, rather than offered a spelling suggestion or loaded with the key dropped.
+    ("auth", "ad_allow_insecure_ldap"): (
+        "a plain ldap:// AD bind would send the service-account and user passwords in cleartext, "
+        "so it is refused at every posture, with no escape, as verify-off LDAPS is (vault BACKLOG "
+        "#3533). Point ad_server at an ldaps:// address, and pin an internal CA with "
+        "ad_tls_ca_cert_file if the directory needs one"
     ),
     # BACKLOG #2090 (ADR 0066 §12): `false` could only start the mode that deadlocks.
     ("pipeline", "require_rcsi_for_pooled"): (
@@ -9054,8 +9036,7 @@ def security_loosenings(
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169), ``[store].secure_delete`` on a file-backed
     SQLite store (vault BACKLOG #2619),
-    ``[auth].ad_session_recheck_seconds``, ``[auth].ad_allow_insecure_ldap`` with a live ``ldap://``
-    bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288),
+    ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288),
     ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
     BACKLOG #2600), the ``[auth]``
     sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache,
@@ -9094,9 +9075,9 @@ def security_loosenings(
     the gap is a written decision that a new switch cannot silently join. That set also holds at
     least two switches this registry DOES report. One is ``require_mfa``: a loaded config reports it
     as the ``[security]`` switch below, and its ``[auth]`` field is only the desugared copy (an
-    embedder that builds ``AuthSettings`` itself with it off is not reported). The other is
-    ``ad_allow_insecure_ldap``, because its entry needs a live ``ldap://`` bind that the floor's
-    lone flip never builds; its own tests pin it.
+    embedder that builds ``AuthSettings`` itself with it off is not reported). The other was
+    ``ad_allow_insecure_ldap``, until vault BACKLOG #3533 removed it: a plain ``ldap://`` bind is
+    now refused at load, so there is nothing to report.
 
     **``[auth].initial_password_expiry_hours`` is reported since vault BACKLOG #2600 step 4.**
     BACKLOG #1245 made it load-bearing: it is the ONLY bound on an admin-issued temporary password,
@@ -9457,19 +9438,6 @@ def security_loosenings(
                 "ad_session_recheck_seconds",
                 "directory revocation does NOT propagate — an AD account disabled or deleted keeps its "
                 "live engine sessions until they expire on their own",
-            )
-        )
-    # Vault BACKLOG #2354: a plain ldap:// AD bind. ServiceSettings refuses it at load under enforce, so a
-    # loaded config reaches this only at warn. Conditional on the bind being live: the flag beside an
-    # ldaps:// address, or with AD off, changes nothing and is not named.
-    if auth.plain_ldap_bind:
-        out.append(
-            (
-                "ad_allow_insecure_ldap",
-                "AD binds over plain ldap:// -- the service-account password, and the password a "
-                "directory user types to step up a Windows SSO (Kerberos) session, cross the network "
-                "in cleartext, and nothing authenticates the domain controller (an OIDC session steps "
-                "up at the identity provider and sends no password here)",
             )
         )
     # BACKLOG #288: the new-client-IP step-up defaults ON.

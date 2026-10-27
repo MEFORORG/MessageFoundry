@@ -455,9 +455,8 @@ async def _reconciler(
     """A real ``AuthService`` over a fresh store, probing through ``authenticator``."""
     store = await MessageStore.open(":memory:")
     try:
-        settings = _ad_settings(
-            ad_server=f"ldap://127.0.0.1:{port}", ad_allow_insecure_ldap=True, **over
-        )
+        # The AuthService reads no address of its own here: `authenticator` makes every bind.
+        settings = _ad_settings(ad_server=f"ldaps://127.0.0.1:{port}", **over)
         yield AuthService(store, settings, ldap=authenticator), store
     finally:
         await store.close()

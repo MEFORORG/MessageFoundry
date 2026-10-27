@@ -1840,12 +1840,12 @@ def test_the_plaintext_hop_acknowledgement_is_not_reported_when_a_cert_serves_th
     assert "plaintext_upstream_hop_acknowledged" in _names(api=_terminated(ack=True))
 
 
-# --- [auth].ad_allow_insecure_ldap: inert under enforce (vault BACKLOG #2354) -------------------
+# --- a plain ldap:// AD bind: refused at every posture (vault BACKLOG #3533 item 1) -------------
 #
-# The MEFOR_ALLOW_INSECURE_TLS escape is clamped under [security].enforcement = enforce. This one used to be
-# honoured at any dial, so on a first deployment it would have sent both passwords over a cleartext
-# SIMPLE bind. The enforce arm is the one the clamp exists for; the warn arm is the control that shows
-# the same config loads when only the dial moves, so the refusal is keyed on the dial.
+# It used to be released by [auth].ad_allow_insecure_ldap at [security].enforcement = warn (#2354),
+# while verify-off LDAPS was refused with no escape (#3230). Both binds carry the same two passwords,
+# so the plain one is refused the same way, and the opt-in is a REMOVED key. Each arm below runs at
+# both dial settings: the warn arm is the one the change exists for.
 
 
 _PLAIN_LDAP_AUTH = """
@@ -1854,45 +1854,62 @@ ad_enabled = true
 ad_server = "ldap://dc.test.invalid:389"
 ad_user_search_base = "OU=Staff,DC=test,DC=invalid"
 ad_bind_dn = "CN=svc-mefor,OU=Service,DC=test,DC=invalid"
-ad_allow_insecure_ldap = true
 """
 
 #: The bind password comes from the env, as the docs say, so no file-secret warning is involved.
 _BIND_ENV = {"MEFOR_AUTH_AD_BIND_PASSWORD": "synthetic"}
 
+#: What the load-time refusal says. The pre-#3533 message offered the opt-in instead.
+_PLAIN_REFUSED = "refused with no escape"
 
-def _load_plain_ldap(tmp_path: Path, enforcement: str) -> ServiceSettings:
+
+def _load_plain_ldap(
+    tmp_path: Path, enforcement: str, auth: str = _PLAIN_LDAP_AUTH
+) -> ServiceSettings:
     path = tmp_path / "messagefoundry.toml"
-    path.write_text(
-        f'[security]\nenforcement = "{enforcement}"\n{_PLAIN_LDAP_AUTH}', encoding="utf-8"
-    )
+    path.write_text(f'[security]\nenforcement = "{enforcement}"\n{auth}', encoding="utf-8")
     return load_settings(config_path=path, environ=_BIND_ENV)
 
 
-def test_plain_ldap_with_the_opt_in_is_refused_at_load_under_enforce(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="ad_allow_insecure_ldap is inert under"):
-        _load_plain_ldap(tmp_path, "enforce")
-
-
+@pytest.mark.parametrize("enforcement", ["enforce", "warn"])
 @pytest.mark.parametrize(
-    ("prefix", "server"),
+    "server",
     [
-        # A loopback ldap:// (an on-box LDAPS proxy): the cleartext-hop gradient's loopback ALLOW was
-        # deliberately not extended to this hop.
-        ("", "ldap://127.0.0.1:389"),
-        # The sign-in-off case that sat here went with the switch (vault BACKLOG #2719): no config
-        # can turn sign-in off any more.
+        "ldap://dc.test.invalid:389",
+        # A loopback ldap:// (an on-box LDAPS proxy): the cleartext-hop gradient's loopback ALLOW
+        # was deliberately not extended to this hop.
+        "ldap://127.0.0.1:389",
+        # ldap3 dials a scheme-less host on 389 with no TLS, even one whose name starts with "ldaps".
+        "ldapsrv01.test.invalid",
     ],
-    ids=["loopback"],
+    ids=["remote", "loopback", "bare-host"],
 )
-def test_the_enforce_refusal_has_no_loopback_carve_out(
-    tmp_path: Path, prefix: str, server: str
+def test_a_plain_ldap_bind_is_refused_at_load_at_every_posture(
+    tmp_path: Path, enforcement: str, server: str
 ) -> None:
-    path = tmp_path / "messagefoundry.toml"
-    body = _PLAIN_LDAP_AUTH.replace("ldap://dc.test.invalid:389", server)
-    path.write_text(prefix + body, encoding="utf-8")
-    with pytest.raises(ValueError, match="ad_allow_insecure_ldap is inert under"):
-        load_settings(config_path=path, environ=_BIND_ENV)
+    auth = _PLAIN_LDAP_AUTH.replace("ldap://dc.test.invalid:389", server)
+    with pytest.raises(ValueError, match=_PLAIN_REFUSED) as refused:
+        _load_plain_ldap(tmp_path, enforcement, auth)
+    assert "cleartext" in str(refused.value)
+
+
+@pytest.mark.parametrize("enforcement", ["enforce", "warn"])
+def test_the_removed_opt_in_is_refused_by_name_at_load(tmp_path: Path, enforcement: str) -> None:
+    """Beside an ldaps:// address, where it used to do nothing, the key is refused rather than
+    dropped, and the refusal names the key and the decision. Without the removed-key entry, the
+    loader would offer a spelling suggestion for a key that is not misspelled."""
+    auth = _PLAIN_LDAP_AUTH.replace("ldap://", "ldaps://") + "ad_allow_insecure_ldap = true\n"
+    with pytest.raises(
+        ValueError, match=r"\[auth\]\.ad_allow_insecure_ldap was REMOVED"
+    ) as refused:
+        _load_plain_ldap(tmp_path, enforcement, auth)
+    assert "cleartext" in str(refused.value)
+
+
+def test_the_removed_opt_in_is_refused_by_name_when_built_in_code() -> None:
+    """A section built in code skips the loader, and ``extra="ignore"`` would drop the key."""
+    with pytest.raises(ValueError, match="ad_allow_insecure_ldap was REMOVED"):
+        AuthSettings(ad_allow_insecure_ldap=True)  # type: ignore[call-arg]
 
 
 def test_surrounding_whitespace_does_not_hide_an_ldaps_address() -> None:
@@ -1905,63 +1922,33 @@ def test_surrounding_whitespace_does_not_hide_an_ldaps_address() -> None:
     assert not _ad(ad_server=" ldaps://dc.test.invalid:636").plain_ldap_bind
 
 
-def test_plain_ldap_with_the_opt_in_loads_under_warn_and_is_named(tmp_path: Path) -> None:
-    """The control arm: the same config, with only the dial moved, loads and is reported."""
-    settings = _load_plain_ldap(tmp_path, "warn")
-    assert settings.auth.plain_ldap_bind is True
-    risk = _risks(settings.security, settings.auth)["ad_allow_insecure_ldap"]
-    assert "cleartext" in risk
-    # Directory password sign-in is retired, so the only user bind left is the step-up re-bind, and
-    # only a Kerberos session reaches it: an OIDC session steps up at the identity provider. The
-    # posture text said "every signing-in user's password"; it must name that step-up instead.
-    from tests._sign_in_claim import SIGN_IN_ANY_TENSE
-
-    assert not SIGN_IN_ANY_TENSE.search(risk), risk
-    assert "step up a Windows SSO (Kerberos) session" in risk, risk
-    assert "OIDC session steps up at the identity provider" in risk, risk
-
-
-def test_a_bare_host_with_no_scheme_is_a_plain_bind(tmp_path: Path) -> None:
-    """ldap3 dials a scheme-less host on 389 with no TLS, even one whose name starts with "ldaps"."""
-    path = tmp_path / "messagefoundry.toml"
-    path.write_text(
-        _PLAIN_LDAP_AUTH.replace("ldap://dc.test.invalid:389", "ldapsrv01.test.invalid"),
-        encoding="utf-8",
+@pytest.mark.parametrize("enforcement", ["enforce", "warn"])
+def test_an_ldaps_server_loads_at_either_posture(tmp_path: Path, enforcement: str) -> None:
+    """The control for the refusals above: the same config with an ldaps:// address loads."""
+    settings = _load_plain_ldap(
+        tmp_path, enforcement, _PLAIN_LDAP_AUTH.replace("ldap://", "ldaps://")
     )
-    with pytest.raises(ValueError, match="ad_allow_insecure_ldap is inert under"):
-        load_settings(config_path=path, environ=_BIND_ENV)
-
-
-def test_an_ldaps_server_under_enforce_still_loads(tmp_path: Path) -> None:
-    """The refusal keys on the plain bind, not on the flag: beside an ldaps:// address the opt-in does
-    nothing, so it neither refuses nor reports."""
-    path = tmp_path / "messagefoundry.toml"
-    path.write_text(_PLAIN_LDAP_AUTH.replace("ldap://", "ldaps://"), encoding="utf-8")
-    settings = load_settings(config_path=path, environ=_BIND_ENV)
     assert settings.auth.plain_ldap_bind is False
-    assert "ad_allow_insecure_ldap" not in _names(auth=settings.auth)
 
 
-def test_the_opt_in_with_ad_off_is_not_a_loosening() -> None:
-    assert "ad_allow_insecure_ldap" not in _names(auth=AuthSettings(ad_allow_insecure_ldap=True))
-
-
-def test_the_authenticator_refuses_a_plain_bind_at_the_enforcing_default() -> None:
-    """The build-time repeat, for a caller that hands LdapAuthenticator an AuthSettings alone and so
-    never passes through ServiceSettings. Its dial defaults to enforce, so omitting it refuses."""
+def test_the_authenticator_refuses_a_plain_bind_at_every_dial() -> None:
+    """The build-time repeat, for a caller that hands LdapAuthenticator an AuthSettings that never
+    passed the load-time refusal. AuthSettings refuses a plain bind only while ad_enabled, so these
+    build with AD off; the authenticator must not assume the load check ran."""
     from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
 
-    auth = _ad(ad_server="ldap://dc.test.invalid:389", ad_allow_insecure_ldap=True)
-    with pytest.raises(LdapError, match="inert under"):
-        LdapAuthenticator(auth)
-    with pytest.raises(LdapError, match="inert under"):
-        LdapAuthenticator(auth, enforcing=True)
-    # Either dial input saying enforce refuses: a known enforcing posture wins over enforcing=False.
-    with pytest.raises(LdapError, match="inert under"):
-        LdapAuthenticator(auth, enforcing=False, posture=HopPosture(enforcing=True))
+    auth = _ad(ad_enabled=False, ad_server="ldap://dc.test.invalid:389")
+    for enforcing in (True, False):
+        with pytest.raises(LdapError, match="refused, with no escape"):
+            LdapAuthenticator(auth, enforcing=enforcing)
+    # No posture releases it: a known non-enforcing posture refuses too.
+    with pytest.raises(LdapError, match="refused, with no escape"):
+        LdapAuthenticator(auth, enforcing=False, posture=HopPosture(enforcing=False))
     # A bare host that starts with "ldaps" is still a plain bind.
-    with pytest.raises(LdapError, match="inert under"):
-        LdapAuthenticator(_ad(ad_server="ldapsrv01.test.invalid", ad_allow_insecure_ldap=True))
+    with pytest.raises(LdapError, match="refused, with no escape"):
+        LdapAuthenticator(
+            _ad(ad_enabled=False, ad_server="ldapsrv01.test.invalid"), enforcing=False
+        )
 
 
 def test_a_refused_plain_bind_never_resolves_the_bind_secret(
@@ -1972,32 +1959,10 @@ def test_a_refused_plain_bind_never_resolves_the_bind_secret(
 
     calls: list[object] = []
     monkeypatch.setattr(ldap_module, "resolve_connector_secret", lambda *a, **k: calls.append(a))
-    auth = _ad(ad_server="ldap://dc.test.invalid:389", ad_allow_insecure_ldap=True)
-    with pytest.raises(ldap_module.LdapError, match="inert under"):
-        ldap_module.LdapAuthenticator(auth)
-    assert calls == []
-
-
-def test_the_authenticator_wants_the_opt_in_even_with_ad_off() -> None:
-    """AuthSettings checks the opt-in only while ad_enabled; a direct build must not assume it."""
-    from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
-
     auth = _ad(ad_enabled=False, ad_server="ldap://dc.test.invalid:389")
-    with pytest.raises(LdapError, match="needs ad_allow_insecure_ldap"):
-        LdapAuthenticator(auth, enforcing=False)
-
-
-def test_the_authenticator_honours_a_plain_bind_under_warn_and_says_so(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    from messagefoundry.auth.ldap import LdapAuthenticator
-
-    auth = _ad(ad_server="ldap://dc.test.invalid:389", ad_allow_insecure_ldap=True)
-    with caplog.at_level("WARNING", logger="messagefoundry.auth.ldap"):
-        LdapAuthenticator(auth, enforcing=False)
-    assert any(
-        r.levelname == "WARNING" and "plain ldap://" in r.getMessage() for r in caplog.records
-    )
+    with pytest.raises(ldap_module.LdapError, match="refused, with no escape"):
+        ldap_module.LdapAuthenticator(auth, enforcing=False)
+    assert calls == []
 
 
 # --- the cross-field refusal, keyed on model_fields_set ---------------------------------------
@@ -3108,9 +3073,6 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "password_require_lowercase",
         "password_require_digit",
         "password_require_symbol",
-        # REPORTED, so not an owed gap: named only with a live ldap:// bind, which this loop's lone
-        # flip never builds (ad_enabled stays off). The plain-LDAP section above pins it (#2354).
-        "ad_allow_insecure_ldap",
         # Security-relevant and gated ELSEWHERE, not by this registry — same owed note as [store].
         # Not reported through THIS field: it is the desugared copy of [security].require_mfa, which
         # a loaded config reports and the [security] floor covers. Off, it is also refused at exposure

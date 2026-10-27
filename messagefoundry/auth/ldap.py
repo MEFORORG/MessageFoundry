@@ -1518,29 +1518,20 @@ class LdapAuthenticator:
         # refusal below, the suite assertion, and _server(). It is the settings module's own test, so
         # this and AuthSettings agree: a bare host that merely starts with "ldaps" is plain (#2354).
         self._ldaps = is_ldaps_address(str(settings.ad_server))
-        # Vault BACKLOG #2354: a plain bind sends both passwords in cleartext. ServiceSettings refuses
-        # it at load under [security].enforcement = enforce; this repeats that refusal for a caller that
-        # hands over an AuthSettings alone. It refuses if EITHER dial input says enforce: `enforcing`
-        # (the [security].enforcement dial, defaulting to enforce) or a known enforcing `posture`. It
-        # runs before the bind secret is resolved, so a refused build never fetches the password.
+        # A plain bind sends both passwords in cleartext, so it is refused, with no escape and in every
+        # posture, as verify-off LDAPS is below (vault BACKLOG #3533 item 1). Until then the removed
+        # ad_allow_insecure_ldap opt-in released it at [security].enforcement = warn (#2354).
+        # AuthSettings refuses it at load while ad_enabled; this repeats the refusal for a caller that
+        # hands over an AuthSettings built some other way. It runs before the bind secret is
+        # resolved, so a refused build never fetches the password. `posture` no longer decides
+        # anything here; it stays a keyword because its callers still pass it.
+        del posture
         if not self._ldaps:
-            if not settings.ad_allow_insecure_ldap:
-                # AuthSettings requires the opt-in only while ad_enabled; a direct construction can
-                # carry ad_enabled = false, so check it here too rather than assume it.
-                raise LdapError(
-                    "ad_server is not an ldaps:// address; a plain bind needs "
-                    "ad_allow_insecure_ldap = true under [security].enforcement = warn."
-                )
-            if enforcing or (posture is not None and posture.enforcing):
-                raise LdapError(
-                    "ad_server is not an ldaps:// address, and ad_allow_insecure_ldap is inert under "
-                    "[security].enforcement = enforce (the binds would send passwords in cleartext). "
-                    "Use an ldaps:// ad_server."
-                )
-            logger.warning(
-                "AD binds over plain ldap:// (ad_allow_insecure_ldap=true, honoured because "
-                "[security].enforcement = warn) -- the service-account and user passwords cross the "
-                "network in cleartext; do not use in production."
+            raise LdapError(
+                "ad_server is not an ldaps:// address; a plain ldap:// bind would send the AD "
+                "service-account and user passwords in cleartext, so it is refused, with no escape. "
+                "Use an ldaps:// ad_server, and pin a private CA with ad_tls_ca_cert_file if the "
+                "directory needs one."
             )
         # Every LDAPS bind carries a password: the service account's (required below) and then the
         # user's. With ad_tls_verify=false the engine would hand both to whichever peer answered, so it

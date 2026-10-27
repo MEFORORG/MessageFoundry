@@ -22,7 +22,6 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
-from messagefoundry.auth.service import AuthService
 from messagefoundry.config.ai_policy import AiMode
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
@@ -126,26 +125,6 @@ def test_ldaps_verifyoff_refuses_before_the_bind_secret_is_fetched() -> None:
     s = _ldaps_verifyoff().model_copy(update={"ad_bind_password_secret": "kv/ad#pw"})
     with pytest.raises(LdapError, match="ad_tls_verify=false"):
         LdapAuthenticator(s, secret_provider=_NeverCalled(), posture=STAGING_PHI)  # type: ignore[arg-type]
-
-
-async def test_authservice_threads_posture_to_the_ldap_bind(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Seam: AuthService must thread hop_posture into the LdapAuthenticator it builds. The LDAPS
-    # verify-off cell no longer reads the posture (vault BACKLOG #3230), so the seam is proven on the
-    # plain ldap:// cell, which still does: with the enforcement dial at warn, only the posture can
-    # refuse it. If the seam dropped the posture, the enforcing arm below would build.
-    plain = AuthSettings(
-        ad_enabled=True,
-        ad_server="ldap://dc.example.com",
-        ad_allow_insecure_ldap=True,
-        ad_user_search_base="DC=example,DC=com",
-        ad_bind_dn="CN=svc,DC=example,DC=com",
-        ad_bind_password="synthetic-bind-secret",
-    )
-    with pytest.raises(LdapError, match="inert under"):
-        AuthService(store, plain, hop_posture=PROD_PHI, enforcing=False)
-    AuthService(store, plain, hop_posture=STAGING_PHI, enforcing=False)
 
 
 def test_ldaps_verifying_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:

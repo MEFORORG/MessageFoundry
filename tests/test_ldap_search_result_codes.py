@@ -80,7 +80,7 @@ from tests.test_ldap_referrals import (
     _read_message,
     _tlv,
 )
-from tests.test_ldap_timeouts import _ad_settings, _install_fakes
+from tests.test_ldap_timeouts import _ad_settings, _install_fakes, _over_plain_loopback
 
 #: Stands for text the directory sends with a result: its diagnostic message and matched DN. It
 #: must never reach an error, a log line or an audit row.
@@ -1188,13 +1188,12 @@ def _scripted_dc(
     **settings_over: Any,
 ) -> Iterator[tuple[_ScriptedDc, LdapAuthenticator]]:
     """A loopback server, and an authenticator pointed at it over plain ``ldap://``: the property
-    under test is the decode, not the hop's TLS. ``settings_over`` overrides further settings."""
+    under test is the decode, not the hop's TLS (``_over_plain_loopback``). ``settings_over``
+    overrides further settings."""
     dc = _ScriptedDc(answer, extended_code, bind_reply, extended_reply)
     try:
-        settings = _ad_settings(
-            ad_server=f"ldap://127.0.0.1:{dc.port}", ad_allow_insecure_ldap=True, **settings_over
-        )
-        yield dc, LdapAuthenticator(settings, enforcing=False)
+        settings = _ad_settings(ad_server=f"ldaps://127.0.0.1:{dc.port}", **settings_over)
+        yield dc, _over_plain_loopback(settings)
     finally:
         dc.close()
         # In the finally, so a failure also replaces an exception the test expected to see.
