@@ -61,6 +61,7 @@ pointed at one of those levers.
 | `Sftp` with a `password` | the server's host key is not in `known_hosts` | add the host key to `known_hosts` |
 | `[auth]` AD binds over LDAPS | `ad_tls_verify = false` | turn it on; pin a private CA with `ad_tls_ca_cert_file` |
 | `[auth]` AD binds | `ad_server` is a plain `ldap://` address, or a bare host (vault BACKLOG #3533) | use an `ldaps://` address; pin a private CA with `ad_tls_ca_cert_file` |
+| `[alerts]` SMTP relay login (`email_username`) | `email_use_tls = false` or `email_tls_verify = false`, refused at load (vault BACKLOG #3533) | turn both on; pin the relay's CA with `email_tls_ca_file`; or remove the login |
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
@@ -85,7 +86,6 @@ engine has not verified, when the lever named beside each is set:
 - the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;
-- the `[alerts]` SMTP relay login, under `email_tls_verify = false`;
 - the AI broker's `[ai].api_key` over a plain `http` endpoint, and a secret in the path of an
   alert webhook URL over `http`, each under `MEFOR_ALLOW_INSECURE_TLS` at
   `[security].enforcement = warn`;
@@ -511,10 +511,13 @@ false premise.
   the ack was renamed from `allow_unencrypted_phi_in_production` by [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) when the dial moved from the `production` tier to `enforcement`).
 
 ### `allow_unverified_alert_smtp_tls = true` — permit an unauthenticated `[alerts]` SMTP hop
-- **What you lose:** the hop carrying operator alert bodies, **every per-user security-event email**
-  (lockout, password/roles change, new-IP admin action) and the SMTP login credential no longer
-  authenticates the mail relay. It covers **both** unauthenticated shapes: `[alerts].email_use_tls = false`
-  (cleartext) and `[alerts].email_tls_verify = false` (encrypted, but any certificate is accepted). An
+- **What you lose:** the hop carrying operator alert bodies and **every per-user security-event email**
+  (lockout, password/roles change, new-IP admin action) no longer authenticates the mail relay. It
+  covers **both** unauthenticated shapes: `[alerts].email_use_tls = false` (cleartext) and
+  `[alerts].email_tls_verify = false` (encrypted, but any certificate is accepted). It covers a hop
+  with **no login** only: with `[alerts].email_username` set, either shape is refused at load, at
+  every posture, so the SMTP AUTH password never crosses (vault BACKLOG #3533). CORRECTED
+  2026-10-27: this entry said the switch also let the SMTP login credential cross. An
   on-path attacker who can answer for the relay reads all of it — and, since stream 12 is the ASVS
   6.3.5/6.3.7 out-of-band channel, can also *deny* a user the notice that their account was just taken over.
 - **When acceptable:** a lab/dev relay with a self-signed certificate you cannot re-issue, on a trusted

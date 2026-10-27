@@ -4254,6 +4254,10 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # Gated on a CONFIGURED transport: with no email_smtp_host/email_from there is no hop to protect,
     # and the #188 gate above already owns the "no channel at all" case.
+    #
+    # A LOGIN NEVER REACHES THIS GATE (vault BACKLOG #3533 item 3). AlertsSettings refuses
+    # email_username beside either shape at load, at every posture, so the acknowledgment below
+    # covers alert bodies and notice email on a hop with no login, and never the SMTP AUTH password.
     if settings.alerts.email_smtp_host and settings.alerts.email_from:
         if not settings.alerts.email_use_tls:
             hop_desc = "[alerts].email_use_tls=false (the SMTP hop is CLEARTEXT)"
@@ -4265,12 +4269,12 @@ def _serve(args: argparse.Namespace) -> int:
             if enforcing and not settings.security.allow_unverified_alert_smtp_tls:
                 print(
                     f"error: {hop_desc} on a {'production ' if production else ''}PHI instance "
-                    f"({env_name!r}); refusing to start — operator alert bodies, every per-user "
-                    "security-event email, and the SMTP AUTH password would cross a hop that does not "
-                    "authenticate the relay, so an on-path attacker can read them. Remove the override "
-                    "(the default verifies), or point [alerts].email_tls_ca_file / [tls].internal_ca_file "
-                    "at the relay's CA; or set [security].allow_unverified_alert_smtp_tls=true to "
-                    "deliberately accept an unauthenticated alert hop (audited).",
+                    f"({env_name!r}); refusing to start — operator alert bodies and every per-user "
+                    "security-event email would cross a hop that does not authenticate the relay, so "
+                    "an on-path attacker can read them. Remove the override (the default verifies), "
+                    "or point [alerts].email_tls_ca_file / [tls].internal_ca_file at the relay's CA; "
+                    "or set [security].allow_unverified_alert_smtp_tls=true to deliberately accept an "
+                    "unauthenticated alert hop with no login (audited).",
                     file=sys.stderr,
                 )
                 return 2
@@ -4279,17 +4283,17 @@ def _serve(args: argparse.Namespace) -> int:
                 # (captured by NSSM stdout/SIEM), then the shared warn posture below. Never silent.
                 logging.getLogger(__name__).warning(
                     "AUDIT: starting a %sPHI instance (environment %r) with %s, permitted because "
-                    "[security].allow_unverified_alert_smtp_tls=true — alert bodies, security-event "
-                    "email and the SMTP authentication credential cross an UNAUTHENTICATED hop "
+                    "[security].allow_unverified_alert_smtp_tls=true — alert bodies and security-event "
+                    "email cross an UNAUTHENTICATED hop with no login "
                     "(alert-SMTP-TLS verification opt-out override).",
                     "production " if production else "",
                     env_name,
                     hop_desc,
                 )
             print(
-                f"warning: {hop_desc} in a PHI-carrying environment ({env_name!r}) — alert bodies, "
-                "per-user security-event email and the SMTP AUTH password cross a hop that does not "
-                "authenticate the relay (MITM-able). Remove the override, or trust the relay's CA via "
+                f"warning: {hop_desc} in a PHI-carrying environment ({env_name!r}) — alert bodies and "
+                "per-user security-event email cross a hop that does not authenticate the relay "
+                "(MITM-able). Remove the override, or trust the relay's CA via "
                 "[alerts].email_tls_ca_file / [tls].internal_ca_file.",
                 file=sys.stderr,
             )
@@ -7589,7 +7593,9 @@ def _offline_security_notifier(
     **An SMTP hop that does not authenticate the relay is refused unless acknowledged**, whatever the
     instance's posture. ``serve`` refuses that hop only on a PHI instance under ``enforce``, and that
     posture is derived from more than this command reads. Refusing everywhere is the stricter of the
-    two, and it costs one notice rather than putting the SMTP password on an unauthenticated hop.
+    two, and it costs one notice rather than putting the notice on an unauthenticated hop. A login
+    never reaches this point on such a hop: settings refuse ``[alerts].email_username`` beside it
+    at load (vault BACKLOG #3533 item 3).
 
     **ANY failure to build the channel is WARNED and yields ``None`` rather than refusing.** This
     serves a recovery command, and losing the notice is the smaller harm than losing the recovery. A
@@ -7615,8 +7621,9 @@ def _offline_security_notifier(
         # Acknowledged, and never silent: `serve` logs the same acknowledgment as an AUDIT line.
         print(
             "WARNING: sending over an [alerts] SMTP hop that does not authenticate the relay, "
-            "permitted by [security].allow_unverified_alert_smtp_tls=true. The notice and the SMTP "
-            "password can be read on that hop.",
+            "permitted by [security].allow_unverified_alert_smtp_tls=true. The notice can be read "
+            "on that hop. No login crosses it: [alerts].email_username beside that hop is refused "
+            "when settings load.",
             file=sys.stderr,
         )
     try:

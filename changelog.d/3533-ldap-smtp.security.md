@@ -5,3 +5,8 @@
   `ad_server`, and pin a private CA with `ad_tls_ca_cert_file` if the directory needs one. See
   [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
   (`BACKLOG #3533`)
+- **An `[alerts]` SMTP login never crosses a hop that does not authenticate the relay.** With
+  `[alerts].email_username` set, `email_use_tls = false` or `email_tls_verify = false` is now
+  refused at load, at every posture. `[security].allow_unverified_alert_smtp_tls` still permits
+  such a hop with no login, but it no longer lets the SMTP AUTH password cross. See
+  [ADR 0029](../docs/adr/0029-email-smtp-destination.md). (`BACKLOG #3533`)

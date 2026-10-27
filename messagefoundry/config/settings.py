@@ -5478,6 +5478,8 @@ class AlertsSettings(_Section):
     # hop was encrypted but unauthenticated. FALSE is an audited loosening: it is named by
     # security_loosenings() and REFUSED at the serve gate on an enforcing PHI instance unless
     # [security].allow_unverified_alert_smtp_tls is also set. Only meaningful when email_use_tls=true.
+    # Beside email_username it is refused at load, at every posture, and that switch does not cover
+    # it (vault BACKLOG #3533 item 3; _refuse_a_login_over_an_unauthenticated_hop).
     email_tls_verify: bool = True
     # PEM bundle of trust anchors for that hop. None (the default) = the [tls] internal-CA policy if one
     # is configured, else the OS trust store. A path, not a secret — same status as [tls].internal_ca_file.
@@ -5552,6 +5554,35 @@ class AlertsSettings(_Section):
         if isinstance(v, str):
             return [addr.strip() for addr in v.split(",") if addr.strip()]
         return v
+
+    @model_validator(mode="after")
+    def _refuse_a_login_over_an_unauthenticated_hop(self) -> AlertsSettings:
+        """Vault BACKLOG #3533 item 3: a login never crosses a hop that does not authenticate the relay.
+
+        The sender runs SMTP AUTH whenever ``email_username`` is not ``None`` (``send_plain_email``),
+        so that is the test here, an empty string included. With ``email_use_tls = false`` the hop
+        is cleartext, and with ``email_tls_verify = false`` it accepts any certificate; either way the
+        password goes to whichever peer answered. Refused at load, in every posture and with no
+        escape, as the Email and Direct connectors already refuse a credential over such a hop.
+        ``[security].allow_unverified_alert_smtp_tls`` still permits an unauthenticated hop with no
+        login, at the serve gate. It lives here rather than there because the shape is decided by
+        this section alone, so ``serve``, ``check``, a reload and every CLI command that loads
+        settings all refuse it. The send-time refusal of cleartext AUTH stays as a second line."""
+        if self.email_username is None or (self.email_use_tls and self.email_tls_verify):
+            return self
+        knob = (
+            "email_use_tls = false, so the hop is cleartext"
+            if not self.email_use_tls
+            else "email_tls_verify = false, so the hop accepts any certificate"
+        )
+        raise ValueError(
+            f"[alerts].email_username is set and [alerts].{knob}: the SMTP AUTH password would "
+            "reach a relay the engine has not verified. Refused, with no escape; "
+            "[security].allow_unverified_alert_smtp_tls covers only a hop with no login. Turn "
+            "email_use_tls and email_tls_verify on, and pin the relay's CA with "
+            "[alerts].email_tls_ca_file if it needs one; or remove email_username and the password "
+            "to send unauthenticated"
+        )
 
     @model_validator(mode="after")
     def _check_email_templates(self) -> AlertsSettings:
@@ -6888,7 +6919,9 @@ class SecuritySettings(_Section):
     # posture fails closed instead; this switch is unchanged by that.) So the refusal is keyed on this explicit
     # switch at the serve gate instead, in the shape of allow_unencrypted_phi_under_strict_enforcement.
     # Default FALSE and byte-identical when unset. Setting it TRUE is a LOOSENING: security_loosenings()
-    # names it, so the opt-out is never silent.
+    # names it, so the opt-out is never silent. It covers a hop with NO login only: beside
+    # [alerts].email_username the unauthenticated hop is refused at load, with no escape (vault BACKLOG
+    # #3533 item 3; AlertsSettings._refuse_a_login_over_an_unauthenticated_hop).
     allow_unverified_alert_smtp_tls: bool = False
 
     # ── Store principal privileges (ASVS 13.2.2, ADR 0199) ───────────
@@ -9600,14 +9633,16 @@ def security_loosenings(
     # on the switch alone would leave the actual weakening invisible — which is the failure mode this
     # registry exists to prevent. Reported at every call site (unlike cleartext_accepted, this is
     # settings-scoped, so `security show` and a graphless GET /security/posture see it completely).
+    # Neither names a login: beside [alerts].email_username both shapes are refused at load (vault
+    # BACKLOG #3533 item 3), so a loaded config reaches these only with no login.
     if alerts.email_smtp_host and alerts.email_from:
         if not alerts.email_use_tls:
             out.append(
                 (
                     "email_use_tls",
-                    "the [alerts] SMTP hop is CLEARTEXT — operator alert bodies, every per-user "
-                    "security-event email (lockout, password/roles change) and the SMTP login "
-                    "credential cross it unencrypted and readable by anything on the path",
+                    "the [alerts] SMTP hop is CLEARTEXT — operator alert bodies and every per-user "
+                    "security-event email (lockout, password/roles change) cross it unencrypted and "
+                    "readable by anything on the path",
                 )
             )
         elif not alerts.email_tls_verify:
@@ -9615,16 +9650,17 @@ def security_loosenings(
                 (
                     "email_tls_verify",
                     "the [alerts] SMTP hop is encrypted but UNAUTHENTICATED — it accepts any "
-                    "certificate, so an on-path attacker presenting one reads the alert bodies, the "
-                    "per-user security-event email and the SMTP login credential",
+                    "certificate, so an on-path attacker presenting one reads the alert bodies and "
+                    "the per-user security-event email",
                 )
             )
     if sec.allow_unverified_alert_smtp_tls:
         out.append(
             (
                 "allow_unverified_alert_smtp_tls",
-                "an unauthenticated [alerts] SMTP hop is permitted to start an enforcing PHI instance "
-                "— the serve gate that would otherwise refuse it is acknowledged away",
+                "an unauthenticated [alerts] SMTP hop with no login is permitted to start an "
+                "enforcing PHI instance — the serve gate that would otherwise refuse it is "
+                "acknowledged away",
             )
         )
     if sec.allow_over_granted_store_principal:

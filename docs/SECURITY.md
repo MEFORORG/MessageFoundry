@@ -378,7 +378,9 @@ account held **before** the repair (BACKLOG #2019).
   relay refuses the send, and the command shows a WARNING.
 - With `email_use_tls` or `email_tls_verify` false, no notice is sent unless
   `[security].allow_unverified_alert_smtp_tls` is true, and then the command warns. This is
-  stricter than `serve`, which refuses that hop only on a PHI instance under `enforce`.
+  stricter than `serve`, which refuses that hop only on a PHI instance under `enforce`. With
+  `email_username` set, either shape is refused when settings load, so no login crosses that hop
+  (vault BACKLOG #3533).
 - The `auth.first_administrator_provisioned` audit row gains `holder_notice`: `dispatched`,
   `no_prior_address`, `no_channel`, or null for a fresh create. It is written after the notice, so
   `dispatched` means the notifier took it. It does not mean the mail was delivered. The row also
