@@ -536,10 +536,10 @@ def test_a_ca_cryptography_cannot_read_is_skipped_alone(
     real = pki_module._akid_fit
     old = x509.load_pem_x509_certificate(twins.old_ca.read_bytes())
 
-    def fit(crl: x509.CertificateRevocationList, ca: pki_module._ListedCa) -> bool | None:
+    def fit(akid: pki_module._CrlAkid | None, ca: pki_module._ListedCa) -> bool | None:
         if ca.cert == old:
             raise x509.UnsupportedGeneralNameType("x400Address is not supported")
-        return real(crl, ca)
+        return real(akid, ca)
 
     monkeypatch.setattr(pki_module, "_akid_fit", fit)
     pem = twins.write_crl("new", "new")
@@ -997,9 +997,9 @@ def test_a_root_with_a_zero_serial_is_matched_by_its_real_serial_and_prints_no_w
         )
 
     with warnings.catch_warnings():
-        # Reading a serial of 0 in the CRL's own key identifier warns too. That is the CRL's
-        # warning, not the CA's, so this test keeps it quiet.
-        warnings.simplefilter("ignore", CryptographyDeprecationWarning)
+        # A serial of 0 in the CRL's own key identifier is read without the warning too, so
+        # this holds where warnings are errors.
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
         assert [s.state for s in judge_crl_signatures(forged(0), [odd])] == ["bad"]
         # Control: serial 1, the parsed copy's serial, is not that CA's, so no CA fits.
         assert [s.state for s in judge_crl_signatures(forged(1), [odd])] == ["unlisted"]
@@ -1011,6 +1011,70 @@ def test_a_root_with_a_zero_serial_is_matched_by_its_real_serial_and_prints_no_w
         named = _zero_serial_ca(key, own_akid=True)
         assert [s.state for s in judge_crl_signatures(plain, [named])] == ["bad"]
     assert not [w for w in shown if issubclass(w.category, CryptographyDeprecationWarning)]
+
+
+def _crl_naming_serial(
+    signer: ec.EllipticCurvePrivateKey, named: ec.EllipticCurvePrivateKey, serial: int
+) -> bytes:
+    """A CRL from :data:`_ZERO_NAME` signed by ``signer``, whose Authority Key Identifier names
+    ``named``'s key, the name :data:`_ZERO_NAME` and the CA serial ``serial``."""
+    akid = x509.AuthorityKeyIdentifier(
+        x509.SubjectKeyIdentifier.from_public_key(named.public_key()).digest,
+        [x509.DirectoryName(_ZERO_NAME)],
+        serial,
+    )
+    return (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(_ZERO_NAME)
+        .last_update(_NOW - _DAY)
+        .next_update(_NOW + 30 * _DAY)
+        .add_extension(akid, False)
+        .sign(signer, hashes.SHA256())
+        .public_bytes(_PEM)
+    )
+
+
+def test_a_forged_crl_whose_own_key_identifier_carries_serial_zero_refuses_the_start(
+    tmp_path: Path,
+) -> None:
+    """Review finding 1 of round four on vault BACKLOG #3506. A CRL whose own Authority Key
+    Identifier carries serial 0 warned when its extensions were read. Where warnings are errors,
+    a start then failed with that raw warning rather than a refusal naming the file, and the
+    signature check read the CRL as ``unlisted``. It is read without the warning now."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    ca_file = tmp_path / "zero-serial-ca.pem"
+    ca_file.write_text(ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key)), "ascii")
+    crl = tmp_path / "crl.pem"
+    forged = _crl_naming_serial(ec.generate_private_key(ec.SECP256R1()), key, 0)
+    crl.write_bytes(forged)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        # Control: the instrument is real. Reading this CRL's extensions warns, as an error.
+        with pytest.raises(CryptographyDeprecationWarning):
+            x509.load_pem_x509_crl(forged).extensions  # noqa: B018 -- the read is the point
+        with pytest.raises(ValueError, match="does not verify the CRL's signature") as refused:
+            _hop(ca_file, crl)
+        assert str(refused.value).startswith(f"{_SETTING} ({str(crl)!r})")
+        assert "mefor-3506-zero-serial" in str(refused.value)
+        # Control: the CRL that CA's key signed, with the same key identifier, loads.
+        crl.write_bytes(_crl_naming_serial(key, key, 0))
+        assert _hop(ca_file, crl).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_crl_key_identifier_serial_is_kept_as_the_crl_carries_it() -> None:
+    """The copy :func:`pki._crl_extensions` reads has serial 1 where the CRL carries 0. What
+    OpenSSL scores a CRL on still holds the real serial, so a CRL naming serial 0 and one naming
+    serial 1 do not score alike."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = _NOW.timestamp()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        ((_, zero),) = pki_module.judge_every_crl(_crl_naming_serial(key, key, 0), now=now)
+    ((_, one),) = pki_module.judge_every_crl(_crl_naming_serial(key, key, 1), now=now)
+    assert zero.selection[1] is not None and one.selection[1] is not None
+    assert zero.selection[1] != one.selection[1]
+    # The bytes differ in the serial alone, and the CRL's own carries 0.
+    assert zero.selection[1].replace(b"\x82\x01\x00", b"\x82\x01\x01") == one.selection[1]
 
 
 def test_a_long_issuer_name_is_quoted_with_a_bound(twins: _Twins) -> None:

@@ -2037,16 +2037,17 @@ the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
 engine process logs the WARNING once while the file keeps the same bytes, and the ERROR above
-once too. It keeps that record for one version only, the last one it logged either line for. So
+once for each type of exception that ended the check. It keeps that record for one version only, the last one it logged either line for. So
 an earlier version is logged again when it returns after another version that was logged. A
 version in between that logged neither line does not reset the record. That includes at least one
 that verified, and one refused with no failure in the check. A version refused after the check failed part way did log
 its ERROR, so it does reset the record. A hop whose CA list
 gives a different result for the same file logs its own line, and each engine shard logs its own. A system
 root the hop has loaded counts as a listed CA, including one whose serial number is not positive,
-as at least some roots carry. So the same proof against a system root's key refuses the start too.
-A CA certificate the engine cannot read at all is the exception: it is skipped, as though the hop
-did not list it.
+as at least some roots carry. A CRL whose authority key identifier carries such a serial is judged
+too. So the same proof against a system root's key refuses the start too, at least where the
+engine can read both that root and the CRL. A CA certificate the engine cannot read at all is
+skipped, as though the hop did not list it.
 
 The reload is stricter than a start. Under rule 2 it holds back every CRL it cannot confirm against
 a listed CA. Where the engine matches the CRL to a listed CA and cannot confirm the signature with

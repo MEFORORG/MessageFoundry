@@ -134,7 +134,13 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
-from messagefoundry.pki import CrlBlock, CrlFacts, CrlIssuerKey, crl_signature_refusal
+from messagefoundry.pki import (
+    CrlBlock,
+    CrlFacts,
+    CrlIssuerKey,
+    crl_signature_refusal,
+    quoted_issuer,
+)
 from messagefoundry.redaction import log_timestamp
 
 __all__ = [
@@ -758,8 +764,9 @@ def _reload_path(
         # another, such as a proven bad signature, which the reload cannot tell from an unproven
         # one (vault BACKLOG #3506). The remedy says when.
         refusals.strongest = (
-            f"{why}. Not before {log_timestamp(unmet.this_update)}: a start refuses this file too at least until then, "
-            f"since its CRL from issuer {unmet.issuer!r} is not in effect",
+            f"{why}. Not before {log_timestamp(unmet.this_update)}: a start refuses this file "
+            f"too at least until then, since its CRL from issuer "
+            f"{quoted_issuer(unmet.issuer)} is not in effect",
             remedy,
         )
         # Judged again each pass, so the warning goes once its time has passed.

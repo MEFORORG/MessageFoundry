@@ -35,7 +35,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from pydantic import ValidationError
 
 from messagefoundry.config import loaded_crls
@@ -357,7 +359,29 @@ async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_ref
     (in_effect,) = _pass(runner)
     assert in_effect.refusal is not None and in_effect.refusal.remedy == BAD_SIGNATURE
     assert not in_effect.start_refuses
-    assert "a start until then refuses" not in in_effect.refusal.reason
+    assert "at least until then" not in in_effect.refusal.reason
+
+
+async def test_the_caveat_quotes_a_long_issuer_name_with_a_bound(pki: _Pki) -> None:
+    """Vault BACKLOG #3506: the caveat quotes the issuer of the CRL not yet in effect the way the
+    signature check quotes one, cut to a bound, since a name has no length bound of its own."""
+    hop = pki.outbound_hop()
+    runner = _runner(_Sink())
+    long_name = x509.Name(
+        [x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, f"unit-{n:03}") for n in range(80)]
+    )
+    assert len(long_name.rfc4514_string()) > 600  # the premise
+    pki.crl.write_bytes(pki.crl_pem(issued=-_DAY, lasts=90 * _DAY, issuer=long_name))
+
+    (outcome,) = _pass(runner)
+
+    assert outcome.refusal is not None and outcome.start_refuses
+    reason = outcome.refusal.reason
+    assert "is not in effect" in reason and "(cut: the name is" in reason
+    caveat = reason[reason.index("since its CRL from issuer") :]
+    assert len(caveat) < 300
+    assert long_name.rfc4514_string() not in reason[reason.index("Not before") :]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF  # keeps the hop alive to here
 
 
 def test_every_remedy_has_its_own_class_token() -> None:
