@@ -414,7 +414,9 @@ It runs on **Windows**, the engine's only supported deployment platform: `pip-au
 whose environment marker does not match the runner, so a Linux runner never audits the engine's
 Windows-only dependencies. With a `requirements.lock` it also runs the engine's own auditor
 (`python -P -m messagefoundry.security.audit_all_platforms requirements.lock`), which audits every pin
-in the lock whatever its marker; the engine's `docs/ADOPTER-CI.md` lists what it refuses.
+in the lock whatever its marker; the engine's `docs/ADOPTER-CI.md` lists what it refuses. The job
+takes wheels only (`PIP_ONLY_BINARY`), so a dependency with no wheel for Windows fails it rather
+than having its build code run in CI.
 
 ## Transitive supply-chain (your deps, not the engine)
 `gh attestation verify` authenticates the **engine wheel** only; `pip install -r requirements.txt`

@@ -1167,8 +1167,9 @@ reads the code and fails when one of these no longer matches it:
 
 - the section 4 table: a new process start, or a start that changes form, such as a new
   `shell=True`. In the list under *What each child is handed*, each module an item names must call
-  each builder it names. The host cipher probes' timeout and the `OPENSSL_*` names must match
-  `verify/cipher_policy.py`, and each of its starts must pass that timeout;
+  each builder it names. The host cipher probes' timeout, in the paragraph on the host cipher read,
+  and the `OPENSSL_*` names, in the `openssl` start's item, must match `verify/cipher_policy.py`,
+  and each of its starts must pass that timeout;
 - the section 5 module list: a new `ctypes` import, and every library load must name its library
   with a literal;
 - the section 7 parser tables: a parse site the six patterns find that the first two tables omit,

@@ -192,7 +192,10 @@ automatically. Your remediation clock starts without anyone reading an advisory 
 It runs on a **Windows** runner, because Windows is the engine's only supported deployment platform
 and `pip-audit` evaluates each dependency's environment marker against the runner. A dependency whose
 marker does not match is skipped silently, so on a Linux runner the job would never audit the engine's
-Windows-only dependencies (at least `colorama` and `sspilib`):
+Windows-only dependencies (at least `colorama` and `sspilib`). The job sets `PIP_ONLY_BINARY: ":all:"`
+for every `pip` in it, so a dependency with no wheel for Windows fails the job, with or without a
+lock, rather than having its build code run there. Remove the variable only once you have decided
+that package's build code may run in CI:
 
 - **Always**: `pip-audit -r requirements.txt --desc`, which resolves on Windows the closure your
   deployment installs. Without a lock the job also warns that the closure resolves live and unhashed.
@@ -201,9 +204,7 @@ Windows-only dependencies (at least `colorama` and `sspilib`):
   auditor, `python -P -m messagefoundry.security.audit_all_platforms requirements.lock`. That is the
   code the engine's own required audit runs, and the module documents what it checks. It dry-run
   installs the lock with `--require-hashes`, then audits **every pin, whatever its marker**.
-  - The job sets `PIP_ONLY_BINARY: ":all:"`, and the auditor's dry-run passes `--only-binary :all:`
-    itself, so a pin with no wheel for the runner fails the job rather than having its build code
-    run. Remove the variable only once you have decided that package's build code may run in CI.
+  - The auditor's dry-run passes `--only-binary :all:` itself, whatever the job sets.
   - It needs an engine release that ships the module; 0.5.1 and earlier do not, and the job fails
     rather than fall back to an audit that skips pins.
   - It runs `pip-audit --strict`, so a pin PyPI cannot look up (a private package) fails the job,
