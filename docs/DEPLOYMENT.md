@@ -1013,10 +1013,11 @@ hop is already refused by the [hop authority](#channel--tls-posture-matrix), so 
 decides a hop that is *already* verifying.
 
 **The ways across.** There is no `--allow-insecure-bind` for either gate and `MEFOR_ALLOW_INSECURE_TLS`
-does not reach them — but there are **six** crossings, not three. Items 1–4 are the only ones available
-**at the shipped PHI + `enforce` default**. For an outbound connection that leaves three, the same three
-[CONNECTIONS.md](CONNECTIONS.md) lists: stay on loopback, load a CRL the hop checks, or attest that one
-connection. Items 5–6 are what a *changed* posture does, they apply to
+does not reach them — but there are **five** live crossings, not three, and item 5 records a sixth
+that is retired. Items 1–4 are the only ones available **at the shipped PHI + `enforce` default**. For
+an outbound connection that leaves three, the same three [CONNECTIONS.md](CONNECTIONS.md) lists: stay
+on loopback, load a CRL the hop checks, or attest that one connection. Item 6 is what a *changed*
+posture does, and item 5 is what one did until ADR 0186. Both apply to
 the **outbound gate only** (the listener gate reads neither the data label nor `enforcement`, so it
 refuses regardless), and they are the realistic failure mode — a mislabelled box, not a missing
 attestation:
@@ -1027,7 +1028,7 @@ attestation:
    itself and the listener gate never fires. **There is no outbound equivalent you can configure.** The
    authority has a "declared revocation-checking egress terminator" input, but no call site ever sets it
    — routing your egress through such a proxy is good practice and does not change the engine's
-   decision, so an outbound hop still needs option 2's per-connection attestation or option 3.
+   decision, so an outbound hop still needs option 2's per-connection attestation, option 3 or option 4.
 2. **Attest it** — set the environment variable `MEFOR_TLS_REVOCATION_ATTESTED=1`. **It no longer
    clears the OUTBOUND gate on an enforcing instance, and this bullet said for a while that it did.**
    BACKLOG #299 clamped it: the env is held apart from a per-connection attestation and ranks *below*
@@ -1069,9 +1070,10 @@ attestation:
    least one family: a command that opens a store with no posture still refuses an unattested
    off-box Vault (the Vault paragraph above). Also a named loosening in the posture read-out.
 
-Items 5 and 6 are **not supported production settings** and neither is a per-hop decision: both are
-instance-wide, and both leave the refusal-shaped evidence a reviewer looks for **absent rather than
-recorded**. If you are auditing revocation, check those two switches *before* counting attestations.
+Item 6 is **not a supported production setting** and not a per-hop decision: it is instance-wide, and
+it leaves the refusal-shaped evidence a reviewer looks for **absent rather than recorded**. Item 5 can
+no longer be set. If you are auditing revocation, check `[security].enforcement` *before* counting
+attestations.
 
 ---
 

@@ -6015,8 +6015,8 @@ def _write_cert_files(
 
     ``public`` holds ``(path, pem, kind)``, ``kind`` naming the file in a refusal. Each create is
     exclusive, so a file that appeared after the caller's :func:`_refusal_for_existing` check is
-    still never replaced. If a public write fails, every file this run wrote is removed, the key
-    included, and the failure line names any it could not remove. Returns ``None`` when every
+    still never replaced. If a write fails or is interrupted, every file this run wrote is
+    removed, the key included, and the failure line names any it could not remove. Returns ``None`` when every
     file is written, else the command's exit code (BACKLOG #3073; vault BACKLOG #3514 for
     `cert import`)."""
     # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
@@ -6027,45 +6027,43 @@ def _write_cert_files(
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         return _cert_fail(f"cannot create --out-dir {str(out_dir)!r}: {exc}", as_json=as_json)
+    written: list[Path] = []
+    path, kind = key_path, "key"
+    # One try over every write, so an interrupt anywhere between them, even between two files,
+    # still cleans up. BaseException for that reason; anything but an OSError is re-raised.
     try:
-        _write_private_key(key_path, key_pem)
-    except FileExistsError:
-        return _cert_fail(_refuse_overwrite("key", key_path), as_json=as_json)
-    except OSError as exc:
-        return _cert_fail(f"cannot write {key_path}: {exc}", as_json=as_json)
-
-    written = [key_path]
-    for path, pem, kind in public:
-        try:
+        _write_private_key(key_path, key_pem)  # on an OSError it leaves nothing at key_path
+        written.append(key_path)
+        for entry in public:
+            path, pem, kind = entry  # path and kind name the file a failure line reports
             with path.open("xb") as fh:
                 written.append(path)
                 fh.write(pem)
-        except BaseException as exc:
-            # BaseException, so an interrupt between the writes still cleans up; it is re-raised.
-            # Remove only what THIS run wrote, never a file that was already there.
-            removed: list[str] = []
-            left: list[str] = []
-            for done in written:
-                try:
-                    _unlink_generated(done)
-                except FileNotFoundError:
-                    continue  # already gone, so nothing is left to remove
-                except OSError:
-                    left.append(str(done))
-                else:
-                    removed.append(str(done))
-            if not isinstance(exc, OSError):
-                raise
-            reason = (
-                _refuse_overwrite(kind, path)
-                if isinstance(exc, FileExistsError)
-                else f"cannot write {path}: {exc}"
-            )
-            if removed:
-                reason += f"; removed {', '.join(removed)}, which this run wrote"
-            if left:
-                reason += f"; could not remove {', '.join(left)}, so remove it before running again"
-            return _cert_fail(reason, as_json=as_json)
+    except BaseException as exc:
+        # Remove only what THIS run wrote, never a file that was already there.
+        removed: list[str] = []
+        left: list[str] = []
+        for done in written:
+            try:
+                _unlink_generated(done)
+            except FileNotFoundError:
+                continue  # already gone, so nothing is left to remove
+            except OSError:
+                left.append(str(done))
+            else:
+                removed.append(str(done))
+        if not isinstance(exc, OSError):
+            raise
+        reason = (
+            _refuse_overwrite(kind, path)
+            if isinstance(exc, FileExistsError)
+            else f"cannot write {path}: {exc}"
+        )
+        if removed:
+            reason += f"; removed {', '.join(removed)}, which this run wrote"
+        if left:
+            reason += f"; could not remove {', '.join(left)}, so remove it before running again"
+        return _cert_fail(reason, as_json=as_json)
     return None
 
 
@@ -6087,8 +6085,8 @@ def _cert_import(args: argparse.Namespace) -> int:
     a CLI arg and never echoed. A bad password / malformed bundle is
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
     public; key.pem is written by :func:`_write_private_key`. It refuses an existing cert.pem,
-    key.pem or (when the bundle carries CAs) ca-chain.pem before it writes, and if a public file is
-    not written, the files this run wrote are removed (:func:`_write_cert_files`)."""
+    key.pem or ca-chain.pem before it writes, and if a file is not written, the files this run
+    wrote are removed (:func:`_write_cert_files`)."""
     import os
 
     from messagefoundry import pki
@@ -6129,9 +6127,12 @@ def _cert_import(args: argparse.Namespace) -> int:
     public = [(cert_path, pki.cert_to_pem(cert), "certificate")]
     if cas:
         public.append((ca_path, pki.ca_chain_to_pem(cas), "CA chain"))
-    # Refuse every file this run would replace before writing any (vault BACKLOG #3514). cert.pem
-    # and ca-chain.pem were replaced without a word, as `cert self-signed` replaced cert.pem (#3073).
-    refusal = _refusal_for_existing([(p, kind) for p, _pem, kind in public] + [(key_path, "key")])
+    # Refuse before writing any file (vault BACKLOG #3514). cert.pem and ca-chain.pem were replaced
+    # without a word, as `cert self-signed` replaced cert.pem (#3073). An earlier ca-chain.pem is
+    # refused even when this bundle carries no CA, or it would sit beside a key it does not chain.
+    refusal = _refusal_for_existing(
+        [(cert_path, "certificate"), (ca_path, "CA chain"), (key_path, "key")]
+    )
     if refusal is not None:
         return _cert_fail(refusal, as_json=args.json)
 

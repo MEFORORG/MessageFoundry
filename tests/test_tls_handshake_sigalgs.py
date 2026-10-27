@@ -442,9 +442,9 @@ _SITES: dict[str, Callable[[Kit], object]] = {
     "messagefoundry/api/tls.py::build_api_ssl_context::'API/UI listener'": lambda k: (
         api_tls.build_api_ssl_context(ApiSettings(tls_cert_file=k.cert, tls_key_file=k.key))
     ),
-    "messagefoundry/transports/mllp.py::_mllp_ssl_context::'MLLP listener'": _mllp_listener,
+    "messagefoundry/transports/mllp.py::_mllp_ssl_context::listener": _mllp_listener,
     "messagefoundry/transports/dicom.py::_server_ssl_context::'DICOM listener'": _dicom_listener,
-    "messagefoundry/transports/mllp.py::_mllp_ssl_context::'MLLP destination'": lambda k: (
+    "messagefoundry/transports/mllp.py::_mllp_ssl_context::destination": lambda k: (
         mllp._mllp_ssl_context({"tls": True, "host": "localhost"}, server=False)
     ),
     "messagefoundry/transports/dicom.py::_client_ssl_context::connector": lambda k: (

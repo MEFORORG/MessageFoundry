@@ -370,7 +370,9 @@ class InsecureHopGuard:
     that connection alone, ADR 0031). ``serve`` runs no ``build_check`` pre-flight of its own; the live
     build is the check (vault BACKLOG #3514). :meth:`assert_send` is the zero-I/O send-time backstop at
     the byte crossing. Both **no-op when the posture is unstamped** (``None``, such as a direct test
-    build or an embedding that stamps none): with no posture there is no dial to key the decision on."""
+    build or an embedding that stamps none), so such a build crosses a cleartext hop with no refusal
+    and no warning. That is an open path, not a checked one: the runner's live builds are covered
+    only because they stamp."""
 
     host: str
     port: int
@@ -585,12 +587,20 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
 # --- destination -------------------------------------------------------------
 
 
+def _tls_label(family: str, name: str) -> str:
+    """A TLS refusal's label: the family, with the connection's name when the caller passed one, as
+    the runner does, so an operator with several such connections knows which one to fix. A direct
+    build with no name keeps the bare family label (vault BACKLOG #3514)."""
+    return f"{family} {name!r}" if name else family
+
+
 def _mllp_ssl_context(
     s: Mapping[str, Any],
     *,
     server: bool,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
     name: str = "",
+    listener_family: str = "MLLP listener",
 ) -> ssl.SSLContext | None:
     """Build the per-connection MLLP ``SSLContext`` (WP-13b, ADR 0002), or ``None`` when ``tls`` is off.
 
@@ -615,12 +625,14 @@ def _mllp_ssl_context(
     exactly as before.
 
     ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142),
-    and for the TLS refusal labels below, as the DICOM destination's do (vault BACKLOG #3514)."""
-    # Name the connection when the caller passed one, as the runner does, so an operator with several
-    # MLLP connections knows which one to fix. A direct build with no name keeps the bare family label.
-    family = "MLLP listener" if server else "MLLP destination"
-    connector = f"{family} {name!r}" if name else family
-    refuse_an_unread_ca_pin(s, inbound=server, connector=connector)
+    and for the TLS refusal labels below, as the DICOM destination's do (vault BACKLOG #3514).
+    ``listener_family`` names the listener in those labels: the inbound HTTP listener builds its
+    context here too, and passes its own."""
+    refuse_an_unread_ca_pin(
+        s,
+        inbound=server,
+        connector=_tls_label(listener_family if server else "MLLP destination", name),
+    )
     if not s.get("tls"):
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
@@ -655,8 +667,9 @@ def _mllp_ssl_context(
         # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
         # apply_connection_tls_ciphers. Unset (the default) narrows to the approved AEAD suites
         # (BACKLOG #300, the ADR 0188 amendment); set, to the operator's validated string.
-        apply_connection_tls_ciphers(ctx, s, connector=connector)  # opt-in per-hop suite list
-        harden_cipher_suites(ctx, connector=connector)  # assert forward secrecy (ASVS 12.1.2)
+        listener = _tls_label(listener_family, name)
+        apply_connection_tls_ciphers(ctx, s, connector=listener)  # opt-in per-hop suite list
+        harden_cipher_suites(ctx, connector=listener)  # assert forward secrecy (ASVS 12.1.2)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
         return ctx
     # Outbound (client): verify the server cert unless explicitly — and loudly — disabled. #200 (ADR
@@ -706,8 +719,9 @@ def _mllp_ssl_context(
     # See the listener above: narrow first (ADR 0188), assert second, both visible here. The pair runs
     # on the tls_verify=false path too -- a hop that skips certificate verification still negotiates a
     # suite, and an operator who narrowed this connection meant that hop as much as any other.
-    apply_connection_tls_ciphers(ctx, s, connector=connector)  # opt-in per-hop suite list
-    harden_cipher_suites(ctx, connector=connector)  # assert forward secrecy (ASVS 12.1.2)
+    destination = _tls_label("MLLP destination", name)
+    apply_connection_tls_ciphers(ctx, s, connector=destination)  # opt-in per-hop suite list
+    harden_cipher_suites(ctx, connector=destination)  # assert forward secrecy (ASVS 12.1.2)
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
         # #129 (ADR 0094): granular expiry-only relaxation — honour a partner cert whose notAfter has

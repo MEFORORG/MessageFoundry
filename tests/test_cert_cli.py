@@ -375,26 +375,33 @@ def test_import_refuses_to_overwrite_existing_key(
 # --- cert import: no silent replacement, all files or none (vault BACKLOG #3514) -------------
 
 
-def _import_into(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path) -> int:
-    """Import a fresh bundle that carries one CA, so the run writes all three files."""
+def _import_into(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path, *, with_ca: bool = True
+) -> int:
+    """Import a fresh bundle, by default one that carries a CA, so the run writes all three files."""
     monkeypatch.delenv("MEFOR_PFX_PASSWORD", raising=False)
     _ca_key, ca_cert = _make_cert("ca.example.org")
     key, cert = _make_cert("leaf.example.org")
     pfx_path = tmp_path / "b.pfx"
-    pfx_path.write_bytes(_make_pfx(key, cert, cas=[ca_cert]))
+    pfx_path.write_bytes(_make_pfx(key, cert, cas=[ca_cert] if with_ca else None))
     return main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(out), "--json"])
 
 
 @pytest.mark.parametrize(
-    ("existing", "refusal"),
+    ("existing", "refusal", "with_ca"),
     [
-        pytest.param("cert.pem", "an existing certificate file", id="cert"),
-        pytest.param("ca-chain.pem", "an existing CA chain file", id="ca-chain"),
+        pytest.param("cert.pem", "an existing certificate file", True, id="cert"),
+        pytest.param("ca-chain.pem", "an existing CA chain file", True, id="ca-chain"),
+        # A bundle with no CA writes no ca-chain.pem, but an earlier one would sit beside a key it
+        # does not chain, so it is refused too.
+        pytest.param("ca-chain.pem", "an existing CA chain file", False, id="stale-ca-chain"),
+        pytest.param("key.pem", "an existing key file", True, id="key"),
     ],
 )
-def test_import_refuses_to_overwrite_an_existing_public_file(
+def test_import_refuses_to_overwrite_an_existing_file(
     existing: str,
     refusal: str,
+    with_ca: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -407,7 +414,7 @@ def test_import_refuses_to_overwrite_an_existing_public_file(
     out.mkdir()
     (out / existing).write_bytes(b"THE-OPERATORS-FILE\n")
 
-    assert _import_into(tmp_path, monkeypatch, out) == 2
+    assert _import_into(tmp_path, monkeypatch, out, with_ca=with_ca) == 2
     assert f"refusing to overwrite {refusal}" in json.loads(capsys.readouterr().out)["error"]
     assert (out / existing).read_bytes() == b"THE-OPERATORS-FILE\n"
     assert sorted(p.name for p in out.iterdir()) == [existing]

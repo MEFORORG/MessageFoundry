@@ -46,6 +46,7 @@ from messagefoundry.config.wiring import (
     EnvRef,
     FhirLookup,
     Ftp,
+    Http,
     Registry,
     Rest,
     Soap,
@@ -515,6 +516,28 @@ def test_an_unread_mllp_ca_pin_refusal_names_the_connection() -> None:
     settings = {"tls": True, "host": "mllp.internal.example.org", "tls_ca_pin": "ab" * 32}
     with pytest.raises(ValueError, match=r"^MLLP destination 'OB_MLLP': tls_ca_pin is set"):
         mllp._mllp_ssl_context(settings, server=False, name="OB_MLLP")
+
+
+def test_an_http_listener_refusal_names_its_own_family(tmp_path: Path) -> None:
+    """The inbound HTTP listener builds its context through the MLLP builder. Built the way the
+    runner builds it, a refusal names it an HTTP listener, not an MLLP one, with its connection."""
+    cert, key = _self_signed(tmp_path)
+    spec = Http(
+        port=8443, tls=True, tls_cert_file=str(cert), tls_key_file=str(key), tls_ca_pin="ab" * 32
+    )
+    with pytest.raises(ValueError) as caught:
+        build_source(
+            _source_config(
+                build_inbound_connection("IB_HTTP", spec, router="r"),
+                "127.0.0.1",
+                {},
+                TrustAnchorPolicy(),
+            ),
+            egress=EgressSettings(deny_by_default=False),
+        )
+    assert str(caught.value).startswith("HTTP listener 'IB_HTTP': tls_ca_pin is set"), str(
+        caught.value
+    )
 
 
 def test_the_token_hop_reads_the_factory_ca_even_with_verify_tls_off(tmp_path: Path) -> None:
