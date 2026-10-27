@@ -201,7 +201,12 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
       release();
     }
     childProcess.execFile = answeringCli;
-    await trust.engineTrustSettled(); // nothing from this test may run into the next one
+    // A released CLI child queues its refresh a few callbacks later; let it, then wait it out, so
+    // nothing from this test runs into the next one.
+    for (let i = 0; i < 10; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    await trust.engineTrustSettled();
     childProcess.execFile = realExecFile;
     fsPromises.open = realOpen;
     trust.forgetEngineTrust();
@@ -727,10 +732,16 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     // The CLI reads the engine's state partway through its run, so a certificate minted after that
     // read and before the answer is invisible to it.
     stubInventory = NO_CERT_YET;
-    childProcess.execFile = cliThatFirst(() => {
-      if (invocations.length === 0) {
-        void trust.followCertificateChange(LOOPBACK, undefined);
-      }
+    // The failure arrives AFTER the spawn returned, while the child is running, and the CLI answers
+    // after it: delivering it inside execFile would run it before the refresh records the child.
+    stubCli((done) => {
+      const first = invocations.length === 1;
+      setImmediate(() => {
+        if (first) {
+          void trust.followCertificateChange(LOOPBACK, undefined);
+        }
+        setImmediate(() => done(null, JSON.stringify(stubInventory), ""));
+      });
     });
 
     await trust.refreshEngineTrust();
@@ -896,7 +907,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     return { opens, most: () => most };
   }
 
-  type Done = (err: Error, stdout: string, stderr: string) => void;
+  type Done = (err: Error | null, stdout: string, stderr: string) => void;
 
   /** A stubbed CLI that records each call and hands its completion callback to `onCall`. */
   function stubCli(onCall: (done: Done) => void): void {
@@ -924,7 +935,10 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
       const release = answer;
       answer = undefined;
       if (release !== undefined) {
-        held.splice(held.indexOf(release), 1);
+        const at = held.indexOf(release);
+        if (at >= 0) {
+          held.splice(at, 1);
+        }
         release();
       }
     };
@@ -1073,20 +1087,68 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
   });
 
-  test("a failure while an earlier CLI child is alive starts no refresh", async () => {
-    stubInventory = plantedEngine();
-    await trust.refreshEngineTrust();
+  test("a failure while an abandoned CLI child is alive waits for its exit, then asks", async () => {
+    stubInventory = NO_CERT_YET;
     trust.setEngineTrustLimitsForTest({ cliAnswerMs: 50 });
-    hungCli();
-    await trust.refreshEngineTrust();
+    const exit = hungCli();
+    await trust.refreshEngineTrust(); // gives up on the child, which stays alive
     const before = logged.length;
 
-    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, PEM), false);
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), false);
     await ticks();
     await settle();
-
     const skipped = logged.slice(before).filter((line) => line.includes("has not exited"));
     assert.deepStrictEqual(skipped, [], "a refresh started only to skip the CLI");
+
+    // The engine minted its certificate meanwhile; the child's exit asks again and picks it up.
+    stubInventory = plantedEngine();
+    childProcess.execFile = answeringCli;
+    exit();
+    await ticks();
+    await settle();
+    assert.strictEqual(invocations.length, 2, "the child's exit did not ask for the failure");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("pin, dropped: a caFile read whole that holds no certificate drops the anchor", async () => {
+    // Emptied or replaced (DER, garbage) is an answer, not a failure: keeping the old certificate
+    // would go on trusting a CA the user just took away.
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    fs.writeFileSync(caFile, "");
+
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
+  });
+
+  test("CLI, kept: an answer with no api_tls (an older engine) keeps the loopback anchor", async () => {
+    stubInventory = plantedEngine();
+    await trust.refreshEngineTrust();
+    stubInventory = { certs: [] };
+
+    assert.strictEqual(await trust.refreshEngineTrust(), false);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("before the first commit, a caFile removed while the follow read it is not registered", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    let release: (() => void) | undefined;
+    openHook = (file) =>
+      file === path.normalize(caFile)
+        ? new Promise((resolve) => {
+            release = () => resolve(realOpen(file));
+          })
+        : undefined;
+
+    const followed = trust.followCertificateChange(REMOTE, undefined);
+    stubConfig.environments = [{ name: "PROD", url: REMOTE }];
+    assert.ok(release !== undefined, "the follow never opened the file, so this test proves nothing");
+    release();
+
+    assert.strictEqual(await followed, false);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
   });
 
   test("certificate reads are bounded: at most two run at once, abandoned ones included", async () => {

@@ -172,9 +172,18 @@ const readSlotWaiters = new Set<() => void>();
  *  while one is alive, so a child that cannot be killed is never joined by a second. */
 let cliRun: Promise<unknown> | undefined;
 
-/** A refresh skipped the CLI because {@link cliRun} was alive, so when that child exits one more
- *  refresh runs: a setting changed in the meantime is then applied. */
-let cliSkipped = false;
+/** The refresh that started {@link cliRun} stopped waiting for it, and it has not exited. */
+let cliAbandoned = false;
+
+/**
+ * Something needed the CLI while an abandoned child was alive: a refresh skipped it, or a failure
+ * the CLI could answer arrived. When that child exits, one more refresh runs, so a setting changed
+ * or a certificate minted in the meantime is picked up.
+ */
+let cliWanted = false;
+
+/** The extension was deactivated, so an abandoned child's exit starts nothing. */
+let deactivated = false;
 
 /** The tail of the refresh chain. Refreshes run one at a time; see {@link refreshEngineTrust}. */
 let refreshTail: Promise<unknown> = Promise.resolve();
@@ -268,17 +277,12 @@ function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () => T): P
  *     where the source named one, the same file. "Now" includes a renewal a request followed while
  *     this refresh ran.
  *   * no outcome — the key is authoritatively unanchored: no usable pin and no CLI answer names it
- *     (the pin was removed or refused, `engineUrl` moved, the CLI answered with no certificate, or no
- *     trusted workspace remains to ask). Drop it.
+ *     (the pin was removed or refused, its file was read whole and holds no certificate, `engineUrl`
+ *     moved, the CLI answered with no certificate, or no trusted workspace remains to ask). Drop it.
  */
-interface Outcome {
-  /** The source: a `caFile` pin, or the CLI. */
-  readonly pinned: boolean;
-  /** The file that source names, when it named one. */
-  readonly file?: string;
-  /** The certificate read, for `fresh`; absent for `keep`. */
-  readonly fresh?: Registered;
-}
+type Outcome =
+  | Registered
+  | { readonly keep: true; readonly pinned: boolean; readonly file?: string };
 
 /** A certificate file a refresh reads, and the host key it would anchor. */
 interface ToRead {
@@ -297,8 +301,10 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   // This refresh asks the CLI after any failure noted so far, so it covers that failure.
   lateFailure = undefined;
   acceptsLateFailure = !followUp;
-  const reads = pinsToRead(pins);
+  const reads: ToRead[] = [];
   await askCli(claimed, reads, outcomes);
+  // After the CLI's file, so two pins on an unreachable share cannot take both read slots first.
+  reads.push(...pinsToRead(pins));
   // Every file is read only now, after the CLI has answered, so a file rotated in place while the CLI
   // ran is read as rotated: a read already running from before (`since`) is read again.
   const since = readSeq;
@@ -309,10 +315,14 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   for (const [{ key, url, file, pinned }, { read, readAt }] of results) {
     if (read.pem === undefined) {
       engineLog().warn(`${read.problem} — not ${pinned ? "pinning" : "trusting"} ${url}`);
-      outcomes.set(key, { pinned, file });
+      // A caFile that was read whole and holds no certificate is an answer: the user replaced it.
+      // The engine's own file is not, since the engine renews into it in place.
+      if (!(pinned && read.notACertificate)) {
+        outcomes.set(key, { keep: true, pinned, file });
+      }
       continue;
     }
-    outcomes.set(key, { pinned, file, fresh: { url, file, pem: read.pem, pinned, readAt } });
+    outcomes.set(key, { url, file, pem: read.pem, pinned, readAt });
     engineLog().info(
       pinned
         ? `trusting ${file} for ${url} (its caFile in messagefoundry.environments)`
@@ -338,11 +348,11 @@ function commit(outcomes: ReadonlyMap<string, Outcome>): void {
     const sameSource =
       live !== undefined &&
       live.pinned === outcome.pinned &&
-      (outcome.file === undefined || live.file === outcome.file);
-    if (outcome.fresh !== undefined) {
+      (outcome.file === undefined || sameFile(live.file, outcome.file));
+    if (!("keep" in outcome)) {
       // A request may have followed the same file while this refresh read it. Keep whichever read
       // STARTED later, so a rotation the follow path saw is not undone by this older read.
-      register(sameSource && live.readAt > outcome.fresh.readAt ? live : outcome.fresh);
+      register(sameSource && live.readAt > outcome.readAt ? live : outcome);
     } else if (sameSource) {
       register(live);
       engineLog().info(`keeping the certificate read earlier from ${live.file} for ${live.url}`);
@@ -423,12 +433,12 @@ async function askCli(
   const key = engineHostKey(url);
   const inconclusive = (): void => {
     if (key !== undefined && !claimed.has(key)) {
-      outcomes.set(key, { pinned: false });
+      outcomes.set(key, { keep: true, pinned: false });
     }
   };
 
   if (cliRun !== undefined) {
-    cliSkipped = true;
+    cliWanted = true;
     engineLog().warn("an earlier `cert inventory` run has not exited; not starting another");
     inconclusive();
     return;
@@ -448,8 +458,9 @@ async function askCli(
         return;
       }
       cliRun = undefined;
-      if (cliSkipped) {
-        cliSkipped = false;
+      cliAbandoned = false;
+      if (cliWanted && !deactivated) {
+        cliWanted = false;
         void refreshEngineTrustThenRecheck();
       }
     };
@@ -462,12 +473,18 @@ async function askCli(
     return;
   }
   if (payload === CLI_SILENT) {
+    cliAbandoned = true;
     engineLog().warn(`\`cert inventory\` did not report within ${limits.cliAnswerMs / 1000} s`);
     inconclusive();
     return;
   }
 
   const facts = parseApiTls(payload);
+  if (facts === undefined) {
+    // An older engine (no `api_tls`) or a malformed answer says nothing about the certificate.
+    inconclusive();
+    return;
+  }
   // The TARGET and the workspace go into the decision, not just the facts. Computing the file here
   // and choosing whom to register it for separately is what let a local certificate become a remote
   // engine's trust anchor, so the two arrive together or not at all. The decision also carries WHY it
@@ -557,8 +574,11 @@ async function fillFrom(
   return length;
 }
 
-/** A certificate read: the PEM, or why there is none, worded for the log. */
-type PemRead = { pem: string; problem?: undefined } | { pem?: undefined; problem: string };
+/** A certificate read: the PEM, or why there is none, worded for the log. `notACertificate` says the
+ *  file was read whole and holds no PEM certificate, which is an answer rather than a failure. */
+type PemRead =
+  | { pem: string; problem?: undefined; notACertificate?: undefined }
+  | { pem?: undefined; problem: string; notACertificate?: boolean };
 
 /**
  * Read a certificate PEM, or say why it cannot be used.
@@ -583,9 +603,19 @@ async function readAnchorPem(file: string): Promise<PemRead> {
   if (!pem.includes("-----BEGIN CERTIFICATE-----")) {
     return {
       problem: `the engine certificate at ${file} is not PEM (no BEGIN CERTIFICATE block)`,
+      notACertificate: true,
     };
   }
   return { pem };
+}
+
+/** How a file is identified: Windows paths are case-insensitive, as `trustPinsFor` treats them. */
+function fileId(file: string): string {
+  return process.platform === "win32" ? file.toLowerCase() : file;
+}
+
+function sameFile(a: string, b: string): boolean {
+  return fileId(a) === fileId(b);
 }
 
 /** {@link askCli}'s marker for a CLI that did not report in time. */
@@ -619,9 +649,12 @@ function readSlotFreed(deadline: number): Promise<boolean> {
  */
 async function sharedRead(file: string, deadline: number): Promise<StampedRead> {
   for (;;) {
-    const running = inflightReads.get(file);
+    const running = inflightReads.get(fileId(file));
     if (running !== undefined) {
       return withDeadline(running, deadline - performance.now(), () => cutShort(file));
+    }
+    if (performance.now() >= deadline) {
+      return cutShort(file); // a read nobody will wait for would only hold a slot
     }
     if (inflightReads.size < MAX_RUNNING_READS) {
       break;
@@ -634,14 +667,14 @@ async function sharedRead(file: string, deadline: number): Promise<StampedRead> 
   const pending: Promise<StampedRead> = readAnchorPem(file)
     .then((read) => ({ readAt, read }))
     .finally(() => {
-      if (inflightReads.get(file) === pending) {
-        inflightReads.delete(file);
+      if (inflightReads.get(fileId(file)) === pending) {
+        inflightReads.delete(fileId(file));
       }
       for (const wake of [...readSlotWaiters]) {
         wake();
       }
     });
-  inflightReads.set(file, pending);
+  inflightReads.set(fileId(file), pending);
   return withDeadline(pending, deadline - performance.now(), () => cutShort(file));
 }
 
@@ -664,9 +697,8 @@ async function readSince(
 
 /**
  * True when a refresh could anchor `key` from the engine's CLI: it is `messagefoundry.engineUrl`'s
- * host, that host is loopback, no `caFile` claims it (a pin, usable or not, wins over the CLI's
- * answer, so asking would change nothing), and no earlier `cert inventory` child is still alive (a
- * refresh would not start another, and that child's exit queues a refresh of its own when needed).
+ * host, that host is loopback, and no `caFile` claims it (a pin, usable or not, wins over the CLI's
+ * answer, so asking would change nothing).
  */
 function cliCouldAnchor(key: string): boolean {
   const url = engineUrl();
@@ -674,7 +706,6 @@ function cliCouldAnchor(key: string): boolean {
     // askCli's own guard: with no workspace, or an untrusted one, the CLI is never asked.
     !!workspaceDir() &&
     !isExecGated() &&
-    cliRun === undefined &&
     !claimedKeys.has(key) &&
     registered.get(key)?.pinned !== true &&
     key === engineHostKey(url) &&
@@ -685,6 +716,7 @@ function cliCouldAnchor(key: string): boolean {
 /**
  * Start a full refresh for a failure the CLI could answer, without spawning one per failing probe.
  *
+ * While an abandoned `cert inventory` child is alive, none: its exit runs one ({@link cliWanted}).
  * With no refresh pending, at most one per {@link FAILURE_REFRESH_MIN_MS}. With one pending, none at
  * once: a refresh that has not yet asked the CLI will see whatever caused this failure. One already
  * asking may not, since the CLI reads the engine's state partway through its run, so the failure is
@@ -692,6 +724,11 @@ function cliCouldAnchor(key: string): boolean {
  * replaced the anchor the request failed with.
  */
 function noteCliAnchorableFailure(key: string, usedCa: string | undefined): void {
+  if (cliAbandoned) {
+    // A refresh now would not start a second CLI beside it; that child's exit asks instead.
+    cliWanted = true;
+    return;
+  }
   if (refreshesPending > 0) {
     if (refreshesPending === 1 && acceptsLateFailure) {
       lateFailure = { key, usedCa };
@@ -739,11 +776,11 @@ export async function followCertificateChange(
   if (key === undefined) {
     return false;
   }
-  // Before the first refresh commits there is no snapshot, so this reads the configuration, once.
-  const configured =
-    pinFiles === undefined ? pinFilesOf(trustPinsFor(pinTargetsOf(environments()))) : undefined;
+  // Before the first refresh commits there is no snapshot, so this reads the configuration; again
+  // after the read, so a setting changed meanwhile is seen.
   const fileFor = (): string | undefined =>
-    registered.get(key)?.file ?? (pinFiles ?? configured)?.get(key);
+    registered.get(key)?.file ??
+    (pinFiles ?? pinFilesOf(trustPinsFor(pinTargetsOf(environments())))).get(key);
   const file = fileFor();
   // A read already running when this request failed may predate the rotation. Only when it returns
   // the certificate that just failed is the file read again; anything else answers this request.
@@ -758,7 +795,11 @@ export async function followCertificateChange(
   // The file must still be the one that describes this host, and no newer read of it registered: a
   // refresh that read it later, or moved the host to another file, has the newer answer, and the
   // branch below retries against that.
-  const newer = held !== undefined && held.file === file && held.readAt > (stamped?.readAt ?? 0);
+  const newer =
+    held !== undefined &&
+    file !== undefined &&
+    sameFile(held.file, file) &&
+    held.readAt > (stamped?.readAt ?? 0);
   const changed = read !== undefined && read !== usedCa;
   if (file !== undefined && stamped !== undefined && changed && file === fileFor() && !newer) {
     if (read !== held?.pem) {
@@ -802,7 +843,9 @@ export function forgetEngineTrust(): void {
   inflightReads.clear();
   readSlotWaiters.clear();
   cliRun = undefined;
-  cliSkipped = false;
+  cliAbandoned = false;
+  cliWanted = false;
+  deactivated = false;
   limits = LIMITS;
 }
 
@@ -839,7 +882,12 @@ function warnAboutUnanchoredTargets(targets: readonly PinTarget[]): void {
  */
 export function registerEngineTrust(context: vscode.ExtensionContext): void {
   setTrustFailureHandler(followCertificateChange);
-  context.subscriptions.push({ dispose: () => setTrustFailureHandler(undefined) });
+  context.subscriptions.push({
+    dispose: () => {
+      setTrustFailureHandler(undefined);
+      deactivated = true;
+    },
+  });
   void refreshEngineTrustThenRecheck();
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
