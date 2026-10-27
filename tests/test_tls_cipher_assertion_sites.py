@@ -537,11 +537,11 @@ def test_a_plaintext_ldap_bind_is_refused_before_any_tls_context(
     error.
 
     ``ldap://`` builds no ``Tls`` at all. It used to build cleanly behind the removed
-    ``ad_allow_insecure_ldap`` opt-in; now it is refused at every posture (vault BACKLOG #3533 item
-    1), before any context is built. So under a fixture that makes every reachable assertion raise,
-    the error here is the plain-bind refusal and not the assertion. That keeps the LDAPS test above
-    keyed on the scheme, not merely on the constructor running. ``AuthSettings`` refuses a plain
-    bind while AD is on, so this builds with AD off, as a direct caller could.
+    ``ad_allow_insecure_ldap`` opt-in, which showed a construction could finish under this fixture.
+    Now it is refused at every posture (vault BACKLOG #3533 item 1), before any context is built, so
+    this pins only that the plain-bind refusal comes first. It no longer shows that the LDAPS test
+    above is keyed on the scheme; the ``LDAPS bind to AD`` match there is what holds that now.
+    ``AuthSettings`` refuses a plain bind while AD is on, so this builds with AD off.
     """
 
     with pytest.raises(ldap_auth.LdapError, match="refused, with no escape"):

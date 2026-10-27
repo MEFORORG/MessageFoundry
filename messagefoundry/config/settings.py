@@ -5567,7 +5567,13 @@ class AlertsSettings(_Section):
         login, at the serve gate. It lives here rather than there because the shape is decided by
         this section alone, so ``serve``, ``check``, a reload and every CLI command that loads
         settings all refuse it. The send-time refusal of cleartext AUTH stays as a second line."""
-        if self.email_username is None or (self.email_use_tls and self.email_tls_verify):
+        # Gated on a configured relay, as every other [alerts] SMTP check is: with no host there is
+        # no hop, and a username left behind crosses nothing.
+        if (
+            not self.email_smtp_host
+            or self.email_username is None
+            or (self.email_use_tls and self.email_tls_verify)
+        ):
             return self
         knob = (
             "email_use_tls = false, so the hop is cleartext"

@@ -536,6 +536,15 @@ def send_plain_email(
             "credentials require STARTTLS. Set [alerts].email_use_tls=true, or drop "
             "[alerts].email_username/email_password to send unauthenticated."
         )
+    # Vault BACKLOG #3533 item 3: nor to a relay whose certificate is not verified. AlertsSettings
+    # refuses that pair at load; this repeats it for a caller that never built one, such as a
+    # direct EmailTransport or SecurityEventNotifier.
+    if username is not None and not tls_verify:
+        raise ValueError(
+            "alerts SMTP would send AUTH credentials to a relay whose certificate is not verified "
+            "(tls_verify=false); refused, with no escape. Set [alerts].email_tls_verify=true, or "
+            "drop [alerts].email_username/email_password to send unauthenticated."
+        )
     # The Email destination's address rule, here at the chokepoint every caller passes, so a rule's
     # recipient override and a per-user notice address are held to it too. MAIL FROM and RCPT TO are
     # passed explicitly below rather than derived from a parse of the headers (vault BACKLOG #2870).

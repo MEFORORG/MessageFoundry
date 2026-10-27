@@ -708,6 +708,29 @@ def test_neither_way_past_the_serve_gate_lets_a_login_cross(
     assert _LOGIN not in err
 
 
+def test_a_login_with_no_relay_configured_loads() -> None:
+    """With no SMTP host there is no hop, so a username left behind crosses nothing."""
+    AlertsSettings(email_username=_LOGIN, email_use_tls=False)
+    AlertsSettings(email_username=_LOGIN, email_tls_verify=False)
+
+
+def test_the_send_step_refuses_a_login_over_verify_off(smtp: type[_RecordingSMTP]) -> None:
+    """The second line, for a caller that never built an AlertsSettings. On the unchanged code it
+    sends, and the fake records the login on a hop that accepted any certificate."""
+    t = EmailTransport(
+        host="smtp.example",
+        port=587,
+        sender="mf@example",
+        recipients=["ops@x"],
+        tls_verify=False,
+        username="svc",
+        password="pw",
+    )
+    with pytest.raises(ValueError, match="certificate is not verified"):
+        asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "b"}))
+    assert "login" not in smtp.captured, "the credential reached the transport before the refusal"
+
+
 def test_the_acknowledgment_still_starts_a_hop_with_no_login(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

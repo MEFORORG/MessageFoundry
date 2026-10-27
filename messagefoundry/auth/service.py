@@ -2862,8 +2862,7 @@ def _refuse_idp_revocation(
     closed the gap, while telling them to set the CRL they had set.
 
     ``posture`` is PASSED, never read ambiently: ``AuthService`` is built in the API lifespan, outside
-    every ``active_hop_posture`` scope, which is the position ``auth/ldap.py`` is already in. ``None``
-    leaves both guards the shipped no-op.
+    every ``active_hop_posture`` scope. ``None`` leaves both guards the shipped no-op.
 
     ``attested=False`` because no per-hop revocation attestation exists for these legs. There is no
     ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.

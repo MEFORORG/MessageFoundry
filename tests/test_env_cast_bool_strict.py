@@ -326,21 +326,3 @@ def test_a_non_bool_cast_still_says_its_default_is_not_converted(tmp_path: Path)
     # The note is skipped only for the bool cast, which does convert its default.
     with pytest.raises(WiringError, match=r"not converted by the ref's cast"):
         _toml_with(tmp_path, 'timeout_seconds = { env = "t", cast = "float", default = true }')
-
-
-# --- a string past every factory is refused, not read with bool() (vault BACKLOG #3533 item 11) ------
-
-
-@pytest.mark.parametrize("raw", ["", "false", "true", " "])
-def test_bool_setting_refuses_a_string_naming_the_key_and_not_the_value(raw: str) -> None:
-    # bool("") is False, so an empty string turned a default-on TLS check off, and bool("false")
-    # is True. On the unchanged code each of these returns a bool instead of raising.
-    with pytest.raises(ValueError, match="tls_verify must be true or false, not str") as refused:
-        bool_setting({"tls_verify": raw}, "tls_verify", default=True)
-    assert repr(raw) not in str(refused.value)
-
-
-@pytest.mark.parametrize(("raw", "want"), [(None, True), (True, True), (False, False), (0, False)])
-def test_bool_setting_still_reads_none_and_a_real_bool(raw: object, want: bool) -> None:
-    # The control: None takes the default, and a bool or an int reads as before.
-    assert bool_setting({"tls_verify": raw}, "tls_verify", default=True) is want

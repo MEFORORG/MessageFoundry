@@ -4226,8 +4226,14 @@ def test_the_loosening_guide_lists_a_plain_ldap_bind_as_refused_not_as_a_looseni
     assert re.search(r"^\| `\[auth\]` AD binds \| `ad_server` is a plain `ldap://`", table, re.M), (
         "the refusal table does not name the plain ldap:// AD bind"
     )
-    not_reached = rest.split("\n\n", 2)[1]
-    assert "ldap://" not in not_reached, "the not-reached list still names the plain ldap:// bind"
+    end = rest.find("\nAn SFTP login")
+    bullets = [
+        line for line in rest[: end if end != -1 else None].splitlines() if line.startswith("- ")
+    ]
+    assert bullets, "found no bullets under the not-reached heading, so this check reads nothing"
+    assert not [b for b in bullets if "ldap://" in b], (
+        "the not-reached list still names the plain ldap:// bind"
+    )
 
 
 def test_the_thirteenth_sweep_phi_qualifies_the_second_factor_for_oidc() -> None:
