@@ -69,6 +69,10 @@ log = logging.getLogger(__name__)
 # backoff (wiring_runner._WORKER_ERROR_BACKOFF_SECONDS). Only the faulting lane pauses; siblings and
 # the claimer are untouched.
 _LANE_ERROR_BACKOFF_SECONDS = 1.0
+
+# BACKLOG #1611: a serializer whose re-pend of its claimed rows failed retries it on a doubling
+# backoff from _LANE_ERROR_BACKOFF_SECONDS, capped here, holding its lane meanwhile.
+_REPEND_RETRY_CAP_SECONDS = 30.0
 # Claimer store-error backoff: the whole chunk's lanes return to READY and this claimer's partition
 # pauses ~this long (chunk-scoped; raise K to shrink the blast radius). ADR 0066 §11 item 1.
 _CLAIM_ERROR_BACKOFF_SECONDS = 1.0
@@ -1290,34 +1294,31 @@ class StageDispatcher:
         state mutation runs synchronously after the (async) tail release so it is atomic on the loop
         (no double-dispatch window)."""
         outcome, tail_ids, head_reschedule = await self._drain_lane(lane, items)
-        # Fix A (ADR 0070): re-pend the T17 head with a DURABLE backoff BEFORE the tail release — a
-        # store write, best-effort (a failure leaves it INFLIGHT for reset_stale_inflight/the sweep).
+        # Fix A (ADR 0070): re-pend the T17 head with a DURABLE backoff BEFORE the tail release.
         # This is NOT release_claimed: it dates the head into the future so it reads not-due (collapsing
         # the ~4×/s spin) rather than past-due (which re-readies it at the sweep cadence).
+        #
+        # BACKLOG #1611: both writes are retried until they land, while this serializer still HOLDS
+        # the lane (PROCESSING, slot reserved), so no claim takes a later row past a stranded one. A
+        # stop ends the retry and leaves the rows INFLIGHT for reset_stale_inflight at the next start,
+        # as a cancelled serializer's are; the in-flight watch pages them meanwhile.
         if head_reschedule is not None:
             head_id, when = head_reschedule
-            try:
-                await self._store.reschedule_claimed([head_id], when)
-            except Exception:  # noqa: BLE001 — recovery covers a failed reschedule; don't stall the lane
-                log.warning(
-                    "StageDispatcher %s reschedule_claimed failed for lane %s head",
-                    self._stage.value,
-                    lane,
-                    exc_info=True,
-                )
-        # Async tail release BEFORE the synchronous transition. Best-effort: a release failure leaves
-        # the tail INFLIGHT for reset_stale_inflight/the sweep to recover — never blocks the transition.
-        if tail_ids:
-            try:
-                await self._store.release_claimed(tail_ids)
-            except Exception:  # noqa: BLE001 — recovery covers a failed release; do not stall the lane
-                log.warning(
-                    "StageDispatcher %s release_claimed failed for lane %s (%d rows)",
-                    self._stage.value,
-                    lane,
-                    len(tail_ids),
-                    exc_info=True,
-                )
+            # A retry dates the head from now, so it never lands already past-due.
+            if not await self._land_while_holding(
+                lane,
+                "reschedule_claimed of the head",
+                lambda: self._store.reschedule_claimed(
+                    [head_id], max(when, self._clock() + _LANE_ERROR_BACKOFF_SECONDS)
+                ),
+            ):
+                return
+        if tail_ids and not await self._land_while_holding(
+            lane,
+            f"release_claimed of {len(tail_ids)} row(s)",
+            functools.partial(self._store.release_claimed, tail_ids),
+        ):
+            return
         # --- synchronous terminal transition (NO await below) -------------------------------------
         # S_lane (ARM 1): read the episode clock ONCE, here, before the outcome branch — re-reading it
         # inside each branch would silently fold the branch's own work into the episode and costs extra
@@ -1428,6 +1429,51 @@ class StageDispatcher:
         already exceeds the ~60 s cap). 10 consecutive zero-progress faults span ~4 min of wall clock —
         the count is really a duration gate."""
         return _capped_backoff(_LANE_ERROR_BACKOFF_SECONDS, streak, self._infra_fault_backoff_cap)
+
+    async def _land_while_holding(
+        self, lane: str, what: str, write: Callable[[], Awaitable[object]]
+    ) -> bool:
+        """Run ``write``, a re-pend of rows this serializer claimed, until it lands, on a capped
+        backoff (BACKLOG #1611). Returns False if the dispatcher stopped first; the rows then stay
+        INFLIGHT for ``reset_stale_inflight`` at the next start.
+
+        The caller still holds the lane, so nothing claims a later row past the ones being re-pended,
+        and no clock or ownership guess is needed: the serializer is the lane's only consumer and
+        knows which rows it holds. A failure is logged at WARNING on a backoff (1st, 2nd, 4th ...)
+        with a line when the write lands; counts and the exception only, never a row's content."""
+        run = FailureRun()
+        while True:
+            try:
+                await write()
+            except Exception as exc:  # noqa: BLE001 — retried while holding the lane; see the docstring
+                run = run.record(
+                    log,
+                    exc,
+                    "StageDispatcher %s lane %s: %s failed; holding the lane and retrying, so no "
+                    "later row overtakes it",
+                    self._stage.value,
+                    lane,
+                    what,
+                    level=logging.WARNING,
+                )
+            else:
+                if run.count:
+                    run.clear(
+                        log,
+                        "StageDispatcher %s lane %s: %s",
+                        self._stage.value,
+                        lane,
+                        what,
+                        level=logging.WARNING,
+                    )
+                return True
+            await self._sleep_or_stop(
+                _capped_backoff(
+                    _LANE_ERROR_BACKOFF_SECONDS, run.count - 1, _REPEND_RETRY_CAP_SECONDS
+                )
+            )
+            if self._stop.is_set():
+                return False
 
     async def _drain_lane(
         self, lane: str, items: list[OutboxItem]

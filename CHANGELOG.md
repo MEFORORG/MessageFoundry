@@ -6,6 +6,17 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A row stranded in flight is recovered without a restart, and nothing overtakes it.** A store
+  fault between a committed claim and its handoff leaves the row `inflight`, and the worker's
+  re-pend of it can fail too. A worker, or a pooled lane serializer, whose re-pend fails now
+  retries it on a capped backoff while it holds the lane, claiming nothing newer until the row is
+  pending again, so per-lane order holds. A per-lane worker that dies holding a row has the rows on
+  its own lane re-pended before its replacement claims anything; clustered, that step stands down,
+  as the unconditional startup reset does. A stop during the retry leaves the row in flight for the
+  next start, as before. While the store stays down the row stays in flight, and the in-flight
+  watch added in 0.5.0 still pages it. (`BACKLOG #1611`)
+
 ## [0.5.2] — 2026-10-20 — Early Access
 
 This engine pairs with web console 0.5.0, which is published after it under its own

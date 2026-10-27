@@ -189,9 +189,11 @@ from messagefoundry.pipeline.sandbox import (
 from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.pipeline.stage_dispatcher import (
+    _REPEND_RETRY_CAP_SECONDS,
     LaneItemResult,
     LaneResultKind,
     StageDispatcher,
+    _capped_backoff,
 )
 from messagefoundry.pipeline.sync_reply import SyncReplyMetrics, SyncReplyResolverImpl
 from messagefoundry.redaction import safe_exc, safe_text
@@ -450,6 +452,22 @@ class ShardLaneOwnershipError(RuntimeError):
 # A delivery worker backs off this long after an *unexpected* error (e.g. the store being briefly
 # unavailable) before retrying, so a transient failure logs once and recovers instead of hot-looping.
 _WORKER_ERROR_BACKOFF_SECONDS = 1.0
+
+# The stage each per-lane inbound worker kind consumes, keyed on the inbound's channel_id.
+_INBOUND_WORKER_STAGE = {
+    "router": Stage.INGRESS,
+    "transform": Stage.ROUTED,
+    "response": Stage.RESPONSE,
+}
+
+
+def _left_a_lane(prev: asyncio.Task[None] | None) -> bool:
+    """Whether a spawn replaces a worker that FINISHED -- returned, or died on an exception -- so the
+    replacement recovers the lane before its first claim (BACKLOG #1611). A first spawn has no
+    predecessor; the startup reset covered it. A cancelled one is teardown's, whose rows wait for
+    the next start by design (ADR 0066). A live one is never recovered over: its rows may be
+    mid-send, and every caller spawns only over a missing or finished worker anyway."""
+    return prev is not None and prev.done() and not prev.cancelled()
 
 
 # A per-lane worker's run of faults closes on the first healthy pass or empty claim at least this
@@ -811,8 +829,8 @@ def _log_inflight_strand(stage: str, name: str, count: int, age: float) -> None:
     in flight rather than pending, so this line does. Lane name and counts only, never content."""
     log.warning(
         "%d row(s) held in flight on %s lane %r, oldest claimed %.0fs ago with no handoff; "
-        "a stranded row stays in flight until a store recovery path re-pends it, at least a "
-        "restart",
+        "a worker that could not re-pend its row holds the lane and retries, and a stranded row "
+        "stays in flight until a recovery path re-pends it",
         count,
         stage,
         name,
@@ -6065,7 +6083,12 @@ class RegistryRunner:
                 self.registry.shard_id,
             )
             return
-        task = asyncio.create_task(self._delivery_worker(name))
+        prev = self._workers.get(name)
+        task = asyncio.create_task(
+            self._recover_then_run(Stage.OUTBOUND, name, self._delivery_worker)
+            if _left_a_lane(prev)
+            else self._delivery_worker(name)
+        )
         task.add_done_callback(functools.partial(self._on_worker_done, name))
         self._workers[name] = task
         # A fresh worker is what re-arms a lane whose worker a STOP returned, whichever door spawned
@@ -6151,7 +6174,13 @@ class RegistryRunner:
     def _spawn_inbound_worker(self, kind: str, name: str) -> None:
         """Start the ``kind`` (router/transform) worker for one inbound connection."""
         workers = self._inbound_worker_dict(kind)
-        task = asyncio.create_task(self._inbound_worker_coro(kind)(name))
+        worker = self._inbound_worker_coro(kind)
+        prev = workers.get(name)
+        task = asyncio.create_task(
+            self._recover_then_run(_INBOUND_WORKER_STAGE[kind], name, worker)
+            if _left_a_lane(prev)
+            else worker(name)
+        )
         task.add_done_callback(functools.partial(self._on_inbound_worker_done, kind, name))
         workers[name] = task
 
@@ -6939,11 +6968,7 @@ class RegistryRunner:
             return task.done() and not task.cancelled() and task.exception() is None
 
         scopes: list[tuple[Stage, OwnedLanes]] = []
-        for kind, stage in (
-            ("router", Stage.INGRESS),
-            ("transform", Stage.ROUTED),
-            ("response", Stage.RESPONSE),
-        ):
+        for kind, stage in _INBOUND_WORKER_STAGE.items():
             names = frozenset(n for n, t in self._inbound_worker_dict(kind).items() if returned(t))
             if names:
                 scopes.append((stage, OwnedLanes(channels=names, destinations=frozenset())))
@@ -6969,6 +6994,75 @@ class RegistryRunner:
             )
         if recovered:
             log.info("reload: re-pended %d row(s) a stopped worker left in flight", recovered)
+        return recovered
+
+    async def _recover_then_run(
+        self, stage: Stage, name: str, worker: Callable[[str], Awaitable[None]]
+    ) -> None:
+        """A replacement per-lane worker's body: recover the lane, then run the worker. The
+        recovery is awaited first, so nothing on the lane is claimed before it (BACKLOG #1611)."""
+        await self._recover_respawned_lane(stage, name)
+        await worker(name)
+
+    async def _recover_respawned_lane(self, stage: Stage, name: str) -> int:
+        """Re-pend what a FINISHED per-lane worker left INFLIGHT on its own lane, before its
+        replacement's first claim (BACKLOG #1611 step 2). Returns the rows re-pended.
+
+        It covers at least a worker killed by a ``BaseException`` that is not an ``Exception`` (the
+        loops catch ``Exception`` only, so it dies holding its claimed row, and
+        :meth:`_on_worker_done` / :meth:`_on_inbound_worker_done` respawn it), and a STOPPED
+        worker whose tail release failed (:meth:`_release_tail_on_stop`) and which an operator, an
+        alert rule or a reload re-arms. Without it the row stayed in flight, invisible to every
+        claim, while the replacement drained its successors past it until a restart.
+
+        **No clock, no age, and no ownership guess.** The discriminator is the worker state: the
+        predecessor is done (:func:`_left_a_lane`), and each lane has exactly one consumer (ADR
+        0059, ADR 0066 D4, which :meth:`_spawn_worker` refuses to break), so nothing live holds a
+        row on this lane while its replacement has not yet claimed. The reset is the
+        ownership-scoped ``reset_stale_inflight`` the reload backstop
+        (:meth:`_recover_stopped_worker_residue`) uses, scoped to this one stage and lane.
+
+        The claim's ``attempts`` increment stands, as under the startup reset. That is by design:
+        ADR 0057 G6 needs it, so a row that kills its worker on every pass still dead-letters at
+        ``max_attempts`` instead of crash-looping forever.
+
+        CLUSTERED, IT STANDS DOWN, exactly where ``Engine.start()`` skips its unconditional reset
+        (``reclaims_inflight()``). An ex-leader may still hold a row on this lane mid-send, and
+        nothing here can tell its rows from the dead worker's. Recovery there stays where it was:
+        the leader's lease-reclaim sweep (Postgres) or the on-promotion reset (SQL Server). A node
+        that is not the leader runs nothing either. Single-node and engine-sharded, the lane is
+        this node's own: a worker exists only for a lane this shard owns (ADR 0073), and the scope
+        is that lane alone, so a sibling shard's rows are out of reach.
+
+        Best effort: a failure logs and leaves the rows for the next start, and the in-flight watch
+        (:meth:`_check_inflight_strands`) still pages them on claim age."""
+        if self._coordinator.reclaims_inflight() or not self._coordinator.is_leader():
+            return 0
+        lane = frozenset({name})
+        owned = (
+            OwnedLanes(channels=frozenset(), destinations=lane)
+            if stage is Stage.OUTBOUND
+            else OwnedLanes(channels=lane, destinations=frozenset())
+        )
+        try:
+            recovered = await self.store.reset_stale_inflight(stage=stage.value, owned=owned)
+        except Exception:  # noqa: BLE001 — best effort; see the docstring
+            log.warning(
+                "%s lane %r: recovery of rows a finished worker left in flight failed; they stay "
+                "INFLIGHT for the next start, and the in-flight watch pages them",
+                stage.value,
+                name,
+                exc_info=True,
+            )
+            return 0
+        if recovered:
+            log.warning(
+                "%s lane %r: re-pended %d row(s) a finished worker left in flight, before its "
+                "replacement's first claim",
+                stage.value,
+                name,
+                recovered,
+            )
         return recovered
 
     async def _warn_stranded_by_dropped_inbounds(
@@ -8046,49 +8140,86 @@ class RegistryRunner:
         ids: Sequence[str],
         *,
         faults: _WorkerFaultLog | None = None,
-    ) -> None:
-        """Best-effort re-pend of the rows a per-lane worker was holding when its loop faulted
-        (BACKLOG #1611 step 1) — the per-lane analogue of the pooled T17 head re-pend in
-        :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
+    ) -> bool:
+        """Re-pend the rows a per-lane worker was holding when its loop faulted, retrying until the
+        write lands (BACKLOG #1611 steps 1 and 2) — the per-lane analogue of the pooled T17 head
+        re-pend in :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
+        Returns True when the runner was stopped while the rows were still held, so the caller
+        returns rather than claiming again.
 
         The claim is its own committed transaction, so a fault in the handoff that follows leaves the
-        claimed row INFLIGHT. Every claim path selects ``status='pending'``, so the surviving worker
-        never reconsiders it, and ``reset_stale_inflight`` runs from ``Engine.start()``, the
-        cluster promotion path, and a ``reload()`` for a worker that has RETURNED (ADR 0157 Inc 2)
-        -- which this surviving worker has not. Without this the row waits for a
-        service restart, overtaken by its successors, while ``pending_depth`` (pending rows only)
-        reports the lane healthy to the buildup and stall alerts.
+        claimed row INFLIGHT. Every claim path selects ``status='pending'``, so a worker that went on
+        claiming would take the row's successor and deliver it first, a per-lane FIFO break, while
+        ``pending_depth`` (pending rows only) reports the lane healthy.
+
+        **So a failed re-pend is retried, on a capped backoff, while the worker HOLDS the lane**: it
+        claims nothing new until the stranded rows are pending again. That is what keeps per-lane
+        FIFO, and it needs no clock and no ownership guess, because the worker retrying is the lane's
+        only consumer (ADR 0059) and knows which rows it holds. A store that stays down keeps the
+        rows in flight, and the runner's in-flight watch pages them on their claim age
+        (:meth:`_check_inflight_strands`), which nothing here touches.
+
+        A runner stop ends the retry and leaves the rows INFLIGHT for ``reset_stale_inflight`` at
+        the next start, as a cancelled worker's are; the backoff is :meth:`_stop_or_sleep`, and the
+        task stays cancellable. A node that is no longer the leader stops retrying too: the rows
+        then belong to the successor's promotion recovery.
 
         Dates the rows into the future by the same backoff the caller is about to sleep, exactly as
         T17 does and for the same reason: a plain release leaves them past-due, so the sweep re-readies
         them and a broken dependency is re-claimed ~4x/s. ``reschedule_claimed`` is guarded
         ``status='inflight'`` and FIFO-neutral (``seq`` is never re-minted), so rows the worker already
         resolved are left untouched and the survivors keep their lane position — which is why a caller
-        may pass its whole claimed batch without tracking which row died.
+        may pass its whole claimed batch without tracking which row died. The claim's ``attempts``
+        increment stands, as it does under ``reset_stale_inflight``: ADR 0057 G6 needs it, so a row
+        that faults every pass is still bounded by ``max_attempts``.
 
-        Wrapped in its own ``except`` because a re-pend that raises inside an except arm would kill the
-        worker, which is strictly worse than the leak it fixes; a failure here simply falls back to the
-        pre-existing recovery (``reset_stale_inflight`` at the next start).
-
-        A worker loop passes its ``faults`` (BACKLOG #1844), and a failure is then logged on that
-        worker's backoff rather than once per pass: a busy-timeout that fails the handoff tends to fail
-        this write on the same passes.
+        A failure is caught, never raised: a re-pend that raises inside an except arm would kill the
+        worker and leave the rows to the respawn's recovery (:meth:`_recover_respawned_lane`), a
+        detour with no gain. It is logged at WARNING on the worker's ``faults`` backoff (BACKLOG
+        #1844), one line per 1st, 2nd, 4th ... failure and a line when the write lands; a caller
+        without one gets a backoff of its own. The line carries counts and the exception, never a
+        row's content.
         """
         if not ids:
-            return
-        try:
-            await self.store.reschedule_claimed(
-                list(ids), time.time() + _WORKER_ERROR_BACKOFF_SECONDS
-            )
-        except Exception as exc:  # noqa: BLE001 — recovery must never kill the worker; see the docstring
-            message = (
-                "%s worker %r: reschedule_claimed failed for %d claimed row(s); they stay INFLIGHT "
-                "for reset_stale_inflight at the next start"
-            )
-            if faults is None:
-                log.warning(message, worker, name, len(ids), exc_info=True)
+            return False
+        rows = list(ids)
+        log_to = faults if faults is not None else _WorkerFaultLog(worker, name)
+        failures = 0
+        while True:
+            try:
+                await self.store.reschedule_claimed(
+                    rows, time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+                )
+            except Exception as exc:  # noqa: BLE001 — retried while holding the lane; see the docstring
+                failures += 1
+                log_to.repend_failed(
+                    exc,
+                    "%s worker %r: reschedule_claimed failed for %d claimed row(s); holding the lane "
+                    "and retrying, so no later row overtakes them",
+                    worker,
+                    name,
+                    len(rows),
+                )
             else:
-                faults.repend_failed(exc, message, worker, name, len(ids))
+                # A worker's own `faults` closes the re-pend run on quiet, with its main run
+                # (#1844); a log made for this call alone is never closed, so it says so here.
+                if failures and faults is None:
+                    log.warning(
+                        "%s worker %r: reschedule_claimed landed for %d claimed row(s) after %d "
+                        "failed attempt(s); the lane resumes",
+                        worker,
+                        name,
+                        len(rows),
+                        failures,
+                    )
+                return False
+            if not self._coordinator.is_leader():
+                return False  # the successor's promotion recovery owns them now
+            delay = _capped_backoff(
+                _WORKER_ERROR_BACKOFF_SECONDS, failures - 1, _REPEND_RETRY_CAP_SECONDS
+            )
+            if await self._stop_or_sleep(delay):
+                return True
 
     async def _release_tail_on_stop(self, worker: str, name: str, ids: Sequence[str]) -> None:
         """Best-effort release of the batch tail a per-lane worker still holds when it RETURNS on a
@@ -8106,8 +8237,9 @@ class RegistryRunner:
 
         Without this the tail stayed INFLIGHT, invisible to every claim, and a worker re-armed by an
         operator ``start_*`` / ``restart_*`` (or an alert rule's auto-restart) drained newer rows past
-        it until the next start. A failure here logs and leaves the rows for the reload-time backstop
-        (:meth:`_recover_stopped_worker_residue`) or the next start."""
+        it until the next start. A failure here logs and leaves the rows for at least the
+        replacement worker's own recovery before its first claim (:meth:`_recover_respawned_lane`),
+        the reload-time backstop (:meth:`_recover_stopped_worker_residue`), or the next start."""
         if not ids or not self._coordinator.is_leader():
             return
         try:
@@ -8115,7 +8247,7 @@ class RegistryRunner:
         except Exception:  # noqa: BLE001 — a stopping worker must not raise out of its return
             log.warning(
                 "%s worker %r: release_claimed failed for %d claimed row(s) on stop; they stay "
-                "INFLIGHT for the reload-time backstop or the next start",
+                "INFLIGHT until the lane's next worker, a reload or the next start recovers them",
                 worker,
                 name,
                 len(ids),
@@ -8276,7 +8408,8 @@ class RegistryRunner:
                 # #1844: log with a backoff, not a traceback per pass (see _WorkerFaultLog).
                 faults.failed(exc, "delivery worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("delivery", name, claimed, faults=faults)
+                if await self._repend_claimed_on_fault("delivery", name, claimed, faults=faults):
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9119,7 +9252,8 @@ class RegistryRunner:
                 # back off, and keep going (mirrors the delivery worker). #1844: with a backoff.
                 faults.failed(exc, "router worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("router", name, claimed, faults=faults)
+                if await self._repend_claimed_on_fault("router", name, claimed, faults=faults):
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9466,7 +9600,8 @@ class RegistryRunner:
                 # log, back off, keep going (mirrors the router/delivery workers). #1844: with a backoff.
                 faults.failed(exc, "response worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("response", name, claimed, faults=faults)
+                if await self._repend_claimed_on_fault("response", name, claimed, faults=faults):
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9592,7 +9727,8 @@ class RegistryRunner:
                     exc, "transform worker %r: unexpected error; backing off and retrying"
                 )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("transform", name, claimed, faults=faults)
+                if await self._repend_claimed_on_fault("transform", name, claimed, faults=faults):
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -10530,11 +10666,13 @@ class RegistryRunner:
 
         **Why this exists.** A claim is its own committed transaction, so a store fault between it and
         the handoff leaves the row ``inflight``. Part A made the per-lane workers re-pend it, and the
-        pooled dispatcher already did (T17), but both re-pends are store writes that can fail too.
-        What is left then is recovered by ``reset_stale_inflight`` at the next start, and nothing
-        before that. It is invisible to ``pending_depth``, so the buildup and stall alerts read the
-        lane healthy, and those alerts only run from the lane's own processing path, which a strand
-        has stopped. This check runs on its own clock and reads in-flight rows directly.
+        pooled dispatcher already did (T17). Both re-pends are store writes that can fail too, so
+        since step 2 each retries its write while holding the lane, and a worker that died holding a
+        row has it recovered before its replacement's first claim. A store that stays down keeps the
+        row in flight for as long as it stays down. It is invisible to ``pending_depth``, so the
+        buildup and stall alerts read the lane healthy, and those alerts only run from the lane's own
+        processing path, which a strand has stopped. This check runs on its own clock and reads
+        in-flight rows directly, so it pages whichever recovery is still waiting.
 
         **What it pages, on which threshold.** Every lane fires ``queue_buildup`` on the age its
         pending check uses: an outbound lane's resolved :class:`BuildupThreshold`, and the global
@@ -10549,11 +10687,13 @@ class RegistryRunner:
         past the threshold is either stranded or in a send or transform that has run that long, and
         an operator wants the page in both cases.
 
-        **It does not recover the row.** A reclaim would have to know which in-flight rows no live
-        task still holds, and the pooled dispatcher keeps a claimed prefix inside its own serializer
-        where this runner cannot see it. Re-pending a held row sends it twice. So this pages, and
-        the store's existing recovery paths still re-pend. They include at least
-        ``reset_stale_inflight`` at a single-node start and, on Postgres only, the expired-lease
+        **It does not recover the row.** A reclaim from here would have to know which in-flight rows
+        no live task still holds, and the pooled dispatcher keeps a claimed prefix inside its own
+        serializer where this runner cannot see it. Re-pending a held row sends it twice. So this
+        pages, and recovery stays with the holder: the worker or serializer retrying its own re-pend
+        (:meth:`_repend_claimed_on_fault`, the dispatcher's ``_run_lane``), a replacement worker's
+        recovery of its own lane (:meth:`_recover_respawned_lane`), and the store's paths. Those
+        include at least ``reset_stale_inflight`` at a single-node start and, on Postgres only, the expired-lease
         reclaim inside the FIFO head claims plus the clustered leader's ``reclaim_expired_leases``
         sweep. An ``ordering=unordered`` lane claims through ``claim_ready``, which has no such
         reclaim. And on a FIFO lane the lease reclaim re-pends the row after its successors have
