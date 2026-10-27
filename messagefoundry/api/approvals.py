@@ -2263,7 +2263,7 @@ class ApprovalGate:
         except RowSealError:
             await self._approval_seal_failed(str(found["id"]))
             return None
-        if approval_seal_ok(self._store.row_sealer(), row):
+        if await approval_seal_ok(self._store.row_sealer(), row):
             return row
         await self._approval_seal_failed(row.id)
         return None

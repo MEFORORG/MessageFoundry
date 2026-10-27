@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -84,7 +85,7 @@ async def test_the_contract_fails_when_the_service_checks_no_seal(
     import messagefoundry.auth.service as service_module
 
     store, path = keyed
-    monkeypatch.setattr(service_module, "session_seal_ok", lambda sealer, record: True)
+    monkeypatch.setattr(service_module, "session_seal_ok", AsyncMock(return_value=True))
     with pytest.raises(AssertionError):
         await assert_session_seal_contract(store, _raw_for(path))
 
@@ -214,7 +215,7 @@ async def test_a_keyless_store_writes_no_seal_and_checks_none(tmp_path: Path) ->
             token_hash=hash_token(token), user_id="u", expires_at=time.time() + 3600
         )
         row = await store.get_session(hash_token(token))
-        assert row is not None and row.seal == "" and session_seal_ok(None, row)
+        assert row is not None and row.seal == "" and await session_seal_ok(None, row)
         assert await AuthService(store, AuthSettings()).identity_for_token(token) is not None
     finally:
         await store.close()

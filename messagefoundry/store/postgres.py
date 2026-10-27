@@ -177,6 +177,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     RowSealer,
     RowSealError,
+    Sealer,
 )
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
@@ -1659,7 +1660,7 @@ class PostgresStore:
         self._settings = settings
         self._cipher: Cipher = cipher or IdentityCipher()
         # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
-        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
+        self._row_sealer: Sealer | None = RowSealer.for_cipher(self._cipher)
         # A1 live cost counters (QueueStore protocol / `/stats` uniformity). Exposed at 0 on this backend:
         # counting is fully wired on SQLite + SQL Server, whose explicit ``conn.commit()`` / body-insert
         # sites funnel through single helpers; Postgres commits implicitly via ``async with
@@ -8297,7 +8298,7 @@ class PostgresStore:
                 await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
                 # The open-request rule is the Store protocol's; the SQLite and SQL Server
                 # twins state it in their own SQL, and the shared repeat contract checks all three.
-                joined = first_sealed_approval(
+                joined = await first_sealed_approval(
                     self._row_sealer,
                     await conn.fetch(
                         _PG_APPROVAL_SELECT + " WHERE operation = $1 AND params = $2"
@@ -8329,10 +8330,13 @@ class PostgresStore:
         transaction. Returns whether a row was written."""
         sealer = self._row_sealer
         if current is None:
-            await conn.execute(_PG_APPROVAL_INSERT, *seal_approval(sealer, new).write_params())
+            await conn.execute(
+                _PG_APPROVAL_INSERT, *(await seal_approval(sealer, new)).write_params()
+            )
             return True
         result = await conn.execute(
-            _PG_APPROVAL_UPDATE, *approval_update(sealer, current, new).update_params(current)
+            _PG_APPROVAL_UPDATE,
+            *(await approval_update(sealer, current, new)).update_params(current),
         )
         return _rowcount(result) > 0
 
@@ -8785,7 +8789,7 @@ class PostgresStore:
         # BACKLOG #2592: the whole row, sealed, in one INSERT.
         await self._execute_with_audits(
             _PG_USER_INSERT,
-            user_insert_params(seal_user(self._row_sealer, record)),
+            user_insert_params(await seal_user(self._row_sealer, record)),
             audits,
             now=now,
         )
@@ -8828,7 +8832,7 @@ class PostgresStore:
         current = await self._read_user_record(conn, user_id)
         if current is None:
             return None
-        if not user_seal_ok(self._row_sealer, current):
+        if not await user_seal_ok(self._row_sealer, current):
             raise RowSealError(USER_KIND)
         changed = change(current)
         if changed is None:
@@ -8836,7 +8840,7 @@ class PostgresStore:
         if changed.roles != current.roles:
             roles = await conn.fetch("SELECT id FROM roles")
             changed = existing_roles_only(current, changed, [str(r["id"]) for r in roles])
-        updated = seal_user(self._row_sealer, changed)
+        updated = await seal_user(self._row_sealer, changed)
         status = await conn.execute(_PG_USER_RESEAL, *user_reseal_params(updated, current))
         if _rowcount(status) != 1:
             return None
@@ -8869,7 +8873,7 @@ class PostgresStore:
         the contract."""
         current = await self._read_user_record(conn, user_id)
         if current is not None:
-            if not user_seal_ok(self._row_sealer, current):
+            if not await user_seal_ok(self._row_sealer, current):
                 raise RowSealError(USER_KIND)
             if (
                 self._row_sealer is not None
@@ -9584,7 +9588,9 @@ class PostgresStore:
     async def _write_role(self, conn: Any, row: RoleRow) -> None:
         """The one writer of a ``roles`` row (BACKLOG #2592); store.py's
         ``MessageStore._write_role`` states the contract. Call it inside ``conn``'s transaction."""
-        await conn.execute(_PG_ROLE_UPSERT, *seal_role(self._row_sealer, row).write_params())
+        await conn.execute(
+            _PG_ROLE_UPSERT, *(await seal_role(self._row_sealer, row)).write_params()
+        )
 
     async def list_roles(self) -> Sequence[Row]:
         return await self._fetchall("SELECT * FROM roles ORDER BY id")
@@ -9810,7 +9816,7 @@ class PostgresStore:
         )
         rows = await conn.fetch(sql.pairs)
         current = AdMap.of(name, [(str(r[0]), str(r[1])) for r in rows], str(seal or ""))
-        new = ad_map_write(self._row_sealer, current, change)
+        new = await ad_map_write(self._row_sealer, current, change)
         if new is None:
             return False
         if new.pairs != current.pairs:
@@ -9851,7 +9857,7 @@ class PostgresStore:
                 if locked is None:
                     continue
                 role = RoleRow.from_mapping(dict(locked))
-                if not role_seal_ok(sealer, role):
+                if not await role_seal_ok(sealer, role):
                     refused += 1
                     continue
                 await self._write_role(conn, role)
@@ -9934,7 +9940,7 @@ class PostgresStore:
                 idp_auth_time=idp_auth_time,
                 user_epoch=0 if row is None else int(row["session_epoch"]),
             )
-            record = seal_session(self._row_sealer, record)
+            record = await seal_session(self._row_sealer, record)
             await conn.execute(_PG_SESSION_INSERT, *session_insert_params(record))
         return True
 
@@ -9955,9 +9961,9 @@ class PostgresStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        if not session_seal_ok(self._row_sealer, current):
+        if not await session_seal_ok(self._row_sealer, current):
             raise RowSealError(SESSION_KIND)
-        updated = seal_session(self._row_sealer, change(current))
+        updated = await seal_session(self._row_sealer, change(current))
         status = await conn.execute(_PG_SESSION_RESEAL, *session_reseal_params(updated, current))
         return updated if _rowcount(status) > 0 else None
 
@@ -9966,7 +9972,7 @@ class PostgresStore:
         row = await conn.fetchrow("SELECT session_epoch FROM users WHERE id=$1", user_id)
         return 0 if row is None else int(row["session_epoch"])
 
-    def row_sealer(self) -> RowSealer | None:
+    def row_sealer(self) -> Sealer | None:
         """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
         :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
         return self._row_sealer

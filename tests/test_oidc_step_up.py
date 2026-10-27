@@ -22,6 +22,7 @@ from collections.abc import Callable, Coroutine
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from _totp_clock import pin_totp_clock
@@ -894,7 +895,7 @@ async def test_a_role_map_that_fails_its_seal_is_not_called_a_demotion(
         )
         token = await _oidc_session(service, monkeypatch, rsa_key)
         flow_id, _url = await _begin(service, token)
-        monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+        monkeypatch.setattr(service_module, "ad_map_seal_ok", AsyncMock(return_value=False))
 
         out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
 

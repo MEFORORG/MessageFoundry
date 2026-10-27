@@ -284,8 +284,8 @@ def vault_consumers(settings: ServiceSettings) -> list[VaultConsumer]:
                 "transit",
                 "store Transit cipher (token in MEFOR_STORE_VAULT_TOKEN)",
                 "read on transit/keys/<data key> and transit/keys/<audit key>; update on "
-                "transit/encrypt/<data key>, transit/decrypt/<data key> and transit/hmac/<audit key>; "
-                + _SELF_READ_GRANT,
+                "transit/encrypt/<data key>, transit/decrypt/<data key>, transit/hmac/<audit key> and "
+                "transit/verify/<audit key>; " + _SELF_READ_GRANT,
             )
         )
     elif store.key_provider == "vault":

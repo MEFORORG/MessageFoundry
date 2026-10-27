@@ -64,7 +64,7 @@ from messagefoundry.store.privilege import (
     probe_failure,
     sqlite_not_applicable,
 )
-from messagefoundry.store.row_seal import RowSealer
+from messagefoundry.store.row_seal import Sealer
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
@@ -2820,7 +2820,7 @@ class AuthStore(Protocol):
     async def set_ad_group_scope_map(self, entries: Iterable[tuple[str, str]]) -> None: ...
 
     # --- sessions ------------------------------------------------------------
-    def row_sealer(self) -> RowSealer | None:
+    def row_sealer(self) -> Sealer | None:
         """The sealer this store writes authority-row integrity seals with, or ``None`` when its
         cipher holds no in-process key, in which case no seal is written or checked (BACKLOG #2592).
 

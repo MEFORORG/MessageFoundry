@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -193,7 +194,7 @@ async def test_a_role_map_that_fails_its_seal_is_no_demotion_on_the_re_bind(
     from messagefoundry.auth.service import DIRECTORY_ROLE_MAP_UNSEALED
 
     s = await _signed_in(store, _OPERATORS, _VIEWERS)
-    monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+    monkeypatch.setattr(service_module, "ad_map_seal_ok", AsyncMock(return_value=False))
 
     refused = await s.service.reauth(s.identity, _GOOD, token=s.token)
 

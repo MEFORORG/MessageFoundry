@@ -86,9 +86,10 @@ same position. The owner named this actor in scope on 2026-10-01 (vault BACKLOG 
 A writer never needs the key to change a plaintext column. Without a seal, on a first deployment,
 one inserted row would give it an administrator session, a role or a channel scope.
 
-**Row seals** need a store key held in the engine's own memory. So the `vault_transit` key provider
-and a keyless store write and check none yet. On any other keyed store, the engine refuses at
-least these changes made outside the store:
+**Row seals** need a store key. A keyless store writes and checks none. Under `vault_transit` the
+seal is Transit's own HMAC and the check is Transit's verify call, so no seal key enters the
+engine's memory. On any keyed store, the engine refuses at least these changes made outside the
+store:
 
 - a session row inserted or edited, in any column but `last_used_at`;
 - an account inserted or edited: its `users` row, its role rows, or its passkey set apart from
@@ -109,7 +110,9 @@ moved message still shows in the other channel's message list by its plaintext c
 encrypted cells withheld. The engine keeps running. A refusal usually writes an `integrity.*`
 audit row and raises an `integrity_drift` alert, with at least these exceptions. Under
 `vault_transit`, a cell that fails its tag keeps the cipher's own error, with no integrity audit
-row or alert. Each process reports a row that keeps failing again only after an interval: five
+row or alert. And under `vault_transit`, a seal Transit cannot make or check because it did not
+answer refuses the request or the write with an error log and no integrity audit row, since an
+outage is not a forgery. Each process reports a row that keeps failing again only after an interval: five
 minutes for a sealed row, and an hour for a message or saved-search cell. What each refusal does
 is in the changelog entries for vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the
 next release, then [CHANGELOG.md](../CHANGELOG.md)). The seal format is
@@ -123,8 +126,8 @@ On a first deployment, a writer could still do at least these:
   sends the chain anchors off the host, where a collector could compare them.
 - **Copy sealed rows in from another store** under the same key. The row seal key carries no
   store id yet. That pin is vault BACKLOG #3411.
-- **Change authority rows and approval requests freely on a keyless store or under**
-  **`vault_transit`**, since no row seal is written there.
+- **Change authority rows and approval requests freely on a keyless store**, since no row seal
+  is written there.
 - **Move messages and re-route queue rows on a keyless store, or with `[store].aad_bind` off**,
   since no cell tag is bound there.
 - **Blank an encrypted cell.** An empty value opens on any keyed store, so a writer can erase a

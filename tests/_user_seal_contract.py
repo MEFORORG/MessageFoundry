@@ -140,7 +140,7 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     viewer = await h.account("viewer")
     record = await _record(store, viewer)
     assert record.row.authz_seal.startswith(SEAL_PREFIX)
-    assert user_seal_ok(sealer, record)
+    assert await user_seal_ok(sealer, record)
     token = await h.token(viewer)
     identity = await h.service.identity_for_token(token)
     assert identity is not None and Role.ADMINISTRATOR not in identity.roles
@@ -327,7 +327,7 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     first = await h.token(epoch)
     await store.revoke_user_sessions(epoch)
     after_revoke = await _record(store, epoch)
-    assert after_revoke.row.session_epoch == 1 and user_seal_ok(sealer, after_revoke)
+    assert after_revoke.row.session_epoch == 1 and await user_seal_ok(sealer, after_revoke)
     assert await h.service.identity_for_token(first) is None
     assert await h.service.identity_for_token(await h.token(epoch)) is not None
 

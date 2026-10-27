@@ -538,8 +538,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2592: row integrity seals. hmac = HMAC-SHA256 over a typed row encoding under a key
     # derived (HKDF, through the store.crypto seam) from the store key's authorization root; hashlib =
     # the SHA-256 the HMAC runs over; compare_digest for the constant-time verify.
+    # Under vault_transit (ADR-draft decision D14) the seal is Transit's own HMAC, through the
+    # Transit cipher (store.crypto_transit), which row_seal imports lazily to pick that sealer.
     "messagefoundry/store/row_seal.py": frozenset(
-        {"hashlib", "hmac", "messagefoundry.store.crypto"}
+        {"hashlib", "hmac", "messagefoundry.store.crypto", "messagefoundry.store.crypto_transit"}
     ),
     # BACKLOG #2593: builds the AES-GCM associated data a queue payload cell is sealed under (the
     # row's routing fields) and opens the cell through the store cipher seam. No key of its own.
@@ -1174,9 +1176,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "mac:via messagefoundry.auth.totp",
             "sign_verify:via messagefoundry.auth.oidc.claims",
             "sign_verify:via messagefoundry.auth.webauthn",
-            # BACKLOG #2592: the session loader checks each session row's integrity seal, and the
-            # user loader each account's.
-            "sign_verify:via messagefoundry.store.store",
             "tls_context:via messagefoundry.auth.oidc_http",
         }
     ),
@@ -1449,16 +1448,25 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt_data()",
             "cipher:.encrypt_data()",
             "mac:.generate_hmac()",
+            # BACKLOG #2592 (ADR-draft decision D14): Transit's verify call checks a row seal's
+            # HMAC inside Vault, at the key version the stored seal names. A MAC check.
+            "sign_verify:.verify_signed_data()",
             "tls_context:via messagefoundry.store.keyprovider_vault",
         }
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"csprng:via messagefoundry.store.crypto"}),
     # BACKLOG #2592: HMAC-SHA256 row seals and their constant-time verify, under a key the
-    # store.crypto seam derives (HKDF) and names by a SHA-256 digest.
+    # store.crypto seam derives (HKDF) and names by a SHA-256 digest. Every store and service seal
+    # check now runs through this module's awaited forms, which call RowSealer.verify (a MAC
+    # check), so the per-backend sign_verify entries moved here. Under vault_transit the MAC and
+    # its check run inside Transit; hashlib.sha256 names the Transit key (the key id) and keys the
+    # cache of successful checks, both non-secret digests.
     "messagefoundry/store/row_seal.py": frozenset(
         {
             "compare:hmac.compare_digest",
+            "hash:hashlib.sha256",
+            "sign_verify:.verify()",
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
@@ -1506,8 +1514,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "kdf:via messagefoundry.store.crypto",
             "key_cert:via messagefoundry.config.tls_policy",
             "mac:via messagefoundry.store.store",
-            # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
-            "sign_verify:via messagefoundry.store.store",
             "tls_context:.check_hostname = False",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.create_default_context",
@@ -1536,8 +1542,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.auth.trust_anchors",
             "hash:via messagefoundry.auth.trust_anchors",
             "mac:via messagefoundry.store.store",
-            # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
-            "sign_verify:via messagefoundry.store.store",
         }
     ),
     "messagefoundry/store/store.py": frozenset(
@@ -1554,8 +1558,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
-            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
-            "sign_verify:.verify()",
         }
     ),
     # BACKLOG #1352 / #1171: the generic dialect checks a driver client key's wrap (libpq sslkey)

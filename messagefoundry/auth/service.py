@@ -161,8 +161,8 @@ from messagefoundry.store.row_seal import (
     ROLE_KIND,
     SESSION_KIND,
     USER_KIND,
-    RowSealer,
     RowSealError,
+    Sealer,
     SealFailureThrottle,
 )
 from messagefoundry.store.store import (
@@ -10016,10 +10016,10 @@ class AuthService:
             return None
         return session
 
-    async def _session_row_holds(self, session: SessionRecord, sealer: RowSealer | None) -> bool:
+    async def _session_row_holds(self, session: SessionRecord, sealer: Sealer | None) -> bool:
         """Whether an unrevoked session row's seal verifies; a row that fails is handed to
         :meth:`_session_seal_failed`, which ends it (BACKLOG #2592)."""
-        if session_seal_ok(sealer, session):
+        if await session_seal_ok(sealer, session):
             return True
         await self._session_seal_failed(
             session.token_hash, key_changed=session_sealed_by_retired_key(sealer, session)
@@ -10171,7 +10171,7 @@ class AuthService:
         for attempt in range(2):
             grants = await self._store.get_user_role_grants(user.id)
             record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
-            if sealer is None or (record is not None and user_seal_ok(sealer, record)):
+            if sealer is None or (record is not None and await user_seal_ok(sealer, record)):
                 return VerifiedUser.of(user, sorted(g.role_id for g in grants))
             if attempt == 0:
                 reread = await self._store.get_user(user.id)
@@ -10269,7 +10269,7 @@ class AuthService:
         if found is None:
             return None
         row = RoleRow.from_mapping(found)
-        if role_seal_ok(self._store.row_sealer(), row):
+        if await role_seal_ok(self._store.row_sealer(), row):
             return row
         await self._role_seal_failed(row.id)
         return None
@@ -10284,7 +10284,7 @@ class AuthService:
             row = RoleRow.from_mapping(found)
             if not is_custom_role_id(row.id):
                 continue  # a built-in resolves from code; its row grants nothing
-            holds = role_seal_ok(sealer, row)
+            holds = await role_seal_ok(sealer, row)
             if not holds:
                 await self._role_seal_failed(row.id)
             out.append((row, holds))
@@ -10325,7 +10325,7 @@ class AuthService:
         """:meth:`_ad_map`, but ``None`` rather than an empty map when the seal fails, for a caller
         that must tell a failing map from an honestly empty one. The failure is still reported."""
         current = await self._store.get_ad_map(name)
-        if ad_map_seal_ok(self._store.row_sealer(), current):
+        if await ad_map_seal_ok(self._store.row_sealer(), current):
             return current
         await self._report_seal_failure(
             f"{ADSET_KIND}:{name}",

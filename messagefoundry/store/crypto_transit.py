@@ -28,6 +28,12 @@ INSIDE the isolated module and the key never enters heap. This lifts the audit c
 mode). The MAC key defaults to the data key and is overridable to a dedicated Transit key via
 ``MEFOR_STORE_TRANSIT_AUDIT_KEY`` for domain separation.
 
+**Row seals (keyed IN Transit too).** The integrity seals on identity and authorization rows
+(BACKLOG #2592) are Transit's own HMAC under the same key, through
+:class:`~messagefoundry.store.row_seal.TransitRowSealer`: :meth:`seal_hmac` to seal and Transit's
+``verify`` call (:meth:`verify_seal_hmac`) to check, so no seal key enters the heap either
+(ADR-draft decision D14).
+
 **Fail-closed (ADR 0138).** Missing config, an unreachable/unknown Transit key, or a key whose TYPE
 cannot run the operation asked of it (BACKLOG #1166) raises
 :class:`~messagefoundry.store.keyprovider.KeyProviderError` at construction (``open_store`` propagates it
@@ -199,9 +205,66 @@ class TransitCipher(_UnmarkedPolicy):
 
     def authz_root(self) -> None:
         """No in-heap DEK, so no in-process authorization root (BACKLOG #2592). Row seals under this
-        provider are Transit's own HMAC, a separate piece of work; until it lands this cipher writes
-        and checks no row seals."""
+        provider are Transit's own HMAC instead (ADR-draft decision D14): ``RowSealer.for_cipher``
+        gives this cipher a ``TransitRowSealer``, which calls :meth:`seal_hmac` and
+        :meth:`verify_seal_hmac`."""
         return None
+
+    @property
+    def seal_key_name(self) -> str:
+        """The Transit key row seals are computed under: the audit key, which is the data key when
+        no audit key is set. Its type is checked at build for ``generate_hmac``. The seal input
+        starts with its own label, so a seal never reads as an audit row MAC."""
+        return self._audit_key
+
+    def seal_hmac(self, data: bytes) -> str:
+        """A row seal's MAC over ``data``, computed INSIDE Transit under the latest key version
+        (ADR-draft decision D14). Returns Transit's ``vault:v<N>:...`` string, which names the
+        version. Blocking: the sealer calls it in a worker thread. Any failure raises
+        :class:`CipherError`, type and Vault text only, never the input."""
+        try:
+            response: Any = self._client.secrets.transit.generate_hmac(
+                name=self._audit_key,
+                hash_input=base64.b64encode(data).decode("ascii"),
+                algorithm=AUDIT_TRANSIT_HASH_ALGO,
+            )
+            mac = response["data"]["hmac"]
+        except Exception as exc:
+            raise CipherError(
+                f"Transit row seal HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
+            ) from exc
+        if not isinstance(mac, str) or not mac:
+            raise CipherError(f"Transit returned an empty row seal HMAC (key={self._audit_key!r})")
+        return mac
+
+    def verify_seal_hmac(self, data: bytes, mac: str) -> bool:
+        """Whether ``mac`` is Transit's HMAC over ``data``, checked by Transit's ``verify`` call at
+        the version ``mac`` names (ADR-draft decision D14). It never regenerates and compares,
+        because a MAC regenerated under a newer version differs from every stored one.
+
+        Transit refusing the check (HTTP 400: a version it does not hold, or a string it cannot
+        read) is ``False``, since a forged seal can name either. Any other failure is an outage and
+        raises :class:`CipherError`. Blocking: the sealer calls it in a worker thread."""
+        try:
+            response: Any = self._client.secrets.transit.verify_signed_data(
+                name=self._audit_key,
+                hash_input=base64.b64encode(data).decode("ascii"),
+                hmac=mac,
+                hash_algorithm=AUDIT_TRANSIT_HASH_ALGO,
+            )
+            valid = response["data"]["valid"]
+        except Exception as exc:
+            if is_vault_bad_request(exc):
+                return False
+            raise CipherError(
+                f"Transit row seal verify failed (key={self._audit_key!r}): "
+                f"{vault_failure_text(exc)}"
+            ) from exc
+        if not isinstance(valid, bool):
+            raise CipherError(
+                f"Transit returned a malformed verify reply (key={self._audit_key!r})"
+            )
+        return valid
 
     def retired_authz_roots(self) -> Sequence[bytes]:
         """No in-heap DEK, so no retired roots either (BACKLOG #2592)."""
@@ -380,9 +443,11 @@ def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
     Kept beside the calls so the two cannot drift. :func:`build_transit_cipher` reads each key's
     metadata (``transit/keys/<key>``, read); :meth:`TransitCipher.encrypt` and
     :meth:`TransitCipher.decrypt` update ``transit/encrypt/<data key>`` and
-    ``transit/decrypt/<data key>``; :meth:`TransitCipher.audit_hmac` updates
-    ``transit/hmac/<audit key>``, which is the data key when no audit key is set. Raises
-    :class:`KeyProviderError` when the data-key name is not set, as the cipher itself does."""
+    ``transit/decrypt/<data key>``; :meth:`TransitCipher.audit_hmac` and
+    :meth:`TransitCipher.seal_hmac` update ``transit/hmac/<audit key>``, which is the data key when
+    no audit key is set; :meth:`TransitCipher.verify_seal_hmac` updates
+    ``transit/verify/<audit key>`` (BACKLOG #2592). Raises :class:`KeyProviderError` when the
+    data-key name is not set, as the cipher itself does."""
     key_name, audit_key = _key_names()
     read, update = frozenset({"read"}), frozenset({"update"})
     return {
@@ -391,4 +456,5 @@ def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
         f"{TRANSIT_MOUNT}/decrypt/{key_name}": update,
         f"{TRANSIT_MOUNT}/keys/{audit_key}": read,
         f"{TRANSIT_MOUNT}/hmac/{audit_key}": update,
+        f"{TRANSIT_MOUNT}/verify/{audit_key}": update,
     }

@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -83,7 +84,7 @@ async def test_the_contract_fails_when_the_service_checks_no_seal(
     import messagefoundry.auth.service as service_module
 
     store, path = keyed
-    monkeypatch.setattr(service_module, check, lambda sealer, row: True)
+    monkeypatch.setattr(service_module, check, AsyncMock(return_value=True))
     with pytest.raises(AssertionError):
         await assert_role_seal_contract(store, _raw_for(path))
 
@@ -261,9 +262,9 @@ async def test_rotation_leaves_a_failing_role_and_map_as_they_are(
     bad_row = await store.get_role(bad)
     assert bad_row is not None and RoleRow.from_mapping(bad_row).seal == foreign
     for name in (AD_ROLE_MAP, AD_SCOPE_MAP):
-        assert not ad_map_seal_ok(sealer, await store.get_ad_map(name)), name
+        assert not await ad_map_seal_ok(sealer, await store.get_ad_map(name)), name
     good_row = await store.get_role(good)
-    assert good_row is not None and role_seal_ok(sealer, RoleRow.from_mapping(good_row))
+    assert good_row is not None and await role_seal_ok(sealer, RoleRow.from_mapping(good_row))
 
 
 async def test_a_role_written_before_the_seal_is_named_at_open_and_repaired_by_a_save(

@@ -22,6 +22,7 @@ from collections.abc import AsyncIterator
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -101,7 +102,7 @@ async def test_the_contract_fails_when_a_seal_check_is_switched_off(
     import importlib
 
     store, path = keyed
-    monkeypatch.setattr(importlib.import_module(module), name, lambda sealer, row: True)
+    monkeypatch.setattr(importlib.import_module(module), name, AsyncMock(return_value=True))
     with pytest.raises(AssertionError):
         await assert_approval_seal_contract(store, _raw_for(path))
 
@@ -201,7 +202,9 @@ async def test_rotation_leaves_a_failing_request_as_it_is(
     bad_row = await store.get_pending_approval(bad)
     assert bad_row is not None and ApprovalRow.from_mapping(bad_row).seal == foreign
     good_row = await store.get_pending_approval(good)
-    assert good_row is not None and approval_seal_ok(sealer, ApprovalRow.from_mapping(good_row))
+    assert good_row is not None and await approval_seal_ok(
+        sealer, ApprovalRow.from_mapping(good_row)
+    )
 
 
 async def test_a_request_written_before_the_seal_is_named_at_open_and_refused(
