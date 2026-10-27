@@ -19,8 +19,9 @@ Four invariants:
 * no base is a digest inspected and found to carry a CA root an advisory removed. That test carries
   its own control, since :data:`_PRE_FIX` has no digest.
 
-:data:`_PRE_FIX` is the positive control. Each predicate is asserted to FIRE on it before the real
-file is checked, because a predicate that fires on nothing looks the same as a clean file.
+:data:`_PRE_FIX` is the positive control for the first three. Each is asserted to FIRE on it
+before the real file is checked, because a predicate that fires on nothing looks the same as a
+clean file.
 """
 
 from __future__ import annotations
@@ -180,8 +181,8 @@ def test_every_registry_base_is_pinned_by_a_literal_digest() -> None:
 #: Base digests inspected and found to carry a CA root an advisory removed; a revert is refused.
 _DISTRUSTED_ROOT_DIGESTS = frozenset(
     {
-        # "emSign ECC Root CA - G3" in Debian ca-certificates and both pip-vendored certifi copies
-        # (GHSA-6q48-6c7w-9gw2, BACKLOG #3905): the multi-arch index, then its linux/amd64 manifest.
+        # GHSA-6q48-6c7w-9gw2 (BACKLOG #3905; the readings are in the docker/Dockerfile header):
+        # the multi-arch index, then its linux/amd64 manifest, the platform inspected.
         "sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83",
         "sha256:a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf",
     }
@@ -195,9 +196,10 @@ def _known_bad_bases(text: str) -> list[str]:
 def test_no_base_is_a_digest_known_to_carry_a_distrusted_root() -> None:
     # Positive control, per entry: a malformed entry could never match a parsed reference.
     for bad in _DISTRUSTED_ROOT_DIGESTS:
-        assert re.fullmatch(r"sha256:[0-9a-f]{64}", bad), bad
+        assert _PINNED.match(f"python:3.14@{bad}"), bad
         assert _known_bad_bases(f"FROM python:3.14-slim-bookworm@{bad} AS python-base\n"), bad
     text = _DOCKERFILE.read_text(encoding="utf-8")
+    assert _registry_bases(text), "no registry FROM found -- the check below is vacuous"
     found = _known_bad_bases(text)
     assert not found, f"{found} carries a CA root an advisory removed; see the Dockerfile header"
 
