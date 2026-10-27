@@ -174,6 +174,8 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
     pip = python_module_argv("pip")
     assert check[: len(pip) + 1] == [*pip, "install"]
     assert {"--dry-run", "--ignore-installed", "--require-hashes"} <= set(check)
+    # Wheels only, set by the auditor itself rather than left to the caller's environment.
+    assert check[check.index("--only-binary") + 1] == ":all:"
     assert checked == LOCK
     # 2. The audit, on the marker-free copy, with pip out of the loop and skips refused.
     pip_audit = python_module_argv("pip_audit")

@@ -201,6 +201,9 @@ Windows-only dependencies (at least `colorama` and `sspilib`):
   auditor, `python -P -m messagefoundry.security.audit_all_platforms requirements.lock`. That is the
   code the engine's own required audit runs, and the module documents what it checks. It dry-run
   installs the lock with `--require-hashes`, then audits **every pin, whatever its marker**.
+  - Its dry-run takes wheels only (`--only-binary :all:`), so a pin with no wheel for the runner
+    fails the job rather than having its build code run. The job's own install of the lock, the
+    step before, sets no such rule.
   - It needs an engine release that ships the module; 0.5.1 and earlier do not, and the job fails
     rather than fall back to an audit that skips pins.
   - It runs `pip-audit --strict`, so a pin PyPI cannot look up (a private package) fails the job,
