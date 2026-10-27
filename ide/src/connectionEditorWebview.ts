@@ -296,11 +296,12 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // One entry per message its hosts post: at least connectionEditor.ts and configEditors.ts use
     // this page. Both post "error"; only connectionEditor.ts answers with "fields". A field is a
     // FieldDescriptor from connectionForm.ts: its declared fields with their types. The two
-    // unknown-typed values (value, defaultValue) and the carried-through envDefault and
-    // preserveValue are not typed there either. Nor is their presence checked: all four are
-    // optional there, and FieldDescriptor says why value and defaultValue are often absent, so a
-    // presence check would discard ordinary "fields" messages. choices is required and may be null;
-    // envKey, cast and a group's description may be absent and are never null.
+    // unknown-typed values (value, defaultValue, envDefault, preserveValue) are not typed there
+    // either, and their presence is not checked: all four are optional there, and FieldDescriptor
+    // says why value and defaultValue can be absent, so a presence check would discard ordinary
+    // "fields" messages. This page does not read envDefault or preserveValue at all. choices is
+    // required and may be null; envKey, cast and a group's description may be absent and are never
+    // null.
     // control and type are closed sets: the lists FieldControl and ParamType are derived from.
     const FIELD_CONTROLS = ${embedJson(FIELD_CONTROLS)};
     const PARAM_TYPES = ${embedJson(PARAM_TYPES)};

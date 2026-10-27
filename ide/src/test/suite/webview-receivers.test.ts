@@ -376,8 +376,10 @@ const SCHEMA: ConnectionSchema = {
 const FIELDS_OK = {
   command: "fields",
   groups: buildForm(SCHEMA, "mllp", "outbound", {
-    host: { env: "PEER_HOST", cast: "str" },
+    host: { env: "PEER_HOST", cast: "str", default: "localhost" },
     port: 6661,
+    // An inline secret literal, so one field carries preserveValue.
+    tls_key_password: "x",
     legacy_key: "kept",
   }),
 };
@@ -824,6 +826,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.ok(fields.some((f) => !("envKey" in f) && !("cast" in f)));
     const bare = FIELDS_BARE.groups.flatMap((g: Payload) => g.fields);
     assert.ok(fields.some((f) => f.value !== undefined) && fields.some((f) => f.defaultValue !== undefined));
+    assert.ok(fields.some((f) => "envDefault" in f) && fields.some((f) => !("envDefault" in f)));
+    assert.ok(fields.some((f) => "preserveValue" in f) && fields.some((f) => !("preserveValue" in f)));
     assert.ok(bare.length > 0 && bare.every((f: Payload) => !("value" in f) && !("defaultValue" in f)));
     assert.ok(FIELDS_OK.groups.some((g) => typeof g.description === "string"), "no group has a description");
     assert.ok(FIELDS_OK.groups.some((g) => !("description" in g)));

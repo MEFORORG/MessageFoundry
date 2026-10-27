@@ -154,13 +154,15 @@ export interface FieldDescriptor {
   placeholder: string;
   /**
    * The default, raw (a checkbox needs its unset position). RENDER-ONLY — never post it. Optional
-   * because it is often undefined, and posting the descriptor to the webview serializes it as JSON,
-   * which drops an undefined member: the page can receive a field with no `defaultValue` at all.
+   * because it can be undefined (at least for a key the schema does not describe, and for a schema
+   * param that carries no `default`), and posting the descriptor to the webview serializes it as
+   * JSON, which drops an undefined member: the page can receive a field with no `defaultValue`.
    */
   defaultValue?: unknown;
   /**
-   * The record's literal value, or undefined when the record does not set this key. Optional for the
-   * same reason as `defaultValue`: an undefined value is absent from what the webview receives.
+   * The record's literal value. Undefined at least when the record does not set this key, when the
+   * key is a secret, and when it holds an env reference -- so undefined does not mean "unset". Optional
+   * for the same reason as `defaultValue`: an undefined value is absent from what the webview receives.
    */
   value?: unknown;
   isEnvRef: boolean;
