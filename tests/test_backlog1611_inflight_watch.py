@@ -1192,6 +1192,7 @@ async def test_a_pooled_retry_after_another_node_led_is_not_sent(
     _fast_backoffs(monkeypatch)
     if variant == "control-ignores-the-epoch":
         monkeypatch.setattr(RependFence, "superseded", lambda self: False)
+        monkeypatch.setattr(RependFence, "moved", lambda self: False)
     await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
     await store.enqueue_ingress(channel_id="IB", raw=RAW_B, now=1.0)
     head, tail = await store.claim_next_fifo_batch(
@@ -1456,7 +1457,7 @@ async def test_the_tail_release_after_a_landed_head_is_fenced(
     is not sent. The control lets it through, the duplicate-send path."""
     _fast_backoffs(monkeypatch)
     if variant == "control-unfenced-tail":
-        monkeypatch.setattr(RependFence, "may_write", lambda self: True)
+        monkeypatch.setattr(RependFence, "moved", lambda self: False)
     await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
     await store.enqueue_ingress(channel_id="IB", raw=RAW_B, now=1.0)
     head, tail = await store.claim_next_fifo_batch(
@@ -1555,3 +1556,32 @@ async def test_a_pause_that_wins_over_the_stop_bound_leaves_the_streak_alone(
     assert st.phase is stage_dispatcher._LanePhase.PAUSED and paused == ["OB"]
     assert sink.stopped == []
     assert st.infra_error_streak == 0
+
+
+async def test_a_demoted_node_still_releases_the_tail_after_its_head_lands(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The demotion drain: the lease is lost, and no other node holds one yet, while the head's
+    re-pend runs; it lands. The tail release is still sent, so the drain leaves zero rows in
+    flight, as before step 2. Only another node's lease, held now, skips it."""
+    _fast_backoffs(monkeypatch)
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
+    await store.enqueue_ingress(channel_id="IB", raw=RAW_B, now=1.0)
+    head, tail = await store.claim_next_fifo_batch(
+        "IB", stage=Stage.INGRESS.value, limit=2, now=2.0
+    )
+    lease = _EpochLease()
+    real_reschedule = store.reschedule_claimed
+
+    async def demoted_during_the_write(ids: list[str], when: float) -> Any:
+        lease.held = False  # demoted: no lease, and no epoch, while the write runs
+        return await real_reschedule(ids, when)
+
+    monkeypatch.setattr(store, "reschedule_claimed", demoted_during_the_write)
+    dispatcher, applied = _lane_run(store, monkeypatch, head.id, [tail.id], time.time() + 60.0)
+    monkeypatch.setattr(dispatcher, "_is_leader", lease.is_leader)
+    monkeypatch.setattr(dispatcher, "_current_epoch", lease.current_epoch)
+    await asyncio.wait_for(dispatcher._run_lane("IB", [head, tail]), timeout=5.0)
+    assert len(applied) == 1
+    assert await _ingress_status(store, tail.message_id) == "pending"
+    assert await _ingress_status(store, head.message_id) == "pending"
