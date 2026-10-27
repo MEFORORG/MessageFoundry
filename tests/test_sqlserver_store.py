@@ -6322,6 +6322,91 @@ def _presented_certificate_pem(host: str, port: int) -> str:
     return ssl.DER_cert_to_PEM_cert(der)
 
 
+def _odbc_pairs(dsn: str) -> list[tuple[str, str]]:
+    """Split an ODBC connection string into ``(keyword, raw value)`` pairs, in order.
+
+    Keys are read as keys, never as substrings: ``"ServerCertificate" in dsn`` is also true of
+    ``TrustServerCertificate=no;``, which every verified string carries (vault BACKLOG #3714). A
+    brace-quoted value is read whole, with ``}}`` as an escaped brace, so a ``;`` or ``=`` inside
+    one, as a password may hold, starts no keyword."""
+    pairs: list[tuple[str, str]] = []
+    i = 0
+    while i < len(dsn):
+        eq = dsn.index("=", i)
+        j = eq + 1
+        if dsn.startswith("{", j):
+            j += 1
+            while True:
+                close = dsn.index("}", j)
+                if dsn.startswith("}}", close):
+                    j = close + 2
+                    continue
+                j = close + 1
+                break
+        end = dsn.find(";", j)
+        if end == -1:
+            end = len(dsn)
+        pairs.append((dsn[i:eq], dsn[eq + 1 : end]))
+        i = end + 1
+    return pairs
+
+
+def _odbc_value(dsn: str, keyword: str) -> str | None:
+    """The value ``keyword`` takes in ``dsn``, or ``None``. ODBC keywords are case-insensitive and
+    the last one wins, as the driver reads them."""
+    values = [v for k, v in _odbc_pairs(dsn) if k.strip().lower() == keyword.lower()]
+    return values[-1] if values else None
+
+
+def _odbc_with(dsn: str, keyword: str, value: str) -> str:
+    """``dsn`` with every ``keyword`` set to ``value`` and nothing else changed. A substring
+    ``replace`` would also rewrite matching text inside a brace-quoted value."""
+    pairs = _odbc_pairs(dsn)
+    assert any(k.strip().lower() == keyword.lower() for k, _ in pairs), (
+        f"no {keyword} in the string"
+    )
+    return "".join(f"{k}={value if k.strip().lower() == keyword.lower() else v};" for k, v in pairs)
+
+
+def test_odbc_keyword_reader_tells_server_certificate_from_trust_server_certificate() -> None:
+    """The pin test's string checks, on the builder's own strings, with no server. It needs none,
+    so it runs on both SQL Server legs ahead of the strict step that depends on it (vault BACKLOG
+    #3714). The password holds the text a substring check would trip on."""
+    from messagefoundry.config.settings import StoreBackend, StoreSettings
+    from messagefoundry.store.sqlserver import connection_string
+
+    base = StoreSettings(
+        backend=StoreBackend.SQLSERVER,
+        server="localhost",
+        port=14330,
+        database="master",
+        username="sa",
+        password="p}w;Encrypt=yes;ServerCertificate={x}",
+    )
+
+    def dsn(pin: str | None) -> str:
+        # model_copy, as the pin test does: the builder reads no file, so none need exist.
+        return connection_string(
+            base.model_copy(update={"trust_server_certificate": False, "ssl_root_cert": pin})
+        )
+
+    unpinned, pinned = dsn(None), dsn("/tmp/presented.pem")
+    # CONTROL: the substring guard this replaced misreads the unpinned string as pinned.
+    assert "ServerCertificate" in unpinned
+    assert _odbc_value(unpinned, "ServerCertificate") is None
+    assert _odbc_value(unpinned, "TrustServerCertificate") == "no"
+    assert _odbc_value(unpinned, "Encrypt") == "yes"
+    assert _odbc_value(pinned, "ServerCertificate") == "{/tmp/presented.pem}"
+    assert _odbc_value(pinned, "Encrypt") == "strict"
+    # The password is one value, read whole, and a rewrite leaves it as it was.
+    assert _odbc_value(unpinned, "PWD") == "{p}}w;Encrypt=yes;ServerCertificate={x}}}"
+    assert "".join(f"{k}={v};" for k, v in _odbc_pairs(unpinned)) == unpinned
+    chain = _odbc_with(unpinned, "Encrypt", "strict")
+    assert _odbc_value(chain, "Encrypt") == "strict"
+    assert _odbc_value(chain, "PWD") == _odbc_value(unpinned, "PWD")
+    assert chain == unpinned.replace("Encrypt=yes;TrustServer", "Encrypt=strict;TrustServer")
+
+
 @pytest.mark.skipif(
     os.getenv("MEFOR_TEST_SQLSERVER_STRICT") != "1",
     reason="set MEFOR_TEST_SQLSERVER_STRICT=1 only where the SQL Server is configured for TDS 8.0 "
@@ -6401,18 +6486,23 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
 
     trusted = os.getenv("MEFOR_TEST_SQLSERVER_PIN_TRUSTED") == "1"
     right_dsn, wrong_dsn = pinned_dsn(right), pinned_dsn(wrong)
-    assert "Encrypt=strict;" in right_dsn and "Encrypt=strict;" in wrong_dsn
+    # Keys, not substrings: "ServerCertificate" is also inside "TrustServerCertificate=no;", which
+    # every verified string carries (vault BACKLOG #3714; run 40524945884 failed on exactly that).
+    for dsn in (right_dsn, wrong_dsn):
+        assert _odbc_value(dsn, "Encrypt") == "strict"
+        assert _odbc_value(dsn, "ServerCertificate") is not None
     # No pin and verification on: the builder sends Encrypt=yes, so strict here is the chain alone.
     unpinned_dsn = connection_string(
         base.model_copy(update={"trust_server_certificate": False, "ssl_root_cert": None})
     )
-    assert "Encrypt=yes;" in unpinned_dsn and "ServerCertificate" not in unpinned_dsn
+    assert _odbc_value(unpinned_dsn, "Encrypt") == "yes"
+    assert _odbc_value(unpinned_dsn, "ServerCertificate") is None
     results = {
         "strict_right": await outcome(right_dsn),
         "strict_wrong": await outcome(wrong_dsn),
-        "strict_chain": await outcome(unpinned_dsn.replace("Encrypt=yes;", "Encrypt=strict;")),
-        "yes_right": await outcome(right_dsn.replace("Encrypt=strict;", "Encrypt=yes;")),
-        "yes_wrong": await outcome(wrong_dsn.replace("Encrypt=strict;", "Encrypt=yes;")),
+        "strict_chain": await outcome(_odbc_with(unpinned_dsn, "Encrypt", "strict")),
+        "yes_right": await outcome(_odbc_with(right_dsn, "Encrypt", "yes")),
+        "yes_wrong": await outcome(_odbc_with(wrong_dsn, "Encrypt", "yes")),
     }
     arm = "trusted" if trusted else "untrusted"
     warnings.warn(
