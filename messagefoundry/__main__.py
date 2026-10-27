@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import ServiceSettings, StoreSettings
+    from messagefoundry.config.snapshot import ConfigSnapshot
     from messagefoundry.config.static_credentials import StaticCredentialGateOutcome
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.config.wiring import Registry
@@ -2397,14 +2398,54 @@ def _exposure_description(settings: ServiceSettings, *, exposed: bool) -> str:
     return "admin interface reachable from beyond this host"
 
 
-def _read_environment_values(*, base_dir: Path, dir_name: str, environment: str) -> dict[str, Any]:
+class _EnvironmentValuesReader:
+    """``serve``'s ``env_values_provider``: :func:`_read_environment_values` over one value file.
+
+    The Engine calls it with no arguments at start, and calls :meth:`from_snapshot` on a reload
+    that read a config snapshot, so a value file the snapshot covers is parsed from the bytes the
+    reload's digest names (vault BACKLOG #2596)."""
+
+    __slots__ = ("base_dir", "dir_name", "environment")
+
+    def __init__(self, *, base_dir: Path, dir_name: str, environment: str) -> None:
+        self.base_dir = base_dir
+        self.dir_name = dir_name
+        self.environment = environment
+
+    def __call__(self) -> dict[str, Any]:
+        return self.from_snapshot(None)
+
+    def from_snapshot(self, snapshot: ConfigSnapshot | None) -> dict[str, Any]:
+        return _read_environment_values(
+            base_dir=self.base_dir,
+            dir_name=self.dir_name,
+            environment=self.environment,
+            snapshot=snapshot,
+        )
+
+
+def _read_environment_values(
+    *,
+    base_dir: Path,
+    dir_name: str,
+    environment: str,
+    snapshot: ConfigSnapshot | None = None,
+) -> dict[str, Any]:
     """This instance's environment values: the value file
     :func:`~messagefoundry.config.environments.values_file_path` names, plus the ``MEFOR_VALUE_*``
-    environment. ``serve`` hands it to the Engine as the ``env_values_provider``, so it runs at
-    start and again on every reload."""
+    environment. ``serve`` hands it to the Engine as the ``env_values_provider``
+    (:class:`_EnvironmentValuesReader`), so it runs at start and again on every reload.
+
+    With ``snapshot``, a value file in the snapshot's ``environments/`` folder is parsed from the
+    bytes the snapshot read, and never read from disk, so a file edited or created after that read
+    does not apply (vault BACKLOG #2596). A value file anywhere else is read from disk."""
     import os
 
-    from messagefoundry.config.environments import load_environment_values, values_file_path
+    from messagefoundry.config.environments import (
+        environment_values_from_bytes,
+        load_environment_values,
+        values_file_path,
+    )
     from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
     from messagefoundry.redaction import safe_exc
 
@@ -2436,6 +2477,10 @@ def _read_environment_values(*, base_dir: Path, dir_name: str, environment: str)
     env_file = values_file_path(base_dir, dir_name, environment)
     assert_trusted_start_paths([env_file], lead="refusing to read environment values from")
     try:
+        if snapshot is not None and snapshot.covers_environment_file(env_file):
+            return environment_values_from_bytes(
+                snapshot.environment_file(env_file), path=env_file, environ=os.environ
+            )
         return load_environment_values(
             base_dir=base_dir,
             dir_name=dir_name,
@@ -4476,11 +4521,8 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError
     from messagefoundry.redaction import safe_exc
 
-    env_values = functools.partial(
-        _read_environment_values,
-        base_dir=env_base,
-        dir_name=settings.environments.dir,
-        environment=env_name,
+    env_values = _EnvironmentValuesReader(
+        base_dir=env_base, dir_name=settings.environments.dir, environment=env_name
     )
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is

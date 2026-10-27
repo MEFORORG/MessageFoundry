@@ -1707,6 +1707,152 @@ async def test_a_file_added_during_the_load_is_not_released_with_it(
     assert [json.loads(row["detail"])["fingerprint"] for row in rows] == [approved]
 
 
+# --- vault BACKLOG #2596: the environment value file under the config directory ------------------
+
+_APPROVED_VALUES = 'HOST = "approved.example.invalid"\n'
+_UNREVIEWED_VALUES = 'HOST = "unreviewed.example.invalid"\n'
+
+
+def _serve_values_provider(cfg: Path) -> Any:
+    """The value provider ``serve`` builds, anchored at the config directory, so the value file it
+    reads is the ``environments/dev.toml`` the approval digest covers."""
+    from messagefoundry.__main__ import _EnvironmentValuesReader
+
+    return _EnvironmentValuesReader(base_dir=cfg, dir_name="environments", environment="dev")
+
+
+def _opaque_values_provider(cfg: Path) -> Callable[[], dict[str, Any]]:
+    """An embedder's provider that reads the same file itself, so the engine cannot hand it the
+    snapshot's bytes."""
+    from messagefoundry.config.environments import load_environment_values
+
+    def _read() -> dict[str, Any]:
+        return load_environment_values(
+            base_dir=cfg, dir_name="environments", environment="dev", environ={}
+        )
+
+    return _read
+
+
+async def _values_engine(
+    tmp_path: Path, approved_text: str | None, provider: Callable[[Path], Any]
+) -> tuple[Engine, Path]:
+    """The ``engine`` fixture's engine, given ``provider`` over a config directory whose
+    ``environments/dev.toml`` holds ``approved_text``, or does not exist when it is ``None``."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    values_file = cfg / "environments" / "dev.toml"
+    if approved_text is not None:
+        values_file.parent.mkdir()
+        values_file.write_text(approved_text, encoding="utf-8")
+    engine = await Engine.create(
+        tmp_path / "dc.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+        env_values_provider=provider(cfg),
+    )
+    return engine, values_file
+
+
+def _edit_values_after_the_snapshot(
+    monkeypatch: pytest.MonkeyPatch, values_file: Path, text: str
+) -> None:
+    """Write ``text`` to ``values_file`` right after the release reads its snapshot, and so before
+    the value provider reads the file: the window a writer to the config directory would use."""
+    from messagefoundry.config.wiring import read_trusted_snapshot
+
+    def _read_then_edit(directory: Path, **kwargs: Any) -> Any:
+        snapshot = read_trusted_snapshot(directory, **kwargs)
+        values_file.parent.mkdir(exist_ok=True)
+        values_file.write_text(text, encoding="utf-8")
+        return snapshot
+
+    monkeypatch.setattr("messagefoundry.pipeline.engine.read_trusted_snapshot", _read_then_edit)
+
+
+@pytest.mark.parametrize("approved_text", [_APPROVED_VALUES, None], ids=["edited", "created"])
+async def test_a_value_file_edited_after_the_release_read_its_snapshot_never_applies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved_text: str | None
+) -> None:
+    """Vault BACKLOG #2596. The approval digest covers ``environments/dev.toml`` under the config
+    directory. ``serve``'s provider reads the snapshot's bytes for it on a reload, so an edit made
+    between the release's read and the provider's read never applies, and neither does a value file
+    created in that window. Before, the provider read the file from disk again, and the edited
+    values applied under the approved digest."""
+    engine, values_file = await _values_engine(tmp_path, approved_text, _serve_values_provider)
+    approved_values = {"host": "approved.example.invalid"} if approved_text is not None else {}
+    try:
+        assert cast(Any, engine)._env_values == approved_values
+        service = await _service(engine)
+        approval_id, r = await _hold_then_release(
+            engine,
+            service,
+            {},
+            between=lambda: _edit_values_after_the_snapshot(
+                monkeypatch, values_file, _UNREVIEWED_VALUES
+            ),
+        )
+        assert r.status_code == 200, r.text
+        assert cast(Any, engine)._env_values == approved_values
+        runner = engine.registry_runner
+        assert runner is not None and cast(Any, runner)._env_values == approved_values
+        approved = _held_params(await engine.store.get_pending_approval(approval_id))
+        rows = await engine.store.list_audit(action="config_reload")
+        assert [json.loads(row["detail"])["fingerprint"] for row in rows] == [
+            approved["fingerprint"]
+        ]
+        # The control: a reload that reads the directory afresh applies the edited file.
+        monkeypatch.undo()
+        await engine.reload_detail(dry_run=False)
+        assert cast(Any, engine)._env_values == {"host": "unreviewed.example.invalid"}
+    finally:
+        await engine.stop()
+
+
+async def test_an_opaque_provider_s_value_file_edited_during_the_release_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2596. A provider the engine cannot hand the snapshot reads the file from
+    disk, so the release takes the digest again after that read, and refuses an edit made in the
+    window as ``digest_mismatch``, with nothing swapped and the running values kept."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+
+    engine, values_file = await _values_engine(tmp_path, _APPROVED_VALUES, _opaque_values_provider)
+    cfg = values_file.parent.parent
+    try:
+        await engine.reload_detail(dry_run=False)  # a live runner, on the approved values
+        runner = engine.registry_runner
+        assert runner is not None
+        approved_values = {"host": "approved.example.invalid"}
+        assert cast(Any, engine)._env_values == approved_values
+        approved = config_fingerprint(cfg)
+        service = await _service(engine)
+        _approval_id, r = await _hold_then_release(
+            engine,
+            service,
+            {},
+            between=lambda: _edit_values_after_the_snapshot(
+                monkeypatch, values_file, _UNREVIEWED_VALUES
+            ),
+        )
+        assert r.status_code == 422, r.text
+        assert engine.registry_runner is runner  # nothing swapped
+        assert cast(Any, engine)._env_values == approved_values
+        assert cast(Any, runner)._env_values == approved_values
+        assert await _digest_mismatch_rows(engine) == [
+            {
+                "requested": None,
+                "dry_run": False,
+                "reason": "digest_mismatch",
+                "approved_fingerprint": approved,
+                "current_fingerprint": config_fingerprint(cfg),
+            }
+        ]
+    finally:
+        await engine.stop()
+
+
 async def test_a_directory_moved_away_after_the_resolve_is_refused_as_missing(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

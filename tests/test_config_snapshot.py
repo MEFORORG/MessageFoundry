@@ -474,3 +474,76 @@ def test_a_directory_gone_after_its_check_still_answers_as_missing(
     monkeypatch.setattr(wiring, "read_config_snapshot", vanishing)
     with pytest.raises(ConfigDirMissing):
         load_config(cfg, allow_empty=True)
+
+
+# --- vault BACKLOG #2596: a reload's value file comes from the snapshot the digest covered -------
+
+
+def test_a_snapshot_names_the_value_file_bytes_it_read(tmp_path: Path) -> None:
+    """``covers_environment_file`` accepts only a file in the snapshot's own ``environments/``
+    folder, whether or not it exists, and ``environment_file`` gives the bytes the snapshot read
+    for it, never the file's bytes now."""
+    cfg = tmp_path / "cfg"
+    (cfg / "environments").mkdir(parents=True)
+    (cfg / "environments" / "dev.toml").write_bytes(b'host = "approved"\n')
+    snapshot = read_config_snapshot(cfg, strict=True)
+    (cfg / "environments" / "dev.toml").write_text('host = "edited"\n', encoding="utf-8")
+    (cfg / "environments" / "new.toml").write_text('host = "created"\n', encoding="utf-8")
+
+    assert snapshot.covers_environment_file(cfg / "environments" / "dev.toml")
+    assert snapshot.environment_file(cfg / "environments" / "dev.toml") == b'host = "approved"\n'
+    assert snapshot.covers_environment_file(cfg / "sub" / ".." / "environments" / "new.toml")
+    assert snapshot.environment_file(cfg / "environments" / "new.toml") is None
+    # Elsewhere, including a differently named folder under the config directory, is not covered.
+    assert not snapshot.covers_environment_file(tmp_path / "environments" / "dev.toml")
+    assert not snapshot.covers_environment_file(cfg / "values" / "dev.toml")
+    assert not snapshot.covers_environment_file(cfg / "environments" / "sub" / "dev.toml")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows names folders and files without case")
+def test_a_value_file_spelled_in_another_case_is_covered_on_windows(tmp_path: Path) -> None:
+    cfg = tmp_path / "cfg"
+    (cfg / "environments").mkdir(parents=True)
+    (cfg / "environments" / "dev.toml").write_bytes(b'host = "approved"\n')
+    snapshot = read_config_snapshot(cfg, strict=True)
+    spelled = cfg / "Environments" / "DEV.toml"
+    assert snapshot.covers_environment_file(spelled)
+    assert snapshot.environment_file(spelled) == b'host = "approved"\n'
+
+
+def test_a_snapshot_that_could_not_read_its_value_files_names_none() -> None:
+    """A lax snapshot that left part of ``environments/`` out cannot say what was there, so it
+    refuses rather than answer that there was no file."""
+    snapshot = ConfigSnapshot(
+        directory=Path(os.path.abspath("cfg")), files={}, unreadable=("environments/dev.toml",)
+    )
+    with pytest.raises(OSError):
+        snapshot.environment_file(Path("cfg") / "environments" / "dev.toml")
+
+
+def test_serve_s_value_reader_parses_the_snapshot_and_reads_any_other_file_from_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``serve``'s provider parses a value file the snapshot covers from the snapshot's bytes. A
+    value file outside the config directory is not in the snapshot, so it is read from disk."""
+    from messagefoundry.__main__ import _EnvironmentValuesReader
+
+    monkeypatch.setattr(
+        "messagefoundry.config.wiring.assert_trusted_start_paths", lambda *_a, **_k: None
+    )
+    cfg = tmp_path / "cfg"
+    (cfg / "environments").mkdir(parents=True)
+    (cfg / "environments" / "dev.toml").write_text('HOST = "approved"\n', encoding="utf-8")
+    snapshot = read_config_snapshot(cfg, strict=True)
+    (cfg / "environments" / "dev.toml").write_text('HOST = "edited"\n', encoding="utf-8")
+
+    inside = _EnvironmentValuesReader(base_dir=cfg, dir_name="environments", environment="dev")
+    assert inside.from_snapshot(snapshot) == {"host": "approved"}
+    assert inside() == {"host": "edited"}  # the control: a start reads the disk
+
+    (tmp_path / "environments").mkdir()
+    (tmp_path / "environments" / "dev.toml").write_text('HOST = "outside"\n', encoding="utf-8")
+    outside = _EnvironmentValuesReader(
+        base_dir=tmp_path, dir_name="environments", environment="dev"
+    )
+    assert outside.from_snapshot(snapshot) == {"host": "outside"}

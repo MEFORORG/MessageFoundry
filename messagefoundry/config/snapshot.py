@@ -45,7 +45,8 @@ CONNECTIONS_REL = "connections.toml"
 #: The folder of per-environment value files the ADR 0041 fingerprint has always covered under the
 #: config directory. **Covered, never loaded:** the loader reads none of them. The value file a serve
 #: start actually reads sits under ``[environments].base_dir``, which by default is not the config
-#: directory, and this snapshot does not read it.
+#: directory. Where it is this folder, a reload's value provider parses the bytes this snapshot read
+#: for it (:meth:`ConfigSnapshot.environment_file`); a value file elsewhere is not read here.
 _ENVIRONMENTS_DIR = "environments"
 
 #: The folders a snapshot lists, beside the directory itself.
@@ -141,7 +142,8 @@ class ConfigSnapshot:
     ``files`` maps each relative path (``cfg.py``, ``_helpers.py``, ``connections.toml``,
     ``codesets/diets.csv``, ``environments/dev.toml``) to its bytes. ``unreadable`` names each file,
     or folder, that could not be read and is left out; a strict read raises instead, so it is empty
-    there. The ``environments/`` files are covered by the fingerprint and never loaded."""
+    there. The ``environments/`` files are covered by the fingerprint and never loaded as config;
+    a reload's value provider may parse one (:meth:`environment_file`)."""
 
     directory: Path
     files: Mapping[str, bytes]
@@ -181,6 +183,31 @@ class ConfigSnapshot:
         """The unreadable entries a load would have read, as against those only the fingerprint
         covers. A load refuses when there is any: it cannot run bytes it does not have."""
         return tuple(rel for rel in self.unreadable if not _covered_only(rel))
+
+    def covers_environment_file(self, path: str | Path) -> bool:
+        """Whether ``path`` names a file in this snapshot's ``environments/`` folder, so the digest
+        of the snapshot covers whatever is there, or that nothing is. Compared after following
+        links and, on Windows, without case, so a value file reached through another spelling of
+        the folder still counts. Neither path need exist."""
+        folder = os.path.realpath(self.directory / _ENVIRONMENTS_DIR)
+        parent = os.path.realpath(Path(path).parent)
+        return os.path.normcase(parent) == os.path.normcase(folder)
+
+    def environment_file(self, path: str | Path) -> bytes | None:
+        """The bytes this snapshot read for the value file ``path``, which
+        :meth:`covers_environment_file` must accept, or ``None`` when the snapshot read no such
+        file. A caller reading values for a reload parses these instead of reading the file again,
+        so the values it applies are the bytes the digest covered (vault BACKLOG #2596). Raises
+        ``OSError`` when part of ``environments/`` could not be read, so this snapshot cannot say
+        what was there."""
+        if any(_covered_only(rel) for rel in self.unreadable):
+            raise OSError(errno.EACCES, "the config snapshot could not read environments/")
+        want = os.path.normcase(Path(path).name)
+        prefix = f"{_ENVIRONMENTS_DIR}/"
+        for rel, data in self.files.items():
+            if rel.startswith(prefix) and os.path.normcase(rel[len(prefix) :]) == want:
+                return data
+        return None
 
     def loaded(self, *, code_sets: bool = True) -> ConfigSnapshot:
         """This snapshot without the files only the fingerprint covers: what a sandbox worker

@@ -405,6 +405,19 @@ class ApprovedConfig:
     fingerprint: str | None
 
 
+@runtime_checkable
+class SnapshotEnvValuesProvider(Protocol):
+    """An ``env_values_provider`` that can also read values for a reload from that reload's config
+    snapshot (vault BACKLOG #2596). ``serve``'s provider is one: a value file the snapshot covers is
+    parsed from the snapshot's bytes, so the values a reload applies are the ones its digest names.
+    :meth:`Engine.reload_detail` takes the digest again after any other provider reads, so a
+    released reload refuses an edit made under the config directory in between."""
+
+    def __call__(self) -> Mapping[str, Any]: ...
+
+    def from_snapshot(self, snapshot: ConfigSnapshot) -> Mapping[str, Any]: ...
+
+
 def _require_approved(current: str | None, approval: ApprovedConfig) -> None:
     """Raise unless ``current`` is the digest ``approval`` names: :class:`ConfigDigestMismatch`
     when the approval named none or the digests differ, :class:`ConfigDigestUnavailable` when no
@@ -3280,7 +3293,9 @@ class Engine:
         cannot be read, with nothing swapped; a directory gone since the resolve gives
         :class:`ConfigDirMissing`. ``None`` binds nothing: an ungated reload, a convergence reload
         and a dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint`
-        hashes and no more.
+        hashes and no more. A :class:`SnapshotEnvValuesProvider` reads a value file in the
+        snapshot's ``environments/`` folder from the snapshot too; after any other provider reads,
+        a released reload takes the digest again and refuses a change the same way.
 
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``ConfigDirMissing``
         (missing dir; a ``FileNotFoundError`` subclass, which the callers map to not_found),
@@ -3340,7 +3355,8 @@ class Engine:
         # Re-gather this environment's values so a reload/promote picks up edited environments/<env>.toml
         # (or MEFOR_VALUE_* changes) without a restart — otherwise the WiringError telling the operator
         # to add a missing value would never clear (review M-23).
-        if self._env_values_provider is not None:
+        provider = self._env_values_provider
+        if provider is not None:
             # Guard the provider. On the CLI path it is tomllib.load over environments/<env>.toml, and
             # for an embedder it is arbitrary caller code, so an unreadable value file raised straight
             # out of the reload: TOMLDecodeError is a ValueError, not a WiringError, so POST
@@ -3352,11 +3368,20 @@ class Engine:
             # dual-control release executor, the cluster convergence loop). A DR activation does not
             # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
+            # Vault BACKLOG #2596: the approval digest covers environments/*.toml under the config
+            # directory, so a provider that can is handed the snapshot and parses the bytes the
+            # digest names. Any other provider reads from disk, after the digest check.
+            reads_snapshot = False
             try:
                 # Off the event loop: the CLI provider reads the value file and, before that, its
                 # owner and access list (vault BACKLOG #2626), like every other file the engine reads.
                 # Into a local: the running values change only at the swap (vault BACKLOG #2596).
-                env_values = dict(await asyncio.to_thread(self._env_values_provider))
+                if snapshot is not None and isinstance(provider, SnapshotEnvValuesProvider):
+                    reads_snapshot = True
+                    read = await asyncio.to_thread(provider.from_snapshot, snapshot)
+                else:
+                    read = await asyncio.to_thread(provider)
+                env_values = dict(read)
             except WiringError:
                 # Already a wiring failure that names its own source. Re-raise unwrapped rather than
                 # nesting the same sentence twice.
@@ -3384,6 +3409,11 @@ class Engine:
                     "could not re-read this environment's values for the reload, so the live graph "
                     f"is unchanged: {refusal}"
                 )
+            if approval is not None and not reads_snapshot:
+                # A provider not handed the snapshot may have read a value file the digest covers
+                # from disk after the check, so the release checks the directory again now, and
+                # refuses an edit made in between rather than apply values nobody approved.
+                _require_approved(await self._content_digest(path), approval)
         # Off the event loop: load_config executes user config modules (arbitrary, potentially
         # heavy imports), which would otherwise stall every listener mid-reload (review low-3).
         # WiringError on a bad config. With a snapshot, a released reload's load failure is a

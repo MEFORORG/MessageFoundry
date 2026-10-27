@@ -33,6 +33,7 @@ from typing import Any
 
 __all__ = [
     "VALUE_ENV_PREFIX",
+    "environment_values_from_bytes",
     "is_drive_relative",
     "load_environment_values",
     "resolve_values_base_dir",
@@ -111,12 +112,21 @@ def load_environment_values(
     overlays ``MEFOR_VALUE_<KEY>`` env vars (env wins). A missing file is **not** an error here —
     referenced-but-undefined keys fail loud when a connector is built, not at gather time.
     """
-    values: dict[str, Any] = {}
-
     path = values_file_path(base_dir, dir_name, environment)
-    if path.is_file():
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
+    return environment_values_from_bytes(
+        path.read_bytes() if path.is_file() else None, path=path, environ=environ
+    )
+
+
+def environment_values_from_bytes(
+    file_bytes: bytes | None, *, path: Path, environ: Mapping[str, str]
+) -> dict[str, Any]:
+    """:func:`load_environment_values` over the value file's bytes already read, ``None`` when there
+    is no file. ``path`` only names the file in a warning. A released reload parses the bytes its
+    approval digest covered this way, rather than reading the file again (vault BACKLOG #2596)."""
+    values: dict[str, Any] = {}
+    if file_bytes is not None:
+        data = tomllib.loads(file_bytes.decode("utf-8"))
         for key, value in data.items():
             if isinstance(value, dict):
                 # Nested tables are reserved (future grouping); a value must be a scalar/array today.
