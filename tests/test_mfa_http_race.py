@@ -154,23 +154,29 @@ async def _assert_failed_closed(
     )
 
 
-#: The begin's answer when it is refused for TOTP already being on: the service's ValueError.
+#: The begin's answers once TOTP is on. Neither text has a constant to import: the MFA-required
+#: detail is inline at each raise site in ``api/security.py``, and the already-enabled one is a
+#: local in ``AuthService.begin_mfa_enrollment``. So both are spelled here.
+_MFA_REQUIRED = {"detail": "multi-factor verification required; POST /auth/mfa-verify then retry"}
 _ALREADY_ENABLED = {"detail": "MFA is already enabled; disable it before re-enrolling"}
 
 
 def _assert_begin_refused_once_enabled(begun: httpx.Response) -> None:
     """A begin that reached the account after the confirm's enable committed, from an MFA-pending
-    session. It is refused in one of three ways, each pinned by its own headers or detail, and any
+    session. It is refused in one of three ways, each pinned by its headers and its detail, and any
     other answer fails the test.
 
     ``require_reauth_only_action`` reads the factor-binding rule twice: once itself, then again
     inside ``_action_step_up_ok``. An enable that commits before the first read yields the
     MFA-required refusal, one that commits between the two reads yields the step-up refusal, and one
     that commits after both, but before the begin stages, leaves the service to refuse it as already
-    enabled. The service's text has no constant to import, so it is spelled here."""
+    enabled. The step-up refusal points the session at ``POST /me/reauth``, which the gate's own
+    docstring says it must not do (BACKLOG #1951). That is a gate defect this test does not fix;
+    it accepts the answer so a correct compare-and-set never reads red here."""
     if begun.status_code == 403 and begun.headers.get("X-MFA-Required") == "1":
         # The route's own read of the rule: the session must prove the factor the account now has.
         assert "X-Step-Up-Required" not in begun.headers, begun.headers
+        assert begun.json() == _MFA_REQUIRED, begun.text
     elif begun.status_code == 403:
         # The second read, inside _action_step_up_ok: refused as a missing step-up for this action.
         assert begun.headers.get("X-Step-Up-Required") == "1", begun.headers
@@ -286,9 +292,12 @@ async def test_a_begin_request_inside_the_confirm_requests_window_cannot_choose_
 #: The unordered test's hook sleeps, in seconds: before the enable's write, and after it.
 _SLEEP_BEFORE_WRITE = 0.3
 _SLEEP_AFTER_WRITE = 0.5
-#: The begin's send delay aimed past the write and before the confirm's answer: the middle of the
-#: after-write sleep, counted from the request's start. A loaded runner can push it back inside the
-#: window, so the event-ordered test below is what reaches the after-write outcome every run.
+#: The begin's send delay aimed past the write and before the confirm's answer. It counts from the
+#: confirm request's start, and the write lands at the confirm's work before the hook (its route
+#: dependencies, code check, argon2id hashing and rotation) plus the before-write sleep. So it sends
+#: the begin half the after-write sleep past the write less that work, which a loaded runner can
+#: grow past the margin and land the begin inside the window. The event-ordered test below is what
+#: reaches the after-write outcome on every run.
 _BEGIN_DELAY_PAST_THE_WRITE = _SLEEP_BEFORE_WRITE + _SLEEP_AFTER_WRITE / 2
 
 
@@ -303,10 +312,13 @@ async def test_a_begin_request_sent_once_the_enable_committed_is_refused_and_the
     enabled, begin answered, confirm resumed, confirm answered, so the whole begin ran while the
     confirm request was in flight, past its write.
 
-    Both of the begin's gate reads then see TOTP on, so the route refuses it with the MFA-required
-    403, and the confirm wins with its own secret. This does not go red without the fix: the begin
-    lands after the window. It is the check that the confirm-wins branch of the sweep below is
-    exercised at all."""
+    The route's first read of the factor-binding rule then sees TOTP on, so it refuses the begin
+    with the MFA-required 403 before the second read inside ``_action_step_up_ok`` runs, and the
+    confirm wins with its own secret. This does not go red without the fix: the begin lands after
+    the window. It makes the sweep's confirm-wins outcome, and the MFA-required arm of
+    ``_assert_begin_refused_once_enabled``, run on every runner. The helper's other two arms need
+    the enable to commit between or after the gate's reads, and only the sweep's unordered
+    interleavings reach them."""
     service = await _service(engine)
     user_id = await _add(service, "op", Role.OPERATOR)
     pin_totp_clock(monkeypatch, _T0)
@@ -314,13 +326,18 @@ async def test_a_begin_request_sent_once_the_enable_committed_is_refused_and_the
         confirmer, beginner, first = await _two_sessions_one_staged(c)
 
         timeline: list[str] = []
+        writes: list[bool] = []
         enabled = asyncio.Event()
         answered = asyncio.Event()
         real_enable = engine.store.enable_totp
 
         async def enable_then_hold(*args: Any, **kwargs: Any) -> bool:
+            if writes:
+                # Holds once, like the forced test's park; any later call passes straight through.
+                return await real_enable(*args, **kwargs)
             try:
                 written = await real_enable(*args, **kwargs)
+                writes.append(written)
             finally:
                 enabled.set()
             timeline.append("confirm enabled")
@@ -354,15 +371,19 @@ async def test_a_begin_request_sent_once_the_enable_committed_is_refused_and_the
             "confirm resumed",
             "confirm answered",
         ], (timeline, confirmed.status_code, confirmed.text)
+        assert writes == [True], "the confirm's compare-and-set wrote nothing"
 
         assert confirmed.status_code == 200, confirmed.text
         assert len(confirmed.json()["recovery_codes"]) == _CODES
-        assert begun.status_code == 403, begun.text
+        _assert_begin_refused_once_enabled(begun)
+        # Narrowed to the one arm this ordering reaches: the route's first read refused it.
         assert begun.headers.get("X-MFA-Required") == "1", begun.headers
-        assert "X-Step-Up-Required" not in begun.headers, begun.headers
         user = await engine.store.get_user(user_id)
         assert user is not None and user.totp_enabled is True
         assert await engine.store.get_totp_secret(user_id) == totp.new_enrolment(first)
+        assert len(await engine.store.get_recovery_code_hashes(user_id)) == _CODES
+        rows = await engine.store.list_audit(actor="op", action="auth.mfa_denied", limit=10)
+        assert [json.loads(str(row["detail"]))["path"] for row in rows] == ["/me/mfa/enroll"]
 
 
 @pytest.mark.parametrize("delay", [0.0, 0.01, 0.05, 0.2, _BEGIN_DELAY_PAST_THE_WRITE])
