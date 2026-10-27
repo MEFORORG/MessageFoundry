@@ -3,7 +3,9 @@
 - **Status:** Accepted (2026-10-27), with Amendment A. Accepted by the batch 447 Manager under the
   Owner's delegation of 2026-10-27 (CLAUDE.md section 5, "A delegated decision counts as that
   ruling", owner ruling 2026-10-22), after two adversarial reviews; Amendment A records the
-  question, the answer and both reviews. The text below says only the owner can move this record to
+  question, the answer and both reviews. Two repair rounds after both reviews (`2a6f30037`,
+  `83d038b7c`) changed design text, and a third adversarial read at `83d038b7c` covered those
+  commits and returned *keep accepted after named small fixes*, which the commit after it applies. The text below says only the owner can move this record to
   Accepted: that delegation record is the owner's ruling under CLAUDE.md section 5, so the
   acceptance rests on it. Three *To resolve on acceptance* items stay open, each with its
   recommendation; the build follows the recommendation unless the owner rules otherwise.
@@ -202,7 +204,8 @@ change.
 - **Lifetime.** 24 hours from issue, fixed rather than a setting. See *To resolve on acceptance*.
 - **Bound to its account.** The check reads the digest on the session's own user row, so a code
   proves nothing for any other account.
-- **Single use, spent atomically.** One conditional write clears the digest only where it still
+- **Single use, spent atomically.** One conditional sealed write, through `_write_user` (Amendment
+  A, *What this amendment changes in the build's cost*), clears the digest only where it still
   matches and has not expired. Only a write that changed a row counts, so two racing ceremonies
   cannot both spend one code.
 - **The order in `confirm_mfa_enrollment`.** First read the code: present, well formed, and
@@ -270,7 +273,8 @@ change.
   for itself. Section 6 covers that case.
 - **Refused for** a local account, an account that already holds an engine factor ("reset its MFA
   first"), a disabled account, and an unknown account.
-- **Its write is one conditional statement, like the host command's.** It sets the digest only where
+- **Its write is one conditional sealed write through `_write_user`, like the host command's.** It
+  sets the digest only where
   the account is `ad`, enabled, and holds no factor. An issue whose write changes no row is refused,
   and nothing is shown. So a disable, or a factor, that lands between the route's checks and its
   write leaves no code on the account.
@@ -312,7 +316,8 @@ Context item 1, so none can call the issuing route.
   refusal at `open_store` (`keyless_opt_out_refusal`), and `_refuse_an_unauditable_write` before the
   write (ADR 0194). ADR 0171 states why host access is a real gate: whoever holds the service
   config, the store and its key already holds the database.
-- **Its write is one conditional statement.** It sets the digest only where the account is `ad`,
+- **Its write is one conditional sealed write through `_write_user`.** It sets the digest only
+  where the account is `ad`,
   enabled, and holds no factor. So it has no read-then-write window for a live engine to slip into.
 - **Whether it may run beside a live engine is not settled here.** That turns on whether a second
   process may append to the audit chain safely. Until the build shows it can, the command follows
@@ -609,8 +614,13 @@ after verifying in code that all three backends serialize the audit append. The 
 recommended option, reading its "I accept" as the delegate's once the question was delegated.
 The Builder's two code-review rounds after the acceptance commit changed design text too (at least
 the TOTP fold's no-passkey condition, the non-database refusal, the sealed columns, and where the
-begin routes' budget draw is built); the pull request names those commits, and neither
-adversarial review saw them. Decision log id
+begin routes' budget draw is built). Those two repair rounds, `2a6f30037` and `83d038b7c`, came
+after both adversarial reviews, so a third adversarial read at `83d038b7c` covered them. It
+returned *keep accepted after named small fixes*: record that read in the Status line and here,
+name how the new columns survive the users-row seal, name the code's writes as conditional sealed
+writes through `_write_user`, and list the spent notice among the audit rows docs/PHI.md says
+store a client address. The commit after
+`83d038b7c` applies them. Decision log id
 `d20261027T133727170-18c43f`. This amendment changes the design the record proposes, and the
 record was accepted with it on 2026-10-27, under the same delegation (see Status).
 
@@ -702,7 +712,7 @@ that removes the directory re-bind under owner ruling A5, and the Lander files i
   secret. The #3025 compare-and-set then fails a confirm the real holder had in flight, and that
   confirm ends its session (section A2). It cannot change which secret is enabled, and it binds
   nothing. **It must not cost the holder's code either**, so on the TOTP path the spend is folded
-  into the enable's conditional write (section A3): a confirm whose enable matches no row spends
+  into the enable's conditional sealed write through `_write_user` (section A3): a confirm whose enable matches no row spends
   nothing. The begin's ceremony-budget draw bounds how often it can restage.
 - The per-actor ceremony budget (`allow_reauth_attempt`) is keyed on the account. So whoever holds a
   session on the account can spend it with refused codes and make the holder's attempt wait out the
@@ -789,7 +799,7 @@ build, with what the challenge does at each refusal:
 8. Pop the challenge, and verify the attestation.
 9. The discoverable check, then the duplicate check on the credential id, then **new: a read of
    whether the account already holds a passkey with this label**.
-10. **New: the spend**, one conditional write. It clears the code's digest only where the digest
+10. **New: the spend**, one conditional sealed write through `_write_user`. It clears the code's digest only where the digest
     still matches and has not expired, the account is enabled, TOTP is still off, and the account
     holds no passkey, the same conditions the TOTP fold below puts on its write. So a
     factor bound by a path that asks no code, after the step 6 re-check and before this write, is
@@ -824,7 +834,8 @@ caller nothing about whether a code is outstanding, because no code was read.
 `confirm_mfa_enrollment` follows the same order up to the code: read the staged secret and
 `verified_cell`, then the floor, the directory lookup, the dead-session guard and its one factor
 check, **then the code read**. After those come the TOTP step verify and consume, then the stamp and
-rotation, **then the enable with the spend folded into it**: one conditional write that turns TOTP
+rotation, **then the enable with the spend folded into it**: one conditional sealed write, through
+`_write_user`, that turns TOTP
 on and clears the code's digest, only where the staged cell is still `verified_cell`, TOTP is still
 off, the account holds no passkey, the account is enabled, and the digest still matches and has not
 expired. The no-passkey condition is new, and it binds only this code-carrying write, for an
@@ -857,8 +868,8 @@ ground out, so this record does not rest on it.** Every backend already serializ
 second process. On SQLite, `_append_audit_row` names *"a CLI command run beside a serving engine"*:
 the UNIQUE constraint on `seq` refuses the second row, and one retry under the write lock takes the
 next position. PostgreSQL takes `pg_advisory_xact_lock` on the chain (H-7), and SQL Server takes an
-application lock on it (`_AUDIT_APPEND_LOCK`). The command's issue is also one conditional write
-(section 6). So beside a live engine its audit row would not fork the chain.
+application lock on it (`_AUDIT_APPEND_LOCK`). The command's issue is also one conditional sealed write
+through `_write_user` (section 6). So beside a live engine its audit row would not fork the chain.
 
 **What is enforced, and why.** This answers section 6's "until the build shows it can" and the
 Consequences line that leans on it: a second process can append safely, so audit-chain safety is no
@@ -949,13 +960,21 @@ the code was used, or from where. **When a code is spent, the issuing Administra
 Read the Consequences list with these changes. The `users` row gains three nullable columns, not
 two: the digest, the expiry and the issuer. There are five audit actions, not four, with
 `auth.enrolment_code_spent_notice`; section 7's "All four actions" reads five. There are two notice
-kinds, not one: the issue notice and the spent notice. The TOTP enable's conditional write also
+kinds, not one: the issue notice and the spent notice. The TOTP enable's conditional sealed write also
 spends the code (A3), and so does the passkey spend, each conditioned on the account holding no
 factor; the condition binds only the code-carrying write, never the enable of a confirm that
-carries no code. The passkey finish gains a label read (A3). The three new columns are fields of the
-`users` row's integrity seal (BACKLOG #2592), with the reseal that a change to the sealed fields
-requires, so a database write without the sealing key cannot plant a code digest or redirect the
-spent notice. The host command gains the SQLite probe refusals and the non-database refusal (A4).
+carries no code. The passkey finish gains a label read (A3). The three new columns join the
+`users` row's integrity seal (BACKLOG #2592), so a database write without the sealing key cannot
+plant a code digest or redirect the spent notice. They cannot simply become sealed fields:
+`UserAuthzRecord.seal_fields` seals every `UserRow` field but `authz_seal`, and `seal_bytes`
+encodes a `None` field by its name, so three new fields would change the sealed bytes of every
+existing user and break its seal, and `reseal_user_records` refuses a record that fails its seal.
+So each new column enters the sealed field set only when it is non-null, as `passkey_digest`
+already does for a passkey's `discoverable` (it leaves the field out of the digest while it is
+false): a user who never held a code keeps the seal it was sealed under, and a code digest planted
+outside the store still fails the seal. Every write that sets or clears them, the code's issue, its
+spend and the TOTP fold, is a conditional sealed write through `_write_user`, which
+`tests/test_user_seal.py` pins every `users` UPDATE to. The host command gains the SQLite probe refusals and the non-database refusal (A4).
 **The begin routes' ceremony-budget draw, and the rest of the A1 table, belong to the build that
 removes `_reauth_ad`**, the one that admits the begins with no grant (A1, *Sequencing*; AC-16).
 This ADR's build does not add them, and that build must not admit a begin without the draw. The two lines A2 drops are dropped. Section 6's no-issuer state, "under
