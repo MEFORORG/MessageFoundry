@@ -215,8 +215,10 @@ function trustState(): string {
  * Resolves to true when what the client TRUSTS changed, compared as host keys and PEM contents, so
  * the caller can re-probe rather than leave a stale verdict on screen. Dropping an anchor counts,
  * because a retarget to a remote engine registers nothing and still invalidates the verdict on
- * screen. Re-reading the same certificate does not count, so a refresh started by a verification
- * failure cannot re-probe itself into a loop.
+ * screen. So does a `caFile` claim this refresh published that differs from the last one published
+ * ({@link publishPinnedHosts}), since it changes which requests are refused. Re-reading the same
+ * certificate does not count, and claims move only with the settings, so a refresh started by a
+ * verification failure cannot re-probe itself into a loop.
  *
  * Refreshes run ONE AT A TIME. Each awaits a subprocess and then replaces the whole set, so two
  * interleaved runs could each replace what the other had just registered with an older reading.
@@ -303,7 +305,7 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   const targets = pinTargetsOf(environments());
   const pins = trustPinsFor(targets);
   const hosts = hostPinsOf(pins);
-  publishPinnedHosts(hosts);
+  const claimsMoved = publishPinnedHosts(hosts);
   // This refresh asks the CLI after any failure noted so far, so it covers that failure.
   lateFailure = undefined;
   acceptsLateFailure = !followUp;
@@ -340,7 +342,7 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   claimedKeys = hosts;
   commit(outcomes, hosts);
   warnAboutUnanchoredTargets(targets, hosts);
-  return trustState() !== before;
+  return claimsMoved || trustState() !== before;
 }
 
 /**
@@ -630,8 +632,9 @@ async function fillFrom(
 const PEM_MARKER = "-----BEGIN CERTIFICATE-----";
 
 /** A certificate read: the PEM, or why there is none, worded for the log. `notACertificate` says the
- *  file was read whole, is not empty, and holds no PEM certificate, which is an answer rather than a
- *  failure. */
+ *  file was read whole and holds no PEM certificate, and is not what a rewrite in place looks like
+ *  partway (empty, a BOM or a line break, or the start of the BEGIN marker; see {@link readAnchorPem}),
+ *  which is an answer rather than a failure. */
 type PemRead =
   | { pem: string; problem?: undefined; notACertificate?: undefined }
   | { pem?: undefined; problem: string; notACertificate?: boolean };
@@ -662,7 +665,7 @@ async function readAnchorPem(file: string): Promise<PemRead> {
     // trim(): a rewrite can also leave only a BOM or a line break for a moment. trim removes both;
     // the leading U+FFFD is part of a BOM whose three bytes had not all landed. A strict prefix of the
     // marker is the same moment a few bytes later, so it proves nothing either.
-    const seen = pem.replace(/^\uFFFD+/, "").trim();
+    const seen = pem.replace(/^\uFFFD/, "").trim(); // one: a partial BOM decodes to exactly one
     return {
       problem: `the engine certificate at ${file} is not PEM (no BEGIN CERTIFICATE block)`,
       notACertificate: seen.length > 0 && !PEM_MARKER.startsWith(seen),

@@ -277,8 +277,8 @@ export function trustRemedy(
       `not sent to ${url}: its caFile in \`messagefoundry.environments\` was refused ` +
       `(${reason ?? "the MessageFoundry Engine log says why"}), and an engine whose https entry sets ` +
       `a caFile is never verified against the default CAs. Correct the caFile (an engine shard ` +
-      `without its own inherits its environment's), or remove it to put this engine back on the ` +
-      `default CAs.`
+      `without its own inherits its environment's), or remove every refused caFile for this ` +
+      `engine to stop pinning it.`
     );
   }
   const head = `cannot verify the TLS certificate ${url} presented (${code}).`;

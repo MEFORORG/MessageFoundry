@@ -420,7 +420,8 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     plantCert(path.join("pki", "prod-ca.pem"));
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile: "pki/prod-ca.pem" }];
 
-    assert.strictEqual(await trust.refreshEngineTrust(), false);
+    // True: no anchor moved, but the refused value now refuses every request to that host.
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
     assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
     assert.ok(
       logged.some((line) => line.includes(`not pinning ${REMOTE}`)),
@@ -518,7 +519,8 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     fs.mkdirSync(dir, { recursive: true });
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile: dir }];
 
-    assert.strictEqual(await trust.refreshEngineTrust(), false);
+    // True: no anchor was read, but the host is now pinned, so its requests are refused.
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
     assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
     assert.ok(
       logged.some((line) => line.includes("could not read") && line.includes(`not pinning ${REMOTE}`)),
@@ -1505,6 +1507,12 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     }
     // The control: real content that is not PEM is an answer, and drops it.
     fs.writeFileSync(caFile, "not a certificate");
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
+    // And bytes that are not UTF-8 at all (a UTF-16 BOM) are more than one partial BOM: an answer too.
+    fs.writeFileSync(caFile, PEM);
+    await trust.refreshEngineTrust();
+    fs.writeFileSync(caFile, Buffer.from([0xff, 0xfe]));
     await trust.refreshEngineTrust();
     assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
   });
