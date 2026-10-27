@@ -957,9 +957,9 @@ class StoreSettings(_Section):
     #     CA-bundle pin (chain + hostname still verified).
     #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's OWN certificate
     #     by file (an exact-cert match, brace-quoted STORE-5-safe), so a CA file matches nothing. It goes
-    #     out with `Encrypt=strict`: on the Driver 18.7 build tested, the pin was enforced with strict and
-    #     not with `Encrypt=yes` (vault BACKLOG #2223). Strict is TDS 8.0, so it needs SQL Server 2022 or
-    #     later, the supported floor; an older server refuses the connection. Not a revocation control.
+    #     out with `Encrypt=strict` (vault BACKLOG #2223). Why strict, the server version it needs, and the
+    #     build and platform it was tested on: the `ssl_root_cert` row of docs/CONFIGURATION.md. Not a
+    #     revocation control.
     # REJECTED for SQLite (no TLS at all). A path, not a secret — it may live in the config file /
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).

@@ -4762,8 +4762,8 @@ def _serve(args: argparse.Namespace) -> int:
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
         # BACKLOG #299: the settings-level CRL files ([tls], [logging] forward, [auth] OIDC, [store],
         # [api] client), so a CRL going stale on an OUTBOUND hop alerts before it fails a handshake.
-        # Vault BACKLOG #2223: plus the SQL Server store pin, whose expiry the driver does not check
-        # under Encrypt=strict.
+        # Vault BACKLOG #2223: plus the SQL Server store pin, whose expiry the engine watches itself
+        # (why: the `ssl_root_cert` row of docs/CONFIGURATION.md).
         settings_crls=[*crls_from_settings(settings), *certs_from_settings(settings)],
         # Reserve the engine's own API listener so no inbound can be wired onto it (it would collide
         # with uvicorn at bind); surfaced as a clear PortConflictError at check/start instead.
