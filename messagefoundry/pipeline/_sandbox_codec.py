@@ -48,7 +48,6 @@ never a NAK, never an accept-and-drop, never a crashed connection.
 from __future__ import annotations
 
 import base64
-import binascii
 import datetime as _dt
 import json
 import math
@@ -912,11 +911,9 @@ def enc_code_sets(code_sets: object, blobs: _Blobs) -> Any:
 
     Sent **once per spawn**, not per dispatch: re-sending them with every message was ~430 KB and
     ~4.6 ms of pure marshalling on a realistic crosswalk. Sending them at all — rather than letting the
-    child use its OWN ``load_config`` of the same directory — is what keeps ``mode=subprocess``
-    byte-identical to ``mode=off``: after a transparent respawn (a wall-cap kill, a crash) the child
-    re-reads ``codesets/`` from disk, so an operator who edits a crosswalk without a ``/config/reload``
-    would otherwise have the child serve a value the engine never would. The engine's tables are the
-    single source of truth on both sides.
+    child parse its own — is what keeps ``mode=subprocess`` byte-identical to ``mode=off``: the
+    engine's tables are the single source of truth on both sides, and with them published the boot
+    frame leaves the snapshot's ``codesets/`` files out (vault BACKLOG #2596).
 
     ``None`` means "the caller published no tables" and leaves the child on its own bootstrap load (the
     pre-existing behaviour for a session constructed without them); an empty mapping means "the engine
@@ -1021,7 +1018,7 @@ def dec_snapshot(node: Any, reader: _Reader) -> ConfigSnapshot:
             raise SandboxCodecError(f"config snapshot path {rel!r} appears twice")
         try:
             files[rel] = base64.b64decode(reader.text(pair[1]), validate=True)
-        except binascii.Error as exc:
+        except ValueError as exc:  # binascii.Error, or a str segment that is not ASCII
             raise SandboxCodecError(f"config snapshot file {rel!r} is not base64: {exc}") from exc
     try:
         return ConfigSnapshot(directory=Path(directory), files=files)

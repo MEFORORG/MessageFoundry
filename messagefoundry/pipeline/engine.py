@@ -3088,7 +3088,9 @@ class Engine:
             # The path can come from a client's config_dir, so it is scrubbed for CodeQL
             # py/log-injection as the reload refusal logs scrub theirs.
             log.warning(
-                "config content digest failed for %s: %s",
+                "config content digest failed for %s: %s. The reload's snapshot could not be "
+                "read whole, so a released reload is refused, and any other reload reads the "
+                "directory again and refuses only a file it needs",
                 scrub_log_argument(str(path)),
                 safe_exc(exc),
             )

@@ -29,9 +29,15 @@ from types import CodeType
 
 import pytest
 
+from messagefoundry.config import wiring
 from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.config.run_context import RunContext
-from messagefoundry.config.snapshot import ConfigSnapshot, config_py_files, read_config_snapshot
+from messagefoundry.config.snapshot import (
+    ConfigDirMissing,
+    ConfigSnapshot,
+    config_py_files,
+    read_config_snapshot,
+)
 from messagefoundry.config.wiring import WiringError, load_config, load_snapshot, validate_config
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.dryrun import transform_one
@@ -392,3 +398,30 @@ def test_an_unreadable_module_named_like_the_tables_folder_still_declares(
     monkeypatch.setattr(Path, "read_bytes", refuse)
     messages = [d.message for d in validate_config(tmp_path)]
     assert messages == ["could not read codesets_map.py"]
+
+
+def test_a_boot_frame_file_that_is_not_ascii_base64_is_a_codec_refusal() -> None:
+    """``b64decode`` of a str with a non-ASCII character raises a plain ValueError, not
+    binascii.Error; a frame rejection is still the codec's own error."""
+    node = {"dir": "cfg", "files": [["graph.py", "éAAA"]]}
+    with pytest.raises(codec.SandboxCodecError, match="not base64"):
+        codec.dec_snapshot(node, codec._Reader([]))
+
+
+def test_a_directory_gone_after_its_check_still_answers_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lax read reads a vanished directory as an empty one. A load must refuse it as missing,
+    not run an empty graph, or with ``allow_empty`` return one (BACKLOG #3157)."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "graph.py").write_text(_graph("V1"), encoding="utf-8")
+
+    def vanishing(directory: Path, *, strict: bool) -> ConfigSnapshot:
+        (cfg / "graph.py").unlink()
+        cfg.rmdir()
+        return read_config_snapshot(directory, strict=strict)
+
+    monkeypatch.setattr(wiring, "read_config_snapshot", vanishing)
+    with pytest.raises(ConfigDirMissing):
+        load_config(cfg, allow_empty=True)

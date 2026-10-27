@@ -8052,6 +8052,12 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
         raise ConfigDirMissing(f"config directory not found: {directory}")
     _assert_safe_config_source(directory)
     snapshot = read_config_snapshot(directory, strict=strict)
+    if not strict and not snapshot.files and not directory.is_dir():
+        # A lax read reads a vanished directory as an empty one; a load must not run that as an
+        # empty graph, so it still answers as missing (BACKLOG #3157).
+        from messagefoundry.config.snapshot import ConfigDirMissing
+
+        raise ConfigDirMissing(f"config directory not found: {directory}")
     _require_loadable(snapshot)
     return snapshot
 
@@ -8092,7 +8098,7 @@ def load_config(
     directory = Path(directory)
     if snapshot is None:
         snapshot = read_trusted_snapshot(directory)
-    # Resolved, so a worker that spawns later loads this target even if a link in the path moves.
+    # Resolved, so the graph names the directory it came from even if a link in the path moves.
     return load_snapshot(snapshot, allow_empty=allow_empty, source_dir=directory.resolve())
 
 

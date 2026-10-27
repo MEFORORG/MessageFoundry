@@ -561,7 +561,8 @@ class SandboxWorkerRefused(SandboxError):
     engine graph is refused from the session's cached refusal with ``first`` False, so the runner
     raises its ``sandbox_worker_refused`` alert once per refusal, not once per message (vault
     BACKLOG #2724, owner ruling 2026-10-16). ``content_only`` is True when the config modules'
-    bytes are the only difference, so the cause is an edit on disk with no reload. ``graph`` is
+    bytes are the only difference: the worker ran other bytes than the engine loaded, which a
+    session sent the engine's snapshot cannot do (vault BACKLOG #2596). ``graph`` is
     the engine graph the worker was compared with, so the runner can tell a refusal against a
     graph it no longer serves. The defaults exist only so that a copy or an unpickle, which
     passes the message alone, still builds."""
