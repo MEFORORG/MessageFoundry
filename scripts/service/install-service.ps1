@@ -1927,11 +1927,14 @@ if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Le
     throw "Service settings file not found at: $ServiceConfig"
 }
 
-# The first act of an install that builds its root (vault BACKLOG #2626), once the inputs above
-# have been read. NOT YET READ here: -NssmPath and -NssmDir, which Resolve-Nssm reads below, so a
-# refusal there leaves the built root for a re-run without -EngineWheel. The check below then
-# reads the built root as it reads any install.
+# An install that builds its root (vault BACKLOG #2626) resolves NSSM first. Resolve-Nssm's
+# refusals, at least a -NssmPath off the pin, an -NssmDir others can write and a failed download,
+# need no engine root, and one after the build would leave a built root that -EngineWheel then
+# refuses to build over. Every later refusal acts on the service registration itself. The check
+# below then reads the built root as it reads any install.
 if ($BuildsInstall) {
+    # AFTER the normalization, as the call below says.
+    $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
     Build-EngineInstall -InstallRoot $DefaultInstallRoot -Wheel $EngineWheel -WheelSha256 $EngineWheelSha256 `
         -RequirementsLock $RequirementsLock -LockSha256 $RequirementsLockSha256 -BasePython $BasePython
     foreach ($built in @($PythonExe, $AppExe)) {
@@ -1952,8 +1955,9 @@ if ($installProblem) {
 }
 
 # AFTER the normalization: Resolve-Nssm copies nssm.exe into -NssmDir, and the service is registered
-# with that path, so a relative one would be resolved against a different directory later.
-$NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
+# with that path, so a relative one would be resolved against a different directory later. An
+# install that built its root resolved it above, before the build.
+if (-not $BuildsInstall) { $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir }
 
 $LogDir   = Join-Path $DataDir "logs"
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null

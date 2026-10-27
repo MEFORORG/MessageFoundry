@@ -81,8 +81,9 @@ of record for the steps and their order.
 
 It refuses to build into a root that already exists, so it never upgrades in place; see
 [Update to a new build](#update-to-a-new-build-restart-vs-reinstall). An unfinished build deletes
-the root. The build runs before NSSM is fetched, so when a later step fails, such as the NSSM
-download, re-run with `-EngineWheel` left out to use the root it built. `-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython`
+the root. NSSM is fetched and checked before the build, so a refused `-NssmPath` or `-NssmDir`, or
+a failed download, leaves no root. When a step after the build fails, such as the service
+registration, re-run with `-EngineWheel` left out to use the root it built. `-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython`
 defaults to the first `python` on `PATH`; `Get-EngineBuildProblem` in the script lists what it
 refuses there, at least a launcher, a shim, a venv's interpreter, a Python older than 3.14 and
 one anyone but administrators can write. The installer installs the engine wheel only. Install

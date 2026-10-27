@@ -94,7 +94,10 @@ def test_every_install_is_checked_for_broad_write_before_anything_acts() -> None
         in text
     )
     assert "throw" in text[calls[0] : calls[0] + 300]
-    assert calls[0] < text.index("$NssmPath = Resolve-Nssm")
+    # Before NSSM acts on an install it does not build. One it builds resolves NSSM first, so a
+    # refusal there leaves no root (test_building_the_install_root_is_opt_in_and_never_editable).
+    default_nssm = "if (-not $BuildsInstall) { $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir }"
+    assert calls[0] < text.index(default_nssm)
     # The old check, under the default-install condition only, is gone.
     assert "$installFiles" not in text
     assert "or pass -AppExe." not in text
@@ -717,11 +720,16 @@ def test_building_the_install_root_is_opt_in_and_never_editable() -> None:
     )
     lock_check = text.index("$configLockProblem = Get-LockPathProblem -Path $Config")
     settings = text.index('throw "Service settings file not found at: $ServiceConfig"')
+    block = text.index(
+        "if ($BuildsInstall) {\n    # AFTER the normalization, as the call below says."
+    )
+    nssm_first = text.index("    $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir\n")
     build = text.index("    Build-EngineInstall -InstallRoot $DefaultInstallRoot")
     check = text.index("$installProblem = Get-EngineInstallProblem")
-    nssm = text.index("$NssmPath = Resolve-Nssm")
-    # Every refusal that reads an input sits before the build, and the build before the check.
-    assert preflight < lock_check < settings < build < check < nssm
+    nssm_default = text.index("if (-not $BuildsInstall) { $NssmPath = Resolve-Nssm")
+    # Every refusal that reads an input, NSSM's included, sits before the build, and the build
+    # before the check. Without a build, the check comes before NSSM acts.
+    assert preflight < lock_check < settings < block < nssm_first < build < check < nssm_default
     assert "-LockSha256 $RequirementsLockSha256" in text[preflight:check]
     for editable in ("pip install -e", "--editable", '"-e"'):
         assert editable not in text
@@ -762,6 +770,7 @@ def _build(tmp_path: Path, body: str) -> dict[str, Any]:
             "Get-NssmHomeProblem",
             "Get-EngineBuildProblem",
             "Build-EngineInstall",
+            "Resolve-Nssm",
         ],
         "",
     )
@@ -882,6 +891,54 @@ def test_the_build_refuses_a_root_others_can_write_before_pip_runs(tmp_path: Pat
     assert "BUILTIN\\Users" in got["error"]
     assert [str(x) for x in got["log"]] == [f"acl {root}"], got
     assert got["root"] is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
+@pytest.mark.parametrize("nssm", ["off_pin", "on_pin"])
+def test_a_refused_nssm_path_with_engine_wheel_leaves_no_root(nssm: str, tmp_path: Path) -> None:
+    """The installer's own build block runs, lifted by AST, with the real Resolve-Nssm. A -NssmPath
+    off the pin refuses before any native step, and no root is made. The control, a -NssmPath on
+    the pin, runs the build."""
+    wheel, lock = _wheel(tmp_path / "release")
+    (tmp_path / "pf").mkdir()
+    root = tmp_path / "pf" / "MessageFoundry" / "engine"
+    nssm_exe = tmp_path / "dl" / "nssm.exe"
+    nssm_exe.parent.mkdir()
+    nssm_exe.write_bytes(b"an nssm.exe")
+    pin = _sha(nssm_exe) if nssm == "on_pin" else _wrong(_sha(nssm_exe))
+    body = (
+        "  $res = [ordered]@{ error = '' }\n"
+        f"  $NssmExeSha256 = {_psq(pin)}\n"
+        f"  $NssmPath = {_psq(str(nssm_exe))}\n"
+        f"  $NssmDir = {_psq(str(tmp_path / 'pf' / 'MessageFoundry' / 'nssm'))}\n"
+        "  $BuildsInstall = $true\n"
+        f"  $DefaultInstallRoot = {_psq(str(root))}\n"
+        f"  $EngineWheel = {_psq(str(wheel))}\n"
+        f"  $EngineWheelSha256 = {_psq(_sha(wheel))}\n"
+        f"  $RequirementsLock = {_psq(str(lock))}\n"
+        f"  $RequirementsLockSha256 = {_psq(_sha(lock))}\n"
+        "  $BasePython = 'C:\\Python314\\python.exe'\n"
+        # Files that exist, so the block's post-build check passes in the control.
+        f"  $PythonExe = {_psq(str(wheel))}\n"
+        f"  $AppExe = {_psq(str(lock))}\n"
+        "  $block = $ast.Find({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] "
+        "-and $args[0].Extent.Text.StartsWith('if ($BuildsInstall) {') -and "
+        "$args[0].Extent.Text.Contains('Build-EngineInstall') }, $true)\n"
+        "  try { . ([scriptblock]::Create($block.Extent.Text)) } "
+        "catch { $res.error = $_.Exception.Message }\n"
+        "  $res.log = @($log)\n"
+        f"  $res.root = Test-Path -LiteralPath {_psq(str(root))}\n"
+        "  $res | ConvertTo-Json -Compress\n"
+    )
+    got = _build(tmp_path, body)
+    if nssm == "off_pin":
+        assert "Refusing -NssmPath" in got["error"], got
+        assert not _runs(got), got
+        assert got["root"] is False, got
+    else:
+        assert got["error"] == "", got
+        assert len(_runs(got)) == 5, got
+        assert got["root"] is True, got
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
