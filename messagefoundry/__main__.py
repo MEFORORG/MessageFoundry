@@ -38,10 +38,8 @@ from messagefoundry.remotedebug import (
 # process: the test suite does, and so does `api/tls.py` inside an engine that already has it.
 #
 # `_serve` and `_supervise` still make the same call first. Their comments describe the window
-# as it was before this call existed; with this one in place theirs normally adds nothing. Where
-# an earlier audit hook cuts off the install's probe, each call adds a copy (remotedebug.py says
-# why). Under `python -m`, an import of this module, such as `api/tls.py` makes, runs this call
-# again.
+# as it was before this call existed; with this one in place theirs normally adds nothing.
+# `install_remote_debug_guard` says when a later call adds a copy, including this one run again.
 install_remote_debug_guard()
 
 # PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that

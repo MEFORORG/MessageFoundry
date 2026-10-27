@@ -285,7 +285,8 @@ def _guard_answers() -> bool:
 
 
 def install_remote_debug_guard() -> None:
-    """Add the hook to this process, once, when the interpreter accepts injected scripts.
+    """Add the hook to this process when the interpreter accepts injected scripts and the hook
+    does not answer a probe. Behind a hook that cuts the probe off, every call adds a copy.
 
     Call it as early in the process as possible: a script injected before the call runs. A later
     call adds nothing once the hook answers, and an audit hook cannot be removed. Each call starts
@@ -317,8 +318,9 @@ def install_remote_debug_guard() -> None:
     That keeps the retry for an earlier hook that cuts the probe off and refused the add at
     import, but no longer refuses it by the time ``serve`` or ``supervise`` makes its own call.
     The cost is a copy that may stack where the first add did go in behind a cut-off probe: one
-    per call made while the probe stays cut off, and nothing else bounds them. The command line
-    makes at least two calls, at import and then first in ``_serve`` or ``_supervise``. Under
+    per call made while the probe stays cut off, and nothing else bounds them. ``serve`` and
+    ``supervise`` make at least two calls, at import and then first in ``_serve`` or
+    ``_supervise``; other subcommands make the import's call. Under
     ``python -m``, a later import of the command-line module runs the import-time call again, as
     ``api/tls.py`` does when it writes a key. A stacked copy changes no count: the first copy
     raises on ``cpython.remote_debugger_script``, and the interpreter stops at the first hook
