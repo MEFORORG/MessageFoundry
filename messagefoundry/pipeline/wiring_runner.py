@@ -878,6 +878,16 @@ class _AttachmentWriteFailed(Exception):
     answers the sender, as it does for a failed ingress commit."""
 
 
+#: Every refusal ``_detach_documents`` raises. Both callers catch this one tuple, so a new refusal
+#: cannot reach one caller and escape the other (how BACKLOG #1619's put_attachment gap arose).
+_DETACH_REFUSALS: tuple[type[Exception], ...] = (
+    _StreamBudgetExceeded,
+    StreamingAttachmentsUnsupported,
+    DocRefError,
+    _AttachmentWriteFailed,
+)
+
+
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
 # PortConflictError naming the connection + binding, instead of a bare unattributed OSError aborting the
 # inbound. EADDRINUSE: another process/instance holds it; EADDRNOTAVAIL: the bind_address isn't a local
@@ -920,6 +930,26 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 #: settle, taking the ADR 0031 rebind-failure branch instead. The plain (SHUTDOWN) source stop and
 #: stop_inbound use the same bound, for the same reason (BACKLOG #1620): one policy, not two.
 _PENDING_STOP_SETTLE_SECONDS = 10.0
+
+
+async def _join_or_cancel(
+    tasks: Collection[asyncio.Task[None]],
+) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+    """Wait for ``tasks`` under ``_PENDING_STOP_SETTLE_SECONDS``, then cancel and join the stragglers.
+    Returns ``(done, cancelled_stragglers)``. A cancel of the caller cancels every task before it
+    propagates, so none is left running unowned. The one cancel-and-join policy for inbound stops
+    (BACKLOG #1620); the demotion path abandons instead, on purpose (:meth:`_stop_sources_demote`)."""
+    try:
+        done, still = await asyncio.wait(tasks, timeout=_PENDING_STOP_SETTLE_SECONDS)
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        raise
+    for task in still:
+        task.cancel()
+    if still:
+        await asyncio.gather(*still, return_exceptions=True)
+    return done, still
 
 
 class DrIntakeState(NamedTuple):
@@ -4665,23 +4695,14 @@ class RegistryRunner:
         The bound limits how long the RUNNER waits, not the work. A ``stop()`` blocked in
         ``asyncio.to_thread`` (a share call, a driver call) is cancelled at its await, but CPython
         cannot kill the thread, which runs on until its call returns. Same accepted-by-design leak as
-        the strict-validate timeout in :meth:`_handle_inbound`.
-
-        A cancel of this coroutine cancels every stop task before it propagates, so none is orphaned.
+        the strict-validate timeout in :meth:`_handle_inbound`. :func:`_join_or_cancel` holds the
+        wait itself, shared with :meth:`_settle_pending_source_stops`.
         """
         if not sources:
             return {}
         tasks = {asyncio.create_task(src.stop(), name=f"stop:{n}"): n for n, src in sources}
-        try:
-            done, still = await asyncio.wait(tasks, timeout=_PENDING_STOP_SETTLE_SECONDS)
-        except asyncio.CancelledError:
-            for task in tasks:
-                task.cancel()
-            raise
-        for task in still:
-            task.cancel()
+        done, still = await _join_or_cancel(tasks)
         if still:
-            await asyncio.gather(*still, return_exceptions=True)
             log.warning(
                 "%d inbound stop(s) did not finish within %.1fs and were cancelled: %s. A stop "
                 "blocked in a worker thread keeps that thread until its call returns, and a rebind "
@@ -5798,11 +5819,8 @@ class RegistryRunner:
         self._pending_source_stops = []
         if not pending:
             return
-        _done, still = await asyncio.wait(pending, timeout=_PENDING_STOP_SETTLE_SECONDS)
-        for task in still:
-            task.cancel()
+        _done, still = await _join_or_cancel(pending)
         if still:
-            await asyncio.gather(*still, return_exceptions=True)
             log.warning(
                 "%d abandoned inbound stop(s) did not finish within %.1fs and were cancelled; a "
                 "rebind of those ports may fail (isolated per connection, ADR 0031)",
@@ -5900,9 +5918,8 @@ class RegistryRunner:
         else:
             # BACKLOG #1620: concurrent and bounded. Fully joined (stragglers cancelled and gathered)
             # before the dispatcher stop below, so the D3 order holds.
-            for name, exc in (
-                await self._stop_sources_bounded(list(self._sources.items()))
-            ).items():
+            failed = await self._stop_sources_bounded(list(self._sources.items()))
+            for name, exc in failed.items():
                 log.warning("inbound %r: stop() failed: %s", name, safe_exc(exc))
             # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
             # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
@@ -7638,12 +7655,7 @@ class RegistryRunner:
         if streaming_over:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
-            except (
-                _StreamBudgetExceeded,
-                StreamingAttachmentsUnsupported,
-                DocRefError,
-                _AttachmentWriteFailed,
-            ) as exc:
+            except _DETACH_REFUSALS as exc:
                 await self._record(
                     ic,
                     peek,
@@ -8018,12 +8030,7 @@ class RegistryRunner:
         if streaming_over:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
-            except (
-                _StreamBudgetExceeded,
-                StreamingAttachmentsUnsupported,
-                DocRefError,
-                _AttachmentWriteFailed,
-            ) as exc:
+            except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=detach_err)
                 ack = (

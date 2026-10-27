@@ -20,7 +20,6 @@ import logging
 import threading
 import time
 from collections.abc import Iterator
-from typing import Any
 
 import pytest
 
@@ -168,7 +167,5 @@ async def test_a_cancelled_stop_leaves_no_stop_task_behind(release: threading.Ev
     with pytest.raises(asyncio.CancelledError):
         await task
     await asyncio.sleep(0)
-    leftover: list[Any] = [
-        t for t in asyncio.all_tasks() if t.get_name().startswith("stop:") and not t.done()
-    ]
+    leftover = [t for t in asyncio.all_tasks() if t.get_name().startswith("stop:") and not t.done()]
     assert leftover == []

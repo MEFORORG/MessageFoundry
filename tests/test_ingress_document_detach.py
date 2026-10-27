@@ -16,7 +16,8 @@ the ingress commit, leaving a small ``mfdoc:v1:ref:`` handle in the persisted sk
 * content-address dedup (identical docs → one physical attachment, refcount N, no double-write);
 * a crash before the skeleton commit leaves an orphan chunk the Phase-0 sweep reclaims, and a re-run
   re-derives identically (dedup on sha256);
-* the streaming-detach in-flight budget + an unsupported backend both NAK (never accepted-and-dropped);
+* the streaming-detach in-flight budget, an unsupported backend and a failed put_attachment (BACKLOG
+  #1619) all NAK (never accepted-and-dropped);
 * the detached skeleton composes with ADR 0104 copy-on-Send (Message.copy carries the handle verbatim).
 
 Mirrors ``test_nonhl7_ingress_size_cap.py`` (ingress via ``_handle_inbound``) + ``test_attachment_substrate.py``.
@@ -27,7 +28,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import socket
+import sqlite3
 from pathlib import Path
+from typing import Any, NoReturn
 
 import pytest
 
@@ -466,6 +469,79 @@ async def test_unsupported_backend_naks(store: MessageStore) -> None:
 
     assert _ack_code(ack) == "AE"
     assert (await _messages(store))[0]["status"] == MessageStatus.ERROR.value
+
+
+# --- put_attachment itself fails (BACKLOG #1619) ------------------------------
+#
+# Both callers of _detach_documents caught only the refusals above, so a driver error from
+# put_attachment escaped the ingress handler with no message row. It now joins them: an ERROR row
+# plus AE/CE (or a refused receipt on HTTP). A hard outage, where the ERROR write fails too, still
+# propagates, so the MLLP transport's last-resort NAK answers (tests/test_ack_after_commit_invariant.py).
+
+# A driver error whose text quotes a segment, the way one quoting a bound parameter would.
+_DRIVER_FAULT = "disk I/O error binding PID|1||MRN123^^^FAC||DOE^JOHN"
+
+
+async def _fail_put(*args: Any, **kwargs: Any) -> NoReturn:
+    raise sqlite3.OperationalError(_DRIVER_FAULT)
+
+
+@pytest.mark.parametrize(("ack_mode", "code"), [(AckMode.ORIGINAL, "AE"), (AckMode.ENHANCED, "CE")])
+async def test_put_attachment_failure_records_error_and_naks(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, ack_mode: AckMode, code: str
+) -> None:
+    ic = _streaming_ic(threshold=500, ack_mode=ack_mode)
+    runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
+    monkeypatch.setattr(store, "put_attachment", _fail_put)
+
+    ack = await runner._handle_inbound(ic, _hl7_with_doc(_big_b64(2000)).encode("utf-8"))
+
+    assert _ack_code(ack) == code
+    msgs = await _messages(store)
+    assert [m["status"] for m in msgs] == [MessageStatus.ERROR.value]
+    assert "attachment write failed" in msgs[0]["error"]
+    assert "OperationalError" in msgs[0]["error"]
+    assert "DOE^JOHN" not in msgs[0]["error"], (
+        "the driver text reached the stored reason unscrubbed"
+    )
+    assert await store.in_pipeline_depth() == 0, "an ingress row landed though the detach failed"
+    assert runner._stream_inflight_bytes == 0, "the in-flight budget was not released"
+
+
+async def test_http_put_attachment_failure_records_error_and_refuses(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
+    monkeypatch.setattr(store, "put_attachment", _fail_put)
+
+    mid = await runner._handle_inbound_http(ic, _hl7_with_doc(_big_b64(2000)).encode("utf-8"))
+
+    assert mid is None, "a receipt came back though the attachment write failed"
+    msgs = await _messages(store)
+    assert [m["status"] for m in msgs] == [MessageStatus.ERROR.value]
+    assert "attachment write failed" in msgs[0]["error"]
+    assert await store.in_pipeline_depth() == 0
+
+
+class _StoreDown(RuntimeError):
+    pass
+
+
+async def test_put_attachment_failure_with_the_store_down_still_propagates(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _down(*args: Any, **kwargs: Any) -> NoReturn:
+        raise _StoreDown("store unavailable")
+
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
+    monkeypatch.setattr(store, "put_attachment", _fail_put)
+    monkeypatch.setattr(store, "record_received", _down)
+
+    with pytest.raises(_StoreDown):
+        await runner._handle_inbound(ic, _hl7_with_doc(_big_b64(2000)).encode("utf-8"))
+    assert runner._stream_inflight_bytes == 0
 
 
 # --- copy-on-Send composition (ADR 0104) --------------------------------------
