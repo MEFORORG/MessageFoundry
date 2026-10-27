@@ -48,7 +48,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import Protocol
 
@@ -1304,28 +1304,37 @@ class StageDispatcher:
         # BACKLOG #1611: both writes are retried until they land, while this serializer still HOLDS
         # the lane (PROCESSING, slot reserved), so no claim takes a later row past a stranded one. A
         # stop ends the retry and leaves the rows INFLIGHT for reset_stale_inflight at the next start,
-        # as a cancelled serializer's are; the in-flight watch pages them meanwhile.
+        # as a cancelled serializer's are; the in-flight watch pages them meanwhile. Each write is
+        # still sent once on a stop, so a stop during the head's retry still tries the tail release.
         #
         # Losing leadership pauses the retry and does not end it; _land_while_holding says why.
+        head_ok = tail_ok = True
         if head_reschedule is not None:
             head_id, when = head_reschedule
-            # The head is dated `when`, which the RETRY outcome parks the lane until. Only a retry
-            # that runs past it dates the head from now instead, by the same escalated span, so it
-            # never lands past-due and fix A's backoff is kept.
+            # The head is dated `when`, and _drain_lane parks its RETRY outcome until that same
+            # date. Only a retry that runs past it dates the head from now instead, by the same
+            # escalated span, so it never lands past-due and fix A's backoff is kept; the lane then
+            # parks until the date actually written.
             span = max(when - self._clock(), _LANE_ERROR_BACKOFF_SECONDS)
-            if not await self._land_while_holding(
+            dated = when
+
+            def reschedule_head() -> Awaitable[object]:
+                nonlocal dated
+                now = self._clock()
+                dated = when if now < when else now + span
+                return self._store.reschedule_claimed([head_id], dated)
+
+            head_ok = await self._land_while_holding(
+                lane, "reschedule_claimed of the head", reschedule_head
+            )
+            outcome = replace(outcome, park_until=dated)
+        if tail_ids:
+            tail_ok = await self._land_while_holding(
                 lane,
-                "reschedule_claimed of the head",
-                lambda: self._store.reschedule_claimed(
-                    [head_id], when if self._clock() < when else self._clock() + span
-                ),
-            ):
-                return
-        if tail_ids and not await self._land_while_holding(
-            lane,
-            f"release_claimed of {len(tail_ids)} row(s)",
-            functools.partial(self._store.release_claimed, tail_ids),
-        ):
+                f"release_claimed of {len(tail_ids)} row(s)",
+                functools.partial(self._store.release_claimed, tail_ids),
+            )
+        if not (head_ok and tail_ok):
             return
         # --- synchronous terminal transition (NO await below) -------------------------------------
         # S_lane (ARM 1): read the episode clock ONCE, here, before the outcome branch — re-reading it
@@ -1492,6 +1501,7 @@ class StageDispatcher:
                 if self._stop.is_set():
                     return False
                 if self._is_leader():
+                    warned = False  # leading again: a second loss in this retry warns again
                     break
                 delay = _LANE_ERROR_BACKOFF_SECONDS
                 if not warned:
@@ -1820,6 +1830,10 @@ class StageDispatcher:
         self._empty.record_empty(woken=woken)
 
     async def _sleep_or_stop(self, seconds: float) -> None:
+        # A set stop is read first: with ``seconds`` 0, wait_for cancels the wait before it runs and
+        # raises TimeoutError even on a set Event (see RegistryRunner._stop_or_sleep).
+        if self._stop.is_set():
+            return
         try:  # noqa: SIM105
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
         except TimeoutError:

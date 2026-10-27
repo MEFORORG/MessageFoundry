@@ -478,6 +478,16 @@ def _died(prev: asyncio.Task[None]) -> bool:
     return prev.exception() is not None
 
 
+def _g6_exhausted(item: OutboxItem, max_attempts: int) -> bool:
+    """ADR 0057 guardrail G6, the poison-crash attempts ceiling: whether a claimed row's
+    POST-increment ``attempts`` has reached a finite cap (``mark_failed``'s ``attempts >=
+    max_attempts``). It bounds a row whose work ends the process or kills its worker each time,
+    with no exception any handler can catch: no ingress, routed or response claim enforces
+    ``max_attempts``, but the claim counts the attempt and ``reset_stale_inflight`` does not undo
+    it."""
+    return item.attempts >= max_attempts
+
+
 # A per-lane worker's run of faults closes on the first healthy pass or empty claim at least this
 # long after its last fault (see _WorkerFaultLog).
 _FAULT_RUN_QUIET_SECONDS = 10.0
@@ -1476,6 +1486,9 @@ class RegistryRunner:
         # BACKLOG #1611: per (stage, lane), consecutive per-lane worker deaths and when the latest
         # replacement started, for the respawn backoff in _recover_then_run.
         self._worker_deaths: dict[tuple[str, str], tuple[int, float]] = {}
+        # BACKLOG #1611: (stage, lane) whose worker DIED and whose replacement has not yet claimed a
+        # row. Its first claimed head meets the ADR 0057 G6 ceiling (_dead_letter_head_after_death).
+        self._ceiling_armed: set[tuple[str, str]] = set()
         # --- outbound operator PAUSE (connection controls) ---------------------------------------
         # Operator-paused outbounds: delivery halted, queued rows RETAINED PENDING (never dropped/
         # reordered). The RELOAD-SURVIVING source of truth — outbound_running() reads it, a reload
@@ -7022,7 +7035,15 @@ class RegistryRunner:
         to :data:`_RESPAWN_BACKOFF_CAP_SECONDS`, the pooled claimer's figures), and the first
         death after :data:`_RESPAWN_STABLE_SECONDS` of clean running waits nothing. Recovery puts
         the row a worker died holding back at the head of its lane, so a row that kills its
-        worker every time would otherwise respawn, re-claim and die with no pause at all."""
+        worker every time would otherwise respawn, re-claim and die with no pause at all.
+
+        **What ends that loop is the ADR 0057 G6 attempts ceiling.** No ingress, routed or response
+        claim enforces ``max_attempts``, and a delivery's ``mark_failed`` never runs for a worker
+        killed mid-send, but each claim's ``attempts`` increment stands through the reset. So the
+        replacement of a worker that DIED checks the head of its first non-empty claim against the
+        ceiling (:meth:`_dead_letter_head_after_death`) and dead-letters it once its attempts reach a finite
+        cap. Where the cap is not finite (``max_attempts=None``), nothing dead-letters it: the
+        loop goes on, paced only by this backoff, and each death still logs its traceback."""
         if died and await self._stop_or_sleep(self._respawn_delay(stage, name)):
             return
         run = FailureRun()
@@ -7047,7 +7068,17 @@ class RegistryRunner:
                 continue
             run.clear(log, "%s lane %r: recovery", stage.value, name, level=logging.WARNING)
             break
-        await worker(name)
+        if not died:
+            await worker(name)
+            return
+        # Armed for the replacement's life: its first non-empty claim consumes it, and a worker
+        # that exits before claiming leaves nothing armed for the next one on this lane.
+        armed = (stage.value, name)
+        self._ceiling_armed.add(armed)
+        try:
+            await worker(name)
+        finally:
+            self._ceiling_armed.discard(armed)
 
     def _respawn_delay(self, stage: Stage, name: str) -> float:
         """The wait before a dead per-lane worker's replacement recovers and claims; see
@@ -7086,10 +7117,10 @@ class RegistryRunner:
         (:meth:`_recover_stopped_worker_residue`) uses, scoped to this one stage and lane.
 
         The claim's ``attempts`` increment stands, as under the startup reset, and that is by
-        design (ADR 0057 G6): a row whose worker died holding it counts the attempt. That bounds the
-        loop only where a claim path enforces ``max_attempts``, which not every lane does, so the
-        respawn backoff in :meth:`_recover_then_run` is what paces a row that kills its worker
-        every time. A STOPPED worker's tail, recovered here when its own release failed, is
+        design (ADR 0057 G6): a row whose worker died holding it counts the attempt, and the
+        replacement of a worker that died dead-letters its first claimed head once those attempts
+        reach a finite cap (:meth:`_recover_then_run` says how, and what is left when the cap is
+        not finite). A STOPPED worker's tail, recovered here when its own release failed, is
         charged the same +1, as under the reload backstop.
 
         CLUSTERED, IT STANDS DOWN, exactly where ``Engine.start()`` skips its unconditional reset
@@ -7097,8 +7128,8 @@ class RegistryRunner:
         nothing here can tell its rows from the dead worker's. Recovery there stays where it was:
         at least the leader's lease-reclaim sweep (Postgres) and the on-promotion reset (SQL Server). A node
         that is not the leader runs nothing either. Single-node and engine-sharded, the lane is
-        this node's own: a worker exists only for a lane this shard owns (ADR 0073), and the scope
-        is that lane alone, so a sibling shard's rows are out of reach.
+        this node's own: a worker exists only for a lane this engine shard owns (ADR 0073), and the
+        scope is that lane alone, so a sibling engine shard's rows are out of reach.
 
         A store failure RAISES: :meth:`_recover_then_run` retries it before any claim, and the
         in-flight watch (:meth:`_check_inflight_strands`) pages the rows meanwhile."""
@@ -8281,6 +8312,7 @@ class RegistryRunner:
                 if await self._stop_or_sleep(delay):
                     return True
                 if self._coordinator.is_leader():
+                    warned = False  # leading again: a second loss in this retry warns again
                     break
                 delay = _WORKER_ERROR_BACKOFF_SECONDS
                 if not warned:
@@ -8432,6 +8464,11 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
+                # #1611: the replacement for a worker that died judges its first head (ADR 0057 G6).
+                if self._ceiling_armed and await self._dead_letter_head_after_death(
+                    Stage.OUTBOUND, name, items[0]
+                ):
+                    items, claimed = items[1:], claimed[1:]
                 for i, item in enumerate(items):
                     # #2771: the two loop-top gates, re-asked PER ITEM, before the pacing wait and
                     # again after it. An UNORDERED claim holds up to claim_limit rows, and a paced lane
@@ -9302,6 +9339,11 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
+                # #1611: the replacement for a worker that died judges its first head (ADR 0057 G6).
+                if self._ceiling_armed and await self._dead_letter_head_after_death(
+                    Stage.INGRESS, name, items[0]
+                ):
+                    items, claimed = items[1:], claimed[1:]
                 for i, item in enumerate(items):
                     outcome = await self._process_ingress_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
@@ -9407,6 +9449,54 @@ class RegistryRunner:
         await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}")
         return _ItemOutcome.PROCESSED, None
 
+    async def _dead_letter_exhausted(
+        self, stage: Stage, name: str, item: OutboxItem, max_attempts: int
+    ) -> None:
+        """Dead-letter ``item``, which :func:`_g6_exhausted` judged out of attempts (ADR 0057 G6).
+        Ids and counts only in the log line, never content."""
+        log.warning(
+            "%s lane %r: item %s exhausted its attempts (%d >= %d); dead-lettering "
+            "(poison-crash ceiling G6)",
+            stage.value,
+            name,
+            item.id,
+            item.attempts,
+            max_attempts,
+        )
+        await self.store.dead_letter_now(item.id, f"{stage.value} attempts exhausted")
+
+    async def _dead_letter_head_after_death(
+        self, stage: Stage, name: str, head: OutboxItem
+    ) -> bool:
+        """Judge the head of the first non-empty claim of a replacement whose predecessor DIED
+        (BACKLOG #1611) against the G6 ceiling, and return True if it was dead-lettered. Any other
+        claim is not judged: the caller reads :attr:`_ceiling_armed` first, so a lane with no death
+        pays nothing for this.
+
+        It is what ends the respawn loop :meth:`_recover_then_run` describes. Respawn recovery
+        re-pends the row a worker died holding at the head of its lane, so that head is the row to
+        judge, and only that one: a batch claim charges every row it takes, so rows behind the
+        poison climb with it, and judging them would dead-letter rows that never killed anything.
+        An unordered outbound lane claims in its own order, so there the row may not be the head,
+        and the respawn backoff alone paces it. The cap is the one the lane's own failures meet:
+        the outbound's resolved retry policy for a delivery lane, and ``[delivery]``
+        ``retry_max_attempts`` for the inbound stages, as the router and transform workers'
+        internal-error policy takes it. A lane whose connection a reload removed keeps its row, as
+        its worker's missing-connection path does."""
+        key = (stage.value, name)
+        if key not in self._ceiling_armed:
+            return False
+        self._ceiling_armed.discard(key)
+        if stage is Stage.OUTBOUND:
+            policy = self._retry.get(name)
+            cap = None if policy is None else policy.max_attempts
+        else:
+            cap = self._delivery_defaults.max_attempts if name in self.registry.inbound else None
+        if cap is None or not _g6_exhausted(head, cap):
+            return False
+        await self._dead_letter_exhausted(stage, name, head, cap)
+        return True
+
     async def _process_ingress_item(
         self, name: str, item: OutboxItem
     ) -> tuple[_ItemOutcome, float | None]:
@@ -9436,28 +9526,14 @@ class RegistryRunner:
             )
             return _ItemOutcome.STOPPED, None
         inline = self._inline_ok.get(name, False)
-        if inline:
-            # ADR 0057 G6 — ingress-lane attempts ceiling. The fused inline path widens the
-            # work under ONE re-runnable unit, so a deterministic process-crash (segfault/OOM,
-            # no exception to catch) inside route_only/transform_one/handoff would re-pend +
-            # re-run forever: C2 durably bumped attempts each pass, but no ingress/routed-lane
-            # path enforces max_attempts today (mark_failed's ceiling is delivery-only). Close
-            # that crash-loop here: a re-claimed item whose attempts have reached the finite
-            # delivery cap is dead-lettered (matches mark_failed's `attempts >= max_attempts`
-            # semantics, sqlserver.py mark_failed). max_attempts None = retry forever
-            # (no ceiling), unchanged.
-            max_attempts = self._delivery_defaults.max_attempts
-            if max_attempts is not None and item.attempts >= max_attempts:
-                log.warning(
-                    "router worker %r: inline item %s exhausted ingress attempts "
-                    "(%d >= %d); dead-lettering (poison-crash ceiling G6)",
-                    name,
-                    item.id,
-                    item.attempts,
-                    max_attempts,
-                )
-                await self.store.dead_letter_now(item.id, "ingress attempts exhausted")
-                return _ItemOutcome.PROCESSED, None
+        # ADR 0057 G6 — ingress-lane attempts ceiling (see _g6_exhausted). The fused inline path
+        # widens the work under ONE re-runnable unit, so a deterministic process-crash inside
+        # route_only/transform_one/handoff would re-pend + re-run forever. max_attempts None =
+        # retry forever (no ceiling), unchanged.
+        cap = self._delivery_defaults.max_attempts
+        if inline and cap is not None and _g6_exhausted(item, cap):
+            await self._dead_letter_exhausted(Stage.INGRESS, name, item, cap)
+            return _ItemOutcome.PROCESSED, None
         # ADR 0071 B5 PR3 — fused route+handoff dispatch (SQL Server, pooled, flag on). Fuse
         # route_only (CONTENT) + route_handoff_sync (INFRA) into ONE worker hop, gated on the
         # real guard _fusion_active (True only on SS with the sync twins + executors opened OK).
@@ -9663,6 +9739,12 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
                     woken = await self._wait_for_work(wait_ev)
                     continue
+                # #1611: the replacement for a worker that died judges its first head (ADR 0057 G6).
+                if self._ceiling_armed and await self._dead_letter_head_after_death(
+                    Stage.RESPONSE, name, item
+                ):
+                    claimed = []
+                    continue
                 outcome = await self._process_response_item(name, item)
                 if outcome[0] is _ItemOutcome.STOPPED:
                     return
@@ -9772,6 +9854,11 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
+                # #1611: the replacement for a worker that died judges its first head (ADR 0057 G6).
+                if self._ceiling_armed and await self._dead_letter_head_after_death(
+                    Stage.ROUTED, name, items[0]
+                ):
+                    items, claimed = items[1:], claimed[1:]
                 # Process the claimed FIFO batch. BACKLOG #214: when intra-message transform concurrency
                 # is enabled this overlaps a message's sibling rows' transforms while keeping the handoff
                 # serial + in claim order; default (concurrency 1 / single row / fused) it is the exact
@@ -10972,7 +11059,12 @@ class RegistryRunner:
 
     async def _stop_or_sleep(self, delay: float) -> bool:
         """Sleep up to ``delay`` seconds; return True if a stop was requested meanwhile (so a
-        backing-off worker exits promptly on shutdown instead of sleeping out the full delay)."""
+        backing-off worker exits promptly on shutdown instead of sleeping out the full delay).
+
+        A stop already requested is read first: with ``delay`` 0, ``wait_for`` cancels the wait
+        before it runs and raises ``TimeoutError`` even on a set Event, so it would report no stop."""
+        if self._stop.is_set():
+            return True
         try:
             await asyncio.wait_for(self._stop.wait(), delay)
             return True
