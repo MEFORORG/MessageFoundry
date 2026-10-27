@@ -6016,12 +6016,12 @@ def _write_cert_files(
     ``public`` holds ``(path, pem, kind)``, ``kind`` naming the file in a refusal. Each create is
     exclusive, so a file that appeared after the caller's :func:`_refusal_for_existing` check is
     still never replaced. If a write fails or is interrupted, every file this run wrote is
-    removed, the key included, and the failure line names any it could not remove. Returns ``None`` when every
-    file is written, else the command's exit code (BACKLOG #3073; vault BACKLOG #3514 for
-    `cert import`)."""
+    removed, the key included, and the failure line names any it could not remove. Returns
+    ``None`` when every file is written, else the command's exit code (BACKLOG #3073; vault
+    BACKLOG #3514 for `cert import`)."""
     # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
     # It rides out a brief Windows hold on a file, such as a scanner opening the new key.
-    from messagefoundry.api.tls import _unlink_generated
+    from messagefoundry.restricted_file import unlink_generated
 
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -6045,7 +6045,7 @@ def _write_cert_files(
         left: list[str] = []
         for done in written:
             try:
-                _unlink_generated(done)
+                unlink_generated(done)
             except FileNotFoundError:
                 continue  # already gone, so nothing is left to remove
             except OSError:
