@@ -48,7 +48,7 @@ from messagefoundry.pipeline.secret_rotation import (
     StoreKeyRotationOverdueError,
     enforce_secret_expiry,
 )
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import generate_key, make_cipher, seal_rotation_fingerprint
 from messagefoundry.store.store import MessageStore
 from tests._ast_sites import call_sites
 
@@ -294,16 +294,16 @@ async def _start_with_old_ad_stamp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, settings: SecretRotationSettings
 ) -> Engine:
     """A real Engine over a real KEYED SQLite store, holding an AD bind password whose persisted stamp
-    says it was last rotated in 2020. The stamp carries the SAME keyed fingerprint the reconcile will
-    compute, so the reconcile keeps the old date rather than reading a rotation."""
+    says it was last rotated in 2020. The stamp carries a sealed cell of the SAME value the reconcile will
+    check, so the reconcile keeps the old date rather than reading a rotation."""
     value = "test-only-bind-password"  # nosec B105 - a test value, never a real credential
     monkeypatch.setenv(_AD, value)
     store = await MessageStore.open(tmp_path / "expiry.db", cipher=make_cipher(generate_key()))
-    fp_key = store.secret_rotation_fingerprint_key()
-    assert fp_key is not None, "premise: a keyed store fingerprints secrets"
+    cipher = store.secret_rotation_cipher()
+    assert cipher is not None, "premise: a keyed store fingerprints secrets"
     await store.upsert_secret_rotation_meta(
         _AD,
-        fingerprint=sr._keyed_fingerprint(fp_key, value),
+        fingerprint=seal_rotation_fingerprint(cipher, _AD, sr._fingerprint_cell(_AD, value)),
         tracked_since="2020-01-01",
         last_rotated="2020-01-01",
     )
@@ -380,7 +380,7 @@ async def test_a_keyless_engine_with_an_opt_in_starts(
     engine starts and says the opt-in cannot fire here."""
     monkeypatch.setenv(_AD, "test-only-bind-password")
     store = await MessageStore.open(tmp_path / "keyless.db")
-    assert store.secret_rotation_fingerprint_key() is None, "premise: a keyless store"
+    assert store.secret_rotation_cipher() is None, "premise: a keyless store"
     engine = Engine(
         store,
         secret_rotation_settings=SecretRotationSettings(enforce_secret_expiry_classes=[_AD]),
@@ -425,7 +425,7 @@ async def test_a_vault_transit_engine_with_an_opt_in_says_nothing_alerts(
     )
     assert isinstance(store, MessageStore)
     assert store.cipher().encrypts, "premise: an encrypting store, not a keyless one"
-    assert store.secret_rotation_fingerprint_key() is None, "premise: nothing is fingerprinted"
+    assert store.secret_rotation_cipher() is None, "premise: nothing is fingerprinted"
     # BACKLOG #2337: enforce refuses a vault_transit start with no bound attestation, a gate this
     # test is not about, so attest the fake's key and keep the premise on the secret-expiry line.
     await store.record_transit_bound_attestation(

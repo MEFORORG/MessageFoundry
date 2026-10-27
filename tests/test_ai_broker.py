@@ -110,15 +110,36 @@ def test_endpoint_host_allowlist_matching() -> None:
     assert endpoint_host_allowed("https://ai.internal/x", []) is False  # empty => nothing
 
 
-def test_broker_refuses_cleartext_http_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    # http would put the api_key on the wire in clear -> refused unless the dev escape is set.
-    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with pytest.raises(AiBrokerError, match="cleartext http"):
+@pytest.mark.parametrize("escape", [False, True], ids=["escape-off", "escape-on"])
+def test_broker_refuses_cleartext_http_endpoint(
+    escape: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every call sends the api_key, so http is refused with no escape (vault BACKLOG #3533 item 5).
+    # Until then MEFOR_ALLOW_INSECURE_TLS released it at warn; the escape-on case pins that it no
+    # longer does, and the posture is no longer a parameter at all.
+    if escape:
+        monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    else:
+        monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(AiBrokerError, match="cleartext http") as info:
         AiBroker(
             endpoint="http://ai.internal/v1/messages",
-            api_key="k",
+            api_key="synthetic-ai-key",
             allowed_endpoints=["ai.internal"],
         )
+    message = str(info.value)
+    assert "with no escape" in message
+    assert "MEFOR_ALLOW_INSECURE_TLS" not in message  # never offers the escape it ignores
+    assert "synthetic-ai-key" not in message
+
+
+def test_broker_refuses_http_before_the_allowlist_and_other_schemes_as_not_https() -> None:
+    # http is refused before the SSRF allowlist check, so an operator is never sent to list a host
+    # whose http endpoint is refused anyway. Any other non-https scheme says https is required.
+    with pytest.raises(AiBrokerError, match="cleartext http"):
+        AiBroker(endpoint="http://ai.internal/v1/messages", api_key="k", allowed_endpoints=[])
+    with pytest.raises(AiBrokerError, match="must be https, got scheme 'ftp'"):
+        AiBroker(endpoint="ftp://ai.internal/x", api_key="k", allowed_endpoints=["ai.internal"])
 
 
 def test_broker_requires_endpoint_and_key() -> None:
