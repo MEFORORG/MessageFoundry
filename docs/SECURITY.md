@@ -2335,8 +2335,9 @@ release the config source's trust check runs before the directory is read. It st
 reads no file's contents. The release then reads the directory once, into a snapshot, and checks
 that snapshot's digest against the approved one before any config module runs. The load compiles
 and runs that same snapshot, and the `config_reload` row records its digest. So the config
-modules, helpers and tables checked are the ones that run, and an edit to them on disk during the
-load is neither run nor recorded. The environment values are read apart from the snapshot, as the
+modules, helpers and tables checked are the ones the loader runs, and an edit to them on disk
+during the load is neither run nor recorded. The limits below name at least one import that runs
+from disk instead. The environment values are read apart from the snapshot, as the
 limits below say. If the digest differs, nothing loads and nothing swaps. The running graph keeps
 the environment values it had. A reload applies the values it re-read only with the swap, and a
 rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
@@ -2391,12 +2392,14 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
 - the digest covers what `config/fingerprint.py` hashes and no more. The release reads the
   environment value file again after the digest check, wherever the file sits, so an edit to it,
   or to a `MEFOR_VALUE_*` variable, changes the values a release applies under an unchanged digest.
-  No config module or `_` helper runs from `__pycache__`, because the loader compiles each from the
-  snapshot. A module a config module imports through the ordinary import system, such as a sibling
-  when the config directory is on `sys.path`, is outside both the snapshot and the digest;
+  The loader compiles each config module, and each `_` helper a config module imports with an
+  `import` statement, from the snapshot. A module reached through the ordinary import system runs
+  from disk, a matching `__pycache__` file included, so the bytes that run are not the bytes the
+  digest covers. At least `importlib.import_module`, and a sibling import while the config directory
+  is on `sys.path`, reach it that way;
 - the request-time digest is taken before the route checks its step-up proof;
 - the digest checks that each folder it reads can be listed, and then lists it again. A folder
-  that becomes unlistable between the two is left out of the digest;
+  removed between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
 - a swap that fails while reconciling outbound connections does not roll those connections back.

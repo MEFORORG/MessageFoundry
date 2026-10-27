@@ -2728,9 +2728,7 @@ async def _compare_start_config(
     digest, as main's did. The caller stops the process vouching for that digest only when both
     digests were taken over the same files and differ (:func:`_moved_during_load`): a first digest
     that failed, or two that left out different files, is marked here and still vouched for. Two
-    reads miss at least two cases: an edit that lands and is reverted between them, and
-    a module the loader runs from a still-valid ``__pycache__`` bytecode file rather than from the
-    source the digests hash.
+    reads miss at least an edit that lands and is reverted between them.
 
     A digest that left out files it could not read (:func:`digest_coverage`) is still compared. A
     start whose own digest is partial is ``partial_start_digest``, logged at WARNING with what it

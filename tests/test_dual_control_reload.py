@@ -1520,9 +1520,16 @@ async def test_a_release_refused_by_the_source_trust_check_names_its_approval(
         monkeypatch.setattr(wiring, "_assert_safe_config_source", _loosened)
 
     service = await _service(engine)
-    _approval_id, r = await _hold_then_release(engine, service, {}, between=_tamper)
+    live = engine.registry_runner
+    before = live.registry if live is not None else None
+    approval_id, r = await _hold_then_release(engine, service, {}, between=_tamper)
     assert r.status_code == 422, r.text
     assert r.json()["detail"] == "invalid configuration"
+    assert not marker.exists(), "the edited module ran before the refusal"
+    rr = engine.registry_runner
+    assert (rr.registry if rr is not None else None) is before  # nothing swapped
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "failed"
     # Digests and the marker only: the row's exact keys show no path or file content entered it.
     assert await _failed_reload_rows(engine) == [
         {
