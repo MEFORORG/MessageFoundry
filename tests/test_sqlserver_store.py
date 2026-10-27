@@ -5918,11 +5918,9 @@ async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> No
     the round count; the shared module is what keeps this leg and the Postgres one asking the same
     question rather than two hand-synced copies drifting apart.
 
-    This backend's rate was measured separately, because its lock is a different mechanism under a
-    different snapshot rule from Postgres: with only the finalize applock removed, 29 of 30 rounds
-    were stranded (0.97 per round) on SQL Server 2022 and 2025 alike, in CI run 40452739332 on PR
-    2554 at head 95def813 (BACKLOG #1610). The negative control below re-measures it on every run
-    and prints the rate; the ``sqlserver-store`` CI job log carries it.
+    This backend's own lock-removed result is recorded in that module too; read it there rather
+    than here. The negative control below re-measures it whenever the gated ``sqlserver-store`` job
+    runs, and that job's log carries the printed line.
     """
     from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
 
@@ -5936,7 +5934,8 @@ async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
 
     WHY THIS EXISTS (BACKLOG #1610). A race test that passes proves nothing unless it can also fail:
     the benign interleaving can win every round over a store carrying no lock at all. The Postgres
-    arm was shown to fail with its lock removed; the test above has no such proof in the tree. This
+    arm was shown to fail with its lock removed, and one CI sample (``tests/_finalize_race_contract``)
+    showed the same here; a recorded sample is not a standing proof, so this control keeps it. This
     test is a STANDING expected-red-under-patch control: it removes the lock on every run and
     asserts the race is observable, so a change that made the test above blind (a pool of one, a
     serialised ``mark_done``, a round body that stopped racing) turns THIS test red instead of

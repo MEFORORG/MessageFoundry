@@ -30,11 +30,19 @@ ARM, so a single-round test would have falsely passed over a store with no lock 
 
 SQL Server was measured separately, because its applock is a different mechanism
 (``sp_getapplock``) under a different snapshot rule. With ONLY the finalize applock removed, 29 of
-30 rounds were stranded (0.97 per round) on both SQL Server 2022 and SQL Server 2025, in CI run
-40452739332 on PR 2554 at head 95def813 (BACKLOG #1610). So 30 rounds gives ample headroom on both
-backends. ``test_concurrent_mark_done_strands_rounds_without_the_finalize_applock`` in the gated
-``sqlserver-store`` suite re-measures this on every run: it removes ONLY the finalize applock, runs
-:func:`count_round_statuses`, and prints the per-round failure rate to the job log.
+30 rounds were stranded on both SQL Server 2022 and SQL Server 2025, in CI run 40452739332 on PR
+2554 at head 95def813 (BACKLOG #1610). Both jobs printed the same line:
+
+    [#1610 control] finalize applock removed: 29 of 30 rounds not PROCESSED (0.97 per round);
+    statuses {'processed': 1, 'routed': 29}; 60 finalize applock calls skipped
+
+The counts drop round order, so this does not say WHICH round passed; read it as 29 of 30, not as
+a per-round probability. On these samples 30 rounds gives ample headroom on both backends. Each
+rate is one sample, which is why the round count stays at 30 rather than being cut to the minimum
+the samples would allow. Nothing asserts that headroom: the SQL Server control named next asserts
+only that at least one round strands. ``test_concurrent_mark_done_strands_rounds_without_the_finalize_applock``
+in the gated ``sqlserver-store`` suite re-measures it whenever that job runs: it removes ONLY the
+finalize applock, runs :func:`count_round_statuses`, and prints the line above to the job log.
 
 TWO BACKENDS, DELIBERATELY: THERE IS NO SQLITE ARM, and one would be vacuous rather than missing.
 SQLite has no per-message finalize lock to remove -- ``_lock_finalize_batch`` exists only in

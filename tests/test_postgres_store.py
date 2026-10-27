@@ -5537,8 +5537,8 @@ async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> No
     ``tests/_finalize_race_contract`` carries the property, the mechanism, and the paired-arm
     measurement behind the round count -- read it there rather than here.
 
-    THIS is the backend that measurement was taken on, so a red here is the shared contract's first
-    and best signal.
+    Both server backends have now been measured with their lock removed, so a red on either leg is
+    an equally strong signal.
     """
     from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
 
