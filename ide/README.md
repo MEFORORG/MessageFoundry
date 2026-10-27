@@ -250,31 +250,29 @@ set `caFile` on its `messagefoundry.environments` entry (or on one engine shard)
   applies to every request to that `host:port`, including `messagefoundry.engineUrl` when it names
   the same engine, and it wins over the certificate `messagefoundry.serviceConfig` names.
 - It must be a full path (a drive-letter or UNC path on Windows, an absolute path elsewhere); a
-  relative or root-relative path is refused, so a workspace can never choose the file. A `caFile`
-  that is refused, or that has never been read, leaves that engine with no anchor at all; it never
-  falls back to the certificate `messagefoundry.serviceConfig` names. The exception is a `caFile` on an `http://`
-  entry, which has no certificate to pin: it is refused and claims nothing, so an https engine on
-  the same `host:port` is anchored as if it were absent. The setting is machine-scoped, so a checked-in
-  `.vscode/settings.json` cannot add or change a pin. An engine shard without its own `caFile` uses
-  its environment's.
-- **A `caFile`-pinned host never falls back to the default CAs.** From the moment the setting names
-  a usable `caFile` (a full path on an https entry), a request to that `host:port` is sent only with
-  a certificate read from that file, never with the default roots or the certificate
-  `messagefoundry.serviceConfig` names. While no certificate from that file is held, because it has
-  not been read yet or holds no PEM certificate, the request is refused before it is sent, with an
-  error naming the `caFile` in `messagefoundry.environments`. The refusal tries to read the file
-  again, waiting up to two seconds, and if that read succeeds the request is sent once with it; a
-  file slower than that is left to a background pass, at most once a minute, with the longer wait
-  a pass allows (see *Every wait is bounded*). A certificate already read from the file
-  stays in use when a later read fails, as the next sections say. The pin covers the `host:port`
-  exactly as the entry spells it: the same server reached under another name or by its IP address is
-  a different host here and is not pinned.
-- A `caFile` that is refused pins nothing by itself, so it does not stop a host verifying against
-  the default roots. At least these are refused: a value that is not a string, a path that is not a
-  full path, and a `caFile` on an `http://` entry. A refused `caFile` on an https entry still keeps
-  the `messagefoundry.serviceConfig` certificate off that host (see above), and a second,
-  different `caFile` for a `host:port` an earlier entry pins is refused while the earlier pin stays
-  in force. Remove the `caFile` to put a host back on the default roots.
+  relative or root-relative path is refused, so a workspace can never choose the file. The setting
+  is machine-scoped, so a checked-in `.vscode/settings.json` cannot add or change a pin. An engine
+  shard without its own `caFile` uses its environment's.
+- **A host whose https entry sets any `caFile`, accepted or refused, never falls back to the default
+  CAs**, nor to the certificate `messagefoundry.serviceConfig` names. This holds from the moment the
+  setting names it, before any file is read. A request to that `host:port` is sent only with a
+  certificate read from an accepted `caFile`; otherwise it is refused before it is sent, with an
+  error naming the `caFile` in `messagefoundry.environments`. To fix it, correct the `caFile` or
+  remove it; removing it is the only way to put the host back on the default roots.
+  - **Accepted, not read yet.** While no certificate from the file is held, because it has not been
+    read yet or holds no PEM certificate, the refusal tries to read the file again, waiting up to two
+    seconds, and if that read succeeds the request is sent once with it. A file slower than that is
+    left to a background pass, at most once a minute, with the longer wait a pass allows (see *Every
+    wait is bounded*). A certificate already read from the file stays in use when a later read
+    fails, as the next sections say.
+  - **Refused.** The error names why, and nothing is read or retried, because there is no file to
+    read. At least these are refused: a value that is not a string, and a path that is not a full
+    path. A second, different `caFile` for a `host:port` an earlier entry pins is refused too, but
+    there the earlier pin stays in force and anchors the host.
+- The exception is a `caFile` on an `http://` entry, which has no certificate to pin. It is refused
+  and claims nothing, so an https engine on the same `host:port` is treated as if it were absent.
+- The pin covers the `host:port` exactly as the entry spells it: the same server reached under
+  another name or by its IP address is a different host here and is not pinned.
 - A refused or unreadable `caFile` is named in the **MessageFoundry Engine** log, and so is an https
   target that has no anchor at all.
 
@@ -301,7 +299,8 @@ cases: you removed or broke its `caFile`; its `caFile` was read whole and holds 
 not a PEM certificate (DER, for example); you moved `messagefoundry.engineUrl`; the engine reported
 no certificate; or no trusted workspace is open to ask the engine. A failure that proves nothing
 keeps the anchor in force instead. That covers at least a file that could not be opened or read, was
-read too slowly, or was empty (a file rewritten in place is empty for a moment), any file over 512
+read too slowly, or was empty or held only the start of a `-----BEGIN CERTIFICATE-----` line (a
+file rewritten in place is caught that way for a moment), any file over 512
 KB or that is not a regular file, the engine's own certificate file caught mid-renewal, and an
 engine command that failed, did not answer, answered in a form this extension does not read, or was
 not started. A renewal a failing request followed meanwhile is kept too. A kept `caFile` anchor is

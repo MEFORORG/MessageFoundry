@@ -33,12 +33,15 @@ import {
 } from "../../engineClient";
 import { describeNetworkCode } from "../../engineStatusModel";
 import {
+  CAFILE_REFUSED_CODE,
   CAFILE_UNREAD_CODE,
   TLS_TRUST_CODES,
   engineHostKey,
+  hostPinsOf,
   isFullyQualifiedPath,
   isTlsTrustError,
   parseApiTls,
+  pinnedFile,
   pinTargetsOf,
   schemeMismatch,
   trustAnchorFor,
@@ -271,6 +274,43 @@ suite("a trust failure is not an absent engine (BACKLOG #1695)", () => {
       // Not the serviceConfig remedy: a pinned host never takes that certificate.
       assert.ok(!/serviceConfig/.test(text), text);
     }
+  });
+
+  test("hostPinsOf: an accepted pin wins over any refusal for its host; http:// claims nothing", () => {
+    const flavour = path.posix;
+    const hosts = hostPinsOf(
+      trustPinsFor(
+        [
+          { url: "https://a:1", caFile: "rel/ca.pem" }, // refused before the accepted pin
+          { url: "https://a:1", caFile: "/pki/a.pem" },
+          { url: "https://a:1", caFile: "/pki/other.pem" }, // conflict, refused after it
+          { url: "https://b:1", caFile: 7 },
+          { url: "https://b:1", caFile: "rel/b.pem" }, // the first reason is kept
+          { url: "http://c:1", caFile: "rel/c.pem" },
+        ],
+        flavour,
+      ),
+    );
+    assert.deepStrictEqual(hosts.get("a:1"), { kind: "pin", file: "/pki/a.pem" });
+    assert.deepStrictEqual(hosts.get("b:1"), { kind: "refused", reason: "caFile is not a string" });
+    assert.strictEqual(hosts.has("c:1"), false);
+    assert.strictEqual(pinnedFile(hosts, "a:1"), "/pki/a.pem");
+    assert.strictEqual(pinnedFile(hosts, "b:1"), undefined);
+  });
+
+  test("a request refused for a refused caFile names the reason, not a file to make readable", () => {
+    assert.ok(isTlsTrustError(CAFILE_REFUSED_CODE));
+    assert.notStrictEqual(CAFILE_REFUSED_CODE, CAFILE_UNREAD_CODE);
+    const url = "https://prod-host:8765";
+    const text = trustRemedy(CAFILE_REFUSED_CODE, url, "caFile pki/ca.pem is not an absolute path") ?? "";
+    assert.match(text, /\(caFile pki\/ca\.pem is not an absolute path\)/);
+    assert.match(text, /never verified against the default CAs/);
+    assert.match(text, /Correct the caFile, or remove it/);
+    assert.ok(!/exists/.test(text), `sends the user to look for a file: ${text}`);
+    // With no reason (the status bar has only the code), it still names the setting and the fix.
+    const bare = describeNetworkCode(CAFILE_REFUSED_CODE, url);
+    assert.match(bare, /caFile in `messagefoundry\.environments` was refused/);
+    assert.ok(!/serviceConfig/.test(bare), bare);
   });
 });
 

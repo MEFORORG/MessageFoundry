@@ -8,12 +8,15 @@ import * as https from "node:https";
 
 import { serveCommandLine } from "./engineControlModel";
 import {
+  CAFILE_REFUSED_CODE,
   CAFILE_UNREAD_CODE,
   engineHostKey,
   isRecord,
+  isPinRefusalCode,
   isTlsTrustError,
   trustRemedy,
 } from "./engineTrustModel";
+import type { HostPin } from "./engineTrustModel";
 
 /**
  * What a step-up refusal asked for (403 + `X-Step-Up-Required`). `action` is the
@@ -182,8 +185,9 @@ export const TLS_CIPHERS = TLS_12_SUITES.concat(TLS_13_SUITES).join(":");
  * in this extension reaching a given engine needs the same one, and threading a `ca` argument
  * through `postJson`/`getJson` and their eight call sites would let one of them be forgotten.
  * Populated by `engineTrust.ts` from what the engine itself reports and from `caFile` pins. A host
- * with no anchor verifies against Node's default CA set alone, unless a `caFile` pins it: then the
- * request is refused until the file is read ({@link pinRefusal}).
+ * with no anchor verifies against Node's default CA set alone, unless an https `caFile` claims it:
+ * then the request is refused until the file is read, or for good while the value is refused
+ * ({@link pinRefusal}).
  */
 const trustAnchors = new Map<string, string>();
 
@@ -207,20 +211,21 @@ export function clearEngineTrustAnchors(): void {
 }
 
 /**
- * Every `host:port` an accepted https `caFile` pin names in the settings as they are NOW, whether or
- * not its file has been read. Such a host must never be verified against Node's default roots: a
- * request to one with no anchor registered is refused before it is sent ({@link pinRefusal}).
+ * Every `host:port` an https `caFile` claims in the settings as they are NOW, accepted or refused,
+ * whether or not its file has been read. Such a host must never be verified against Node's default
+ * roots: a request to one with no anchor registered is refused before it is sent ({@link pinRefusal}).
+ * The value says whether an accepted pin names the host or only a refused value claims it.
  *
- * Kept apart from {@link trustAnchors} because the two change at different times. This set follows the
+ * Kept apart from {@link trustAnchors} because the two change at different times. This map follows the
  * setting the moment it changes (`engineTrust.ts` publishes it synchronously, at activation and on
  * every settings change), while an anchor arrives only once its file is read, which on a slow share
  * may take a whole refresh or longer. Only `engineTrust.ts` writes either.
  */
-let pinnedHosts: ReadonlySet<string> = new Set();
+let pinnedHosts: ReadonlyMap<string, HostPin> = new Map();
 
-/** Replace the set of pinned `host:port` keys (see {@link pinnedHosts}). */
-export function setPinnedEngineHosts(keys: Iterable<string>): void {
-  pinnedHosts = new Set(keys);
+/** Replace the pinned `host:port` keys and what pins each ({@link pinnedHosts}). */
+export function setPinnedEngineHosts(hosts: Iterable<readonly [string, HostPin]>): void {
+  pinnedHosts = new Map(hosts);
 }
 
 /**
@@ -244,13 +249,18 @@ export function snapshotEngineTrustAnchors(): () => void {
 /**
  * The error a request to `url` fails with WITHOUT being sent, or `undefined` when it may be sent.
  *
- * Refused: an https URL whose `host:port` a `caFile` pins and that has no anchor registered. With no
- * `ca`, Node verifies against its default roots, so a publicly signed certificate for that host would
- * pass, which is what pinning it excludes. The code is a trust failure ({@link CAFILE_UNREAD_CODE}),
- * so {@link withRenewalRetry} hands it to the failure handler, which reads the file; the request, a
- * POST included since it was never sent, then runs once more with the anchor. Every other URL is
- * unaffected: an unpinned host keeps the default roots, and the loopback engine keeps the
- * certificate `messagefoundry.serviceConfig` names.
+ * Refused: an https URL whose `host:port` an https `caFile` claims ({@link pinnedHosts}) and that has
+ * no anchor registered. With no `ca`, Node verifies against its default roots, so a publicly signed
+ * certificate for that host would pass, which is what pinning it excludes.
+ *   * An accepted pin whose file is not read yet fails with {@link CAFILE_UNREAD_CODE}, a trust
+ *     failure, so {@link withRenewalRetry} hands it to the failure handler, which reads the file; the
+ *     request, a POST included since it was never sent, then runs once more with the anchor.
+ *   * A host only a refused `caFile` claims fails with {@link CAFILE_REFUSED_CODE}, whose text names
+ *     the reason. There is no file to read, so the handler registers nothing and the request fails,
+ *     unless the caFile was corrected since: then the handler reads the corrected file and the
+ *     request runs once more with it, as above.
+ * Every other URL is unaffected: an unpinned host keeps the default roots, and the loopback engine
+ * keeps the certificate `messagefoundry.serviceConfig` names.
  */
 export function pinRefusal(url: URL): NetworkError | undefined {
   if (url.protocol !== "https:") {
@@ -260,7 +270,10 @@ export function pinRefusal(url: URL): NetworkError | undefined {
   if (key === undefined || !pinnedHosts.has(key) || trustAnchors.has(key)) {
     return undefined;
   }
-  return new NetworkError(trustRemedy(CAFILE_UNREAD_CODE, url.origin) ?? "", CAFILE_UNREAD_CODE);
+  const host = pinnedHosts.get(key);
+  const [code, reason] =
+    host?.kind === "refused" ? [CAFILE_REFUSED_CODE, host.reason] : [CAFILE_UNREAD_CODE, undefined];
+  return new NetworkError(trustRemedy(code, url.origin, reason) ?? "", code);
 }
 
 /** The anchor registered for `url`'s engine, if any. The ONE lookup: {@link tlsOptions} and
@@ -337,7 +350,8 @@ async function withRenewalRetry<T>(
       throw err;
     }
     // A request pinRefusal refused was never sent, so resending it cannot duplicate it, POST or not.
-    if (!retry && err.code !== CAFILE_UNREAD_CODE) {
+    // That includes a refused caFile corrected since: the handler reads the corrected file.
+    if (!retry && !isPinRefusalCode(err.code)) {
       // The trust error's own text sends the user to fix `serviceConfig` or a `caFile`, which is wrong
       // here: the configuration is fine, the engine's certificate moved, and it is already followed.
       throw new CertificateChangedError(baseUrl, err.code);

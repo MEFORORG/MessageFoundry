@@ -18,14 +18,16 @@ import { engineLog } from "./engineLog";
 import { isLocalEngine } from "./engineTarget";
 import {
   engineHostKey,
+  hostPinsOf,
   isHttpsUrl,
   parseApiTls,
+  pinnedFile,
   pinTargetsOf,
   schemeMismatch,
   trustAnchorForTarget,
   trustPinsFor,
 } from "./engineTrustModel";
-import type { PinTarget, TrustPin } from "./engineTrustModel";
+import type { HostPin, PinTarget, TrustPin } from "./engineTrustModel";
 
 /**
  * How much of a certificate file we are willing to read. A PEM chain is kilobytes; this only bounds
@@ -118,9 +120,9 @@ const registered = new Map<string, Registered>();
 
 /**
  * Every host key a `caFile` claimed at the last refresh, usable or not. Such a host never takes the
- * CLI's certificate (see {@link claimedBy}), so a failure there must not spawn the CLI either.
+ * CLI's certificate (see {@link HostPin}), so a failure there must not spawn the CLI either.
  */
-let claimedKeys: ReadonlySet<string> = new Set();
+let claimedKeys: HostPins = new Map();
 
 /** When the last failure-started full refresh began, on the MONOTONIC clock (`performance.now`), so
  *  a wall clock stepped backward cannot hold the limit shut. For {@link FAILURE_REFRESH_MIN_MS}. */
@@ -201,9 +203,9 @@ function trustState(): string {
  *
  * **Fail-soft throughout, and never looser for it.** Nothing here throws. A target this refresh
  * cannot anchor and never anchored is verified against Node's default roots with verification on,
- * unless a usable `caFile` pins it: then engineClient refuses its requests until the file is read
- * ({@link publishPinnedHosts}). Either way a failing request carries the remedy (`trustRemedy`). A
- * target that WAS anchored keeps its anchor through any failure that proves nothing (see
+ * unless an https `caFile` claims it: then engineClient refuses its requests until the file is read,
+ * or while the value is refused ({@link publishPinnedHosts}). Either way a failing request carries
+ * the remedy (`trustRemedy`). A target that WAS anchored keeps its anchor through any failure that proves nothing (see
  * {@link Outcome}), because dropping it would put an unpinned target back on the default roots, which
  * trusts more than the anchor did, and refuse every request to a pinned one.
  *
@@ -297,16 +299,15 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   const outcomes = new Map<string, Outcome>();
   const targets = pinTargetsOf(environments());
   const pins = trustPinsFor(targets);
-  const files = pinFilesOf(pins);
-  publishPinnedHosts(files);
-  const claimed = claimedBy(pins);
+  const hosts = hostPinsOf(pins);
+  publishPinnedHosts(hosts);
   // This refresh asks the CLI after any failure noted so far, so it covers that failure.
   lateFailure = undefined;
   acceptsLateFailure = !followUp;
   const reads: ToRead[] = [];
-  await askCli(claimed, reads, outcomes);
+  await askCli(hosts, reads, outcomes);
   // After the CLI's file, so two pins on an unreachable share cannot take both read slots first.
-  reads.push(...pinsToRead(pins));
+  reads.push(...pinsToRead(pins, hosts));
   // Every file is read only now, after the CLI has answered, so a file rotated in place while the CLI
   // ran is read as rotated: a read already running from before (`since`) is read again.
   const since = readSeq;
@@ -333,36 +334,36 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   }
   // Swap only now, after the subprocess has answered. Clearing first and then awaiting left EVERY
   // engine unanchored for as long as `cert inventory` ran.
-  claimedKeys = claimed;
-  commit(outcomes, files);
-  warnAboutUnanchoredTargets(targets, files, claimed);
+  claimedKeys = hosts;
+  commit(outcomes, hosts);
+  warnAboutUnanchoredTargets(targets, hosts);
   return trustState() !== before;
 }
 
 /**
  * Replace the registered set by applying each key's {@link Outcome} to what is registered now.
  *
- * `files` is the pin set this refresh read from. The settings may have pinned a host since: such a
- * host takes no outcome from another source or another file, and this refresh's silence about it is
- * not an answer, so an anchor from the file the settings pin it to now is kept.
+ * `read` is the pin set this refresh read from. The settings may have claimed a host since: such a
+ * host takes no outcome from another source or another file (none at all when only a refused `caFile`
+ * claims it), and this refresh's silence about it is not an answer, so an anchor from the file the
+ * settings pin it to now is kept.
  */
-function commit(outcomes: ReadonlyMap<string, Outcome>, files: ReadonlyMap<string, string>): void {
+function commit(outcomes: ReadonlyMap<string, Outcome>, read: HostPins): void {
   const previous = new Map(registered);
-  const pinnedNow = configuredPinFiles();
+  const now = configuredPins();
   clearEngineTrustAnchors();
   registered.clear();
   for (const [key, live] of previous) {
-    const pin = pinnedNow.get(key);
-    const readHere = files.get(key);
+    const pin = pinnedFile(now, key);
+    const readHere = pinnedFile(read, key);
     const unread = readHere === undefined || !sameFile(readHere, pin ?? readHere);
     if (pin !== undefined && unread && live.pinned && sameFile(live.file, pin)) {
       register(live);
     }
   }
   for (const [key, outcome] of outcomes) {
-    const pin = pinnedNow.get(key);
-    if (pin !== undefined && !(outcome.pinned && outcome.file !== undefined && sameFile(outcome.file, pin))) {
-      continue; // pinned since this refresh read its settings, to a different file or none
+    if (now.has(key) && !fromPinFile(outcome, pinnedFile(now, key))) {
+      continue; // claimed since this refresh read its settings: by a different file, or a refused one
     }
     const live = previous.get(key);
     const sameSource =
@@ -380,57 +381,38 @@ function commit(outcomes: ReadonlyMap<string, Outcome>, files: ReadonlyMap<strin
   }
 }
 
-/**
- * Every host key a `caFile` CLAIMS, whether or not its pin can be used ({@link TrustPin} says which
- * refusals claim). A claimed key whose pin is refused or unreadable gets NO anchor from the
- * certificate `messagefoundry.serviceConfig` names.
- */
-function claimedBy(pins: readonly TrustPin[]): Set<string> {
-  const claimed = new Set<string>();
-  for (const pin of pins) {
-    const key = pin.kind === "pin" ? pin.key : pin.claims;
-    if (key !== undefined) {
-      claimed.add(key);
-    }
-  }
-  return claimed;
-}
-
-/** The usable `caFile` for each host key. */
-function pinFilesOf(pins: readonly TrustPin[]): Map<string, string> {
-  return new Map(pins.flatMap((pin) => (pin.kind === "pin" ? [[pin.key, pin.file] as const] : [])));
-}
-
-/** The pins `messagefoundry.environments` names now. */
-function configuredPinFiles(): Map<string, string> {
-  return pinFilesOf(trustPinsFor(pinTargetsOf(environments())));
+/** What `messagefoundry.environments` decides now, per host key ({@link hostPinsOf}). */
+function configuredPins(): HostPins {
+  return hostPinsOf(trustPinsFor(pinTargetsOf(environments())));
 }
 
 /**
- * Tell engineClient which hosts a usable `caFile` pins, so a request to one with no anchor from that
+ * Tell engineClient which hosts a `caFile` claims, so a request to one with no anchor from its pin's
  * file is refused rather than verified against the default roots or another source's certificate
  * (`pinRefusal` there).
  *
- * `files` is {@link pinFilesOf}'s map, so only an accepted pin marks its host; a refused one has no
- * file that could anchor it. Called SYNCHRONOUSLY from the settings, at activation, on every settings
- * change and at the start of every refresh, never after a file read, so no read on a slow share can
- * leave a pinned host on the default roots meanwhile.
+ * A REFUSED `caFile` on an https entry marks its host too, with the refusal reason: the user meant to
+ * pin that host, so a value this extension cannot use fails closed rather than falling back to the
+ * default roots. Called SYNCHRONOUSLY from the settings, at activation, on every settings change and
+ * at the start of every refresh, never after a file read, so no read on a slow share can leave a
+ * claimed host on the default roots meanwhile.
  *
- * An anchor registered for a pinned host from anything but that pin's file (the CLI's certificate, or
- * a file the setting named before) is dropped here too, in both stores: the pin wins from the moment
- * it is set, and a refresh would not keep such an anchor for that host anyway.
+ * An anchor registered for a claimed host from anything but its pin's file (the CLI's certificate, or
+ * a file the setting named before; anything at all when only a refused value claims it) is dropped
+ * here too, in both stores: the claim wins from the moment it is set, and a refresh would not keep
+ * such an anchor for that host anyway.
  */
-function publishPinnedHosts(files: ReadonlyMap<string, string>): boolean {
+function publishPinnedHosts(hosts: HostPins): boolean {
   let dropped = false;
-  for (const [key, file] of files) {
+  for (const key of hosts.keys()) {
     const live = registered.get(key);
-    if (live !== undefined && !(live.pinned && sameFile(live.file, file))) {
+    if (live !== undefined && !fromPinFile(live, pinnedFile(hosts, key))) {
       registered.delete(key);
       setEngineTrustAnchor(live.url, undefined);
       dropped = true;
     }
   }
-  setPinnedEngineHosts(files.keys());
+  setPinnedEngineHosts(hosts);
   return dropped;
 }
 
@@ -441,11 +423,18 @@ function publishPinnedHosts(files: ReadonlyMap<string, string>): boolean {
  * workspace: the setting is machine-scoped, so the file it names was chosen by the user of this
  * machine.
  */
-function pinsToRead(pins: readonly TrustPin[]): ToRead[] {
+function pinsToRead(pins: readonly TrustPin[], hosts: HostPins): ToRead[] {
   const out: ToRead[] = [];
   for (const pin of pins) {
     if (pin.kind === "refused") {
-      engineLog().warn(`messagefoundry.environments: not pinning ${pin.url}: ${pin.reason}`);
+      const failsClosed = pin.claims !== undefined && hosts.get(pin.claims)?.kind === "refused";
+      engineLog().warn(
+        `messagefoundry.environments: not pinning ${pin.url}: ${pin.reason}` +
+          (failsClosed
+            ? `. Requests to ${pin.claims} are refused, never verified against the default roots, ` +
+              `until the caFile is corrected or removed.`
+            : ""),
+      );
     } else {
       out.push({ key: pin.key, url: pin.url, file: pin.file, pinned: true });
     }
@@ -463,7 +452,7 @@ function pinsToRead(pins: readonly TrustPin[]): ToRead[] {
  * there is nothing to anchor.
  */
 async function askCli(
-  claimed: ReadonlySet<string>,
+  claimed: HostPins,
   reads: ToRead[],
   outcomes: Map<string, Outcome>,
 ): Promise<void> {
@@ -627,6 +616,9 @@ async function fillFrom(
   return length;
 }
 
+/** The one marker every PEM certificate chain carries. */
+const PEM_MARKER = "-----BEGIN CERTIFICATE-----";
+
 /** A certificate read: the PEM, or why there is none, worded for the log. `notACertificate` says the
  *  file was read whole, is not empty, and holds no PEM certificate, which is an answer rather than a
  *  failure. */
@@ -656,11 +648,13 @@ async function readAnchorPem(file: string): Promise<PemRead> {
   // carries. A DER file fails it, correctly — the read decodes utf8, so DER never worked here.
   // An EMPTY file is not `notACertificate`: a file rewritten in place is empty between the truncate
   // and the write, so an empty read says nothing about what the file now holds.
-  if (!pem.includes("-----BEGIN CERTIFICATE-----")) {
+  if (!pem.includes(PEM_MARKER)) {
+    // trim(): a rewrite can also leave only a BOM or a line break for a moment. trim removes both.
+    // A strict prefix of the marker is the same moment a few bytes later, so it proves nothing either.
+    const seen = pem.trim();
     return {
       problem: `the engine certificate at ${file} is not PEM (no BEGIN CERTIFICATE block)`,
-      // trim(): a rewrite can also leave only a BOM or a line break for a moment. trim removes both.
-      notACertificate: pem.trim().length > 0,
+      notACertificate: seen.length > 0 && !PEM_MARKER.startsWith(seen),
     };
   }
   return { pem };
@@ -674,6 +668,17 @@ function fileId(file: string): string {
 function sameFile(a: string, b: string): boolean {
   return fileId(a) === fileId(b);
 }
+
+/** True when `anchor` was read from the pin file `file` (`undefined`: no accepted pin, so never). */
+function fromPinFile(
+  anchor: { readonly pinned: boolean; readonly file?: string },
+  file: string | undefined,
+): boolean {
+  return file !== undefined && anchor.pinned && anchor.file !== undefined && sameFile(anchor.file, file);
+}
+
+/** {@link hostPinsOf}'s map: every host key a `caFile` claims, and what pins it. */
+type HostPins = ReadonlyMap<string, HostPin>;
 
 /** {@link askCli}'s marker for a CLI that did not report in time. */
 const CLI_SILENT = Symbol("cli-silent");
@@ -770,7 +775,7 @@ function cliCouldAnchor(key: string): boolean {
     !isExecGated() &&
     !claimedKeys.has(key) &&
     // The settings as they are now too: a host claimed since the last refresh is no longer the CLI's.
-    !claimedBy(trustPinsFor(pinTargetsOf(environments()))).has(key) &&
+    !configuredPins().has(key) &&
     registered.get(key)?.pinned !== true &&
     key === engineHostKey(url) &&
     isLocalEngine(url)
@@ -845,7 +850,7 @@ export async function followCertificateChange(
   // commit. With no pin, the file an unpinned (CLI) anchor came from. Read again after the read, so a
   // setting changed meanwhile is seen.
   const sourceFor = (): { readonly file: string | undefined; readonly pinned: boolean } => {
-    const pin = configuredPinFiles().get(key);
+    const pin = pinnedFile(configuredPins(), key);
     if (pin !== undefined) {
       return { file: pin, pinned: true };
     }
@@ -927,7 +932,7 @@ export function forgetEngineTrust(): void {
   clearEngineTrustAnchors();
   setPinnedEngineHosts([]);
   registered.clear();
-  claimedKeys = new Set();
+  claimedKeys = new Map();
   lastFailureRefresh = Number.NEGATIVE_INFINITY;
   lateFailure = undefined;
   inflightReads.clear();
@@ -949,15 +954,18 @@ export function forgetEngineTrust(): void {
  */
 function warnAboutUnanchoredTargets(
   targets: readonly PinTarget[],
-  pinned: ReadonlyMap<string, string>,
-  claimed: ReadonlySet<string>,
+  claimed: HostPins,
 ): void {
   const missing = targets.filter((t) => {
     const key = engineHostKey(t.url);
     return key !== undefined && isHttpsUrl(t.url) && !registered.has(key);
   });
   const unread = [
-    ...new Set(missing.filter((t) => pinned.has(engineHostKey(t.url) ?? "")).map((t) => t.url)),
+    ...new Set(
+      missing
+        .filter((t) => pinnedFile(claimed, engineHostKey(t.url) ?? "") !== undefined)
+        .map((t) => t.url),
+    ),
   ];
   // A host whose caFile was refused already has its own log line saying how to fix the value, so it
   // is not told to set a caFile it has.
@@ -995,7 +1003,7 @@ export function registerEngineTrust(context: vscode.ExtensionContext): void {
   setTrustFailureHandler(followCertificateChange);
   // Before the first refresh is queued: its file reads may take seconds, and a pinned host must not
   // be reachable on the default roots meanwhile.
-  publishPinnedHosts(configuredPinFiles());
+  publishPinnedHosts(configuredPins());
   context.subscriptions.push({
     dispose: () => {
       setTrustFailureHandler(undefined);
@@ -1012,7 +1020,7 @@ export function registerEngineTrust(context: vscode.ExtensionContext): void {
       ) {
         // Now, not when the queued refresh starts. An anchor dropped here is gone before that refresh
         // takes its own before-and-after reading, so it would not count as a change there.
-        const dropped = publishPinnedHosts(configuredPinFiles());
+        const dropped = publishPinnedHosts(configuredPins());
         void refreshThenRecheck(false, dropped);
       }
     }),

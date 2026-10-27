@@ -208,7 +208,7 @@ export const TLS_TRUST_CODES: readonly string[] = [
 ];
 
 /**
- * Our own code for a request refused BEFORE it was sent: its `host:port` is pinned by an https
+ * Our own code for a request refused BEFORE it was sent: its `host:port` is pinned by an accepted https
  * `caFile`, and no certificate from that file is registered yet (BACKLOG #1695). Sending it would
  * verify against Node's default roots, which a pin exists to exclude. Not in {@link TLS_TRUST_CODES},
  * whose remedy is a different one, but a trust failure all the same ({@link isTlsTrustError}), so the
@@ -216,9 +216,25 @@ export const TLS_TRUST_CODES: readonly string[] = [
  */
 export const CAFILE_UNREAD_CODE = "MF_CAFILE_UNREAD";
 
-/** True when `code` is one of {@link TLS_TRUST_CODES}, or {@link CAFILE_UNREAD_CODE}. */
+/**
+ * Our own code for a request refused BEFORE it was sent because an https entry's `caFile` CLAIMS its
+ * `host:port` but {@link trustPinsFor} refused the value (not a string, not a full path, a second file
+ * for a pinned host). The user meant to pin that host, so it fails closed: it is never verified against
+ * the default roots, and no file is read for it, since there is no file to read. Kept apart from
+ * {@link CAFILE_UNREAD_CODE} because the remedy differs: that one is a file to make readable, this one
+ * is a setting to correct.
+ */
+export const CAFILE_REFUSED_CODE = "MF_CAFILE_REFUSED";
+
+/** True when `code` says a request was refused BEFORE it was sent, for a pin: {@link CAFILE_UNREAD_CODE}
+ *  or {@link CAFILE_REFUSED_CODE}. Such a request can be resent without being duplicated. */
+export function isPinRefusalCode(code: string | undefined): boolean {
+  return code === CAFILE_UNREAD_CODE || code === CAFILE_REFUSED_CODE;
+}
+
+/** True when `code` is one of {@link TLS_TRUST_CODES}, or a pin refusal ({@link isPinRefusalCode}). */
 export function isTlsTrustError(code: string | undefined): boolean {
-  return code !== undefined && (code === CAFILE_UNREAD_CODE || TLS_TRUST_CODES.includes(code));
+  return code !== undefined && (isPinRefusalCode(code) || TLS_TRUST_CODES.includes(code));
 }
 
 /**
@@ -238,7 +254,11 @@ export function isTlsTrustError(code: string | undefined): boolean {
  * host just presented. Naming it there would send the user to fix a file with no bearing on the
  * engine they dialled. See `engineTarget.ts` for the same boundary on the credential side.
  */
-export function trustRemedy(code: string | undefined, url: string): string | undefined {
+export function trustRemedy(
+  code: string | undefined,
+  url: string,
+  reason?: string,
+): string | undefined {
   if (!isTlsTrustError(code)) {
     return undefined;
   }
@@ -246,8 +266,17 @@ export function trustRemedy(code: string | undefined, url: string): string | und
     return (
       `not sent to ${url}: its caFile in \`messagefoundry.environments\` has not been read yet, or ` +
       `could not be read as a PEM certificate, and a pinned engine is never verified against the ` +
-      `default CAs. Check that the file exists and is readable from this machine; a refused request ` +
-      `tries to read it again, and the MessageFoundry Engine log names what went wrong.`
+      `default CAs. Check that the file exists, is readable from this machine and holds a PEM ` +
+      `certificate; a refused request tries to read it again, and the MessageFoundry Engine log ` +
+      `names what went wrong.`
+    );
+  }
+  if (code === CAFILE_REFUSED_CODE) {
+    return (
+      `not sent to ${url}: its caFile in \`messagefoundry.environments\` was refused ` +
+      `(${reason ?? "the MessageFoundry Engine log says why"}), and an engine whose https entry sets ` +
+      `a caFile is never verified against the default CAs. Correct the caFile, or remove it to put ` +
+      `this engine back on the default CAs.`
     );
   }
   const head = `cannot verify the TLS certificate ${url} presented (${code}).`;
@@ -330,8 +359,9 @@ export function pinTargetsOf(envs: readonly PinnableEnvironment[]): PinTarget[] 
  * What the pin pass decided for one target that named a `caFile`.
  *
  * A refusal still CLAIMS its host (`claims`, the host key) when the target is https: the user meant
- * to pin that host, so a broken pin must leave it unanchored rather than hand it to the certificate a
- * workspace setting names. An `http://` target claims nothing. Host keys carry no scheme, so a claim
+ * to pin that host, so a broken pin fails closed. The host gets no anchor from the certificate a
+ * workspace setting names, and its requests are refused rather than verified against the default
+ * roots (`publishPinnedHosts` in engineTrust.ts). An `http://` target claims nothing. Host keys carry no scheme, so a claim
  * there would take the anchor from an https engine on the same `host:port`, and plain http has no
  * handshake to pin anyway.
  */
@@ -343,6 +373,37 @@ export type TrustPin =
       readonly reason: string;
       readonly claims: string | undefined;
     };
+
+/**
+ * What the `caFile` values decide for one host key that a `caFile` CLAIMS ({@link TrustPin}): the
+ * usable file an accepted pin names, or, when no accepted pin names the host, the first reason a
+ * claiming value was refused. A claimed host never takes the certificate `messagefoundry.serviceConfig`
+ * names and is never sent on the default roots; a `refused` one can be anchored by nothing, so every
+ * request to it is refused until the value is corrected or removed.
+ */
+export type HostPin =
+  | { readonly kind: "pin"; readonly file: string }
+  | { readonly kind: "refused"; readonly reason: string };
+
+/** {@link trustPinsFor}'s output folded per host key ({@link HostPin}); an unclaimed host is absent.
+ *  An accepted pin wins over any refusal for the same host, and the first refusal reason is kept. */
+export function hostPinsOf(pins: readonly TrustPin[]): Map<string, HostPin> {
+  const out = new Map<string, HostPin>();
+  for (const pin of pins) {
+    if (pin.kind === "pin") {
+      out.set(pin.key, { kind: "pin", file: pin.file });
+    } else if (pin.claims !== undefined && !out.has(pin.claims)) {
+      out.set(pin.claims, { kind: "refused", reason: pin.reason });
+    }
+  }
+  return out;
+}
+
+/** The usable `caFile` an accepted pin names for `key`, if any. */
+export function pinnedFile(hosts: ReadonlyMap<string, HostPin>, key: string): string | undefined {
+  const host = hosts.get(key);
+  return host?.kind === "pin" ? host.file : undefined;
+}
 
 /** The two path flavours {@link isFullyQualifiedPath} distinguishes; `node:path` itself is one. */
 type PathFlavour = Pick<typeof path, "sep" | "isAbsolute" | "normalize">;

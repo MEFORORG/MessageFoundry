@@ -22,7 +22,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { CAFILE_UNREAD_CODE } from "../../engineTrustModel";
+import { CAFILE_REFUSED_CODE, CAFILE_UNREAD_CODE } from "../../engineTrustModel";
 
 /** What the stubbed `vscode.workspace.getConfiguration("messagefoundry")` answers. */
 interface StubConfig {
@@ -1256,19 +1256,8 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
       if (file !== path.normalize(caFile) || stale !== undefined) {
         return undefined;
       }
-      const bytes = Buffer.from(PEM);
-      let served = false;
-      const handle = {
-        stat: async () => ({ isFile: () => true, size: bytes.length }),
-        read: async (buffer: Buffer, offset: number) => {
-          const bytesRead = served ? 0 : bytes.copy(buffer, offset);
-          served = true;
-          return { bytesRead };
-        },
-        close: async () => undefined,
-      };
       return new Promise((resolve) => {
-        stale = () => resolve(handle);
+        stale = () => resolve(servingHandle(PEM));
       });
     };
     childProcess.execFile = cliThatFirst(() => {
@@ -1499,7 +1488,8 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     const caFile = plantCert(path.join("pki", "prod-ca.pem"));
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
     await trust.refreshEngineTrust();
-    for (const partial of [String.fromCharCode(0xfeff), "\r\n"]) {
+    // The last two: a rewrite caught a few bytes in, before the marker is whole.
+    for (const partial of [String.fromCharCode(0xfeff), "\r\n", "-", "\r\n-----BEGIN CERTIF"]) {
       fs.writeFileSync(caFile, partial);
       await trust.refreshEngineTrust();
       assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM, JSON.stringify(partial));
@@ -1584,19 +1574,220 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     }
   });
 
-  test("a refused caFile (http://, relative) does not mark its host as pinned", async () => {
-    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
-    stubConfig.environments = [
-      { name: "PROD", url: REMOTE, caFile: "pki/prod-ca.pem" },
-      { name: "PLAIN", url: "http://plain.example.com:8765", caFile },
-    ];
-    await trust.refreshEngineTrust();
+  // ---- round 6: a refused https caFile fails closed, and two repair lines get their own tests ----
 
-    assert.strictEqual(engineClient.pinRefusal(new URL(REMOTE)), undefined);
+  /** Refused caFile values on an https entry, each with a fragment of the reason it is refused for. */
+  const REFUSED_VALUES: readonly (readonly [unknown, string])[] = [
+    ["pki/prod-ca.pem", "pki/prod-ca.pem is not"],
+    ["~/pki/prod-ca.pem", "~/pki/prod-ca.pem is not"],
+    [42, "caFile is not a string"],
+  ];
+
+  test("an https caFile that is refused marks its host, with the reason; an http:// one does not", async () => {
+    for (const [caFile, reason] of REFUSED_VALUES) {
+      stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+      await trust.refreshEngineTrust();
+      const refused = engineClient.pinRefusal(new URL(REMOTE));
+      assert.strictEqual(refused?.code, CAFILE_REFUSED_CODE, JSON.stringify(caFile));
+      assert.ok(refused.message.includes(reason), `${JSON.stringify(caFile)}: ${refused.message}`);
+    }
+    // The control: an http:// entry has no handshake to pin, so its bad caFile claims nothing, and an
+    // https engine on the same host:port is not refused.
+    stubConfig.environments = [{ name: "PLAIN", url: "http://plain.example.com:8765", caFile: "pki/ca.pem" }];
+    await trust.refreshEngineTrust();
     assert.strictEqual(engineClient.pinRefusal(new URL("https://plain.example.com:8765")), undefined);
-    // The control: an https entry with a full path does pin the host, read or not.
+    // And a full path that is merely unread is the other code.
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile: path.join(ws, "pki", "missing.pem") }];
     await trust.refreshEngineTrust();
     assert.strictEqual(engineClient.pinRefusal(new URL(REMOTE))?.code, CAFILE_UNREAD_CODE);
+  });
+
+  test("a refused https caFile is refused for GET and POST with no connection, and reads nothing", async () => {
+    const target = await countingListener();
+    const unpinned = await countingListener();
+    stubConfig.environments = [
+      { name: "PROD", url: target.url, caFile: "pki/prod-ca.pem" },
+      { name: "OTHER", url: unpinned.url },
+    ];
+    withFollowHandler();
+    await trust.refreshEngineTrust();
+    const spawned = invocations.length;
+    let opened = 0;
+    openHook = () => {
+      opened++;
+      return undefined;
+    };
+
+    for (const send of [
+      () => engineClient.getJson(target.url, "/health", undefined, 2000),
+      () => engineClient.postJson(target.url, "/config/reload", {}, undefined, 2000),
+    ]) {
+      await assert.rejects(
+        send,
+        (e: unknown) =>
+          e instanceof engineClient.NetworkError &&
+          e.code === CAFILE_REFUSED_CODE &&
+          e.message.includes("pki/prod-ca.pem is not"),
+      );
+    }
+    await ticks();
+    await settle();
+    assert.strictEqual(target.connections(), 0, "a host a refused caFile claims was sent on the default roots");
+    assert.strictEqual(opened, 0, "a refused caFile has no file, yet the follow opened one");
+    assert.strictEqual(invocations.length, spawned, "a refused caFile started a refresh");
+    const key = new URL(target.url).host;
+    assert.ok(
+      logged.some((line) => line.includes(`Requests to ${key} are refused`)),
+      `the log does not say the host is refused: ${JSON.stringify(logged)}`,
+    );
+
+    // The control: an unpinned host beside it still goes out.
+    await assert.rejects(
+      () => engineClient.getJson(unpinned.url, "/health", undefined, 2000),
+      (e: unknown) => e instanceof engineClient.NetworkError && e.code !== CAFILE_REFUSED_CODE,
+    );
+    assert.strictEqual(unpinned.connections(), 1, "an unpinned host must be sent as before");
+  });
+
+  test("an http:// entry with a bad caFile is still sent: the control", async () => {
+    const target = await countingListener();
+    const plain = target.url.replace("https:", "http:");
+    stubConfig.environments = [{ name: "PLAIN", url: plain, caFile: "pki/prod-ca.pem" }];
+    await trust.refreshEngineTrust();
+
+    await assert.rejects(
+      () => engineClient.getJson(plain, "/health", undefined, 2000),
+      (e: unknown) => e instanceof engineClient.NetworkError && e.code !== CAFILE_REFUSED_CODE,
+    );
+    assert.strictEqual(target.connections(), 1);
+  });
+
+  test("a refused caFile corrected to a valid one is read by the failing request, which then goes out", async () => {
+    const target = await countingListener();
+    stubConfig.environments = [{ name: "PROD", url: target.url, caFile: "pki/prod-ca.pem" }];
+    withFollowHandler();
+    await trust.refreshEngineTrust();
+    // Corrected in the settings; no refresh has run since, so engineClient still holds the refusal.
+    stubConfig.environments = [{ name: "PROD", url: target.url, caFile: plantCert(path.join("pki", "prod-ca.pem")) }];
+
+    await assert.rejects(
+      () => engineClient.postJson(target.url, "/config/reload", {}, undefined, 2000),
+      // Sent, with the anchor; it fails only because the listener is not TLS. Never sent before, so
+      // not a CertificateChangedError either.
+      (e: unknown) =>
+        e instanceof engineClient.NetworkError &&
+        !(e instanceof engineClient.CertificateChangedError) &&
+        e.code !== CAFILE_REFUSED_CODE,
+    );
+    assert.strictEqual(target.connections(), 1, "the corrected caFile was not read, so nothing was retried");
+    assert.strictEqual(engineClient.tlsOptions(new URL(target.url)).ca, PEM);
+  });
+
+  test("a refresh that started before a caFile was refused does not commit the CLI's certificate", async () => {
+    // The refused value claims the host as an accepted pin would, so a refresh that read the settings
+    // before it gives that host nothing.
+    stubInventory = plantedEngine();
+    childProcess.execFile = cliThatFirst(() => {
+      stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile: "relative/ca.pem" }];
+    });
+
+    await trust.refreshEngineTrust();
+
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+    // The control: with no caFile the same answer anchors the loopback engine.
+    stubConfig.environments = [];
+    childProcess.execFile = answeringCli;
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("a refused caFile set in the settings drops the CLI's certificate at once", async () => {
+    stubInventory = plantedEngine();
+    const subscriptions: { dispose(): unknown }[] = [];
+    held.push(() => subscriptions.forEach((d) => d.dispose()));
+    trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
+    await settle();
+    const listener = configListener as ConfigListener | undefined;
+    assert.ok(listener !== undefined, "no settings listener was subscribed");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+
+    stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile: "relative/ca.pem" }];
+    listener({ affectsConfiguration: (s) => s === "messagefoundry.environments" });
+
+    assert.strictEqual(engineClient.pinRefusal(new URL(LOOPBACK))?.code, CAFILE_REFUSED_CODE);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+  });
+
+  /** A file handle that serves `text` once, standing in for an open that finished long ago. Hoisted,
+   *  so the round-4 test above uses it too. */
+  function servingHandle(text: string): unknown {
+    const bytes = Buffer.from(text);
+    let served = false;
+    return {
+      stat: async () => ({ isFile: () => true, size: bytes.length }),
+      read: async (buffer: Buffer, offset: number) => {
+        const bytesRead = served ? 0 : bytes.copy(buffer, offset);
+        served = true;
+        return { bytesRead };
+      },
+      close: async () => undefined,
+    };
+  }
+
+  test("a stale failed read is not an answer when the refresh's own re-read is cut short", async () => {
+    // readSince's cut-short return: the refresh joins a read that began before it asked, so it reads
+    // again; that re-read does not finish in time. The joined read saw something that is not a
+    // certificate, but it is stale, so it must not drop the pin's anchor.
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    trust.setEngineTrustLimitsForTest({ refreshReadMs: 150, followReadMs: 5_000 });
+
+    let releaseStale: (() => void) | undefined;
+    let opens = 0;
+    openHook = (file) => {
+      if (file !== path.normalize(caFile)) {
+        return undefined;
+      }
+      opens++;
+      if (opens === 1) {
+        return new Promise((resolve) => (releaseStale = () => resolve(servingHandle("garbage"))));
+      }
+      return new Promise((_resolve, reject) => held.push(() => reject(new Error("EHOSTDOWN"))));
+    };
+    const followed = trust.followCertificateChange(REMOTE, PEM);
+    childProcess.execFile = cliThatFirst(() => setTimeout(() => releaseStale?.(), 20));
+
+    await trust.refreshEngineTrust();
+    await followed;
+
+    assert.strictEqual(opens, 2, "the refresh never read again, so this test proves nothing");
+    assert.strictEqual(
+      engineClient.tlsOptions(new URL(REMOTE)).ca,
+      PEM,
+      "an older failed read was taken as the answer and dropped the pin's anchor",
+    );
+  });
+
+  test("a pin anchor a request registered while a refresh ran is kept, though that refresh never read it", async () => {
+    // commit's first loop: the refresh read settings with no pin, the pin arrived meanwhile and a
+    // request read it, so the refresh's silence about that host is not an answer.
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    let followed: Promise<boolean> | undefined;
+    stubCli((done) => {
+      stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+      followed = trust.followCertificateChange(REMOTE, undefined);
+      void followed.then(() => done(null, JSON.stringify(stubInventory), ""));
+    });
+
+    await trust.refreshEngineTrust();
+
+    assert.ok(followed !== undefined, "the follow never ran, so this test proves nothing");
+    assert.strictEqual(await followed, true);
+    assert.strictEqual(
+      engineClient.tlsOptions(new URL(REMOTE)).ca,
+      PEM,
+      "the refresh dropped an anchor from the file the settings pin now",
+    );
   });
 });
