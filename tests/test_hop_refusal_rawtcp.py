@@ -17,9 +17,8 @@ transports now consume the ONE pure authority (``config.tls_policy``) through th
 NOT carved out any more — it refuses exactly like a PHI one. Loopback and per-connection-attested hops
 still ALLOW (byte-identical); a non-enforcing instance WARNs (crosses, loud-logged); a per-connection
 ``cleartext_accepted`` declaration WARNs + audits even under ENFORCE; and ``MEFOR_ALLOW_INSECURE_TLS``
-can no longer influence the decision at all. A hop built OUTSIDE the stamped gate (a live serve build
-after the pre-flight, or a direct test/embedding — posture unstamped) is still a no-op, so no existing
-lane breaks.
+can no longer influence the decision at all. A hop built with the posture unstamped (a direct
+test/embedding; the runner stamps its live serve builds) is still a no-op.
 """
 
 from __future__ import annotations
