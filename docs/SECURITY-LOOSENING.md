@@ -44,11 +44,16 @@ statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
 or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
-or starts the service, except SFTP: the host key is known only once the server answers, so that
-refusal comes at connect, before the password is sent. **No lever in this guide lifts a refusal in
+or starts the service, with two exceptions. SFTP: the host key is known only once the server
+answers, so that refusal comes at connect, before the password is sent. The AI broker: the engine
+builds it for each `POST /ai/chat`, so that request is refused and answers `503`, and the refusal
+names `[ai].endpoint`. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
 `tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection, or
-the `[auth]` setting for the AD bind, and offers only settings that do fix it. `Email` and `Direct`
+the `[auth]` setting for the AD bind, and offers only settings that can fix it. A verify-off refusal
+names a header off the allowlist apart from any credential. Where such headers are all it lists, it
+also offers removing them. The engine then judges the hop as one with no credential, under its own
+levers. `Email` and `Direct`
 check the credential before the cleartext and verify-off checks, so a credentialed hop is never
 pointed at one of those levers.
 
@@ -60,34 +65,46 @@ pointed at one of those levers.
 | `Rest`, `Soap`, `FHIR`, `DICOMweb`, `FhirLookup` | `verify_tls = false` on an `https` URL | turn `verify_tls` on; pin a private CA with `tls_ca_file` |
 | `Sftp` with a `password` | the server's host key is not in `known_hosts` | add the host key to `known_hosts` |
 | `[auth]` AD binds over LDAPS | `ad_tls_verify = false` | turn it on; pin a private CA with `ad_tls_ca_cert_file` |
+| AI broker (`[ai].endpoint`) | the endpoint is plain `http` | use an `https` endpoint |
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
-a static header that settings views would mask, such as `Authorization` or an API key. That last
-test leans toward caution: a header named like a key, such as `X-Routing-Key`, also counts. The
-HTTP family reads its auth-setting credentials from the same reader as the static-credential
-inventory. That inventory does not yet count a static header or a `url` query credential, so for
-those two kinds this rule is the wider of the two. A hop with no credential is not refused by this
-rule. Its own loosening entry decides it.
+a static header that settings views would mask, such as `Authorization` or an API key. On a
+`verify_tls = false` hop, the engine also refuses any other static header, unless its name is
+`Accept`, `Content-Type`, `User-Agent` or `X-Request-ID`, in any case. The refusal names such a
+header as outside the allowlist, not as a credential. That allowlist fails closed, so a
+secret under a neutral name, such as `X-Session`, is refused without being recognized. A
+credential-shaped value under an allowlisted name is still refused. The HTTP family reads its
+auth-setting credentials from the same reader as the static-credential inventory. That inventory
+does not yet count a static header or a `url` query credential, so for those two kinds this rule is
+the wider of the two. A hop with no credential and no such header is not refused by this rule. Its own loosening entry
+decides it.
 
 An AD bind always carries a credential, because the service account must bind first. So
-`ad_tls_verify = false` over LDAPS is refused in every case.
+`ad_tls_verify = false` over LDAPS is refused in every case. The AI broker is the same: it refuses
+an empty `[ai].api_key`, so every call sends the key, and a plain `http` endpoint is refused in
+every case.
 
 **The rule does not reach every hop yet.** At least these still send a credential to a peer the
 engine has not verified, when the lever named beside each is set:
 
 - an HTTP-family credential over plain `http`, under `cleartext_accepted` or `tls_hop_attested`;
-- an HTTP-family secret the refusal cannot see as a credential, on a `verify_tls = false` hop or
-  over plain `http`, under that hop's own levers. That covers at least a static header with a
-  neutral name, such as `X-Session`, and a secret in the path of the `url`. The test for a
-  credential header reads the header's name, and the `url` test reads only its query;
+- an HTTP-family secret in the `url` that the refusal cannot see as a credential, on a
+  `verify_tls = false` hop or over plain `http`, under that hop's own levers. That covers at least a
+  query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
+  like a credential. A secret anywhere in the path crosses unrefused too. A path secret cannot be
+  told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
+- an HTTP-family static header with a neutral name, such as `X-Session`, over plain `http`, under
+  that hop's own levers. The header allowlist applies on `verify_tls = false` hops only;
+- a secret that is not credential-shaped under an allowlisted header name, such as an opaque token
+  in `X-Request-ID`, on a `verify_tls = false` hop. The allowlist reads names, and the value test
+  knows only auth-scheme prefixes and JWTs;
 - the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;
 - the AD binds over plain `ldap://`, under `ad_allow_insecure_ldap = true`;
 - the `[alerts]` SMTP relay login, under `email_tls_verify = false`;
-- the AI broker's `[ai].api_key` over a plain `http` endpoint, and a secret in the path of an
-  alert webhook URL over `http`, each under `MEFOR_ALLOW_INSECURE_TLS` at
+- a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
   `[security].enforcement = warn`;
 - a credential header a Handler stamps per message under `dynamic_headers`, on a `verify_tls =
   false` hop. The refusal reads settings, so it cannot see one.
