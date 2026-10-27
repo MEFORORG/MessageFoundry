@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -234,7 +235,7 @@ def test_quarantine_is_not_stamped(tmp_path: Path) -> None:
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
     s = await MessageStore.open(tmp_path / "retention.db")
     yield s
     await s.close()
