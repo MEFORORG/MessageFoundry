@@ -259,12 +259,20 @@ set `caFile` on its `messagefoundry.environments` entry (or on one engine shard)
   its environment's.
 - **A `caFile`-pinned host never falls back to the default CAs.** From the moment the setting names
   a usable `caFile` (a full path on an https entry), a request to that `host:port` is sent only with
-  a certificate read from that file. Until the file has been read, or while it cannot be read as a
-  PEM certificate, the request is refused before it is sent, with an error naming the `caFile` in
-  `messagefoundry.environments`. That refusal reads the file again, so a GET that was refused only
-  because the file had not been read yet is retried once with it. A `caFile` that is refused (a
-  relative path, or an `http://` entry) pins nothing, so that host verifies against the default
-  roots as if no `caFile` were set. Remove the `caFile` to put a host back on the default roots.
+  a certificate read from that file, never with the default roots or the certificate
+  `messagefoundry.serviceConfig` names. While no certificate from that file is held, because it has
+  not been read yet or holds no PEM certificate, the request is refused before it is sent, with an
+  error naming the `caFile` in `messagefoundry.environments`. The refusal reads the file again, and
+  if that read succeeds the request is sent once with it. A certificate already read from the file
+  stays in use when a later read fails, as the next sections say. The pin covers the `host:port`
+  exactly as the entry spells it: the same server reached under another name or by its IP address is
+  a different host here and is not pinned.
+- A `caFile` that is refused pins nothing by itself, so it does not stop a host verifying against
+  the default roots. At least these are refused: a value that is not a string, a path that is not a
+  full path, and a `caFile` on an `http://` entry. A refused `caFile` on an https entry still keeps
+  the `messagefoundry.serviceConfig` certificate off that host (see above), and a second,
+  different `caFile` for a `host:port` an earlier entry pins is refused while the earlier pin stays
+  in force. Remove the `caFile` to put a host back on the default roots.
 - A refused or unreadable `caFile` is named in the **MessageFoundry Engine** log, and so is an https
   target that has no anchor at all.
 

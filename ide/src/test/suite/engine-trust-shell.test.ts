@@ -1149,13 +1149,26 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     await trust.refreshEngineTrust();
 
     let followed: Promise<boolean> | undefined;
+    // Resolves when the refresh's own read of the engine's file has closed it, so the follow below
+    // starts a read of its own rather than joining that one (a timer here was flaky on a slow runner).
+    let certClosed!: () => void;
+    const certRead = new Promise<void>((resolve) => (certClosed = resolve));
     childProcess.execFile = cliThatFirst(() => fs.writeFileSync(cert, cliFileFirst));
     openHook = (file) => {
+      if (file === path.normalize(cert)) {
+        return realOpen(file).then((opened) => {
+          const handle = opened as { close: () => Promise<void> };
+          const close = handle.close.bind(handle);
+          handle.close = () => close().finally(certClosed);
+          return handle;
+        });
+      }
       if (file !== path.normalize(caFile) || followed !== undefined) {
         return undefined;
       }
       followed = (async () => {
-        await new Promise((resolve) => setTimeout(resolve, 30)); // the engine's file is read by now
+        await certRead;
+        await new Promise((resolve) => setImmediate(resolve)); // let that read leave the in-flight map
         fs.writeFileSync(cert, RENEWED);
         return trust.followCertificateChange(LOOPBACK, PEM);
       })();
@@ -1361,6 +1374,66 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(target.connections(), 1, "the follow never read the caFile, so nothing was retried");
     assert.strictEqual(engineClient.tlsOptions(new URL(target.url)).ca, PEM);
     assert.strictEqual(engineClient.pinRefusal(new URL(target.url)), undefined);
+  });
+
+  test("a refused POST is sent once the follow reads the caFile: it never left, so it cannot repeat", async () => {
+    const target = await countingListener();
+    const caFile = path.join(ws, "pki", "late-ca.pem");
+    stubConfig.environments = [{ name: "PROD", url: target.url, caFile }];
+    withFollowHandler();
+    await trust.refreshEngineTrust();
+    plantCert(path.join("pki", "late-ca.pem"));
+
+    await assert.rejects(
+      () => engineClient.postJson(target.url, "/config/reload", {}, undefined, 2000),
+      (e: unknown) =>
+        e instanceof engineClient.NetworkError &&
+        !(e instanceof engineClient.CertificateChangedError) &&
+        e.code !== CAFILE_UNREAD_CODE,
+    );
+    assert.strictEqual(target.connections(), 1);
+  });
+
+  test("a pin added since the last refresh is read by a failing request, not only by that refresh", async () => {
+    await trust.refreshEngineTrust();
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+
+    assert.strictEqual(await trust.followCertificateChange(REMOTE, undefined), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+  });
+
+  test("pinning a host drops the certificate serviceConfig gave it, at once", async () => {
+    stubInventory = plantedEngine();
+    const subscriptions: { dispose(): unknown }[] = [];
+    held.push(() => subscriptions.forEach((d) => d.dispose()));
+    trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
+    await settle();
+    const listener = configListener as ConfigListener | undefined;
+    assert.ok(listener !== undefined, "no settings listener was subscribed");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+
+    const caFile = path.join(ws, "pki", "missing.pem");
+    stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile }];
+    listener({ affectsConfiguration: (s) => s === "messagefoundry.environments" });
+
+    assert.strictEqual(engineClient.pinRefusal(new URL(LOOPBACK))?.code, CAFILE_UNREAD_CODE);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+  });
+
+  test("a caFile caught holding only a BOM or a line break keeps its anchor, like an empty one", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    for (const partial of ["﻿", "\r\n"]) {
+      fs.writeFileSync(caFile, partial);
+      await trust.refreshEngineTrust();
+      assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM, JSON.stringify(partial));
+    }
+    // The control: real content that is not PEM is an answer, and drops it.
+    fs.writeFileSync(caFile, "not a certificate");
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
   });
 
   test("a pin is in force from the setting, before any file read or CLI answer", async () => {

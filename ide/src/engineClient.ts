@@ -247,9 +247,10 @@ export function snapshotEngineTrustAnchors(): () => void {
  * Refused: an https URL whose `host:port` a `caFile` pins and that has no anchor registered. With no
  * `ca`, Node verifies against its default roots, so a publicly signed certificate for that host would
  * pass, which is what pinning it excludes. The code is a trust failure ({@link CAFILE_UNREAD_CODE}),
- * so {@link withRenewalRetry} hands it to the failure handler, which reads the file; a GET then runs
- * once more with the anchor. Every other URL is unaffected: an unpinned host keeps the default roots,
- * and the loopback engine keeps the certificate `messagefoundry.serviceConfig` names.
+ * so {@link withRenewalRetry} hands it to the failure handler, which reads the file; the request, a
+ * POST included since it was never sent, then runs once more with the anchor. Every other URL is
+ * unaffected: an unpinned host keeps the default roots, and the loopback engine keeps the
+ * certificate `messagefoundry.serviceConfig` names.
  */
 export function pinRefusal(url: URL): NetworkError | undefined {
   if (url.protocol !== "https:") {
@@ -302,9 +303,9 @@ export function setTrustFailureHandler(
  * window was reloaded or a setting changed. The engine's own Python client follows a renewal the
  * same way: re-read the pin on the first verification failure, retry only if it changed.
  *
- * ONLY A GET RETRIES. Whether Node can flush a request's bytes before its JS-side verification
- * destroys the socket has not been measured, and a POST here can be a reload or a dual-control
- * approval, where a duplicate is costly. A POST still reports the failure, so the anchor is
+ * ONLY A GET RETRIES, apart from a request {@link pinRefusal} refused, which was never sent. Whether
+ * Node can flush a request's bytes before its JS-side verification destroys the socket has not been
+ * measured, and a POST here can be a reload or a dual-control approval, where a duplicate is costly. A POST still reports the failure, so the anchor is
  * followed and the NEXT request succeeds; when it was followed, the POST rejects with a
  * {@link CertificateChangedError} saying a retry will work, not the trust error's remedy, which would
  * send the user to a configuration that is not at fault. Verification is never relaxed for the retry.
@@ -335,7 +336,8 @@ async function withRenewalRetry<T>(
     if (!followed) {
       throw err;
     }
-    if (!retry) {
+    // A request pinRefusal refused was never sent, so resending it cannot duplicate it, POST or not.
+    if (!retry && err.code !== CAFILE_UNREAD_CODE) {
       // The trust error's own text sends the user to fix `serviceConfig` or a `caFile`, which is wrong
       // here: the configuration is fine, the engine's certificate moved, and it is already followed.
       throw new CertificateChangedError(baseUrl, err.code);
