@@ -2181,12 +2181,13 @@ Where a CRL setting names it too, as `[store].ssl_crl_file` can, the check comes
 restart. A start judges that setting. A hop may still hold a stale copy through a CRL setting.
 Only then does the restart wait for the reload's verdict. So after the CA-file step, `detail` says
 to restart once the reload has applied the file. Or it gives a refused reload's remedy and reason.
-The CA-file hop's restart follows, unless that remedy is itself a restart of the engine. The
-signature check may fail on a later CRL in the file after one it could not confirm. Then `detail`
-does not ask for a check: it says to replace the CRL before restarting. Put a CRL in
-the hop's CRL setting instead to have it applied without a restart. The listeners, OIDC and AD load
-only the certificates from their CA files, so a CRL there is ignored, as the CA file rows above say.
-The PostgreSQL store's `[store].ssl_root_cert` is not watched this way: it records no held copy.
+The CA-file hop's restart follows, unless that remedy is itself a restart of the engine. The scan
+may log a WARNING that it could not check the signature of a later CRL in the CA file. It does so
+only after a CRL that `detail` would ask you to check. Then `detail` does not ask for a check: it
+says to replace the CRL before restarting. Put a CRL in the hop's CRL setting instead to have it
+applied without a restart. The listeners, OIDC and AD load only the certificates from their CA
+files, so a CRL there is ignored, as the CA file rows above say. The PostgreSQL store's
+`[store].ssl_root_cert` is not watched this way: it records no held copy.
 
 At least two cases still need a restart: a CRL inside a CA file, and a replacement refused under rule
 3. A hop may hold a CRL from a path no setting above names, such as an inbound `tls_crl_file` given
