@@ -12714,6 +12714,36 @@ class MessageStore:
             await self._commit()
             return recovered
 
+    async def reclaim_stale_inflight(
+        self, *, stage: str, claimed_before: Mapping[str, float], now: float | None = None
+    ) -> int:
+        """Re-pend the rows at ``stage`` claimed before their lane's bound (see the protocol). One
+        UPDATE per lane in one transaction: the ``(stage, status)`` pair seeks ``ix_queue_ready``, as
+        :meth:`reset_stale_inflight`'s does, and the lane and claim-time terms ride it as residuals."""
+        if not claimed_before:
+            return 0
+        now = time.time() if now is None else now
+        lane_col = self._lane_col(stage)
+        recovered = 0
+        async with _writer_guard(self._db, self._lock):
+            for lane, before in sorted(claimed_before.items()):
+                cur = await self._db.execute(
+                    f"UPDATE queue SET status=?, next_attempt_at=?, updated_at=?"
+                    f" WHERE status=? AND stage=? AND {lane_col}=? AND updated_at<?",
+                    (
+                        OutboxStatus.PENDING.value,
+                        now,
+                        now,
+                        OutboxStatus.INFLIGHT.value,
+                        stage,
+                        lane,
+                        before,
+                    ),
+                )
+                recovered += cur.rowcount
+            await self._commit()
+            return recovered
+
     async def dead_letter_missing_destinations(
         self, valid_names: set[str], now: float | None = None
     ) -> int:

@@ -6496,6 +6496,36 @@ class PostgresStore:
                 recovered += _rowcount(result)
         return recovered
 
+    async def reclaim_stale_inflight(
+        self, *, stage: str, claimed_before: Mapping[str, float], now: float | None = None
+    ) -> int:
+        """Re-pend the rows at ``stage`` claimed before their lane's bound (see the protocol), with the
+        owner and lease cleared as :meth:`reset_stale_inflight` clears them. One UPDATE per lane in one
+        transaction. Single-node only: the runner never calls it on a clustered engine."""
+        if not claimed_before:
+            return 0
+        now = time.time() if now is None else now
+        lane_col = self._lane_col(stage)
+        sql = (
+            "UPDATE queue SET status=$1, next_attempt_at=$2, updated_at=$2,"
+            " owner=NULL, lease_expires_at=NULL"
+            f" WHERE status=$3 AND stage=$4 AND {lane_col}=$5 AND updated_at<$6"
+        )
+        recovered = 0
+        async with self._timed_acquire() as conn, conn.transaction():
+            for lane, before in sorted(claimed_before.items()):
+                result = await conn.execute(
+                    sql,
+                    OutboxStatus.PENDING.value,
+                    now,
+                    OutboxStatus.INFLIGHT.value,
+                    stage,
+                    lane,
+                    before,
+                )
+                recovered += _rowcount(result)
+        return recovered
+
     # --- streaming attachments (#149, ADR 0105 Phase 4 — Postgres parity) ----------------------------
     # Byte-for-byte behavioral parity with the SQLite reference (store/store.py): content-addressed
     # sha256 ref, per-chunk mfenc seal, dedup, refcount + GC-at-0, two-object ingress commit (above),

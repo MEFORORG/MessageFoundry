@@ -10622,6 +10622,45 @@ class SqlServerStore:
                 raise
         return recovered
 
+    async def reclaim_stale_inflight(
+        self, *, stage: str, claimed_before: Mapping[str, float], now: float | None = None
+    ) -> int:
+        """Re-pend the rows at ``stage`` claimed before their lane's bound (see the protocol), with the
+        owner and lease cleared as :meth:`reset_stale_inflight` clears them, and counted from the
+        ``OUTPUT inserted.id`` rowset for the same reason (BACKLOG #2097). One UPDATE per lane in one
+        transaction. Single-node only: the runner never calls it on a clustered engine."""
+        if not claimed_before:
+            return 0
+        now = time.time() if now is None else now
+        lane_col = self._lane_col(stage)
+        sql = (
+            "UPDATE queue SET status=?, next_attempt_at=?, updated_at=?, owner=NULL,"
+            " lease_expires_at=NULL OUTPUT inserted.id"
+            f" WHERE status=? AND stage=? AND {lane_col}=? AND updated_at<?"
+        )
+        recovered = 0
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                for lane, before in sorted(claimed_before.items()):
+                    await cur.execute(
+                        sql,
+                        (
+                            OutboxStatus.PENDING.value,
+                            now,
+                            now,
+                            OutboxStatus.INFLIGHT.value,
+                            stage,
+                            lane,
+                            before,
+                        ),
+                    )
+                    recovered += len(await cur.fetchall())
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return recovered
+
     # --- streaming attachments (#149, ADR 0105 Phase 4 — SQL Server parity) --------------------------
     # Byte-for-byte behavioral parity with the SQLite reference (store/store.py): content-addressed
     # sha256 ref, per-chunk mfenc seal, dedup, refcount + GC-at-0, two-object ingress commit (above),

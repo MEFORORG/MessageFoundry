@@ -191,6 +191,11 @@ class _LaneState:
     # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
     # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
     claimer_deaths: int = 0
+    # BACKLOG #1611 step 2a: the dispatcher's clock when this lane last entered CLAIMING. Every row
+    # the lane's current episode holds was claimed at or after it, the batch members a serializer
+    # coalesces later included. Read only through held_since(), which publishes it while the
+    # phase says the lane holds rows.
+    held_since: float = 0.0
 
 
 @dataclass
@@ -1037,6 +1042,8 @@ class StageDispatcher:
         # claimer path for stamps that are semantically identical. Hoisting makes the "reserved together"
         # invariant literal AND costs one read instead of N. Zero when the lever is off.
         now_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
+        # #1611 step 2a: read before the claim, which writes its rows' claim time from a later read.
+        held_since = self._clock()
         while claimer.ready and len(lanes) < budget:
             lane = claimer.ready.popleft()
             claimer.ready_set.discard(lane)
@@ -1051,6 +1058,7 @@ class StageDispatcher:
             # is skipped by it). Await-free from this read to the mutation, so no sibling claimer can
             # interleave.
             st.episode_start_ns = now_ns
+            st.held_since = held_since
             self._reserve_lane_slot(st)
             lanes.append(lane)
         return lanes
@@ -1931,6 +1939,20 @@ class StageDispatcher:
     def phase(self, key: str) -> _LanePhase | None:
         st = self._states.get(key)
         return st.phase if st is not None else None
+
+    def held_since(self, key: str) -> float | None:
+        """When the episode holding ``key``'s claimed rows began, or ``None`` when this dispatcher
+        holds none of them (BACKLOG #1611 step 2a). The runner's stale in-flight reclaim reads it so
+        it never re-pends a row this dispatcher still holds: such a row was claimed at or after the
+        value returned.
+
+        CLAIMING and PROCESSING are the phases that can hold rows. A claim in progress, a claimer's
+        abandoned prefix awaiting adoption, a live serializer, and one whose terminal transition has
+        not run all read as held, which errs toward not reclaiming. Every other phase holds none."""
+        st = self._states.get(key)
+        if st is None or st.phase not in (_LanePhase.CLAIMING, _LanePhase.PROCESSING):
+            return None
+        return st.held_since
 
     def paused(self, key: str) -> bool:
         """Whether ``key`` is in the operator-PAUSED phase (mirrors :meth:`phase`; the runner reads it

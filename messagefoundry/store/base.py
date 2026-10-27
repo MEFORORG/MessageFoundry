@@ -960,6 +960,22 @@ class QueueStore(StoreLifecycle, Protocol):
         set matches nothing for the stages it scopes."""
         ...
 
+    async def reclaim_stale_inflight(
+        self, *, stage: str, claimed_before: Mapping[str, float], now: float | None = None
+    ) -> int:
+        """Return to ``pending`` the ``inflight`` rows at ``stage`` whose lane is a key of
+        ``claimed_before`` and whose claim time (``updated_at``, see :meth:`inflight_by_lane`) is
+        strictly earlier than that lane's value (BACKLOG #1611 step 2b). Returns the rows re-pended.
+
+        This is the running engine's single-node reclaim of a row stranded between its claim and its
+        handoff. The caller owns the safety condition: each lane's bound must sit below the claim time
+        of every row a live worker still holds, and below the reclaim age. The store re-checks both
+        the status and the claim time in the statement itself, so a row that resolved, or was re-pended
+        and claimed again, after the caller read it is never touched. Like :meth:`reset_stale_inflight`
+        it keeps each row's ``seq`` and ``attempts``. Never call it on a clustered store, whose
+        recovery is the lease reclaim or the promotion reset."""
+        ...
+
     async def dead_letter_missing_destinations(
         self, valid_names: set[str], now: float | None = None
     ) -> int: ...

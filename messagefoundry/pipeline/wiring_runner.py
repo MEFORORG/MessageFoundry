@@ -805,14 +805,22 @@ _SHARD_WATCHDOG_INTERVAL_SECONDS = 30.0
 # is exactly a lane that has stopped processing, so this one has to run on its own clock.
 _INFLIGHT_WATCH_INTERVAL_SECONDS = 30.0
 
+# BACKLOG #1611 step 2b: the age, since its claim, past which the in-flight watch re-pends a row no
+# live worker holds. The ownership test is the held-since watermark, not this age. The age guards the
+# moment between a claim's commit and its worker publishing it, and keeps a fresh claim out of reach.
+_INFLIGHT_RECLAIM_AFTER_SECONDS = 120.0
+# Rows claimed this close before a holder's watermark are treated as held too, so a store whose claim
+# time comes from another clock than this process's cannot slip a held row under the watermark.
+_HELD_SINCE_SLACK_SECONDS = 5.0
+
 
 def _log_inflight_strand(stage: str, name: str, count: int, age: float) -> None:
     """The in-flight watch's log line. The alert payloads carry no stage and do not say the rows are
     in flight rather than pending, so this line does. Lane name and counts only, never content."""
     log.warning(
         "%d row(s) held in flight on %s lane %r, oldest claimed %.0fs ago with no handoff; "
-        "a stranded row stays in flight until a store recovery path re-pends it, at least a "
-        "restart",
+        "a stranded row stays in flight until a store recovery path re-pends it: on a single "
+        "node the stale in-flight reclaim, once no live worker holds it, or a restart",
         count,
         stage,
         name,
@@ -1710,6 +1718,14 @@ class RegistryRunner:
         self._shard_watchdog: asyncio.Task[None] | None = None
         # BACKLOG #1611 part B: the in-flight watch (see _inflight_watch). Every mode, every backend.
         self._inflight_watch: asyncio.Task[None] | None = None
+        # BACKLOG #1611 step 2a: per (stage, lane), the wall clock just before a per_lane worker's
+        # claim, held until that pass resolves. Every row the worker holds was claimed at or after
+        # it, so the stale in-flight reclaim (_reclaim_stale_inflight) never re-pends one. A worker
+        # that returns may leave its entry behind, which only errs toward not reclaiming.
+        self._held_since: dict[tuple[str, str], float] = {}
+        # BACKLOG #1611 step 2b: how long a row must sit in flight, past every live holder, before the
+        # reclaim re-pends it. An instance attribute so a test can shorten it.
+        self._inflight_reclaim_after = _INFLIGHT_RECLAIM_AFTER_SECONDS
         # #122 (ADR 0162): fail-closed application-log write guard. The escalation arrives on whatever
         # thread was logging, so the response is bounced onto this runner's loop as a task; the latch
         # makes the stop fire once per break rather than once per dropped record.
@@ -8142,6 +8158,9 @@ class RegistryRunner:
         # pass appends, so the STOPPED tail slice below never sees them.
         claimed: list[str] = []
         faults = _WorkerFaultLog("delivery", name)  # #1844: backs off the except arm's traceback
+        # #1611 step 2a: this worker's _held_since key. Set before the claim, so the rows a batching
+        # outbound coalesces later in the pass are covered too.
+        held = (Stage.OUTBOUND.value, name)
         while not self._stop.is_set():
             # #122 (ADR 0189) THE CLAIM GATE, per_lane half: the application log is unwritable and this
             # process has fail-closed, so this lane must not deliver no matter which door started it.
@@ -8189,6 +8208,7 @@ class RegistryRunner:
                 # claim that RAISES is not timed (the worker's outer except logs it and backs off); a
                 # timeout-capped duration would distort the claim-latency figure this measures.
                 _claim_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
+                self._held_since[held] = time.time()
                 if self._lane_ordering(name) is OrderingMode.FIFO:
                     # FIFO: claim only the due head; the head blocks the lane while it backs off. Under
                     # active-passive HA the graph runs on the leader ONLY, so one node drains this lane;
@@ -8221,6 +8241,9 @@ class RegistryRunner:
                     )
                     self._claim_phase_stats.maybe_emit(stage="outbound", claimers=1)
                 if not items:
+                    # Before the idle wait, not in the finally after it: a watermark
+                    # left up while idle would hold a fresh strand under its slack.
+                    self._held_since.pop(held, None)
                     faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
@@ -8280,6 +8303,10 @@ class RegistryRunner:
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
+            finally:
+                # #1611 step 2a: the pass holds nothing now. Popping late only lowers
+                # the reclaim's bound, which errs toward not reclaiming.
+                self._held_since.pop(held, None)
 
     async def _user_metadata_for(self, message_id: str) -> dict[str, str] | None:
         """The message's user-metadata bag as a flat ``{key: value}`` map for a ``dynamic_headers``
@@ -9069,6 +9096,7 @@ class RegistryRunner:
         )
         claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("router", name)  # #1844: backs off the except arm's traceback
+        held = (Stage.INGRESS.value, name)  # #1611 step 2a: this worker's _held_since key
         while not self._stop.is_set():
             # #122 (ADR 0162): the application log is unwritable and this process has fail-closed.
             # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state a
@@ -9081,6 +9109,7 @@ class RegistryRunner:
                 # runs on the leader ONLY, so a single node drains this lane. ADR 0058: when
                 # fifo_claim_batch == 1 (default) claim the single head (byte-identical); when > 1 claim
                 # the contiguous due head-prefix in one commit and process each row in FIFO order below.
+                self._held_since[held] = time.time()
                 if self._fifo_batch <= 1:
                     one = await self.store.claim_next_fifo(name, stage=Stage.INGRESS.value)
                     items = [one] if one is not None else []
@@ -9090,6 +9119,9 @@ class RegistryRunner:
                     )
                 claimed = [it.id for it in items]  # #1611
                 if not items:
+                    # Before the idle wait, not in the finally after it: a watermark
+                    # left up while idle would hold a fresh strand under its slack.
+                    self._held_since.pop(held, None)
                     faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
@@ -9123,6 +9155,10 @@ class RegistryRunner:
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
+            finally:
+                # #1611 step 2a: the pass holds nothing now. Popping late only lowers
+                # the reclaim's bound, which errs toward not reclaiming.
+                self._held_since.pop(held, None)
 
     async def _apply_router_internal_error(
         self, name: str, item: OutboxItem, exc: Exception
@@ -9443,13 +9479,18 @@ class RegistryRunner:
         )
         claimed: list[str] = []  # #1611: the row this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("response", name)  # #1844: backs off the except arm's traceback
+        held = (Stage.RESPONSE.value, name)  # #1611 step 2a: this worker's _held_since key
         while not self._stop.is_set():
             if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
                 return
             try:
+                self._held_since[held] = time.time()
                 item = await self.store.claim_next_fifo(name, stage=Stage.RESPONSE.value)
                 claimed = [] if item is None else [item.id]  # #1611
                 if item is None:
+                    # Before the idle wait, not in the finally after it: a watermark
+                    # left up while idle would hold a fresh strand under its slack.
+                    self._held_since.pop(held, None)
                     faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
                     woken = await self._wait_for_work(wait_ev)
@@ -9470,6 +9511,10 @@ class RegistryRunner:
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
+            finally:
+                # #1611 step 2a: the pass holds nothing now. Popping late only lowers
+                # the reclaim's bound, which errs toward not reclaiming.
+                self._held_since.pop(held, None)
 
     async def _process_response_item(
         self, name: str, item: OutboxItem
@@ -9541,6 +9586,7 @@ class RegistryRunner:
         wait_ev = self._lane_event(Stage.ROUTED, name) if self._per_lane_wake else self._routed_work
         claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("transform", name)  # #1844: backs off the except arm's traceback
+        held = (Stage.ROUTED.value, name)  # #1611 step 2a: this worker's _held_since key
         while not self._stop.is_set():
             if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
                 return
@@ -9549,6 +9595,7 @@ class RegistryRunner:
                 # leader ONLY, so a single node drains this lane. ADR 0058: single head when
                 # fifo_claim_batch == 1 (default, byte-identical); else the contiguous due head-prefix in
                 # one commit, processed in FIFO order below.
+                self._held_since[held] = time.time()
                 if self._fifo_batch <= 1:
                     one = await self.store.claim_next_fifo(name, stage=Stage.ROUTED.value)
                     items = [one] if one is not None else []
@@ -9558,6 +9605,9 @@ class RegistryRunner:
                     )
                 claimed = [it.id for it in items]  # #1611
                 if not items:
+                    # Before the idle wait, not in the finally after it: a watermark
+                    # left up while idle would hold a fresh strand under its slack.
+                    self._held_since.pop(held, None)
                     faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
@@ -9596,6 +9646,10 @@ class RegistryRunner:
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
+            finally:
+                # #1611 step 2a: the pass holds nothing now. Popping late only lowers
+                # the reclaim's bound, which errs toward not reclaiming.
+                self._held_since.pop(held, None)
 
     async def _process_routed_batch(self, name: str, items: Sequence[OutboxItem]) -> bool:
         """Process one claimed FIFO batch of routed rows; return ``True`` iff the lane must STOP (a STOP
@@ -10522,8 +10576,96 @@ class RegistryRunner:
                 await self._check_inflight_strands()
             except Exception:
                 log.exception("in-flight watch check failed; the next tick retries")
+            # After the page, so a strand is paged before it is healed. Its own guard, for the same
+            # reason as the line below: a failed strand check must not skip the reclaim.
+            try:
+                await self._reclaim_stale_inflight()
+            except Exception:
+                log.exception("stale in-flight reclaim failed; the next tick retries")
             # Its own guard: it logs its own faults, so a strand-check failure must not skip it.
             await self._page_dr_failed_lanes()
+
+    def _held_bound(self, stage: Stage, lane: str, cutoff: float) -> float:
+        """The claim time below which no live worker of this engine holds a row of ``lane`` at
+        ``stage``, capped at ``cutoff`` (BACKLOG #1611 step 2a). Each lane has one consumer (ADR
+        0059): a per_lane worker, or the pooled dispatcher for the stage. Both are asked, because
+        under pooled an UNORDERED outbound lane is still drained by its per_lane worker. Each one's
+        published watermark predates every row it holds, so subtracting the slack leaves the bound
+        below them all."""
+        dispatcher = self._dispatchers.get(stage)
+        since = (
+            self._held_since.get((stage.value, lane)),
+            None if dispatcher is None else dispatcher.held_since(lane),
+        )
+        return min([cutoff, *(v - _HELD_SINCE_SLACK_SECONDS for v in since if v is not None)])
+
+    async def _reclaim_stale_inflight(self, now: float | None = None) -> int:
+        """Re-pend each row held in flight past ``_inflight_reclaim_after`` that no live worker holds
+        (BACKLOG #1611 step 2b): the running engine's heal for a row a fault stranded between its
+        claim and its handoff, where the worker's own re-pend failed too. Before this only a restart
+        recovered it. Returns the rows re-pended.
+
+        **Ownership.** A row a live worker still holds must never be re-pended: the worker would hand
+        it off and a second claim would hand it off again, and a FIFO lane would reorder. Every
+        holder publishes a watermark at or before its claim (:meth:`_held_bound`), and the store
+        re-pends only rows claimed before it, re-checking the claim time in the statement. A claim
+        that lands while this runs is newer than the reclaim age, so it is out of reach too.
+
+        **Single node only.** A clustered engine never runs it: its rows may be a live sibling's,
+        which this process cannot see, and its recovery is the lease reclaim or the promotion reset
+        (``reclaims_inflight``, the gate ``Engine.start`` uses for the startup reset). An engine
+        shard scopes itself, since it only asks about the lanes its own registry owns, and each of
+        those has its one consumer in this process.
+
+        The re-pended rows keep their ``seq``, so a FIFO lane claims each again as its head. A
+        stranded row's successors may already have shipped; that reorder happened at the strand."""
+        if self._coordinator.reclaims_inflight() or not self._coordinator.is_leader():
+            return 0
+        now = time.time() if now is None else now
+        cutoff = now - self._inflight_reclaim_after
+        stages: list[tuple[Stage, frozenset[str]]] = [
+            (
+                Stage.OUTBOUND,
+                frozenset(n for n in self.registry.outbound if self._owns_destination(n)),
+            )
+        ]
+        inbound = frozenset(self.registry.inbound)
+        stages += [(Stage.INGRESS, inbound), (Stage.ROUTED, inbound)]
+        # The RESPONSE lane set is the loopback inbounds, as in _check_inflight_strands; none, no read.
+        loopbacks = frozenset(
+            n for n, ic in self.registry.inbound.items() if ic.spec.type is ConnectorType.LOOPBACK
+        )
+        stages.append((Stage.RESPONSE, loopbacks))
+        recovered = 0
+        for stage, lanes in stages:
+            if not lanes:
+                continue
+            held = await self.store.inflight_by_lane(stage=stage.value)
+            # Read after that await and with none before the store call's own, so each watermark is
+            # current; a claim landing in the store call's await is younger than the cutoff.
+            bounds = {
+                lane: self._held_bound(stage, lane, cutoff)
+                for lane, (_count, oldest) in held.items()
+                if lane in lanes and oldest < cutoff
+            }
+            if not bounds:
+                continue
+            count = await self.store.reclaim_stale_inflight(
+                stage=stage.value, claimed_before=bounds, now=now
+            )
+            if count:
+                recovered += count
+                log.warning(
+                    "re-pended %d row(s) held in flight on %s lane(s) %s for over %.0fs with no live "
+                    "worker holding them; a fault had stranded them between claim and handoff",
+                    count,
+                    stage.value,
+                    ", ".join(repr(lane) for lane in sorted(bounds)),
+                    self._inflight_reclaim_after,
+                )
+                for lane in bounds:
+                    self._wake_lane(stage, lane)
+        return recovered
 
     async def _check_inflight_strands(self, now: float | None = None) -> None:
         """Page on a row held in flight past the lane's age threshold (BACKLOG #1611 part B, P3-03).
@@ -10549,10 +10691,10 @@ class RegistryRunner:
         past the threshold is either stranded or in a send or transform that has run that long, and
         an operator wants the page in both cases.
 
-        **It does not recover the row.** A reclaim would have to know which in-flight rows no live
-        task still holds, and the pooled dispatcher keeps a claimed prefix inside its own serializer
-        where this runner cannot see it. Re-pending a held row sends it twice. So this pages, and
-        the store's existing recovery paths still re-pend. They include at least
+        **It does not recover the row.** On a single-node engine :meth:`_reclaim_stale_inflight`
+        does, on the same tick and on its own bound (step 2), using the holders' published
+        watermarks so it never re-pends a held row. On a clustered engine nothing in this process
+        can see a sibling's holders, so the store's other recovery paths re-pend. They include at least
         ``reset_stale_inflight`` at a single-node start and, on Postgres only, the expired-lease
         reclaim inside the FIFO head claims plus the clustered leader's ``reclaim_expired_leases``
         sweep. An ``ordering=unordered`` lane claims through ``claim_ready``, which has no such

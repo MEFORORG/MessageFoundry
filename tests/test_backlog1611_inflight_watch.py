@@ -13,8 +13,12 @@ This file covers the read (``inflight_by_lane``), the runner's in-flight watch t
 the two ``pooled`` rows of P3-03's measured table as failure-injection tests:
 
 * ``route_handoff`` raises once: T17 re-pends the head and the message routes, no restart.
-* ``route_handoff`` AND ``reschedule_claimed`` each raise once: the row strands. It still strands (part
-  B ships no reclaim; see ``_check_inflight_strands``), and now the in-flight watch pages it.
+* ``route_handoff`` AND ``reschedule_claimed`` each raise once: the row strands, and the in-flight
+  watch pages it.
+
+Step 2 adds the single-node stale in-flight reclaim. The last tests show the double-fault strand route
+with no restart in both claim modes, and that a row a live worker holds past the bound is left alone,
+with a control that removes the holder check and watches the row get re-pended.
 """
 
 from __future__ import annotations
@@ -454,10 +458,10 @@ async def test_pooled_double_fault_strands_and_the_watch_pages_it(
     """P3-03's second pooled row: ``route_handoff`` AND ``reschedule_claimed`` each raise once. T17's
     own re-pend fails, so the row stays ``inflight``, and ``pending_depth`` reads the lane empty.
 
-    It STILL strands after part B, by design: no reclaim shipped, because the pooled serializer holds
-    claimed rows this runner cannot see, and re-pending a held row sends it twice. What changed is that
-    the strand now pages. If a safe reclaim ever lands, this test is the one to flip: the row should
-    then route instead of staying in flight."""
+    Part B made the strand page. Step 2's reclaim heals it only past its own bound, which defaults to
+    far longer than this test runs, so here the row is still in flight when the page lands.
+    ``test_a_double_fault_strand_is_reclaimed_without_a_restart`` shortens the bound and shows it
+    route."""
     monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.01)
     monkeypatch.setattr(wiring_runner, "_INFLIGHT_WATCH_INTERVAL_SECONDS", 0.05)
     calls: dict[str, int] = {}
@@ -492,3 +496,178 @@ async def test_pooled_double_fault_strands_and_the_watch_pages_it(
             assert any(name == "IB" and depth == 1 for name, depth, _ in sink.buildup)
         finally:
             await runner.stop()
+
+
+# --- step 2: the stale in-flight reclaim ------------------------------------------------------------
+
+
+def _reclaiming_runner(tmp_path: Path, store: MessageStore, claim_mode: str) -> RegistryRunner:
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        claim_mode=claim_mode,
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    runner._inflight_reclaim_after = 0.3  # the bound, shortened; the watch ticks every 0.05 s
+    return runner
+
+
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+async def test_a_double_fault_strand_is_reclaimed_without_a_restart(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    claim_mode: str,
+) -> None:
+    """P3-03's measured strand, in both claim modes: ``route_handoff`` AND ``reschedule_claimed`` each
+    raise once, so the worker's own re-pend (step 1 per_lane, T17 pooled) fails and the row stays in
+    flight. Before step 2 it waited for a restart (the test above shows the strand). Now the watch's
+    reclaim re-pends it once it is past the bound with no live holder, and the message routes."""
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.01)
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.01)
+    monkeypatch.setattr(wiring_runner, "_INFLIGHT_WATCH_INTERVAL_SECONDS", 0.05)
+    calls: dict[str, int] = {}
+    _fail_once(monkeypatch, store, "route_handoff", calls)
+    _fail_once(monkeypatch, store, "reschedule_claimed", calls)
+    runner = _reclaiming_runner(tmp_path, store, claim_mode)
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        await runner.start()
+        try:
+            mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
+            runner.notify_work()
+
+            async def routed() -> bool:
+                msg = await store.get_message(mid)
+                return msg is not None and msg["status"] != MessageStatus.RECEIVED.value
+
+            await _until(routed)
+            assert calls["reschedule_claimed"] >= 1 and calls["route_handoff"] == 2
+            assert await _ingress_inflight(store) == 0
+            assert "re-pended 1 row(s) held in flight on ingress lane(s) 'IB'" in caplog.text
+        finally:
+            await runner.stop()
+
+
+def _gate_route_handoff(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, gate: asyncio.Event, calls: list[str]
+) -> None:
+    """Hold every ``route_handoff`` until ``gate`` opens: a live worker holding its claimed row in
+    flight for as long as the test likes, the way a slow handoff would."""
+    real = store.route_handoff
+
+    async def slow(*a: Any, **k: Any) -> Any:
+        calls.append(k["ingress_id"])
+        await gate.wait()
+        return await real(*a, **k)
+
+    monkeypatch.setattr(store, "route_handoff", slow)
+
+
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+@pytest.mark.parametrize("ignore_holders", [False, True], ids=["holders-honoured", "control"])
+async def test_the_reclaim_never_repends_a_row_a_live_worker_holds(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claim_mode: str,
+    ignore_holders: bool,
+) -> None:
+    """THE SAFETY CONDITION of step 2. A worker holds its claimed row in flight well past the bound
+    (its handoff is slow, not failed). The reclaim must leave that row alone through many ticks, or
+    the worker's handoff and a second claim would both hand it off.
+
+    The ``control`` case removes the holder check (``_held_bound`` returns the bare age cutoff) and
+    asserts the row IS re-pended, so this test can tell a reclaim that honours holders from one that
+    happens to do nothing."""
+    monkeypatch.setattr(wiring_runner, "_INFLIGHT_WATCH_INTERVAL_SECONDS", 0.05)
+    if ignore_holders:
+        monkeypatch.setattr(RegistryRunner, "_held_bound", lambda self, stage, lane, cutoff: cutoff)
+    gate = asyncio.Event()
+    handoffs: list[str] = []
+    _gate_route_handoff(monkeypatch, store, gate, handoffs)
+    runner = _reclaiming_runner(tmp_path, store, claim_mode)
+    ticks: list[int] = []
+    real_reclaim = runner._reclaim_stale_inflight
+
+    async def counted(now: float | None = None) -> int:
+        n = await real_reclaim(now)
+        ticks.append(n)
+        return n
+
+    monkeypatch.setattr(runner, "_reclaim_stale_inflight", counted)
+    await runner.start()
+    try:
+        mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
+        runner.notify_work()
+
+        async def holding() -> bool:
+            return bool(handoffs)
+
+        await _until(holding)
+        assert await _ingress_inflight(store) == 1
+        held_at = len(ticks)
+
+        async def past_the_bound() -> bool:
+            # The bound is 0.3 s at 0.05 s ticks: well past it, the reclaim has had many chances.
+            return len(ticks) - held_at >= 12
+
+        await _until(past_the_bound)
+        if ignore_holders:
+            assert sum(ticks) >= 1  # the control: the reclaim re-pended the held row
+            assert await _ingress_inflight(store) == 0
+            return
+        assert sum(ticks) == 0
+        assert await _ingress_inflight(store) == 1
+        assert await store.pending_depth("IB", stage=Stage.INGRESS.value) == (0, None)
+        gate.set()
+
+        async def routed() -> bool:
+            msg = await store.get_message(mid)
+            return msg is not None and msg["status"] != MessageStatus.RECEIVED.value
+
+        await _until(routed)
+        assert len(handoffs) == 1  # handed off once, never re-claimed behind the holder's back
+    finally:
+        gate.set()
+        await runner.stop()
+
+
+async def test_reclaim_store_rechecks_the_claim_time(store: MessageStore) -> None:
+    """The store half of the safety condition: only rows claimed strictly before their lane's bound
+    move, so a row re-claimed after the runner computed the bound is out of reach. Other lanes and
+    stages are untouched, and the re-pended row keeps its place."""
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
+    await store.enqueue_ingress(channel_id="IB2", raw=RAW, now=1.0)
+    await store.claim_next_fifo("IB", now=100.0, stage=Stage.INGRESS.value)
+    await store.claim_next_fifo("IB2", now=100.0, stage=Stage.INGRESS.value)
+    ingress = Stage.INGRESS.value
+    # A bound at the claim time is not strictly after it: nothing moves.
+    assert await store.reclaim_stale_inflight(stage=ingress, claimed_before={"IB": 100.0}) == 0
+    routed = Stage.ROUTED.value  # the wrong stage: nothing moves
+    assert await store.reclaim_stale_inflight(stage=routed, claimed_before={"IB": 200.0}) == 0
+    assert await store.reclaim_stale_inflight(stage=ingress, claimed_before={"IB": 100.5}) == 1
+    assert await store.inflight_by_lane(stage=ingress) == {"IB2": (1, 100.0)}
+    assert await store.pending_depth("IB", stage=ingress) == (1, 1.0)
+    assert await store.reclaim_stale_inflight(stage=ingress, claimed_before={}) == 0
+
+
+class _Clustered(NullCoordinator):
+    def reclaims_inflight(self) -> bool:
+        return True
+
+
+async def test_a_clustered_engine_never_reclaims(store: MessageStore, tmp_path: Path) -> None:
+    """A clustered coordinator's rows may be a live sibling's, which this process cannot see, so the
+    reclaim stands down there exactly as ``Engine.start`` skips its unconditional reset. The same row
+    under a single-node coordinator is the control."""
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
+    await store.claim_next_fifo("IB", now=2.0, stage=Stage.INGRESS.value)
+    egress = EgressSettings(deny_by_default=False)
+    clustered = RegistryRunner(_registry(tmp_path), store, coordinator=_Clustered(), egress=egress)
+    assert await clustered._reclaim_stale_inflight() == 0
+    assert await _ingress_inflight(store) == 1
+    single = RegistryRunner(_registry(tmp_path), store, egress=egress)
+    assert await single._reclaim_stale_inflight() == 1
+    assert await _ingress_inflight(store) == 0
