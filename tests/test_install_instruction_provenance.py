@@ -46,6 +46,9 @@ _ROOT = Path(__file__).resolve().parent.parent
 #: first `webconsole-v*` release, closing the ASVS 15.2.4 exposure where README.md instructed an index
 #: install of an unclaimed name.
 #:
+#: This matches an install VERB only, so it cannot see text that names a listed distribution without
+#: one, such as a `Requires-Dist` line or prose saying a package depends on it.
+#:
 #: The set exists for the NEXT distribution: add its name here the moment `packaging/<name>/` lands and
 #: before any doc references it, then remove it once the first release claims the name.
 #: `test_a_new_distribution_must_be_classified` fails if a packaged distribution is neither listed here
@@ -57,10 +60,14 @@ _UNPUBLISHED_DISTRIBUTIONS: frozenset[str] = frozenset()
 #:
 #: **`messagefoundry-toolkit` moved here in ADR 0201 slice 3**, from `_UNPUBLISHED_DISTRIBUTIONS`,
 #: where slice 2 put it. The probe, read 2026-10-27: PyPI's JSON API returned 200 for
-#: `/pypi/messagefoundry-toolkit/json`, `/0.5.0/json` and `/0.5.1/json`, and 404 for the control
-#: `/0.0.0.dev999/json`. The 0.5.0 wheel's provenance names publisher `MEFORORG/MessageFoundry`,
-#: workflow `release.yml`, so the claim is this repo's first upload. That is a reading on that date,
-#: not something this test re-checks: no test here reaches the network.
+#: `/pypi/messagefoundry-toolkit/json`, `/pypi/messagefoundry-toolkit/0.5.0/json` and
+#: `/pypi/messagefoundry-toolkit/0.5.1/json`, and for the harness control
+#: `/pypi/messagefoundry-harness/0.5.1/json`; it returned 404 for the controls
+#: `/pypi/messagefoundry-toolkit/0.0.0.dev999/json` and an unregistered project name. The project
+#: lists releases 0.5.0, 0.5.1 and 0.5.2, and each wheel's provenance names publisher
+#: `MEFORORG/MessageFoundry`, workflow `release.yml`. So every release on the project is this repo's
+#: upload. That is a reading on that date, not something this test re-checks: no test here reaches
+#: the network.
 _PUBLISHED_DISTRIBUTIONS = frozenset(
     {"messagefoundry-harness", "messagefoundry-toolkit", "messagefoundry-webconsole"}
 )
