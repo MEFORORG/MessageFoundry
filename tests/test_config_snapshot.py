@@ -23,6 +23,7 @@ import importlib.machinery
 import importlib.util
 import marshal
 import os
+import runpy
 import subprocess
 import sys
 import tokenize
@@ -180,8 +181,8 @@ def test_a_helper_runs_the_snapshot_bytes_too(tmp_path: Path) -> None:
 
 
 def test_a_config_module_cannot_be_reloaded_from_disk(tmp_path: Path) -> None:
-    """``importlib.reload`` finds no spec for the mangled name, so it never re-runs a config module
-    from the directory, its cache included."""
+    """Nothing re-runs a loaded config module: ``importlib.reload`` finds no spec for the mangled
+    name, so it never reads the directory or its cache, and ``runpy`` gets no second code object."""
     graph = tmp_path / "graph.py"
     graph.write_text(_graph("V1"), encoding="utf-8")
     registry = load_config(tmp_path)
@@ -191,6 +192,10 @@ def test_a_config_module_cannot_be_reloaded_from_disk(tmp_path: Path) -> None:
     try:
         with pytest.raises(ModuleNotFoundError):
             importlib.reload(module)
+        module.__spec__ = spec
+        # Nor does runpy: the loader served its one code object to the load.
+        with pytest.raises(ImportError, match="No code object"):
+            runpy.run_module(module.__name__)
         # A reload that ran would have re-bound the module's names to new functions.
         assert module.__dict__["h_ver"] is registry.handlers["h_ver"]
     finally:
@@ -204,6 +209,7 @@ def test_a_compile_failure_is_still_judged_as_raised_in_the_loader(tmp_path: Pat
     with pytest.raises(WiringError) as info:
         load_config(tmp_path)
     assert wiring._WITHHELD not in str(info.value)
+    assert isinstance(info.value.__cause__, MemoryError | RecursionError)  # compile's own wall
 
 
 # --- probe 2: a sandbox worker respawn -------------------------------------------------------------

@@ -7764,7 +7764,7 @@ def _body_helper_imports(source: bytes, stems: frozenset[str]) -> list[tuple[str
 
 class _SnapshotLoader(importlib.abc.InspectLoader):
     """The import loader for one config module or helper: it serves the bytes the load's
-    :class:`~messagefoundry.config.snapshot.ConfigSnapshot` holds for the file ``filename`` names.
+    :class:`~messagefoundry.config.snapshot.ConfigSnapshot` holds for ``path``, once.
 
     It takes the place of the ``SourceFileLoader`` that ``spec_from_file_location`` gave a config
     module before (vault BACKLOG #2596). The module still executes through the import system's own
@@ -7772,14 +7772,19 @@ class _SnapshotLoader(importlib.abc.InspectLoader):
     reads or writes a ``__pycache__`` file, and it reads nothing from the directory: a sandbox
     worker that was sent the snapshot runs the same bytes.
 
+    **One code object, for the load's own run.** The first :meth:`get_code` drops the snapshot, so
+    nothing can run the module a second time through its spec (``runpy.run_module`` gets no code
+    and refuses, as it did when a config module had no loader), and a module kept alive after a
+    reload holds no snapshot bytes.
+
     No source and no ``get_data``. :mod:`inspect` and a traceback read the file on disk, which may
     hold other bytes than the ones that ran, as before this loader. ``pkgutil.get_data`` and
     :mod:`importlib.resources` find no resources beside a config module, since the snapshot holds
     only the files a load reads."""
 
-    def __init__(self, source: bytes, filename: str) -> None:
-        self._source = source
-        self._filename = filename
+    def __init__(self, files: Mapping[str, bytes], path: Path) -> None:
+        self._files: Mapping[str, bytes] | None = files
+        self._path = path
 
     def is_package(self, fullname: str) -> bool:
         return False
@@ -7790,12 +7795,16 @@ class _SnapshotLoader(importlib.abc.InspectLoader):
         # linecache and inspect read the file, as they did when a config module had no loader.
         return None
 
-    def get_code(self, fullname: str) -> CodeType:
+    def get_code(self, fullname: str) -> CodeType | None:
+        files, self._files = self._files, None
+        if files is None:
+            return None  # already run: exec_module and runpy refuse with an ImportError
         # compile() here, not InspectLoader.source_to_code, so a compile failure's innermost frame is
-        # this package's, as _exec_module expects. Compiled from the bytes, so a PEP 263 coding line
-        # and a BOM are read from them, as the source loader reads them. The file name is the path
-        # an author edits, which a traceback and a load diagnostic name.
-        return compile(self._source, self._filename, "exec", dont_inherit=True)
+        # this package's, as _exec_module expects; the lookup is here too, inside its try. Compiled
+        # from the bytes, so a PEP 263 coding line and a BOM are read from them, as the source loader
+        # reads them. The file name is the path an author edits, which a traceback and a load
+        # diagnostic name.
+        return compile(files[self._path.name], str(self._path), "exec", dont_inherit=True)
 
 
 class _HelperImporter:
@@ -7957,7 +7966,7 @@ class _HelperImporter:
         on ``sys.meta_path`` knows its mangled name, so nothing runs it again from disk."""
         # Built by hand with has_location, as spec_from_file_location builds one, so the module
         # gets a __file__; spec_from_loader would leave it without one.
-        loader = _SnapshotLoader(self._snapshot.files[path.name], str(path))
+        loader = _SnapshotLoader(self._snapshot.files, path)
         spec = importlib.machinery.ModuleSpec(mod_name, loader, origin=str(path))
         spec.has_location = True  # sets __file__ from the origin
         module = importlib.util.module_from_spec(spec)
@@ -7973,7 +7982,7 @@ class _HelperImporter:
         0036) is what holds them, and docs/DANGEROUS-FUNCTIONALITY.md section 2 names this site."""
         spec = module.__spec__
         if spec is None or not isinstance(spec.loader, _SnapshotLoader):  # pragma: no cover
-            raise WiringError(f"error loading config module {path.name}: not a snapshot module")
+            raise WiringError(f"error loading config file {path.name}: not a snapshot module")
         spec.loader.exec_module(module)
 
     def source_of(self, filename: str) -> bytes | None:
