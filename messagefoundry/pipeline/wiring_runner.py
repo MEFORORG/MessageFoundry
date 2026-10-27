@@ -869,6 +869,15 @@ class _StreamBudgetExceeded(Exception):
     ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message."""
 
 
+class _AttachmentWriteFailed(Exception):
+    """``put_attachment`` failed for a reason other than an unsupported backend (BACKLOG #1619): a
+    driver error, a cipher fault, a lock timeout. Raised by ``_detach_documents`` so both callers turn
+    it into an ``ERROR`` row + NAK beside the budget and unsupported-backend refusals. Before this the
+    driver error escaped the ingress handler with no message row at all. If the store is down hard,
+    the ``ERROR`` write that follows fails too and propagates, so the transport's last-resort NAK
+    answers the sender, as it does for a failed ingress commit."""
+
+
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
 # PortConflictError naming the connection + binding, instead of a bare unattributed OSError aborting the
 # inbound. EADDRINUSE: another process/instance holds it; EADDRNOTAVAIL: the bind_address isn't a local
@@ -7574,7 +7583,12 @@ class RegistryRunner:
         if streaming_over:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
-            except (_StreamBudgetExceeded, StreamingAttachmentsUnsupported, DocRefError) as exc:
+            except (
+                _StreamBudgetExceeded,
+                StreamingAttachmentsUnsupported,
+                DocRefError,
+                _AttachmentWriteFailed,
+            ) as exc:
                 await self._record(
                     ic,
                     peek,
@@ -7620,7 +7634,8 @@ class RegistryRunner:
 
         Raises :class:`_StreamBudgetExceeded` when the aggregate in-flight budget would be exceeded, and
         :class:`~messagefoundry.store.StreamingAttachmentsUnsupported` on a backend without streaming
-        support (SQL Server / Postgres in Phase 1a) — both are turned into an ``ERROR``/NAK by the
+        support (SQL Server / Postgres in Phase 1a), and :class:`_AttachmentWriteFailed` when
+        ``put_attachment`` itself fails (BACKLOG #1619) — each is turned into an ``ERROR``/NAK by the
         caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
         size = len(text)
@@ -7658,7 +7673,19 @@ class RegistryRunner:
                 safe_ct = content_type
                 if not attachment_mime_agrees(content_type, b64_head(verbatim_b64)):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
-                ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
+                chunks = chunk_b64(verbatim_b64)
+                try:
+                    ref = await self.store.put_attachment(chunks, safe_ct)
+                except StreamingAttachmentsUnsupported:
+                    raise  # its own refusal, already caught by both callers
+                except Exception as exc:
+                    # Broad on purpose: the store backends raise driver classes this module cannot
+                    # name (sqlite3, pyodbc, psycopg) plus CipherError and lock timeouts, and there is
+                    # no common store base class. CancelledError is a BaseException, so a stop still
+                    # unwinds. safe_exc keeps a driver error that quotes a bound value out of the row.
+                    raise _AttachmentWriteFailed(
+                        f"attachment write failed: {safe_exc(exc)}"
+                    ) from exc
                 await asyncio.to_thread(
                     message.set, "OBX-5.5", make_doc_ref(ref, safe_ct), occurrence=occ
                 )
@@ -7940,6 +7967,7 @@ class RegistryRunner:
                 _StreamBudgetExceeded,
                 StreamingAttachmentsUnsupported,
                 DocRefError,
+                _AttachmentWriteFailed,
             ) as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=detach_err)
