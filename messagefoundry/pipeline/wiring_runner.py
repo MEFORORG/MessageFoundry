@@ -190,10 +190,13 @@ from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.pipeline.stage_dispatcher import (
     _REPEND_RETRY_CAP_SECONDS,
+    HoldResult,
     LaneItemResult,
     LaneResultKind,
+    RependFence,
     StageDispatcher,
     _capped_backoff,
+    wait_to_retry,
 )
 from messagefoundry.pipeline.sync_reply import SyncReplyMetrics, SyncReplyResolverImpl
 from messagefoundry.redaction import safe_exc, safe_text
@@ -6252,6 +6255,7 @@ class RegistryRunner:
             infra_fault_stop_after=self._infra_fault_stop_after,
             infra_fault_backoff_cap=self._infra_fault_backoff_cap,
             is_leader=self._coordinator.is_leader,
+            current_epoch=self._coordinator.current_epoch,
         )
 
     async def _start_pooled_dispatchers(self) -> None:
@@ -8049,12 +8053,15 @@ class RegistryRunner:
         ids: Sequence[str],
         *,
         faults: _WorkerFaultLog | None = None,
-    ) -> bool:
-        """Re-pend the rows a per-lane worker was holding when its loop faulted, retrying until the
-        write lands (BACKLOG #1611 steps 1 and 2) — the per-lane analogue of the pooled T17 head
+        abandon: Callable[[], bool] | None = None,
+        give_up_after: int | None = None,
+    ) -> HoldResult:
+        """Re-pend the rows a per-lane worker was holding when its loop faulted, retrying while it
+        holds the lane (BACKLOG #1611 steps 1 and 2) — the per-lane analogue of the pooled T17 head
         re-pend in :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
-        Returns True when the runner was stopped while the rows were still held, so the caller
-        returns rather than claiming again.
+        Returns how the hold ended. Only ``STOPPED``, the runner stopping with the rows still held,
+        makes the caller return rather than claim again; every other end leaves the rows INFLIGHT
+        and the worker loops on, as it did before step 2 after one failed write.
 
         The claim is its own committed transaction, so a fault in the handoff that follows leaves the
         claimed row INFLIGHT. Every claim path selects ``status='pending'``, so a worker that went on
@@ -8068,13 +8075,23 @@ class RegistryRunner:
         rows in flight, and the runner's in-flight watch pages them on their claim age
         (:meth:`_check_inflight_strands`), which nothing here touches.
 
-        A runner stop ends the retry and leaves the rows INFLIGHT for ``reset_stale_inflight`` at
-        the next start, as a cancelled worker's are; the backoff is :meth:`_stop_or_sleep`, and the
-        task stays cancellable. Leadership gates the retries, not the first write, exactly as in
-        :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._land_while_holding`, which
-        says why; not the leader, the worker keeps holding the lane, so a stop returns True and a
-        flap resumes the retry. Returning on leader loss instead would let the worker claim past the
-        held rows through such a flap.
+        **How the hold ends.** At least these, each sending no further write:
+
+        * A runner stop returns ``STOPPED`` and leaves the rows for ``reset_stale_inflight`` at the
+          next start, as a cancelled worker's are; the backoff is :meth:`_stop_or_sleep`, and the
+          task stays cancellable.
+        * Leadership and the lease's epoch gate the retries, not the first write, through the
+          :class:`~messagefoundry.pipeline.stage_dispatcher.RependFence`, which says why. Not the
+          leader, the worker keeps holding the lane, so a stop returns ``STOPPED`` and a flap under
+          the same lease resumes the retry; leading under another lease returns ``SUPERSEDED``.
+        * ``abandon``, read at the base interval through each backoff, returns ``ABANDONED``. The
+          delivery worker and the pooled batch guard pass the negation of :meth:`_lane_may_deliver`,
+          so an operator pause or stop of the outbound, and the #122 halt, are not held until the
+          store heals. The router, transform and response workers have no pause, so their hold ends
+          only on a stop or an epoch change.
+        * ``give_up_after`` failures return ``EXHAUSTED``. Only the pooled batch guard passes it,
+          under ``infra_fault_policy = stop``, since that hold is the pooled dispatcher's. The
+          per-lane workers never read the policy and have no STOP path, so they pass none.
 
         Dates the rows into the future by the same backoff the caller is about to sleep, exactly as
         T17 does and for the same reason: a plain release leaves them past-due, so the sweep re-readies
@@ -8094,8 +8111,10 @@ class RegistryRunner:
         Each line carries counts and the exception, never a row's content.
         """
         if not ids:
-            return False
+            return HoldResult.LANDED
         rows = list(ids)
+        # Read before the first write, which can hang across a flap.
+        fence = RependFence.capture(self._coordinator.is_leader, self._coordinator.current_epoch)
         # Without a worker's `faults` (#1844), this call logs on its own backoff and closes it.
         own = FailureRun()
         failures = 0
@@ -8116,34 +8135,37 @@ class RegistryRunner:
                     own = own.record(
                         log, exc, message, worker, name, len(rows), level=logging.WARNING
                     )
+                if give_up_after is not None and failures >= give_up_after:
+                    return HoldResult.EXHAUSTED
             else:
                 # A worker's own `faults` closes the re-pend run on quiet, with its main run.
                 own.clear(
                     log, "%s worker %r: reschedule_claimed", worker, name, level=logging.WARNING
                 )
-                return False
-            if await self._stop_or_sleep(
+                return HoldResult.LANDED
+            # One WARNING per leadership loss; a loss after a regain in this retry warns again.
+            ended = await wait_to_retry(
                 _capped_backoff(
                     _WORKER_ERROR_BACKOFF_SECONDS, failures - 1, _REPEND_RETRY_CAP_SECONDS
-                )
-            ):
-                return True
-            if self._coordinator.is_leader():
-                continue
-            # One WARNING per leadership loss; a loss after a regain in this retry warns again.
-            log.warning(
-                "%s worker %r: reschedule_claimed failed %d time(s) for %d claimed row(s) "
-                "and this node is not the leader, so no retry is sent; the lane stays held "
-                "with the rows in flight, and the retry resumes only if this node leads "
-                "again before it stops",
-                worker,
-                name,
-                failures,
-                len(rows),
+                ),
+                poll=_WORKER_ERROR_BACKOFF_SECONDS,
+                sleep=self._stop_or_sleep,
+                fence=fence,
+                abandon=abandon,
+                not_leader=functools.partial(
+                    log.warning,
+                    "%s worker %r: reschedule_claimed failed %d time(s) for %d claimed row(s) "
+                    "and this node is not the leader, so no retry is sent; the lane stays held "
+                    "with the rows in flight, and the retry resumes only if this node leads "
+                    "again before it stops",
+                    worker,
+                    name,
+                    failures,
+                    len(rows),
+                ),
             )
-            while not self._coordinator.is_leader():
-                if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
-                    return True
+            if ended is not None:
+                return ended
 
     async def _release_tail_on_stop(self, worker: str, name: str, ids: Sequence[str]) -> None:
         """Best-effort release of the batch tail a per-lane worker still holds when it RETURNS on a
@@ -8331,7 +8353,14 @@ class RegistryRunner:
                 # #1844: log with a backoff, not a traceback per pass (see _WorkerFaultLog).
                 faults.failed(exc, "delivery worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                if await self._repend_claimed_on_fault("delivery", name, claimed, faults=faults):
+                held = await self._repend_claimed_on_fault(
+                    "delivery",
+                    name,
+                    claimed,
+                    faults=faults,
+                    abandon=lambda: not self._lane_may_deliver(name),
+                )
+                if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
@@ -8814,18 +8843,33 @@ class RegistryRunner:
             extras = [it.id for it in members[1:]]
             if extras_out is not None:
                 extras_out.extend(extras)  # the caller's re-pend owns them now
-            # Stopped while holding the extras (True): they stay INFLIGHT for the next start, and
-            # the batch's fault is re-raised either way. That is the stop path too, not only the
-            # landed one: the head is the pooled dispatcher's, whose T17 arm sends its one
-            # permitted first write and then reads the same stop, so re-raising ends the pass at
-            # once. Returning a result here instead would tell the dispatcher the head resolved.
-            elif await self._repend_claimed_on_fault("batch delivery", name, extras):
-                log.warning(
-                    "delivery lane %r: stopped while holding %d coalesced batch row(s) whose re-pend "
-                    "had not landed; they stay in flight for the next start",
+            # The batch's fault is re-raised however the hold on the extras ended; one that did not
+            # land leaves them INFLIGHT. That is the stop path too, not only the landed one: the head
+            # is the pooled dispatcher's, whose T17 arm sends its one permitted first write and then
+            # reads the same stop, so re-raising ends the pass at once. Returning a result here
+            # instead would tell the dispatcher the head resolved. This hold is the pooled
+            # dispatcher's, so it ends as that dispatcher's own holds do: on a pause of the lane,
+            # and under infra_fault_policy = stop at infra_fault_stop_after failures, after which
+            # the head's hold counts its own failures toward the lane's STOP.
+            else:
+                held = await self._repend_claimed_on_fault(
+                    "batch delivery",
                     name,
-                    len(extras),
+                    extras,
+                    abandon=lambda: not self._lane_may_deliver(name),
+                    give_up_after=(
+                        self._infra_fault_stop_after if self._infra_fault_policy == "stop" else None
+                    ),
                 )
+                if held is not HoldResult.LANDED:
+                    log.warning(
+                        "delivery lane %r: stopped holding %d coalesced batch row(s) whose "
+                        "re-pend had not landed (%s); they stay in flight until a store recovery "
+                        "path re-pends them, at least the next start",
+                        name,
+                        len(extras),
+                        held.name.lower(),
+                    )
             raise
 
     async def _deliver_coalesced_batch(
@@ -9185,7 +9229,8 @@ class RegistryRunner:
                 # back off, and keep going (mirrors the delivery worker). #1844: with a backoff.
                 faults.failed(exc, "router worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                if await self._repend_claimed_on_fault("router", name, claimed, faults=faults):
+                held = await self._repend_claimed_on_fault("router", name, claimed, faults=faults)
+                if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
@@ -9533,7 +9578,8 @@ class RegistryRunner:
                 # log, back off, keep going (mirrors the router/delivery workers). #1844: with a backoff.
                 faults.failed(exc, "response worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                if await self._repend_claimed_on_fault("response", name, claimed, faults=faults):
+                held = await self._repend_claimed_on_fault("response", name, claimed, faults=faults)
+                if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
@@ -9660,7 +9706,10 @@ class RegistryRunner:
                     exc, "transform worker %r: unexpected error; backing off and retrying"
                 )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                if await self._repend_claimed_on_fault("transform", name, claimed, faults=faults):
+                held = await self._repend_claimed_on_fault(
+                    "transform", name, claimed, faults=faults
+                )
+                if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):

@@ -843,8 +843,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def lane_stuck(self, name: str, *, detail: str) -> None:
         # ADR 0070 retry_forever: a pooled lane is retrying a persistent T17 infra fault at capped
-        # backoff (never STOPped); or, under either policy, a pooled lane held retrying a failed
-        # re-pend of its claimed rows (BACKLOG #1611). The shared _emit throttle keys on (type, connection), so an ongoing
+        # backoff (never STOPped), or held retrying a failed re-pend of its claimed rows (BACKLOG
+        # #1611). The shared _emit throttle keys on (type, connection), so an ongoing
         # stuck lane collapses to one notification per cooldown; detail is a PHI-free stage+streak reason.
         self._emit({"type": "lane_stuck", "connection": name, "detail": detail})
 

@@ -96,6 +96,95 @@ def _capped_backoff(base: float, exp: int, cap: float) -> float:
     return min(float(base * (2 ** min(max(exp, 0), 20))), cap)
 
 
+class HoldResult(Enum):
+    """How a hold on a failed re-pend of claimed rows ended (BACKLOG #1611): the pooled
+    :meth:`StageDispatcher._land_while_holding` and the per-lane
+    ``RegistryRunner._repend_claimed_on_fault``. Only ``STOPPED`` is a teardown, after which the
+    caller returns. Every other end sends no further write, leaves the rows INFLIGHT, and lets the
+    caller go on as it did before step 2 after its one failed write: a per-lane worker loops, a
+    pooled serializer runs its terminal transition."""
+
+    LANDED = auto()  # the write landed
+    STOPPED = auto()  # the engine is stopping: the rows stay INFLIGHT for the next start
+    ABANDONED = auto()  # the lane may not deliver any more, at least an operator pause
+    SUPERSEDED = auto()  # another node may have led since the fault, so the rows may be its own
+    EXHAUSTED = auto()  # infra_fault_policy = stop, at infra_fault_stop_after failures
+
+
+@dataclass(frozen=True)
+class RependFence:
+    """The leadership a held re-pend's RETRIES are gated on (BACKLOG #1611). The first write is
+    always sent (ADR 0157 C1); a retry only while this node leads under the lease it held at the
+    fault. :meth:`capture` reads that lease before the first write, since a hung first write can
+    span a flap.
+
+    The epoch bumps only when the lease changes owner, so a node that regains the lease after
+    another node led holds a newer one, and that node may have claimed these rows meanwhile:
+    ``reschedule_claimed`` is fenced only by ``status='inflight'``, so a retry would re-pend the
+    successor's claim, a duplicate send. :meth:`superseded` reads that. A node that was not the
+    leader at the fault cannot tell who led since, so it never retries after regaining the lease.
+    A ``None`` epoch while leading, a single node, keeps no fence: there is no second writer.
+
+    What is left is the window between the check and the write, a flap inside one store round
+    trip. A store-level owner or epoch fence on ``reschedule_claimed`` is the full fix; it is not
+    filed yet."""
+
+    is_leader: Callable[[], bool]
+    current_epoch: Callable[[], int | None]
+    leading: bool
+    epoch: int | None
+
+    @classmethod
+    def capture(
+        cls, is_leader: Callable[[], bool], current_epoch: Callable[[], int | None]
+    ) -> RependFence:
+        leading = is_leader()
+        return cls(is_leader, current_epoch, leading, current_epoch() if leading else None)
+
+    def superseded(self) -> bool:
+        """Whether, leading now, this node may lead under a lease other than the one it held at
+        the fault."""
+        return not self.leading or (self.epoch is not None and self.current_epoch() != self.epoch)
+
+    def may_write(self) -> bool:
+        """Whether a write sent now, after the first, is fenced as above."""
+        return self.is_leader() and not self.superseded()
+
+
+async def wait_to_retry(
+    delay: float,
+    *,
+    poll: float,
+    sleep: Callable[[float], Awaitable[bool]],
+    fence: RependFence,
+    abandon: Callable[[], bool] | None,
+    not_leader: Callable[[], object],
+) -> HoldResult | None:
+    """Wait out one backoff of a held re-pend, then return None to send the retry, or how the
+    hold ends (BACKLOG #1611). ``sleep`` returns True on a stop. With an ``abandon`` predicate the
+    backoff is slept in ``poll`` steps, reading it after each, so a pause ends the hold within
+    about ``poll`` rather than after a backoff of up to 30 s. Not the leader, the hold waits on
+    in ``poll`` steps and calls ``not_leader`` once, to log it; leading again, the fence decides."""
+    warned = False
+    while True:
+        left = delay
+        while True:
+            step = min(left, poll) if abandon is not None else left
+            if await sleep(step):
+                return HoldResult.STOPPED
+            if abandon is not None and abandon():
+                return HoldResult.ABANDONED
+            left -= step
+            if left <= 0:
+                break
+        if fence.is_leader():
+            return HoldResult.SUPERSEDED if fence.superseded() else None
+        if not warned:
+            not_leader()
+            warned = True
+        delay = poll
+
+
 class LaneResultKind(Enum):
     """How the injected ``process_item`` body resolved one claimed row — the pooled analog of the
     per_lane loop's control flow, carrying the park deadline the ``_ItemOutcome`` two-member enum
@@ -364,6 +453,7 @@ class StageDispatcher:
         infra_fault_stop_after: int = 10,
         infra_fault_backoff_cap: float = 60.0,
         is_leader: Callable[[], bool] | None = None,
+        current_epoch: Callable[[], int | None] | None = None,
     ) -> None:
         assert claimers_per_stage >= 1
         assert max_processing_lanes >= 1
@@ -405,8 +495,10 @@ class StageDispatcher:
         self._infra_fault_policy = infra_fault_policy
         self._infra_fault_stop_after = infra_fault_stop_after
         self._infra_fault_backoff_cap = infra_fault_backoff_cap
-        # Read by _land_while_holding (BACKLOG #1611). None: a single node, always the leader.
+        # Read by _run_lane's RependFence (BACKLOG #1611). None: a single node, always the leader,
+        # with no epoch to fence on.
         self._is_leader: Callable[[], bool] = is_leader or (lambda: True)
+        self._current_epoch: Callable[[], int | None] = current_epoch or (lambda: None)
 
         self._states: dict[str, _LaneState] = {}
         self._claimers: list[_Claimer] = [
@@ -1301,15 +1393,19 @@ class StageDispatcher:
         # This is NOT release_claimed: it dates the head into the future so it reads not-due (collapsing
         # the ~4×/s spin) rather than past-due (which re-readies it at the sweep cadence).
         #
-        # BACKLOG #1611: both writes are retried until they land, while this serializer still HOLDS
-        # the lane (PROCESSING, slot reserved), so no claim takes a later row past a stranded one. A
-        # stop ends the retry and leaves the rows INFLIGHT for reset_stale_inflight at the next start,
-        # as a cancelled serializer's are; the in-flight watch pages them meanwhile. A stop during
-        # the head's retry still sends the tail release once, but only while this node leads: that
-        # write is no longer at fault time, and after a hold a successor may hold those rows.
+        # BACKLOG #1611: both writes are retried while this serializer still HOLDS the lane
+        # (PROCESSING, slot reserved), so no claim takes a later row past a stranded one. How a hold
+        # ends is a HoldResult. A stop is the teardown: the rows stay INFLIGHT for
+        # reset_stale_inflight at the next start, as a cancelled serializer's are, and this returns
+        # with no terminal transition. Any other end (a pause, an epoch change, the stop policy's
+        # bound) sends no further retry and runs the terminal transition below, as before step 2
+        # after one failed write; the rows stay in flight and the in-flight watch pages them.
         #
-        # Losing leadership pauses the retry and does not end it; _land_while_holding says why.
-        head_ok = tail_ok = True
+        # When the head's hold did not land, the tail release is sent once, as before step 2, but
+        # only while this node leads under the lease it held at the fault: the write is no longer
+        # at fault time, and a successor may hold those rows. _land_while_holding says the rest.
+        fence = RependFence.capture(self._is_leader, self._current_epoch)
+        head = tail = HoldResult.LANDED
         if head_reschedule is not None:
             head_id, when = head_reschedule
             # The head is dated `when`, and _drain_lane parks its RETRY outcome until that same
@@ -1325,20 +1421,23 @@ class StageDispatcher:
                 dated = when if now < when else now + span
                 return self._store.reschedule_claimed([head_id], dated)
 
-            head_ok = await self._land_while_holding(
-                lane, "reschedule_claimed of the head", reschedule_head
+            head = await self._land_while_holding(
+                lane, "reschedule_claimed of the head", reschedule_head, fence
             )
             outcome = replace(outcome, park_until=dated)
         if tail_ids:
-            if head_ok or self._is_leader():
-                tail_ok = await self._land_while_holding(
-                    lane,
-                    f"release_claimed of {len(tail_ids)} row(s)",
-                    functools.partial(self._store.release_claimed, tail_ids),
-                )
+            release = functools.partial(self._store.release_claimed, tail_ids)
+            what = f"release_claimed of {len(tail_ids)} row(s)"
+            if head is HoldResult.LANDED:
+                tail = await self._land_while_holding(lane, what, release, fence)
+            elif not fence.may_write():
+                tail = HoldResult.SUPERSEDED
             else:
-                tail_ok = False
-        if not (head_ok and tail_ok):
+                tail = await self._write_once(lane, what, release, head)
+        unlanded = (head is not HoldResult.LANDED) + (
+            len(tail_ids) if tail is not HoldResult.LANDED else 0
+        )
+        if HoldResult.STOPPED in (head, tail):
             # No terminal transition, so the dispatcher's quiesce reads this lane as drained; say
             # here that its rows did not come back. Counts only, never content.
             log.warning(
@@ -1346,9 +1445,23 @@ class StageDispatcher:
                 "had not landed; they stay in flight for the next start or a successor's recovery",
                 self._stage.value,
                 lane,
-                (0 if head_ok else 1) + (0 if tail_ok else len(tail_ids)),
+                unlanded,
             )
             return
+        if unlanded:
+            log.warning(
+                "StageDispatcher %s lane %s: stopped holding %d claimed row(s) whose re-pend had "
+                "not landed (%s); they stay in flight until a store recovery path re-pends them, "
+                "at least the next start",
+                self._stage.value,
+                lane,
+                unlanded,
+                (head if head is not HoldResult.LANDED else tail).name.lower(),
+            )
+        if HoldResult.EXHAUSTED in (head, tail) and outcome.kind is LaneResultKind.RETRY:
+            # The stop policy's bound: _land_while_holding added the hold's failures to the streak,
+            # and _apply_retry STOPs only a zero-progress infra fault, which a failing re-pend is.
+            outcome = replace(outcome, is_infra_fault=True, made_progress=False)
         # --- synchronous terminal transition (NO await below) -------------------------------------
         # S_lane (ARM 1): read the episode clock ONCE, here, before the outcome branch — re-reading it
         # inside each branch would silently fold the branch's own work into the episode and costs extra
@@ -1461,12 +1574,13 @@ class StageDispatcher:
         return _capped_backoff(_LANE_ERROR_BACKOFF_SECONDS, streak, self._infra_fault_backoff_cap)
 
     def _page_held_lane(self, lane: str, what: str, failures: int) -> None:
-        """Raise ``lane_stuck`` once for a lane held by :meth:`_land_while_holding`: a held lane
-        never reaches :meth:`_apply_retry`, so the ADR 0070 fix B streak cannot page it. Marks the
-        episode alerted, so :meth:`_maybe_lane_stuck_alert` does not page it again once the write
-        lands, and an episode already alerted (the head's hold, then the tail's) is not paged again.
-        A sink that raises is logged and swallowed, as :meth:`_to_stopped` does, because the
-        serializer still holds the lane and must not die on an alert."""
+        """Raise ``lane_stuck`` once for a lane held by :meth:`_land_while_holding` under
+        ``retry_forever``: a held lane never reaches :meth:`_apply_retry`, so the ADR 0070 fix B
+        streak cannot page it. Marks the episode alerted, so :meth:`_maybe_lane_stuck_alert` does
+        not page it again once the write lands, and an episode already alerted (the head's hold,
+        then the tail's) is not paged again. A sink that raises is logged and swallowed, as
+        :meth:`_to_stopped` does, because the serializer still holds the lane and must not die on
+        an alert."""
         st = self._states.get(lane)
         if st is not None:
             if st.lane_stuck_alerted:
@@ -1477,7 +1591,7 @@ class StageDispatcher:
                 lane,
                 detail=(
                     f"{self._stage.value} lane held: {what} failed {failures} consecutive "
-                    "times; retrying"
+                    "times; retrying (retry_forever)"
                 ),
             )
         except Exception:  # noqa: BLE001 — an alert must not kill the serializer holding the lane
@@ -1488,27 +1602,68 @@ class StageDispatcher:
                 exc_info=True,
             )
 
+    def _hold_abandoned(self, lane: str) -> bool:
+        """Whether an operator pause, at least ``pause_lane`` from a stop or pause of the outbound,
+        waits on this lane, so its hold ends and the terminal transition reaches PAUSED. Only the
+        OUTBOUND dispatcher is ever paused: a router, transform or response lane's hold ends only on
+        an engine stop, an epoch change or the stop policy's bound."""
+        st = self._states.get(lane)
+        return st is not None and st.pause_pending
+
+    async def _slept_into_stop(self, seconds: float) -> bool:
+        await self._sleep_or_stop(seconds)
+        return self._stop.is_set()
+
+    async def _write_once(
+        self, lane: str, what: str, write: Callable[[], Awaitable[object]], failed: HoldResult
+    ) -> HoldResult:
+        """Send ``write`` once, best-effort, as every re-pend was before BACKLOG #1611: LANDED, or
+        ``failed`` when it raises, logged."""
+        try:
+            await write()
+        except Exception:  # noqa: BLE001 — one best-effort write; the rows stay INFLIGHT
+            log.warning(
+                "StageDispatcher %s lane %s: %s failed; not retried",
+                self._stage.value,
+                lane,
+                what,
+                exc_info=True,
+            )
+            return failed
+        return HoldResult.LANDED
+
     async def _land_while_holding(
-        self, lane: str, what: str, write: Callable[[], Awaitable[object]]
-    ) -> bool:
+        self,
+        lane: str,
+        what: str,
+        write: Callable[[], Awaitable[object]],
+        fence: RependFence,
+    ) -> HoldResult:
         """Run ``write``, a re-pend of rows this serializer claimed, until it lands, on a capped
-        backoff (BACKLOG #1611). Returns False if the dispatcher stopped first; the rows then stay
-        INFLIGHT for ``reset_stale_inflight`` at the next start.
+        backoff, while the caller holds the lane (BACKLOG #1611). Returns how the hold ended; only
+        ``STOPPED`` is a teardown, and :meth:`_run_lane` says what each end does.
 
-        The first write is always sent. A RETRY is sent only while this node is the leader, read
-        after each backoff, right before it: the writes are unfenced by design (ADR 0157 C1), and a
-        retry from a node that lost the lease could re-pend rows a successor re-claimed. Not the
-        leader, the serializer sends nothing, logs one WARNING, and keeps holding the lane, polling
-        at the base interval: a stop (the demotion teardown) returns False, and leading again with
-        no teardown (a flap) resumes the retry. Ending the retry on leader loss instead would leave
-        the lane PROCESSING with no serializer through such a flap.
+        The caller still holds the lane, so nothing claims a later row past the ones being
+        re-pended, and no clock or ownership guess is needed: the serializer is the lane's only
+        consumer and knows which rows it holds. A failure is logged at WARNING on a backoff (1st,
+        2nd, 4th ...) with a line when the write lands; counts and the exception only, never a
+        row's content.
 
-        The caller still holds the lane, so nothing claims a later row past the ones being re-pended,
-        and no clock or ownership guess is needed: the serializer is the lane's only consumer and
-        knows which rows it holds. A failure is logged at WARNING on a backoff (1st, 2nd, 4th ...)
-        with a line when the write lands; counts and the exception only, never a row's content. At
-        ``infra_fault_stop_after`` consecutive failures it raises one ``lane_stuck`` alert, since a
-        held lane never reaches the ADR 0070 streak that would otherwise page it."""
+        **The first write is always sent; a RETRY only under the fence** (:class:`RependFence`
+        says why), read after each backoff, right before it. Not the leader, the serializer sends
+        nothing, logs one WARNING, and keeps holding the lane, polling at the base interval: a stop
+        (the demotion teardown) returns ``STOPPED``, and leading again under the same lease with no
+        teardown (a flap) resumes the retry. Leading under another lease returns ``SUPERSEDED``.
+
+        **An operator pause ends the hold** (``ABANDONED``). It is read at the base interval
+        through the backoff, so a pause, a stop of the outbound and the purge that waits on it are
+        not held until the store heals. :meth:`_hold_abandoned` says which lanes can be paused.
+
+        **At ``infra_fault_stop_after`` consecutive failures the policy decides.** Under ``stop``
+        the hold ends (``EXHAUSTED``) and adds its failures to the lane's ``infra_error_streak``, so
+        :meth:`_apply_retry` STOPs the lane with ``connection_stopped``, as a persistent T17 fault
+        does. Under ``retry_forever`` the hold goes on and raises one ``lane_stuck``
+        (:meth:`_page_held_lane`)."""
         run = FailureRun()
         while True:
             try:
@@ -1524,8 +1679,14 @@ class StageDispatcher:
                     what,
                     level=logging.WARNING,
                 )
-                if run.count == self._infra_fault_stop_after:
-                    self._page_held_lane(lane, what, run.count)
+                if run.count >= self._infra_fault_stop_after:
+                    if self._infra_fault_policy == "stop":
+                        st = self._states.get(lane)
+                        if st is not None:
+                            st.infra_error_streak += run.count
+                        return HoldResult.EXHAUSTED
+                    if run.count == self._infra_fault_stop_after:
+                        self._page_held_lane(lane, what, run.count)
             else:
                 run.clear(  # logs only after a failure
                     log,
@@ -1535,30 +1696,29 @@ class StageDispatcher:
                     what,
                     level=logging.WARNING,
                 )
-                return True
-            await self._sleep_or_stop(
+                return HoldResult.LANDED
+            # One WARNING per leadership loss; a loss after a regain in this retry warns again.
+            ended = await wait_to_retry(
                 _capped_backoff(
                     _LANE_ERROR_BACKOFF_SECONDS, run.count - 1, _REPEND_RETRY_CAP_SECONDS
-                )
+                ),
+                poll=_LANE_ERROR_BACKOFF_SECONDS,
+                sleep=self._slept_into_stop,
+                fence=fence,
+                abandon=functools.partial(self._hold_abandoned, lane),
+                not_leader=functools.partial(
+                    log.warning,
+                    "StageDispatcher %s lane %s: %s failed %d time(s) and this node is not the "
+                    "leader, so no retry is sent; the lane stays held with the rows in flight, "
+                    "and the retry resumes only if this node leads again before it stops",
+                    self._stage.value,
+                    lane,
+                    what,
+                    run.count,
+                ),
             )
-            if self._stop.is_set():
-                return False
-            if self._is_leader():
-                continue
-            # One WARNING per leadership loss; a loss after a regain in this retry warns again.
-            log.warning(
-                "StageDispatcher %s lane %s: %s failed %d time(s) and this node is not the "
-                "leader, so no retry is sent; the lane stays held with the rows in flight, "
-                "and the retry resumes only if this node leads again before it stops",
-                self._stage.value,
-                lane,
-                what,
-                run.count,
-            )
-            while not self._is_leader():
-                await self._sleep_or_stop(_LANE_ERROR_BACKOFF_SECONDS)
-                if self._stop.is_set():
-                    return False
+            if ended is not None:
+                return ended
 
     async def _drain_lane(
         self, lane: str, items: list[OutboxItem]
