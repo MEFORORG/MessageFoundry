@@ -820,9 +820,13 @@ It runs the commands of this step. It differs from them in at least the ways nam
   filter of check 1 applied in Python, and the two `Enabled` values of check 2 read from the
   registry. It imports the system TLS module by its path under the Windows PowerShell folder and
   runs the `Get-TlsCipherSuite` the imported module exports, never one looked up by name. Given a path,
-  `Import-Module` loads from that path and does not search the module path, which is where a
-  module in the account's Documents folder would be found. That is read from the command, not
-  measured: no run planted a same-named module in a Documents folder. No command it runs is
+  `Import-Module` loads the module at that path rather than searching the module path for the
+  name, which is where a module in the account's Documents folder would be found. That covers the
+  manifest the path names, not every module that manifest names in turn: on one Windows 11 host,
+  read 2026-10-26, `TLS\tls.psd1` names its root module,
+  `Microsoft.WindowsAuthenticationProtocols.Commands`, by name alone, with no file of that name
+  beside it, and how PowerShell resolves that name was not read. That is read from the command,
+  not measured: no run planted a same-named module in a Documents folder. No command it runs is
   looked up by a bare name, so a program or script of that name on the `PATH`, such as a
   `Join-Path.cmd`, cannot answer either; why, and what was measured, is in the comment on
   `_SUITES_COMMAND` in `messagefoundry/verify/cipher_policy.py`.
