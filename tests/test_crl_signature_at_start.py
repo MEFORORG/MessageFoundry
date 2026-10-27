@@ -811,7 +811,8 @@ def test_the_reload_s_finding_keeps_the_three_states_apart_and_reports_the_stron
     # The words of each state are the start's own, so the two cannot drift apart.
     for pem, state in ((unproven, "unproven"), (uncheckable, "uncheckable")):
         finding = crl_signature_finding(pem, ders)
-        assert finding is not None and pki_module.UNCONFIRMED_SIGNATURE[state] in finding.why
+        assert finding is not None and finding.state == state
+        assert pki_module.UNCONFIRMED_SIGNATURE[finding.state] in finding.why
     finding = crl_signature_finding(unlisted, ders)
     assert finding is not None and pki_module.UNLISTED_SIGNATURE in finding.why
     # The folded flag is unchanged for its callers: True for all three, False for unlisted alone.
