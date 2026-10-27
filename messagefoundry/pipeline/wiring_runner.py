@@ -870,21 +870,24 @@ class _StreamBudgetExceeded(Exception):
 
 
 class _AttachmentWriteFailed(Exception):
-    """``put_attachment`` failed for a reason other than an unsupported backend (BACKLOG #1619): a
-    driver error, a cipher fault, a lock timeout. Raised by ``_detach_documents`` so both callers turn
-    it into an ``ERROR`` row + NAK beside the budget and unsupported-backend refusals. Before this the
-    driver error escaped the ingress handler with no message row at all. If the store is down hard,
-    the ``ERROR`` write that follows fails too and propagates, so the transport's last-resort NAK
-    answers the sender, as it does for a failed ingress commit."""
+    """``put_attachment`` itself failed (BACKLOG #1619): a driver error, a cipher fault, a lock
+    timeout. Not a refusal of the message, so it is not in :data:`_DETACH_REFUSALS`. Both callers
+    record an ``ERROR`` row and then RE-RAISE, so the sender gets what a failed ingress commit gives
+    it: on MLLP the listener's last-resort NAK and close, which keeps pipelined frames in order; on
+    HTTP a 5xx, which a client retries, where a refused receipt would read as a permanent 4xx. Before
+    this the driver error escaped with no message row at all. If the store is down hard the ``ERROR``
+    write fails too, and that error propagates instead.
+
+    The message names the driver error's TYPE only. A driver error can quote a bound value, and
+    ``safe_exc`` cannot strip one that carries no HL7 delimiter (BACKLOG #1661)."""
 
 
-#: Every refusal ``_detach_documents`` raises. Both callers catch this one tuple, so a new refusal
-#: cannot reach one caller and escape the other (how BACKLOG #1619's put_attachment gap arose).
+#: The refusals ``_detach_documents`` raises: an ``ERROR`` row plus an in-band NAK (or a refused
+#: receipt). One tuple for both callers, so a new refusal cannot reach one and escape the other.
 _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     _StreamBudgetExceeded,
     StreamingAttachmentsUnsupported,
     DocRefError,
-    _AttachmentWriteFailed,
 )
 
 
@@ -927,29 +930,9 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 #: How long start() waits for a PRIOR demotion's abandoned stops before cancelling them. Sized to
 #: 2x the client-shutdown grace because MLLP/TCP/X12/HTTP each consume that grace TWICE, serially,
 #: inside one stop() — a 1x bound would cancel in precisely the slow-but-healthy case it exists to
-#: settle, taking the ADR 0031 rebind-failure branch instead. The plain (SHUTDOWN) source stop and
-#: stop_inbound use the same bound, for the same reason (BACKLOG #1620): one policy, not two.
+#: settle, taking the ADR 0031 rebind-failure branch instead. The plain (SHUTDOWN) source stop's
+#: first deadline uses it too, for the same reason (BACKLOG #1620).
 _PENDING_STOP_SETTLE_SECONDS = 10.0
-
-
-async def _join_or_cancel(
-    tasks: Collection[asyncio.Task[None]],
-) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
-    """Wait for ``tasks`` under ``_PENDING_STOP_SETTLE_SECONDS``, then cancel and join the stragglers.
-    Returns ``(done, cancelled_stragglers)``. A cancel of the caller cancels every task before it
-    propagates, so none is left running unowned. The one cancel-and-join policy for inbound stops
-    (BACKLOG #1620); the demotion path abandons instead, on purpose (:meth:`_stop_sources_demote`)."""
-    try:
-        done, still = await asyncio.wait(tasks, timeout=_PENDING_STOP_SETTLE_SECONDS)
-    except asyncio.CancelledError:
-        for task in tasks:
-            task.cancel()
-        raise
-    for task in still:
-        task.cancel()
-    if still:
-        await asyncio.gather(*still, return_exceptions=True)
-    return done, still
 
 
 class DrIntakeState(NamedTuple):
@@ -4674,48 +4657,7 @@ class RegistryRunner:
         """stop_inbound body without the reload lock — for callers that already hold it."""
         source = self._sources.pop(name, None)
         if source is not None:
-            # Bounded (BACKLOG #1620): this runs under _reload_lock, so an unbounded wait on a wedged
-            # share call would wedge reload, shutdown and the connection API with it. The source's own
-            # stop() error still reaches the caller, as before.
-            failed = await self._stop_sources_bounded([(name, source)])
-            if name in failed:
-                raise failed[name]
-
-    async def _stop_sources_bounded(
-        self, sources: Sequence[tuple[str, SourceConnector]]
-    ) -> dict[str, BaseException]:
-        """Stop ``sources`` concurrently under ONE deadline (BACKLOG #1620), and return the error each
-        failed ``stop()`` raised, by inbound name.
-
-        The plain-stop twin of :meth:`_stop_sources_demote`: the same eager ``create_task`` and the same
-        ``asyncio.wait`` deadline, but a stop that misses it is cancelled and joined, never abandoned. A
-        SHUTDOWN must not leave a task at loop close (see :meth:`stop`), and the ADR 0066 D3 order needs
-        every source finished before the dispatchers stop.
-
-        The bound limits how long the RUNNER waits, not the work. A ``stop()`` blocked in
-        ``asyncio.to_thread`` (a share call, a driver call) is cancelled at its await, but CPython
-        cannot kill the thread, which runs on until its call returns. Same accepted-by-design leak as
-        the strict-validate timeout in :meth:`_handle_inbound`. :func:`_join_or_cancel` holds the
-        wait itself, shared with :meth:`_settle_pending_source_stops`.
-        """
-        if not sources:
-            return {}
-        tasks = {asyncio.create_task(src.stop(), name=f"stop:{n}"): n for n, src in sources}
-        done, still = await _join_or_cancel(tasks)
-        if still:
-            log.warning(
-                "%d inbound stop(s) did not finish within %.1fs and were cancelled: %s. A stop "
-                "blocked in a worker thread keeps that thread until its call returns, and a rebind "
-                "of those ports may fail (isolated per connection, ADR 0031)",
-                len(still),
-                _PENDING_STOP_SETTLE_SECONDS,
-                ", ".join(sorted(tasks[task] for task in still)),
-            )
-        return {
-            tasks[task]: exc
-            for task in done
-            if not task.cancelled() and (exc := task.exception()) is not None
-        }
+            await source.stop()
 
     def _record_failed(self, name: str, exc: BaseException, *, kind: Direction) -> None:
         """Isolate a connection that failed to build/bind (ADR 0031): record the reason, log it
@@ -5710,18 +5652,8 @@ class RegistryRunner:
         for stale in self._pending_source_stops:
             stale.cancel()
         self._pending_source_stops = []
-        sources = list(self._sources.items())  # snapshot BEFORE the first await
-        if not sources:
-            return
-        tasks = [asyncio.create_task(src.stop(), name=f"demote-stop:{n}") for n, src in sources]
-        _done, still = await asyncio.wait(tasks, timeout=max(0.0, budget))
-        for task in _done:
-            if not task.cancelled() and task.exception() is not None:
-                log.warning("demotion: an inbound stop() failed: %s", task.exception())
+        still = await self._stop_sources_abandoning(budget, phase="demotion")
         if still:
-            self._pending_source_stops = list(still)
-            for task in still:
-                task.add_done_callback(self._reap_pending_stop)
             log.warning(
                 "demotion: %d inbound listener(s) did not stop within %.2fs and were ABANDONED "
                 "(their listening sockets are already closed; the client drain finishes in the "
@@ -5731,6 +5663,63 @@ class RegistryRunner:
                 len(still),
                 budget,
             )
+
+    async def _stop_sources_shutdown(self) -> None:
+        """SHUTDOWN's concurrent, bounded source stop (BACKLOG #1620). NEVER raises.
+
+        Before this the plain path awaited each ``stop()`` in turn with no bound, so one source wedged
+        on a dead share held ``_reload_lock`` and the rest of teardown for as long as the share call
+        ran, and N slow sources cost N times one. It reuses the demotion mechanism rather than a second
+        policy: one deadline over all stops, and a stop that misses it is ABANDONED into
+        ``_pending_source_stops``, not cancelled here. :meth:`stop` then settles those under its own
+        bound after the rest of teardown, as it already did for a demotion's leftovers. Cancelling at
+        the first deadline would cut a File or Database stop inside the store call it deliberately
+        waits out.
+
+        The ADR 0066 D3 order is kept for every source that stops inside the bound. An abandoned one
+        may still be draining when the dispatchers stop; a listener wake into a cleared dispatcher is
+        the verified no-op :meth:`_teardown_body` relies on under DEMOTE.
+
+        The bound limits how long the RUNNER waits, not the work: CPython cannot kill a thread, so a
+        ``stop()`` blocked in ``asyncio.to_thread`` keeps its thread until the call returns.
+        """
+        still = await self._stop_sources_abandoning(_PENDING_STOP_SETTLE_SECONDS, phase="shutdown")
+        if still:
+            log.warning(
+                "shutdown: %d inbound stop(s) did not finish within %.1fs and are settled after "
+                "the rest of teardown: %s",
+                len(still),
+                _PENDING_STOP_SETTLE_SECONDS,
+                ", ".join(still),
+            )
+
+    async def _stop_sources_abandoning(self, budget: float, *, phase: str) -> list[str]:
+        """Start every source's ``stop()`` at once and wait ONE deadline over all of them. Log each
+        stop that failed inside it, park each one still running in ``_pending_source_stops`` (reaped
+        by :meth:`_reap_pending_stop`), and return the parked inbounds' names, sorted. The mechanism
+        :meth:`_stop_sources_demote` documents; the caller owns the straggler warning and its bound.
+
+        A cancel of the caller parks every unfinished stop the same way before it propagates, so none
+        is left running unowned."""
+        sources = list(self._sources.items())  # snapshot BEFORE the first await
+        if not sources:
+            return []
+        tasks = {asyncio.create_task(src.stop(), name=f"{phase}-stop:{n}"): n for n, src in sources}
+        try:
+            done, still = await asyncio.wait(tasks, timeout=max(0.0, budget))
+        except asyncio.CancelledError:
+            self._park_pending_stops(task for task in tasks if not task.done())
+            raise
+        for task in done:
+            if not task.cancelled() and (exc := task.exception()) is not None:
+                log.warning("%s: inbound %r stop() failed: %s", phase, tasks[task], safe_exc(exc))
+        self._park_pending_stops(still)
+        return sorted(tasks[task] for task in still)
+
+    def _park_pending_stops(self, tasks: Iterable[asyncio.Task[None]]) -> None:
+        for task in tasks:
+            self._pending_source_stops.append(task)
+            task.add_done_callback(self._reap_pending_stop)
 
     async def _quiesce_workers_demote(self, budget: float) -> None:
         """per_lane parity for the pooled quiesce (ADR 0157 Inc 5). NEVER raises.
@@ -5796,10 +5785,8 @@ class RegistryRunner:
         """Retrieve an abandoned stop's exception, else asyncio logs 'never retrieved' at GC."""
         if task in self._pending_source_stops:
             self._pending_source_stops.remove(task)
-        if not task.cancelled() and task.exception() is not None:
-            log.warning(
-                "demotion: an abandoned inbound stop() ended with an error: %s", task.exception()
-            )
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            log.warning("an abandoned inbound stop() ended with an error: %s", safe_exc(exc))
 
     async def _settle_pending_source_stops(self) -> None:
         """Join a prior demotion's abandoned stops, BOUNDED — and the bound is mandatory.
@@ -5819,8 +5806,11 @@ class RegistryRunner:
         self._pending_source_stops = []
         if not pending:
             return
-        _done, still = await _join_or_cancel(pending)
+        _done, still = await asyncio.wait(pending, timeout=_PENDING_STOP_SETTLE_SECONDS)
+        for task in still:
+            task.cancel()
         if still:
+            await asyncio.gather(*still, return_exceptions=True)
             log.warning(
                 "%d abandoned inbound stop(s) did not finish within %.1fs and were cancelled; a "
                 "rebind of those ports may fail (isolated per connection, ADR 0031)",
@@ -5916,11 +5906,7 @@ class RegistryRunner:
             await self._quiesce_dispatchers_demote(budget * _DEMOTE_QUIESCE_SHARE)
             await self._stop_sources_demote(budget * (1.0 - _DEMOTE_QUIESCE_SHARE))
         else:
-            # BACKLOG #1620: concurrent and bounded. Fully joined (stragglers cancelled and gathered)
-            # before the dispatcher stop below, so the D3 order holds.
-            failed = await self._stop_sources_bounded(list(self._sources.items()))
-            for name, exc in failed.items():
-                log.warning("inbound %r: stop() failed: %s", name, safe_exc(exc))
+            await self._stop_sources_shutdown()  # BACKLOG #1620: concurrent and bounded
             # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
             # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
             # _stop.set(). The shared _stop already broke their loops; d.stop() cancels each
@@ -7664,6 +7650,10 @@ class RegistryRunner:
                     error=f"streaming detach failed: {safe_exc(exc)}",
                 )
                 return None
+            except _AttachmentWriteFailed as exc:
+                # Recorded, then re-raised: a store fault is a 5xx, not a refusal (see the class).
+                await self._record(ic, peek, text, MessageStatus.ERROR, error=str(exc))
+                raise
         mid = await self.store.enqueue_ingress(
             channel_id=ic.name,
             raw=skeleton,
@@ -7701,9 +7691,9 @@ class RegistryRunner:
 
         Raises :class:`_StreamBudgetExceeded` when the aggregate in-flight budget would be exceeded, and
         :class:`~messagefoundry.store.StreamingAttachmentsUnsupported` on a backend without streaming
-        support (SQL Server / Postgres in Phase 1a), and :class:`_AttachmentWriteFailed` when
-        ``put_attachment`` itself fails (BACKLOG #1619) — each is turned into an ``ERROR``/NAK by the
-        caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
+        support (SQL Server / Postgres in Phase 1a) — both are turned into an ``ERROR``/NAK by the
+        caller — and :class:`_AttachmentWriteFailed` when ``put_attachment`` itself fails (BACKLOG
+        #1619), which the caller records and re-raises. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
         size = len(text)
         budget = self._stream_inflight_budget
@@ -7743,15 +7733,15 @@ class RegistryRunner:
                 chunks = chunk_b64(verbatim_b64)
                 try:
                     ref = await self.store.put_attachment(chunks, safe_ct)
-                except StreamingAttachmentsUnsupported:
-                    raise  # its own refusal, already caught by both callers
+                except _DETACH_REFUSALS:
+                    raise  # a refusal, already caught by both callers
                 except Exception as exc:
                     # Broad on purpose: the store backends raise driver classes this module cannot
                     # name (sqlite3, pyodbc, psycopg) plus CipherError and lock timeouts, and there is
                     # no common store base class. CancelledError is a BaseException, so a stop still
-                    # unwinds. safe_exc keeps a driver error that quotes a bound value out of the row.
+                    # unwinds. Type only: see _AttachmentWriteFailed.
                     raise _AttachmentWriteFailed(
-                        f"attachment write failed: {safe_exc(exc)}"
+                        f"attachment write failed: {type(exc).__name__}"
                     ) from exc
                 await asyncio.to_thread(
                     message.set, "OBX-5.5", make_doc_ref(ref, safe_ct), occurrence=occ
@@ -8048,6 +8038,10 @@ class RegistryRunner:
                         detail=detach_err,
                     )
                 return ack
+            except _AttachmentWriteFailed as exc:
+                # Recorded, then re-raised to the listener's last-resort NAK (see the class).
+                await self._record(ic, peek, text, MessageStatus.ERROR, error=str(exc))
+                raise
 
         # ACK-on-receipt (staged pipeline, ADR 0001 Step A): persist the raw message durably to the
         # ingress stage, then ACK. Routing/transform/delivery run AFTER the ACK in the ingress worker,
