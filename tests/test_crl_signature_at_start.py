@@ -23,6 +23,7 @@ All material is synthetic and minted here. No PHI.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import ssl
 import warnings
@@ -45,6 +46,7 @@ from messagefoundry.config.tls_policy import (
     build_verifying_client_context,
     harden_crl_check,
 )
+from messagefoundry.keywrap import der_children, read_der_tlv
 from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE
 from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
@@ -1013,29 +1015,78 @@ def test_a_root_with_a_zero_serial_is_matched_by_its_real_serial_and_prints_no_w
     assert not [w for w in shown if issubclass(w.category, CryptographyDeprecationWarning)]
 
 
+def _der_length(n: int) -> bytes:
+    """A DER length, minimal, for the CRLs :func:`_crl_naming_serial` assembles."""
+    assert n < 0x10000
+    if n < 0x80:
+        return bytes([n])
+    return bytes([0x81, n]) if n < 0x100 else bytes([0x82, n >> 8, n & 0xFF])
+
+
 def _crl_naming_serial(
-    signer: ec.EllipticCurvePrivateKey, named: ec.EllipticCurvePrivateKey, serial: int
+    signer: ec.EllipticCurvePrivateKey,
+    named: ec.EllipticCurvePrivateKey,
+    serial: int,
+    *,
+    x400: bool = False,
 ) -> bytes:
     """A CRL from :data:`_ZERO_NAME` signed by ``signer``, whose Authority Key Identifier names
-    ``named``'s key, the name :data:`_ZERO_NAME` and the CA serial ``serial``."""
+    ``named``'s key, the name :data:`_ZERO_NAME` and the CA serial that is the one byte
+    ``serial``: 0x00 for 0, 0x80 for -128, as :func:`_zero_serial_ca` takes. The builder refuses
+    a negative serial, so it is built with serial 1, edited, and signed again by ``signer``. With
+    ``x400`` the name is tagged as an x400Address instead, a general name ``cryptography`` does
+    not read."""
     akid = x509.AuthorityKeyIdentifier(
         x509.SubjectKeyIdentifier.from_public_key(named.public_key()).digest,
         [x509.DirectoryName(_ZERO_NAME)],
-        serial,
+        1,
     )
-    return (
+    der = (
         x509.CertificateRevocationListBuilder()
         .issuer_name(_ZERO_NAME)
         .last_update(_NOW - _DAY)
         .next_update(_NOW + 30 * _DAY)
         .add_extension(akid, False)
         .sign(signer, hashes.SHA256())
-        .public_bytes(_PEM)
+        .public_bytes(serialization.Encoding.DER)
     )
+    akid_serial = bytes.fromhex("820101")  # the AKID's [2] serial, 1
+    assert der.count(akid_serial) == 1
+    der = der.replace(akid_serial, akid_serial[:-1] + bytes([serial]))
+    if x400:
+        span = pki_module._crl_akid_span(der)
+        assert span is not None
+        akid_tlv = read_der_tlv(der, *span)
+        (names,) = [part for part in der_children(der, akid_tlv) if part.tag == 0xA1]
+        assert der[names.start] == 0xA4  # directoryName, [4]
+        der = der[: names.start] + b"\xa3" + der[names.start + 1 :]  # x400Address, [3]
+    outer = read_der_tlv(der, 0, len(der))
+    tbs = read_der_tlv(der, outer.start, outer.end)
+    algorithm = read_der_tlv(der, tbs.end, outer.end)
+    signature = signer.sign(der[outer.start : tbs.end], ec.ECDSA(hashes.SHA256()))
+    body = (
+        der[outer.start : algorithm.end]
+        + b"\x03"
+        + _der_length(len(signature) + 1)
+        + b"\x00"
+        + signature
+    )
+    whole = b"\x30" + _der_length(len(body)) + body
+    return _pem_from_der(whole)
 
 
-def test_a_forged_crl_whose_own_key_identifier_carries_serial_zero_refuses_the_start(
-    tmp_path: Path,
+def _pem_from_der(der: bytes) -> bytes:
+    """``der`` as a PEM CRL, without parsing it."""
+    text = base64.encodebytes(der).decode("ascii")
+    return f"-----BEGIN X509 CRL-----\n{text}-----END X509 CRL-----\n".encode("ascii")
+
+
+_NOT_POSITIVE = pytest.mark.parametrize("serial", [0x00, 0x80], ids=["zero", "negative"])
+
+
+@_NOT_POSITIVE
+def test_a_forged_crl_whose_own_key_identifier_carries_a_serial_not_positive_refuses_the_start(
+    tmp_path: Path, serial: int
 ) -> None:
     """Review finding 1 of round four on vault BACKLOG #3506. A CRL whose own Authority Key
     Identifier carries serial 0 warned when its extensions were read. Where warnings are errors,
@@ -1043,9 +1094,9 @@ def test_a_forged_crl_whose_own_key_identifier_carries_serial_zero_refuses_the_s
     signature check read the CRL as ``unlisted``. It is read without the warning now."""
     key = ec.generate_private_key(ec.SECP256R1())
     ca_file = tmp_path / "zero-serial-ca.pem"
-    ca_file.write_text(ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key)), "ascii")
+    ca_file.write_text(ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key, serial)), "ascii")
     crl = tmp_path / "crl.pem"
-    forged = _crl_naming_serial(ec.generate_private_key(ec.SECP256R1()), key, 0)
+    forged = _crl_naming_serial(ec.generate_private_key(ec.SECP256R1()), key, serial)
     crl.write_bytes(forged)
     with warnings.catch_warnings():
         warnings.simplefilter("error", CryptographyDeprecationWarning)
@@ -1057,24 +1108,50 @@ def test_a_forged_crl_whose_own_key_identifier_carries_serial_zero_refuses_the_s
         assert str(refused.value).startswith(f"{_SETTING} ({str(crl)!r})")
         assert "mefor-3506-zero-serial" in str(refused.value)
         # Control: the CRL that CA's key signed, with the same key identifier, loads.
-        crl.write_bytes(_crl_naming_serial(key, key, 0))
+        crl.write_bytes(_crl_naming_serial(key, key, serial))
         assert _hop(ca_file, crl).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
-def test_a_crl_key_identifier_serial_is_kept_as_the_crl_carries_it() -> None:
-    """The copy :func:`pki._crl_extensions` reads has serial 1 where the CRL carries 0. What
-    OpenSSL scores a CRL on still holds the real serial, so a CRL naming serial 0 and one naming
-    serial 1 do not score alike."""
+@_NOT_POSITIVE
+def test_a_crl_key_identifier_serial_is_kept_as_the_crl_carries_it(serial: int) -> None:
+    """The copy :func:`pki._crl_extensions` reads has serial 1 where the CRL carries 0 or -128.
+    What OpenSSL scores a CRL on still holds the real serial, so a CRL naming that serial and one
+    naming serial 1 do not score alike."""
     key = ec.generate_private_key(ec.SECP256R1())
     now = _NOW.timestamp()
     with warnings.catch_warnings():
         warnings.simplefilter("error", CryptographyDeprecationWarning)
-        ((_, zero),) = pki_module.judge_every_crl(_crl_naming_serial(key, key, 0), now=now)
-    ((_, one),) = pki_module.judge_every_crl(_crl_naming_serial(key, key, 1), now=now)
-    assert zero.selection[1] is not None and one.selection[1] is not None
-    assert zero.selection[1] != one.selection[1]
-    # The bytes differ in the serial alone, and the CRL's own carries 0.
-    assert zero.selection[1].replace(b"\x82\x01\x00", b"\x82\x01\x01") == one.selection[1]
+        ((_, odd),) = pki_module.judge_every_crl(_crl_naming_serial(key, key, serial), now=now)
+    ((_, one),) = pki_module.judge_every_crl(_crl_naming_serial(key, key, 0x01), now=now)
+    assert odd.selection[1] is not None and one.selection[1] is not None
+    assert odd.selection[1] != one.selection[1]
+    # The bytes differ in the serial alone, and the CRL's own carries ``serial``.
+    carried = bytes([0x82, 0x01, serial])
+    assert odd.selection[1].replace(carried, b"\x82\x01\x01") == one.selection[1]
+    # The fingerprint is still the CRL's own.
+    pem = _crl_naming_serial(key, key, 0x01)
+    ((_, block),) = pki_module.judge_every_crl(pem, now=now)
+    assert block.fingerprint == x509.load_pem_x509_crl(pem).fingerprint(hashes.SHA256())
+
+
+def test_a_crl_whose_extensions_do_not_read_is_refused_by_name(tmp_path: Path) -> None:
+    """Review round four on vault BACKLOG #3506. A CRL extension ``cryptography`` cannot read
+    raised out of the start as itself, naming neither the setting nor the file. One such is a
+    general name of a type it does not support, which OpenSSL loads. It refuses by name now."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    ca_file = tmp_path / "zero-serial-ca.pem"
+    ca_file.write_text(ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key, 0x01)), "ascii")
+    crl = tmp_path / "crl.pem"
+    unread = _crl_naming_serial(key, key, 0x01, x400=True)
+    # Control: the instrument is real. Reading this CRL's extensions raises, and not a ValueError.
+    with pytest.raises(x509.UnsupportedGeneralNameType):
+        x509.load_pem_x509_crl(unread).extensions  # noqa: B018 -- the read is the point
+    crl.write_bytes(unread)
+    with pytest.raises(ValueError, match="CRL block 1 of 1 cannot be judged: its extensions do"):
+        _hop(ca_file, crl)
+    # Control: the same CRL with its name tagged as a directory name loads.
+    crl.write_bytes(_crl_naming_serial(key, key, 0x01))
+    assert _hop(ca_file, crl).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
 def test_a_long_issuer_name_is_quoted_with_a_bound(twins: _Twins) -> None:
