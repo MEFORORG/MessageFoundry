@@ -913,9 +913,9 @@ _PENDING_STOP_SETTLE_SECONDS = 10.0
 #: How long a SHUTDOWN teardown cancelled from outside still lets its in-flight source stops run
 #: before it cuts them (BACKLOG #1620, ADR 0157 Amendment B). The grace spares a stop that ends
 #: promptly a cut and a redo, and the DICOM and Database cut hazards. The bound honours the
-#: caller's cancel: a hung stop is cut here and then hangs, visibly, in the following unbounded
-#: stop() (Engine.stop() calls registry_runner.stop() right after cancelling the supervisor), which
-#: covers the rest. It saves no shutdown time on that path; it ADDS up to its own length there.
+#: caller's cancel: a hung stop is cut here and then hangs in the unbounded registry_runner.stop()
+#: that Engine.stop() runs later in its sequence, after its other stop steps, which covers the
+#: rest. It saves no shutdown time on that path; it ADDS up to its own length there.
 _CANCELLED_STOP_GRACE_SECONDS = 2.0
 
 
@@ -5758,9 +5758,8 @@ class RegistryRunner:
                 _PENDING_STOP_SETTLE_SECONDS,
             )
 
-    @staticmethod
     async def _join_cancelled_source_stops(
-        tasks: list[asyncio.Task[None]], cancels_before: int, cut: set[asyncio.Task[None]]
+        self, names: list[str], tasks: list[asyncio.Task[None]], cancels_before: int
     ) -> None:
         """The SHUTDOWN source phase was cancelled from outside (ADR 0157 Amendment B).
 
@@ -5768,49 +5767,64 @@ class RegistryRunner:
         rest and join their cancellation. A second cancel cuts at once, whether it arrives during
         the grace or was coalesced with the first: ``cancelling()`` is compared against
         ``cancels_before``, read before the wait, so a cancel the task already carried from earlier
-        does not count. Every task this method cancels is added to ``cut`` first, so the caller can
-        tell a stop it cut from one that ended cancelled for any other reason. The caller re-raises.
+        does not count. The caller re-raises.
 
-        A further cancel during the final ``gather`` cannot leave a cut stop running: the task's
+        A further cancel during the final ``gather`` cannot leave a cut stop TASK running: the
         cancel is forwarded to the stops, and ``gather`` still resolves only once each has
-        finished, so this method returns only after every stop task is done. No later stop()
-        can therefore overlap one (ADR 0157 Amendment B).
+        finished. A connector's own thread can outlive its task, as a cut DICOM shutdown does; the
+        ADR lists that per connector.
         """
         current = asyncio.current_task()
-        if current is not None and current.cancelling() - cancels_before > 1:
-            still = {task for task in tasks if not task.done()}
-        else:
-            try:
-                _done, still = await asyncio.wait(tasks, timeout=_CANCELLED_STOP_GRACE_SECONDS)
-            except asyncio.CancelledError:
+        cut: set[asyncio.Task[None]] = set()
+        try:
+            if current is not None and current.cancelling() - cancels_before > 1:
+                why = "a second cancel"
                 still = {task for task in tasks if not task.done()}
-        if still:
-            cut.update(still)
-            for task in still:
-                task.cancel()
-            log.warning(
-                "shutdown cancelled: cut %d inbound stop(s) still running (grace %.1fs, or a second "
-                "cancel); they stay registered and the next stop() or start() stops them again",
-                len(still),
-                _CANCELLED_STOP_GRACE_SECONDS,
-            )
-            await asyncio.gather(*still, return_exceptions=True)
+            else:
+                why = f"the {_CANCELLED_STOP_GRACE_SECONDS:.1f}s grace"
+                try:
+                    _done, still = await asyncio.wait(tasks, timeout=_CANCELLED_STOP_GRACE_SECONDS)
+                except asyncio.CancelledError:
+                    why = "a second cancel"
+                    still = {task for task in tasks if not task.done()}
+            if still:
+                cut.update(still)
+                for task in still:
+                    task.cancel()
+                log.warning(
+                    "shutdown cancelled: cut %d inbound stop(s) still running after %s; they stay "
+                    "registered and the next stop() or start() stops them again",
+                    len(still),
+                    why,
+                )
+                await asyncio.gather(*still, return_exceptions=True)
+        finally:
+            foreign = 0
+            for name, task in zip(names, tasks, strict=True):
+                if not task.done() or (task.cancelled() and task in cut):
+                    continue
+                if task.cancelled():
+                    foreign += 1  # cancelled by another canceller, such as a loop close
+                elif (failure := task.exception()) is not None:
+                    log.warning("inbound %r: stop() failed: %s", name, safe_exc(failure))
+            if foreign:
+                log.warning(
+                    "shutdown cancelled: %d inbound stop(s) were cancelled by something other than "
+                    "this teardown (a loop close, say); they stay registered",
+                    foreign,
+                )
+            self._forget_stopped_sources(names, tasks)
 
     @staticmethod
     def _log_failed_source_stops(
-        names: list[str],
-        tasks: list[asyncio.Task[None]],
-        cut: Collection[asyncio.Task[None]] = (),
+        names: list[str], tasks: list[asyncio.Task[None]]
     ) -> list[BaseException]:
-        """Log each FINISHED stop that failed, by inbound name, and return the failures; one still
-        running, or one in ``cut`` (already logged as a count), is skipped. A stop that ended
-        cancelled although the runner did not cut it is a failure, as a RuntimeError: a bare
-        CancelledError raised from a teardown nobody cancelled reads as the caller's own cancel
-        (the graph supervisor would exit on it)."""
+        """Log each stop that failed, by inbound name, and return the failures. A stop that ended
+        cancelled is a failure, as a RuntimeError: nobody cancelled this teardown, and a bare
+        CancelledError raised from it reads as the caller's own cancel (the graph supervisor would
+        exit on it)."""
         failed: list[BaseException] = []
         for name, task in zip(names, tasks, strict=True):
-            if not task.done() or task in cut:
-                continue
             failure: BaseException | None = (
                 RuntimeError(f"inbound {name!r}: stop() ended cancelled")
                 if task.cancelled()
@@ -5820,6 +5834,14 @@ class RegistryRunner:
                 log.warning("inbound %r: stop() failed: %s", name, safe_exc(failure))
                 failed.append(failure)
         return failed
+
+    def _forget_stopped_sources(self, names: list[str], tasks: list[asyncio.Task[None]]) -> None:
+        """Before a raise out of the source phase: drop each inbound whose stop() returned cleanly,
+        so only the ones that may still be live stay registered. Otherwise inbound_running() would
+        report a closed listener as up, and a per-connection start of it would be a silent no-op."""
+        for name, task in zip(names, tasks, strict=True):
+            if task.done() and not task.cancelled() and task.exception() is None:
+                self._sources.pop(name, None)
 
     async def _teardown_unsafe(
         self,
@@ -5931,14 +5953,11 @@ class RegistryRunner:
                 try:
                     await asyncio.wait(tasks)  # never cancels its awaitables (D6)
                 except asyncio.CancelledError:
-                    cut: set[asyncio.Task[None]] = set()
-                    try:
-                        await self._join_cancelled_source_stops(tasks, cancels_before, cut)
-                    finally:
-                        self._log_failed_source_stops(names, tasks, cut)
+                    await self._join_cancelled_source_stops(names, tasks, cancels_before)
                     raise
             failed_stops = self._log_failed_source_stops(names, tasks)
             if failed_stops:
+                self._forget_stopped_sources(names, tasks)
                 raise failed_stops[0]
             # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
             # listener can no longer mark_ready an already-cleared dispatcher — NOT right after

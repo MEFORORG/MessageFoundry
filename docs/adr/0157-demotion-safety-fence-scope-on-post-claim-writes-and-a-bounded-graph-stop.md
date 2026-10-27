@@ -1128,7 +1128,7 @@ Removing the floor from `mark_failed` turned four red, and from `mark_batch_fail
 `tests/test_adr0157_sqlserver_fence.py` drives a re-pended row under both NOCOUNT states. Both run
 only on the hosted legs.
 
-## Amendment B (2026-10-26): SHUTDOWN source stops run concurrently, and an outer cancel gives them a grace (BACKLOG #1620)
+## Amendment B (2026-10-26): SHUTDOWN inbound stops run concurrently, and an outer cancel gives them a grace (BACKLOG #1620)
 
 ### What changed
 
@@ -1136,9 +1136,10 @@ Inc 4 kept SHUTDOWN byte-identical and made the bounded, concurrent source stop 
 SHUTDOWN's source phase is now concurrent too. `_teardown_body`'s non-demote branch starts every
 `source.stop()` as a task and joins them all with `asyncio.wait`, so N slow inbound stops cost the
 slowest one, not the sum. A failed stop is logged by inbound name, and once every stop has been
-joined the first failure is re-raised, before anything after the source phase runs. Every inbound
-and the whole drain side therefore stay residual state, and the next `stop()` or `start()` retries
-the stops, as the serial loop left them.
+joined the first failure is re-raised, before anything after the source phase runs. Each inbound
+whose `stop()` returned cleanly is dropped from `_sources` first, so `inbound_running()` does not
+report a closed listener as up; the ones that may still be live, and the whole drain side, stay
+residual state, and the next `stop()` or `start()` retries them.
 
 ### Why the parity constraint is relaxed for this phase only
 
@@ -1186,12 +1187,14 @@ rest. A plain `gather` over concurrent stops would cut all of them at once. Inst
    loop turn. That is read as `current_task().cancelling()` rising by more than one over its value
    before the wait, so a cancel the task already carried, swallowed in a cleanup path, does not
    count.
-4. Every stop that finished with an error is logged by inbound name through `safe_exc`. A further
-   cancel during the join of the cut stops does not leave one running: `gather` forwards the cancel
-   to them and still resolves only once each has finished, so the teardown returns only after
-   every stop task is done, and no later `stop()` can overlap one. A stop that ended cancelled
-   although the runner did not cut it is logged as a failure. Then the cancel is re-raised. The
-   clears never run, so every source stays in `_sources`, and `_running = False` still runs in `_teardown_unsafe`'s `finally`
+4. Every stop that finished with an error is logged by inbound name through `safe_exc`, including
+   a cut stop whose cancellation handling raised one. Stops that ended cancelled without the
+   runner cutting them, as a loop close does to every task, are counted in one warning. A further
+   cancel during the join of the cut stops does not leave a stop TASK running: `gather` forwards
+   the cancel to them and still resolves only once each has finished, so no later `stop()` can
+   overlap the task. A connector thread can outlive its task, as a cut DICOM shutdown does; see
+   per connector. Then the cancel is re-raised. Each inbound that stopped cleanly is dropped from
+   `_sources`; the rest stay, and `_running = False` still runs in `_teardown_unsafe`'s `finally`
    (the `_running` regression Inc 5's tests pin).
 
 So an outer cancel is bounded by the grace plus each cut stop's own cancellation handling. The serial
@@ -1199,12 +1202,14 @@ loop's bound was that handling alone. A stop that needs longer than the grace, s
 in its client drain (`_CLIENT_SHUTDOWN_GRACE`), is cut, as the serial loop cut its one in-flight
 stop.
 
-Two limits come with running the stops as tasks at all, and so with the concurrency itself; the
-DEMOTE path has had both since Inc 4. A canceller of every task, such as `asyncio.run`'s close of
-a loop with the teardown still in flight, cancels each stop task directly and so cuts them all
-with no grace; that is reached only when a shutdown is already being torn down from under it. And
-the listeners' connection events from the stops reach the bounded event queue in one burst rather
-than one stop at a time, so at a large inbound count more of them can be dropped as overflow.
+At least these limits come with running the stops as tasks at all, and so with the concurrency
+itself; the DEMOTE path has had them since Inc 4. A canceller of every task, such as
+`asyncio.run`'s close of a loop with the teardown still in flight, cancels each stop task directly
+and so cuts them all with no grace; that is reached only when a shutdown is already being torn
+down from under it. The listeners' connection events reach the bounded event queue in one burst
+rather than one stop at a time, so at a large inbound count more of them can be dropped as
+overflow. And every `to_thread` shutdown, DICOM's and File's share calls among them, reaches the
+default executor at once, where the serial loop put one there at a time.
 
 ### What this relies on, per connector
 
@@ -1233,7 +1238,10 @@ once, which turns red without the second cancel's handler. Two coalesced cancels
 turns red without the `cancelling()` check. A stop that failed before the cancel is still logged by
 name, which turns red if the cancel path skips the failure read. A stop that ended cancelled on
 its own before an outer cancel is still logged, which turns red if the cancel path skips every
-cancelled task. A cancel the task already carried
+cancelled task. A cut stop that raised while cut is logged by name, which turns red if every cut
+task is skipped. A failed stop is raised only once its slower sibling has finished, which turns red
+under `return_when=FIRST_EXCEPTION`, and leaves only the failed inbound registered, which turns red
+if the cleanly stopped ones are not dropped. A cancel the task already carried
 does not skip the grace, which turns red without the baseline. A stop that ends cancelled on its
 own is raised as a `RuntimeError`, which turns red if it is re-raised as a cancel. A failed stop
 keeps the drain side, which turns red on head `8bf008396`, where the rest of teardown ran first. A

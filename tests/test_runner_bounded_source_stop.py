@@ -2,14 +2,14 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The runner's plain (SHUTDOWN) source stop runs the stops concurrently (BACKLOG #1620).
 
-``RegistryRunner.stop()`` used to await each ``source.stop()`` in turn, so N slow sources cost N
-times one. They now run together, and every one is still joined before the dispatchers stop. A
+``RegistryRunner.stop()`` used to await each inbound's ``stop()`` in turn, so N slow inbounds cost
+N times one. They now run together, and every one is still joined before the dispatchers stop. A
 failed stop is logged and re-raised once every stop is joined, before the dispatchers stop: its
 listener may still be live, so the drain side is kept as residual state, and the next stop() or
 start() retries it, as the serial loop left it (ADR 0157 Amendment B).
 
 The runner deliberately adds no bound of its own: cutting or abandoning a stop there would let
-start() rebind over a source still releasing its port or poll task. Each source's own stop() is
+start() rebind over an inbound still releasing its port or poll task. Each inbound's own stop() is
 the bound; FileSource's is tests/test_file_source_bounded_stop.py. The one exception is a
 teardown cancelled from outside: the in-flight stops get a bounded grace, then are cut, and a
 second cancel cuts at once (ADR 0157 Amendment B).
@@ -60,6 +60,8 @@ class _Source:
             await self._body()
         except asyncio.CancelledError:
             self.events.append(f"cut:{self.name}")
+            if self.mode == "fails_when_cut":
+                raise OSError("port release failed") from None
             if self.mode == "slow_cut":
                 assert self.gate is not None
                 # Cleanup that outlives the cut AND a re-cancel, as one inside a thread or a
@@ -84,7 +86,7 @@ class _Source:
         elif self.mode == "slow_cut":
             if self.stop_calls == 1:
                 await asyncio.Event().wait()
-        elif self.mode == "hangs":
+        elif self.mode in ("hangs", "fails_when_cut"):
             await asyncio.Event().wait()
         elif self.mode == "self_cancels":
             raise asyncio.CancelledError
@@ -143,21 +145,26 @@ async def test_a_failed_stop_keeps_the_drain_side(
 ) -> None:
     """A failed stop may leave its listener live, still ACKing into the store. Teardown must not
     clear the drain side under it. Mutation: run the rest of teardown before the raise (head
-    8bf008396). Red: the dispatchers are stopped and cleared."""
+    8bf008396). Red: the dispatchers are stopped and cleared. Mutation: wait with
+    return_when=FIRST_EXCEPTION. Red: stop() raises while IB_OK is still stopping."""
     events: list[str] = []
-    runner = _runner(events, IB_OK="ok", IB_BAD="fails")
+    gate = asyncio.Event()
+    runner = _runner(events, gate, IB_OK="gated", IB_BAD="fails")
     worker: asyncio.Task[None] = asyncio.create_task(_park())
     runner._workers["OB_X"] = worker
     runner._destinations["OB_X"] = _Destination(events)  # type: ignore[assignment]
 
     try:
-        with (
-            caplog.at_level(logging.WARNING, logger=wiring_runner.log.name),
-            pytest.raises(OSError, match="share went away"),
-        ):
-            await runner.stop()
+        with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+            task = asyncio.create_task(runner.stop())
+            await _started(events, "IB_OK", "IB_BAD")
+            await _yield()
+            assert not task.done()  # every stop is joined before the failure is raised
+            gate.set()
+            with pytest.raises(OSError, match="share went away"):
+                await task
 
-        assert "end:IB_OK" in events  # every stop still ran and was joined
+        assert "end:IB_OK" in events
         assert "'IB_BAD': stop() failed" in caplog.text and "OSError" in caplog.text
         # The whole drain side survives: dispatchers, workers, destinations.
         assert "dispatchers" not in events and "aclose" not in events
@@ -166,7 +173,9 @@ async def test_a_failed_stop_keeps_the_drain_side(
         assert list(runner._destinations) == ["OB_X"]
     finally:
         worker.cancel()
-    assert set(runner._sources) == {"IB_OK", "IB_BAD"}
+        await asyncio.gather(worker, return_exceptions=True)
+    # Only the inbound that may still be live stays registered; IB_OK's listener is closed.
+    assert set(runner._sources) == {"IB_BAD"}
     assert runner.has_residual_state and not runner.running
 
 
@@ -198,7 +207,7 @@ async def test_a_stop_that_ends_cancelled_is_raised_as_a_runtime_error() -> None
         await runner.stop()
 
     assert "end:IB_OK" in events and "dispatchers" not in events
-    assert set(runner._sources) == {"IB_ODD", "IB_OK"}
+    assert set(runner._sources) == {"IB_ODD"}
 
 
 async def _started(events: list[str], *names: str) -> None:
@@ -237,8 +246,9 @@ async def test_an_outer_cancel_lets_the_in_flight_stops_finish() -> None:
 
     assert sorted(e for e in events if e.startswith(("end:", "cut:"))) == ["end:IB_A", "end:IB_B"]
     assert "dispatchers" not in events  # the rest of teardown never ran
-    # The clears never ran, so start() re-runs teardown instead of building over them.
-    assert set(runner._sources) == {"IB_A", "IB_B"}
+    # Both stopped cleanly, so neither stays registered; the drain side is still residual state,
+    # so start() re-runs teardown instead of building over it.
+    assert runner._sources == {}
     assert runner.has_residual_state and not runner.running
 
 
@@ -261,8 +271,8 @@ async def test_an_outer_cancel_cuts_a_hung_stop_after_the_grace(
         await asyncio.wait_for(task, _RENDEZVOUS_SECONDS)
 
     assert "end:IB_OK" in events and "cut:IB_HANG" in events
-    assert "cut 1 inbound stop(s) still running" in caplog.text
-    assert set(runner._sources) == {"IB_HANG", "IB_OK"}
+    assert "cut 1 inbound stop(s) still running after the 0.1s grace" in caplog.text
+    assert set(runner._sources) == {"IB_HANG"}
     assert not runner.running
 
 
@@ -349,7 +359,7 @@ async def test_a_failure_before_an_outer_cancel_is_logged_by_name(
         await task
 
     assert "'IB_BAD': stop() failed" in caplog.text and "OSError" in caplog.text
-    assert set(runner._sources) == {"IB_BAD", "IB_A"}
+    assert set(runner._sources) == {"IB_BAD"}
 
 
 async def test_a_third_cancel_still_joins_the_cut_stops(
@@ -392,9 +402,8 @@ async def test_a_third_cancel_still_joins_the_cut_stops(
 async def test_an_outer_cancel_still_reports_a_stop_cancelled_by_someone_else(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The cancel path skips only the stops the runner itself cut. Mutation: skip every cancelled
-    task there. Red: IB_ODD, which ended cancelled before the runner cut anything, is never
-    logged."""
+    """The cancel path counts a stop that ended cancelled without the runner cutting it. Mutation:
+    skip every cancelled task there. Red: IB_ODD is never reported."""
     events: list[str] = []
     gate = asyncio.Event()
     runner = _runner(events, gate, IB_ODD="self_cancels", IB_A="gated")
@@ -410,7 +419,31 @@ async def test_an_outer_cancel_still_reports_a_stop_cancelled_by_someone_else(
     ):
         await task
 
-    assert "'IB_ODD': stop() failed" in caplog.text and "ended cancelled" in caplog.text
+    assert "1 inbound stop(s) were cancelled by something other than this teardown" in caplog.text
+    assert set(runner._sources) == {"IB_ODD"}
+
+
+async def test_a_cut_stop_that_fails_while_cut_is_still_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cut stop whose cancellation handling raises a real error must not vanish into the cut
+    count. Mutation: skip every task the runner cut. Red: the OSError is never logged."""
+    monkeypatch.setattr(wiring_runner, "_CANCELLED_STOP_GRACE_SECONDS", 60.0)
+    events: list[str] = []
+    runner = _runner(events, IB_DICOM="fails_when_cut")
+
+    task = asyncio.create_task(runner.stop())
+    await _started(events, "IB_DICOM")
+    task.cancel()
+    task.cancel()
+    with (
+        caplog.at_level(logging.WARNING, logger=wiring_runner.log.name),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await asyncio.wait_for(task, _RENDEZVOUS_SECONDS)
+
+    assert "'IB_DICOM': stop() failed" in caplog.text and "port release failed" in caplog.text
+    assert set(runner._sources) == {"IB_DICOM"}
 
 
 async def test_control_healthy_stops_log_nothing(caplog: pytest.LogCaptureFixture) -> None:
