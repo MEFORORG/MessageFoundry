@@ -2323,20 +2323,25 @@ class PipelineSettings(_Section):
     snapshot_on_send: bool = Field(default=True)
 
 
-def _pass_environment_refusal(name: str) -> str | None:
-    """Why ``name`` may not be handed to a sandbox worker, or ``None`` if it may.
+def _pass_environment_refusal(names: tuple[str, ...], key: str, receiver: str) -> tuple[str, ...]:
+    """``names``, or a :class:`ValueError` for the first one that may not be handed to ``receiver``.
 
-    The worker runs the code ``[sandbox]`` exists to keep the engine's secrets from, so nothing of
-    the engine's own may be named: no ``MEFOR_*`` variable at all, and no secret a library reads on
-    the engine's behalf. That is the rule the DR hook's environment follows
-    (:func:`messagefoundry.childenv.outside_engine_namespace`), reused so the two cannot drift.
+    For the two ``pass_environment`` settings: ``[sandbox]``'s, read by the sandbox worker, and
+    ``[dr]``'s, read by the DR hooks. Each child gets an allowlist
+    (:mod:`messagefoundry.childenv`), and this keeps the engine's own names off both lists: no
+    ``MEFOR_*`` variable at all, and no secret a library reads on the engine's behalf
+    (:func:`messagefoundry.childenv.outside_engine_namespace`, reused so the two cannot drift).
     Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
     added. The text never echoes a value, only the name the operator typed."""
-    if not (name.isascii() and name.isidentifier()):
-        return f"{name!r} is not an environment variable name"
-    if not outside_engine_namespace(name):
-        return f"{name} is one of the engine's own variables; it may not be passed to a worker"
-    return None
+    for name in names:
+        if not (name.isascii() and name.isidentifier()):
+            raise ValueError(f"{key}: {name!r} is not an environment variable name")
+        if not outside_engine_namespace(name):
+            raise ValueError(
+                f"{key}: {name} is one of the engine's own variables; "
+                f"it may not be passed to {receiver}"
+            )
+    return names
 
 
 class SandboxSettings(_Section):
@@ -2412,19 +2417,12 @@ class SandboxSettings(_Section):
     @field_validator("pass_environment", mode="before")
     @classmethod
     def _split_pass_environment(cls, v: object) -> object:
-        # The env layer delivers MEFOR_SANDBOX_PASS_ENVIRONMENT as one string; split on commas.
-        if isinstance(v, str):
-            return [name.strip() for name in v.split(",") if name.strip()]
-        return v
+        return _split_address_list(v)
 
     @field_validator("pass_environment")
     @classmethod
     def _pass_environment_names(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        for name in v:
-            refusal = _pass_environment_refusal(name)
-            if refusal is not None:
-                raise ValueError(f"sandbox.pass_environment: {refusal}")
-        return v
+        return _pass_environment_refusal(v, "sandbox.pass_environment", "a worker")
 
 
 class DiagnosticsSettings(_Section):
@@ -6688,6 +6686,21 @@ class DrSettings(_Section):
     # latest anchor differs → activation refuses closed). "" (the default) = OFF: the #102 gate is
     # byte-unchanged and SQLite is a no-op. A URL is rejected (local/UNC only, like seed_archive).
     restore_token: str = ""
+    # Environment variable NAMES the takeover and release hooks are given, beyond the platform's
+    # start-up names (messagefoundry/childenv.py, hook_environment): a cloud profile, a proxy, a
+    # credential the hook's own tool reads. Nothing else crosses. Names only, and never a MEFOR_*
+    # name or another of the engine's own: see _pass_environment_refusal.
+    pass_environment: tuple[str, ...] = ()
+
+    @field_validator("pass_environment", mode="before")
+    @classmethod
+    def _split_pass_environment(cls, v: object) -> object:
+        return _split_address_list(v)
+
+    @field_validator("pass_environment")
+    @classmethod
+    def _pass_environment_names(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        return _pass_environment_refusal(v, "dr.pass_environment", "a hook")
 
     @field_validator("takeover_hook", "release_hook")
     @classmethod

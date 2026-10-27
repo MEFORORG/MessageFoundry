@@ -826,7 +826,9 @@ def test_environment_list_drift_is_reported() -> None:
     assert _env_list_drift(_replace_once(text, "(`hook_environment`)", "(none)"), sources)
     changed = dict(sources)
     changed["pipeline/dr.py"] = _replace_once(
-        changed["pipeline/dr.py"], "env=hook_environment()", "env=engine_environment()"
+        changed["pipeline/dr.py"],
+        "env=hook_environment(extra_names=pass_environment)",
+        "env=engine_environment()",
     )
     assert _env_list_drift(text, changed)
 

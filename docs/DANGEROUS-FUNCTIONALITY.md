@@ -362,9 +362,10 @@ and the builders, and a test checks that each module named calls each builder na
   reads, and the names `[sandbox].pass_environment` lists. No other inherited variable crosses. On
   Linux with `[sandbox].mem_mb` set, the engine also sets `MALLOC_ARENA_MAX=2` where the operator
   passed none.
-- The disaster-recovery hook, in `pipeline/dr.py`, gets everything outside the engine's `MEFOR_*`
-  namespace, less the few secret names the module lists outside it (`hook_environment`). A secret
-  kept under any other name still reaches it.
+- The disaster-recovery hook, in `pipeline/dr.py`, gets an allowlist (`hook_environment`): the
+  platform's start-up names, on Windows the names that say where programs are installed, and the
+  names `[dr].pass_environment` lists. No other inherited variable crosses, so no secret reaches
+  it unless an operator lists its name.
 - The engine shards and the config-loading child, in `pipeline/supervisor.py`, and the tray's
   branded relaunch, in `tray/branding.py`, get the whole environment, secrets included, less any
   empty or relative `PYTHONPATH` entry (`engine_environment`).
@@ -373,11 +374,11 @@ and the builders, and a test checks that each module named calls each builder na
   `OPENSSL_CONF` and `OPENSSL_CONF_INCLUDE`, and the provider modules and engines it loads,
   `OPENSSL_MODULES` and `OPENSSL_ENGINES`
   (`worker_environment`). No other variable reaches it.
-- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get what the
-  disaster-recovery hook gets, less any empty or relative `PYTHONPATH` entry (`hook_environment`
-  over `engine_environment`). So they keep the index, proxy and certificate settings they read
-  from the environment, and any other variable the runner set, a CI token among them, reaches them
-  too.
+- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get everything outside
+  the engine's `MEFOR_*` namespace, less the few secret names the module lists outside it and any
+  empty or relative `PYTHONPATH` entry (`non_engine_environment` over `engine_environment`). So
+  they keep the index, proxy and certificate settings they read from the environment, and any
+  other variable the runner set, a CI token among them, reaches them too.
 
 At least these pass on the environment they run with, on purpose: `checks.py`, which adds one
 variable, and the tray's opens, where starting VS Code drops the two variables VS Code's own

@@ -56,7 +56,7 @@ import json
 import logging
 import socket
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -1279,7 +1279,12 @@ class DrCoordinator:
             # left taking the address. A release hook is left to finish late, as before, since
             # killing it partway could strand the address on this box (vault BACKLOG #2622).
             ok = await asyncio.wait_for(
-                _run_command(command, stop_kills=phase == "takeover", on_start=mark_started),
+                _run_command(
+                    command,
+                    stop_kills=phase == "takeover",
+                    on_start=mark_started,
+                    pass_environment=self._settings.pass_environment,
+                ),
                 timeout=self._settings.takeover_timeout_seconds,
             )
         except TimeoutError:
@@ -1367,15 +1372,20 @@ class DrCoordinator:
 
 
 async def _run_command(
-    command: str, *, stop_kills: bool = True, on_start: Callable[[], None] | None = None
+    command: str,
+    *,
+    stop_kills: bool = True,
+    on_start: Callable[[], None] | None = None,
+    pass_environment: Collection[str] = (),
 ) -> bool:
     """Run an operator-supplied shell command OFF the event loop and return whether it exited 0. Uses the
     asyncio subprocess API (never blocks the loop). The command is operator-configured (``[dr]``), not
     request-derived, so it is run via the shell exactly as the operator wrote it (parity with the way the
     backup destination / other operator-configured paths are trusted).
 
-    Its environment is :func:`messagefoundry.childenv.hook_environment`: the operator's ordinary
-    variables, without the engine's own (vault BACKLOG #2587). ``on_start`` is called once the
+    Its environment is :func:`messagefoundry.childenv.hook_environment`: an allowlist of the
+    platform's start-up names and the ``pass_environment`` names, ``[dr].pass_environment``, and
+    nothing else (vault BACKLOG #2587). ``on_start`` is called once the
     hook's process has been let run, and never for one that was not (vault BACKLOG #3094).
 
     **Stopping it stops the whole hook, when** ``stop_kills`` (vault BACKLOG #2622). The caller
@@ -1394,7 +1404,7 @@ async def _run_command(
             command,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
-            env=hook_environment(),
+            env=hook_environment(extra_names=pass_environment),
             creationflags=proctree.ADOPT_CREATIONFLAGS if stop_kills else 0,
             start_new_session=proctree.ADOPT_NEW_SESSION and stop_kills,
         )
