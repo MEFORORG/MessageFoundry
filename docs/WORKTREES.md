@@ -769,6 +769,27 @@ when you mean to remove it.
 
 Tests: [`tests/test_seat_worktree_lock.py`](../tests/test_seat_worktree_lock.py).
 
+### Finding a worktree the GC emptied — `find-emptied-worktrees.ps1`
+
+BACKLOG #2525. When the GC hits a folder a session holds open, it deletes the files, the `.git` link
+and the registration, then fails with `Permission denied` and leaves the empty folder. So a folder
+under `<primary>\.claude\worktrees\` with no `.git` that `git worktree list` does not carry is one it
+emptied, or one left some other way. `hygiene-report.ps1` section f lists each such folder, and
+[`find-emptied-worktrees.ps1`](../scripts/worktree/find-emptied-worktrees.ps1) prints the same list
+on demand. Beside each folder it names the Desktop log lines that name it, read from every
+profile's `logs\*.log`: `[reapUntrackedWorktreeDir] git worktree remove refused` with
+`failed to delete`, and `Git worktree remove failed, will try manual cleanup` with
+`Permission denied`. The logs rotate, so a folder with no line is still reported.
+
+```powershell
+pwsh -NoProfile -File scripts\worktree\find-emptied-worktrees.ps1
+```
+
+It only reads. A session still in an emptied folder can re-add the worktree at the same path, on the
+same branch, from the primary checkout, then re-declare its seat, which locks it again.
+
+Tests: [`tests/test_find_emptied_worktrees.py`](../tests/test_find_emptied_worktrees.py).
+
 ## A PR-state cache for read-only panes — `pr_state.py`
 
 One poller per PC writes the open pull requests and the merge queue to one file. A fleet pane reads

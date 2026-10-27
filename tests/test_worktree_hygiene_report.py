@@ -624,6 +624,28 @@ def test_seat_locks_whose_session_is_gone_are_listed_and_left_locked(fx: Fx, sle
         assert f"locked {reason}" in listed
 
 
+def test_an_emptied_worktree_folder_is_listed_in_section_f(fx: Fx) -> None:
+    """BACKLOG #2525, through the report: a planted empty, unregistered folder is listed with its
+    log line. The rule's own controls are in test_find_emptied_worktrees.py."""
+    folder = fx.primary / ".claude" / "worktrees" / "seat-gone"
+    folder.mkdir(parents=True)
+    logs = fx.root / "desktop-logs"
+    logs.mkdir()
+    (logs / "main.log").write_text(
+        "2026-09-23 16:46:28 [warn] Git worktree remove failed, will try manual cleanup: "
+        f"error: failed to delete '{folder.as_posix()}': Permission denied\n",
+        encoding="utf-8",
+    )
+    proc = _run(fx, "-SkipGh", "-SkipFetch", "-DesktopLogRoot", str(logs))
+    assert proc.returncode == 0, proc.stderr
+    emptied = _report(fx)["clones"][0]["emptied"]
+    assert [Path(e["path"]).name for e in emptied] == ["seat-gone"]
+    assert len(emptied[0]["logLines"]) == 1
+    md = (fx.out / "latest.md").read_text(encoding="utf-8")
+    assert "### f. Worktree folders emptied in place (1)" in md
+    assert folder.is_dir(), "the report must not touch the folder"
+
+
 def test_hook_drift_is_read_through_the_installers_status_mode(fx: Fx) -> None:
     installer = fx.primary / "scripts" / "coord" / "install-git-hooks.ps1"
     installer.parent.mkdir(parents=True)

@@ -35,6 +35,9 @@
       e. Seat locks whose session is gone (BACKLOG #2524). seat.ps1 locks a seat's worktree on arrival
          and the SessionEnd hook unlocks it, so a lock left behind names a seat that died. The rule
          for what counts as a seat lock and as gone is worktree-audit.ps1's.
+      f. Worktree folders emptied in place (BACKLOG #2525): under `.claude\worktrees\`, no `.git`, and
+         not in `git worktree list`, each with the Desktop log line that emptied it.
+         find-emptied-worktrees.ps1 prints the same list on demand.
 
     "MERGED" COMES FROM GITHUB, ONE BULK CALL PER CLONE PER RUN. This repository squash-merges, so
     `merge-base --is-ancestor` cannot see a landing, and the clone is shallow as well. One
@@ -110,6 +113,10 @@
 .PARAMETER ConfigRoot
     Claude config roots for the liveness fence. Defaults to every <userprofile>\.claude* registry.
 
+.PARAMETER DesktopLogRoot
+    Directories holding Claude Desktop `*.log` files, for section f. Defaults to every profile's logs
+    directory (worktree-audit.ps1, Get-DesktopLogFiles). They are read only when a folder was emptied.
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\worktree\hygiene-report.ps1
     pwsh -NoProfile -File scripts\worktree\hygiene-report.ps1 -SkipFetch -NoExtraRoots
@@ -129,7 +136,8 @@ param(
     [double]$HoldHours = 24,
     [double]$IdleHours = 72,
     [int]$Throttle = 8,
-    [string[]]$ConfigRoot
+    [string[]]$ConfigRoot,
+    [string[]]$DesktopLogRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -492,6 +500,9 @@ function Get-CloneReport($R) {
                 command = "git -C '$($root -replace "'", "''")' worktree unlock '$($s.Path -replace "'", "''")'"
             }
         })
+    $rep.emptied = @(foreach ($e in (Find-EmptiedWorktrees -PrimaryPath $root -Worktrees $occ.Worktrees -LogRoot $DesktopLogRoot)) {
+            [ordered]@{ path = $e.Path; entries = $e.Entries; logLines = @($e.LogLines | ForEach-Object { [ordered]@{ file = $_.File; line = $_.LineNumber; text = $_.Text } }) }
+        })
     $reconcile = Join-Path $root 'scripts/coord/claim-reconcile.ps1'
     $rep.claimReconcile = if (Test-Path -LiteralPath $reconcile -PathType Leaf) { "pwsh -NoProfile -File `"$reconcile`"" } else { '' }
 
@@ -659,6 +670,19 @@ foreach ($c in $report.clones) {
         $md.Add('```powershell')
         foreach ($s in $c.staleSeatLocks) { $md.Add($s.command) }
         $md.Add('```')
+    }
+
+    $md.Add("")
+    $md.Add("### f. Worktree folders emptied in place ($($c.emptied.Count))")
+    $md.Add("")
+    if ($c.emptied.Count -eq 0) { $md.Add("None: every folder under ``.claude\worktrees\`` has a ``.git`` or is a registered worktree.") }
+    else {
+        $md.Add("Each has no ``.git`` and is not in ``git worktree list``. A session may still be in one, so recover before deleting: docs/WORKTREES.md, *A seat locks its worktree on arrival*.")
+        $md.Add("")
+        foreach ($e in $c.emptied) {
+            $md.Add("- ``$($e.path)`` ($($e.entries) entries left)$(if ($e.logLines.Count -eq 0) { ': no Desktop log line names it. The logs rotate, so that is not evidence either way.' })")
+            foreach ($l in $e.logLines) { $md.Add("  - ``$($l.file):$($l.line)``: ``$($l.text)``") }
+        }
     }
 }
 

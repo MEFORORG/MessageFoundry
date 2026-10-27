@@ -3,7 +3,8 @@
 <#
 .SYNOPSIS
     Read-only worktree checks shared by hygiene-report.ps1 and the seat-lock writer: the seat-lock
-    reason format, and which seat locks name a session that is gone.
+    reason format, which seat locks name a session that is gone, and which worktree folders were
+    emptied in place, with the Desktop log lines that emptied them.
 
 .DESCRIPTION
     Dot-source this; it defines functions and does nothing on its own. It RUNS NO GIT VERB AT ALL and
@@ -132,4 +133,88 @@ function Get-StaleSeatLocks {
         $out.Add([pscustomobject]@{ Path = $w.Path; Reason = $w.LockReason; Seat = $p.Seat; SessionKey = $p.SessionKey; State = $r.State; Detail = $r.Detail })
     }
     return @($out)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Worktrees emptied in place (BACKLOG #2525).
+# ---------------------------------------------------------------------------------------------
+#
+# The GC's `git worktree remove --force` on a folder a live session holds open fails on Windows with
+# `Permission denied` AFTER it has deleted the files, the `.git` link and the registration. What is
+# left is a folder under `.claude\worktrees\` that has no `.git` and that `git worktree list` does not
+# carry. The app logs that as a refusal, in one of the two lines below, so the log line that emptied
+# a folder can be named beside it. The evidence is the vault's
+# docs/reviews/2026-09-30-b184-1917-worktree-emptying.md.
+
+# Each failure line: a marker, and a second substring the same line must carry.
+$script:EmptiedLogMarkers = @(
+    @{ Marker = 'reapUntrackedWorktreeDir] git worktree remove refused'; Also = 'failed to delete' }
+    @{ Marker = 'Git worktree remove failed, will try manual cleanup'; Also = 'Permission denied' }
+)
+
+function Get-DesktopLogFiles {
+    <#
+    .SYNOPSIS
+        Every Claude Desktop log file: each profile's `%USERPROFILE%\.claude-desktop*\logs`, and the
+        default profile's `%LOCALAPPDATA%\Claude\Logs` and older `%APPDATA%\Claude\logs`. -LogRoot
+        replaces that list, for a test or another layout.
+    #>
+    param([string[]]$LogRoot)
+    $roots = if ($LogRoot) { @($LogRoot) } else {
+        @(Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter '.claude-desktop*' -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { Join-Path $_.FullName 'logs' })
+        if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Claude\Logs' }
+        if ($env:APPDATA) { Join-Path $env:APPDATA 'Claude\logs' }
+    }
+    return @(foreach ($r in $roots) {
+            if ($r -and (Test-Path -LiteralPath $r -PathType Container)) {
+                Get-ChildItem -LiteralPath $r -File -Filter '*.log' -ErrorAction SilentlyContinue
+            }
+        })
+}
+
+function Find-EmptiedWorktrees {
+    <#
+    .SYNOPSIS
+        Each folder under <PrimaryPath>\.claude\worktrees\ that has no `.git` and is not a registered
+        worktree, with the Desktop log lines that name it. Reads only; runs no git.
+
+    .DESCRIPTION
+        $Worktrees are rows as occupancy.ps1's Get-RepoWorktrees returns them; the caller has
+        dot-sourced occupancy.ps1. The logs are read only when there is a folder to explain, so a
+        clean tree costs one directory listing.
+
+        A folder with no log line is still reported. The logs rotate, and a folder can be left empty
+        some other way; the absence of a line is not evidence the GC did not do it.
+    #>
+    param([string]$PrimaryPath, [object[]]$Worktrees, [string[]]$LogRoot)
+    $dir = Join-Path $PrimaryPath '.claude\worktrees'
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return @() }
+    $registered = @{}
+    foreach ($w in @($Worktrees)) { if ($w) { $registered[(ConvertTo-Norm $w.Path)] = $true } }
+    $emptied = @(Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue | Where-Object {
+            -not (Test-Path -LiteralPath (Join-Path $_.FullName '.git')) -and -not $registered.ContainsKey((ConvertTo-Norm $_.FullName))
+        })
+    if ($emptied.Count -eq 0) { return @() }
+
+    $hits = @()
+    $files = @(Get-DesktopLogFiles -LogRoot $LogRoot)
+    if ($files.Count -gt 0) {
+        $markers = @($script:EmptiedLogMarkers | ForEach-Object { $_.Marker })
+        $hits = @(Select-String -LiteralPath $files.FullName -SimpleMatch -Pattern $markers -ErrorAction SilentlyContinue |
+                Where-Object { $l = $_.Line; @($script:EmptiedLogMarkers | Where-Object { $l.Contains($_.Marker) -and $l.Contains($_.Also) }).Count -gt 0 })
+    }
+    return @(foreach ($e in $emptied) {
+            # The log spells a path with either slash. A name must end at the match, so `seat-a` does
+            # not claim the line about `seat-ab`.
+            $pat = [regex]::Escape((ConvertTo-Norm $e.FullName)) + '(?![A-Za-z0-9._-])'
+            $lines = @($hits | Where-Object { ($_.Line -replace '\\', '/').ToLowerInvariant() -match $pat } | ForEach-Object {
+                    [pscustomobject]@{ File = $_.Path; LineNumber = $_.LineNumber; Text = $_.Line.Trim() }
+                })
+            [pscustomobject]@{
+                Path     = $e.FullName
+                Entries  = @(Get-ChildItem -LiteralPath $e.FullName -Force -ErrorAction SilentlyContinue).Count
+                LogLines = $lines
+            }
+        })
 }
