@@ -31,7 +31,10 @@ because the SQL Server rate below is unmeasured, not because Postgres needs it.
 
 The SQL Server figure is CARRIED OVER from Postgres, never measured there -- its applock is a
 different mechanism (``sp_getapplock``) under a different snapshot rule, so the per-round failure
-rate could differ. Read the gated ``sqlserver-store`` CI job for that backend's first real result.
+rate could differ. Read the gated ``sqlserver-store`` CI job for that backend's first real result:
+``test_concurrent_mark_done_strands_rounds_without_the_finalize_applock`` in that suite removes ONLY
+the finalize applock, runs :func:`count_unfinalized_rounds`, and prints the per-round failure rate
+(BACKLOG #1610). Replace the carried-over figure with that printed line once it has been read.
 
 TWO CALLERS, DELIBERATELY: THERE IS NO SQLITE ARM, and one would be vacuous rather than missing.
 SQLite has no per-message finalize lock to remove -- ``_lock_finalize_batch`` exists only in
@@ -57,6 +60,31 @@ FINALIZE_RACE_ROUNDS = 30
 _RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
 
+async def _race_one_round(store: Any, round_no: int) -> str:
+    """Enqueue one two-destination message, complete both legs concurrently, return its status."""
+    # Flat timestamps, as every neighbouring test uses: an earlier round's rows are DONE, so no
+    # `now` can make them claimable again, and `mark_done` spends `now` only on updated_at and
+    # the delivered-key stamp, neither of which this contract reads.
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=_RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], now=100.0
+    )
+    # Claim per DESTINATION rather than one limit=N sweep. SQL Server's claim opens with
+    # SET LOCK_TIMEOUT 0 and may fail-close a batch to empty (see _claim_until in that suite),
+    # which would flake a bare `len(items) == 2` for a reason that has nothing to do with the
+    # finalizer -- and a flake here reads as the very defect this contract is pinning.
+    items = []
+    for dest in ("OB1", "OB2"):
+        claimed = await store.claim_ready(now=200.0, destination_name=dest)
+        assert len(claimed) == 1, f"round {round_no}: {dest} claimed {len(claimed)} rows, want 1"
+        items.append(claimed[0])
+
+    await asyncio.gather(*(store.mark_done(item.id, now=300.0) for item in items))
+
+    msg = await store.get_message(mid)
+    assert msg is not None, f"round {round_no}: message {mid} vanished"
+    return str(msg["status"])
+
+
 async def assert_concurrent_finalize_reaches_processed(
     store: Any, *, rounds: int = FINALIZE_RACE_ROUNDS
 ) -> None:
@@ -66,29 +94,22 @@ async def assert_concurrent_finalize_reaches_processed(
     beyond a live store on a clean slate.
     """
     for round_no in range(rounds):
-        # Flat timestamps, as every neighbouring test uses: an earlier round's rows are DONE, so no
-        # `now` can make them claimable again, and `mark_done` spends `now` only on updated_at and
-        # the delivered-key stamp, neither of which this contract reads.
-        mid = await store.enqueue_message(
-            channel_id="IB", raw=_RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], now=100.0
-        )
-        # Claim per DESTINATION rather than one limit=N sweep. SQL Server's claim opens with
-        # SET LOCK_TIMEOUT 0 and may fail-close a batch to empty (see _claim_until in that suite),
-        # which would flake a bare `len(items) == 2` for a reason that has nothing to do with the
-        # finalizer -- and a flake here reads as the very defect this contract is pinning.
-        items = []
-        for dest in ("OB1", "OB2"):
-            claimed = await store.claim_ready(now=200.0, destination_name=dest)
-            assert len(claimed) == 1, (
-                f"round {round_no}: {dest} claimed {len(claimed)} rows, want 1"
-            )
-            items.append(claimed[0])
-
-        await asyncio.gather(*(store.mark_done(item.id, now=300.0) for item in items))
-
-        msg = await store.get_message(mid)
-        assert msg is not None, f"round {round_no}: message {mid} vanished"
-        assert msg["status"] == MessageStatus.PROCESSED.value, (
-            f"round {round_no}: finalized {msg['status']!r}, not PROCESSED -- both deliveries are "
+        status = await _race_one_round(store, round_no)
+        assert status == MessageStatus.PROCESSED.value, (
+            f"round {round_no}: finalized {status!r}, not PROCESSED -- both deliveries are "
             "DONE, so the two finalizers raced and neither claimed the terminal write"
         )
+
+
+async def count_unfinalized_rounds(store: Any, *, rounds: int = FINALIZE_RACE_ROUNDS) -> int:
+    """The counting twin of :func:`assert_concurrent_finalize_reaches_processed`: run the SAME
+    round body ``rounds`` times and return how many rounds did NOT land on PROCESSED.
+
+    For a negative control, which needs the per-round failure RATE over a store with its finalize
+    lock removed rather than the first failure. Never use it to relax the assertion above.
+    """
+    missed = 0
+    for round_no in range(rounds):
+        if await _race_one_round(store, round_no) != MessageStatus.PROCESSED.value:
+            missed += 1
+    return missed

@@ -5927,6 +5927,62 @@ async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> No
     await assert_concurrent_finalize_reaches_processed(store)
 
 
+async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
+    store, monkeypatch, capsys
+) -> None:
+    """NEGATIVE CONTROL for the test above: with ONLY the finalize applock removed, the race shows.
+
+    WHY THIS EXISTS (BACKLOG #1610). A race test that passes proves nothing unless it can also fail:
+    the benign interleaving can win every round over a store carrying no lock at all. The Postgres
+    arm was shown to fail with its lock removed; this leg never was, so its green said nothing. This
+    test is a STANDING expected-red-under-patch control: it removes the lock on every run and
+    asserts the race is observable, so a change that made the test above blind (a pool of one, a
+    serialised ``mark_done``, a round body that stopped racing) turns THIS test red instead of
+    leaving the positive test green for the wrong reason. Measured once before, on engine
+    2ffcf3347 against a live SQL Server 2022: with the finalize applock a no-op, 79 of 80 fan-out
+    messages never finalised.
+
+    ONLY the finalize lock is removed. ``SqlServerStore._applock`` also takes the schema, audit
+    append, resend, quota and admin-guard locks, so it is wrapped, not replaced: a resource
+    starting ``mefor:finalize:`` is skipped and counted, everything else runs. The count must be
+    above zero, so a renamed resource string fails this loudly rather than passing it with the lock
+    still in place.
+
+    The per-round failure rate is printed outside pytest's capture, so the ``sqlserver-store`` job
+    log carries it on a pass as well as a failure. That line is this backend's measurement.
+    """
+    from tests._finalize_race_contract import FINALIZE_RACE_ROUNDS, count_unfinalized_rounds
+
+    real_applock = store._applock
+    skipped = 0
+
+    async def _applock_without_finalize(cur: Any, resource: str) -> None:
+        nonlocal skipped
+        if resource.startswith("mefor:finalize:"):
+            skipped += 1
+            return
+        await real_applock(cur, resource)
+
+    monkeypatch.setattr(store, "_applock", _applock_without_finalize)
+
+    missed = await count_unfinalized_rounds(store, rounds=FINALIZE_RACE_ROUNDS)
+    with capsys.disabled():
+        print(
+            f"\n[#1610 control] finalize applock removed: {missed} of {FINALIZE_RACE_ROUNDS} rounds "
+            f"not PROCESSED ({missed / FINALIZE_RACE_ROUNDS:.2f} per round); "
+            f"{skipped} finalize applock calls skipped"
+        )
+
+    assert skipped > 0, (
+        "no applock resource started with 'mefor:finalize:', so nothing was removed -- the resource "
+        "was renamed or mark_done stopped finalizing through _applock; this control tested nothing"
+    )
+    assert missed > 0, (
+        f"all {FINALIZE_RACE_ROUNDS} rounds reached PROCESSED with the finalize applock removed, so "
+        "the round body no longer races and the positive test above cannot fail on this backend"
+    )
+
+
 async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> None:
     """BACKLOG #1731: the drainer's burst writer. Every row lands with the singular's scrub, seal and
     AAD binding, and a burst that fails part-way writes none of its rows."""
