@@ -579,8 +579,14 @@ SITES: dict[str, Site] = {
         OPERATOR,
         "Reads the git metadata of the operator's own config checkout; read only, to a commit hash.",
     ),
-    "messagefoundry/config/fingerprint.py::_require_listable": Site(1, OPERATOR, _CONFIG_FIXED),
     "messagefoundry/config/impact.py::_validate_new_name": Site(1, OPERATOR, _CODESETS),
+    "messagefoundry/config/snapshot.py::_list_folders": Site(1, OPERATOR, _CONFIG_FIXED),
+    "messagefoundry/config/snapshot.py::read_config_snapshot": Site(
+        2,
+        REVIEWED,
+        "A fixed folder name under the operator's config directory, and the names its own listing "
+        "of that folder returned; read, never written.",
+    ),
     "messagefoundry/config/tls_policy.py::staged_crl": Site(
         1, INTERNAL, "A fixed name in a private temp directory this function made."
     ),
@@ -594,8 +600,20 @@ SITES: dict[str, Site] = {
         "access list of for the trust check; no file is opened through them here.",
     ),
     "messagefoundry/config/wiring.py::install_trust_paths": Site(2, INTERNAL, _PKG_LITERAL),
-    "messagefoundry/config/wiring.py::load_config": Site(1, OPERATOR, _CODESETS),
-    "messagefoundry/config/wiring.py::validate_config": Site(1, OPERATOR, _CODESETS),
+    "messagefoundry/config/wiring.py::load_snapshot": Site(
+        2,
+        REVIEWED,
+        "The snapshot's directory joined to the fixed codesets name, which only names the folder in "
+        "a refusal, and to each module name the snapshot holds, which ConfigSnapshot checks is a "
+        "plain name on this platform (vault BACKLOG #2596). Compiled under, never opened.",
+    ),
+    "messagefoundry/config/wiring.py::validate_config": Site(
+        3,
+        REVIEWED,
+        "The operator's config directory joined to the fixed codesets name, to a module name its "
+        "snapshot holds (checked a plain name, compiled under and never opened), and to an "
+        "unreadable file's relative path, which only names it in a diagnostic.",
+    ),
     "messagefoundry/corepoint_import.py::_replace_modules": Site(
         1, INTERNAL, "A pid temp name beside a target the importer already built."
     ),

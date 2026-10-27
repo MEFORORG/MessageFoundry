@@ -143,7 +143,7 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "KeyError carries the lookup key, which the new KeyError also quotes",
     ),
     _Allowed(
-        "messagefoundry/config/code_sets.py::load_policy::CodeSetError::CodeSetError",
+        "messagefoundry/config/code_sets.py::parse_policy::CodeSetError::CodeSetError",
         _SAFE + "the new message interpolates the caught CodeSetError whole",
     ),
     _Allowed(
