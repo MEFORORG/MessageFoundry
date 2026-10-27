@@ -13,19 +13,24 @@ attested (per-connection ``tls_revocation_attested``) or really checked.
 **BACKLOG #299 clamped the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env.** It used to be OR'd into the
 per-connection attestation, so setting it once crossed every verifying outbound hop in an enforcing
 instance. It now ranks BELOW the enforcing refusal: under ``enforcing`` only the hop's own facts cross it
-(loopback, a CRL actually loaded on that hop's context, a proven terminator, or the per-connection flag),
-while a non-enforcing posture still crosses on the env exactly as before. Several tests here asserted the
+(loopback, a CRL actually loaded on that hop's context, or the per-connection flag), while a
+non-enforcing posture still crosses on the env exactly as before. Several tests here asserted the
 pre-clamp ALLOW and now assert the refusal; each says so at its own docstring.
 
-Loopback / attested / proxy-proven hops are byte-identical; a non-enforcing hop WARNs. The fourth
-relaxation, a synthetic instance, went with BACKLOG #1279 -- every instance carries patient data. It
-COMPOSES with #200: #200 refuses the CLEARTEXT / verify-off hop, so revocation fires ONLY on a VERIFYING
-hop — the two gates key on disjoint conditions and never double-refuse one hop.
+Loopback / attested hops are byte-identical; a non-enforcing hop WARNs. A synthetic-instance
+relaxation went with BACKLOG #1279 -- every instance carries patient data -- and a proven-terminator
+arm, which no engine call site ever set True, with BACKLOG #3514 item 5 (pinned below).
+
+The revocation refusal COMPOSES with #200: #200 refuses the CLEARTEXT / verify-off hop, so revocation
+fires ONLY on a VERIFYING hop — the two gates key on disjoint conditions and never double-refuse one
+hop.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
+import inspect
 import ssl
 from pathlib import Path
 
@@ -115,7 +120,6 @@ def test_revocation_hop_disposition_matrix() -> None:
         *,
         enforcing: bool,
         is_loopback_hop: bool = False,
-        proxy_proven: bool = False,
         attested: bool = False,
         crl_checked: bool = False,
         blanket_attested: bool = False,
@@ -123,7 +127,6 @@ def test_revocation_hop_disposition_matrix() -> None:
         return revocation_hop_disposition(
             enforcing=enforcing,
             is_loopback_hop=is_loopback_hop,
-            proxy_proven=proxy_proven,
             attested=attested,
             crl_checked=crl_checked,
             blanket_attested=blanket_attested,
@@ -131,18 +134,16 @@ def test_revocation_hop_disposition_matrix() -> None:
 
     # loopback → ALLOW (on-box, not a network exposure) even on enforcing-PHI.
     assert disp(enforcing=True, is_loopback_hop=True) is HopDisposition.ALLOW
-    # a proven revocation-checking terminator → ALLOW.
-    assert disp(enforcing=True, proxy_proven=True) is HopDisposition.ALLOW
     # a PER-CONNECTION attestation → ALLOW.
     assert disp(enforcing=True, attested=True) is HopDisposition.ALLOW
     # BACKLOG #299: this hop's own context checks a CRL → ALLOW, the relaxation that replaces a
     # declaration with a real in-engine check.
     assert disp(enforcing=True, crl_checked=True) is HopDisposition.ALLOW
-    # A fourth ALLOW arm sat here -- `not is_phi`, the synthetic instance -- and went with BACKLOG
+    # Another ALLOW arm sat here -- `not is_phi`, the synthetic instance -- and went with BACKLOG
     # #1279. Every instance carries patient data, so it had no input left to fire on and this row,
     # which used to ALLOW, now falls through to the refusal below.
     #
-    # enforcing, unproven → REFUSE.
+    # enforcing, not loopback, not CRL-checked, not attested → REFUSE.
     assert disp(enforcing=True) is HopDisposition.REFUSE
     # non-enforcing → WARN (crosses, loud-logged).
     assert disp(enforcing=False) is HopDisposition.WARN
@@ -159,7 +160,6 @@ def test_blanket_attestation_does_not_defeat_an_enforcing_posture() -> None:
         revocation_hop_disposition(
             enforcing=True,
             is_loopback_hop=False,
-            proxy_proven=False,
             attested=False,
             blanket_attested=True,
         )
@@ -171,7 +171,6 @@ def test_blanket_attestation_does_not_defeat_an_enforcing_posture() -> None:
         revocation_hop_disposition(
             enforcing=False,
             is_loopback_hop=False,
-            proxy_proven=False,
             attested=False,
             blanket_attested=True,
         )
@@ -179,10 +178,9 @@ def test_blanket_attestation_does_not_defeat_an_enforcing_posture() -> None:
     )
     # And the clamp never removes a hop's OWN way out: each per-hop relaxation still crosses an
     # enforcing hop while the blanket env alone does not.
-    for relaxation in ("is_loopback_hop", "proxy_proven", "attested", "crl_checked"):
+    for relaxation in ("is_loopback_hop", "attested", "crl_checked"):
         kwargs: dict[str, bool] = {
             "is_loopback_hop": False,
-            "proxy_proven": False,
             "attested": False,
             "crl_checked": False,
         }
@@ -193,17 +191,58 @@ def test_blanket_attestation_does_not_defeat_an_enforcing_posture() -> None:
         ), relaxation
 
 
+def test_the_authority_takes_no_egress_terminator_input() -> None:
+    """BACKLOG #3514 item 5 removed ``proxy_proven``: no engine call site ever set it True, so its
+    ALLOW arm never fired outside tests. At least DEPLOYMENT.md, CONNECTIONS.md and ADR 0173 now say
+    the authority has no input for an egress terminator, so a change that adds a new decision input,
+    under any name, must change those pages too. The exact name sets are pinned for that reason, not
+    only the absence of the old name: the authority's parameters, the guard's ``capture``
+    parameters, and the guard's fields. This pins names only; it cannot see a wrapper that feeds a
+    new fact through an existing slot such as ``attested``."""
+    assert set(inspect.signature(revocation_hop_disposition).parameters) == {
+        "enforcing",
+        "is_loopback_hop",
+        "attested",
+        "crl_checked",
+        "blanket_attested",
+    }
+    # A name that is not a revocation decision input (an audit or message field) only needs adding
+    # to these sets; a decision input needs the pages above changed too.
+    assert set(inspect.signature(RevocationHopGuard.capture).parameters) == {
+        "host",
+        "cell",
+        "description",
+        "attested",
+        "context",
+        "posture",
+        "ways_across",
+        "attested_reason",
+        "connection",
+    }
+    assert {f.name for f in dataclasses.fields(RevocationHopGuard)} == {
+        "host",
+        "cell",
+        "description",
+        "attested",
+        "posture",
+        "blanket_attested",
+        "crl_checked",
+        "ways_across",
+        "attested_reason",
+        "connection",
+    }
+
+
 # --- the guard: construction gate + unstamped no-op + attestation audit ------------------------------
 
 
-def _guard(host: str, *, attested: bool = False, proxy_proven: bool = False) -> RevocationHopGuard:
+def _guard(host: str, *, attested: bool = False) -> RevocationHopGuard:
     # capture() snapshots current_hop_posture(), so call it inside the test's active_hop_posture scope.
     return RevocationHopGuard.capture(
         host=host,
         cell="test",
         description="verified TLS egress (no revocation check)",
         attested=attested,
-        proxy_proven=proxy_proven,
         connection=None,
     )
 
@@ -217,7 +256,6 @@ def test_guard_allows_loopback_nonprod_attested() -> None:
     with active_hop_posture(PROD_PHI):
         _guard(LOOPBACK).enforce_construction()  # on-box
         _guard(REMOTE, attested=True).enforce_construction()  # attested
-        _guard(REMOTE, proxy_proven=True).enforce_construction()  # proven terminator
     with active_hop_posture(STAGING_PHI):
         _guard(REMOTE).enforce_construction()  # non-prod PHI → WARN (constructs)
 
@@ -741,8 +779,8 @@ def test_the_synthetic_arm_is_gone_and_those_hops_now_refuse() -> None:
 
     Pinned once, on every cell that carried a SYNTHETIC arm before, rather than left implicit in six
     deleted lines. Each of these constructed silently on an instance declared synthetic; each refuses
-    now, because there is no declaration that reaches this gate any more. The only relaxations left are
-    the three the disposition still names: on-box, a proven terminator, an operator attestation.
+    now, because there is no declaration that reaches this gate any more. The relaxations asserted
+    below are the two a guard built here can take: on-box and an operator attestation.
     """
     with active_hop_posture(SYNTHETIC_NOW_ENFORCING):
         with pytest.raises(InsecureHopRefused, match="revocation"):
@@ -758,11 +796,10 @@ def test_the_synthetic_arm_is_gone_and_those_hops_now_refuse() -> None:
     # separately rather than dropped -- it carried a SYNTHETIC arm too.
     with pytest.raises(ValueError, match="revocation"):
         _build_ssl(_pg(), posture=SYNTHETIC_NOW_ENFORCING)
-    # ...and the three real relaxations still cross it, so this is a tightening rather than a wall.
+    # ...and the real relaxations still cross it, so this is a tightening rather than a wall.
     with active_hop_posture(SYNTHETIC_NOW_ENFORCING):
         _guard(LOOPBACK).enforce_construction()
         _guard(REMOTE, attested=True).enforce_construction()
-        _guard(REMOTE, proxy_proven=True).enforce_construction()
 
 
 def test_email_tls_unstamped_is_noop() -> None:

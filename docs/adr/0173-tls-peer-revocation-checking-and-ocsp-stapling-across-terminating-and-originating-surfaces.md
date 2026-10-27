@@ -261,6 +261,11 @@ false-premise defect:
    one call, `_TokenEndpointProvider._open_token_hop` in `transports/smart.py`, so one site now
    serves two hops. Read the list as *"at least these"* and locate each by symbol: these line numbers were
    written in August and the §4.3 build moved several of them.
+   *(Note 2026-10-27: revocation "proven in front" never crossed this refusal on a shipped hop: no
+   engine call site set `proxy_proven` True, and the parameter is now gone from
+   `revocation_hop_disposition` and `RevocationHopGuard`, vault BACKLOG #3514 item 5. The
+   docstring of `revocation_hop_disposition` is the source of record.
+   The item keeps its original wording.)*
 2. **Terminating `[api]` TLS — `in_process_tls_revocation_refused`** (`config/tls_policy.py:344`),
    wired at `__main__.py:1722`. `serve` refuses an in-process off-loopback `[api]` TLS bind unless a
    declared TLS-terminating reverse proxy (WP-15) or `MEFOR_TLS_REVOCATION_ATTESTED` proves
@@ -599,7 +604,9 @@ the guarded originating hops listed at §1.5 rider 1. *(This read "the seven gua
 than warn: `config/settings.py:2338-2342` derives `DataClass.PHI` for `dev`, `staging` **and** `prod`,
 and `settings.py:3675` defaults enforcement to `SecurityEnforcement.ENFORCE`. The disposition ladder
 at `tls_policy.py:963-973` has no global audited-opt-out arm (`:958-960`), so the only relaxations are
-loopback, a proven terminator, an attestation, or a non-PHI posture.
+loopback, a proven terminator, an attestation, or a non-PHI posture. *(Note 2026-10-27: on an
+outbound hop the "proven terminator" arm is gone; the docstring of `revocation_hop_disposition`
+says why. The sentence keeps its original wording.)*
 
 **One caveat, stated so nobody reads more coverage into it than exists:**
 `RevocationHopGuard.enforce_construction` **no-ops when the posture is unstamped** — a direct test
@@ -715,6 +722,8 @@ OAuth2 token hop. Two reasons:
 - It delivers the second option's outcome without a second rule. With no context `crl_checked` is
   false, and `refuse_unrevoked_verified_hop` has no `proxy_proven` parameter. So on an enforcing
   instance only a loopback token host or the per-connection `tls_revocation_attested` crosses.
+  *(Note 2026-10-27: `revocation_hop_disposition` and `RevocationHopGuard` have no `proxy_proven`
+  parameter either now, so no hop can declare one.)*
 
 **The refusal on the ECH arm names the attestation alone.** The default text offers
 `[tls].crl_file`, which cannot cross an ECH hop. (It also offered an egress proxy, which no call
@@ -786,7 +795,9 @@ which the same CRL relaxes the same hop without a sidecar.
   or attest. Some sites will attest without a revocation-checking PKI behind the claim, because
   attesting is one environment variable and standing up a proxy is a project. The control is honest by
   construction — the flag is named an attestation and its use is audited — but the residual risk moves
-  into a claim the engine cannot check.
+  into a claim the engine cannot check. *(Note 2026-10-27: a revocation-checking egress proxy does
+  not cross the refusal; `docs/DEPLOYMENT.md`, *The ways across*, lists what does. The bullet keeps
+  its original wording.)*
 - **Direction 3 remains opt-in and default-off**, so a site that configures nothing gets no
   client-certificate revocation and, on an enforcing PHI posture, a start-time refusal telling it so.
 - **An operator who enables direction 3 takes on CRL refresh.** The engine alarms on expiry

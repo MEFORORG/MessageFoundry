@@ -2415,7 +2415,6 @@ def revocation_hop_disposition(
     *,
     enforcing: bool,
     is_loopback_hop: bool,
-    proxy_proven: bool,
     attested: bool,
     crl_checked: bool = False,
     blanket_attested: bool = False,
@@ -2434,9 +2433,6 @@ def revocation_hop_disposition(
        rather than declared away. The caller derives it from that context (see
        :meth:`RevocationHopGuard.capture`), never from the presence of a ``[tls].crl_file`` setting: a
        configured CRL that a given hop's handshake never consults must not silence that hop's guard.
-    #. ``proxy_proven`` → :attr:`~HopDisposition.ALLOW` — revocation is *proven in front* by a declared
-       revocation-checking egress terminator (the outbound analogue of ADR 0078's ``proxy_terminated``).
-       **Unreachable today:** no call site sets it, so no refusal offers it (BACKLOG #2987).
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
@@ -2453,11 +2449,14 @@ def revocation_hop_disposition(
     ALLOWs, byte-identical to the pre-clamp behaviour, so nothing outside an enforcing posture moves.
 
     A ``not is_phi`` ALLOW arm sat fourth until BACKLOG #1279. Every instance carries patient data now,
-    so it could no longer fire and its removal leaves the remaining relaxations as the whole set.
+    so it could no longer fire and its removal leaves the remaining relaxations as the whole set. A
+    ``proxy_proven`` ALLOW arm, for revocation proven by a declared revocation-checking egress
+    terminator, sat between ``crl_checked`` and ``attested`` until BACKLOG #3514 item 5: no engine call
+    site ever set it True, so it never fired outside tests.
 
     Unlike :func:`insecure_hop_disposition` this carries NO global-escape (``audited_opt_out``) arm — the
-    only relaxations an ENFORCING hop has are the on-box carve-out, an in-engine CRL check, a declared
-    revocation-checking terminator and a per-connection attestation. This never turns verification off
+    only relaxations an ENFORCING hop has are the on-box carve-out, an in-engine CRL check and a
+    per-connection attestation. This never turns verification off
     (the caller has already built a verifying context) — it only decides whether the
     *unchecked-revocation* property of that verified hop is tolerable, so it composes with (never
     weakens) the #200 cleartext/verify-off refusals."""
@@ -2465,13 +2464,11 @@ def revocation_hop_disposition(
         return HopDisposition.ALLOW
     if crl_checked:
         return HopDisposition.ALLOW
-    if proxy_proven:
-        return HopDisposition.ALLOW
     if attested:
         return HopDisposition.ALLOW
     if enforcing:
         # The clamp: a blanket env attestation does NOT reach this arm. Only the per-connection
-        # attestation above, a proven terminator, or a real in-engine CRL check crosses an enforcing hop.
+        # attestation above or a real in-engine CRL check crosses an enforcing hop.
         return HopDisposition.REFUSE
     if blanket_attested:
         return HopDisposition.ALLOW
@@ -2498,8 +2495,8 @@ CREDENTIAL_HOP_WAYS_ACROSS = (
 #: four documents off such a count. Find the consumers by symbol.
 #:
 #: It offered a third lever until BACKLOG #2987 (#2977 item 9): terminate at a revocation-checking
-#: egress proxy. No call site sets ``proxy_proven``, so routing egress through such a proxy never
-#: changed the decision, and the refusal named a remedy the operator could not perform (SDS-3.7).
+#: egress proxy. No call site ever declared such a proxy, so routing egress through one never changed
+#: the decision, and the refusal named a remedy the operator could not perform (SDS-3.7).
 _CONNECTION_WAYS_ACROSS = (
     "Configure [tls].crl_file so the engine checks a CRL on this hop, or set "
     "tls_revocation_attested=true with a tls_revocation_attested_reason on this connection."
@@ -2526,7 +2523,6 @@ class RevocationHopGuard:
     cell: str
     description: str
     attested: bool
-    proxy_proven: bool
     posture: HopPosture | None
     #: Whether the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env was set when this hop was captured.
     #: Held SEPARATELY from the per-connection ``attested`` (BACKLOG #299) — folding the two into one
@@ -2565,7 +2561,6 @@ class RevocationHopGuard:
         cell: str,
         description: str,
         attested: bool,
-        proxy_proven: bool = False,
         context: ssl.SSLContext | None = None,
         posture: HopPosture | None = None,
         ways_across: str | None = None,
@@ -2599,7 +2594,6 @@ class RevocationHopGuard:
             cell=cell,
             description=description,
             attested=attested,
-            proxy_proven=proxy_proven,
             posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
             crl_checked=context_checks_revocation(context),
@@ -2620,7 +2614,6 @@ class RevocationHopGuard:
         return revocation_hop_disposition(
             enforcing=posture.enforcing,
             is_loopback_hop=is_loopback_hop_host(self.host),
-            proxy_proven=self.proxy_proven,
             attested=self.attested,
             crl_checked=self.crl_checked,
             blanket_attested=self.blanket_attested,
@@ -2649,29 +2642,26 @@ class RevocationHopGuard:
         if posture is None:
             return
         disposition = self._disposition(posture)
-        # Audit an attestation / proven terminator that SUPPRESSED a would-be production-PHI refusal: the
-        # disposition is ALLOW only because tls_revocation_attested / proxy_proven fired before the REFUSE
-        # arm, so an operator should see the unchecked-revocation hop was crossed on their attestation.
+        # Audit an attestation that SUPPRESSED a would-be production-PHI refusal: the disposition is
+        # ALLOW only because tls_revocation_attested fired before the REFUSE arm, so an operator should
+        # see the unchecked-revocation hop was crossed on their attestation.
         # crl_checked is deliberately NOT in this condition: that hop DOES check revocation, so there is
         # no unchecked-revocation crossing to audit. blanket_attested is not here either — under an
         # enforcing posture it can no longer produce an ALLOW (BACKLOG #299), and under a non-enforcing
         # one `posture.enforcing` already excludes the line.
         if (
             disposition is HopDisposition.ALLOW
-            and (self.attested or self.proxy_proven)
+            and self.attested
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
-            # A proven terminator ALLOWs without any per-connection attestation, so say which.
             log_attested_crossing(
                 logger,
                 crossing="verified TLS hop crossed without certificate revocation checking",
                 connection=self.connection,
                 detail=f"{self.cell}: {self._detail()}",
-                reason=self.attested_reason
-                if self.attested
-                else "revocation proven by a declared egress terminator",
-                declaration="tls_revocation_attested" if self.attested else "proxy_proven",
+                reason=self.attested_reason,
+                declaration="tls_revocation_attested",
             )
         enforce_insecure_hop(
             disposition, message=self._detail(), cell=self.cell, connection=self.connection
