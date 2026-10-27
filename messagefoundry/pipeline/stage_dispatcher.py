@@ -100,9 +100,10 @@ class HoldResult(Enum):
     """How a hold on a failed re-pend of claimed rows ended (BACKLOG #1611): the pooled
     :meth:`StageDispatcher._land_while_holding` and the per-lane
     ``RegistryRunner._repend_claimed_on_fault``. Only ``STOPPED`` is a teardown, after which the
-    caller returns. Every other end sends no further write, leaves the rows INFLIGHT, and lets the
-    caller go on as it did before step 2 after its one failed write: a per-lane worker loops, a
-    pooled serializer runs its terminal transition."""
+    caller returns. Every other end sends no further retry of that write, leaves its rows
+    INFLIGHT, and lets the caller go on as it did before step 2 after its one failed write: a
+    per-lane worker loops, a pooled serializer runs its terminal transition, after at most one
+    tail release (``_run_lane`` says when)."""
 
     LANDED = auto()  # the write landed
     STOPPED = auto()  # the engine is stopping: the rows stay INFLIGHT for the next start
@@ -123,7 +124,9 @@ class RependFence:
     ``reschedule_claimed`` is fenced only by ``status='inflight'``, so a retry would re-pend the
     successor's claim, a duplicate send. :meth:`superseded` reads that. A node that was not the
     leader at the capture cannot tell who led since, so it never retries after regaining the lease.
-    A ``None`` epoch while leading, a single node, keeps no fence: there is no second writer.
+    A ``None`` epoch while leading (``NullCoordinator``) keeps no fence. That is safe for a single
+    node; engine shards also run it, and a lane whose owning shard changes on a reload while a
+    hold runs is not fenced here either.
 
     What is left is the window between the check and the write, a flap inside one store round
     trip. A store-level owner or epoch fence on ``reschedule_claimed`` is the full fix; it is not
@@ -145,6 +148,14 @@ class RependFence:
         """Whether, leading now, this node may lead under a lease other than the one it held at
         the fault."""
         return not self.leading or (self.epoch is not None and self.current_epoch() != self.epoch)
+
+    def moved(self) -> bool:
+        """Whether another lease than the captured one is held now: proof another node led, where
+        :meth:`superseded` also counts a demotion that no successor may have followed yet."""
+        if self.epoch is None:
+            return False
+        now = self.current_epoch()
+        return now is not None and now != self.epoch
 
     def may_write(self) -> bool:
         """Whether a write sent now, after the first, is fenced as above."""
@@ -1404,9 +1415,10 @@ class StageDispatcher:
         # bound) sends no further retry and runs the terminal transition below, as before step 2
         # after one failed write; the rows stay in flight and the in-flight watch pages them.
         #
-        # After a head re-pend, the tail's first write is fenced too, since it is no longer at
-        # fault time and a successor may hold those rows; when the head's hold did not land, that
-        # write is sent once, as before step 2. _land_while_holding says the rest.
+        # After a head re-pend the tail's first write is no longer at fault time, and a successor
+        # may hold those rows. When the head landed, it is skipped only if another node's lease is
+        # held now; when the head's hold did not land, it is sent once, as before step 2, and only
+        # under the fence. _land_while_holding says the rest.
         head = tail = HoldResult.LANDED
         if head_reschedule is not None:
             head_id, when = head_reschedule
@@ -1430,10 +1442,15 @@ class StageDispatcher:
         if tail_ids:
             release = functools.partial(self._store.release_claimed, tail_ids)
             what = f"release_claimed of {len(tail_ids)} row(s)"
-            if head_reschedule is not None and not fence.may_write():
+            if head is HoldResult.LANDED:
+                # Not on leader loss alone: the demotion drain relies on this release (zero rows
+                # INFLIGHT at quiesce), as before step 2. Only a lease another node took skips it.
+                if head_reschedule is not None and fence.moved():
+                    tail = HoldResult.SUPERSEDED
+                else:
+                    tail = await self._land_while_holding(lane, what, release, fence)
+            elif not fence.may_write():
                 tail = HoldResult.SUPERSEDED
-            elif head is HoldResult.LANDED:
-                tail = await self._land_while_holding(lane, what, release, fence)
             else:
                 tail = await self._write_once(lane, what, release, head)
         unlanded = (head is not HoldResult.LANDED) + (
