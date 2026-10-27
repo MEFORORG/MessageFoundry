@@ -444,12 +444,17 @@ class CrlSignature:
       Identifier, every fitting CA so named was checked and its key does not verify the CRL, and
       no fitting CA verifies it. The CRL names that key, and that key did not sign it. A fitting
       CA with no Subject Key Identifier that could not be checked does not lift this to
-      ``uncheckable`` (vault BACKLOG #4159, the reading of #2905 item 1 decided 2026-10-26): every
-      verifying engine context sets ``VERIFY_X509_STRICT``, under which OpenSSL 3 refuses a chain
-      through a CA with no Subject Key Identifier, so that CA cannot make the CRL valid at a
-      handshake. Measured 2026-10-27 on CPython 3.14.7 with OpenSSL 3.5.7. An OpenSSL build or a
-      context without that strict check could still take such a CA for the issuer; the engine
-      sets no OpenSSL floor.
+      ``uncheckable`` (vault BACKLOG #4159, the reading of #2905 item 1 decided 2026-10-26). The
+      reason: every verifying engine context sets ``VERIFY_X509_STRICT``, under which OpenSSL 3
+      refuses a chain of two or more certificates through a CA with no Subject Key Identifier,
+      so such a CA cannot make the CRL valid for that chain. Measured 2026-10-27 on CPython
+      3.14.7 with OpenSSL 3.5.7. **At least two residuals, where the start refuses a CRL a
+      handshake could pass.** OpenSSL skips its strict checks on a one-certificate chain: a peer
+      that presents a self-signed CA with no Subject Key Identifier, listed here, passed a strict
+      handshake judged by a CRL that CA signed, measured the same day. And an OpenSSL build or a
+      context without the strict check could take such a CA for the issuer; the engine sets no
+      OpenSSL floor. A fitting CA with no Subject Key Identifier that verifies the CRL still
+      makes it ``verified``.
     * ``uncheckable``: no fitting CA verifies, and some fitting CA could not be checked: one the
       CRL names by key identifier, or, where the CRL names no fitting CA's key, any. "Cannot check"
       is not "does not verify" (:func:`_verifies`).
@@ -884,11 +889,10 @@ def _signature_state(
         named_unchecked = named_unchecked or (answer is None and names_key)
     if not fitting:
         return "unlisted"
-    # Vault BACKLOG #4159: proof outranks a CA with no Subject Key Identifier that could not be
-    # checked. Where the CRL names a key, _akid_fit drops a CA whose identifier differs, so every
-    # fitting CA it does not name carries none, and no strict context chains through such a CA.
-    if named and not named_unchecked:
-        return "bad"
+    if named:
+        # Where the CRL names a key, _akid_fit drops a CA whose identifier differs, so a fitting
+        # CA it does not name carries none; CrlSignature says why that one cannot lift ``bad``.
+        return "uncheckable" if named_unchecked else "bad"
     return "uncheckable" if unchecked else "unproven"
 
 

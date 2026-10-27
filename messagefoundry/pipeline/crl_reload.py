@@ -200,9 +200,10 @@ BAD_SIGNATURE = (
     "refuses the file too only where it proves the signature bad. Short of that proof the "
     "signature does not stop a start: unless another rule refuses the file, a start loads it "
     "with a warning, and each handshake then decides. That covers at least a CRL that names no "
-    "key and a signature the engine cannot check. The handshake passes where the peer's chain "
-    "carries the CA that signed the CRL, as after a CA renews its key, and fails where it does "
-    "not"
+    "key and a signature the engine cannot check with the key the CRL names, or, where it names "
+    "no listed CA's key, with any listed CA of that name. The handshake passes where the peer's "
+    "chain carries the CA that signed the CRL, as after a CA renews its key, and fails where it "
+    "does not"
 )
 NO_ISSUER = (
     "Restart the engine to apply the file. The reload checks a CRL's signature against the hop's "

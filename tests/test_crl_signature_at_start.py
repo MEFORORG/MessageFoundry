@@ -27,6 +27,7 @@ import datetime
 import functools
 import logging
 import ssl
+import time
 import warnings
 import weakref
 from dataclasses import dataclass
@@ -48,7 +49,7 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
 )
 from messagefoundry.keywrap import der_children, read_der_tlv
-from messagefoundry.pipeline import crl_reload
+from messagefoundry.pipeline import cert_expiry, crl_reload
 from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE, FIX, reload_replaced_crls
 from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
 from tests.test_crl_bundle_anchors import _ku
@@ -480,16 +481,26 @@ def test_a_crl_its_named_ca_proves_bad_refuses_beside_an_unchecked_ca_with_no_sk
     assert pki_module._verifies(x509.load_pem_x509_crl(pem), no_ski) is None
 
     assert [s.state for s in judge_crl_signatures(pem, _ders(mixed))] == ["bad"]
-    with pytest.raises(ValueError, match="does not verify the CRL's signature") as refused:
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
         _hop(mixed, twins.crl)
-    assert "with no Subject Key Identifier does not change that" in str(refused.value)
+
+    # The CA-file monitor gives the proven remedy, where it asked for a check before.
+    verdict_of_scan = cert_expiry._ca_file_crl_refusal(
+        mixed.read_bytes() + pem,
+        time.time(),
+        None,
+        ca_file_only=True,
+        on_unchecked=lambda: None,
+    )
+    assert verdict_of_scan is not None
+    assert verdict_of_scan[1].startswith("Replace the CRL in the CA file with one its CA signed")
 
     # The running-hop reload is unchanged: it held this file back before and still does.
     verdict = crl_signature_refusal(pem, _ders(mixed))
     assert verdict is not None and verdict[1] is True
 
-    # Control: OpenSSL itself fails the handshake on this CRL, whichever CA the file lists first,
-    # so the refusal refuses nothing that works on this interpreter's OpenSSL.
+    # Control: OpenSSL itself fails this chain's handshake on this CRL, in either listing order.
+    # One chain shape only, a leaf under the named CA; pki.CrlSignature names the residuals.
     with pytest.raises(ssl.SSLError, match="signature"):
         _handshake(_raw_hop(mixed, twins.crl), twins.server(sends_renewed=False))
 

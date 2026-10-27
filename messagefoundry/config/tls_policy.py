@@ -571,8 +571,8 @@ _UNCONFIRMED_SIGNATURE = {
         "name that CA's key, so a renewed CA key could explain it"
     ),
     "uncheckable": (
-        "the engine cannot check its signature with the listed CA's key, where that CA carries "
-        "the key identifier the CRL names, or the CRL names no listed CA's key"
+        "the engine cannot check its signature with the key of the listed CA the CRL names by key "
+        "identifier, or, where it names none, of a listed CA of that name"
     ),
 }
 #: How many CRLs that warning describes before it only counts the rest.
@@ -645,9 +645,7 @@ def _check_crl_signatures(
         raise ValueError(
             f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "
             "key does not verify the CRL's signature. A handshake OpenSSL judges by this CRL "
-            "fails with 'CRL signature failure'. A listed CA of that name with no Subject Key "
-            "Identifier does not change that: strict verification refuses a chain through such "
-            "a CA. Give this setting the CRL that CA signed, or "
+            "fails with 'CRL signature failure'. Give this setting the CRL that CA signed, or "
             "remove this CRL if a good one from that issuer is already in the file"
         )
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
