@@ -27,7 +27,9 @@ process has to import this module and reach the install call first, and a caller
 the engine can aim for that window. The command line makes the call when
 ``messagefoundry/__main__.py`` is imported, ahead of that module's other imports and for every
 command. What is left is at least the interpreter's own start-up, the package's ``__init__``,
-loading that module, and this module's imports, which are most of the part the engine controls.
+loading that module, and this module's imports ("Start-up cost" below has the reading).
+:func:`messagefoundry.api.create_app` makes the same call, for an application that builds the API
+without the command line.
 And the capability underneath is untouched: a process that can write this process's
 memory can run code in it some other way, and can remove a hook. So an enabled interface with the
 hook in place is reported as a residual (:func:`remote_debug_loosening`). Under ``enforce``,
@@ -80,21 +82,35 @@ message. Not measured: at least Linux, a File connection, a TLS hop, a peer give
 persistent MLLP outbound and a DEBUG log level. Start-up and API requests were not measured
 either.
 
+**Start-up cost.** Every millisecond spent importing this module is time in which an injected
+script still runs, so it imports neither ``logging`` nor ``dataclasses``. In CPython 3.14
+``logging`` pulls in ``traceback``, which pulls in ``dataclasses`` and ``inspect``. The reporter
+thread imports ``logging`` when it first writes. Measured once on one machine (vault BACKLOG
+#3673), on 2026-10-27, on Windows 11 (10.0.26300) with CPython 3.14.6 and other work running:
+
+- *Spawn to hook.* A parent read the clock, started a child, and the child printed the clock
+  right after its install call. The median of 21 runs was 64 ms before the cut, and of 41 runs
+  43 ms after it. A child that only printed the clock took 22 ms both times.
+- *Import time.* ``python -X importtime -c "import messagefoundry.remotedebug"``, six runs each.
+  This module's cumulative time went from 41 to 45 ms to 19 to 21 ms. About 9 ms of each is
+  the package's ``__init__``, almost all of it ``typing``.
+
+It is a reading, not a bound, and it was not taken on Linux.
+
 No engine state. It imports the standard library and ``messagefoundry.controlchars``, which
 imports only the standard library, so any package may import it.
 """
 
 from __future__ import annotations
 
+# No `logging` and no `dataclasses` here: see "Start-up cost" in the module docstring.
 import contextlib
-import logging
 import os
 import queue
 import sys
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Final
+from typing import Final, NamedTuple
 
 from messagefoundry.controlchars import scrub_log_argument
 
@@ -142,7 +158,6 @@ _FILE_NAME_LIMIT: Final = 120
 #: refused; only its log line is dropped, so a caller that repeats cannot grow the queue.
 _REPORT_BACKLOG: Final = 64
 
-_log = logging.getLogger(__name__)
 _install_lock = threading.Lock()
 _reports: queue.SimpleQueue[str] = queue.SimpleQueue()
 _refused = 0
@@ -153,9 +168,9 @@ class RemoteScriptRefused(RuntimeError):
     """Raised inside the audit hook, which is what makes the interpreter drop the script."""
 
 
-@dataclass(frozen=True, slots=True)
-class RemoteDebugPosture:
-    """What :func:`remote_debug_posture` read from this process."""
+class RemoteDebugPosture(NamedTuple):
+    """What :func:`remote_debug_posture` read from this process. A named tuple rather than a
+    dataclass, for the start-up cost the module docstring measures."""
 
     #: ``sys.is_remote_debug_enabled()``: whether the interpreter accepts an injected script.
     interpreter_enabled: bool
@@ -210,8 +225,10 @@ def _report(name: str) -> None:
     # Scrubbed here as well as by the handlers: the injecting process chooses the name, it may
     # hold a line break, and a handler with no filter chain would write it as it came. `_ascii`
     # has escaped the line break already; the scrub stays as the step CodeQL's log-injection
-    # query recognises.
-    _log.warning(
+    # query recognises. Imported here, on the reporter thread, to keep it out of start-up.
+    import logging
+
+    logging.getLogger(__name__).warning(
         "refused a script that another process injected through the interpreter's remote "
         "debugging (audit event %s, script file name %s). Nothing in it ran.",
         REMOTE_SCRIPT_EVENT,
@@ -246,6 +263,27 @@ def _ensure_reporter() -> None:
     with contextlib.suppress(RuntimeError):
         _start_reporter()
         _reporter_started = True
+
+
+def _after_fork_in_child() -> None:
+    """Give a forked child its own reporter (vault BACKLOG #3673, defect 2).
+
+    The child keeps the hook, the flag and the queue, but not the reporter thread: fork copies
+    only the thread that called it. Without this a refusal in the child is counted and never
+    logged, because the inherited flag stops every later call from starting a reporter. The lock
+    is new because a thread that no longer exists may have held it at the fork. The queue is new
+    because the parent's reporter logs what was queued before the fork."""
+    global _install_lock, _reports, _reporter_started
+    _install_lock = threading.Lock()
+    _reports = queue.SimpleQueue()
+    if _reporter_started:
+        _reporter_started = False
+        with _install_lock:
+            _ensure_reporter()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _without_own_refusals(
@@ -320,7 +358,8 @@ def install_remote_debug_guard() -> None:
     The cost is a copy that may stack where the first add did go in behind a cut-off probe: one
     per call made while the probe stays cut off, and nothing else bounds them. ``serve`` and
     ``supervise`` make at least two calls, at import and then first in ``_serve`` or
-    ``_supervise``; other subcommands make the import's call. Under
+    ``_supervise``; other subcommands make the import's call. Each
+    :func:`messagefoundry.api.create_app` call makes one more, so ``serve`` makes three. Under
     ``python -m``, a later import of the command-line module runs the import-time call again, as
     ``api/tls.py`` does when it writes a key. A stacked copy changes no count: the first copy
     raises on ``cpython.remote_debugger_script``, and the interpreter stops at the first hook
@@ -426,7 +465,8 @@ def remote_debug_loosening(posture: RemoteDebugPosture) -> tuple[str, str] | Non
             "attach to this one, which on Windows includes one running as the same account, "
             "could run Python inside it with sys.remote_exec, with everything it holds (the store "
             f"key, connection secrets, messages in flight).{seen} The `messagefoundry` command "
-            "line installs the hook as it starts. Look for what else in the process adds an "
+            "line installs the hook as it starts, and so does building the API app. Look for "
+            "what else in the process adds an "
             "audit hook. Start the interpreter with -X disable-remote-debug to turn the "
             "interface off",
         )

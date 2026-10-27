@@ -459,14 +459,15 @@ def test_a_long_file_name_is_cut(reports: queue.SimpleQueue[str]) -> None:
     assert len(reports.get_nowait()) == remotedebug._FILE_NAME_LIMIT
 
 
-@pytest.mark.parametrize(
-    "character",
-    [
-        pytest.param("\U0001f600", id="ten-characters-as-an-ascii-escape"),
-        pytest.param("\x01", id="four-characters-as-a-control-escape"),
-        pytest.param("\\", id="two-characters-as-a-doubled-backslash"),
-    ],
-)
+#: One character of each escape length, repeated to the limit, for the read-back tests.
+_BOUNDED = [
+    pytest.param("\U0001f600", id="ten-characters-as-an-ascii-escape"),
+    pytest.param("\x01", id="four-characters-as-a-control-escape"),
+    pytest.param("\\", id="two-characters-as-a-doubled-backslash"),
+]
+
+
+@pytest.mark.parametrize("character", _BOUNDED)
 def test_the_logged_name_is_bounded_and_can_be_read_back(
     caplog: pytest.LogCaptureFixture, character: str
 ) -> None:
@@ -491,6 +492,8 @@ _NAMES = [
     pytest.param("pay\u4e2dload.py", r"pay\u4e2dload.py", id="outside-cp1252"),
     pytest.param("pay\U0001f600load.py", r"pay\U0001f600load.py", id="astral"),
     pytest.param("pay\xe9load.py", r"pay\xe9load.py", id="latin-1"),
+    # A tab is ASCII, so only the escape spells it; the log filters would pass it as it came.
+    pytest.param("pay\tload.py", r"pay\tload.py", id="tab"),
     # Six plain characters that read like an escape. The backslash is doubled, so this name is
     # not logged the same as the lone surrogate in the first arm.
     pytest.param("pay\\udcffload.py", r"pay\\udcffload.py", id="literal-backslash"),
@@ -611,6 +614,21 @@ def test_without_the_escape_a_name_outside_cp1252_keeps_the_line_off_stdout(
     assert REMOTE_SCRIPT_EVENT not in sinks.on_stdout()
     assert REMOTE_SCRIPT_EVENT in sinks.in_file()
     assert sinks.states()["stdout"] == "unwritable"
+
+
+@pytest.mark.parametrize("character", _BOUNDED)
+def test_the_logged_name_reads_back_through_the_engine_filters(
+    build_sinks: Callable[[], _Sinks], character: str
+) -> None:
+    """The read-back test further up reads the record ``caplog`` sees, before any handler filter.
+    The file sink runs the engine's redaction, credential and control-character filters, so this
+    reads the name back from the line an operator reads (vault BACKLOG #3673, finding 6)."""
+    sinks = build_sinks()
+    name = character * remotedebug._FILE_NAME_LIMIT
+    remotedebug._report(name)
+    (line,) = [line for line in sinks.in_file().splitlines() if REMOTE_SCRIPT_EVENT in line]
+    logged = line.split("script file name ")[1].split("). Nothing in it ran.")[0]
+    assert logged.encode("ascii").decode("unicode_escape") == name
 
 
 # --- installing --------------------------------------------------------------------------------
@@ -813,6 +831,84 @@ def test_a_reporter_that_cannot_start_is_tried_again_by_the_next_call(
     assert len(attempts) == 2
     install_remote_debug_guard()  # started now, so nothing more
     assert installs.hooks == [remotedebug._guard] and len(attempts) == 2
+
+
+def test_a_forked_child_starts_its_own_reporter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Vault BACKLOG #3673, defect 2: fork copies only the calling thread, so the child has the
+    parent's flag and no reporter. The child's handler starts one, on a new lock and queue. The
+    real fork is the test below, which runs only where ``os.fork`` exists."""
+    installs = _Installs(monkeypatch)
+    # Restored afterwards: the handler rebinds both, and this process's reporter reads the queue.
+    monkeypatch.setattr(remotedebug, "_install_lock", remotedebug._install_lock)
+    monkeypatch.setattr(remotedebug, "_reports", remotedebug._reports)
+    inherited_lock, inherited_queue = remotedebug._install_lock, remotedebug._reports
+    monkeypatch.setattr(remotedebug, "_reporter_started", True)  # as the parent left it
+    remotedebug._after_fork_in_child()
+    assert installs.reporters == 1 and remotedebug._reporter_started is True
+    assert remotedebug._install_lock is not inherited_lock
+    assert remotedebug._reports is not inherited_queue
+    # CONTROL: a parent that had no reporter, because it had no hook, gives the child none.
+    monkeypatch.setattr(remotedebug, "_reporter_started", False)
+    remotedebug._after_fork_in_child()
+    assert installs.reporters == 1 and remotedebug._reporter_started is False
+
+
+# A real fork, in a fresh interpreter: forking the test process would copy its threads' state.
+_FORK_PROBE = """\
+import logging
+import os
+import pathlib
+import sys
+import time
+import warnings
+
+log, out = sys.argv[1:3]
+logging.basicConfig(filename=log, level=logging.WARNING)
+from messagefoundry import remotedebug
+
+remotedebug.install_remote_debug_guard()
+if not remotedebug.remote_debug_posture().guard_installed:
+    pathlib.Path(out).write_text("unguarded", encoding="utf-8")
+    sys.exit(0)
+# Python warns on a fork while another thread runs; the reporter thread is that thread.
+warnings.simplefilter("ignore", DeprecationWarning)
+pid = os.fork()
+if pid == 0:
+    try:
+        sys.audit(remotedebug.REMOTE_SCRIPT_EVENT, "forked-child.py")
+    except remotedebug.RemoteScriptRefused:
+        pass
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if "forked-child.py" in pathlib.Path(log).read_text(encoding="utf-8"):
+            break
+        time.sleep(0.02)
+    os._exit(0)
+os.waitpid(pid, 0)
+logged = "forked-child.py" in pathlib.Path(log).read_text(encoding="utf-8")
+pathlib.Path(out).write_text(f"logged={logged}", encoding="utf-8")
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="os.fork does not exist on this platform")
+def test_a_refusal_in_a_forked_child_is_logged(tmp_path: Path) -> None:
+    """Against a real interpreter and a real fork. Before the fix the child counted the refusal
+    and logged nothing, because no reporter ran there."""
+    script = tmp_path / "fork_probe.py"
+    script.write_text(_FORK_PROBE, encoding="utf-8")
+    out = tmp_path / "fork.txt"
+    proc = subprocess.run(
+        [sys.executable, str(script), str(tmp_path / "engine.log"), str(out)],
+        env=_child_env(),
+        capture_output=True,
+        text=True,
+        timeout=50,
+    )
+    assert proc.returncode == 0 and out.exists(), proc.stderr[-2000:]
+    reading = out.read_text(encoding="utf-8")
+    if reading == "unguarded":
+        pytest.skip("the child interpreter does not accept injected scripts, or its hook is out")
+    assert reading == "logged=True"
 
 
 def test_the_unraisable_hook_is_wrapped_before_the_audit_hook_is_added(
@@ -1086,6 +1182,7 @@ elif mode == "probe-objecting":
     real(objects)
 before = remote_debug_posture().guard_installed
 quiet_before = sys.unraisablehook
+imported_only = None
 try:
     if mode in ("import", "objecting", "probe-objecting"):
         import messagefoundry.__main__
@@ -1099,6 +1196,12 @@ try:
 
         sys.argv = ["messagefoundry", "--version"]
         runpy.run_module("messagefoundry", run_name="__main__")
+    elif mode == "api":
+        # An application that builds the API without the command line (vault BACKLOG #3673).
+        from messagefoundry.api import create_app
+
+        imported_only = remote_debug_posture().guard_installed
+        create_app()
 except SystemExit:
     pass
 finally:
@@ -1113,6 +1216,8 @@ finally:
                     t.name == "mefor-remote-debug-report" for t in threading.enumerate()
                 ),
                 "quiet": sys.unraisablehook is not quiet_before,
+                "imported_only": imported_only,
+                "cli_loaded": "messagefoundry.__main__" in sys.modules,
             },
             fh,
         )
@@ -1196,10 +1301,37 @@ def test_a_hook_behind_one_that_stops_the_probe_is_reported(
     assert reading["reporter"] is True and reading["quiet"] is True
 
 
+def test_building_the_api_installs_the_guard_without_the_command_line(tmp_path: Path) -> None:
+    """Vault BACKLOG #3673, defect 3: an application that builds the API and never imports the
+    command-line module. Importing the API installs nothing; building the app does. The control
+    is the test below: the same probe, with no API, installs nothing."""
+    reading = _install_probe(tmp_path, "api")
+    assert reading["before"] is False and reading["imported_only"] is False
+    assert reading["after"] is True and reading["cli_loaded"] is False
+    assert len(cast("list[object]", reading["loaded_at_install"])) == 1
+
+
+def test_the_guard_module_imports_neither_logging_nor_dataclasses() -> None:
+    """Vault BACKLOG #3673, defect 4: each import ahead of the install widens the window in which
+    an injected script runs, and these two were most of it. Read in a fresh interpreter. The
+    control is the same reading after ``logging`` is imported, which must see it."""
+    code = (
+        "import sys, messagefoundry.remotedebug; "
+        "print(sorted({'logging', 'dataclasses', 'inspect'} & set(sys.modules))); "
+        "import logging; print('logging' in sys.modules)"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], env=_child_env(), capture_output=True, text=True, timeout=50
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert proc.stdout.split() == ["[]", "True"]
+
+
 def test_the_probe_alone_installs_nothing(tmp_path: Path) -> None:
-    """CONTROL for the test above: the same probe, which imports the guard's own module, without
-    the command line. The guard is not there, so the True above came from importing the
-    command-line module and from nowhere else."""
+    """CONTROL for ``test_the_command_line_installs_the_guard_ahead_of_its_other_imports`` and
+    ``test_building_the_api_installs_the_guard_without_the_command_line``: the same probe, which
+    imports the guard's own module, with neither the command line nor the API. The guard is not
+    there, so the True in each came from the module that test imported and from nowhere else."""
     reading = _install_probe(tmp_path, "library")
     assert reading["before"] is False and reading["after"] is False
     assert reading["loaded_at_install"] == []
