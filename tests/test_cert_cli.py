@@ -896,6 +896,26 @@ def test_self_signed_refuses_to_overwrite_an_existing_cert(
     assert not (out / "key.pem").exists()
 
 
+def test_self_signed_refuses_beside_an_existing_ca_chain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ca-chain.pem an earlier `cert import` left would sit beside a placeholder key it does not
+    chain. `cert import` refuses that case, so `cert self-signed` refuses it too, and writes nothing
+    (vault BACKLOG #3514).
+
+    Mutation: drop the ca-chain.pem check. Red: rc 0, and a key.pem beside the stale chain."""
+    out = tmp_path / "o"
+    out.mkdir()
+    (out / "ca-chain.pem").write_bytes(b"AN-EARLIER-CHAIN\n")
+
+    rc = main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
+    assert rc == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("refusing to mint beside an existing CA chain file"), error
+    assert "A self-signed certificate has no CA chain" in error
+    assert sorted(p.name for p in out.iterdir()) == ["ca-chain.pem"]
+
+
 def _cert_open_dies_midway(monkeypatch: pytest.MonkeyPatch, name: str = "cert.pem") -> None:
     real_open = Path.open
 

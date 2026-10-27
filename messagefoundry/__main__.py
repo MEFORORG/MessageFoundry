@@ -814,8 +814,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) as a TLS PLACEHOLDER (no "
         "chain of trust: better than cleartext, worse than an operator-supplied chain, so replace "
         "it); key.pem is written owner-only (mode 0600 on POSIX, a restrictive access list on "
-        "Windows). It refuses to overwrite an existing cert.pem or key.pem, and removes the key it "
-        "wrote if cert.pem cannot be written",
+        "Windows). It refuses to overwrite an existing cert.pem or key.pem, refuses a directory "
+        "holding a ca-chain.pem, which would not chain the new key, and removes the key it wrote if "
+        "cert.pem cannot be written",
     )
     cert_self_signed.add_argument(
         "--cn",
@@ -6003,6 +6004,18 @@ def _refusal_for_existing(files: list[tuple[Path, str]]) -> str | None:
     return None
 
 
+def _refuse_a_stale_ca_chain(ca_path: Path, verb: str, why: str) -> str | None:
+    """The refusal for a run that writes no ca-chain.pem into a directory that holds one, else
+    ``None``. That chain would sit beside a key it does not chain (vault BACKLOG #3514). ``why``
+    is the sentence saying why this run has no chain to write."""
+    if not ca_path.exists():
+        return None
+    return (
+        f"refusing to {verb} beside an existing CA chain file: {ca_path}. {why}, so that chain "
+        "does not belong to the new key (remove it first)"
+    )
+
+
 def _write_cert_files(
     out_dir: Path,
     key_path: Path,
@@ -6134,11 +6147,8 @@ def _cert_import(args: argparse.Namespace) -> int:
     refusal = _refusal_for_existing(
         [(path, kind) for path, _pem, kind in public] + [(key_path, "key")]
     )
-    if refusal is None and ca_path.exists():  # only when the bundle has no CA, so writes no chain
-        refusal = (
-            f"refusing to import beside an existing CA chain file: {ca_path}. This bundle carries "
-            "no CA certs, so that chain does not belong to the new key (remove it first)"
-        )
+    if refusal is None:  # reached with a ca-chain.pem only when the bundle has no CA to write
+        refusal = _refuse_a_stale_ca_chain(ca_path, "import", "This bundle carries no CA certs")
     if refusal is not None:
         return _cert_fail(refusal, as_json=args.json)
 
@@ -6386,9 +6396,9 @@ def _san_labels(names: list[str]) -> str:
 def _cert_self_signed(args: argparse.Namespace) -> int:
     """`cert self-signed` — mint a self-signed EC P-256 cert+key, a TLS PLACEHOLDER.
 
-    Writes cert.pem + key.pem to ``--out-dir``. It refuses an existing cert.pem or key.pem before
-    it mints, and both writes are exclusive, so a file that appears meanwhile is still never
-    replaced. If cert.pem is not written, the files this run wrote are removed, and the failure
+    Writes cert.pem + key.pem to ``--out-dir``. It refuses an existing cert.pem, key.pem or
+    ca-chain.pem before it mints, and both writes are exclusive, so a file that appears meanwhile
+    is still never replaced. If cert.pem is not written, the files this run wrote are removed, and the failure
     line names any it could not remove. Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
 
@@ -6397,8 +6407,13 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     cert_path = out_dir / "cert.pem"
     key_path = out_dir / "key.pem"
-    # Checked before the mint, so a refused run generates no key.
-    refusal = _refusal_for_existing([(cert_path, "certificate"), (key_path, "key")])
+    # Checked before the mint, so a refused run generates no key. A ca-chain.pem an earlier `cert
+    # import` left is refused too, as that command refuses it (vault BACKLOG #3514).
+    refusal = _refusal_for_existing(
+        [(cert_path, "certificate"), (key_path, "key")]
+    ) or _refuse_a_stale_ca_chain(
+        out_dir / "ca-chain.pem", "mint", "A self-signed certificate has no CA chain"
+    )
     if refusal is not None:
         return _cert_fail(refusal, as_json=args.json)
 
