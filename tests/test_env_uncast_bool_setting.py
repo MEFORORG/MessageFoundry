@@ -11,15 +11,22 @@ and refuses an unknown spelling with the same value-withheld diagnostic."""
 
 from __future__ import annotations
 
+import ast
+import importlib
+import inspect
 import textwrap
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from messagefoundry.auth.trust_anchors import registry_anchor_specs
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
+    _COMPOSER_BOOL_SETTINGS,
     EnvRef,
+    Ftp,
+    Rest,
     WiringError,
     _bool_settings,
     env,
@@ -27,6 +34,8 @@ from messagefoundry.config.wiring import (
     resolve_env_settings,
 )
 from messagefoundry.pipeline.wiring_runner import _dest_config
+from messagefoundry.transports.http_auth import oauth2_auth_configured
+from messagefoundry.transports.smart import smart_auth_configured
 
 SPELLINGS = [(s, False) for s in ["false", "0", "no", "off", "False", " OFF "]] + [
     (s, True) for s in ["true", "1", "yes", "on", "TRUE"]
@@ -205,3 +214,206 @@ def test_connections_toml_uncast_unknown_spelling_is_refused_end_to_end(tmp_path
         _dest(reg, "OB_SYNTH_REST", {"rest_allow_expired": "maybe"})
     msg = str(ei.value)
     assert "'tls_allow_expired'" in msg and "not a valid bool" in msg and "maybe" not in msg
+
+
+# --- the composers' enabled flags (vault BACKLOG #3234 step 1, #3724 item 1) ------------------------
+#
+# A composer stores its flag under a key that is not its parameter's name, so the annotation scan
+# alone never found ``smart_enabled``, ``oauth2_enabled`` or ``sign_enabled``. The SMART and OAuth2
+# readers take the flag with plain bool(), so an uncast "false" left the token hop ON.
+
+_COMPOSER_KEYS = tuple(_COMPOSER_BOOL_SETTINGS)
+
+# The arguments each composer needs besides its bool flag. A new composer fails the census test
+# below until it is listed here, and its flag in wiring._COMPOSER_BOOL_SETTINGS.
+_COMPOSER_ARGS: dict[str, dict[str, Any]] = {
+    "with_smart_backend": {"token_url": "https://t", "client_id": "c", "private_key": "k"},
+    "with_oauth2_client_credentials": {
+        "token_url": "https://t",
+        "client_id": "c",
+        "client_secret": "s",
+    },
+    "with_signing": {"private_key": "k"},
+}
+
+
+@pytest.mark.parametrize("cast", [None, str], ids=["uncast", "str"])
+@pytest.mark.parametrize(("spelling", "want"), SPELLINGS)
+def test_a_composer_enabled_flag_reads_strictly(spelling: str, want: bool, cast: Any) -> None:
+    out = resolve_env_settings(
+        {key: env(key, cast=cast) for key in _COMPOSER_KEYS},
+        dict.fromkeys(_COMPOSER_KEYS, spelling),
+    )
+    assert all(out[key] is want for key in _COMPOSER_KEYS)
+
+
+@pytest.mark.parametrize("key", _COMPOSER_KEYS)
+def test_a_composer_flag_takes_its_default_on_none_and_refuses_an_unknown_spelling(
+    key: str,
+) -> None:
+    assert resolve_env_settings({key: env("k", default=None)}, {})[key] is True
+    with pytest.raises(WiringError, match=f"setting '{key}' \\(env 'k'\\): value is not a valid"):
+        resolve_env_settings({key: env("k")}, {"k": "maybe"})
+
+
+def _composer_bool_params() -> set[tuple[str, str, str]]:
+    """Every keyword parameter annotated ``bool`` on a ``with_*`` function under
+    ``messagefoundry/transports/``, read from the source so no composer is missed for not being
+    imported: ``(module, composer, parameter)``."""
+    import messagefoundry.transports as transports
+
+    found: set[tuple[str, str, str]] = set()
+    for path in sorted(Path(transports.__file__).parent.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("with_"):
+                for arg in node.args.kwonlyargs:
+                    if arg.annotation is not None and ast.unparse(arg.annotation) == "bool":
+                        module = f"messagefoundry.transports.{path.stem}"
+                        found.add((module, node.name, arg.arg))
+    return found
+
+
+def test_every_composer_bool_parameter_writes_a_listed_key_with_its_default() -> None:
+    # The census: a composer bool flag the strict read does not list would read "false" as True
+    # again, silently. The key each flag writes is found by flipping it, so the table is checked
+    # against what the composer does, not against a second copy of its key names.
+    written: dict[str, bool] = {}
+    for module, composer, param in _composer_bool_params():
+        fn = getattr(importlib.import_module(module), composer)
+        default = inspect.signature(fn).parameters[param].default
+        on = fn(Rest(url="https://partner.example.org/in"), **_COMPOSER_ARGS[composer])
+        off = fn(
+            Rest(url="https://partner.example.org/in"),
+            **_COMPOSER_ARGS[composer],
+            **{param: not default},
+        )
+        (key,) = [k for k in on.settings if on.settings[k] != off.settings.get(k)]
+        assert on.settings[key] is default
+        written[key] = default
+    assert written == dict(_COMPOSER_BOOL_SETTINGS)
+    assert all(_bool_settings().defaults[key] is d for key, d in written.items())
+
+
+_COMPOSER_MODULE = """
+from messagefoundry import Rest, env, outbound
+from messagefoundry.transports.http_auth import with_oauth2_client_credentials
+from messagefoundry.transports.signing import with_signing
+from messagefoundry.transports.smart import with_smart_backend
+outbound("OB_SMART", with_smart_backend(Rest(url="https://partner.example.org/in"),
+    token_url="https://auth.example.org/token", client_id="c", private_key="k",
+    enabled=env("smart_on")))
+outbound("OB_OAUTH", with_oauth2_client_credentials(Rest(url="https://partner.example.org/in"),
+    token_url="https://auth.example.org/token", client_id="c", client_secret="s",
+    enabled=env("oauth_on", cast=str)))
+outbound("OB_SIGN", with_signing(Rest(url="https://partner.example.org/in"), private_key="k",
+    enabled=env("sign_on")))
+"""
+
+
+@pytest.mark.parametrize(("spelling", "want"), [("false", False), ("off", False), ("yes", True)])
+def test_code_first_composer_flags_turn_the_token_hops_off_end_to_end(
+    tmp_path: Path, spelling: str, want: bool
+) -> None:
+    (tmp_path / "cfg.py").write_text(textwrap.dedent(_COMPOSER_MODULE), encoding="utf-8")
+    reg = load_config(tmp_path)
+    values = {"smart_on": spelling, "oauth_on": spelling, "sign_on": spelling}
+    smart = _dest(reg, "OB_SMART", values)
+    oauth = _dest(reg, "OB_OAUTH", values)
+    assert smart["smart_enabled"] is want and smart_auth_configured(smart) is want
+    assert oauth["oauth2_enabled"] is want and oauth2_auth_configured(oauth) is want
+    assert _dest(reg, "OB_SIGN", values)["sign_enabled"] is want
+
+
+# --- Ftp(tls=...), which the factory turns into the protocol (#3234 step 1, #3724 item 1) -----------
+
+
+@pytest.mark.parametrize("cast", [None, str, bool], ids=["uncast", "str", "bool"])
+@pytest.mark.parametrize(("spelling", "want"), SPELLINGS)
+def test_an_env_ftp_tls_resolves_to_the_protocol_it_spells(
+    spelling: str, want: bool, cast: Any
+) -> None:
+    # The ref used to be stored as it was, and `"ftps" if tls` read the ref object as True, so no
+    # value, cast=bool included, could turn TLS off.
+    spec = Ftp(host="ftp.example.org", remote_dir="/in", tls=env("ftp_tls", cast=cast))
+    got = resolve_env_settings(spec.settings, {"ftp_tls": spelling})["protocol"]
+    assert got == ("ftps" if want else "ftp")
+
+
+@pytest.mark.parametrize(
+    ("default", "want"), [("false", "ftp"), ("on", "ftps"), (None, "ftp"), (True, "ftps")]
+)
+def test_an_env_ftp_tls_default_is_read_strictly(default: object, want: str) -> None:
+    spec = Ftp(host="ftp.example.org", remote_dir="/in", tls=env("t", default=default))
+    assert resolve_env_settings(spec.settings, {})["protocol"] == want
+
+
+def test_an_env_ftp_tls_unknown_spelling_is_refused_value_withheld() -> None:
+    planted = "-".join(["planted", "tls"])
+    spec = Ftp(host="ftp.example.org", remote_dir="/in", tls=env("ftp_tls"))
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings(spec.settings, {"ftp_tls": planted})
+    msg = str(ei.value)
+    assert "(env 'ftp_tls'): value is not a valid bool for tls" in msg
+    assert planted not in msg
+    with pytest.raises(
+        WiringError, match="env reference 't' with a bool cast: default= is not"
+    ) as di:
+        Ftp(host="ftp.example.org", remote_dir="/in", tls=env("t", default=planted))
+    assert planted not in str(di.value)
+
+
+def test_a_literal_ftp_tls_is_mapped_as_before() -> None:
+    assert Ftp(host="h", remote_dir="/in", tls=True).settings["protocol"] == "ftps"
+    assert Ftp(host="h", remote_dir="/in").settings["protocol"] == "ftp"
+
+
+def test_the_derived_ftp_protocol_ref_has_a_stable_repr() -> None:
+    ref = Ftp(host="h", remote_dir="/in", tls=env("T")).settings["protocol"]
+    assert repr(ref) == "EnvRef(key='t', default=<unset>, cast=bool for tls)"
+
+
+_FTP_MODULE = """
+from messagefoundry import Ftp, env, outbound
+outbound("OB_FTP", Ftp(host="ftp.example.org", remote_dir="/in", tls=env("ftp_tls")))
+"""
+
+_FTP_TOML = """
+[[outbound]]
+name = "OB_SYNTH_FTP"
+transport = "ftp"
+  [outbound.settings]
+  host = "ftp.example.org"
+  remote_dir = "/in"
+  tls = { env = "ftp_tls" }
+"""
+
+
+@pytest.mark.parametrize(
+    ("filename", "body", "name"),
+    [("cfg.py", _FTP_MODULE, "OB_FTP"), ("connections.toml", _FTP_TOML, "OB_SYNTH_FTP")],
+    ids=["code-first", "connections.toml"],
+)
+@pytest.mark.parametrize(("spelling", "want"), [("false", "ftp"), ("0", "ftp"), ("on", "ftps")])
+def test_ftp_tls_env_reads_strictly_end_to_end(
+    tmp_path: Path, filename: str, body: str, name: str, spelling: str, want: str
+) -> None:
+    (tmp_path / filename).write_text(textwrap.dedent(body), encoding="utf-8")
+    reg = load_config(tmp_path, allow_empty=True)
+    assert _dest(reg, name, {"ftp_tls": spelling})["protocol"] == want
+
+
+def test_a_pin_beside_a_ca_that_an_env_plain_ftp_never_reads_is_refused(tmp_path: Path) -> None:
+    # Ftp() refuses a CA beside a literal tls=False. With an env() tls it cannot know, so the check
+    # after resolution reads the resolved protocol. The control: the same graph with TLS on.
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import Ftp, env, outbound\n"
+        "outbound('OB_FTP', Ftp(host='ftp.example.org', remote_dir='/in', tls=env('ftp_tls'), "
+        f"tls_ca_file='/org/ca.pem', tls_ca_pin={'00' * 32!r}))\n",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path)
+    with pytest.raises(ValueError, match="plain FTP \\(tls=False\\) builds no TLS context"):
+        registry_anchor_specs(reg, {"ftp_tls": "false"})
+    (spec,) = registry_anchor_specs(reg, {"ftp_tls": "true"})
+    assert spec.label == "outbound:OB_FTP"

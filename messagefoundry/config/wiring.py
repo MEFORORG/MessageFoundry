@@ -1263,6 +1263,17 @@ _SETTINGS_FACTORY_RETURNS: Final = frozenset(
 )
 _SETTINGS_FACTORY_NAMES: Final = frozenset({"DatabaseLookup"})
 
+#: The boolean settings a ``with_*`` composer in another module writes under a key that is not its
+#: parameter's name (``with_smart_backend(enabled=)`` stores ``smart_enabled``), so the annotation
+#: scan cannot find them, and the default each composer gives it (vault BACKLOG #3234). Listed rather
+#: than imported, so the first resolve does not load the composers' modules and ``cryptography``.
+#: ``tests/test_env_uncast_bool_setting.py`` pins the table against the composers' source: every bool
+#: parameter of every composer under ``messagefoundry/transports/`` must write a key listed here,
+#: with the default listed here.
+_COMPOSER_BOOL_SETTINGS: Final[Mapping[str, bool]] = MappingProxyType(
+    {"smart_enabled": True, "oauth2_enabled": True, "sign_enabled": True}
+)
+
 
 class _BoolSettings(NamedTuple):
     """What :func:`_bool_settings` found. ``defaults`` maps each strict setting to the default its
@@ -1288,8 +1299,9 @@ def _bool_settings() -> _BoolSettings:
     the connection factories ``connections.toml`` offers, and this needs the lookup and reference
     factories too. The annotation is read the way the ``connections.toml`` type check reads it, through
     the same resolver and classifier, so the two cannot disagree on which settings are boolean.
-    Composers in other modules (``with_smart_backend``'s ``enabled``, stored as ``smart_enabled``)
-    are NOT covered: their parameter names are not their settings keys.
+    A composer in another module writes its flag under a key that is not its parameter's name
+    (``with_smart_backend(enabled=)`` stores ``smart_enabled``), so those are listed in
+    :data:`_COMPOSER_BOOL_SETTINGS` with their defaults.
     Cached: the key set is closed, and the annotations are fixed once the module is imported."""
     from messagefoundry.config.connections_file import _classify, _factory_signature
 
@@ -1321,6 +1333,8 @@ def _bool_settings() -> _BoolSettings:
                 defaults.setdefault(param.name, set()).add(param.default)
             else:
                 other_names.add(param.name)
+    for key, default in _COMPOSER_BOOL_SETTINGS.items():
+        defaults.setdefault(key, set()).add(default)
     strict: dict[str, bool | None] = {}
     for name, seen in defaults.items():
         if name in other_names:
@@ -4375,11 +4389,45 @@ def Sftp(
     )
 
 
+def _ftp_protocol(tls: bool | EnvRef) -> str | EnvRef:
+    """The ``protocol`` setting ``Ftp(tls=...)`` stores: ``"ftps"`` or ``"ftp"``, or for an
+    ``env()`` reference a derived reference that resolves to one of them (vault BACKLOG #3234).
+
+    The factory turns ``tls`` into ``protocol``, so no ``tls`` key ever reaches
+    :func:`resolve_env_settings` and its strict boolean read. A reference passed through as it was
+    is truthy, so ``"ftps" if tls`` chose FTPS whatever the environment said, and a value of
+    ``false`` could not turn TLS off. The derived reference reads the value with the reference's own
+    cast and then strictly, as a ``bool`` setting is read, so ``false`` reads as plain FTP and an
+    unknown spelling is refused with the value withheld. A ``None`` is ``tls``'s default, off. A
+    ``default=`` is read here, because :func:`resolve_env_settings` never casts a default.
+
+    A literal is mapped as it always was, with ``bool()``: a code-first literal is outside this
+    item's scope, for the reason the literal arm of :func:`resolve_env_settings` gives."""
+    if not isinstance(tls, EnvRef):
+        return "ftps" if tls else "ftp"
+    inner = tls.cast
+
+    def protocol(flag: Any) -> str:
+        return "ftps" if _read_bool_setting(flag, False) else "ftp"
+
+    def to_protocol(raw: Any) -> str:
+        return protocol(raw if inner is None else inner(raw))
+
+    # The name is what a refusal and EnvRef's repr print: "value is not a valid bool for tls".
+    to_protocol.__name__ = "bool for tls"
+    default = tls.default
+    if default is not _UNSET:
+        # Not through ``inner``: a ref's own cast never touches its default. A bool-cast EnvRef reads
+        # the default strictly and refuses an unknown spelling with the value withheld.
+        default = protocol(EnvRef(key=tls.key, default=default, cast=_cast_bool).default)
+    return EnvRef(key=tls.key, default=default, cast=to_protocol)
+
+
 def Ftp(
     *,
     host: str | EnvRef,  # the FTP server (may be env())
     port: int | EnvRef = 21,
-    tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
+    tls: bool | EnvRef = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
     # unless a hand-built spec sets tls_check_hostname=False, which a credentialed hop may not.
     tls_allow_expired: bool = False,
@@ -4415,6 +4463,7 @@ def Ftp(
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
+    # An env() tls is truthy here; ``unread_ca_reason`` judges the resolved protocol (#3234).
     _check_tls_ca_file(
         "Ftp", tls_ca_file, unread=None if tls else "plain FTP (tls=False) builds no TLS context"
     )
@@ -4422,7 +4471,7 @@ def Ftp(
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
-            "protocol": "ftps" if tls else "ftp",
+            "protocol": _ftp_protocol(tls),
             "host": host,
             "port": port,
             "tls_allow_expired": tls_allow_expired,
