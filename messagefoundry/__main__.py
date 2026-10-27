@@ -5997,11 +5997,19 @@ def _refuse_overwrite(kind: str, path: Path) -> str:
     return f"refusing to overwrite an existing {kind} file: {path} (remove it first)"
 
 
+def _name_taken(path: Path) -> bool:
+    """Whether anything holds ``path``, a link included, dangling or not. ``exists()`` follows a
+    link, so a dangling one read as free, and on Windows the exclusive create then followed it and
+    wrote outside ``--out-dir`` (vault BACKLOG #3514)."""
+    return path.exists(follow_symlinks=False)
+
+
 def _refusal_for_existing(files: list[tuple[Path, str]]) -> str | None:
-    """The refusal for the first of ``files`` (``(path, kind)``) that exists, else ``None``. A
-    `cert` command checks before it writes any file, so a refusal leaves the directory as it was."""
+    """The refusal for the first of ``files`` (``(path, kind)``) whose name is taken, else
+    ``None``. A `cert` command checks before it writes any file, so a refusal leaves the directory
+    as it was."""
     for path, kind in files:
-        if path.exists():
+        if _name_taken(path):
             return _refuse_overwrite(kind, path)
     return None
 
@@ -6009,13 +6017,13 @@ def _refusal_for_existing(files: list[tuple[Path, str]]) -> str | None:
 def _refuse_a_stale_ca_chain(ca_path: Path, verb: str, why: str) -> str | None:
     """The refusal for a run that writes no ca-chain.pem into a directory that holds one, else
     ``None``. That chain would sit beside a key it does not chain (vault BACKLOG #3514). ``why``
-    is the sentence saying why this run has no chain to write. A dangling link at that name is
-    refused too, rather than read as absent."""
-    if not (ca_path.is_symlink() or ca_path.exists()):
+    is the sentence saying why this run has no chain to write. A setting may still name that
+    chain, so the remedy offers another directory before removing it."""
+    if not _name_taken(ca_path):
         return None
     return (
         f"refusing to {verb} beside an existing CA chain file: {ca_path}. {why}, so that chain "
-        "does not belong to the new key (remove it first)"
+        "does not belong to the new key (choose another --out-dir, or remove it first)"
     )
 
 

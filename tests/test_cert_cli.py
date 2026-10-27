@@ -916,24 +916,53 @@ def test_self_signed_refuses_beside_an_existing_ca_chain(
     assert sorted(p.name for p in out.iterdir()) == ["ca-chain.pem"]
 
 
-def test_self_signed_refuses_beside_a_dangling_ca_chain_link(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A ca-chain.pem that is a link to nothing is not absent: it is refused, as a file is.
-
-    Mutation: test the name with ``exists()`` alone. Red: rc 0, minted beside the link."""
-    out = tmp_path / "o"
+def _dangling_link(out: Path, name: str, target: Path) -> None:
     out.mkdir()
     try:
-        (out / "ca-chain.pem").symlink_to(tmp_path / "gone.pem")
+        (out / name).symlink_to(target)
     except OSError as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
+
+
+@pytest.mark.parametrize(
+    ("name", "refusal"),
+    [
+        ("cert.pem", "refusing to overwrite an existing certificate file"),
+        ("key.pem", "refusing to overwrite an existing key file"),
+        ("ca-chain.pem", "refusing to mint beside an existing CA chain file"),
+    ],
+)
+def test_self_signed_refuses_a_dangling_link_before_it_mints(
+    name: str, refusal: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A name that is a link to nothing is taken, not free. ``exists()`` follows the link and read
+    it as free; on Windows the exclusive create then followed it and wrote the cert outside
+    --out-dir (vault BACKLOG #3514). Now each is refused before the mint, and nothing is written.
+
+    Mutation: test the names with ``exists()``. Red: cert.pem and ca-chain.pem go to rc 0, and on
+    Windows the cert lands at the link's target."""
+    out, target = tmp_path / "o", tmp_path / "elsewhere.pem"
+    _dangling_link(out, name, target)
 
     rc = main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
     assert rc == 2
     error = json.loads(capsys.readouterr().out)["error"]
-    assert error.startswith("refusing to mint beside an existing CA chain file"), error
-    assert sorted(p.name for p in out.iterdir()) == ["ca-chain.pem"]
+    assert error.startswith(refusal), error
+    assert sorted(p.name for p in out.iterdir()) == [name]
+    assert not target.exists()
+
+
+def test_import_names_a_dangling_ca_chain_link_as_an_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bundle that carries a CA, into a directory whose ca-chain.pem is a link to nothing, is
+    refused as an overwrite. It was refused saying the bundle carries no CA, which was untrue."""
+    out = tmp_path / "o"
+    _dangling_link(out, "ca-chain.pem", tmp_path / "elsewhere.pem")
+
+    assert _import_into(tmp_path, monkeypatch, out) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("refusing to overwrite an existing CA chain file"), error
 
 
 def _cert_open_dies_midway(monkeypatch: pytest.MonkeyPatch, name: str = "cert.pem") -> None:
