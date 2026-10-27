@@ -278,7 +278,7 @@ export function trustRemedy(
       `(${reason ?? "the MessageFoundry Engine log says why"}), and an engine whose https entry sets ` +
       `a caFile is never verified against the default CAs. Correct the caFile (an engine shard ` +
       `without its own inherits its environment's), or remove every refused caFile for this ` +
-      `engine to stop pinning it.`
+      `host:port.`
     );
   }
   const head = `cannot verify the TLS certificate ${url} presented (${code}).`;
@@ -381,7 +381,7 @@ export type TrustPin =
  * usable file an accepted pin names, or, when no accepted pin names the host, the first reason a
  * claiming value was refused. A claimed host never takes the certificate `messagefoundry.serviceConfig`
  * names and is never sent on the default roots; a `refused` one can be anchored by nothing, so every
- * request to it is refused until the value is corrected or removed.
+ * request to it is refused until a caFile for it is corrected, or every refused one is removed.
  */
 export type HostPin =
   | { readonly kind: "pin"; readonly file: string }

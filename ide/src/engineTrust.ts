@@ -215,10 +215,10 @@ function trustState(): string {
  * Resolves to true when what the client TRUSTS changed, compared as host keys and PEM contents, so
  * the caller can re-probe rather than leave a stale verdict on screen. Dropping an anchor counts,
  * because a retarget to a remote engine registers nothing and still invalidates the verdict on
- * screen. So does a `caFile` claim this refresh published that differs from the last one published
- * ({@link publishPinnedHosts}), since it changes which requests are refused. Re-reading the same
- * certificate does not count, and claims move only with the settings, so a refresh started by a
- * verification failure cannot re-probe itself into a loop.
+ * screen. A `caFile` claim that moved is not counted here: every caller publishes the claims first
+ * ({@link publishPinnedHosts}), and the settings listener re-probes on what that returns. Re-reading
+ * the same certificate does not count, so a refresh started by a verification failure cannot
+ * re-probe itself into a loop.
  *
  * Refreshes run ONE AT A TIME. Each awaits a subprocess and then replaces the whole set, so two
  * interleaved runs could each replace what the other had just registered with an older reading.
@@ -305,7 +305,7 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   const targets = pinTargetsOf(environments());
   const pins = trustPinsFor(targets);
   const hosts = hostPinsOf(pins);
-  const claimsMoved = publishPinnedHosts(hosts);
+  publishPinnedHosts(hosts);
   // This refresh asks the CLI after any failure noted so far, so it covers that failure.
   lateFailure = undefined;
   acceptsLateFailure = !followUp;
@@ -342,7 +342,7 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   claimedKeys = hosts;
   commit(outcomes, hosts);
   warnAboutUnanchoredTargets(targets, hosts);
-  return claimsMoved || trustState() !== before;
+  return trustState() !== before;
 }
 
 /**
