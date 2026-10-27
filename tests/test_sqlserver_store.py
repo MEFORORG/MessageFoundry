@@ -5950,7 +5950,7 @@ async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
     The per-round failure rate is printed outside pytest's capture, so the ``sqlserver-store`` job
     log carries it on a pass as well as a failure. That line is this backend's measurement.
     """
-    from tests._finalize_race_contract import FINALIZE_RACE_ROUNDS, count_unfinalized_rounds
+    from tests._finalize_race_contract import FINALIZE_RACE_ROUNDS, count_round_statuses
 
     real_applock = store._applock
     skipped = 0
@@ -5964,12 +5964,13 @@ async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
 
     monkeypatch.setattr(store, "_applock", _applock_without_finalize)
 
-    missed = await count_unfinalized_rounds(store, rounds=FINALIZE_RACE_ROUNDS)
+    statuses = await count_round_statuses(store, rounds=FINALIZE_RACE_ROUNDS)
+    missed = FINALIZE_RACE_ROUNDS - statuses[MessageStatus.PROCESSED.value]
     with capsys.disabled():
         print(
             f"\n[#1610 control] finalize applock removed: {missed} of {FINALIZE_RACE_ROUNDS} rounds "
-            f"not PROCESSED ({missed / FINALIZE_RACE_ROUNDS:.2f} per round); "
-            f"{skipped} finalize applock calls skipped"
+            f"not PROCESSED ({missed / FINALIZE_RACE_ROUNDS:.2f} per round); statuses "
+            f"{dict(statuses)}; {skipped} finalize applock calls skipped"
         )
 
     assert skipped >= 2 * FINALIZE_RACE_ROUNDS, (
@@ -5979,8 +5980,9 @@ async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
     )
     assert missed > 0, (
         f"all {FINALIZE_RACE_ROUNDS} rounds reached PROCESSED with the finalize applock removed, so "
-        "the positive test above cannot fail on this backend: the round body no longer races, the "
-        "pool serialises the two mark_done calls, or mark_done gained another serialisation"
+        "the positive test above cannot fail on this backend. Causes include at least: a per-round "
+        "race rate low enough for 30 rounds to miss, a round body that no longer races, a pool that "
+        "serialises the two mark_done calls, or a new serialisation inside mark_done"
     )
 
 
