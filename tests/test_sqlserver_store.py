@@ -5934,9 +5934,10 @@ async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
 
     WHY THIS EXISTS (BACKLOG #1610). A race test that passes proves nothing unless it can also fail:
     the benign interleaving can win every round over a store carrying no lock at all. The Postgres
-    arm was shown to fail with its lock removed, and one CI sample (``tests/_finalize_race_contract``)
-    showed the same here; a recorded sample is not a standing proof, so this control keeps it. This
-    test is a STANDING expected-red-under-patch control: it removes the lock on every run and
+    arm was shown to fail with its lock removed, and two CI jobs showed the same here (recorded in
+    ``tests/_finalize_race_contract``). A recorded sample is not a standing proof, so this control
+    re-runs the proof instead of relying on the record. This test is a STANDING
+    expected-red-under-patch control: it removes the lock on every run and
     asserts the race is observable, so a change that made the test above blind (a pool of one, a
     serialised ``mark_done``, a round body that stopped racing) turns THIS test red instead of
     leaving the positive test green for the wrong reason.
