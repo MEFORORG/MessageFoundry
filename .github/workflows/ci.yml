@@ -3516,6 +3516,168 @@ jobs:
           tests/test_store_privilege_preflight.py
           tests/test_store_privilege_schema_split.py
 
+      # THE CERTIFICATE PIN UNDER STRICT ENCRYPTION, 2025 LEG ONLY (vault BACKLOG #3714 items 6 and 8).
+      # tests/test_sqlserver_store.py::test_server_certificate_pin_is_enforced_under_strict_encryption
+      # needs a server that does a TLS-first (TDS 8.0) handshake, and until this it had never run: both
+      # legs skipped it (PR 2533, run 40381630197). The `services:` container above cannot be that
+      # server, for two reasons. It starts before any step, so a certificate made in a step cannot be
+      # mounted into it. And `network.forcestrict = 1` refuses every non-strict login, which every
+      # suite above makes. So the leg keeps its service container and starts a SECOND container from
+      # the same digest-pinned image on 127.0.0.1:14330, after the other suites have finished.
+      # 2025 only: Microsoft's mssql-conf page lists network.forcestrict as "Applies to: SQL Server
+      # 2025 (17.x) and later versions", so the 2022 leg stays exactly as it was.
+      - name: Start a strict-encryption SQL Server for the certificate pin test (2025 only)
+        if: matrix.label == '2025'
+        timeout-minutes: 5
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/mssql-strict"
+          mkdir -p "$dir/tls"
+          # A throwaway test certificate: Server Authentication EKU, CN and SAN localhost, valid now.
+          openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 7 \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -addext "extendedKeyUsage=serverAuth" \
+            -keyout "$dir/tls/mssql.key" -out "$dir/tls/mssql.pem"
+          openssl x509 -in "$dir/tls/mssql.pem" -noout -subject -dates -ext subjectAltName,extendedKeyUsage
+          printf '%s\n' \
+            '[network]' \
+            'tlscert = /var/opt/mssql/tls/mssql.pem' \
+            'tlskey = /var/opt/mssql/tls/mssql.key' \
+            'forceencryption = 1' \
+            'forcestrict = 1' > "$dir/mssql.conf"
+          # Read the account the image runs as rather than assume it, and give it the files: Microsoft
+          # requires them readable by mssql. The key is 400.
+          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
+          echo "the image runs as uid ${uid}"
+          sudo chown -R "${uid}:0" "$dir/tls" "$dir/mssql.conf"
+          sudo chmod 500 "$dir/tls"
+          sudo chmod 400 "$dir/tls/mssql.key"
+          sudo chmod 444 "$dir/tls/mssql.pem"
+          sudo chmod 644 "$dir/mssql.conf"
+          docker run -d --name mssql-strict -p 127.0.0.1:14330:1433 \
+            -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='Str0ng_P@ssw0rd!' \
+            -v "$dir/mssql.conf:/var/opt/mssql/mssql.conf" \
+            -v "$dir/tls:/var/opt/mssql/tls:ro" \
+            "$IMAGE"
+
+      - name: Wait for the strict SQL Server's TLS-first (TDS 8.0) handshake (2025 only)
+        if: matrix.label == '2025'
+        timeout-minutes: 5
+        # Ready means BOTH the server's own ready line and a completed TLS-first handshake on the
+        # listener port, which is what a TDS 8.0 client opens with. Each grep reads a here-string,
+        # never a pipe, so a `grep -q` that stops reading early cannot fail the check.
+        run: |
+          out=""
+          for i in $(seq 1 60); do
+            state="$(docker inspect -f '{{.State.Status}}' mssql-strict 2>&1 || true)"
+            if [ "$state" != "running" ]; then
+              docker logs --tail 80 mssql-strict 2>&1
+              echo "::error::the strict-mode SQL Server container is ${state}, not running. Its mssql.conf sets network.forcestrict = 1 (SQL Server 2025 only); read its log above."
+              exit 1
+            fi
+            logs="$(docker logs mssql-strict 2>&1)"
+            if grep -q "SQL Server is now ready for client connections" <<<"$logs"; then
+              # Inside the `if`, so the shell's -e does not end the loop on a refused handshake.
+              if out="$(timeout 10 openssl s_client -connect 127.0.0.1:14330 -servername localhost -alpn tds/8.0 </dev/null 2>&1)" \
+                && grep -q "BEGIN CERTIFICATE" <<<"$out"; then
+                echo "BACKLOG-3714-STRICT-READY try=${i} $(grep -m1 -E '^(New|Protocol)' <<<"$out") $(grep -m1 'ALPN' <<<"$out")"
+                exit 0
+              fi
+            fi
+            echo "waiting for the strict SQL Server ($i)"; sleep 2
+          done
+          echo "$out"
+          docker logs --tail 80 mssql-strict 2>&1
+          echo "::error::no TLS-first (TDS 8.0) handshake on 127.0.0.1:14330 within about 120 s. The strict-mode SQL Server (network.forcestrict = 1, SQL Server 2025 only) is not serving strict encryption, so the certificate pin test cannot run."
+          exit 1
+
+      # The two arms run the same test with the same run body; MEFOR_TEST_SQLSERVER_PIN_TRUSTED names
+      # the arm. Each step fails unless the test RAN: a skip prints no BACKLOG-2223-PIN line, and a
+      # skipped pin test reads exactly like a passing one.
+      - name: Run the certificate pin test, certificate untrusted (2025 strict server)
+        if: matrix.label == '2025'
+        timeout-minutes: 5
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_TEST_SQLSERVER_STRICT: "1"
+          MEFOR_TEST_SQLSERVER_PIN_TRUSTED: "0"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "14330"
+          MEFOR_STORE_DATABASE: master
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          PYTHONFAULTHANDLER: "1"
+        run: |
+          set -o pipefail
+          arm=untrusted
+          if [ "$MEFOR_TEST_SQLSERVER_PIN_TRUSTED" = "1" ]; then arm=trusted; fi
+          log="$RUNNER_TEMP/pin-${arm}.log"
+          status=0
+          bash scripts/ci/retry-native-crash.sh pytest -v -rs --timeout=120 \
+            "tests/test_sqlserver_store.py::test_server_certificate_pin_is_enforced_under_strict_encryption" \
+            | tee "$log" || status=$?
+          line="$(grep -o "BACKLOG-2223-PIN arm=${arm} .*" "$log" | tail -n 1 || true)"
+          if [ -z "$line" ]; then
+            echo "::error::no BACKLOG-2223-PIN arm=${arm} line: the certificate pin test did not run (skipped, or failed before measuring)."
+            exit 1
+          fi
+          echo "::notice title=BACKLOG-2223-PIN ${arm}::${line}"
+          exit "$status"
+
+      - name: Trust the strict server's certificate in the runner's OpenSSL store (2025 only)
+        if: matrix.label == '2025'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo cp "$RUNNER_TEMP/mssql-strict/tls/mssql.pem" /usr/local/share/ca-certificates/mefor-ci-mssql-strict.crt
+          sudo update-ca-certificates
+          # The runner's own OpenSSL must now verify the presented chain AND host name, or the
+          # trusted arm below would be another untrusted arm. The test checks the driver's view too.
+          if ! out="$(timeout 10 openssl s_client -connect 127.0.0.1:14330 -servername localhost -alpn tds/8.0 \
+            -verify_return_error -verify_hostname localhost </dev/null 2>&1)"; then
+            echo "$out"
+            echo "::error::the runner's OpenSSL does not trust the strict server's certificate after update-ca-certificates"
+            exit 1
+          fi
+          grep -m1 "Verify return code" <<<"$out"
+
+      - name: Run the certificate pin test, certificate trusted (2025 strict server)
+        if: matrix.label == '2025'
+        timeout-minutes: 5
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_TEST_SQLSERVER_STRICT: "1"
+          MEFOR_TEST_SQLSERVER_PIN_TRUSTED: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "14330"
+          MEFOR_STORE_DATABASE: master
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          PYTHONFAULTHANDLER: "1"
+        run: |
+          set -o pipefail
+          arm=untrusted
+          if [ "$MEFOR_TEST_SQLSERVER_PIN_TRUSTED" = "1" ]; then arm=trusted; fi
+          log="$RUNNER_TEMP/pin-${arm}.log"
+          status=0
+          bash scripts/ci/retry-native-crash.sh pytest -v -rs --timeout=120 \
+            "tests/test_sqlserver_store.py::test_server_certificate_pin_is_enforced_under_strict_encryption" \
+            | tee "$log" || status=$?
+          line="$(grep -o "BACKLOG-2223-PIN arm=${arm} .*" "$log" | tail -n 1 || true)"
+          if [ -z "$line" ]; then
+            echo "::error::no BACKLOG-2223-PIN arm=${arm} line: the certificate pin test did not run (skipped, or failed before measuring)."
+            exit 1
+          fi
+          echo "::notice title=BACKLOG-2223-PIN ${arm}::${line}"
+          exit "$status"
+
   # Postgres store backend (Track B): run the gated store suite against a real PostgreSQL service
   # container (Linux, so 1x minutes). Runs NIGHTLY + on-demand (workflow_dispatch — use
   # `gh workflow run ci.yml --ref <branch>` to exercise it on a feature branch) + on PRs that touch
