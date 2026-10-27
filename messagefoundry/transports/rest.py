@@ -1913,10 +1913,10 @@ def _refuse_a_static_proxy_header(headers: object) -> None:
     own header from a static one. Under Digest the connection sets no header of its own, so the
     static one would cross a cleartext proxy leg on the connection's admission. Under Basic it
     would be silently replaced. Refused rather than dropped, so the operator sees the conflict.
-    Names the key, never its value. Of the key, it shows only the plain name and any whitespace,
-    control characters and colons around it. Any other text the key holds, letters, digits or
-    punctuation, may be a credential typed into the key, and is named as more text instead
-    (vault BACKLOG #3457).
+    Names the key, never its value, and shows the key only as
+    :func:`~messagefoundry.transports.bounded_read.proxy_credential_header_name_shown` does,
+    because text around the plain name may be a credential typed into the key (vault BACKLOG
+    #3457).
     The key is read by the function the send-time rule uses, so the two cannot differ on which
     spellings are this header."""
     if not isinstance(headers, Mapping):

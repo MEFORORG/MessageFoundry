@@ -683,6 +683,7 @@ def test_a_static_proxy_header_beside_proxy_user_is_refused_at_build_in_any_spel
     with _WireProxy() as proxy, pytest.raises(ValueError, match="#3443") as raised:
         _rest_with_static_header(name, proxy, proxy_user="u5er", proxy_password="pa55w0rd")
     text = str(raised.value)
+    assert f"headers sets {bounded_read.proxy_credential_header_name_shown(name)} and" in text
     if name in _PUNCTUATED:
         assert repr(name) not in text
         assert "not shown" in text
@@ -1766,6 +1767,11 @@ def test_a_plain_value_is_asked_about_once_an_open_and_only_when_it_could_be_ref
         ),
         ("/== " + _NAME, "a key holding Proxy-Authorization after other text, not shown"),
         (" " * 60 + _NAME, repr(" " * 60 + _NAME[:4]) + ", cut at 64 characters,"),
+        ("\x00" * 60 + _NAME, repr("\x00" * 60 + _NAME[:4]) + ", cut at 64 characters,"),
+        (":" + _NAME, repr(":" + _NAME)),
+        (_NAME + "\x85\u3000\u2028\u2029", repr(_NAME + "\x85\u3000\u2028\u2029")),
+        ("\ufeff" + _NAME + "\u200b\u00ad", repr("\ufeff" + _NAME + "\u200b\u00ad")),
+        (_NAME + "\ue000", repr(_NAME + "\ue000")),
     ],
     ids=[
         "plain",
@@ -1781,12 +1787,17 @@ def test_a_plain_value_is_asked_about_once_an_open_and_only_when_it_could_be_ref
         "letters-before",
         "punctuation-before",
         "long",
+        "long-controls",
+        "colon-before",
+        "c1-and-unicode-separators",
+        "format-characters",
+        "private-use",
     ],
 )
 def test_an_error_shows_nothing_but_separators_around_the_plain_name(name: str, shown: str) -> None:
     """A credential typed into the key may hold letters and digits in any script, and
-    punctuation too: base64 holds ``+``, ``/`` and ``=``. So only whitespace, control
-    characters and colons around the plain name are shown, and a cut at the cap is named, so
+    punctuation too: base64 holds ``+``, ``/`` and ``=``. So around the plain name only
+    whitespace, invisible characters and colons are shown, and a cut at the cap is named, so
     the shown key never reads as whole when it is not."""
     assert is_proxy_credential_header_name(name)
     assert bounded_read.proxy_credential_header_name_shown(name) == shown

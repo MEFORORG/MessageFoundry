@@ -133,6 +133,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast, overload
 
 from messagefoundry.config.tls_policy import is_loopback_hop_host, verifies_peer_fully
+from messagefoundry.controlchars import CONTROL_CATEGORIES
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.transports.base import DeliveryError, NegativeAckError, ReplyBodyDropped
 
@@ -1084,12 +1085,11 @@ def proxy_credential_header_name_shown(name: str) -> str:
 
     Text around the plain name may be a credential typed into the name (vault BACKLOG #3457),
     and a credential may hold punctuation as well as letters and digits: base64 holds ``+``,
-    ``/`` and ``=``. So nothing outside the plain name is shown but whitespace, control
-    characters and colons, which a printable credential does not hold and which an operator
-    cannot otherwise see in the key. The name is shown in ``repr`` form from its start, through
-    the plain name, up to the first other character after it, and what follows is named as more
-    text. A name with any other character before the plain name is not shown at all. At most 64
-    characters are shown, and a cut there is named."""
+    ``/`` and ``=``. So nothing outside the plain name is shown but the characters
+    :func:`_is_shown_separator` names. The name is shown in ``repr`` form from its start,
+    through the plain name, up to the first other character after it, and what follows is named
+    as more text. A name with any other character before the plain name is not shown at all. At
+    most 64 characters are shown, and a cut there is named."""
     start = _NON_NAME_RUN.match(name)
     lead = start.end() if start is not None else 0
     if not all(map(_is_shown_separator, name[:lead])):
@@ -1104,10 +1104,14 @@ def proxy_credential_header_name_shown(name: str) -> str:
 
 
 def _is_shown_separator(ch: str) -> bool:
-    """Whether an error may show ``ch`` beside the plain name: a colon, or whitespace or a control
-    character (Unicode categories ``Cc``, ``Zs``, ``Zl`` and ``Zp``). No printable credential is
-    made of them (vault BACKLOG #3457)."""
-    return ch == ":" or unicodedata.category(ch) in ("Cc", "Zs", "Zl", "Zp")
+    """Whether an error may show ``ch`` beside the plain name (vault BACKLOG #3457).
+
+    Whitespace and the invisible characters of :data:`CONTROL_CATEGORIES`: no printable
+    credential is made of them, and an operator cannot see them in the key, so the error is the
+    one place that names them. And a colon, which a key copied from a ``Name: value`` header line
+    ends in. A colon is printable and a credential may hold one, so a credential that starts with
+    colons has those colons shown; nothing else of it is."""
+    return ch == ":" or ch.isspace() or unicodedata.category(ch) in CONTROL_CATEGORIES
 
 
 def _is_spelled_plainly(name: str | bytes) -> bool:
