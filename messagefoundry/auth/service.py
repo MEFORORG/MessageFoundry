@@ -5091,7 +5091,7 @@ class AuthService:
         # each backend's cipher raises its own classes, which ``auth/`` does not import, and every
         # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it.
         try:
-            secret = self._totp_secret(user)
+            secret = await self._totp_secret(user)
             step = (
                 totp.verify_totp_step(
                     secret,
@@ -10233,13 +10233,20 @@ class AuthService:
         await self._user_seal_failed(user.id)
         return None
 
-    def _totp_secret(self, user: VerifiedUser) -> str | None:
+    async def _open_totp_cell(self, user: VerifiedUser) -> str | None:
+        """``user``'s TOTP cell, the one the checked record's seal covered (BACKLOG #3510), opened
+        OFF THE EVENT LOOP (BACKLOG #3929). The service's one way to open it: under a Transit cipher
+        the open is a blocking ``decrypt_data`` HTTP call (CLAUDE.md section 6), and the combined
+        sign-in reaches it with a username alone. Raises what the store's opener raises."""
+        return await asyncio.to_thread(self._store.open_totp_secret, user.id, user.totp_secret_cell)
+
+    async def _totp_secret(self, user: VerifiedUser) -> str | None:
         """``user``'s TOTP secret, decrypted from the record its seal covered (BACKLOG #3510), or
         ``None``. Never a second read of the store: a secret swapped in after the checked load would
         be checked against no seal, and its codes would sign in. A secret whose enrolment marker
         is refused is logged here (BACKLOG #3422): every code check then reads it as a wrong code,
         so this line is what names the cause."""
-        secret = self._store.open_totp_secret(user.id, user.totp_secret_cell)
+        secret = await self._open_totp_cell(user)
         # A keyless open hands ciphertext through; that is a store-key fault, not a refused marker.
         if (
             secret is not None
@@ -10249,19 +10256,19 @@ class AuthService:
             _log_totp_refused(user.username)
         return secret
 
-    def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
+    async def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
         """``user``'s TOTP enrolment as :meth:`verify_mfa` compares it across a code check (BACKLOG
         #3068): the enrolment stamp and a digest of the opened secret, so the plaintext is not held
         across the check. ``None`` when the cell does not open, logged by
         :func:`_log_totp_undecryptable`."""
         try:
-            secret = self._totp_secret(user)
+            secret = await self._totp_secret(user)
         except CipherError:
             _log_totp_undecryptable(user.username)
             return None
         return user.totp_enrolled_at, None if secret is None else hash_token(secret)
 
-    def _totp_enrolment_moved(
+    async def _totp_enrolment_moved(
         self, verified: _TotpEnrolment | None, current: VerifiedUser
     ) -> _TotpMoved | None:
         """Why the TOTP factor :meth:`verify_mfa` checked a code against is no longer the one row
@@ -10271,7 +10278,7 @@ class AuthService:
         apart by the stamp or the opened secret). BACKLOG #3068, #3780."""
         if not current.totp_enabled:
             return "factor_removed"
-        enrolment_now = self._totp_enrolment(current)
+        enrolment_now = await self._totp_enrolment(current)
         if verified is None or enrolment_now is None:
             return "factor_unverified"
         if not _same_totp_enrolment(verified, enrolment_now):
@@ -12422,19 +12429,17 @@ class AuthService:
         """What ``user``'s TOTP is (:func:`_opened_totp_state`, the census rule), or ``None`` when
         it is not enabled. The engine judges it ``"usable"`` when it can compute codes with it. An
         enrolment whose marker this release refuses matches no code, so its combined sign-in can
-        never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one this checked
-        record's seal covered (BACKLOG #3510), opened OFF THE EVENT LOOP, since a Transit cipher's
-        decrypt is a blocking HTTP call (CLAUDE.md section 6). The service's way-past
+        never pass a lock, and it is no way past (BACKLOG #3422). The cell is opened by
+        :meth:`_open_totp_cell`, off the event loop. The service's way-past
         decisions ask this: the rotation and removal gates, the last-factor rule and the lock
         notice; the store's conditional writes and the lock escalation ask the same rule
         (``totp_usable``) on the cell they lock."""
-        cell = user.totp_secret_cell
         if not user.totp_enabled:
             return None
-        if cell is None:
+        if user.totp_secret_cell is None:
             return "refused"
         try:
-            secret = await asyncio.to_thread(self._store.open_totp_secret, user.id, cell)
+            secret = await self._open_totp_cell(user)
         except CipherError:
             log_unopened_totp(user.id)
             return "unknown"
@@ -12777,7 +12782,7 @@ class AuthService:
         user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
-        secret = self._totp_secret(user)
+        secret = await self._totp_secret(user)
         if not secret:
             raise ValueError("no enrollment in progress")
         # The stored cell this code is checked against. The enable below turns TOTP on only while
@@ -13080,7 +13085,7 @@ class AuthService:
             # ``replace_totp_enrolment``'s compare-and-set relies on, and the opened secret is
             # compared too, so two enrolments sharing a stamp still differ. Neither moves under a
             # store-key rotation, which re-encrypts the cell, so a rotation refuses nothing.
-            verified_enrolment = self._totp_enrolment(user)
+            verified_enrolment = await self._totp_enrolment(user)
             match = _CodeMatch()
             try:
                 proved = await self._verify_second_factor(
@@ -13119,7 +13124,7 @@ class AuthService:
                 # no longer holds. It is spent by now, so the refusal is audited with its reason.
                 # A cell that no longer opens proves nothing either way; the proof is spent, so it
                 # is refused and audited too rather than raised past the "never raises" contract.
-                refusal = self._totp_enrolment_moved(verified_enrolment, fresh)
+                refusal = await self._totp_enrolment_moved(verified_enrolment, fresh)
                 if refusal is not None:
                     await self._audit(
                         "auth.mfa_failed",
@@ -13206,7 +13211,7 @@ class AuthService:
                     )
                     if isinstance(held, Elevation):
                         return held
-                    change = self._totp_enrolment_moved(verified_enrolment, held)
+                    change = await self._totp_enrolment_moved(verified_enrolment, held)
                 except Exception:  # noqa: BLE001 - any re-read failure is charged, never raised
                     _log.exception("verify_mfa: the factor re-read after a failed spend raised")
                 else:
@@ -13644,7 +13649,7 @@ class AuthService:
         if not code:
             return False
         totp_refused = False
-        secret = self._totp_secret(user)
+        secret = await self._totp_secret(user)
         if secret:
             # Clock-skew window is operator-configurable (BACKLOG #187; ASVS 6.5.5). Default
             # totp_skew_steps=0 accepts only the current 30 s step (strict, tightest replay window);
@@ -13929,7 +13934,7 @@ class AuthService:
         # verify, and _totp_secret logs it at every code check.
         if user.totp_enabled and totp.reenrolment_possible():
             try:
-                secret = self._totp_secret(user)
+                secret = await self._totp_secret(user)
             except CipherError:
                 _log_totp_undecryptable(user.username)
                 secret = None
