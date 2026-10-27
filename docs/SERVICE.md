@@ -23,9 +23,10 @@ venv interpreter) and the per-connection firewall openings the service needs.
 
 1. **The engine, installed where only administrators can write.** The installer's default is
    `C:\Program Files\MessageFoundry\engine`, built from the engine wheel and never editable.
+   The installer builds it when you pass the wheel, as
    [Install the engine where only administrators can write](#install-the-engine-where-only-administrators-can-write)
-   builds it. The installer checks that folder and does not build it. It refuses any other
-   install, such as a checkout's venv, that anyone but administrators can write.
+   shows, and refuses any install, such as a checkout's venv, that anyone but administrators can
+   write.
 2. **NSSM** — provisioned automatically. `install-service.ps1` keeps the `nssm.exe` the service
    runs in `-NssmDir`, `C:\Program Files\MessageFoundry\nssm` by default. It refuses a folder that
    anyone but administrators can write to or owns, because it runs that file as administrator. It
@@ -55,32 +56,56 @@ change. So the installer's default engine is a virtual environment under Program
 the engine wheel (vault BACKLOG #2626). An editable install in a checkout is code its developers can
 change, and the service would run their next edit.
 
-1. Get the engine wheel. Take a release wheel and verify it as
-   [INSTALL-GUIDE.md](INSTALL-GUIDE.md) shows, or build one from a checkout as yourself, not
-   elevated: `python -m pip wheel --no-deps -w dist .`
-2. In an elevated PowerShell, in the folder that holds the wheel and the release's
-   `requirements.lock`, build the install:
+1. Get the engine wheel and the `requirements.lock` of the same release into one folder. Take a
+   release wheel and verify it as [INSTALL-GUIDE.md](INSTALL-GUIDE.md) shows, with the lock from
+   that release's tag, or build a wheel from a checkout as yourself, not elevated:
+   `python -m pip wheel --no-deps -w dist .`
+2. Take the SHA-256 of each: `(Get-FileHash -Algorithm SHA256 <file>).Hash`. The lock pins every
+   dependency by hash, but not the engine wheel. No signature covers the lock, so compare it with
+   the release tag's copy (`git show v<version>:requirements.lock`) before you hash it: its pin
+   shows only that pip reads the file you hashed.
+3. Pass them to the installer, elevated, with the options [Install](#install) names:
    ```powershell
-   $Root = "$env:ProgramFiles\MessageFoundry\engine"
-   python -m venv $Root
-   & "$Root\Scripts\python.exe" -m pip install --require-hashes -r requirements.lock
-   & "$Root\Scripts\python.exe" -m pip install --no-deps (Get-Item .\messagefoundry-*.whl).FullName
+   .\scripts\service\install-service.ps1 -EngineWheel D:\release\messagefoundry-0.5.2-py3-none-any.whl `
+       -EngineWheelSha256 <wheel hash> -RequirementsLockSha256 <lock hash> `
+       -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml
    ```
-   `requirements.lock` is the SHA-256-pinned export checked in sync and audited in CI (DEP-1).
-   Install the web console wheel the same way if the service serves `/ui`.
-3. Make the folder and the folder above it administrator-only, owner included:
-   ```powershell
-   $Parent = Split-Path -Parent $Root
-   foreach ($Folder in $Parent, $Root) {
-       icacls $Folder /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" `
-           "*S-1-5-32-545:(OI)(CI)RX" "*S-1-5-11:(OI)(CI)RX"
-   }
-   icacls $Parent /setowner "*S-1-5-32-544"
-   icacls $Root /setowner "*S-1-5-32-544" /T /C
-   ```
-   A new folder under Program Files can be owned by the administrator who made it, with full
-   control through `CREATOR OWNER`. That administrator's own account then counts as another
-   account that can write it.
+
+**With `-EngineWheel`, the installer builds the root before it checks it** (vault BACKLOG #2626).
+Without it, the installer builds nothing and checks the root that is there; it never falls back to
+an editable install. It makes the root administrator-only before pip runs, and refuses, installing
+nothing, when the copy of the wheel or the lock pip would read misses its pin. It installs the lock
+with `--require-hashes` and binary wheels only, and the engine wheel with `--no-deps`, with pip
+reading no configuration file or `PIP_` variable. So pip needs `pypi.org` for the dependencies:
+it reads no mirror or proxy a `pip.ini` names. `Build-EngineInstall` in the script is the source
+of record for the steps and their order.
+
+It refuses to build into a root that already exists, so it never upgrades in place; see
+[Update to a new build](#update-to-a-new-build-restart-vs-reinstall). An unfinished build deletes
+the root. NSSM is fetched and checked before the build, so a refused `-NssmPath` or `-NssmDir`, or
+a failed download, leaves no root. When a step after the build fails, such as the service
+registration, re-run with `-EngineWheel` left out to use the root it built.
+`-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython` defaults to the first `python` on `PATH`; `Get-EngineBuildProblem` in the script lists what it
+refuses there, at least a launcher, a shim, a venv's interpreter, a Python older than 3.14 and
+one anyone but administrators can write. The installer installs the engine wheel only. Install
+the web console wheel by hand if the service serves `/ui`, then reset the owner as below.
+
+**To reset an existing root's access list and owner**, such as after an update by hand:
+
+```powershell
+$Root = "$env:ProgramFiles\MessageFoundry\engine"
+$Parent = Split-Path -Parent $Root
+foreach ($Folder in $Parent, $Root) {
+    icacls $Folder /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" `
+        "*S-1-5-32-545:(OI)(CI)RX" "*S-1-5-11:(OI)(CI)RX"
+}
+icacls $Parent /setowner "*S-1-5-32-544"
+icacls $Root /setowner "*S-1-5-32-544" /T /C
+```
+
+A file an administrator creates there can be owned by that administrator's own account, under the
+"Object creator" default-owner policy. That account then counts as another account that can write
+it, and the installer refuses the install.
 
 **The installer refuses an engine install anyone but administrators can write** (vault BACKLOG
 #2626). That holds for the default root and for one you pass with `-AppExe` or `-PythonExe`. It
@@ -248,8 +273,11 @@ Restart-Service MessageFoundry
 curl.exe --cacert C:\ProgramData\MessageFoundry\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
-Install the release's `requirements.lock` first when its dependencies changed. The installer
-refuses an editable install, so a restart never runs whatever branch a checkout has.
+Install the release's `requirements.lock` first when its dependencies changed, then reset the
+owner as
+[Install the engine where only administrators can write](#install-the-engine-where-only-administrators-can-write)
+shows. The installer refuses an editable install, so a restart never runs whatever branch a
+checkout has.
 
 **Reinstall** instead when paths or flags change (port, config dir, data dir) or the service
 definition drifted — the install script is idempotent (it stops and reconfigures in place):
@@ -567,9 +595,8 @@ environment.
   `encryption_key_file` at it, and run `messagefoundry rotate-key` with the prior key in
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
   the rotation, once nothing still needs its key. Set that retired key in the shell that runs
-  `rotate-key`, never in the service's NSSM list: the engine refuses to start with it there. So the
-  service's first start after a rotation runs without the retired key, and the secret-rotation
-  watcher then keeps each secret's older date and logs a warning ([PHI.md](PHI.md) §3).
+  `rotate-key`, never in the service's NSSM list: the engine refuses to start with it there. The
+  service's first start after a rotation needs no retired key ([PHI.md](PHI.md) §3, BACKLOG #3472).
   **CORRECTED 2026-10-01:** this said `protect-key` locks the file to the minting admin plus SYSTEM
   after writing it, and that a rotation writes the new key "to the file" (vault BACKLOG #2601).
 

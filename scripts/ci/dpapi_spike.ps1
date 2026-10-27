@@ -88,7 +88,8 @@ if (-not (Test-Path -LiteralPath $PythonExe)) { throw "No interpreter at $Python
 
 # --- the installer's own definitions ---------------------------------------------------------------
 $lifted = @(
-    "Get-FilePinProblem", "Get-BroadWriteHolders", "Set-AdminOnlyAcl", "Get-NssmHomeProblem",
+    "Get-FilePinProblem", "Get-BroadWriteHolders", "Set-AdminOnlyAcl", "New-AdminOnlyFolder",
+    "Get-NssmHomeProblem",
     "Save-PinnedNssm", "Resolve-Nssm", "Get-ServiceImageProblem", "Set-ServiceImage",
     "Set-ServiceAccount", "Disable-RefusedService", "Set-ServiceLogonRight",
     "Get-ServiceSidTypeChoice", "Get-ServiceTokenProblem", "Set-ServiceTokenHardening",

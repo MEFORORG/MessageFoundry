@@ -1598,8 +1598,16 @@ def test_a_delta_crl_drops_a_revocation_without_the_refusal(
 
 
 def test_harden_crl_check_refuses_a_delta_crl(_crl_material: dict[str, str]) -> None:
-    with pytest.raises(ValueError, match="CRL block 2 of 2 cannot be judged: it is a delta CRL"):
+    with pytest.raises(
+        ValueError, match="CRL block 2 of 2 cannot be judged: it is a delta CRL"
+    ) as e:
         harden_crl_check(_verifying_ctx(), _crl_material["ca_base_then_delta"])
+    # BACKLOG #3112 and #3512: the reason states both OpenSSL delta rules and puts the cause on the
+    # engine. The prefix above is shared with the old text, which gave one rule and blamed OpenSSL.
+    text = str(e.value)
+    assert "the engine turns on no delta CRL support" in text, text
+    assert "lose the base CRL's revocations" in text, text
+    assert "rejects a delta as a complete CRL and loses the delta's revocations" in text, text
 
 
 @pytest.mark.parametrize("stem", ["fresh_then_expired", "ca_only"])

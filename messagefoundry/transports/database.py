@@ -752,8 +752,8 @@ def _warn_generic_tls_unenforced(
     BACKLOG #1178 it was the whole of what stood between a generic PHI connection with no TLS keyword
     and a plaintext crossing. The refusal now lives in :func:`generic_cleartext_hop_guard`, which puts
     the same classifier's verdict through the shared hop authority. This still fires beside that gate,
-    and it is the ONLY report on the arm the gate no-ops: an unstamped posture (a direct embedding, or
-    a live-serve rebuild after the enforced pre-flight already vetted the config).
+    and it is the ONLY report on the arm the gate no-ops: an unstamped posture, such as a direct
+    embedding or test build. The runner stamps its live serve builds, so they reach the gate.
 
     ``connection`` names the declaring connection (#333). Without it a site running several generic DB
     connections gets a line it cannot act on — the remedy is per-connection, so the report must be too.

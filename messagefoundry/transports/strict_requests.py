@@ -73,7 +73,9 @@ own would turn that test red.
 **A verifying hop that checks no revocation is refused unless it is attested (vault BACKLOG
 #2983, owner ruling 2026-10-13).** :func:`_refuse_an_unrevoked_vault_hop` says how. It runs when the
 client is built and again before each send, on the same inputs. On an instance that is not
-enforcing, the same hop is crossed with a warning.
+enforcing, the same hop is crossed with a warning. The TLS leg to an ``https://`` proxy is judged
+on those inputs too, by :func:`_refuse_an_unrevoked_proxy_leg`, before each tunnelled connection
+opens its socket (vault BACKLOG #3561).
 
 **A refusal of the hop is one type at both phases (BACKLOG #2318).** Every check on the hop itself,
 its address, its proxy, its TLS leg or its pool, raises :class:`VaultHopRefused`, an
@@ -86,6 +88,7 @@ shrinking it to a type name.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import http.client
 import logging
@@ -204,7 +207,10 @@ _NARROWED_POOL_MARK = "_mefor_narrowed_tls"
 
 
 def _narrowed_pool_classes(
-    factory: Callable[[], ssl.SSLContext], *, connector: str
+    factory: Callable[[], ssl.SSLContext],
+    *,
+    connector: str,
+    judge_proxy_leg: Callable[[ssl.SSLContext, str | None], None],
 ) -> dict[str, type[urllib3.connectionpool.HTTPConnectionPool]]:
     """The pool classes one adapter's managers use, replacing ``urllib3``'s module-level map.
 
@@ -253,6 +259,12 @@ def _narrowed_pool_classes(
     urllib3 renames the hook, though only after ``CONNECT``. That second check reads the proxy leg
     through ``SSLTransport.socket``, also urllib3's own name. If that changes, every tunnelled
     connection is refused: it fails closed, never open.
+
+    **The proxy leg's revocation is judged before its socket opens (vault BACKLOG #3561).** Proxy
+    credentials and the Vault host name cross that leg, protected by its TLS alone.
+    ``judge_proxy_leg`` is the adapter's :func:`_refuse_an_unrevoked_proxy_leg`, bound to its
+    posture and attestation. :meth:`_narrow_the_proxy_leg` hands it the leg's own context and the
+    proxy's host once it has built that context.
 
     **A connection that will not verify is refused before its socket opens.** The Vault clients
     refuse ``verify=False``, so requests sets ``CERT_NONE`` on one case only: an ``http://`` Vault
@@ -404,6 +416,9 @@ def _narrowed_pool_classes(
             ):
                 return None
             context = factory()
+            # Vault BACKLOG #3561: before the socket opens, so before CONNECT and any proxy
+            # credentials cross. The CRL flag it reads does not depend on the CA load below.
+            judge_proxy_leg(context, self.proxy.host)
             # The Vault anchor; the docstring above says why the connection loads it here.
             if self.ca_certs or self.ca_cert_dir or self.ca_cert_data:
                 try:
@@ -531,7 +546,18 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
     ) -> None:
         # Set BEFORE super().__init__(), which builds the pool manager through init_poolmanager.
         self._ssl_context_factory = ssl_context_factory
-        self._pool_classes = _narrowed_pool_classes(ssl_context_factory, connector=connector)
+        self._pool_classes = _narrowed_pool_classes(
+            ssl_context_factory,
+            connector=connector,
+            judge_proxy_leg=functools.partial(
+                _refuse_an_unrevoked_proxy_leg,
+                connector=connector,
+                revocation_attested=revocation_attested,
+                attestation_section=attestation_section,
+                posture=posture,
+                revocation_reason=revocation_reason,
+            ),
+        )
         super().__init__()
         self._connector = connector
         self._limit = limit
@@ -612,18 +638,25 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # since, which takes a loopback Vault off the box.
         self.refuse_an_unrevoked_hop(url, proxy)
         # Vault BACKLOG #4028: after this method's refusals, so a send refused here is not named.
-        # What the WARNING claims is in docs/CONFIGURATION.md, the point-of-use paragraphs.
+        # What the WARNING claims is in docs/CONFIGURATION.md, under the sub-heading it names.
         _disclose_ambient_proxy(self._connector, proxy)
         return pool
 
     def _checks_revocation(self) -> bool:
         """Whether this adapter's contexts check revocation, read once and kept.
 
-        The guard runs at the mount and again before every send. Building a context costs about
-        11 ms (a review agent's measurement, 2026-10-13), and the Transit cipher sends once per
-        stored cell. So the flag is read off one context the factory builds, the first time the
-        answer could matter, and kept for the adapter's life. Every connection's context comes
-        from the same factory."""
+        The guard runs at the mount and again before every send, and the Transit cipher sends once
+        per stored cell. So the flag is read off one context the factory builds, the first time
+        the answer could matter, and kept for the adapter's life. Every connection's context comes
+        from the same factory.
+
+        **That build is one more per client build, on a hop that warns or refuses** (vault
+        BACKLOG #3565). The suite assertion already builds one and drops it, and reusing it needs
+        a change in ``config/tls_policy.py``. It was measured on 2026-10-26, on Windows with
+        CPython 3.14.6, OpenSSL 3.5.7 and urllib3 2.8.0. One factory build took 0.13 ms, the
+        median of 200. An unattested client build on a ``warn`` instance built 2 contexts before
+        any send, and an attested one built 1. *(This read "about 11 ms (a review agent's
+        measurement, 2026-10-13)" until then.)*"""
         if self._crl_checked is None:
             self._crl_checked = context_checks_revocation(self._ssl_context_factory())
         return self._crl_checked
@@ -757,7 +790,8 @@ def _proxy_scheme(proxy: str) -> str:
         scheme = urllib3.util.parse_url(
             requests.utils.prepend_scheme_if_needed(proxy, "http")
         ).scheme
-    except ValueError:  # LocationParseError
+    # LocationParseError; TypeError when the prepend joins a userinfo to no host ("http://u@").
+    except (ValueError, TypeError):
         return ""
     return (scheme or "").lower()
 
@@ -929,7 +963,8 @@ def _proxy_carries_cleartext_credentials(proxy: str) -> bool:
         scheme = urllib3.util.parse_url(
             requests.utils.prepend_scheme_if_needed(proxy, "http")
         ).scheme
-    except ValueError:  # LocationParseError
+    # LocationParseError; TypeError when the prepend joins a userinfo to no host ("http://u@").
+    except (ValueError, TypeError):
         return True
     return (scheme or "").lower() != "https"
 
@@ -961,14 +996,18 @@ _UNREVOKED_VAULT_HOP = (
     "revocation (no CRL and no OCSP), and no CRL lever is built for it. Only a loopback Vault "
     "reached with no proxy crosses without an attestation."
 )
-#: The one lever each refusal offers: the hop's own settings pair, and nothing else.
+#: The one lever each refusal offers: the hop's own settings pair, and nothing else. Through an
+#: ``https://`` proxy the pair covers the proxy's certificate too (vault BACKLOG #3561), and this
+#: refusal fires first, so it is the one that says so.
 _STORE_REVOCATION_LEVER = (
-    "If revocation of that certificate is covered outside the engine, set "
+    "If revocation of that certificate is covered outside the engine, and of an https:// proxy's "
+    "certificate where the hop goes through one, set "
     "[store].vault_revocation_attested = true with a [store].vault_revocation_attested_reason; "
     "refusing (vault BACKLOG #2983)"
 )
 _SECRETS_REVOCATION_LEVER = (
-    "If revocation of that certificate is covered outside the engine, set "
+    "If revocation of that certificate is covered outside the engine, and of an https:// proxy's "
+    "certificate where the hop goes through one, set "
     "[secrets].vault_revocation_attested = true with a "
     "[secrets].vault_revocation_attested_reason; refusing (vault BACKLOG #2983)"
 )
@@ -995,10 +1034,17 @@ _CROSSINGS_LOGGED: set[tuple[str, str]] = set()
 _CROSSINGS_LOCK = threading.Lock()
 
 
+def _crossing_logged(connector: str, kind: str) -> bool:
+    """Whether :func:`_first_crossing` has already marked this crossing. Asked before every
+    send, so it takes no lock; a False answer is settled under the lock."""
+    return (connector, kind) in _CROSSINGS_LOGGED
+
+
 def _first_crossing(connector: str, kind: str) -> bool:
     """Whether this is the first ``kind`` of crossing on the ``connector`` hop in this process.
 
-    Shared by the revocation crossings (kinds ``attested`` and ``warned``) and the ambient proxy
+    Shared by the revocation crossings (kinds ``attested`` and ``warned``, and ``proxy leg
+    attested`` and ``proxy leg warned`` for the leg to an ``https://`` proxy) and the ambient proxy
     disclosure (kind ``ambient proxy <digest>``), so resetting the set resets both.
 
     A crossing is logged once per process for each hop, not at every client build. The secret
@@ -1008,10 +1054,9 @@ def _first_crossing(connector: str, kind: str) -> bool:
     **The hop is named by its connector label.** The key provider and the Transit cipher share
     one label, one Vault address and one settings pair, so they share one line. A process that
     crosses the same hop both ways, attested and warned, logs each once."""
-    key = (connector, kind)
-    # Asked before every send, so the common answer takes no lock.
-    if key in _CROSSINGS_LOGGED:
+    if _crossing_logged(connector, kind):
         return False
+    key = (connector, kind)
     with _CROSSINGS_LOCK:
         if key in _CROSSINGS_LOGGED:
             return False
@@ -1028,12 +1073,18 @@ def _disclose_ambient_proxy(connector: str, proxy: str | None) -> None:
     Keyed by a digest of the raw value, never the raw string: why, and what that does not
     protect, is the ``docs/ASVS-L2-PHASE0-CHANGES.md`` section 4 row "Vault hop ambient-proxy
     disclosure dedupe". Keyed by it rather than the label, so an already-named proxy costs one
-    hash rather than a parse on each send (the Transit cipher sends once per stored cell)."""
+    hash rather than a parse on each send (the Transit cipher sends once per stored cell).
+
+    The label is built before the value is marked as named, so a label that failed to build could
+    not leave the value marked and never named."""
     if not proxy:
         return
-    digest = hashlib.sha256(proxy.encode("utf-8", "surrogatepass")).hexdigest()
-    if _first_crossing(connector, f"ambient proxy {digest}"):
-        logger.warning("%s", vault_hop_proxy_warning(connector, _dialled_proxy_label(proxy)))
+    kind = f"ambient proxy {hashlib.sha256(proxy.encode('utf-8', 'surrogatepass')).hexdigest()}"
+    if _crossing_logged(connector, kind):
+        return
+    label = _dialled_proxy_label(proxy)
+    if _first_crossing(connector, kind):
+        logger.warning("%s", vault_hop_proxy_warning(connector, label))
 
 
 def _dialled_proxy_label(proxy: str) -> str:
@@ -1046,7 +1097,8 @@ def _dialled_proxy_label(proxy: str) -> str:
     label = proxy_label(proxy)
     try:
         parsed = urllib3.util.parse_url(requests.utils.prepend_scheme_if_needed(proxy, "http"))
-    except (ValueError, urllib3.exceptions.LocationParseError):
+    # TypeError: requests' prepend joins a userinfo with a host of None, as in "http://u@".
+    except (ValueError, TypeError, urllib3.exceptions.LocationParseError):
         return UNREADABLE_PROXY_LABEL
     if parsed.host is None:  # else the f-string below would compare a host spelled "None"
         return UNREADABLE_PROXY_LABEL
@@ -1128,13 +1180,57 @@ def _refuse_an_unrevoked_vault_hop(
     :class:`VaultHopRefused` with fixed text that names the hop's own settings pair and no other
     lever.
 
-    **Named gap, the proxy leg.** Through an ``https://`` proxy the hop has a second TLS leg, to
-    the proxy. Nothing checks revocation of the proxy's certificate, and the attestation does
-    not claim it. :func:`_narrowed_pool_classes` says why that leg does not protect the token."""
+    **The proxy leg has a guard of its own (vault BACKLOG #3561).** Through an ``https://`` proxy
+    the hop has a second TLS leg, to the proxy. :func:`_refuse_an_unrevoked_proxy_leg` judges it,
+    and this hop's attestation claims that leg's certificate too.
+    :func:`_narrowed_pool_classes` says why that leg does not protect the token."""
     scheme, host = _vault_scheme_and_host(url)
     if scheme != "https":
         return
-    on_box = _stays_on_the_box(host, proxy)
+    if _crossed_unrevoked(
+        connector=connector,
+        on_box=_stays_on_the_box(host, proxy),
+        checks_revocation=checks_revocation,
+        revocation_attested=revocation_attested,
+        attestation_section=attestation_section,
+        posture=posture,
+        revocation_reason=revocation_reason,
+        kind="",
+        unchecked=_UNCHECKED_VAULT_HOP,
+        under_enforce=(
+            f"this hop is refused unless {_REVOCATION_PAIR[attestation_section]} is true with its "
+            "reason, which must also cover the proxy's certificate where the hop goes through an "
+            "HTTPS proxy"
+        ),
+    ):
+        return
+    # Two raise sites, so each text is built from module constants alone and the source scan in
+    # tests/test_vault_hop_refusal_marker.py can hold it to that.
+    if attestation_section == "store":
+        raise VaultHopRefused(f"{connector}: {_UNREVOKED_VAULT_HOP} {_STORE_REVOCATION_LEVER}")
+    raise VaultHopRefused(f"{connector}: {_UNREVOKED_VAULT_HOP} {_SECRETS_REVOCATION_LEVER}")
+
+
+def _crossed_unrevoked(
+    *,
+    connector: str,
+    on_box: bool,
+    checks_revocation: Callable[[], bool],
+    revocation_attested: bool,
+    attestation_section: VaultAttestationSection,
+    posture: HopPosture | None,
+    revocation_reason: str | None,
+    kind: str,
+    unchecked: str,
+    under_enforce: str,
+) -> bool:
+    """Decide one TLS leg of a Vault hop and log its crossing; ``False`` means refuse it.
+
+    The decision both revocation guards share: :func:`_refuse_an_unrevoked_vault_hop` for the
+    Vault leg and :func:`_refuse_an_unrevoked_proxy_leg` for the leg to an ``https://`` proxy.
+    The first one's docstring gives the inputs and the three answers. Each guard raises its own
+    refusal, so its text stays fixed. ``kind`` prefixes the :func:`_first_crossing` kinds, so each
+    leg logs its own lines; ``unchecked`` and ``under_enforce`` are those lines' fixed text."""
     attested = revocation_attested is True
     # An unknown posture is enforcing, the rule `HopPosture.fail_closed` gives an unknown dial.
     # Only the value `False` relaxes it, so a posture built with no dial at all stays strict.
@@ -1144,7 +1240,6 @@ def _refuse_an_unrevoked_vault_hop(
         return revocation_hop_disposition(
             enforcing=enforcing,
             is_loopback_hop=on_box,
-            proxy_proven=False,
             attested=attested,
             crl_checked=crl_checked,
             blanket_attested=tls_revocation_attested(),
@@ -1154,38 +1249,33 @@ def _refuse_an_unrevoked_vault_hop(
     if disposition is not HopDisposition.ALLOW and checks_revocation():
         disposition = decide(True)
     if disposition is HopDisposition.ALLOW:
-        # The attestation is why this hop crossed where nothing above it in the authority
+        # The attestation is why this leg crossed where nothing above it in the authority
         # allowed it: off the box, under a posture that would have refused. This arm does not
-        # read the CRL flag. No CRL lever is built, so the read could only build a context to
-        # learn nothing, and `_UNCHECKED_VAULT_HOP` already says no lever is built. A change
-        # that builds one must revisit that text and this arm together.
-        if attested and enforcing and not on_box and _first_crossing(connector, "attested"):
+        # read the CRL flag. No CRL lever is built, so on the Vault leg the read could only
+        # build a context to learn nothing, and `unchecked` already says no lever is built. A
+        # change that builds one must revisit that text and this arm together.
+        if attested and enforcing and not on_box and _first_crossing(connector, f"{kind}attested"):
             log_attested_crossing(
                 logger,
                 crossing=_CROSSED_UNCHECKED,
                 connection=None,
-                detail=f"{connector}; {_UNCHECKED_VAULT_HOP}. Logged once per process for this hop",
+                detail=f"{connector}; {unchecked}. Logged once per process for this hop",
                 reason=revocation_reason,
                 declaration=_REVOCATION_PAIR[attestation_section],
             )
-        return
+        return True
     if disposition is HopDisposition.WARN:
-        if _first_crossing(connector, "warned"):
+        if _first_crossing(connector, f"{kind}warned"):
             logger.warning(
-                "%s, because [security].enforcement is not enforce; %s; %s. Under enforce this "
-                "hop is refused unless %s is true with its reason. Logged once per process for "
-                "this hop.",
+                "%s, because [security].enforcement is not enforce; %s; %s. Under enforce %s. "
+                "Logged once per process for this hop.",
                 _CROSSED_UNCHECKED,
                 connector,
-                _UNCHECKED_VAULT_HOP,
-                _REVOCATION_PAIR[attestation_section],
+                unchecked,
+                under_enforce,
             )
-        return
-    # Two raise sites, so each text is built from module constants alone and the source scan in
-    # tests/test_vault_hop_refusal_marker.py can hold it to that.
-    if attestation_section == "store":
-        raise VaultHopRefused(f"{connector}: {_UNREVOKED_VAULT_HOP} {_STORE_REVOCATION_LEVER}")
-    raise VaultHopRefused(f"{connector}: {_UNREVOKED_VAULT_HOP} {_SECRETS_REVOCATION_LEVER}")
+        return True
+    return False
 
 
 #: The text after the connector label of each revocation refusal above, by the section it names.
@@ -1214,6 +1304,93 @@ def is_unrevoked_vault_hop_refusal(
         return False
     _connector, _sep, reason = str(exc).partition(": ")
     return reason == _UNREVOKED_VAULT_HOP_REASONS[section]
+
+
+#: The fixed text of the proxy leg's revocation refusal (vault BACKLOG #3561). It names no part of
+#: the proxy URL, no credential and no CA path.
+_UNREVOKED_PROXY_LEG = (
+    "the TLS leg to this hop's https:// proxy would be verified, but it checks no certificate "
+    "revocation (no CRL and no OCSP), and no CRL lever is built for it. Proxy credentials and the "
+    "Vault host name cross that leg."
+)
+_STORE_PROXY_LEG_LEVER = (
+    "If revocation of the proxy's certificate is covered outside the engine, as well as the Vault "
+    "server's, set [store].vault_revocation_attested = true with a "
+    "[store].vault_revocation_attested_reason that covers both; refusing (vault BACKLOG #3561)"
+)
+_SECRETS_PROXY_LEG_LEVER = (
+    "If revocation of the proxy's certificate is covered outside the engine, as well as the Vault "
+    "server's, set [secrets].vault_revocation_attested = true with a "
+    "[secrets].vault_revocation_attested_reason that covers both; refusing (vault BACKLOG #3561)"
+)
+#: What both of the proxy leg's crossing records say about it. Fixed text, like the refusal.
+_UNCHECKED_PROXY_LEG = (
+    "the TLS leg to its https:// proxy is verified, but checks no certificate revocation (no CRL "
+    "and no OCSP), and no CRL lever is built for it"
+)
+
+
+def _refuse_an_unrevoked_proxy_leg(
+    context: ssl.SSLContext,
+    proxy_host: str | None,
+    *,
+    connector: str,
+    revocation_attested: bool,
+    attestation_section: VaultAttestationSection,
+    posture: HopPosture | None = None,
+    revocation_reason: str | None = None,
+) -> None:
+    """Refuse the TLS leg to an ``https://`` proxy when it checks no revocation and carries no
+    attestation (vault BACKLOG #3561, owner ruling 2026-10-26).
+
+    The Vault token does not need this leg: it crosses inside the tunnel, on the Vault leg's own
+    TLS. But proxy credentials do. :func:`_refuse_cleartext_proxy_credentials` allows a
+    credentialed ``https://`` proxy, so its ``Proxy-Authorization`` crosses this leg with this
+    leg's TLS as its only protection. A holder of the proxy's revoked key would get that
+    credential and the Vault host name from the ``CONNECT``, and could stop the hop. A proxy
+    with no credentials is judged the same way, since the host name still crosses.
+
+    ``context`` is the leg's own context, as ``_narrow_the_proxy_leg`` built it, and the CRL flag
+    is read off it, never off a setting. ``proxy_host`` is the host urllib3 dials for the proxy.
+
+    **It decides as** :func:`_refuse_an_unrevoked_vault_hop` **does, through the same**
+    :func:`_crossed_unrevoked`, **and adds no check on the wire.** The hop's posture, its
+    attestation and the process-wide variable go in the same slots, and the CRL flag is read
+    only when the answer could turn on it. The leg is on the box when the proxy's host is
+    loopback, decided without DNS.
+
+    **The hop's attestation covers this leg.** Both legs are on the one path to Vault, so a hop
+    crosses only when both are covered, and one claim with a reason that names both
+    certificates says that. A second settings pair would let nothing new cross. The refusal
+    text says the reason must cover the proxy's certificate.
+
+    **When this refusal can fire on its own is in ADR 0173 §12.** Today the Vault leg's guard
+    refuses the same hops first, and its refusal names the proxy's certificate too. Its crossing
+    lines are written once per process for each hop, under the kinds :func:`_first_crossing`
+    names.
+
+    Runs once per new tunnelled connection, before its socket opens. Raises
+    :class:`VaultHopRefused` with fixed text."""
+    if _crossed_unrevoked(
+        connector=connector,
+        # The leg ends at the proxy, so only the proxy's own host decides it, without DNS.
+        on_box=bool(host := (proxy_host or "").strip("[]")) and is_loopback_hop_host(host),
+        checks_revocation=lambda: context_checks_revocation(context),
+        revocation_attested=revocation_attested,
+        attestation_section=attestation_section,
+        posture=posture,
+        revocation_reason=revocation_reason,
+        kind="proxy leg ",
+        unchecked=_UNCHECKED_PROXY_LEG,
+        under_enforce=(
+            f"this leg is refused unless {_REVOCATION_PAIR[attestation_section]} is true with a "
+            "reason that covers the proxy's certificate"
+        ),
+    ):
+        return
+    if attestation_section == "store":
+        raise VaultHopRefused(f"{connector}: {_UNREVOKED_PROXY_LEG} {_STORE_PROXY_LEG_LEVER}")
+    raise VaultHopRefused(f"{connector}: {_UNREVOKED_PROXY_LEG} {_SECRETS_PROXY_LEG_LEVER}")
 
 
 def _prepared_vault_hop(

@@ -102,7 +102,6 @@ from messagefoundry.pipeline.wiring_runner import (
 )
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
-from messagefoundry.store.crypto import rotation_fingerprint_keys
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
     REINGRESS_TARGET_PREFIX,
@@ -1537,12 +1536,13 @@ class Engine:
             return frozenset()
         if not isinstance(self.store, SecretRotationMetaStore):
             return frozenset()
-        if self.store.secret_rotation_fingerprint_key() is None:
-            # Keyless, or `vault_transit`, where the DEK never enters the heap: no secret is
+        if self.store.secret_rotation_cipher() is None:
+            # Keyless, or `vault_transit`, where fingerprinting stays off (BACKLOG #3472; whether it
+            # should start is vault BACKLOG #3473): no secret is
             # fingerprinted, so no class can carry an age and the opt-in cannot fire. Say so rather
             # than let an operator believe the listed classes refuse. BACKLOG #2320: this line used
             # to say those classes "only alert", but reconcile_rotation_meta stamps a non-DEK class
-            # only under a fingerprint key, so here no class has a stamp and the reminder runner
+            # only under a sealing cipher, so here no class has a stamp and the reminder runner
             # never sees one. They do not alert either, and the line must say so.
             log.warning(
                 "[secret_rotation].enforce_secret_expiry_classes is set but this store does not "
@@ -2100,8 +2100,9 @@ class Engine:
         if self._secret_rotation_settings is not None:
             # Reconcile the NON-SECRET fingerprint/tracked-since stamps once at start (ASVS 13.3.4): the
             # DEK is tracked live-by-default off a persisted key-id stamp; each held connector/AD/SMTP/
-            # Vault/OIDC secret is fingerprinted with a DEK-derived keyed MAC so a change auto-detects a
-            # rotation; and the ENFORCE escalation fires here (at restart) for a DEK past max_age + grace.
+            # Vault/OIDC secret is fingerprinted with a keyed MAC sealed as a store-cipher cell
+            # (BACKLOG #3472) so a change auto-detects a rotation; and the ENFORCE escalation fires
+            # here (at restart) for a DEK past max_age + grace.
             # The upserts are idempotent (keyed-MAC + dates only, never a value). All three shipped
             # backends (SQLite, SQL Server, Postgres) implement the narrow SecretRotationMetaStore
             # (#1186), so this isinstance gate engages on each and the reconcile + ENFORCE escalation
@@ -2119,9 +2120,6 @@ class Engine:
                         # they ride the SAME keyed-MAC fingerprint mechanism as the fixed MEFOR_* classes
                         # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
                         extra_values=self._connector_secret_env_values(),
-                        # BACKLOG #2242: the keys a retired DEK derives, so a DEK rotation re-keys
-                        # the fingerprints instead of reading every class as rotated.
-                        prior_fingerprint_keys=rotation_fingerprint_keys(self.store.cipher()),
                     )
                 except Exception:
                     # A reconcile failure must never take the engine down — the runner still works off the

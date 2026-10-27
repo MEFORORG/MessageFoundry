@@ -442,9 +442,9 @@ _SITES: dict[str, Callable[[Kit], object]] = {
     "messagefoundry/api/tls.py::build_api_ssl_context::'API/UI listener'": lambda k: (
         api_tls.build_api_ssl_context(ApiSettings(tls_cert_file=k.cert, tls_key_file=k.key))
     ),
-    "messagefoundry/transports/mllp.py::_mllp_ssl_context::'MLLP listener'": _mllp_listener,
+    "messagefoundry/transports/mllp.py::_mllp_ssl_context::listener": _mllp_listener,
     "messagefoundry/transports/dicom.py::_server_ssl_context::'DICOM listener'": _dicom_listener,
-    "messagefoundry/transports/mllp.py::_mllp_ssl_context::'MLLP destination'": lambda k: (
+    "messagefoundry/transports/mllp.py::_mllp_ssl_context::destination": lambda k: (
         mllp._mllp_ssl_context({"tls": True, "host": "localhost"}, server=False)
     ),
     "messagefoundry/transports/dicom.py::_client_ssl_context::connector": lambda k: (
@@ -495,6 +495,30 @@ _SITES: dict[str, Callable[[Kit], object]] = {
     ),
     "messagefoundry/verify/smoke.py::live_smoke_ssl_context::'verify live smoke'": lambda k: (
         smoke.live_smoke_ssl_context()
+    ),
+}
+
+#: The label each site whose key holds an expression, not a literal, passes when its factory above
+#: builds it. A literal key is checked against its own text, and every other key needs an entry
+#: here, so no site's label goes unchecked (vault BACKLOG #3514: the MLLP keys became variable
+#: names, and the literal-only check stopped running for them without a word).
+_PASSED_LABELS: dict[str, str] = {
+    "messagefoundry/transports/mllp.py::_mllp_ssl_context::listener": "MLLP listener",
+    "messagefoundry/transports/mllp.py::_mllp_ssl_context::destination": "MLLP destination",
+    "messagefoundry/transports/dicom.py::_client_ssl_context::connector": "DICOM destination",
+    "messagefoundry/config/tls_policy.py::build_asserted_https_handler::connector": (
+        "urllib default handler (measurement)"
+    ),
+    _LDAPS_SITE: "LDAPS bind to AD",
+    "messagefoundry/config/tls_policy.py::assert_hvac_tls_suites.narrowed_context::connector": (
+        "Vault (measurement)"
+    ),
+    "messagefoundry/config/tls_policy.py::build_anchored_https_handler::connector": (
+        "HTTP family (measurement)"
+    ),
+    "messagefoundry/config/tls_policy.py::build_smtp_tls_context::cell": "SMTP (measurement)",
+    "messagefoundry/store/postgres.py::_verifying_context::connector": (
+        "Postgres store (system trust)"
     ),
 }
 
@@ -596,12 +620,18 @@ def captured(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[GateCall]]:
             setattr(module, _GATE, original)
 
 
+def _is_literal(connector: str) -> bool:
+    """Whether a key's ``connector=`` part is a string literal, so its own text is the label."""
+    return connector[:1] in ("'", '"')
+
+
 def build_site(site: str, kit: Kit, seen: list[GateCall]) -> tuple[ssl.SSLContext, object]:
     """Run the site's real builder; return the one context it handed the gate, and what it built.
 
     The call must come from the site the key names, file and function, and with the key's connector
-    when that is a literal. Otherwise a factory that reaches the gate through another function (a
-    builder delegating to a sibling) would be filed under a site it never measured."""
+    when that is a literal, else the label :data:`_PASSED_LABELS` gives it. Otherwise a factory
+    that reaches the gate through another function (a builder delegating to a sibling), or another
+    arm of the same one, would be filed under a site it never measured."""
     built = _SITES[site](kit)
     assert len(seen) == 1, f"{site}: the gate saw {len(seen)} contexts, expected exactly one"
     call = seen[0]
@@ -609,10 +639,8 @@ def build_site(site: str, kit: Kit, seen: list[GateCall]) -> tuple[ssl.SSLContex
     assert (call.file, call.function) == (file, function), (
         f"{site}: the gate call came from {call.file}::{call.function}, a different site"
     )
-    if connector[:1] in ("'", '"'):
-        assert call.connector == ast.literal_eval(connector), (
-            f"{site}: connector {call.connector!r}"
-        )
+    expected = ast.literal_eval(connector) if _is_literal(connector) else _PASSED_LABELS[site]
+    assert call.connector == expected, f"{site}: connector {call.connector!r}"
     return call.ctx, built
 
 
@@ -654,6 +682,14 @@ def test_the_measured_population_is_the_derived_population() -> None:
         f"{missing}. Gone from the code: {stale}. Add a factory to _SITES that builds the new "
         f"context through its real builder; do not narrow the derivation to make this pass."
     )
+
+
+def test_every_site_without_a_literal_label_has_one_given() -> None:
+    """A key whose ``connector=`` is not a literal has its label checked only through
+    :data:`_PASSED_LABELS`, so it must have an entry there, and an entry must name such a key
+    (vault BACKLOG #3514)."""
+    expression_keys = {s for s in _SITES if not _is_literal(s.rsplit("::", 1)[1])}
+    assert expression_keys == set(_PASSED_LABELS), sorted(expression_keys ^ set(_PASSED_LABELS))
 
 
 @pytest.mark.parametrize("site", _params(list(_SITES)))
