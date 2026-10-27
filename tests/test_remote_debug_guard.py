@@ -657,16 +657,24 @@ def test_a_hook_behind_a_cut_off_probe_is_still_reported(
     """Vault BACKLOG #3463, state 2 of ``install_remote_debug_guard``: an earlier audit hook raises
     on the probe event, so the engine's hook is in and refuses but never answers. Until then each
     call started no reporter and put the interpreter's unraisable hook back, so a refusal was not
-    logged and its full path went to standard error. The command line's two calls each add, so
-    one extra copy stacks, which the docstring bounds."""
+    logged and its full path went to standard error. Each call adds while the probe stays cut
+    off, so a copy stacks per call, as the docstring says."""
     installs = _Installs(monkeypatch)
-    before = sys.unraisablehook
+    passed_on: list[BaseException | None] = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda u: passed_on.append(u.exc_value))
     monkeypatch.setattr(remotedebug, "_probe", lambda: None)
     install_remote_debug_guard()
     install_remote_debug_guard()
     assert installs.hooks == [remotedebug._guard, remotedebug._guard]
     assert installs.reporters == 1
-    assert sys.unraisablehook is not before
+    # The hook left in place drops a refusal and passes anything else on.
+    refused = RemoteScriptRefused("refused")
+    other = ValueError("not ours")
+    for exc in (refused, other):
+        sys.unraisablehook(
+            cast("sys.UnraisableHookArgs", SimpleNamespace(exc_value=exc, exc_type=type(exc)))
+        )
+    assert passed_on == [other]
 
 
 def test_a_hook_refused_at_import_behind_a_cut_off_probe_goes_in_at_serve(
@@ -697,14 +705,16 @@ def test_a_probe_that_reads_false_after_a_cut_off_one_adds_on_every_call(
 ) -> None:
     """The Lander's second finding on engine PR 2528: the probe reads None then None, False then
     False, then None. The second call proves the hook is not in, so the third call must add, as
-    main does. Every call here adds."""
+    main does. Every call here adds. The stand-in records each add call: the scripted probes,
+    not the record, say which of them the interpreter kept."""
     installs = _Installs(monkeypatch)
     answers = iter([None, None, False, False, None, None])
     monkeypatch.setattr(remotedebug, "_probe", lambda: next(answers))
     install_remote_debug_guard()
     install_remote_debug_guard()
     install_remote_debug_guard()
-    assert installs.hooks == [remotedebug._guard] * 3
+    add_calls = installs.hooks
+    assert add_calls == [remotedebug._guard] * 3
     assert installs.reporters == 1
 
 
@@ -1179,8 +1189,8 @@ def test_a_hook_behind_one_that_stops_the_probe_is_reported(
     reading = _install_probe(tmp_path, "probe-objecting")
     assert reading["before"] is False and reading["after"] is False
     # Every call adds while the probe is cut off, so a hook refused at import still goes in later
-    # (the Lander's first finding on engine PR 2528). The probe makes the import's call and both
-    # later ones, one more than a real process makes, as it runs `_serve` or `_supervise`.
+    # (the Lander's first finding on engine PR 2528). The probe makes the import's call and the
+    # two `serve` and `supervise` make, so one copy stacks per call.
     assert len(cast("list[object]", reading["loaded_at_install"])) == 3
     assert reading["reporter"] is True and reading["quiet"] is True
 

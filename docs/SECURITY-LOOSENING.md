@@ -1846,9 +1846,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   In either case a later install call adds the hook again. So a hook the other one refused at
   import still goes in if that hook stops refusing by the time `serve` or `supervise` makes its
   own call. In the first case nothing stacks, because the interpreter dropped the hook. In the
-  second a copy can stack. The command line installs at most twice per process, so at most one
-  extra copy stacks. It changes no count: the first copy refuses the script, and the
-  interpreter asks no hook after one that raised. Without a count,
+  second a copy can stack, one per install call, and nothing else bounds them. The command line
+  makes at least two calls, at import and then in `serve` or `supervise`. Under `python -m`, the
+  `api/tls.py` import above runs the import-time call again, and an application makes one per
+  call it adds. A stacked copy changes no count: the first copy refuses the script, and the
+  interpreter asks no hook after one that raised. Each copy does run on every other audited
+  event, so the hook's per-event cost is paid once per copy. Without a count,
   the entry cannot tell the cases apart, so read it as the first, and look for what else in the
   process adds an audit hook.
 - **An audit hook added earlier can refuse a script ahead of the engine's, in any state.** Where

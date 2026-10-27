@@ -305,8 +305,9 @@ def install_remote_debug_guard() -> None:
     - It answered: the hook is in. Later calls find it answering and add nothing.
     - It passed every hook unanswered (False): the hook is not in the list, for example because
       an audit hook added earlier raised on ``sys.addaudithook`` and the interpreter dropped the
-      new hook without an error. The quiet ``sys.unraisablehook`` is put back, no reporter starts,
-      and the next call tries again. Nothing can stack, because the hook is not in the list.
+      new hook without an error. The quiet wrapper this call put on ``sys.unraisablehook`` comes
+      off, this call starts no reporter, and the next call tries again. Nothing can stack, because
+      the hook is not in the list. A wrapper and a reporter an earlier cut-off call left stay.
     - An earlier hook raised on the probe event and cut it off (None). The hook may be in behind
       it, refusing, or that hook may also have refused the add. The quiet wrapper and the reporter
       stay, so a refusal is logged and its full path is kept off standard error. The posture reads
@@ -315,12 +316,15 @@ def install_remote_debug_guard() -> None:
     Any call whose first probe does not read True adds the hook, whatever an earlier call read.
     That keeps the retry for an earlier hook that cuts the probe off and refused the add at
     import, but no longer refuses it by the time ``serve`` or ``supervise`` makes its own call.
-    The cost is a copy that may stack where the first add did go in behind a cut-off probe. The
-    command line calls this at most twice per process (at import, then first in ``_serve`` or
-    ``_supervise``), so at most one extra copy stacks there. An application that calls it more
-    often can stack one copy per call while the probe stays cut off. A stacked copy changes no
-    count: the first copy raises on ``cpython.remote_debugger_script``, and the interpreter stops
-    at the first hook that raises, so a later copy never sees the event.
+    The cost is a copy that may stack where the first add did go in behind a cut-off probe: one
+    per call made while the probe stays cut off, and nothing else bounds them. The command line
+    makes at least two calls, at import and then first in ``_serve`` or ``_supervise``. Under
+    ``python -m``, a later import of the command-line module runs the import-time call again, as
+    ``api/tls.py`` does when it writes a key. A stacked copy changes no count: the first copy
+    raises on ``cpython.remote_debugger_script``, and the interpreter stops at the first hook
+    that raises, so a later copy never sees the event. Each copy does run on every other audited
+    event, so the per-event cost the module docstring measures is paid once per copy, and each
+    call that adds also wraps ``sys.unraisablehook`` once more.
 
     Where ``sys.addaudithook`` raised instead of returning, the hook is not in, so the quiet
     wrapper is put back and the next call tries again. Nothing is logged there: the command line
@@ -336,8 +340,8 @@ def install_remote_debug_guard() -> None:
     if not sys.is_remote_debug_enabled():
         return
     with _install_lock:
-        # A cut-off probe (None) adds too: the docstring says why, and what can stack.
-        if _probe() is not True:
+        # A cut-off probe adds too: the docstring says why, and what can stack.
+        if not _guard_answers():
             # Quiet first, so no refusal is ever reported with its full path.
             previous = sys.unraisablehook
             quiet = sys.unraisablehook = _without_own_refusals(previous)
