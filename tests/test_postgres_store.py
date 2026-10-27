@@ -812,6 +812,32 @@ async def test_stats_and_metrics(store) -> None:
     assert ok is True
 
 
+async def test_last_received_loose_scan_matches_the_group_by(store) -> None:
+    """BACKLOG #1726 limb B on Postgres: the shared loose-index-scan string returns what the old
+    GROUP BY did, over several channels whose ids differ in case, length and non-ASCII characters,
+    and connection_metrics carries each channel's newest received_at. The SQLite differential does
+    not reach here: postgres.py binds the string by name at import."""
+    from messagefoundry.store.store import _LAST_RECEIVED_SQL
+
+    assert await store._fetchall(_LAST_RECEIVED_SQL) == []  # an empty table ends the walk at once
+    channels = ("IB_B", "IB_a", "IB_A", "IB_é", "", "IB_AA")
+    expected: dict[str, float] = {}
+    for n, channel in enumerate(channels):
+        for k in range(3):
+            at = 100.0 + 10 * n + k
+            await store.enqueue_message(channel_id=channel, raw=RAW, deliveries=[], now=at)
+            expected[channel] = at
+    old = await store._fetchall(
+        "SELECT channel_id, MAX(received_at) AS last_at FROM messages GROUP BY channel_id"
+    )
+    new = await store._fetchall(_LAST_RECEIVED_SQL)
+    assert len(new) == len(channels)
+    assert {r["channel_id"]: r["last_at"] for r in new} == expected
+    assert {r["channel_id"]: r["last_at"] for r in old} == expected
+    metrics = await store.connection_metrics(since=10_000.0, now=10_000.0)
+    assert {c: m.last_at for c, m in metrics.inbound.items()} == expected
+
+
 async def test_cancel_queued(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0

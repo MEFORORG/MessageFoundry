@@ -189,6 +189,7 @@ from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _LAST_RECEIVED_SQL,
     _SESSION_CAP_ORDER_SQL,
     AD_MAPS,
     AD_ROLE_MAP,
@@ -520,6 +521,9 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_messages_channel ON messages(channel_id, received_at)",
     "CREATE INDEX IF NOT EXISTS ix_messages_control ON messages(channel_id, control_id)",
+    # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's
+    # plan is pinned by a test; this backend's plan has not been measured.
+    "CREATE INDEX IF NOT EXISTS ix_messages_received ON messages(received_at, id)",
     """CREATE TABLE IF NOT EXISTS queue (
         id               TEXT PRIMARY KEY,
         message_id       TEXT NOT NULL REFERENCES messages(id),
@@ -10599,9 +10603,9 @@ class PostgresStore:
             since,
         )
         counts = {r["channel_id"]: (r["read"], r["errored"]) for r in count_rows}
-        last_rows = await self._fetchall(
-            "SELECT channel_id, MAX(received_at) AS last_at FROM messages GROUP BY channel_id"
-        )
+        # BACKLOG #1726: the SQLite store's loose index scan, as one string. Its result is pinned
+        # against the old GROUP BY on the gated Postgres leg; its plan here is not measured.
+        last_rows = await self._fetchall(_LAST_RECEIVED_SQL)
         inbound: dict[str, InboundMetrics] = {}
         for r in last_rows:
             read, errored = counts.pop(r["channel_id"], (0, 0))

@@ -1943,6 +1943,10 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_messages_channel ON messages(channel_id, received_at)""",
     """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_control','IndexID') IS NULL
         CREATE INDEX ix_messages_control ON messages(channel_id, control_id)""",
+    # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's
+    # plan is pinned by a test; this backend's plan has not been measured.
+    """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_received','IndexID') IS NULL
+        CREATE INDEX ix_messages_received ON messages(received_at, id)""",
     # Unified staged queue (ADR 0001) — ingress -> routed -> outbound, one row per stage-unit with a
     # `stage` discriminator. The SQL Server backend originally shipped a flat `outbox` table; it was
     # RECREATED by this very `_SCHEMA` on every open and read by nothing (the staged pipeline and every
@@ -14892,6 +14896,11 @@ class SqlServerStore:
             (MessageStatus.ERROR.value, since),
         )
         counts = {r["channel_id"]: (r["read"], r["errored"]) for r in count_rows}
+        # BACKLOG #1726: still reads every messages row. SQLite and Postgres walk this as a loose
+        # index scan (store.py _LAST_RECEIVED_SQL, a recursive CTE hopping distinct channel_id
+        # values), but SQL Server forbids scalar aggregation, TOP and subqueries in a recursive CTE
+        # member, so that form does not port. A ROW_NUMBER() variant could; it was left out of the
+        # #1726 slice, so this stays the GROUP BY.
         last_rows = await self._fetchall(
             "SELECT channel_id, MAX(received_at) AS last_at FROM messages GROUP BY channel_id"
         )

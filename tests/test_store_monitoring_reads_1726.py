@@ -10,6 +10,11 @@ latest-event subquery picks its row by ``MAX(id)``. These tests pin three things
   they still return, measured by running the OLD form and the NEW form on one seeded store;
 * the upgrade -- a store opened before the index existed gains it on its next open.
 
+``connection_metrics``' per-channel last-received read is a loose index scan (limb B): its plan
+seeks ``ix_messages_channel`` once per channel and never scans ``messages``, and the OLD
+``GROUP BY`` form and the new form give identical ``ConnectionMetrics``. The server schemas carry
+the same ``ix_messages_received`` (limb A).
+
 No row is deleted and no figure changes meaning; retention is out of scope here.
 """
 
@@ -17,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import random
+import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -24,7 +30,8 @@ from typing import Any
 import pytest
 
 from messagefoundry.store import MessageStore, OutboxStatus
-from messagefoundry.store.store import Stage
+from messagefoundry.store import store as sqlite_store
+from messagefoundry.store.store import _LAST_RECEIVED_SQL, Stage
 
 _INDEX = "ix_messages_received"
 
@@ -36,6 +43,11 @@ _OLD_LIST_SQL = (
     "  ORDER BY e.id DESC LIMIT 1) AS last_event"
     " FROM messages{where}"
     " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?"
+)
+
+# The per-channel last-received read exactly as it shipped before BACKLOG #1726 limb B.
+_OLD_LAST_RECEIVED_SQL = (
+    "SELECT channel_id, MAX(received_at) AS last_at FROM messages GROUP BY channel_id"
 )
 
 _CHANNELS = ("IB_A", "IB_B", "IB_C")
@@ -287,24 +299,36 @@ async def test_list_messages_old_and_new_return_the_same_rows(
     assert last_events["m0004"] is None  # no events
 
 
+_WINDOWS = (
+    (0.0, 200.0, 60.0),
+    (140.0, 190.0, 30.0),
+    (1_000.0, 1_000.0, 60.0),  # since after every row: last_at must survive an empty since window
+    (120.0, 500.0, 1_000.0),
+)
+
+
+async def _metrics(store: MessageStore) -> list[Any]:
+    return [
+        await store.connection_metrics(since=s, now=now, rate_window=rw) for s, now, rw in _WINDOWS
+    ]
+
+
+async def _metrics_under(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, last_received_sql: str
+) -> list[Any]:
+    with monkeypatch.context() as m:
+        m.setattr(sqlite_store, "_LAST_RECEIVED_SQL", last_received_sql)
+        return await _metrics(store)
+
+
 async def test_connection_metrics_returns_every_figure_unchanged(store: MessageStore) -> None:
     """Every inbound and destination figure, with the new index and with it dropped, across since
-    and rate windows. The metrics SQL did not change, and today's planner picks the same plan in both
-    arms, so this guards the day a planner or a later edit starts using ix_messages_received there."""
+    and rate windows. Guards the day a planner or a later edit starts using ix_messages_received in
+    the metrics reads; the old-against-new SQL comparison for limb B is the next test."""
     await _seed(store)
-    windows = (
-        (0.0, 200.0, 60.0),
-        (140.0, 190.0, 30.0),
-        (1_000.0, 1_000.0, 60.0),  # since after every row
-        (120.0, 500.0, 1_000.0),
-    )
-    new = [
-        await store.connection_metrics(since=s, now=now, rate_window=rw) for s, now, rw in windows
-    ]
+    new = await _metrics(store)
     await _drop_index(store)
-    old = [
-        await store.connection_metrics(since=s, now=now, rate_window=rw) for s, now, rw in windows
-    ]
+    old = await _metrics(store)
     assert old == new
     # The seed reaches every figure, so the comparison is not vacuous.
     first = new[0]
@@ -320,6 +344,103 @@ async def test_connection_metrics_returns_every_figure_unchanged(store: MessageS
     assert any(d.last_done_at is not None for d in dests)
     # The since window moves the windowed counts, so the windows are distinct cases.
     assert new[1] != new[0]
+
+
+async def test_last_received_loose_scan_gives_the_old_connection_metrics(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Limb B differential: ConnectionMetrics from the pre-#1726 GROUP BY and from the loose index
+    scan, on one store, across since and rate windows. Equal, and the seed makes last_at matter."""
+    # The empty store first: no channel at all, from either form.
+    empty_old = await _metrics_under(store, monkeypatch, _OLD_LAST_RECEIVED_SQL)
+    assert empty_old == await _metrics_under(store, monkeypatch, _LAST_RECEIVED_SQL)
+    assert all(not m.inbound for m in empty_old)
+    await _seed(store)
+    old = await _metrics_under(store, monkeypatch, _OLD_LAST_RECEIVED_SQL)
+    new = await _metrics_under(store, monkeypatch, _LAST_RECEIVED_SQL)
+    assert old == new
+    # Not vacuous: last_at is each channel's newest row, set even where the since window is empty.
+    late = new[2].inbound
+    assert all(m.read == 0 for m in late.values())
+    assert {c: m.last_at for c, m in late.items()} == {
+        **dict.fromkeys(_CHANNELS, 179.0),  # 240 rows, three per timestamp from 100.0
+        "IB_ONLY_CANCELLED": 50.0,
+    }
+    # Control: a form that reports a wrong last_at is caught by the same comparison.
+    wrong = _OLD_LAST_RECEIVED_SQL.replace("MAX(", "MIN(")
+    assert await _metrics_under(store, monkeypatch, wrong) != new
+
+
+async def test_last_received_read_seeks_the_channel_index_and_scans_no_messages(
+    store: MessageStore,
+) -> None:
+    await _seed(store, n=30)
+    plan = await _plan(store, _LAST_RECEIVED_SQL, ())
+    # "SCAN m" covers both the table name and the subqueries' alias.
+    assert not any(line.startswith("SCAN m") for line in plan), plan
+    assert not any("TEMP B-TREE" in line for line in plan), plan
+    seeks = [line for line in plan if "USING COVERING INDEX ix_messages_channel" in line]
+    assert any("(channel_id>?)" in line for line in seeks), plan  # the hop to the next channel
+    assert any("(channel_id=?)" in line for line in seeks), plan  # that channel's MAX
+    # Control: the old form reads the whole of messages (by index) rather than seeking it.
+    old_plan = await _plan(store, _OLD_LAST_RECEIVED_SQL, ())
+    assert any(line.startswith("SCAN messages") for line in old_plan), old_plan
+
+
+def _vm_steps(rows_per_channel: int, sql: str) -> int:
+    """SQLite VM instructions ``sql`` costs on a fresh store of 5 channels x ``rows_per_channel``.
+
+    The plan text cannot tell a MIN/MAX that stops at one index entry from one that walks the
+    channel's whole range (``MAX(x * 1)`` prints the same plan), so this counts the work instead."""
+    db = sqlite3.connect(":memory:")
+    try:
+        db.executescript(sqlite_store._SCHEMA)
+        db.executemany(
+            "INSERT INTO messages (id, channel_id, received_at, raw, status)"
+            " VALUES (?,?,?,'r','s')",
+            ((f"{c}-{i}", f"IB_{c}", float(i)) for c in range(5) for i in range(rows_per_channel)),
+        )
+        steps = 0
+
+        def tick() -> int:
+            nonlocal steps
+            steps += 1
+            return 0
+
+        db.set_progress_handler(tick, 1)
+        db.execute(sql).fetchall()
+        db.set_progress_handler(None, 1)
+        return steps
+    finally:
+        db.close()
+
+
+def test_last_received_cost_follows_channels_not_rows() -> None:
+    """Limb B's claim, measured: 100 times the rows per channel costs the loose scan no more work,
+    while the old GROUP BY's cost grows with the rows (the control that the counter sees rows)."""
+    small, large = _vm_steps(20, _LAST_RECEIVED_SQL), _vm_steps(2_000, _LAST_RECEIVED_SQL)
+    assert large == small, (small, large)
+    old_small = _vm_steps(20, _OLD_LAST_RECEIVED_SQL)
+    old_large = _vm_steps(2_000, _OLD_LAST_RECEIVED_SQL)
+    assert old_large > 50 * old_small, (old_small, old_large)
+    # The mutant the plan test cannot see: an expression defeats the MIN/MAX optimisation.
+    mutant = _LAST_RECEIVED_SQL.replace("MAX(m.received_at)", "MAX(m.received_at * 1)")
+    assert _vm_steps(2_000, mutant) > 50 * _vm_steps(20, mutant)
+
+
+def test_server_schemas_carry_the_received_index() -> None:
+    """Limb A: Postgres and SQL Server build ix_messages_received as SQLite does. Each server
+    schema is content-hashed (ADR 0064), so adding the statement forces one full run on the next
+    open, where an existing server store gains the index. Both modules import their drivers lazily,
+    so this runs with or without the server extras installed."""
+    from messagefoundry.store import postgres, sqlserver
+
+    ddl = f"CREATE INDEX IF NOT EXISTS {_INDEX} ON messages(received_at, id)"
+    assert ddl in sqlite_store._SCHEMA
+    assert ddl in postgres._SCHEMA
+    [stmt] = [s for s in sqlserver._SCHEMA if f"'{_INDEX}'" in s]
+    assert f"IF INDEXPROPERTY(OBJECT_ID('messages'),'{_INDEX}','IndexID') IS NULL" in stmt
+    assert f"CREATE INDEX {_INDEX} ON messages(received_at, id)" in stmt
 
 
 # --- upgrade ---------------------------------------------------------------------------------------
