@@ -1809,31 +1809,64 @@ async def test_a_value_file_edited_after_the_release_read_its_snapshot_never_app
         await engine.stop()
 
 
-@pytest.mark.parametrize(
-    ("provider", "approved_text"),
-    [(_opaque_values_provider, _APPROVED_VALUES), (_serve_values_provider, None)],
-    ids=["opaque-provider-edits", "serve-provider-file-created"],
-)
-async def test_a_value_file_read_from_disk_during_the_release_is_refused_when_changed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    provider: Callable[[Path], Any],
-    approved_text: str | None,
+@pytest.mark.parametrize("approved_text", [None, _APPROVED_VALUES], ids=["created", "removed"])
+async def test_a_value_file_created_or_removed_after_the_snapshot_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved_text: str | None
 ) -> None:
-    """Vault BACKLOG #2596. Where the values come from disk rather than the snapshot, the release
-    takes the digest again after that read, and refuses a change made in the window as
-    ``digest_mismatch``, with nothing swapped and the running values kept. Two ways there: a
-    provider the engine cannot hand the snapshot, and ``serve``'s provider where a value file was
-    created after the snapshot, which the snapshot cannot vouch for."""
-    from messagefoundry.config.fingerprint import config_fingerprint
-
-    engine, values_file = await _values_engine(tmp_path, approved_text, provider)
-    cfg = values_file.parent.parent
+    """Vault BACKLOG #2596. The snapshot's bytes cannot stand for a value file created since, nor
+    for one removed since, whose access list can no longer be vetted. ``serve``'s provider refuses
+    both, with nothing swapped and the running values kept."""
+    engine, values_file = await _values_engine(tmp_path, approved_text, _serve_values_provider)
     try:
         await engine.reload_detail(dry_run=False)  # a live runner, on the approved values
         runner = engine.registry_runner
         assert runner is not None
         approved_values = {"host": "approved.example.invalid"} if approved_text else {}
+        assert cast(Any, engine)._env_values == approved_values
+        from messagefoundry.config.wiring import read_trusted_snapshot
+
+        def _read_then_change(directory: Path, **kwargs: Any) -> Any:
+            snapshot = read_trusted_snapshot(directory, **kwargs)
+            if approved_text is None:
+                values_file.parent.mkdir(exist_ok=True)
+                values_file.write_text(_UNREVIEWED_VALUES, encoding="utf-8")
+            else:
+                values_file.unlink()
+            return snapshot
+
+        service = await _service(engine)
+        _approval_id, r = await _hold_then_release(
+            engine,
+            service,
+            {},
+            between=lambda: monkeypatch.setattr(
+                "messagefoundry.pipeline.engine.read_trusted_snapshot", _read_then_change
+            ),
+        )
+        assert r.status_code == 422, r.text
+        assert engine.registry_runner is runner  # nothing swapped
+        assert cast(Any, engine)._env_values == approved_values
+        assert cast(Any, runner)._env_values == approved_values
+        assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
+    finally:
+        await engine.stop()
+
+
+async def test_an_opaque_provider_s_value_file_edited_during_the_release_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2596. A provider the engine cannot hand the snapshot reads the file from
+    disk, so the release takes the digest again after that read, and refuses an edit made in the
+    window as ``digest_mismatch``, with nothing swapped and the running values kept."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+
+    engine, values_file = await _values_engine(tmp_path, _APPROVED_VALUES, _opaque_values_provider)
+    cfg = values_file.parent.parent
+    try:
+        await engine.reload_detail(dry_run=False)  # a live runner, on the approved values
+        runner = engine.registry_runner
+        assert runner is not None
+        approved_values = {"host": "approved.example.invalid"}
         assert cast(Any, engine)._env_values == approved_values
         approved = config_fingerprint(cfg)
         service = await _service(engine)

@@ -58,22 +58,25 @@ class SnapshotEnvValuesProvider(ABC):
     config snapshot (vault BACKLOG #2596). A provider opts in by subclassing, never by having a
     method of the right name. ``serve``'s provider is one."""
 
+    __slots__ = ()
+
     @abstractmethod
     def __call__(self) -> Mapping[str, Any]:
         """The values, read from disk: at start, and on a reload that read no snapshot."""
 
     @abstractmethod
     def from_snapshot(self, snapshot: ConfigSnapshot) -> Mapping[str, Any] | None:
-        """The values, with any value file ``snapshot`` covers parsed from its bytes, or ``None``
-        when the snapshot cannot vouch for the value file this provider reads
-        (:meth:`~messagefoundry.config.snapshot.ConfigSnapshot.environment_file`). On ``None`` the
-        engine calls the provider plainly and, on a released reload, checks the digest again."""
+        """The values, with a value file ``snapshot`` covers parsed from its bytes, or ``None``
+        when the value file this provider reads is outside the snapshot
+        (:meth:`~messagefoundry.config.snapshot.ConfigSnapshot.covers_environment_file`). On
+        ``None`` the engine calls the provider plainly and, on a released reload, checks the digest
+        again."""
 
 
 class ValuesRead(Protocol):
     """A read of one value file's environment values, from disk, or with ``snapshot`` from the
-    bytes it read, raising ``LookupError`` where
-    :meth:`~messagefoundry.config.snapshot.ConfigSnapshot.environment_file` does."""
+    bytes it read, raising :class:`~messagefoundry.config.snapshot.NotInSnapshot` for a value file
+    outside it."""
 
     def __call__(
         self,
@@ -106,6 +109,8 @@ class EnvironmentValuesReader(SnapshotEnvValuesProvider):
         )
 
     def from_snapshot(self, snapshot: ConfigSnapshot) -> dict[str, Any] | None:
+        from messagefoundry.config.snapshot import NotInSnapshot
+
         try:
             return self._read(
                 base_dir=self.base_dir,
@@ -113,7 +118,15 @@ class EnvironmentValuesReader(SnapshotEnvValuesProvider):
                 environment=self.environment,
                 snapshot=snapshot,
             )
-        except LookupError:
+        except NotInSnapshot:
+            # A path only, never a value. The default layout keeps the value file outside the
+            # config directory, so this is the usual line there, and it says why the release then
+            # takes a second digest.
+            _log.info(
+                "environment value file %s is outside the config snapshot; the reload reads it "
+                "from disk",
+                values_file_path(self.base_dir, self.dir_name, self.environment),
+            )
             return None
 
 

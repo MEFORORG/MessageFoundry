@@ -2427,9 +2427,9 @@ def _read_environment_values(
     (:func:`_environment_values_reader`), so it runs at start and again on every reload.
 
     With ``snapshot``, the value file is parsed from the bytes the snapshot read and never read
-    from disk, so a file edited or created after that read does not apply (vault BACKLOG #2596).
-    Where the snapshot cannot vouch for the file, such as one outside the config directory, this
-    raises ``LookupError`` (:meth:`~messagefoundry.config.snapshot.ConfigSnapshot.environment_file`)."""
+    from disk, so a file edited after that read does not apply, and one created or removed since is
+    refused (vault BACKLOG #2596). A value file outside the snapshot's ``environments/`` folder
+    raises :class:`~messagefoundry.config.snapshot.NotInSnapshot` instead."""
     import os
 
     from messagefoundry.config.environments import (
@@ -2437,6 +2437,7 @@ def _read_environment_values(
         load_environment_values,
         values_file_path,
     )
+    from messagefoundry.config.snapshot import NotInSnapshot
     from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
     from messagefoundry.redaction import safe_exc
 
@@ -2466,11 +2467,18 @@ def _read_environment_values(
     # created after the start is not read unvetted. Outside the try below, because WiringError
     # is a ValueError and that arm would wrap the refusal as a read failure.
     env_file = values_file_path(base_dir, dir_name, environment)
-    assert_trusted_start_paths([env_file], lead="refusing to read environment values from")
+    if snapshot is not None and not snapshot.covers_environment_file(env_file):
+        # Before the vetting below, so the plain read the engine then makes vets the file once.
+        raise NotInSnapshot(f"{env_file} is not in the config snapshot's environments folder")
+    # With a snapshot, its folder is vetted even when the file has gone: the bytes that apply were
+    # read earlier, and whoever can write the folder could have planted them (vault BACKLOG #2596).
+    assert_trusted_start_paths(
+        [env_file],
+        lead="refusing to read environment values from",
+        folders=[env_file.parent] if snapshot is not None else (),
+    )
     try:
         if snapshot is not None:
-            # A LookupError, where the snapshot cannot vouch for this file, passes through: the
-            # reader answers None, and the engine reads the disk and checks the digest again.
             return environment_values_from_bytes(
                 snapshot.environment_file(env_file), path=env_file, environ=os.environ
             )

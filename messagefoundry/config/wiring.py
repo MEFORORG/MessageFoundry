@@ -9050,7 +9050,7 @@ def _file_and_folder(files: Iterable[Path]) -> list[Path]:
 
 
 def assert_trusted_start_paths(
-    files: Iterable[Path], *, lead: str = "refusing to start from"
+    files: Iterable[Path], *, lead: str = "refusing to start from", folders: Iterable[Path] = ()
 ) -> None:
     """Refuse a start that reads a settings file or value file another account could write.
 
@@ -9066,10 +9066,16 @@ def assert_trusted_start_paths(
     in the graph. A writer of either would own the service at its next start (vault BACKLOG #2626
     step 3).
 
+    Each of ``folders`` that exists is checked too, whether or not a file in it does: a reload that
+    applies value bytes read earlier needs the folder vetted even when the file has gone since
+    (vault BACKLOG #2596).
+
     **Not checked**, at least: the folders above each file's own folder, and a file named in the
     settings that the start reads later, such as a key, certificate or CRL file. Those have their
     own checks where they are read, or none."""
-    _check_trusted_paths(_file_and_folder(files), lead=lead, refuse=_refuse_unsafe_config_source)
+    paths = _file_and_folder(files)
+    paths += [f.absolute() for f in folders if f.is_dir() and f.absolute() not in paths]
+    _check_trusted_paths(paths, lead=lead, refuse=_refuse_unsafe_config_source)
 
 
 def install_trust_paths() -> list[Path]:

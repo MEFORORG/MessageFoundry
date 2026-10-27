@@ -33,6 +33,7 @@ __all__ = [
     "CONNECTIONS_REL",
     "ConfigDirMissing",
     "ConfigSnapshot",
+    "NotInSnapshot",
     "config_py_files",
     "is_missing_directory",
     "read_config_snapshot",
@@ -51,6 +52,11 @@ _ENVIRONMENTS_DIR = "environments"
 
 #: The folders a snapshot lists, beside the directory itself.
 _FOLDERS: tuple[str, ...] = (CODESETS_DIR_NAME, _ENVIRONMENTS_DIR)
+
+
+class NotInSnapshot(LookupError):
+    """A value file outside the snapshot's ``environments/`` folder, whose bytes the snapshot did
+    not read and its digest does not cover (:meth:`ConfigSnapshot.environment_file`)."""
 
 
 class ConfigDirMissing(FileNotFoundError):
@@ -184,38 +190,45 @@ class ConfigSnapshot:
         covers. A load refuses when there is any: it cannot run bytes it does not have."""
         return tuple(rel for rel in self.unreadable if not _covered_only(rel))
 
-    def environment_file(self, path: str | Path) -> bytes | None:
-        """The bytes this snapshot read for the value file ``path``, or ``None`` when it read no
-        such file and none is there now. A caller reading values for a reload parses these instead
-        of reading the file again, so the values it applies are the bytes the digest covered (vault
-        BACKLOG #2596).
+    def covers_environment_file(self, path: str | Path) -> bool:
+        """Whether ``path`` is in this snapshot's ``environments/`` folder, so the snapshot's digest
+        covers the file there, or that there is none (:func:`_same_folder`)."""
+        return _same_folder(Path(path).parent, self.directory / _ENVIRONMENTS_DIR)
 
-        Raises ``LookupError`` when the snapshot cannot vouch for ``path``: it is not in this
-        snapshot's ``environments/`` folder, or the snapshot holds no file by its name while a file
-        is there now, created since or reached by a spelling the listing does not match. The
-        caller then reads the file itself and must check the digest again. Raises ``OSError`` when
-        part of ``environments/`` could not be read, so this snapshot cannot say what was there."""
-        folder, value_file = self.directory / _ENVIRONMENTS_DIR, Path(path)
-        if not _same_folder(value_file.parent, folder):
-            raise LookupError(f"{value_file} is not in the config snapshot's environments folder")
-        if any(_covered_only(rel) for rel in self.unreadable):
-            raise OSError(errno.EACCES, "the config snapshot could not read environments/")
+    def environment_file(self, path: str | Path) -> bytes | None:
+        """The bytes this snapshot read for the value file ``path``, which
+        :meth:`covers_environment_file` must accept, or ``None`` when it read no such file and none
+        is there now. A caller reading values for a reload parses these instead of reading the file
+        again, so the values it applies are the bytes the digest covered (vault BACKLOG #2596).
+
+        Raises :class:`NotInSnapshot` for a path the snapshot does not cover. Raises ``OSError``
+        where the bytes cannot stand for the file now: the snapshot could not read it or its
+        folder, read a file that is gone now, or read no file by its name while one is there now,
+        created since. The caller refuses then; the values are read again on the next reload."""
+        value_file = Path(path)
+        if not self.covers_environment_file(value_file):
+            raise NotInSnapshot(f"{value_file} is not in the config snapshot's environments folder")
         prefix = f"{_ENVIRONMENTS_DIR}/"
+        want = os.path.normcase(prefix + value_file.name)
+        if any(
+            rel == _ENVIRONMENTS_DIR or os.path.normcase(rel) == want for rel in self.unreadable
+        ):
+            raise OSError(errno.EACCES, "the config snapshot could not read this value file")
+        present = os.path.lexists(value_file)
         data = self.files.get(prefix + value_file.name)
-        if data is None and os.path.normcase("A") != "A":
-            # Windows names files without case, as the open of this path would; an exact match
-            # above wins first, for a folder set to tell case apart.
-            want = os.path.normcase(value_file.name)
+        if data is None and present and os.path.normcase("A") != "A":
+            # Windows names files without case, so the open of this path reads a file the listing
+            # spelled otherwise. Only where the path names a file now: in a folder set to tell case
+            # apart, it does not, and a start would read no file.
             data = next(
-                (
-                    bytes_
-                    for rel, bytes_ in self.files.items()
-                    if rel.startswith(prefix) and os.path.normcase(rel[len(prefix) :]) == want
-                ),
-                None,
+                (data for rel, data in self.files.items() if os.path.normcase(rel) == want), None
             )
-        if data is None and os.path.lexists(value_file):
-            raise LookupError(f"{value_file} is not a file the config snapshot read")
+        if data is None and present:
+            raise OSError(errno.EEXIST, "the value file was created after the config snapshot")
+        if data is not None and not present:
+            # The file's own access list was vetted only if it is still there, so bytes from a
+            # file gone since are not used.
+            raise OSError(errno.ENOENT, "the value file the config snapshot read is gone")
         return data
 
     def loaded(self, *, code_sets: bool = True) -> ConfigSnapshot:

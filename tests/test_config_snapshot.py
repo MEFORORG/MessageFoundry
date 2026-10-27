@@ -38,6 +38,7 @@ from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.snapshot import (
     ConfigDirMissing,
     ConfigSnapshot,
+    NotInSnapshot,
     config_py_files,
     read_config_snapshot,
 )
@@ -482,24 +483,29 @@ def test_a_directory_gone_after_its_check_still_answers_as_missing(
 def test_a_snapshot_names_the_value_file_bytes_it_read(tmp_path: Path) -> None:
     """``environment_file`` gives the bytes the snapshot read for a file in its own
     ``environments/`` folder, never the file's bytes now, and ``None`` for one that is still not
-    there. It refuses with ``LookupError`` what it cannot vouch for: a file created since, or a file
-    in any other folder, a differently named one under the config directory included."""
+    there. A file created or removed since is ``OSError``, and a file in any other folder, a
+    differently named one under the config directory included, is ``NotInSnapshot``."""
     cfg = tmp_path / "cfg"
     (cfg / "environments").mkdir(parents=True)
     (cfg / "environments" / "dev.toml").write_bytes(b'host = "approved"\n')
+    (cfg / "environments" / "gone.toml").write_bytes(b'host = "gone"\n')
     snapshot = read_config_snapshot(cfg, strict=True)
     (cfg / "environments" / "dev.toml").write_bytes(b'host = "edited"\n')
     (cfg / "environments" / "new.toml").write_bytes(b'host = "created"\n')
+    (cfg / "environments" / "gone.toml").unlink()
 
     assert snapshot.environment_file(cfg / "environments" / "dev.toml") == b'host = "approved"\n'
     assert snapshot.environment_file(cfg / "sub" / ".." / "environments" / "absent.toml") is None
+    for changed in (cfg / "environments" / "new.toml", cfg / "environments" / "gone.toml"):
+        with pytest.raises(OSError):
+            snapshot.environment_file(changed)
     for elsewhere in (
-        cfg / "environments" / "new.toml",
         tmp_path / "environments" / "dev.toml",
         cfg / "values" / "dev.toml",
         cfg / "environments" / "sub" / "dev.toml",
     ):
-        with pytest.raises(LookupError):
+        assert not snapshot.covers_environment_file(elsewhere)
+        with pytest.raises(NotInSnapshot):
             snapshot.environment_file(elsewhere)
 
 
@@ -523,14 +529,23 @@ def test_a_value_file_reached_through_a_linked_folder_is_covered(tmp_path: Path)
     assert snapshot.environment_file(alias) == b'host = "approved"\n'
 
 
-def test_a_snapshot_that_could_not_read_its_value_files_names_none() -> None:
-    """A lax snapshot that left part of ``environments/`` out cannot say what was there, so it
-    refuses rather than answer that there was no file."""
-    snapshot = ConfigSnapshot(
-        directory=Path(os.path.abspath("cfg")), files={}, unreadable=("environments/dev.toml",)
+def test_a_snapshot_that_could_not_read_a_value_file_names_none_for_it(tmp_path: Path) -> None:
+    """A lax snapshot that left a value file, or the folder, out cannot say what was there, so it
+    refuses rather than answer that there was no file. Another environment's unreadable file does
+    not stop a lookup of one it read."""
+    cfg = tmp_path / "cfg"
+    (cfg / "environments").mkdir(parents=True)
+    (cfg / "environments" / "dev.toml").write_bytes(b'host = "dev"\n')
+    for unreadable in (("environments/dev.toml",), ("environments",)):
+        snapshot = ConfigSnapshot(directory=cfg, files={}, unreadable=unreadable)
+        with pytest.raises(OSError):
+            snapshot.environment_file(cfg / "environments" / "dev.toml")
+    other = ConfigSnapshot(
+        directory=cfg,
+        files={"environments/dev.toml": b'host = "dev"\n'},
+        unreadable=("environments/prod.toml",),
     )
-    with pytest.raises(OSError):
-        snapshot.environment_file(Path("cfg") / "environments" / "dev.toml")
+    assert other.environment_file(cfg / "environments" / "dev.toml") == b'host = "dev"\n'
 
 
 def test_serve_s_value_reader_parses_the_snapshot_or_answers_none(
