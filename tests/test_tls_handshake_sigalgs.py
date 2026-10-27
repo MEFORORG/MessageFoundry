@@ -343,17 +343,33 @@ _GATE = "harden_cipher_suites"
 _PKG = Path(messagefoundry.__file__).resolve().parent
 
 
-def _gate_calls(node: ast.AST, rel: str, scope: tuple[str, ...], out: list[str]) -> None:
+def _gate_calls(
+    node: ast.AST,
+    rel: str,
+    scope: tuple[str, ...],
+    out: list[str],
+    local: list[str],
+    params: frozenset[str] = frozenset(),
+) -> None:
+    """Append each gate call's key to ``out``, and to ``local`` too when its ``connector=`` is a
+    bare name that is no parameter of an enclosing function, so a label the function builds itself.
+    ``params`` accumulates down nested functions, since a closure forwards its outer function's."""
     for child in ast.iter_child_nodes(node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            _gate_calls(child, rel, (*scope, child.name), out)
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = child.args
+            own = {x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+            _gate_calls(child, rel, (*scope, child.name), out, local, params | own)
+            continue
+        if isinstance(child, ast.ClassDef):
+            _gate_calls(child, rel, (*scope, child.name), out, local, params)
             continue
         if isinstance(child, ast.Call) and callee_name(child) == _GATE:
-            connector = next(
-                (ast.unparse(k.value) for k in child.keywords if k.arg == "connector"), "?"
-            )
-            out.append(f"{rel}::{'.'.join(scope)}::{connector}")
-        _gate_calls(child, rel, scope, out)
+            value = next((k.value for k in child.keywords if k.arg == "connector"), None)
+            key = f"{rel}::{'.'.join(scope)}::{'?' if value is None else ast.unparse(value)}"
+            out.append(key)
+            if isinstance(value, ast.Name) and value.id not in params:
+                local.append(key)
+        _gate_calls(child, rel, scope, out, local, params)
 
 
 def derived_sites() -> Counter[str]:
@@ -365,7 +381,19 @@ def derived_sites() -> Counter[str]:
     route to the gate is refused outright, because this scan and the spy both look for its name: an
     import under another name, or the bare name used as a value (``_h = harden_cipher_suites``,
     ``partial(harden_cipher_suites, ...)``) rather than called."""
+    return _scan()[0]
+
+
+def local_label_sites() -> set[str]:
+    """The derived sites whose ``connector=`` is a label the function builds in a local name, such
+    as MLLP's ``listener`` and ``destination``. The key alone cannot say what label such a site
+    passes, so each must have its label in :data:`_RESOLVED_LABELS` (vault BACKLOG #3514)."""
+    return set(_scan()[1])
+
+
+def _scan() -> tuple[Counter[str], list[str]]:
     found: list[str] = []
+    local: list[str] = []
     for path in sorted(_PKG.rglob("*.py")):
         text = path.read_text(encoding="utf-8-sig")  # -sig: a leading BOM is dropped
         if _GATE not in text:
@@ -385,8 +413,8 @@ def derived_sites() -> Counter[str]:
                     f"{rel}:{node.lineno} uses {_GATE} as a value, not a call; a call through that "
                     f"value is invisible to this scan and to the spy"
                 )
-        _gate_calls(tree, rel, (), found)
-    return Counter(found)
+        _gate_calls(tree, rel, (), found, local)
+    return Counter(found), local
 
 
 @dataclass(frozen=True)
@@ -498,6 +526,18 @@ _SITES: dict[str, Callable[[Kit], object]] = {
     ),
 }
 
+#: The label each local-label site passes when its factory above builds it, which names no
+#: connection. A literal key is checked against its own text; these keys hold a variable's name, so
+#: without this the check would not run for them (vault BACKLOG #3514).
+_RESOLVED_LABELS: dict[str, str] = {
+    "messagefoundry/transports/mllp.py::_mllp_ssl_context::listener": "MLLP listener",
+    "messagefoundry/transports/mllp.py::_mllp_ssl_context::destination": "MLLP destination",
+    "messagefoundry/transports/dicom.py::_client_ssl_context::connector": "DICOM destination",
+    "messagefoundry/store/postgres.py::_verifying_context::connector": (
+        "Postgres store (system trust)"
+    ),
+}
+
 _SERVER_SITES = [s for s in _SITES if "listener" in s.rsplit("::", 1)[1]]
 _CLIENT_SITES = [s for s in _SITES if s not in _SERVER_SITES]
 
@@ -600,8 +640,9 @@ def build_site(site: str, kit: Kit, seen: list[GateCall]) -> tuple[ssl.SSLContex
     """Run the site's real builder; return the one context it handed the gate, and what it built.
 
     The call must come from the site the key names, file and function, and with the key's connector
-    when that is a literal. Otherwise a factory that reaches the gate through another function (a
-    builder delegating to a sibling) would be filed under a site it never measured."""
+    when that is a literal, or the label :data:`_RESOLVED_LABELS` gives a local-label site.
+    Otherwise a factory that reaches the gate through another function (a builder delegating to a
+    sibling), or another arm of the same one, would be filed under a site it never measured."""
     built = _SITES[site](kit)
     assert len(seen) == 1, f"{site}: the gate saw {len(seen)} contexts, expected exactly one"
     call = seen[0]
@@ -610,9 +651,11 @@ def build_site(site: str, kit: Kit, seen: list[GateCall]) -> tuple[ssl.SSLContex
         f"{site}: the gate call came from {call.file}::{call.function}, a different site"
     )
     if connector[:1] in ("'", '"'):
-        assert call.connector == ast.literal_eval(connector), (
-            f"{site}: connector {call.connector!r}"
-        )
+        expected: str | None = ast.literal_eval(connector)
+    else:
+        expected = _RESOLVED_LABELS.get(site)
+    if expected is not None:
+        assert call.connector == expected, f"{site}: connector {call.connector!r}"
     return call.ctx, built
 
 
@@ -653,6 +696,19 @@ def test_the_measured_population_is_the_derived_population() -> None:
         f"harden_cipher_suites call sites and this module's measured list disagree. Unmeasured: "
         f"{missing}. Gone from the code: {stale}. Add a factory to _SITES that builds the new "
         f"context through its real builder; do not narrow the derivation to make this pass."
+    )
+
+
+def test_every_local_label_site_has_its_label_checked() -> None:
+    """A site whose ``connector=`` is a label built in a local name gets its label checked only
+    through :data:`_RESOLVED_LABELS`, so a new one must be added there, and a gone one removed.
+    The MLLP pair must be found, or the scan would pass by finding none (vault BACKLOG #3514)."""
+    local = local_label_sites()
+    assert "messagefoundry/transports/mllp.py::_mllp_ssl_context::destination" in local, sorted(
+        local
+    )
+    assert local == set(_RESOLVED_LABELS), (
+        f"local-label sites and _RESOLVED_LABELS disagree: {sorted(local ^ set(_RESOLVED_LABELS))}"
     )
 
 
