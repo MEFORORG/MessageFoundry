@@ -24,7 +24,7 @@ import os
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import MappingProxyType
 
 from messagefoundry.config.code_sets import CODESETS_DIR_NAME, is_code_set_name
@@ -104,16 +104,26 @@ def _is_module_rel(rel: str) -> bool:
     return "/" not in rel and rel.lower().endswith(".py") and not rel.startswith(".")
 
 
+def _plain_name(part: str) -> bool:
+    """Whether ``part`` names one entry of a folder on this platform, and nothing else: joined to
+    a directory it stays in that directory, and its ``name`` is itself. On Windows that refuses a
+    backslash and a drive (``C:x.py``); on POSIX both are ordinary characters, and a file so named
+    is one the listing can return, so it is accepted there."""
+    return part not in ("", ".", "..") and PurePath(part).name == part and not PurePath(part).anchor
+
+
 def _check_rel(rel: object) -> str:
     """``rel`` when it is a relative path a snapshot can hold, else ``ValueError``. A snapshot can
     arrive from another process (the sandbox boot frame), so its names are checked, not trusted:
     a module at the top level, ``connections.toml``, or one file in ``codesets/`` or
-    ``environments/``. Nothing here is ever opened, so the check keeps the grammar closed rather
-    than guarding a path."""
-    if not isinstance(rel, str) or not rel or "\\" in rel or "\0" in rel:
+    ``environments/``, each part a plain name on this platform (:func:`_plain_name`). Nothing here
+    is ever opened, but a module's name is joined to the snapshot's directory and looked up again
+    by that path's ``name``, so a part that is not a plain name could select another file's bytes.
+    Every name :func:`read_config_snapshot` lists on a platform passes there."""
+    if not isinstance(rel, str) or not rel or "\0" in rel:
         raise ValueError(f"config snapshot path {rel!r} is not a plain relative path")
     parts = rel.split("/")
-    if any(part in ("", ".", "..") for part in parts):
+    if not all(_plain_name(part) for part in parts):
         raise ValueError(f"config snapshot path {rel!r} is not a plain relative path")
     if len(parts) == 1 and (rel == CONNECTIONS_REL or _is_module_rel(rel)):
         return rel
@@ -141,13 +151,16 @@ class ConfigSnapshot:
     def __post_init__(self) -> None:
         checked = {_check_rel(rel): bytes(data) for rel, data in self.files.items()}
         object.__setattr__(self, "files", MappingProxyType(dict(sorted(checked.items()))))
-        object.__setattr__(
-            self, "_modules", tuple(rel for rel in self.files if _is_module_rel(rel))
-        )
+        # In path order, as the loader ran them when it globbed the directory: without case on
+        # Windows, so a bundle's load order, and which file a duplicate-name refusal names, stay
+        # what they were.
+        modules = (rel for rel in self.files if _is_module_rel(rel))
+        object.__setattr__(self, "_modules", tuple(sorted(modules, key=PurePath)))
 
     @property
     def modules(self) -> tuple[str, ...]:
-        """Every config module's file name, sorted, ``_``-prefixed helpers included."""
+        """Every config module's file name, in path order (without case on Windows),
+        ``_``-prefixed helpers included."""
         return self._modules
 
     @property

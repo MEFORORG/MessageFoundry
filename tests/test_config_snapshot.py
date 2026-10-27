@@ -22,14 +22,14 @@ import importlib.machinery
 import importlib.util
 import marshal
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import CodeType
 
 import pytest
 
 from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.config.run_context import RunContext
-from messagefoundry.config.snapshot import ConfigSnapshot, read_config_snapshot
+from messagefoundry.config.snapshot import ConfigSnapshot, config_py_files, read_config_snapshot
 from messagefoundry.config.wiring import WiringError, load_config, load_snapshot
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.dryrun import transform_one
@@ -212,11 +212,43 @@ def test_the_boot_frame_carries_the_snapshot_and_no_directory(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
-    "rel", ["../graph.py", "sub/graph.py", "codesets/x.py", "/abs.py", "a\\b.py", ".hidden.py"]
+    "rel", ["../graph.py", "sub/graph.py", "codesets/x.py", "/abs.py", ".hidden.py", "a\0b.py"]
 )
 def test_a_snapshot_refuses_a_path_no_load_reads(rel: str) -> None:
     with pytest.raises(ValueError, match="config snapshot path"):
         ConfigSnapshot(directory=Path("cfg"), files={rel: b""})
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a backslash and a drive are plain names on POSIX")
+@pytest.mark.parametrize("rel", ["a\\b.py", "C:x.py", "codesets/C:x.csv"])
+def test_a_snapshot_refuses_a_name_windows_would_not_keep_in_the_folder(rel: str) -> None:
+    """Joined to the directory, ``C:x.py`` names another drive and ``a\\b.py`` a sub-folder, and
+    either path's ``name`` is ``x.py`` or ``b.py``: a boot frame naming one could run another
+    module's bytes under its name."""
+    with pytest.raises(ValueError, match="config snapshot path"):
+        ConfigSnapshot(directory=Path("cfg"), files={rel: b""})
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows refuses a backslash in a file name")
+def test_a_posix_module_named_with_a_backslash_loads(tmp_path: Path) -> None:
+    """A name the listing returns is one a snapshot holds, so it loads as it did, rather than
+    escaping the load as a bare ValueError."""
+    (tmp_path / "a\\graph.py").write_text(_graph("V1"), encoding="utf-8")
+    registry = load_config(tmp_path)
+    assert _ran(registry) == "V1"
+    assert registry.config_snapshot is not None
+    assert registry.config_snapshot.modules == ("a\\graph.py",)
+
+
+def test_modules_run_in_the_order_the_directory_listing_gave(tmp_path: Path) -> None:
+    """Path order, as the loader globbed it: without case on Windows, so a bundle's load order and
+    the file a duplicate-name refusal names stay as they were."""
+    names = ["A_feed.py", "a2.py", "b_feed.py", "Router.py"]
+    for name in names:
+        (tmp_path / name).write_text("X = 1\n", encoding="utf-8")
+    snapshot = read_config_snapshot(tmp_path, strict=True)
+    assert snapshot.modules == tuple(p.name for p in config_py_files(tmp_path))
+    assert snapshot.modules == tuple(sorted(names, key=PurePath))
 
 
 # --- the points the row folds in -------------------------------------------------------------------

@@ -52,7 +52,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 from messagefoundry.redaction import codec_safe_str
@@ -563,8 +563,9 @@ def code_sets_from_files(
         return sibling(f"{base}.csv") is not None or sibling(f"{base}.toml") is not None
 
     out: dict[str, CodeSet] = {}
-    # Sorted for a deterministic load order, so a clash error names a stable "first" file.
-    for name in sorted(files):
+    # Sorted for a deterministic load order, so a clash error names a stable "first" file. In path
+    # order, as the folder listing was sorted: without case on Windows.
+    for name in sorted(files, key=PurePath):
         if not is_code_set_name(name):
             continue
         # A ``<name>.policy.toml`` sidecar (#162) is policy METADATA for its code set, not a code set
