@@ -4313,7 +4313,7 @@ def test_a_cert_held_open_elsewhere_is_waited_out_during_recovery(tmp_path: Path
     """On Windows another process holding the certificate open (the tray pinning it, a backup, an
     antivirus scan) refuses its deletion. Recovery must ride out that brief hold, not crash on it.
 
-    Mutation: make `_unlink_generated` a bare `path.unlink()`. Red: PermissionError [WinError 32]."""
+    Mutation: make `unlink_generated` a bare `path.unlink()`. Red: PermissionError [WinError 32]."""
     api = ApiSettings()
     material = ensure_api_tls_material(api, state_dir=tmp_path)
     assert material is not None
