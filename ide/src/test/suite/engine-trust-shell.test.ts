@@ -788,6 +788,33 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, RENEWED);
   });
 
+  test("a refresh whose own read failed keeps a renewal a request read after it", async () => {
+    const cert = plantCert(path.join("state", "api-cert.pem"));
+    stubInventory = inventoryFor(cert, "generated");
+    stubConfig.environments = Array.from({ length: 20 }, (_, i) => ({
+      name: `E${i}`,
+      url: `https://h${i}.example.com:8765`,
+      caFile: plantCert(path.join("pki", `ca-${i}.pem`)),
+    }));
+    await trust.refreshEngineTrust();
+
+    // The engine is mid-renewal when this refresh reads: the file holds no certificate yet.
+    childProcess.execFile = cliThatFirst(() => fs.writeFileSync(cert, "partial"));
+    let followed: Promise<boolean> | undefined;
+    onLog = (line): void => {
+      if (followed === undefined && line.includes(`${cert} is not PEM`)) {
+        fs.writeFileSync(cert, RENEWED); // the renewal completes; a request fails and follows it
+        followed = trust.followCertificateChange(LOOPBACK, PEM);
+      }
+    };
+    await trust.refreshEngineTrust();
+    assert.ok(followed !== undefined, "the refresh's read did not fail, so this test proves nothing");
+    assert.strictEqual(await followed, true);
+    await settle();
+
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
+  });
+
   test("a caFile on an http:// entry does not take the anchor from an https engineUrl", async () => {
     // Host keys carry no scheme, so a claim from the http entry would land on the https engine.
     stubInventory = plantedEngine();

@@ -274,8 +274,10 @@ after the window opened. If no https `caFile` covers that `host:port`, a failure
 again in the background. This happens at most once a minute. A failure that arrives while the
 engine is already being asked waits for that answer. If the answer does not fix it, the engine is
 asked once more. The failed request is not retried; the status bar picks the certificate up when
-the answer arrives. Asking the engine is abandoned after a minute, so a hung interpreter cannot stop
-later setting changes from taking effect. Verification stays on throughout.
+the answer arrives. The engine gets 35 seconds to answer, and each certificate file gets 10 seconds
+to read. Past that, the extension goes on with what it has, so a hung interpreter or share cannot
+stop later setting changes from taking effect. While an earlier run of the engine's command is still
+alive, no second one starts. Verification stays on throughout.
 
 **The OS trust store.** Unmeasured. VS Code's `http.systemCertificates` (on by default) is meant to
 add the OS store to an extension's https requests. Reading the `@vscode/proxy-agent` 0.45.0 that VS
