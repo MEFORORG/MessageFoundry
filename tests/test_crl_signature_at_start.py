@@ -883,6 +883,53 @@ def test_on_a_context_that_already_held_a_crl_the_staging_refusal_comes_before_t
     assert "does not verify" not in str(refused.value)
 
 
+def test_the_reload_s_finding_keeps_an_unconfirmed_verdict_when_a_later_block_fails(
+    twins: _Twins, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3506 code review, round 2. The reload's check stopped at the first
+    unconfirmed block before item 8, so a failure on a later block never reached it. Item 8 reads
+    on for a stronger finding, and a failure there threw the verdict away: the reload then told
+    the operator to restart, with the signature unjudged. It now keeps the verdict, as a start
+    does, and logs the failure."""
+    real = pki_module._signature_state
+    calls = 0
+
+    def second_fails(crl: x509.CertificateRevocationList, cas: list[pki_module._ListedCa]) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("a defect in the check")
+        return real(crl, cas)
+
+    monkeypatch.setattr(pki_module, "_signature_state", second_fails)
+    ders = _ders(twins.new_ca)
+    good = _crl(twins.new_key, names=twins.new_key)
+    with caplog.at_level("ERROR", logger="messagefoundry.pki"):
+        finding = crl_signature_finding(_crl(twins.stranger, names=None) + good, ders)
+    assert finding is not None and finding.state == "unproven", finding
+    assert finding.why.startswith("CRL block 1 of 2") and "not judged" in finding.why
+    (error,) = [r for r in caplog.records if "signature check failed after" in r.getMessage()]
+    assert error.exc_info is not None
+
+    # Control: with only an unlisted block before it, nothing is kept, and the failure is raised.
+    calls = 0
+    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-unlisted")])
+    with pytest.raises(RuntimeError, match="a defect in the check"):
+        crl_signature_finding(_crl(twins.stranger, names=None, name=other) + good, ders)
+
+
+def test_the_reload_s_two_rankings_agree() -> None:
+    """Vault BACKLOG #3506 code review, round 2. ``pki._FINDING_RANK`` picks a block within one
+    file and ``crl_reload._PRECEDENCE`` a remedy across contexts. They must order the signature
+    states the same way, or one file's report would depend on how its hops are spread."""
+    by_finding = sorted(pki_module._FINDING_RANK, key=pki_module._FINDING_RANK.__getitem__)
+    by_remedy = sorted(
+        crl_reload._SIGNATURE_REMEDY,
+        key=lambda state: crl_reload._RANK[crl_reload._SIGNATURE_REMEDY[state]],
+    )
+    assert by_finding == by_remedy
+
+
 def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
     twins: _Twins, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
+import logging
 import os
 import string
 from collections.abc import Iterable, Iterator
@@ -82,6 +83,8 @@ __all__ = [
     "canonical_dn",
     "IssuerIndex",
 ]
+
+log = logging.getLogger(__name__)
 
 # Day math shared with pipeline/cert_expiry.py's expiry monitor — keep the convention identical.
 _SECONDS_PER_DAY = 86_400
@@ -951,10 +954,35 @@ def crl_signature_finding(pem: bytes, ca_ders: Iterable[bytes]) -> CrlSignatureF
     :data:`_FINDING_RANK` picks the state reported, the first block of it in file order among
     equals. It stops at the first ``bad`` block, since nothing outranks it.
 
+    A check that fails part way keeps a finding already reached other than ``unlisted``, as a
+    start keeps its verdicts (``tls_policy._check_crl_signatures``): it is
+    logged, and ``why`` says the CRLs after it were not judged. Before vault BACKLOG #3506 the
+    reload stopped at the first such block, so it never reached the failure. With no such finding
+    the failure is raised.
+
     A CA that does not parse is ignored. ``pem`` must be bytes :func:`judge_every_crl` accepted;
     a block that does not parse raises ``ValueError``."""
     strongest: CrlSignature | None = None
-    for signature in judge_crl_signatures(pem, ca_ders):
+    unjudged = ""
+    signatures = judge_crl_signatures(pem, ca_ders)
+    while True:
+        try:
+            signature = next(signatures)
+        except StopIteration:
+            break
+        except Exception as exc:
+            if strongest is None or strongest.state == "unlisted":
+                raise
+            log.error(
+                "pki: the CRL signature check failed after %s, so the CRLs after it are not judged",
+                strongest.where,
+                exc_info=True,
+            )
+            unjudged = (
+                f". The check failed on a later CRL ({type(exc).__name__}), so those after it "
+                "are not judged"
+            )
+            break
         if signature.state == "verified":
             continue
         if strongest is None or _FINDING_RANK[signature.state] < _FINDING_RANK[strongest.state]:
@@ -971,7 +999,7 @@ def crl_signature_finding(pem: bytes, ca_ders: Iterable[bytes]) -> CrlSignatureF
         why = (
             f"the engine could not confirm its signature: {UNCONFIRMED_SIGNATURE[strongest.state]}"
         )
-    return CrlSignatureFinding(f"{strongest.where}: {why}", strongest.state)
+    return CrlSignatureFinding(f"{strongest.where}: {why}{unjudged}", strongest.state)
 
 
 def _akid_fit(akid: _CrlAkid | None, listed: _ListedCa) -> bool | None:

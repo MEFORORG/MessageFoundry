@@ -2,7 +2,7 @@
   signature check used to give one remedy, `bad_signature`, for a CRL proven badly signed and for
   one it could not confirm, so its words hedged across both and could not say which one held. A
   proof keeps `bad_signature`: fix the file, which a start that finds the same proof refuses at any
-  time, so that refusal no longer carries `start_refuses` or the "at least until" caveat for a file
+  time, so that refusal carries neither `start_refuses` nor the "at least until" caveat for a file
   not yet in effect. A CRL that names no key of the CA its issuer matches, and that CA's key does
   not verify, now reads `unproven_signature`. One whose signature the engine cannot check with that
   CA's key, such as a signature of another kind than the key, now reads `uncheckable_signature`.

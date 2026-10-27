@@ -48,14 +48,8 @@ from messagefoundry.config.tls_policy import (
     staged_crl,
 )
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, crl_expiry_detail
-from messagefoundry.pipeline.crl_reload import (
-    NO_ISSUER,
-    RELOAD_INTERVAL_SECONDS,
-    RESTART,
-    RETRY,
-)
+from messagefoundry.pipeline.crl_reload import NO_ISSUER, RELOAD_INTERVAL_SECONDS, RESTART, RETRY
 from messagefoundry.pki import (
-    UNCONFIRMED_SIGNATURE,
     CertFacts,
     CrlFacts,
     crl_pem_blocks,
@@ -660,7 +654,7 @@ def held_crl_label(path: str) -> str:
 #: either way. Named once, for at least the remedy that asks for a check, the guard for an error
 #: the signature check raises on a later block after one of them, and the test for a state this
 #: scan does not name (BACKLOG #3512).
-_UNCONFIRMED = frozenset(UNCONFIRMED_SIGNATURE)
+_UNCONFIRMED = frozenset({"unproven", "uncheckable"})
 
 #: The states that pass a CA file's CRL with no step of its own. ``unlisted`` is a CRL that no CA
 #: this file lists fits, as :class:`~messagefoundry.pki.CrlSignature` defines a fit: its issuer can
@@ -729,9 +723,9 @@ def _ca_file_crl_refusal(
             "peer under its issuer",
         )
     # The states of the file's CRLs, merged. Three of them are short of a pass, and only ``bad``
-    # proves a failure (BACKLOG #3512). Bound before the ``try``, so its
-    # handler can read it. The signature loop is the last step in the ``try``, so an error that
-    # finds an unconfirmed state recorded was raised by the signature check on a later block.
+    # proves a failure (BACKLOG #3512). Bound before the ``try``, so its handler can read it. The
+    # signature loop is the last step in the ``try``, so an error that finds an unconfirmed state
+    # recorded was raised by the signature check on a later block.
     states: set[str] = set()
     try:
         # OpenSSL's own reading of these bytes, not of the file again, which may have changed.
