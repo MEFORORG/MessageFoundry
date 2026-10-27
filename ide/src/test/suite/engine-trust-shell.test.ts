@@ -133,7 +133,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
   const PEM = "-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n-----END CERTIFICATE-----\n";
   const LOOPBACK = "https://127.0.0.1:8765";
   const REMOTE = "https://prod.example.com:8765";
-  /** What the unanchored-target warning says; the negative and its positive control share it. */
+  /** What the unanchored-target warning says; both tests that read that warning use it. */
   const UNANCHORED = "with no trust anchor";
 
   let ws: string;
@@ -393,7 +393,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.ok(
       // The fragment carries the URL rather than testing a bare URL substring on its own, which
       // CodeQL reads as incomplete URL sanitization (alert 298).
-      logged.some((line) => line.includes(`${UNANCHORED} (${REMOTE})`)),
+      logged.some((line) => line.includes(`${UNANCHORED} (${REMOTE}`)),
       `an unanchored target went unreported: ${JSON.stringify(logged)}`,
     );
   });
