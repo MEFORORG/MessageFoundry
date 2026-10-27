@@ -246,11 +246,12 @@ function queueRefresh(followUp: boolean): Promise<boolean> {
 
 /** Run the follow-up {@link lateFailure} asked for, if the refresh left the failing anchor in place
  *  and the CLI could still anchor that host. Past the rate limit on purpose: it is bounded to one per
- *  refresh instead. */
+ *  refresh instead. Never after deactivation: nothing would read what it registers. */
 function startLateFollowUp(): void {
   const late = lateFailure;
   lateFailure = undefined;
   if (
+    deactivated ||
     late === undefined ||
     registered.get(late.key)?.pem !== late.usedCa ||
     !cliCouldAnchor(late.key)
@@ -809,6 +810,9 @@ function cliCouldAnchor(key: string): boolean {
  * replaced the anchor the request failed with.
  */
 function noteCliAnchorableFailure(key: string, usedCa: string | undefined): void {
+  if (deactivated) {
+    return; // a request in flight at deactivation must not spawn the CLI
+  }
   if (cliAbandoned) {
     // A refresh now would not start a second CLI beside it; that child's exit asks instead.
     cliWanted = true;
@@ -848,6 +852,9 @@ function noteCliAnchorableFailure(key: string, usedCa: string | undefined): void
  *     `cliAnswerMs`; a request waiting on it would no longer honour its own timeout. The refresh
  *     re-probes the status bar when it registers something.
  *
+ * A `caFile` whose read outlasts `followReadMs` is followed in the background instead, with a
+ * refresh's allowance and no CLI ({@link followSlowPin}).
+ *
  * Every other target gets nothing: the CLI anchors only `engineUrl`'s host, and no file of this
  * machine describes the rest.
  *
@@ -861,6 +868,42 @@ export async function followCertificateChange(
   if (key === undefined) {
     return false;
   }
+  const since = readSeq;
+  const followed = await followFile(url, key, usedCa, since, limits.followReadMs, false);
+  if (followed.retry) {
+    return true;
+  }
+  if (cliCouldAnchor(key)) {
+    noteCliAnchorableFailure(key, usedCa);
+  } else if (followed.pinned && followed.cutShort) {
+    followSlowPin(url, key, usedCa, since);
+  }
+  return false;
+}
+
+/** What {@link followFile} found: whether the request may retry, whether it registered an anchor
+ *  itself, whether the file it read is a `caFile` pin, and whether that read was cut short. */
+interface Followed {
+  readonly retry: boolean;
+  readonly registered: boolean;
+  readonly pinned: boolean;
+  readonly cutShort: boolean;
+}
+
+/**
+ * The file half of {@link followCertificateChange}: re-read the file that describes `key`, waiting at
+ * most `waitMs`, and register what it holds if that is a certificate other than `usedCa`. `since` is
+ * {@link readSeq} when the request failed: a read that started at or before it may predate the
+ * rotation. `background` is {@link followSlowPin}'s call, which registers nothing after deactivation.
+ */
+async function followFile(
+  url: string,
+  key: string,
+  usedCa: string | undefined,
+  since: number,
+  waitMs: number,
+  background: boolean,
+): Promise<Followed> {
   // The file the settings pin this host to NOW, the same reading engineClient refuses requests by, so
   // a pin added or moved since the last refresh is read here rather than waiting for that refresh to
   // commit. With no pin, the file an unpinned (CLI) anchor came from. Read again after the read, so a
@@ -874,13 +917,15 @@ export async function followCertificateChange(
     return { file: live?.pinned === true ? undefined : live?.file, pinned: false };
   };
   const { file, pinned } = sourceFor();
-  // A read already running when this request failed may predate the rotation. Only when it returns
-  // the certificate that just failed is the file read again; anything else answers this request.
-  const deadline = performance.now() + limits.followReadMs;
+  // A read already running when this request failed may predate the rotation. When it returns a
+  // certificate other than the one that just failed, that answers this request; when it returns the
+  // failed one, or no certificate at all (a stale failure says nothing about the file now), the file
+  // is read again.
+  const deadline = performance.now() + waitMs;
   const stamped =
     file === undefined
       ? undefined
-      : await readSince(file, deadline, readSeq, (r) => r.pem === usedCa);
+      : await readSince(file, deadline, since, (r) => r.pem === undefined || r.pem === usedCa);
   const read = stamped?.read.pem;
   // Read the registration again: a refresh may have committed while the file was being read.
   const held = registered.get(key);
@@ -896,45 +941,59 @@ export async function followCertificateChange(
   const after = sourceFor();
   const stillTheSource =
     after.file !== undefined && file !== undefined && after.pinned === pinned && sameFile(file, after.file);
+  const cutShort = stamped?.readAt === 0;
+  if (background && deactivated) {
+    return { retry: false, registered: false, pinned, cutShort };
+  }
   if (file !== undefined && stamped !== undefined && changed && stillTheSource && !newer) {
-    if (read !== held?.pem) {
+    const fresh = read !== held?.pem;
+    if (fresh) {
       register({ url, file, pem: read, pinned, readAt: stamped.readAt });
       engineLog().info(`the certificate at ${file} changed; trusting it for ${url}`);
     }
     // Equal to `held.pem` means another request already followed it; this one retries all the same.
-    return true;
+    return { retry: true, registered: fresh, pinned, cutShort };
   }
-  if (held !== undefined && held.pem !== usedCa) {
-    // A refresh registered a different anchor while this request was in flight. The re-read above
-    // may have failed (a file mid-rewrite), but what is registered now is still worth one retry.
-    return true;
-  }
-  if (cliCouldAnchor(key)) {
-    noteCliAnchorableFailure(key, usedCa);
-  } else if (pinned && held === undefined && stamped?.readAt === 0) {
-    // A pinned host with no anchor whose file took longer than this request could wait. Every request
-    // to it is refused, and each would cut its own read short the same way, so let a refresh read it
-    // with the refresh's longer allowance; rate-limited like a CLI-started one.
-    noteSlowPin();
-  }
-  return false;
+  // A refresh registered a different anchor while this request was in flight. The re-read above may
+  // have failed (a file mid-rewrite), but what is registered now is still worth one retry.
+  return { retry: held !== undefined && held.pem !== usedCa, registered: false, pinned, cutShort };
 }
 
-/** Start a refresh for {@link followCertificateChange}'s slow pin: none while one is pending, and at
- *  most one per {@link FAILURE_REFRESH_MIN_MS}, the limit a failure-started CLI refresh shares. */
-function noteSlowPin(): void {
-  const now = performance.now();
-  if (refreshesPending > 0 || now - lastFailureRefresh < FAILURE_REFRESH_MIN_MS) {
+/** {@link followSlowPin}'s runs still going, by host key: at most one per host at a time. */
+const slowPinFollows = new Map<string, Promise<void>>();
+
+/**
+ * Finish {@link followCertificateChange} in the background for a `caFile` whose read took longer than
+ * the request could wait, with or without an anchor held (one held is the old CA, which a rotation in
+ * place has made stale). Every request to that host fails until the file is read, and each would cut
+ * its own read short the same way, so this waits for that same read with a refresh's allowance
+ * (`refreshReadMs`) and registers what it holds, then re-probes the status bar.
+ *
+ * Not a refresh: a refresh asks the engine's CLI, which can say nothing about a `caFile`, and reads
+ * the file again after joining this read. This joins the read already running and reads again only
+ * when that read is stale ({@link readSince}), so a share that stays slow costs one read per failing
+ * request and no subprocess. None after deactivation, and one per host at a time.
+ */
+function followSlowPin(url: string, key: string, usedCa: string | undefined, since: number): void {
+  if (deactivated || slowPinFollows.has(key)) {
     return;
   }
-  lastFailureRefresh = now;
-  void refreshThenRecheck(false);
+  const run = followFile(url, key, usedCa, since, limits.refreshReadMs, true)
+    .then(async (followed) => {
+      if (followed.registered && !deactivated) {
+        await recheck();
+      }
+    })
+    .finally(() => slowPinFollows.delete(key));
+  slowPinFollows.set(key, run);
 }
 
-/** Resolves once no refresh is queued or running, a follow-up included. For the shell test only. */
+/** Resolves once no refresh is queued or running, a follow-up and a slow pin's follow included. For
+ *  the shell test only. */
 export async function engineTrustSettled(): Promise<void> {
-  while (refreshesPending > 0) {
+  while (refreshesPending > 0 || slowPinFollows.size > 0) {
     await refreshTail;
+    await Promise.all(slowPinFollows.values());
   }
 }
 
@@ -953,6 +1012,7 @@ export function forgetEngineTrust(): void {
   lastFailureRefresh = Number.NEGATIVE_INFINITY;
   lateFailure = undefined;
   inflightReads.clear();
+  slowPinFollows.clear();
   readSlotWaiters.clear();
   cliRun = undefined;
   cliAbandoned = false;
@@ -1036,9 +1096,13 @@ export function registerEngineTrust(context: vscode.ExtensionContext): void {
         e.affectsConfiguration("messagefoundry.serviceConfig")
       ) {
         // Now, not when the queued refresh starts. An anchor dropped here is gone before that refresh
-        // takes its own before-and-after reading, so it would not count as a change there.
-        const changed = publishPinnedHosts(configuredPins());
-        void refreshThenRecheck(false, changed);
+        // takes its own before-and-after reading, so it would not count as a change there. Re-probe
+        // now too: that refresh may wait on the CLI and the reads for `cliAnswerMs + refreshReadMs`,
+        // and the verdict on screen was earned with what this publish just changed.
+        if (publishPinnedHosts(configuredPins())) {
+          void recheck();
+        }
+        void refreshThenRecheck(false);
       }
     }),
   );
@@ -1050,10 +1114,14 @@ export function refreshEngineTrustThenRecheck(): Promise<void> {
   return refreshThenRecheck(false);
 }
 
-async function refreshThenRecheck(followUp: boolean, changedAlready = false): Promise<void> {
-  if (!(await queueRefresh(followUp)) && !changedAlready) {
-    return; // nothing changed about what we trust, so nothing to re-probe
+async function refreshThenRecheck(followUp: boolean): Promise<void> {
+  if (await queueRefresh(followUp)) {
+    await recheck(); // otherwise nothing changed about what we trust, so nothing to re-probe
   }
+}
+
+/** Re-probe the status bar, so a verdict earned with an anchor that has since changed is replaced. */
+async function recheck(): Promise<void> {
   try {
     await vscode.commands.executeCommand("messagefoundry.engineRecheck");
   } catch {

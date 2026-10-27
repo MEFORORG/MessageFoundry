@@ -1448,7 +1448,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
   });
 
-  test("a pinned host whose caFile outlasts a request's wait is read by a background refresh", async () => {
+  test("a pinned host whose caFile outlasts a request's wait is read in the background", async () => {
     const caFile = path.join(ws, "pki", "slow-ca.pem");
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
     await trust.refreshEngineTrust();
@@ -1838,5 +1838,149 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
       PEM,
       "the refresh dropped an anchor from the file the settings pin now",
     );
+  });
+
+  // ---- round 8: the follow path after the Lander's covering review of 2026-10-27 ----
+
+  /** Pin REMOTE to a caFile holding PEM, refresh (anchoring it only when `anchored`; otherwise the
+   *  file appears after that refresh), then make every later open of that file take `delayMs`, longer
+   *  than a request may wait; returns the file and a count of its opens. */
+  async function slowPinnedFile(
+    delayMs: number,
+    anchored = true,
+  ): Promise<{ caFile: string; opens: () => number }> {
+    const caFile = path.join(ws, "pki", "slow-ca.pem");
+    if (anchored) {
+      plantCert(path.join("pki", "slow-ca.pem"));
+    }
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    plantCert(path.join("pki", "slow-ca.pem"));
+    trust.setEngineTrustLimitsForTest({ followReadMs: 20 });
+    let opens = 0;
+    openHook = (file) => {
+      if (file !== path.normalize(caFile)) {
+        return undefined;
+      }
+      opens++;
+      return new Promise((resolve) => setTimeout(resolve, delayMs)).then(() => realOpen(file));
+    };
+    return { caFile, opens: () => opens };
+  }
+
+  test("a pinned host whose anchor is stale follows a CA rotated in place on a slow share", async () => {
+    // Finding 1: the background re-read ran only for a pinned host with NO anchor, so a host holding
+    // the old CA failed every request until the window reloaded.
+    const { caFile } = await slowPinnedFile(80);
+    fs.writeFileSync(caFile, RENEWED);
+
+    assert.strictEqual(await trust.followCertificateChange(REMOTE, PEM), false);
+    await settle();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, RENEWED);
+  });
+
+  test("a slow pin's background re-read spawns no CLI and reads the file once", async () => {
+    // Findings 5 and 6: it was a full refresh, which asked the CLI every time (about once a minute for
+    // a share that stays slow) and joined the request's read only to read the file a second time.
+    // An unanchored pin, which that path already covered, so this isolates its cost from finding 1.
+    const { opens } = await slowPinnedFile(80, false);
+    const spawned = invocations.length;
+    assert.strictEqual(spawned, 1, "the CLI was never asked, so this test proves nothing");
+
+    assert.strictEqual(await trust.followCertificateChange(REMOTE, undefined), false);
+    await settle();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM, "nothing was followed");
+    assert.strictEqual(invocations.length, spawned, "a slow pin spawned the engine's CLI");
+    assert.strictEqual(opens(), 1, "a slow caFile was read more than once");
+  });
+
+  test("a slow pin's background re-read re-probes the status bar when it registers", async () => {
+    const { caFile } = await slowPinnedFile(80);
+    fs.writeFileSync(caFile, RENEWED);
+    let rechecks = 0;
+    const realExecute = vscodeStub.commands.executeCommand;
+    vscodeStub.commands.executeCommand = () => {
+      rechecks++;
+      return Promise.resolve(undefined);
+    };
+    held.push(() => (vscodeStub.commands.executeCommand = realExecute));
+
+    await trust.followCertificateChange(REMOTE, PEM);
+    await settle();
+    assert.ok(rechecks > 0, "the verdict earned with the stale anchor was left on screen");
+  });
+
+  test("a stale FAILED read a request joins is read again, not taken as the answer", async () => {
+    // Finding 4: a joined read that began before this request failed, and that failed itself, was
+    // accepted, so a CA already rotated in place was not followed by this request.
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    let releaseStale: (() => void) | undefined;
+    openHook = (file) => {
+      if (file !== path.normalize(caFile) || releaseStale !== undefined) {
+        return undefined;
+      }
+      return new Promise((resolve) => (releaseStale = () => resolve(servingHandle("garbage"))));
+    };
+    const earlier = trust.followCertificateChange(REMOTE, PEM); // its read hangs, then fails
+    assert.ok(releaseStale !== undefined, "the earlier read never started, so this test proves nothing");
+    fs.writeFileSync(caFile, RENEWED);
+
+    const later = trust.followCertificateChange(REMOTE, PEM); // joins that read
+    releaseStale();
+
+    assert.strictEqual(await later, true, "a stale failed read answered a request");
+    await earlier;
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, RENEWED);
+  });
+
+  test("after deactivation a late failure starts no follow-up refresh", async () => {
+    // Finding 7.
+    stubInventory = NO_CERT_YET;
+    const subscriptions: { dispose(): unknown }[] = [];
+    held.push(() => subscriptions.forEach((d) => d.dispose()));
+    trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
+    await settle();
+    const base = invocations.length;
+    stubCli((done) => {
+      setImmediate(() => {
+        void trust.followCertificateChange(LOOPBACK, undefined);
+        subscriptions[0].dispose(); // the extension deactivates while this refresh runs
+        setImmediate(() => done(null, JSON.stringify(stubInventory), ""));
+      });
+    });
+
+    await trust.refreshEngineTrust();
+    await ticks();
+    await settle();
+    assert.strictEqual(invocations.length, base + 1, "a follow-up refresh ran after deactivation");
+  });
+
+  test("a settings change that drops an anchor re-probes at once, not after a slow refresh", async () => {
+    // Finding 10: the re-probe waited for the queued refresh, which may take the CLI's whole
+    // allowance plus the read allowance (about 45 s) before the stale verdict was replaced.
+    stubInventory = plantedEngine();
+    const subscriptions: { dispose(): unknown }[] = [];
+    held.push(() => subscriptions.forEach((d) => d.dispose()));
+    configListener = undefined;
+    trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
+    await settle();
+    const listener = configListener as ConfigListener | undefined;
+    assert.ok(listener !== undefined, "no settings listener was subscribed");
+    let rechecks = 0;
+    const realExecute = vscodeStub.commands.executeCommand;
+    vscodeStub.commands.executeCommand = () => {
+      rechecks++;
+      return Promise.resolve(undefined);
+    };
+    held.push(() => (vscodeStub.commands.executeCommand = realExecute));
+    hungCli(); // the refresh the change queues does not finish during this test
+
+    stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile: path.join(ws, "pki", "missing.pem") }];
+    listener({ affectsConfiguration: (s) => s === "messagefoundry.environments" });
+    await ticks();
+
+    assert.ok(rechecks > 0, "the verdict earned with the dropped anchor stayed on screen");
   });
 });
