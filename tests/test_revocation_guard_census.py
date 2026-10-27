@@ -19,15 +19,20 @@ to its callers, and they are the sites. A SERVER context (``PROTOCOL_TLS_SERVER`
 the listener gates are a different control.
 
 **What "guarded" proves.** The site's function, or the one its entry names, calls a name in
-:data:`_GUARDS`, and every such name reaches ``RevocationHopGuard.capture``. That ties the site to a
-guard call. It does not prove that every branch reaches the call, or that the call refuses: the
-behaviour tests (at least ``tests/test_revocation_guard_remaining_hops.py`` and
-``tests/test_hop_refusal_revocation.py``) prove that. A second hop added inside a function that is
-already guarded passes here too, so read the function in review.
+:data:`_GUARDS`, and every such name reaches one of the two guards in :data:`_GUARD_ROOTS`. That
+ties the site to a guard call. It does not prove that every branch
+reaches the call, or that the call refuses: the behaviour tests (at least
+``tests/test_revocation_guard_remaining_hops.py``, ``tests/test_hop_refusal_revocation.py`` and
+``tests/test_vault_revocation_hop_guard.py``) prove that. A second hop added inside a function that
+is already guarded passes here too, so read the function in review.
 
 **It goes red.** Delete the guard call from one guarded site and
 :func:`test_every_guarded_site_calls_a_guard` fails naming that site; measured when this file was
 written, by deleting the ``RevocationHopGuard.capture`` call in ``DicomScuDestination.__init__``.
+Measured again when the two Vault ``_build_client`` sites became Guarded (vault BACKLOG #3587):
+renaming the ``mount_strict_reply_adapter`` call in either one failed that test naming it, and
+renaming either link of the chain from the mount to the Vault guard failed
+:func:`test_every_guard_name_reaches_the_guard`.
 """
 
 from __future__ import annotations
@@ -84,22 +89,42 @@ _SHARED_OPENER_MODULES = ("transports/rest.py", "pipeline/alert_sinks.py")
 #: The stdlib and truststore names. Matched only as a call: a bare ``SSLContext`` also names a type.
 _STDLIB_BUILDERS = frozenset({"create_default_context", "SSLContext"})
 
-#: Names whose call runs a revocation guard. Each one other than ``capture`` must reach ``capture``
-#: through the others (:func:`test_every_guard_name_reaches_the_guard`).
-_GUARDS = frozenset(
+#: The guards every other name in :data:`_GUARDS` must reach. The Vault hop guard, in
+#: ``transports/strict_requests.py`` (vault BACKLOG #2983), decides through
+#: ``tls_policy.revocation_hop_disposition`` and never calls ``RevocationHopGuard``; its docstring
+#: says why.
+_GUARD_ROOTS = frozenset(
     {
         "capture",  # RevocationHopGuard.capture, matched only on that receiver
+        "_refuse_an_unrevoked_vault_hop",
+    }
+)
+
+#: Names whose call runs a revocation guard. Each one outside :data:`_GUARD_ROOTS` must reach a root
+#: through the others (:func:`test_every_guard_name_reaches_the_guard`).
+_GUARDS = _GUARD_ROOTS | frozenset(
+    {
         "refuse_unrevoked_verified_hop",
         "_refuse_store_revocation",
         "_refuse_forward_revocation",
         "_refuse_idp_revocation",
         "idp_revocation_guards",
+        # transports/strict_requests.py, the Vault hops (vault BACKLOG #2983)
+        "refuse_an_unrevoked_hop",  # StrictReplyAdapter's, at the mount and before each send
+        "mount_strict_reply_adapter",
     }
 )
 
 #: Ungated verifying hops, with the reason recorded in docs/DEPLOYMENT.md.
 _UNGATED = (
     "an ungated verifying hop, listed in docs/DEPLOYMENT.md under 'Ungated verifying TLS hop'"
+)
+#: What the two Vault entries' guard covers, and what this census does not follow there.
+_VAULT_GUARD = (
+    "through mount_strict_reply_adapter, which runs _refuse_an_unrevoked_vault_hop at "
+    "construction, and the adapter runs it again before each send (vault BACKLOG #2983). The leg to an https:// proxy has its own guard, "
+    "_refuse_an_unrevoked_proxy_leg (vault BACKLOG #3561), handed on as a value this census "
+    "does not follow"
 )
 _TRAY = "the Windows tray probing the engine's own API on this box"
 _LISTENER = (
@@ -162,6 +187,12 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         note="the SMART and OAuth2 token hops"
     ),
     "messagefoundry/transports/soap.py::SoapDestination.__init__": Guarded(),
+    "messagefoundry/config/secretprovider_vault.py::_build_client": Guarded(
+        note=f"the Vault KV secret provider hop, {_VAULT_GUARD}"
+    ),
+    "messagefoundry/store/keyprovider_vault.py::_build_client": Guarded(
+        note=f"the Vault Transit key provider hop, which the Transit cipher shares, {_VAULT_GUARD}"
+    ),
     # --- exempt: ungated verifying hops ------------------------------------------------------------
     "messagefoundry/auth/ldap.py::LdapAuthenticator.__init__": Exempt(f"LDAPS: {_UNGATED}"),
     "messagefoundry/pipeline/alert_sinks.py::_build_no_redirect_opener": Exempt(
@@ -177,15 +208,6 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     ),
     "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Exempt(
         f"the AI-broker endpoint: {_UNGATED}"
-    ),
-    "messagefoundry/config/secretprovider_vault.py::_build_client": Exempt(
-        "the Vault KV secret provider hop. Ungated, and NOT in docs/DEPLOYMENT.md's ungated table: "
-        "its requests-based client takes one CA bundle and no revocation flag, so no CRL can reach "
-        "it (tls_policy refuses [tls].crl_file there). Found by this census; unfiled"
-    ),
-    "messagefoundry/store/keyprovider_vault.py::_build_client": Exempt(
-        "the Vault Transit key provider hop. Ungated, and NOT in docs/DEPLOYMENT.md's ungated "
-        "table, for the same reason as the KV provider above. Found by this census; unfiled"
     ),
     # --- exempt: not a partner hop -----------------------------------------------------------------
     "messagefoundry/apiclient/client.py::_build_verify_context": Exempt(
@@ -376,16 +398,18 @@ def test_every_guarded_site_calls_a_guard() -> None:
 def test_every_guard_name_reaches_the_guard() -> None:
     """A wrapper that stopped calling the guard would leave every site it covers green above.
 
-    Followed through the wrappers to ``capture``, so two wrappers that only call each other are
-    hollow too. Keyed by bare function name, so a same-named def elsewhere in the package could
-    stand in for a wrapper; the guard names here are unique today."""
+    Followed through the wrappers to a root, so two wrappers that only call each other are hollow
+    too. Keyed by bare function name, so a same-named def elsewhere in the package could stand in
+    for a wrapper; the guard names here are unique today."""
     defs = _scan().defs
     assert callable(getattr(RevocationHopGuard, "capture", None))
+    # The Vault root is read from the scan, not imported: its module needs the [vault] extra.
+    unrooted = sorted(name for name in _GUARD_ROOTS - {"capture"} if name not in defs)
+    assert not unrooted, f"root guard name(s) no longer defined in messagefoundry/: {unrooted}"
     # 6 guard names when this floor was set, so 4 lets two go with no edit here (BACKLOG #3512). It
-    # fails a list emptied or cut to "capture" alone, over which the check below passes on nothing.
-    assert "capture" in _GUARDS, sorted(_GUARDS)
+    # fails a list cut to the roots alone, over which the check below passes on nothing.
     assert len(_GUARDS) >= 4, f"only {len(_GUARDS)} guard names, floor 4"
-    reaches = {"capture"}
+    reaches = set(_GUARD_ROOTS)
     grew = True
     while grew:
         grew = False
@@ -394,7 +418,7 @@ def test_every_guard_name_reaches_the_guard() -> None:
                 reaches.add(name)
                 grew = True
     hollow = sorted(_GUARDS - reaches)
-    assert not hollow, f"guard name(s) that never reach RevocationHopGuard.capture: {hollow}"
+    assert not hollow, f"guard name(s) that never reach a root in {sorted(_GUARD_ROOTS)}: {hollow}"
 
 
 def test_every_builder_name_is_still_defined() -> None:
