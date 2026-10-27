@@ -1142,11 +1142,20 @@ re-raised. The inbound therefore stays residual state, and the next `stop()` or 
 ### Why the parity constraint is relaxed for this phase only
 
 Inc 4 cited the parity constraint against *bounding* the SHUTDOWN stop. That still holds: the
-SHUTDOWN branch adds no bound, cut or abandon of its own. Every stop is joined before the
-dispatchers stop (ADR 0066 D3) and before `start()` can rebind on its failed-start and
-residual-state teardowns (review M-8). The relaxation is only the order in which the stops run, and
-when a failure is raised. Every other SHUTDOWN phase, and the order of the phases, is unchanged. The
-single-node parity sentinel in Inc 5 still holds, because no DEMOTE-only statement is reached.
+SHUTDOWN branch adds no bound, cut or abandon of its own on an uncancelled stop. Every stop is
+joined before the dispatchers stop, the source-then-dispatcher order the code comments attribute
+to "ADR 0066 D3" (this ADR's Context records that no such decision exists; the order is the
+code's own), and before `start()` can rebind on its failed-start and residual-state teardowns
+(review M-8). The relaxation is only the order in which the stops run, and when a failure is
+raised. Every other SHUTDOWN phase, and the order of the phases, is unchanged. The single-node
+parity sentinel in Inc 5 still holds, because no DEMOTE-only statement is reached.
+
+Joined is not stopped. A stop that raised can leave its listener live, for example a DICOM server
+whose shutdown raised, while the dispatchers and lanes are then cleared. That inbound is the
+residual state the re-raise preserves, and the next `stop()` or `start()` stops it again. This
+amendment does not analyse what such a live listener does against the cleared dispatchers in that
+window. The serial loop never reached it: a failed stop aborted teardown before the dispatchers
+were cleared.
 
 ### What an outer cancel does now
 
@@ -1155,15 +1164,22 @@ rest. A plain `gather` over concurrent stops would cut all of them at once. Inst
 
 1. The cancel reaches the `asyncio.wait`, which never cancels its awaitables (D6). The stops keep
    running.
-2. `_join_cancelled_source_stops` gives them up to `_CANCELLED_STOP_GRACE_SECONDS` (10s, the
-   `_PENDING_STOP_SETTLE_SECONDS` sizing) to finish.
-3. Stops still running after the grace, or at a second cancel during it, are cancelled and their
-   cancellation is joined.
-4. The cancel is re-raised. The clears never run, so every source stays in `_sources`, and
-   `_running = False` still runs in the `finally` (D7).
+2. `_join_cancelled_source_stops` gives them up to `_CANCELLED_STOP_GRACE_SECONDS` (2.0s) to
+   finish. It is short on purpose: `Engine.stop()` cancels the graph supervisor after 10.0s, which
+   can land inside `start()`'s residual-state teardown, and the service's NSSM
+   `AppStopMethodConsole` is 15000 ms. A 10s grace there would have run past that window.
+3. Stops still running after the grace are cancelled and their cancellation is joined. A second
+   cancel cuts at once, whether it arrives during the grace or is coalesced with the first in one
+   loop turn (read as `current_task().cancelling() > 1`).
+4. Every stop that finished with an error is logged by inbound name through `safe_exc`, even if a
+   further cancel interrupts the join. Then the cancel is re-raised. The clears never run, so every
+   source stays in `_sources`, and `_running = False` still runs in `_teardown_unsafe`'s `finally`
+   (the `_running` regression Inc 5's tests pin).
 
 So an outer cancel is bounded by the grace plus each cut stop's own cancellation handling. The serial
-loop's bound was that handling alone. A caller that cannot wait the grace cancels twice.
+loop's bound was that handling alone. A stop that needs longer than the grace, such as a listener
+in its client drain (`_CLIENT_SHUTDOWN_GRACE`, 5.0s), is cut, as the serial loop cut its one
+in-flight stop.
 
 ### What this relies on, per connector
 
@@ -1188,4 +1204,13 @@ At least these, read 2026-10-26:
 `tests/test_runner_bounded_source_stop.py`. An outer cancel lets two in-flight stops finish, which
 turns red if the branch goes back to `gather`. A hung stop is cut after a shortened grace and the
 cancel still surfaces, which turns red if the grace wait has no timeout. A second cancel cuts at
-once, which turns red without the second cancel's handler.
+once, which turns red without the second cancel's handler. Two coalesced cancels cut at once, which
+turns red without the `cancelling()` check. A stop that failed before the cancel is still logged by
+name, which turns red if the cancel path skips the failure read.
+
+### Not changed here
+
+At least these were found in review and are left as they were, because the serial loop had them
+too: a stop that fails on every attempt keeps every later `start()` from building the graph; a
+re-raised stop failure skips `stop()`'s settle of a prior demotion's abandoned stops; and
+Database, RemoteFile and Timer `stop()` still join their poll task with no bound of their own.

@@ -151,8 +151,11 @@ async def test_a_failed_stop_is_retried_by_the_next_stop() -> None:
 
 
 async def _started(events: list[str], *names: str) -> None:
-    while not all(f"start:{name}" in events for name in names):
-        await asyncio.sleep(0)
+    async def spin() -> None:
+        while not all(f"start:{name}" in events for name in names):
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(spin(), _RENDEZVOUS_SECONDS)  # a regression fails, never hangs
 
 
 async def _yield(turns: int = 5) -> None:
@@ -202,7 +205,7 @@ async def test_an_outer_cancel_cuts_a_hung_stop_after_the_grace(
         await asyncio.wait_for(task, _RENDEZVOUS_SECONDS)
 
     assert "end:IB_OK" in events and "cut:IB_HANG" in events
-    assert "1 inbound stop(s) were still running" in caplog.text
+    assert "cut 1 inbound stop(s) still running" in caplog.text
     assert set(runner._sources) == {"IB_HANG", "IB_OK"}
     assert not runner.running
 
@@ -224,6 +227,47 @@ async def test_a_second_outer_cancel_cuts_at_once(monkeypatch: pytest.MonkeyPatc
 
     assert "cut:IB_HANG" in events
     assert set(runner._sources) == {"IB_HANG"}
+
+
+async def test_two_coalesced_cancels_cut_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two cancel() calls in one loop turn reach the coroutine as ONE CancelledError. Mutation: drop
+    the cancelling() > 1 check. Red: the grace is waited out and wait_for times out."""
+    monkeypatch.setattr(wiring_runner, "_CANCELLED_STOP_GRACE_SECONDS", 60.0)
+    events: list[str] = []
+    runner = _runner(events, IB_HANG="hangs")
+
+    task = asyncio.create_task(runner.stop())
+    await _started(events, "IB_HANG")
+    task.cancel()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, _RENDEZVOUS_SECONDS)
+
+    assert "cut:IB_HANG" in events
+    assert set(runner._sources) == {"IB_HANG"}
+
+
+async def test_a_failure_before_an_outer_cancel_is_logged_by_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cancel path still retrieves, names and redacts a stop that had already failed."""
+    events: list[str] = []
+    gate = asyncio.Event()
+    runner = _runner(events, gate, IB_BAD="fails", IB_A="gated")
+
+    task = asyncio.create_task(runner.stop())
+    await _started(events, "IB_BAD", "IB_A")
+    task.cancel()
+    await _yield()
+    gate.set()
+    with (
+        caplog.at_level(logging.WARNING, logger=wiring_runner.log.name),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await task
+
+    assert "'IB_BAD': stop() failed" in caplog.text and "OSError" in caplog.text
+    assert set(runner._sources) == {"IB_BAD", "IB_A"}
 
 
 async def test_control_healthy_stops_log_nothing(caplog: pytest.LogCaptureFixture) -> None:
