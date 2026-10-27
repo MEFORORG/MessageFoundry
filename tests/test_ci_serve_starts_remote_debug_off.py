@@ -17,10 +17,10 @@ Windows service smoke (NSSM, read by ``tests/test_isolated_launch.py``), the ima
 image's entry point, read there too), and any engine a harness module starts from Python, such as
 the failover profile's nodes in ``harness/load/failover.py``.
 
-THE READER IS A TOKEN SCAN, NOT A SHELL PARSER. It fails closed on the shapes it cannot place: an
-interpreter named through a variable (``"$PY" -m messagefoundry serve``) or the console-script
-launcher reads as a problem. A start built inside a quoted ``bash -c`` string, or assembled from
-variables across lines, is read as text and can be missed.
+THE READER IS A TOKEN SCAN, NOT A SHELL PARSER. Some shapes it cannot place read as a problem: at
+least an interpreter named through a variable (``"$PY" -m messagefoundry serve``), the
+console-script launcher, and a ``-m messagefoundry`` that follows a script or another module. At
+least a start assembled from variables, or spread over lines with no continuation, is missed.
 """
 
 from __future__ import annotations
@@ -37,14 +37,22 @@ from messagefoundry.startupcode import ISOLATED_LAUNCH_OPTIONS
 
 _SUBCOMMANDS = ("serve", "supervise")
 _OPTION = ("-X", "disable-remote-debug")
-#: A word, or one of the characters that end a shell command. Quotes and redirections split words,
-#: so ``serve>engine.log`` and ``"python`` still yield ``serve`` and ``python``.
-_TOKEN = re.compile(r"[^\s;&|()<>\"'`]+|[;&|()]")
+#: A word, or one of the characters that end a shell command. Quotes, redirections, commas and
+#: brackets split words, so ``serve>engine.log``, ``"python`` and ``'-m','messagefoundry'`` still
+#: yield the bare words.
+_TOKEN = re.compile(r"[^\s;&|()<>\"'`,\[\]{}@]+|[;&|()]")
 _SEPARATORS = frozenset(";&|()")
+#: A redirection that duplicates a descriptor, such as ``2>&1``: its ``&`` ends no command.
+_DUPLICATION = re.compile(r"\d*[<>]&\d*")
 #: An interpreter's own name, with any version suffix: ``python``, ``python3.14``, ``python.exe``.
-_INTERPRETER = re.compile(r"python[\d.]*(\.exe)?", re.IGNORECASE)
+_INTERPRETER = re.compile(r"python[\d.]*(\.exe)?")
 #: A line continuation, in bash (a backslash) or in pwsh (a backtick).
 _CONTINUATION = re.compile(r"[\\`]\r?\n")
+#: Interpreter options that take an argument, attached or as the next word.
+_TAKES_ARGUMENT = frozenset("XW")
+#: ``-m`` closing a cluster of single-letter options, and the same with the module attached.
+_MODULE_FLAG = re.compile(r"-([A-Za-z]*)m")
+_MODULE_ATTACHED = re.compile(r"-([A-Za-z]*)m(messagefoundry)")
 
 
 def _name(token: str) -> str:
@@ -52,9 +60,42 @@ def _name(token: str) -> str:
     return PureWindowsPath(token).name.lower()
 
 
-def _turns_remote_debug_off(options: list[str]) -> bool:
-    joined = _OPTION[0] + _OPTION[1]  # CPython also takes the attached form
-    return _OPTION in itertools.pairwise(options) or joined in options
+def _options_problem(options: list[str]) -> str | None:
+    """What is wrong with the interpreter options before ``-m messagefoundry``, or ``None``.
+
+    Read as CPython reads them: single-letter options cluster (``-IX...``), ``-X`` and ``-W`` take
+    the rest of their word or the next word. A word that is no option ends the interpreter's own
+    options, and so does ``-c``, so a ``-m messagefoundry`` after either is not the interpreter's."""
+    found = False
+    words = iter(options)
+    for word in words:
+        if word.startswith("--"):
+            if word == "--check-hash-based-pycs":
+                next(words, None)
+            continue
+        if not word.startswith("-") or word == "-":
+            return f"the module follows {word!r}, so it is not the interpreter's own -m"
+        for at, letter in enumerate(word[1:], 1):
+            if letter in "cm":
+                return f"the module follows {word!r}, so it is not the interpreter's own -m"
+            if letter in _TAKES_ARGUMENT:
+                argument = word[at + 1 :] or next(words, "")
+                found = found or (letter, argument) == (_OPTION[0][1], _OPTION[1])
+                break
+    return None if found else "remote debugging is not turned off"
+
+
+def _interpreter_before(tokens: list[str], end: int) -> int:
+    """The index of the interpreter of the command holding ``tokens[end]``, or -1: the nearest
+    interpreter name before it that is not an option's argument, not past a command separator."""
+    for i in range(end - 1, -1, -1):
+        if tokens[i] in _SEPARATORS:
+            return -1
+        if tokens[i].startswith("-") or (i > 0 and tokens[i - 1] in ("-X", "-W")):
+            continue
+        if _INTERPRETER.fullmatch(_name(tokens[i])):
+            return i
+    return -1
 
 
 def engine_starts(script: str) -> list[tuple[str, str | None]]:
@@ -64,29 +105,28 @@ def engine_starts(script: str) -> list[tuple[str, str | None]]:
     are joined first, so a start split across lines is still one start."""
     starts: list[tuple[str, str | None]] = []
     for line in _CONTINUATION.sub(" ", script).splitlines():
-        tokens = _TOKEN.findall(line)
+        tokens = _TOKEN.findall(_DUPLICATION.sub(" ", line))
         for at, token in enumerate(tokens[:-1]):
-            if _name(token) not in ("messagefoundry", "messagefoundry.exe"):
-                continue
             if tokens[at + 1] not in _SUBCOMMANDS:
                 continue
-            problem = None
-            if at == 0 or tokens[at - 1] != "-m":
-                # The console-script launcher cannot pass an option to the interpreter it starts.
-                problem = "started through the launcher, not the interpreter"
+            if attached := _MODULE_ATTACHED.fullmatch(token):
+                flag_at, cluster = at, attached.group(1)
+            elif _name(token) not in ("messagefoundry", "messagefoundry.exe"):
+                continue
+            elif at and (flag := _MODULE_FLAG.fullmatch(tokens[at - 1])):
+                flag_at, cluster = at - 1, flag.group(1)
             else:
-                # The interpreter of THIS command: the nearest one before `-m`, not past a separator.
-                interpreter = -1
-                for i in range(at - 2, -1, -1):
-                    if tokens[i] in _SEPARATORS:
-                        break
-                    if _INTERPRETER.fullmatch(_name(tokens[i])):
-                        interpreter = i
-                        break
-                if interpreter == -1:
-                    problem = "no interpreter named on the command, so no option can be read"
-                elif not _turns_remote_debug_off(tokens[interpreter + 1 : at - 1]):
-                    problem = "remote debugging is not turned off"
+                # The console-script launcher cannot pass an option to the interpreter it starts.
+                starts.append((line.strip(), "started through the launcher, not the interpreter"))
+                continue
+            interpreter = _interpreter_before(tokens, flag_at)
+            if interpreter == -1:
+                problem: str | None = (
+                    "no interpreter named on the command, so no option can be read"
+                )
+            else:
+                options = tokens[interpreter + 1 : flag_at] + ([f"-{cluster}"] if cluster else [])
+                problem = _options_problem(options)
             starts.append((line.strip(), problem))
     return starts
 
@@ -111,8 +151,8 @@ def _scripts_of(steps: list[dict[str, Any]]) -> list[str]:
 def _step_scripts() -> tuple[tuple[str, str, str], ...]:
     """``(file, job, script)`` for every step script of every workflow and composite action,
     parsed once for the module: ci.yml alone takes a measurable share of a second."""
-    import yaml
-
+    # A missing PyYAML is a skip, here as in the helper, never a collection error.
+    yaml = pytest.importorskip("yaml")
     from tests._workflow_contexts import ROOT, WORKFLOWS, jobs_of
 
     found: list[tuple[str, str, str]] = []
@@ -183,6 +223,16 @@ def test_the_option_is_the_one_the_shipped_launch_passes() -> None:
         # The option belongs to an earlier command on the line, not to the engine's.
         'python -X disable-remote-debug -c pass; "$PY" -m messagefoundry serve',
         "python -X disable-remote-debug -c pass && python -m messagefoundry serve",
+        # Arguments separated by commas, as a pwsh array or a Python list writes them.
+        "Start-Process python -ArgumentList '-I','-m','messagefoundry','serve'",
+        'subprocess.run([sys.executable, "-m", "messagefoundry", "serve"])',
+        # The module attached to -m, alone and in a cluster.
+        "python -mmessagefoundry serve --config c",
+        "python -Im messagefoundry serve --config c",
+        # The option belongs to a wrapper module, a script or -c, not to the interpreter.
+        "python -m coverage run -X disable-remote-debug -m messagefoundry serve",
+        "python script.py -X disable-remote-debug -m messagefoundry serve",
+        "python -c pass -X disable-remote-debug -m messagefoundry serve",
     ],
 )
 def test_the_reader_objects_to_a_planted_start(start: str) -> None:
@@ -199,6 +249,15 @@ def test_the_reader_objects_to_a_planted_start(start: str) -> None:
         "python -Xdisable-remote-debug -m messagefoundry serve --config c",
         "python3.14 -X disable-remote-debug -X pycache_prefix=/tmp/python-cache -m messagefoundry serve",
         "C:\\hostedtoolcache\\Python\\python.exe -I -X disable-remote-debug -m messagefoundry serve",
+        # A descriptor duplication ends no command.
+        "python 2>&1 -I -X disable-remote-debug -m messagefoundry serve",
+        # Another -X argument that names a python path, separate and attached.
+        "python -X disable-remote-debug -X pycache_prefix=/x/python -m messagefoundry serve",
+        "python -X disable-remote-debug -Xpycache_prefix=/x/python -m messagefoundry serve",
+        # Clustered options, and the module attached to -m.
+        "python -IXdisable-remote-debug -m messagefoundry serve",
+        "python -IX disable-remote-debug -mmessagefoundry serve",
+        "python -X disable-remote-debug -Im messagefoundry serve",
     ],
 )
 def test_the_reader_passes_a_start_with_the_option(start: str) -> None:
