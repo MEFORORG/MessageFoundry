@@ -341,6 +341,8 @@ _SHELL_TOKENS: tuple[str, ...] = (
 #:
 #: PowerShell reads a flag without case, after ``-``, ``--`` or ``/``, and takes any prefix of its
 #: name, so every prefix of ``command`` is here, ``c`` included, which is also Python's ``-c``.
+#: Its upper-case ``-C`` is spared only after a literal naming another program, such as git's
+#: ``-C`` (:func:`_another_programs_dash_c`, BACKLOG #3803 R4).
 #: ``-EncodedCommand``'s prefixes start at ``en``, with its ``ec`` alias: the bare ``-e`` is left
 #: out, because Python's ``-E`` is that flag without case, and two engine starts pass it.
 _SCRIPT_TEXT_FLAGS: tuple[str, ...] = (
@@ -1147,13 +1149,69 @@ def _shell_sites(code: dict[str, str]) -> set[str]:
     return {key for key, text in code.items() if any(token in text for token in _SHELL_TOKENS)}
 
 
+#: The programs whose upper-case ``-C`` is ``-Command``, by the start of the file name.
+_POWERSHELL_PROGRAMS = frozenset({"powershell", "pwsh"})
+
+
+def _literal(item: ast.expr) -> str | None:
+    return item.value if isinstance(item, ast.Constant) and isinstance(item.value, str) else None
+
+
+def _is_powershell(text: str) -> bool:
+    """By the file name's start, so ``pwsh-preview``, ``pwsh.dll`` (run by ``dotnet``) and
+    ``powershell_ise`` count as well."""
+    return re.split(r"[\\/]", text)[-1].lower().startswith(tuple(_POWERSHELL_PROGRAMS))
+
+
+def _names_another_program(head: ast.expr) -> bool:
+    """Whether ``head``, the first item of an argument list, is a literal naming a program that
+    is not PowerShell. A literal that starts with ``-``, or with ``/`` and holds no other ``/``,
+    is a flag, not a program; anything not a literal could be PowerShell."""
+    text = _literal(head)
+    if not text or text.startswith("-") or (text.startswith("/") and "/" not in text[1:]):
+        return False
+    return not _is_powershell(text)
+
+
+def _another_programs_dash_c(tree: ast.AST) -> int:
+    """How many ``"-C"`` literals are another program's own flag (BACKLOG #3803 R4).
+
+    Upper-case ``-C`` hands script text to PowerShell alone. So one counts here where its
+    argument list starts with a literal naming another program, such as git, whose ``-C`` is a
+    working folder, and every item before it is a literal naming no PowerShell. A launcher, as in
+    ``["env", "pwsh", "-C", text]``, or an item that is not a literal, keeps it a site."""
+    count = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.List | ast.Tuple) and node.elts):
+            continue
+        if not _names_another_program(node.elts[0]):
+            continue
+        for item in node.elts[1:]:
+            text = _literal(item)
+            if text == "-C":
+                count += 1
+            elif text is None or _is_powershell(text):
+                break  # PowerShell could run from here on
+    return count
+
+
 def _passes_script_text(source: str) -> bool:
     """Whether a string literal in ``source`` carries a flag of :data:`_SCRIPT_TEXT_FLAGS`.
 
     Prose is skipped as :func:`~tests._ast_sites.code_strings` skips it; comments are not in the
     tree at all. A literal anywhere else counts, an error message included: this errs toward a
-    site, which a reviewer then clears by name."""
-    return any(_SCRIPT_TEXT_FLAG_RE.search(text) for text in code_strings(parse_source(source)))
+    site, which a reviewer then clears by name. One literal is spared: a ``"-C"`` item after a
+    literal that names another program (:func:`_another_programs_dash_c`). A ``-C`` inside one
+    command-line string, such as ``"git -C repo"``, still counts."""
+    tree = parse_source(source)
+    texts = code_strings(tree)
+    if any(_SCRIPT_TEXT_FLAG_RE.search(text) for text in texts if text != "-C"):
+        return True
+    # A spared "-C" is an item of an argument list, never prose, so it is among ``texts``, and
+    # each such literal has one parent list, so it is spared at most once. The walk is skipped
+    # where no "-C" is.
+    dash_c = texts.count("-C")
+    return dash_c > 0 and dash_c > _another_programs_dash_c(tree)
 
 
 def _script_text_sites(sources: Mapping[str, str]) -> set[str]:
@@ -1219,6 +1277,19 @@ def test_the_script_text_scan_sees_the_cipher_probe_start() -> None:
         'run(["node", "--eval=x"])',
         'run(["powershell.exe", "-e", blob])',
         'run([sys.executable, "-Ic", code])',
+        # R4's limit: -C is PowerShell's -Command unless a literal names another program first.
+        'run(["pwsh", "-C", text])',
+        'run([r"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\PowerShell.EXE", "-C", text])',
+        'run([shell, "-C", text])',
+        'run(["-NoProfile", "-C", text])',
+        'ARGS = ("-C", text)',
+        'run(["git", "-C", repo, "-c", text])',
+        'run(["env", "pwsh", "-C", text])',
+        'run(["pwsh-preview", "-C", text])',
+        'run(["dotnet", "pwsh.dll", "-C", text])',
+        'run(["sudo", shell, "-C", text])',
+        'run(["tar", "-xf", archive, "-C", folder])',
+        "run('git -C repo status')",
     ],
 )
 def test_the_script_text_scan_fires(source: str) -> None:
@@ -1234,6 +1305,11 @@ def test_the_script_text_scan_fires(source: str) -> None:
         'run(["powershell.exe", "-NoProfile", "-File", path])',
         'run(["tool", "-Compress", "-cert", path])',
         'run(["tool", "-command-file"])',
+        # BACKLOG #3803 R4: an upper-case -C after a program named by a literal that is not
+        # PowerShell is that program's own flag, git's working-folder one here.
+        'run(["git", "-C", repo, "status"])',
+        'run(("/usr/bin/tar", "-C", folder, "-xf", archive))',
+        'run(["make.exe", "-C", folder])',
     ],
 )
 def test_the_script_text_scan_spares(source: str) -> None:
@@ -1374,7 +1450,8 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
     "tray/branding.py": "tray's branded-launcher relaunch, fixed argv, close_fds=True",
     "verify/cipher_policy.py": (
         "verify's host cipher policy read (BACKLOG #3277): Get-TlsCipherSuite through the System32 "
-        "powershell.exe, or `openssl ciphers` on PATH; fixed argv, bounded by _PROBE_TIMEOUT_S"
+        "powershell.exe, or `openssl ciphers` and `openssl version -d` on PATH (BACKLOG #3803); "
+        "fixed argv, each start bounded by _PROBE_TIMEOUT_S"
     ),
 }
 
