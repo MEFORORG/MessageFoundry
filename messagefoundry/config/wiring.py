@@ -8085,7 +8085,11 @@ def load_config(
 
 
 def load_snapshot(
-    snapshot: ConfigSnapshot, *, allow_empty: bool = False, source_dir: Path | None = None
+    snapshot: ConfigSnapshot,
+    *,
+    allow_empty: bool = False,
+    source_dir: Path | None = None,
+    code_sets: Mapping[str, CodeSet] | None = None,
 ) -> Registry:
     """Load the graph ``snapshot`` holds, reading nothing from disk.
 
@@ -8094,7 +8098,9 @@ def load_snapshot(
     the bytes the engine loaded and never reads the directory (vault BACKLOG #2596). The trust
     check belongs to whoever read the snapshot; this function runs what it is given.
     ``source_dir`` is recorded as :attr:`Registry.source_dir`, the snapshot's directory when
-    omitted."""
+    omitted. ``code_sets``, when given, are the tables the load publishes in place of parsing the
+    snapshot's ``codesets/``: a worker is sent the engine's parsed tables and not their files, so
+    one boot frame does not carry each table twice."""
     _require_loadable(snapshot)
     directory = snapshot.directory
     registry = Registry(
@@ -8105,12 +8111,15 @@ def load_snapshot(
     # Load the bundle's reference tables (codesets/ relative to the config dir) BEFORE importing the
     # config modules, so a module-top-level code_set(...) capture resolves. A bad/duplicate table is a
     # WiringError here (fail loud), like a bad env value; a missing codesets/ dir is fine (no tables).
-    try:
-        registry.code_sets = code_sets_from_files(
-            snapshot.code_set_files, directory / CODESETS_DIR_NAME
-        )
-    except CodeSetError as exc:
-        raise WiringError(str(exc)) from exc
+    if code_sets is not None:
+        registry.code_sets = dict(code_sets)
+    else:
+        try:
+            registry.code_sets = code_sets_from_files(
+                snapshot.code_set_files, directory / CODESETS_DIR_NAME
+            )
+        except CodeSetError as exc:
+            raise WiringError(str(exc)) from exc
     with _loading(snapshot, registry) as helpers:
         for name in snapshot.modules:
             if not name.startswith("_"):

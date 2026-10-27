@@ -182,12 +182,18 @@ class ConfigSnapshot:
         covers. A load refuses when there is any: it cannot run bytes it does not have."""
         return tuple(rel for rel in self.unreadable if not _covered_only(rel))
 
-    def loaded(self) -> ConfigSnapshot:
+    def loaded(self, *, code_sets: bool = True) -> ConfigSnapshot:
         """This snapshot without the files only the fingerprint covers: what a sandbox worker
-        needs to run the same graph, and no more."""
+        needs to run the same graph, and no more. Without ``code_sets``, the ``codesets/`` tables
+        are left out too, for a worker handed the engine's parsed tables instead."""
+        codesets = f"{CODESETS_DIR_NAME}/"
         return ConfigSnapshot(
             directory=self.directory,
-            files={rel: data for rel, data in self.files.items() if not _covered_only(rel)},
+            files={
+                rel: data
+                for rel, data in self.files.items()
+                if not _covered_only(rel) and (code_sets or not rel.startswith(codesets))
+            },
         )
 
 

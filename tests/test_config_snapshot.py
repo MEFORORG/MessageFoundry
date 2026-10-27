@@ -251,6 +251,37 @@ def test_modules_run_in_the_order_the_directory_listing_gave(tmp_path: Path) -> 
     assert snapshot.modules == tuple(sorted(names, key=PurePath))
 
 
+def test_a_worker_sent_the_engines_tables_is_not_sent_their_files(tmp_path: Path) -> None:
+    """One boot frame carries each table once: the engine's parsed tables when it publishes any,
+    so the frame's 64 MiB cap admits as many tables under ``subprocess`` as under ``off``. The
+    worker's load publishes them before any module runs, so a top-level capture resolves."""
+    (tmp_path / "graph.py").write_text(
+        _graph("V1") + '\nfrom messagefoundry import code_set\nDIETS = code_set("diets")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "codesets").mkdir()
+    (tmp_path / "codesets" / "diets.csv").write_text("k,v\na,b\n", encoding="utf-8")
+    registry = load_config(tmp_path)
+    snapshot = registry.config_snapshot
+    assert snapshot is not None and "codesets/diets.csv" in snapshot.files
+    published = codec.decode_boot(
+        codec.encode_boot(
+            snapshot=snapshot, forbidden=(), mem_mb=None, code_sets=registry.code_sets
+        )
+    )
+    assert set(published.snapshot.files) == {"graph.py"}
+    assert published.code_sets is not None
+    worker = load_snapshot(published.snapshot, code_sets=published.code_sets)
+    assert worker.code_sets["diets"]["a"] == "b"
+    assert worker.code_digest == registry.code_digest
+    # Control: with no tables published, the files go instead, and the worker parses them.
+    unpublished = codec.decode_boot(
+        codec.encode_boot(snapshot=snapshot, forbidden=(), mem_mb=None, code_sets=None)
+    )
+    assert "codesets/diets.csv" in unpublished.snapshot.files
+    assert load_snapshot(unpublished.snapshot).code_sets["diets"]["a"] == "b"
+
+
 # --- the points the row folds in -------------------------------------------------------------------
 
 

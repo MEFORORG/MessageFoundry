@@ -988,14 +988,16 @@ def _open(body: bytes, allowed: tuple[str, ...]) -> tuple[dict[str, Any], _Reade
     return header, _Reader(blobs), kind
 
 
-def enc_snapshot(snapshot: ConfigSnapshot, blobs: _Blobs) -> Any:
+def enc_snapshot(snapshot: ConfigSnapshot, blobs: _Blobs, *, code_sets: bool = True) -> Any:
     """Describe the config snapshot the engine loaded, for the worker's bootstrap frame.
 
     The worker runs these bytes and never reads the config directory (vault BACKLOG #2596): a
     respawn, after a crash or a wall-cap kill, runs what the engine loaded rather than whatever is
     on disk then. Each file's bytes travel as base64 in a segment, so source in any encoding crosses
-    unchanged. Only what a load reads is sent (:meth:`ConfigSnapshot.loaded`)."""
-    loaded = snapshot.loaded()
+    unchanged. Only what a load reads is sent (:meth:`ConfigSnapshot.loaded`). Without
+    ``code_sets`` the ``codesets/`` tables are left out: the frame carries the engine's parsed
+    tables already, and both copies would halve the volume of tables :data:`MAX_FRAME` admits."""
+    loaded = snapshot.loaded(code_sets=code_sets)
     return {
         "dir": blobs.ref(str(loaded.directory)),
         "files": [
@@ -1044,7 +1046,9 @@ def encode_boot(
     blobs = _Blobs()
     header = _envelope(
         {
-            "snapshot": enc_snapshot(snapshot, blobs),
+            # The tables go once: as the engine's parsed ones when it published any, else as
+            # the snapshot's files, which the worker then parses.
+            "snapshot": enc_snapshot(snapshot, blobs, code_sets=code_sets is None),
             "forbidden": list(forbidden),
             "mem_mb": None if mem_mb is None else int(mem_mb),
             "code_sets": enc_code_sets(code_sets, blobs),

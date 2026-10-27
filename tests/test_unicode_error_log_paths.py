@@ -1175,7 +1175,7 @@ def test_a_sandbox_bootstrap_unicode_failure_is_reported_without_the_character(
     sandbox._write_frame(stdin, boot)
     stdin.seek(0)
 
-    def unreadable(snapshot: object) -> object:
+    def unreadable(snapshot: object, **_kw: object) -> object:
         raise _encode_error()
 
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(buffer=stdin))
