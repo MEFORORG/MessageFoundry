@@ -422,6 +422,126 @@ def test_a_static_api_key_header_over_verify_off_is_refused(
 
 
 @pytest.mark.parametrize("cell", _CELLS)
+def test_a_neutral_named_static_header_over_verify_off_is_refused(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3533 item 7: a secret under a name the redaction screen does not read as a
+    credential, such as ``X-Session``, crossed a verify-off hop until then. A static header off the
+    allowlist now refuses it, whatever its name or value."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {"verify_tls": False, "headers": {"X-Session": _SECRET}}
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw(cell, extra)
+    message = str(exc.value)
+    assert "static header outside the verify-off allowlist (X-Session)" in message
+    assert "its credentials (" not in message  # a header refused for its name is not a credential
+    assert "Or remove the header" in message  # the one listed item that removal can clear
+    # It names the places the refusal cannot see, never the whole url: it does see a
+    # credential-named query parameter.
+    assert (
+        "Moving a secret into the url path, a query parameter with a neutral name or a dynamic "
+        "header is not a fix" in message
+    )
+    _assert_credential_refusal(exc)
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [{"bearer_token": _SECRET}, {"url": f"https://api.example.com/x?api_key={_SECRET}"}],
+    ids=["auth-setting", "url-query"],
+)
+def test_removal_is_not_offered_when_a_credential_still_refuses_the_hop(
+    credential: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a credential beside unlisted headers, removing the headers cannot clear the refusal,
+    so the text names both apart and offers no removal."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {"verify_tls": False, "headers": {"X-Trace": "t1", "X-Tenant": "a"}, **credential}
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw("REST", extra)
+    message = str(exc.value)
+    assert "its credentials (" in message
+    assert "static headers outside the verify-off allowlist (X-Trace, X-Tenant)" in message
+    assert "X-Trace" not in message.split("its credentials (", 1)[1].split(")", 1)[0]
+    assert "remove" not in message.lower()
+    _assert_credential_refusal(exc)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+def test_an_unlisted_static_header_is_refused_on_an_attested_or_loopback_hop_too(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The allowlist rides the credential arm, so the two levers that ALLOW a credential-less
+    verify-off hop on production leave this one refused, as for a credential."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    extra = {"verify_tls": False, "headers": {"X-Trace": "t1"}}
+    with active_hop_posture(_PROD):
+        with pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL):
+            _build_raw(cell, extra, attested=True)
+        with pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL):
+            _build_raw(cell, extra, url="https://127.0.0.1:8443/x")
+
+
+def test_a_fhir_lookup_unlisted_static_header_over_verify_off_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    lookup = {"url": "https://fhir.example.org/fhir", "verify_tls": False}
+    with active_hop_posture(_STAGING):
+        with pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+            FhirLookupExecutor(
+                {"L": {**lookup, "headers": {"X-Session": _SECRET}}},
+                egress=EgressSettings(deny_by_default=False),
+            )
+        assert "static header outside the verify-off allowlist (X-Session)" in str(exc.value)
+        assert "its credentials (" not in str(exc.value)
+        assert _SECRET not in str(exc.value)
+        # The control arm: an allowlisted header still crosses on the escape.
+        ex = FhirLookupExecutor(
+            {"L": {**lookup, "headers": {"Accept": "application/fhir+json"}}},
+            egress=EgressSettings(deny_by_default=False),
+        )
+    assert ex.connections == frozenset({"L"})
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+def test_allowlisted_static_headers_over_verify_off_still_cross_on_the_escape(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control arm for the allowlist: every allowlisted name, in any case, still crosses."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    headers = {
+        "ACCEPT": "application/json",
+        "Content-Type": "application/json",
+        "user-agent": "MessageFoundry",
+        "X-Request-ID": "req-1",
+    }
+    with active_hop_posture(_STAGING):
+        assert _build_raw(cell, {"verify_tls": False, "headers": headers}) is not None
+
+
+def test_a_credential_value_under_an_allowlisted_name_is_still_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The allowlist reads names only, so the redaction screen's value test still runs first."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {"verify_tls": False, "headers": {"User-Agent": f"Bearer {_SECRET}"}}
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw("REST", extra)
+    assert "User-Agent header" in str(exc.value)
+    assert "allowlist" not in str(exc.value)  # labelled a credential, and not told to remove it
+    _assert_credential_refusal(exc)
+
+
+def test_the_verify_off_header_allowlist_is_pinned() -> None:
+    """Widening the list loosens a no-escape refusal, so it is a reviewed change, never a drift."""
+    from messagefoundry.transports.rest import VERIFY_OFF_STATIC_HEADER_ALLOWLIST
+
+    pinned = frozenset({"accept", "content-type", "user-agent", "x-request-id"})
+    assert pinned == VERIFY_OFF_STATIC_HEADER_ALLOWLIST
+
+
+@pytest.mark.parametrize("cell", _CELLS)
 def test_a_url_query_credential_over_verify_off_is_refused(
     cell: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
