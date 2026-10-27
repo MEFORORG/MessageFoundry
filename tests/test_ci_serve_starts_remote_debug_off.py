@@ -58,6 +58,14 @@ _MODULES = ("messagefoundry", "messagefoundry.__main__")
 _LAUNCHERS = ("messagefoundry", "messagefoundry.exe")
 #: A cluster of single-letter options whose last one takes the next word as its argument.
 _ARGUMENT_CLUSTER = re.compile(r"-[A-Za-z]*[XW]")
+#: Floors on the walk below: step scripts read, and the workflow files or action directories that
+#: yielded one. Measured 2026-10-27: 306 scripts from 32 of the 35 workflow files, and none from
+#: the actions, so these floors cannot see the actions half of the walk go blind. They catch a walk
+#: that lost most of its files, not a partial loss. A walk that reads nothing at all also fails the
+#: control below. The script floor is also what lets ``test_vacuous_absence_assert_lint`` see the
+#: absence assertion as guarded. Lower a floor only for a deliberate cut in the workflows.
+_MIN_STEP_SCRIPTS = 150
+_MIN_SCRIPTED_FILES = 25
 
 
 def _name(token: str) -> str:
@@ -175,9 +183,17 @@ def _step_scripts() -> tuple[tuple[str, str, str], ...]:
 
 
 def test_every_command_line_engine_start_turns_remote_debugging_off() -> None:
+    scripts = _step_scripts()
+    files = {where for where, _, _ in scripts}
+    blind = (
+        f"the workflow walk has gone blind: {len(scripts)} step scripts (floor {_MIN_STEP_SCRIPTS}) "
+        f"from {len(files)} files or actions (floor {_MIN_SCRIPTED_FILES})"
+    )
+    assert len(scripts) >= _MIN_STEP_SCRIPTS, blind
+    assert len(files) >= _MIN_SCRIPTED_FILES, blind
     problems = {
         f"{where} / {job}": found
-        for where, job, script in _step_scripts()
+        for where, job, script in scripts
         if (found := start_problems(script))
     }
     assert not problems, (
