@@ -1121,8 +1121,9 @@ def http_credentials_sent(
     connection's own proxy login (vault BACKLOG #3416, #3457).
 
     It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
-    not seen here, nor a secret in the path of ``url``; docs/SECURITY-LOOSENING.md lists both among
-    the hops the rule does not reach."""
+    not seen here; :func:`refuse_dynamic_headers_off_allowlist` judges those at send. Nor is a
+    secret in the path of ``url``; docs/SECURITY-LOOSENING.md lists it among the hops the rule
+    does not reach."""
     # Lazy: both import config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
     from messagefoundry.config.wiring import _is_secret_header
@@ -1201,8 +1202,8 @@ def refuse_verify_off(
         removal = (
             f" Or remove the {noun}; the engine then judges the hop as a verify-off hop with no "
             "credential, which its own posture and levers may still refuse. Moving a secret into "
-            "the url path, a query parameter with a neutral name or a dynamic header is not a "
-            "fix: this refusal cannot see a secret there."
+            "the url path or a query parameter with a neutral name is not a fix: this refusal "
+            "cannot see a secret there. A dynamic header outside the allowlist is refused at send."
             if not secrets
             else ""
         )
@@ -1226,6 +1227,67 @@ def refuse_verify_off(
         return None
     return InsecureHopGuard(
         posture=posture, attested=attested, cell=cell, weakened_tls=True, connection=connection
+    )
+
+
+#: ``NegativeAckError.code`` of a send refused by :func:`refuse_dynamic_headers_off_allowlist`.
+DYNAMIC_HEADER_REFUSED_CODE = "dynamic-header-refused"
+
+
+def holds_headers_to_allowlist(scheme: str, url: str, *, verify_tls: bool) -> bool:
+    """Whether every header this hop sends is held to :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`.
+
+    True for a ``verify_tls = false`` https hop, any host, and for plain http to a host off this
+    machine (vault BACKLOG #3533 items 4, 6, 7). Those are the hops where a static header off the
+    allowlist refuses the connection at build. :func:`refuse_dynamic_headers_off_allowlist` holds
+    a Handler's per-message headers to the same list at send. Call it after the construction
+    guards, which have already refused a URL that names no host."""
+    if scheme == "https":
+        return not verify_tls
+    return scheme == "http" and not is_loopback_hop_host(
+        _hop_guard_host(url, cell=_CLEARTEXT_CREDENTIAL_CELL)
+    )
+
+
+def refuse_dynamic_headers_off_allowlist(
+    headers: Mapping[str, str], *, connector: str, connection: str | None
+) -> None:
+    """Refuse a send whose per-message headers the static rule would refuse (vault BACKLOG #3533
+    item 6, following the owner's 2026-10-26 ruling on item 7).
+
+    ``headers`` is what :func:`outbound_headers_from_metadata` built from the message. A connector
+    calls this only on a hop :func:`holds_headers_to_allowlist` names. A header counts when its name
+    is off :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, in any letter case, or when the redaction
+    screen would mask it, so a credential-shaped value under an allowed name counts too.
+
+    The refusal is permanent: a retry would stamp the same header. It names the connection and how
+    many headers it refused, and **never a header's name or value**. At send a name is a metadata
+    key suffix the Handler may derive from the message, as
+    :func:`enforce_send_time_length_limits` records for its own message-derived arm, so it is
+    treated as PHI. That also keeps a crafted name from faking the refusal's structure."""
+    if not headers:
+        return
+    # Lazy: config.wiring is not otherwise loaded by this module (see http_credentials_sent).
+    from messagefoundry.config.wiring import _is_secret_header
+
+    refused = sum(
+        1
+        for name, value in headers.items()
+        if name.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST
+        or _is_secret_header(name, value)
+    )
+    if not refused:
+        return
+    noun = "header" if refused == 1 else "headers"
+    raise NegativeAckError(
+        f"{hop_name_prefix(connection)}{connector} send refused: a Handler stamped {refused} "
+        f"per-message {noun} under dynamic_headers that this hop may not carry. Its peer is not "
+        "verified (verify_tls=false) or it is cleartext http off this machine, so only the "
+        "allowlisted Accept/Content-Type/User-Agent/X-Request-ID may be stamped, with no "
+        "credential in them. "
+        "The names are withheld, since a Handler may derive them from the message",
+        code=DYNAMIC_HEADER_REFUSED_CODE,
+        permanent=True,
     )
 
 
@@ -2421,6 +2483,10 @@ class RestDestination(DestinationConnector):
                 # assertion cannot reach this hop (ASVS 12.1.2).
                 self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
+        # Vault BACKLOG #3533 item 6: on a hop whose static headers are held to the allowlist, a
+        # Handler's per-message headers are held to it too, at send.
+        self._connection_name = config.name
+        self._holds_headers = holds_headers_to_allowlist(scheme, self.url, verify_tls=verify)
         if self._ech_sidecar is not None:
             # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar
             # owns destination TLS + ECH + cert verification), so a plain no-redirect opener carries it —
@@ -2485,6 +2551,10 @@ class RestDestination(DestinationConnector):
         # #68: build this message's dynamic headers from its user-metadata bag (pure; None → {} → byte-
         # identical). urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         dynamic_headers = outbound_headers_from_metadata(metadata)
+        if self._holds_headers:
+            refuse_dynamic_headers_off_allowlist(
+                dynamic_headers, connector="REST destination", connection=self._connection_name
+            )
         body, status, headers = await asyncio.to_thread(self._post, payload, dynamic_headers)
         if isinstance(body, ReplyBodyDropped):
             # Capture is off. Delivered; the worker records the drop on the message (vault

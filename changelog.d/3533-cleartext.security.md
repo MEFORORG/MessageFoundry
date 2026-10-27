@@ -8,3 +8,8 @@
   [ADR 0153](../docs/adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
   The forward-proxy login is not covered, and
   [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md) lists it. (`BACKLOG #3533`)
+- **A Handler's per-message headers meet the header allowlist at send.** On a
+  `verify_tls = false` hop, or plain `http` off this machine, a header stamped under
+  `dynamic_headers` must be `Accept`, `Content-Type`, `User-Agent` or `X-Request-ID` with no
+  credential in it, or the message is refused permanently. The refusal names the connection
+  and how many headers it refused, never a header's name or value. (`BACKLOG #3533`)

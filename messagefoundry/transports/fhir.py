@@ -117,12 +117,14 @@ from messagefoundry.transports.rest import (
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
     find_outbound_length_violation,
+    holds_headers_to_allowlist,
     http_credentials_sent,
     http_family_trust_anchor,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
+    refuse_dynamic_headers_off_allowlist,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
     refuse_verify_off,
@@ -1025,6 +1027,10 @@ class FhirDestination(DestinationConnector):
                 _redact_url(self.base_url),
             )
             self._opener = _insecure_opener(*proxy_handlers)
+        # Vault BACKLOG #3533 item 6: on a hop whose static headers are held to the allowlist, a
+        # Handler's per-message headers are held to it too, at send.
+        self._connection_name = config.name
+        self._holds_headers = holds_headers_to_allowlist(scheme, self.base_url, verify_tls=verify)
         # #65: HTTP Digest — fold the challenge-answering handler into a per-connection opener (never the
         # shared one). None (default) → byte-identical. Mutually exclusive with a bearer provider.
         from messagefoundry.transports.http_auth import digest_handler_from_settings
@@ -1181,7 +1187,13 @@ class FhirDestination(DestinationConnector):
         # #68: fold this message's dynamic http.header.* entries into the per-request headers, MERGED
         # OVER the static ones but UNDER the connector's interaction headers (If-Match/If-None-Exist),
         # which are semantically required and must win. Pure; None → {} → byte-identical.
-        extra_headers = {**outbound_headers_from_metadata(metadata), **request.headers}
+        dynamic_headers = outbound_headers_from_metadata(metadata)
+        if self._holds_headers:
+            # Only the Handler's headers: request.headers are the connector's own interaction headers.
+            refuse_dynamic_headers_off_allowlist(
+                dynamic_headers, connector="FHIR destination", connection=self._connection_name
+            )
+        extra_headers = {**dynamic_headers, **request.headers}
         # urllib is blocking — keep it off the event loop (the delivery worker awaits this). The
         # transaction wrap and its reply parse ride the same thread: both scale with the body.
         body, status, headers, entry_outcome = await asyncio.to_thread(

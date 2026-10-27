@@ -437,11 +437,13 @@ def test_a_neutral_named_static_header_over_verify_off_is_refused(
     assert "its credentials (" not in message  # a header refused for its name is not a credential
     assert "Or remove the header" in message  # the one listed item that removal can clear
     # It names the places the refusal cannot see, never the whole url: it does see a
-    # credential-named query parameter.
+    # credential-named query parameter. A dynamic header is judged at send since vault BACKLOG
+    # #3533 item 6, so the text says that instead of calling it a blind spot.
     assert (
-        "Moving a secret into the url path, a query parameter with a neutral name or a dynamic "
-        "header is not a fix" in message
+        "Moving a secret into the url path or a query parameter with a neutral name is not a fix"
+        in message
     )
+    assert "A dynamic header outside the allowlist is refused at send." in message
     _assert_credential_refusal(exc)
 
 

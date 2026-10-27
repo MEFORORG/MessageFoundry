@@ -76,7 +76,9 @@ a static header that settings views would mask, such as `Authorization` or an AP
 letter case. On a `verify_tls = false` hop, and on a plain `http` hop off this machine, the
 engine also refuses any other static header, unless its name is
 `Accept`, `Content-Type`, `User-Agent` or `X-Request-ID`, in any case. The refusal names such a
-header as outside the allowlist, not as a credential. That allowlist fails closed, so a
+header as outside the allowlist, not as a credential. A header a Handler stamps per message
+under `dynamic_headers` on such a hop is held to the same list when the message is sent, and
+that refusal names neither the header nor its value. That allowlist fails closed, so a
 secret under a neutral name, such as `X-Session`, is refused without being recognized. A
 credential-shaped value under an allowlisted name is still refused. The HTTP family reads its
 auth-setting credentials from the same reader as the static-credential inventory. That inventory
@@ -112,8 +114,6 @@ engine has not verified, when the lever named beside each is set:
 - the `[alerts]` SMTP relay login, under `email_tls_verify = false`;
 - a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
   `[security].enforcement = warn`;
-- a credential header a Handler stamps per message under `dynamic_headers`, on a `verify_tls =
-  false` hop. The refusal reads settings, so it cannot see one.
 
 An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
 leaves the engine.
