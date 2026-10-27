@@ -14,6 +14,7 @@ Every value here is synthetic.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -69,10 +70,15 @@ def _fhir(url: str, *, verify_tls: bool = True, **declared: Any) -> FhirDestinat
     return dest
 
 
-_ACCEPTED = {"cleartext_accepted": True, "cleartext_reason": "legacy partner has no TLS listener"}
+_Dest = RestDestination | FhirDestination
+
+_ACCEPTED: dict[str, Any] = {
+    "cleartext_accepted": True,
+    "cleartext_reason": "legacy partner has no TLS listener",
+}
 
 #: Each hop the static rule holds to the allowlist, so the dynamic rule must too.
-_HELD = {
+_HELD: dict[str, Callable[[], _Dest]] = {
     "rest verify-off loopback": lambda: _rest("https://127.0.0.1:8443/x", verify_tls=False),
     "rest cleartext off-box": lambda: _rest("http://partner.example.test/x", **_ACCEPTED),
     "fhir verify-off loopback": lambda: _fhir("https://127.0.0.1:8443/fhir", verify_tls=False),
@@ -80,7 +86,7 @@ _HELD = {
 }
 
 #: Each hop the rule does not hold: a verified https hop, and plain http that stays on the box.
-_FREE = {
+_FREE: dict[str, Callable[[], _Dest]] = {
     "rest verified": lambda: _rest("https://127.0.0.1:8443/x"),
     "rest cleartext loopback": lambda: _rest("http://127.0.0.1:8080/x"),
     "fhir verified": lambda: _fhir("https://127.0.0.1:8443/fhir"),

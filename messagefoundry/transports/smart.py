@@ -476,17 +476,14 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
         private_key_password: str | None = None,
         expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
         timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
-        attested: bool = False,
-        # #1498 (ADR 0173 §4.3): the per-connection `tls_revocation_attested`, DISTINCT from `attested`
-        # above (which attests a cleartext/verify-off hop is secure by other means, #200). Read from the
-        # resolved settings by `token_provider_from_settings`, where the runner's `_dest_config` mirrors
-        # the connection's top-level declaration and its mandatory reason (ADR 0173).
+        # #1498 (ADR 0173 §4.3): the per-connection `tls_revocation_attested`. Read from the resolved
+        # settings by `token_provider_from_settings`, where the runner's `_dest_config` mirrors the
+        # connection's top-level declaration and its mandatory reason (ADR 0173). No cleartext
+        # declaration is taken: none lets the token request cross cleartext http off-box (vault
+        # BACKLOG #3533 item 4).
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
-        # Inert on this hop since vault BACKLOG #3533 item 4, with `attested` above: no declaration
-        # lets the token request cross cleartext http off-box. Kept so the callers' keywords hold.
-        cleartext_accepted: bool = False,
-        cleartext_reason: str | None = None,
+        # The connection the refusals and the revocation record name.
         connection: str | None = None,
         # ADR 0173: the connection named by the revocation guard's audit line and refusal. Today both
         # readers take it from the one `connection_name` mirror, so it equals `connection`; it stays a
@@ -669,10 +666,9 @@ def token_provider_from_settings(
     none. ``None`` (a direct test construction) resolves to the OS trust store, byte-identical."""
     if not smart_auth_configured(s):
         return None
-    # ADR 0153: the same per-connection declaration the delivery hop carries, mirrored into these
-    # resolved settings by the runner's _dest_config (with the connection name, so the acceptance audit
-    # record names the declaration). Read exactly as the OAuth2 sibling does.
-    attested, accepted, revocation = hop_declarations_from_settings(s, SmartAuthError)
+    # Read strictly for the flag check (vault BACKLOG #2232) and the connection name the runner's
+    # _dest_config mirrors into these resolved settings. Read exactly as the OAuth2 sibling does.
+    _, accepted, revocation = hop_declarations_from_settings(s, SmartAuthError)
     token_url = str(s.get("smart_token_url") or "")
     return SmartBackendTokenProvider(
         token_url=token_url,
@@ -695,15 +691,10 @@ def token_provider_from_settings(
             knob="smart_timeout_seconds",
             transport="SMART",
         ),
-        # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
-        # __init__ (read from settings exactly as _dest_config / the OAuth2 provider do).
-        attested=attested,
         # #1498 (ADR 0173 §4.3): the revocation attestation `_dest_config` mirrors from the connection's
-        # top-level declaration. A DIFFERENT claim from `attested` above, so it gets its own key.
+        # top-level declaration.
         revocation_attested=revocation[0],
         revocation_attested_reason=revocation[1],
-        cleartext_accepted=accepted[0],
-        cleartext_reason=accepted[1],
         connection=accepted[2],
         revocation_connection=revocation[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST

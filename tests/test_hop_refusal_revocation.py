@@ -1129,11 +1129,12 @@ def test_a_smart_token_hop_with_no_host_is_refused(url: str, smart_key: str) -> 
 
 
 def test_a_cleartext_smart_token_hop_with_no_host_keeps_its_own_remedy(smart_key: str) -> None:
-    """The cleartext token seam re-raises a posture refusal as SmartAuthError, with advice to attest
-    or accept the hop. That advice cannot fix a missing host, so this refusal must reach the
-    operator unwrapped, and an attestation must not cross it."""
+    """The cleartext token seam re-raises a cleartext refusal as SmartAuthError, with advice to use
+    https. That advice cannot fix a missing host, so this refusal must reach the operator
+    unwrapped. The provider takes no attestation since vault BACKLOG #3533 item 4, so none is
+    passed."""
     with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="names no host") as exc:
-        _smart_provider("http:///token", smart_key, attested=True)
+        _smart_provider("http:///token", smart_key)
     assert not isinstance(exc.value, SmartAuthError)
 
 

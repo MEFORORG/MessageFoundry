@@ -944,15 +944,25 @@ def _hop_guard_host(url: str, *, cell: str) -> str:
 _CLEARTEXT_CREDENTIAL_CELL = "HTTP cleartext credentials"
 
 
+def _off_box_cleartext_host(scheme: str, url: str) -> str | None:
+    """The host ``url`` names when it is cleartext ``http`` to a host off this machine, else ``None``.
+
+    The one answer to "is this hop off-box cleartext" that the credential rule and the send-time
+    header hold share (vault BACKLOG #3533 items 4, 6). A URL that names no host raises
+    ``ValueError`` (:func:`_hop_guard_host`, BACKLOG #1924)."""
+    if scheme != "http":
+        return None
+    host = _hop_guard_host(url, cell=_CLEARTEXT_CREDENTIAL_CELL)
+    return None if is_loopback_hop_host(host) else host
+
+
 def _refuse_off_box_cleartext(scheme: str, url: str, *, sends: str, connection: str | None) -> None:
     """Raise :class:`InsecureHopRefused` when ``url`` is cleartext ``http`` to an off-box host.
 
     The one body of the HTTP family's cleartext credential rule (vault BACKLOG #3533 item 4, owner
     ruling 2026-10-26, amending ADR 0153 build note 3). ``sends`` names what would cross."""
-    if scheme != "http":
-        return
-    host = _hop_guard_host(url, cell=_CLEARTEXT_CREDENTIAL_CELL)
-    if is_loopback_hop_host(host):
+    host = _off_box_cleartext_host(scheme, url)
+    if host is None:
         return
     raise InsecureHopRefused(
         f"{hop_name_prefix(connection)}{_CLEARTEXT_CREDENTIAL_CELL}: sends {sends} over cleartext "
@@ -1076,6 +1086,23 @@ VERIFY_OFF_STATIC_HEADER_ALLOWLIST = frozenset(
 _OFF_ALLOWLIST = " header, which is not on the verify-off header allowlist"
 
 
+def _header_held(name: str, value: object) -> str | None:
+    """Why a header may not cross a hop held to :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, as the
+    suffix :func:`http_credentials_sent` puts on its name, or ``None`` when it may.
+
+    The one test the static rule at build and the per-message rule at send share (vault BACKLOG
+    #3533 items 6, 7): a header the redaction screen masks, by name or value, is a credential; any
+    other name off the allowlist, in any letter case, is refused for its name alone."""
+    # Lazy: config.wiring is not otherwise loaded by this module.
+    from messagefoundry.config.wiring import _is_secret_header
+
+    if _is_secret_header(name, value):
+        return " header"
+    if name.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
+        return _OFF_ALLOWLIST
+    return None
+
+
 def _describe_sent(credentials: Sequence[str]) -> str:
     """What a hop would send, worded for a refusal: its credentials, then any static headers
     refused only for their names, apart (vault BACKLOG #3533). ``credentials`` is non-empty and
@@ -1124,9 +1151,8 @@ def http_credentials_sent(
     not seen here; :func:`refuse_dynamic_headers_off_allowlist` judges those at send. Nor is a
     secret in the path of ``url``; docs/SECURITY-LOOSENING.md lists it among the hops the rule
     does not reach."""
-    # Lazy: both import config.wiring, which this module does not otherwise load.
+    # Lazy: it imports config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
-    from messagefoundry.config.wiring import _is_secret_header
 
     sent = http_hop_credentials(ctype, settings, lookup=lookup)
     static = settings.get("headers")
@@ -1135,10 +1161,8 @@ def http_credentials_sent(
             key = str(name)
             if cleartext and is_proxy_credential_header_name(key):
                 continue
-            if _is_secret_header(key, value):
-                sent.append(f"{_display_name(key)} header")
-            elif key.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
-                sent.append(f"{_display_name(key)}{_OFF_ALLOWLIST}")
+            if (held := _header_held(key, value)) is not None:
+                sent.append(f"{_display_name(key)}{held}")
     url = settings.get("url")
     if isinstance(url, str) and (names := credential_query_params(url)):
         sent.append(f"url query parameter {', '.join(names)}")
@@ -1244,9 +1268,7 @@ def holds_headers_to_allowlist(scheme: str, url: str, *, verify_tls: bool) -> bo
     guards, which have already refused a URL that names no host."""
     if scheme == "https":
         return not verify_tls
-    return scheme == "http" and not is_loopback_hop_host(
-        _hop_guard_host(url, cell=_CLEARTEXT_CREDENTIAL_CELL)
-    )
+    return _off_box_cleartext_host(scheme, url) is not None
 
 
 def refuse_dynamic_headers_off_allowlist(
@@ -1267,15 +1289,7 @@ def refuse_dynamic_headers_off_allowlist(
     treated as PHI. That also keeps a crafted name from faking the refusal's structure."""
     if not headers:
         return
-    # Lazy: config.wiring is not otherwise loaded by this module (see http_credentials_sent).
-    from messagefoundry.config.wiring import _is_secret_header
-
-    refused = sum(
-        1
-        for name, value in headers.items()
-        if name.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST
-        or _is_secret_header(name, value)
-    )
+    refused = sum(1 for name, value in headers.items() if _header_held(name, value) is not None)
     if not refused:
         return
     noun = "header" if refused == 1 else "headers"

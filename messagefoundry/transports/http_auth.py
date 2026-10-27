@@ -152,15 +152,12 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
         audience: str | None = None,
         expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
         timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
-        attested: bool = False,
         # BACKLOG #2112 (ADR 0173 section 4.3): the per-connection `tls_revocation_attested`, read from
-        # the resolved settings exactly as the SMART sibling reads it. DISTINCT from `attested` above.
+        # the resolved settings exactly as the SMART sibling reads it. No cleartext declaration is
+        # taken: none lets the token request cross cleartext http off-box (vault BACKLOG #3533 item 4).
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
-        # Inert on this hop since vault BACKLOG #3533 item 4, with `attested` above: no declaration
-        # lets the token request cross cleartext http off-box. Kept so the callers' keywords hold.
-        cleartext_accepted: bool = False,
-        cleartext_reason: str | None = None,
+        # The connection the refusals and the revocation record name.
         connection: str | None = None,
         # The connection that declared `revocation_attested`, named in the revocation guard's audit
         # line. Kept apart from `connection`, the cleartext declaration's name.
@@ -253,7 +250,8 @@ def oauth2_cc_provider_from_settings(
     its ``Destination``. ``None`` resolves to the OS trust store, byte-identical."""
     if not oauth2_auth_configured(s):
         return None
-    attested, _accepted, revocation = hop_declarations_from_settings(s, HttpAuthError)
+    # Read strictly for the flag check (vault BACKLOG #2232) and the mirrored connection name.
+    _, accepted, revocation = hop_declarations_from_settings(s, HttpAuthError)
     token_url = str(s.get("oauth2_token_url") or "")
     return OAuth2ClientCredentialsProvider(
         token_url=token_url,
@@ -272,20 +270,11 @@ def oauth2_cc_provider_from_settings(
             knob="oauth2_timeout_seconds",
             transport="OAuth2",
         ),
-        # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
-        # __init__ (read from settings exactly as _dest_config / FhirLookup do). Default False → the hop
-        # decides purely on posture.
-        attested=attested,
         # BACKLOG #2112 (ADR 0173 section 4.3): the revocation attestation `_dest_config` mirrors from
         # the connection's top-level declaration, through the reader the SMART sibling uses.
         revocation_attested=revocation[0],
         revocation_attested_reason=revocation[1],
-        # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings
-        # by the runner's _dest_config for exactly this kind of settings-driven seam (the connection name
-        # rides with it so the acceptance audit record can name the declaration that produced it).
-        cleartext_accepted=_accepted[0],
-        cleartext_reason=_accepted[1],
-        connection=_accepted[2],
+        connection=accepted[2],
         revocation_connection=revocation[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
         ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)

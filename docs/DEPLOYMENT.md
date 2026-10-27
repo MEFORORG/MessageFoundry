@@ -747,15 +747,18 @@ loud warning):
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
-nor the instance's data label — so cleartext credentials over `http`, cleartext MLLP/DICOM/DICOMweb and the
+nor the instance's data label — so cleartext MLLP/DICOM/DICOMweb and the
 cleartext HTTP family are now governed only by a per-connection `cleartext_accepted` + `cleartext_reason`
-(warn + audit) or a loopback hop. (A per-connection `tls_hop_attested` + `tls_hop_attested_reason` makes
+(warn + audit) or a loopback hop. An HTTP-family credential over `http` to a host off this machine is
+refused with no escape, whatever either declaration says (vault BACKLOG #3533 item 4); the
+forward-proxy login is the exception, and
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer) lists it. (A per-connection `tls_hop_attested` + `tls_hop_attested_reason` makes
 the opposite claim, "secure by other means", and ALLOWs the hop. It is reported as a loosening; see
 [CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested).) *(b)* Where it does still apply it is mostly
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
 enforce`, and for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP and anonymous FTPS cells and, since #329,
-the SFTP host key and the webhook sink — the clamp additionally requires the
+the SFTP host key of a key-only login and the webhook sink — the clamp additionally requires the
 instance to be PHI, which is also the default. Either way, on the shipped posture those cells are inert;
 no bullet above is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.
 

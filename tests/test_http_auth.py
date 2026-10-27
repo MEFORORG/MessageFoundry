@@ -320,7 +320,7 @@ def test_oauth2_cleartext_token_endpoint_refused_on_prod_phi_even_with_escape(
     "declared",
     [
         {"cleartext_accepted": True, "cleartext_reason": "legacy IdP has no TLS listener"},
-        {"attested": True},
+        {"tls_hop_attested": True},
     ],
     ids=["accepted", "attested"],
 )
@@ -328,12 +328,20 @@ def test_oauth2_cleartext_token_endpoint_refused_whatever_the_declaration(
     declared: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Vault BACKLOG #3533 item 4 (owner ruling 2026-10-26): the client secret never crosses
-    cleartext http off-box. ADR 0153 build note 3 once let the declarations carry it; its dated
-    amendment records why that went."""
+    cleartext http off-box, whatever declaration the runner mirrors into the settings. ADR 0153
+    build note 3 once let the declarations carry it; its dated amendment records why that went."""
     monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    settings = {
+        "oauth2_token_url": "http://auth.example.com/token",
+        "oauth2_client_id": "cid",
+        "oauth2_client_secret": "s3cr3t",
+        "connection_name": "OB_OAUTH",
+        **declared,
+    }
     with active_hop_posture(_PROD_PHI), pytest.raises(HttpAuthError, match="refused") as ei:
-        _oauth_provider(token_url="http://auth.example.com/token", **declared)
+        bearer_provider_from_settings(settings)
     assert "use https" in str(ei.value)
+    assert "OB_OAUTH" in str(ei.value)
 
 
 def test_digest_cleartext_refused_on_prod_phi_even_with_escape(

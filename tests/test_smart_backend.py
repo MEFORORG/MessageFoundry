@@ -440,12 +440,12 @@ def test_cleartext_token_url_is_decided_by_the_one_authority(
         )
 
 
-def test_cleartext_token_url_is_refused_despite_a_per_connection_declaration(
+def test_cleartext_token_url_is_refused_and_names_the_connection(
     monkeypatch: pytest.MonkeyPatch, rsa_pem: str
 ) -> None:
-    """Vault BACKLOG #3533 item 4 (owner ruling 2026-10-26): the connection's own declaration no
-    longer carries the signed client assertion across cleartext http off-box. ADR 0153 build note
-    3 once let it; its dated amendment records why that went."""
+    """Vault BACKLOG #3533 item 4 (owner ruling 2026-10-26): the signed client assertion never
+    crosses cleartext http off-box. The provider takes no declaration any more; the settings test
+    below shows a mirrored one does not lift the refusal."""
     from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
@@ -457,8 +457,6 @@ def test_cleartext_token_url_is_refused_despite_a_per_connection_declaration(
             token_url="http://auth.example/token",
             client_id="c",
             private_key=rsa_pem,
-            cleartext_accepted=True,
-            cleartext_reason="legacy IdP has no TLS listener",
             connection="OB_LEGACY",
         )
     assert "OB_LEGACY" in str(exc.value)

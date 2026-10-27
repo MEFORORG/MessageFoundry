@@ -4334,8 +4334,9 @@ def Sftp(
     uploads to ``remote_dir``/``filename`` (write to a temp name then rename, so a poller never sees a
     partial). Needs the ``[sftp]`` extra (``pip install 'messagefoundry[sftp]'``; paramiko is lazily
     imported). **Host-key verification is ON by default** (system + ``known_hosts``; an unknown key is
-    refused) — ``MEFOR_ALLOW_INSECURE_TLS`` accepts an unknown key only at
-    ``[security].enforcement = warn``. Put secrets (``password``/
+    refused). ``MEFOR_ALLOW_INSECURE_TLS`` at ``[security].enforcement = warn`` accepts an unknown
+    key for a key-only login, and never saves it. A ``password`` login to an unknown key is refused
+    with no escape (vault BACKLOG #3230, #3533 item 8). Put secrets (``password``/
     ``private_key``) in ``env()``; ``private_key`` must be unencrypted, and ``key_password`` is
     refused (BACKLOG #1352). The host is gated by ``[egress].allowed_remote``
     (both directions). At-least-once: an upload may re-send and a poll may re-emit, so downstreams
