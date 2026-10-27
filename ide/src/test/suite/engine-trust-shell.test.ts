@@ -1110,16 +1110,61 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
   });
 
-  test("pin, dropped: a caFile read whole that holds no certificate drops the anchor", async () => {
-    // Emptied or replaced (DER, garbage) is an answer, not a failure: keeping the old certificate
-    // would go on trusting a CA the user just took away.
+  test("pin, dropped: a caFile replaced by something that is not a certificate drops the anchor", async () => {
+    // Replaced (DER, anything else) is an answer, not a failure: keeping the old certificate would go
+    // on trusting a CA the user just took away.
     const caFile = plantCert(path.join("pki", "prod-ca.pem"));
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
     await trust.refreshEngineTrust();
-    fs.writeFileSync(caFile, "");
 
+    // The control: EMPTY is what a file rewritten in place looks like mid-write, so it proves nothing.
+    fs.writeFileSync(caFile, "");
+    assert.strictEqual(await trust.refreshEngineTrust(), false);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+
+    fs.writeFileSync(caFile, Buffer.from([0x30, 0x82, 0x01, 0x0a])); // the start of a DER certificate
     assert.strictEqual(await trust.refreshEngineTrust(), true);
     assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
+  });
+
+  /**
+   * A refresh whose pin read is held open while a request follows a renewal of the engine's file,
+   * so the follow registers BEFORE the refresh commits. `cliFileFirst` is what the refresh's own
+   * read of the engine's file sees.
+   */
+  async function followDuringRefresh(cliFileFirst: string): Promise<void> {
+    const cert = plantCert(path.join("state", "api-cert.pem"));
+    stubInventory = inventoryFor(cert, "generated");
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+
+    let followed: Promise<boolean> | undefined;
+    childProcess.execFile = cliThatFirst(() => fs.writeFileSync(cert, cliFileFirst));
+    openHook = (file) => {
+      if (file !== path.normalize(caFile) || followed !== undefined) {
+        return undefined;
+      }
+      followed = (async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30)); // the engine's file is read by now
+        fs.writeFileSync(cert, RENEWED);
+        return trust.followCertificateChange(LOOPBACK, PEM);
+      })();
+      return followed.then(() => realOpen(file));
+    };
+    await trust.refreshEngineTrust();
+    assert.ok(followed !== undefined, "the follow never ran, so this test proves nothing");
+    assert.strictEqual(await followed, true);
+  }
+
+  test("a refresh's older read does not replace a renewal a request registered before its commit", async () => {
+    await followDuringRefresh(PEM);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
+  });
+
+  test("a refresh whose own read failed keeps a renewal a request registered before its commit", async () => {
+    await followDuringRefresh("partial");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
   });
 
   test("CLI, kept: an answer with no api_tls (an older engine) keeps the loopback anchor", async () => {

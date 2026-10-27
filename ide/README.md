@@ -279,18 +279,21 @@ the answer arrives.
 **A failure that proves nothing keeps the anchor you had.** Each time the extension re-learns its
 anchors, it ends each engine one of three ways. A certificate it read replaces the anchor. An engine
 loses its anchor when nothing names a certificate for it any more. That includes at least these
-cases: you removed or broke its `caFile`; its `caFile` was read whole and holds no certificate
-(emptied, or replaced with DER or anything else); you moved `messagefoundry.engineUrl`; the engine
-reported no certificate; or no trusted workspace is open to ask the engine. A failure that proves
-nothing keeps the anchor in force instead. That covers a file that could not be opened or was read
-too slowly, the engine's own certificate file caught mid-renewal, and an engine command that failed,
-did not answer, answered in a form this extension does not read, or was not started. A renewal a
-failing request followed meanwhile is kept too. A kept `caFile` anchor is always one read from the
-file the setting names now, and a kept engine certificate is kept only while `engineUrl` still names
-that engine and no `caFile` claims it. Dropping an anchor for such a failure would put that engine
-back on the default roots, which trust more than the anchor did. So a deleted or unreachable
-`caFile` does not by itself stop the extension trusting the certificate it last read from it; to
-stop trusting it, change or remove the setting. The log names each anchor it keeps.
+cases: you removed or broke its `caFile`; its `caFile` was read whole and holds something that is
+not a PEM certificate (DER, for example); you moved `messagefoundry.engineUrl`; the engine reported
+no certificate; or no trusted workspace is open to ask the engine. A failure that proves nothing
+keeps the anchor in force instead. That covers at least a file that could not be opened or read, was
+read too slowly, or was empty (a file rewritten in place is empty for a moment), any file over 512
+KB or that is not a regular file, the engine's own certificate file caught mid-renewal, and an
+engine command that failed, did not answer, answered in a form this extension does not read, or was
+not started. A renewal a failing request followed meanwhile is kept too. A kept `caFile` anchor is
+always one read from the file the setting names now. A kept engine certificate is kept only while
+`engineUrl` still names that engine and no `caFile` claims it, even when
+`messagefoundry.serviceConfig` changed and the engine could not be asked about the new one. Dropping
+an anchor for such a failure would put that engine back on the default roots, which trust more than
+the anchor did. So a deleted, unreachable or emptied `caFile` does not by itself stop the extension
+trusting the certificate it last read from it; to stop trusting it, change or remove the setting.
+The log names each anchor it keeps.
 
 **Every wait is bounded.** The engine gets 35 seconds to answer. All the certificate files of one
 pass then get 10 seconds together, and a file not read by then counts as a failure that proves

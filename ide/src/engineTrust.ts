@@ -254,6 +254,10 @@ function startLateFollowUp(): void {
   ) {
     return;
   }
+  if (cliAbandoned) {
+    cliWanted = true; // a refresh now would only skip the CLI; that child's exit asks instead
+    return;
+  }
   void refreshThenRecheck(true);
 }
 
@@ -277,7 +281,8 @@ function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () => T): P
  *     where the source named one, the same file. "Now" includes a renewal a request followed while
  *     this refresh ran.
  *   * no outcome — the key is authoritatively unanchored: no usable pin and no CLI answer names it
- *     (the pin was removed or refused, its file was read whole and holds no certificate, `engineUrl`
+ *     (the pin was removed or refused, its file was read whole and holds something other than a
+ *     certificate, `engineUrl`
  *     moved, the CLI answered with no certificate, or no trusted workspace remains to ask). Drop it.
  */
 type Outcome =
@@ -575,7 +580,8 @@ async function fillFrom(
 }
 
 /** A certificate read: the PEM, or why there is none, worded for the log. `notACertificate` says the
- *  file was read whole and holds no PEM certificate, which is an answer rather than a failure. */
+ *  file was read whole, is not empty, and holds no PEM certificate, which is an answer rather than a
+ *  failure. */
 type PemRead =
   | { pem: string; problem?: undefined; notACertificate?: undefined }
   | { pem?: undefined; problem: string; notACertificate?: boolean };
@@ -600,10 +606,12 @@ async function readAnchorPem(file: string): Promise<PemRead> {
   // truncated file would register an anchor that silently does nothing while the caller logs
   // "trusting the engine certificate" and reports success. Check the one marker every PEM chain
   // carries. A DER file fails it, correctly — the read decodes utf8, so DER never worked here.
+  // An EMPTY file is not `notACertificate`: a file rewritten in place is empty between the truncate
+  // and the write, so an empty read says nothing about what the file now holds.
   if (!pem.includes("-----BEGIN CERTIFICATE-----")) {
     return {
       problem: `the engine certificate at ${file} is not PEM (no BEGIN CERTIFICATE block)`,
-      notACertificate: true,
+      notACertificate: pem.length > 0,
     };
   }
   return { pem };
@@ -691,8 +699,12 @@ async function readSince(
   worthAgain: (read: PemRead) => boolean = () => true,
 ): Promise<StampedRead> {
   const first = await sharedRead(file, deadline);
-  const stale = first.readAt !== 0 && first.readAt <= since && worthAgain(first.read);
-  return stale ? sharedRead(file, deadline) : first;
+  if (first.readAt === 0 || first.readAt > since || !worthAgain(first.read)) {
+    return first;
+  }
+  const again = await sharedRead(file, deadline);
+  // Cut short, the older read is still better than none.
+  return again.readAt === 0 ? first : again;
 }
 
 /**
@@ -801,7 +813,7 @@ export async function followCertificateChange(
     sameFile(held.file, file) &&
     held.readAt > (stamped?.readAt ?? 0);
   const changed = read !== undefined && read !== usedCa;
-  if (file !== undefined && stamped !== undefined && changed && file === fileFor() && !newer) {
+  if (file !== undefined && stamped !== undefined && changed && sameFile(file, fileFor() ?? "") && !newer) {
     if (read !== held?.pem) {
       register({ url, file, pem: read, pinned: held?.pinned ?? true, readAt: stamped.readAt });
       engineLog().info(`the certificate at ${file} changed; trusting it for ${url}`);
@@ -881,6 +893,7 @@ function warnAboutUnanchoredTargets(targets: readonly PinTarget[]): void {
  * as "cannot verify" until the next 15-second poll, on every window open.
  */
 export function registerEngineTrust(context: vscode.ExtensionContext): void {
+  deactivated = false;
   setTrustFailureHandler(followCertificateChange);
   context.subscriptions.push({
     dispose: () => {
