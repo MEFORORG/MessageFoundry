@@ -18,12 +18,13 @@ MFA-satisfied.
 The window a begin can land in opens when ``confirm_mfa_enrollment`` reads the staged secret's
 cell, its first store read, and closes at the compare-and-set write the fix made conditional,
 ``store.enable_totp``. A begin that stages before that read makes the confirm's code wrong; one
-that stages after the write commits finds TOTP enabled. Every hook here wraps ``enable_totp``, so
-it acts at the window's tail, after the code check, the time-step consumption, the recovery-code
-hashing, the session stamp and the session rotation. The forced test parks there before calling
-the write. The unordered sweep sleeps there before the write, and for its last delay after it too.
-The event-ordered test acts only once the write has committed, so its begin lands past the window.
-A begin that stages anywhere inside the window meets the same write as one held at its tail.
+that arrives after the write commits finds TOTP enabled and stages nothing. Every hook here wraps
+``enable_totp``, so it runs after the code check, the time-step consumption, the recovery-code
+hashing, the session stamp and the session rotation. The forced test parks before calling the
+write, at the window's tail. The unordered sweep sleeps before the write, and for its last delay
+after it too. The event-ordered test holds only once the write has committed, past the window, so
+its begin lands after it. A begin that stages anywhere inside the window meets the same write as
+one held at its tail.
 """
 
 from __future__ import annotations
@@ -163,8 +164,8 @@ _ALREADY_ENABLED = {"detail": "MFA is already enabled; disable it before re-enro
 
 def _assert_begin_refused_once_enabled(begun: httpx.Response) -> None:
     """A begin that reached the account after the confirm's enable committed, from an MFA-pending
-    session. It is refused in one of three ways, each pinned by its headers and its detail, and any
-    other answer fails the test.
+    session. It is refused in one of three ways, each pinned by its status, its gate headers and
+    its detail, and any other answer fails the test.
 
     ``require_reauth_only_action`` reads the factor-binding rule twice: once itself, then again
     inside ``_action_step_up_ok``. An enable that commits before the first read yields the
@@ -186,6 +187,8 @@ def _assert_begin_refused_once_enabled(begun: httpx.Response) -> None:
         # Both reads ran before the commit, so the service found TOTP on, or its conditional stage
         # wrote nothing.
         assert begun.status_code == 400, begun.text
+        assert "X-MFA-Required" not in begun.headers, begun.headers
+        assert "X-Step-Up-Required" not in begun.headers, begun.headers
         assert begun.json() == _ALREADY_ENABLED, begun.text
 
 
@@ -295,9 +298,8 @@ _SLEEP_AFTER_WRITE = 0.5
 #: The begin's send delay aimed past the write and before the confirm's answer. It counts from the
 #: confirm request's start, and the write lands at the confirm's work before the hook (its route
 #: dependencies, code check, argon2id hashing and rotation) plus the before-write sleep. So it sends
-#: the begin half the after-write sleep past the write less that work, which a loaded runner can
-#: grow past the margin and land the begin inside the window. The event-ordered test below is what
-#: reaches the after-write outcome on every run.
+#: the begin half the after-write sleep past the write, less that work. The sweep's docstring says
+#: what a loaded runner does to it.
 _BEGIN_DELAY_PAST_THE_WRITE = _SLEEP_BEFORE_WRITE + _SLEEP_AFTER_WRITE / 2
 
 
@@ -316,9 +318,8 @@ async def test_a_begin_request_sent_once_the_enable_committed_is_refused_and_the
     with the MFA-required 403 before the second read inside ``_action_step_up_ok`` runs, and the
     confirm wins with its own secret. This does not go red without the fix: the begin lands after
     the window. It makes the sweep's confirm-wins outcome, and the MFA-required arm of
-    ``_assert_begin_refused_once_enabled``, run on every runner. The helper's other two arms need
-    the enable to commit between or after the gate's reads, and only the sweep's unordered
-    interleavings reach them."""
+    ``_assert_begin_refused_once_enabled``, run on every runner. The helper's other two arms are
+    reached by no ordered test, and the sweep reaches them rarely: its docstring says how often."""
     service = await _service(engine)
     user_id = await _add(service, "op", Role.OPERATOR)
     pin_totp_clock(monkeypatch, _T0)
@@ -409,6 +410,10 @@ async def test_a_live_begin_request_racing_a_confirm_request_never_enables_an_un
     after the write, so the confirm won (200) and the route's gate refused the begin (403). The
     delays count from the request's start, so on a loaded runner the last one can land inside the
     window instead; the event-ordered test above reaches the confirm-wins outcome on every run.
+    The begin's step-up 403 and already-enabled 400 need the enable to commit between or after the
+    gate's two reads, a gap this sweep's delays almost never hit. A probe not committed here, 100
+    delays from 0.30 s in 2 ms steps run twice on the same workstation (2026-10-27), reached them
+    3 and 1 times, then 1 and 2 times; every run passed.
     Only a run that lands inside the window goes red without the fix. The forced test above is the
     one that always does.
 
@@ -419,7 +424,7 @@ async def test_a_live_begin_request_racing_a_confirm_request_never_enables_an_un
     service = await _service(engine)
     user_id = await _add(service, "op", Role.OPERATOR)
     pin_totp_clock(monkeypatch, _T0)
-    sleep_after_write = _SLEEP_AFTER_WRITE if delay > _SLEEP_BEFORE_WRITE else 0.0
+    sleep_after_write = _SLEEP_AFTER_WRITE if delay == _BEGIN_DELAY_PAST_THE_WRITE else 0.0
     async with _client(engine, service) as c:
         confirmer, beginner, first = await _two_sessions_one_staged(c)
 
