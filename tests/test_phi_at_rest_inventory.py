@@ -1291,7 +1291,7 @@ def _purge_table_cells(section: str) -> dict[str, dict[str, str]]:
 #: §8 rows whose operation is NOT a Store method: the app-log sweep is filesystem work owned by the
 #: RetentionRunner itself, identical on every backend. Reviewed and pinned below, so it cannot be
 #: used as a hiding place for a store operation that quietly stopped being implemented.
-_NON_STORE_OPERATIONS = frozenset({"app_log_days"})
+_NON_STORE_OPERATIONS = frozenset({"app_log_days", "processed_archive_days"})
 
 
 def _method_shape(cls: type, name: str) -> str:
