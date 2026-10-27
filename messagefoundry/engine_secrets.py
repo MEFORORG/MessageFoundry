@@ -159,12 +159,17 @@ def _cite(entry: str, position: int, total: int) -> str:
     return shown
 
 
+#: Why a file the listing named cannot be read: it is gone.
+_REMOVED: Final = "was removed after the directory was listed; start again"
+
+
 def _not_a_regular_file(path: Path) -> str | None:
-    """Why ``path`` is not a regular file to read, or ``None`` when it is."""
+    """Why ``path`` is not a regular file to read, or ``None`` when it is. This follows a link, so on
+    Windows it runs only after the access check has refused one."""
     try:
         mode = path.stat().st_mode
     except FileNotFoundError:
-        return "was removed after the directory was listed; start again"
+        return _REMOVED
     except OSError as exc:
         return f"could not be examined ({exc.strerror or type(exc).__name__})"
     return None if stat.S_ISREG(mode) else "is not a regular file"
@@ -227,12 +232,21 @@ class SecretsDirectory:
         # Each refusal below is raised outside any exception handler, so it carries no __context__.
         # An OSError names only the file; a UnicodeDecodeError keeps the file's bytes on .object,
         # which a refusal raised inside its handler would carry along (BACKLOG #2307 states the rule).
-        # Before the access check, so a file removed since the listing is reported as that, not as
-        # an access problem. A FIFO or a device named for a setting would block the read for good.
+        # A file removed since the listing is reported as that, not as an access problem. lexists
+        # does not follow a link, so it may run before the access check.
+        if not os.path.lexists(path):
+            raise SecretsDirectoryError(f"{what} {_REMOVED}")
+        # The access check before anything that follows a link: on Windows it refuses a link
+        # without following it, and following one would open whatever it names as the engine's
+        # account, a UNC share included. A link swapped in after this check is still followed by
+        # the stat and the open below; reading through one handle opened without following would
+        # close that, and is not done here. On POSIX the access check itself follows a link and
+        # judges the file behind it, so this order changes nothing there.
+        _check(path, what)
+        # A FIFO or a device named for a setting would block the read for good.
         problem = _not_a_regular_file(path)
         if problem is not None:
             raise SecretsDirectoryError(f"{what} {problem}")
-        _check(path, what)
         raw = _read_capped(path)
         if isinstance(raw, str):
             raise SecretsDirectoryError(f"{what} could not be read ({raw})")

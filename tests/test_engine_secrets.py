@@ -13,9 +13,15 @@ Every value here is synthetic.
 from __future__ import annotations
 
 import ast
+import builtins
+import importlib
+import io
 import os
+import stat
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -383,6 +389,92 @@ def test_a_file_that_is_not_regular_is_refused_and_never_opened(tmp_path: Path) 
     os.mkfifo(directory / "MEFOR_STORE_PASSWORD", 0o600)
     with pytest.raises(SecretsDirectoryError, match="is not a regular file"):
         secret_setting("MEFOR_STORE_PASSWORD", environ=_env(directory))
+
+
+def test_a_link_on_windows_is_refused_before_anything_follows_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows a link in the directory is refused as itself. A stat that followed it first would
+    open whatever it names as the engine's account, a planted UNC path included.
+
+    Creating a symbolic link on Windows needs a privilege a test host may lack, so the Windows arm
+    is forced on every platform instead: ``sys.platform`` reads ``win32``, ``os.lstat`` reports the
+    file as a link, and at least these calls that would follow it are recorded: ``os.stat``, the
+    ``os.path`` probes ``pathlib`` calls, and the opens. A ctypes call, such as the access-list
+    read by name, is not. The directory is opened before the platform is forced, because its own
+    access check would then need Windows calls, and the module the access check imports lazily is
+    imported first, so it is never loaded under the forced platform."""
+    directory = _directory(tmp_path)
+    target = os.fspath(_put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE))
+    secrets = open_secrets_directory(_env(directory))
+    assert secrets is not None
+    importlib.import_module("messagefoundry.config.wiring")
+
+    followed: list[str] = []
+    examined_as_itself: list[str] = []
+
+    def _is_target(path: Any) -> bool:
+        return isinstance(path, (str, os.PathLike)) and os.fspath(path) == target
+
+    def _following(name: str, real: Any) -> Any:
+        def _call(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if _is_target(path):
+                followed.append(name)
+            return real(path, *args, **kwargs)
+
+        return _call
+
+    real_stat, real_lstat = os.stat, os.lstat
+
+    def _stat(path: Any, *, follow_symlinks: bool = True, **kwargs: Any) -> Any:
+        if _is_target(path):
+            if not follow_symlinks:
+                return _lstat(path)
+            followed.append("os.stat")
+        return real_stat(path, follow_symlinks=follow_symlinks, **kwargs)
+
+    def _lstat(path: Any, **kwargs: Any) -> Any:
+        if _is_target(path):
+            examined_as_itself.append(target)
+            return SimpleNamespace(
+                st_mode=stat.S_IFLNK | 0o777,
+                st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+            )
+        return real_lstat(path, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", _stat)
+        patch.setattr(os, "lstat", _lstat)
+        for probe in ("exists", "isfile", "isdir"):
+            patch.setattr(os.path, probe, _following(f"os.path.{probe}", getattr(os.path, probe)))
+        patch.setattr(io, "open", _following("io.open", io.open))
+        patch.setattr(builtins, "open", _following("open", builtins.open))
+        patch.setattr(os, "open", _following("os.open", os.open))
+        patch.setattr(sys, "platform", "win32")
+        # The access check's own wording, so the refusal is known to come from that check.
+        with pytest.raises(SecretsDirectoryError, match="it is a link"):
+            secrets.read("MEFOR_STORE_PASSWORD")
+    # The control: the name was examined as itself, so the empty record below is not vacuous.
+    assert examined_as_itself
+    assert followed == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a directory junction is a Windows link")
+def test_a_real_junction_on_windows_is_refused_as_a_link(tmp_path: Path) -> None:
+    """The same refusal against a real link, so the real ``os.lstat`` is what reports it. A junction
+    needs no privilege to create, unlike a symbolic link. Followed, it names a directory, and the
+    refusal would say "is not a regular file" instead."""
+    directory = _directory(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    if sys.platform == "win32":  # repeats the skip, for the type checker: _winapi is per platform
+        import _winapi
+
+        _winapi.CreateJunction(str(elsewhere), str(directory / "MEFOR_STORE_PASSWORD"))
+    secrets = open_secrets_directory(_env(directory))
+    assert secrets is not None
+    with pytest.raises(SecretsDirectoryError, match="it is a link"):
+        secrets.read("MEFOR_STORE_PASSWORD")
 
 
 def test_a_byte_order_mark_is_not_part_of_the_value(tmp_path: Path) -> None:
