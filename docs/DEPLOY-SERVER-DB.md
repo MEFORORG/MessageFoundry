@@ -507,7 +507,7 @@ validation to succeed, the database's certificate must chain to a CA the host al
 | Backend | How the DB CA is trusted | Disable validation? |
 |---|---|---|
 | **PostgreSQL** | **Either** pin the CA by file with `[store].ssl_root_cert = <ca.pem>` (no machine-wide install — see §1), **or** import it into the Windows machine trust store (§5.2). The file pin is the lighter-touch path. | Never. |
-| **SQL Server (ODBC Driver 18)** | **Machine trust store** (`LocalMachine\Root`, §5.2) is the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`, so SQL Server 2022 or later), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). **Never pin the self-signed certificate SQL Server generates when none is installed**: it breaks at the next service restart, as the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md) explains. | Never. |
+| **SQL Server (ODBC Driver 18)** | **Machine trust store** (`LocalMachine\Root`, §5.2) is the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`, so SQL Server 2022 or later), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). **Never pin the self-signed certificate SQL Server generates when it has no usable one**: the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md) says why, and how to spot it. | Never. |
 
 ### 5.2 Import a private / internal CA into the machine store (`LocalMachine\Root`)
 
