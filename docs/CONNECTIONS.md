@@ -1303,6 +1303,15 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   refused (`RejectPolicy`) even with the variable set; it takes effect only on a non-enforcing / non-PHI
   instance. A login with a `password` never takes the escape: its unknown host key is refused in
   every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)).
+  The connector only reads the `known_hosts` file; it never writes a key into it (vault BACKLOG
+  #3533). A key the escape accepts is pinned in memory for that connector's later logins, and a
+  changed key is then refused. A `known_hosts` entry for the host wins over the pin, so a key you
+  add there is used at the next login. A password login that names the same file never inherits
+  the pin. The pin lasts as long as the connector does, and a new connector starts with none. An
+  outbound keeps its connector across a lane stop and restart, so its pin holds there. At least an
+  engine restart, a reload that changes the connection, and a rebuild of a failed lane build a new
+  outbound connector. An inbound poller builds a new connector every time it starts, which at least
+  a lane restart and any reload do.
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
@@ -1500,7 +1509,7 @@ one.
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — supply via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
-| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab. None of these reaches a connection that carries a credential: that is refused in every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
+| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab. None of these reaches a connection that carries a credential, or a static header outside a short allowlist: that is refused in every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while chain + hostname stay verified — the narrow alternative to `verify_tls=false`. Same contract as the [MLLP row](#mllp--mllp): **no posture gate and no escape variable**. It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
@@ -1804,8 +1813,9 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > hop is allowed, a per-connection `tls_hop_attested` with its `tls_hop_attested_reason` allows it (audited, and reported),
 > `cleartext_accepted` warns
 > and audits, a non-enforcing instance warns, and an **enforcing** instance **refuses** it. The refusal
-> lands at construction, so it fails `messagefoundry check` / dry-run / reload / the `serve` pre-flight
-> before anything starts.
+> lands at construction: it fails `messagefoundry check`, dry-run and reload as a whole, and in the live
+> build when `serve` starts it fails that connection, which is recorded failed while the rest of the
+> graph starts (ADR 0031).
 >
 > What is gated is the case the classifier can judge: **no** ssl/tls/encrypt keyword, or one pinned to
 > a no-TLS value. A keyword set to anything outside that deny-list is still delegated, because the
@@ -3128,7 +3138,8 @@ elsewhere. Keep a weakly wrapped key out of those places.
 ## Declaring a cleartext hop (`cleartext_accepted`)
 
 An **outbound** connection whose hop has no TLS is **refused** at `messagefoundry check` / dry-run /
-reload / the serve pre-flight under the default `[security].enforcement = enforce`
+reload, and in the live build when `serve` starts (that outbound is recorded failed and the rest of
+the graph starts), under the default `[security].enforcement = enforce`
 ([ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)). No data
 label relaxes that — `data_class = "synthetic"` used to allow every cleartext hop silently, and no longer
 does. There are exactly three ways such a hop crosses:

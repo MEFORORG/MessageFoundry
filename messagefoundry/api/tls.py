@@ -17,7 +17,7 @@ import os
 import ssl
 import sys
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +37,12 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.redaction import log_timestamp
+from messagefoundry.restricted_file import (
+    WINERROR_ACCESS_DENIED,
+    WINERROR_SHARING_VIOLATION,
+    ride_out_a_held_file,
+    unlink_generated,
+)
 from messagefoundry.tls_handshake_failures import HandshakeFailures
 
 if TYPE_CHECKING:
@@ -392,40 +398,7 @@ def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
             "unusable and would refuse every later start. Re-minting both.",
             orphan,
         )
-        _unlink_generated(orphan)
-
-
-#: Windows ERROR_SHARING_VIOLATION: another process holds the file open without delete sharing.
-_WINERROR_SHARING_VIOLATION = 32
-#: Windows ERROR_ACCESS_DENIED: what a REPLACE onto a file held open elsewhere returns, measured on
-#: Windows 11 with a reader holding the destination (a delete returns the sharing violation).
-_WINERROR_ACCESS_DENIED = 5
-_UNLINK_RETRY_S = 2.0
-
-
-def _ride_out_a_held_file(action: Callable[[], None], held: frozenset[int]) -> None:
-    """Run ``action``, retrying for :data:`_UNLINK_RETRY_S` while Windows refuses it with one of the
-    ``held`` codes.
-
-    On Windows a file another process holds open cannot be deleted or replaced, and a certificate is
-    exactly the file other processes open: the tray pins it, and backup or antivirus may scan it.
-    That hold is momentary, so the refusal is retried before it propagates. Any other error, and
-    every error off Windows, propagates at once.
-    """
-    deadline = time.monotonic() + _UNLINK_RETRY_S
-    while True:
-        try:
-            action()
-            return
-        except PermissionError as exc:
-            if getattr(exc, "winerror", None) not in held or time.monotonic() >= deadline:
-                raise
-        time.sleep(_MINT_LOCK_POLL_S)
-
-
-def _unlink_generated(path: Path) -> None:
-    """Delete one generated file, riding out a brief Windows sharing violation."""
-    _ride_out_a_held_file(path.unlink, frozenset({_WINERROR_SHARING_VIOLATION}))
+        unlink_generated(orphan)
 
 
 def _replace_generated(staged: Path, live: Path) -> None:
@@ -436,9 +409,9 @@ def _replace_generated(staged: Path, live: Path) -> None:
     file's own access list, which is why the key's DACL and the cert's local-users grant are applied
     BEFORE the replace rather than after it.
     """
-    _ride_out_a_held_file(
+    ride_out_a_held_file(
         lambda: os.replace(staged, live),
-        frozenset({_WINERROR_SHARING_VIOLATION, _WINERROR_ACCESS_DENIED}),
+        frozenset({WINERROR_SHARING_VIOLATION, WINERROR_ACCESS_DENIED}),
     )
 
 
@@ -486,8 +459,8 @@ def _discard_unusable_pair(cert_path: Path, key_path: Path, reason: str) -> None
     )
     # Cert first. Should the key's unlink still fail, a lone key is left, which the next start
     # discards as a half-pair, so no ordering leaves anything a later start cannot recover.
-    _unlink_generated(cert_path)
-    _unlink_generated(key_path)
+    unlink_generated(cert_path)
+    unlink_generated(key_path)
 
 
 def _try_lock(fd: int) -> bool:
@@ -831,7 +804,7 @@ def _discard_staged_leftovers(cert_path: Path, key_path: Path) -> None:
     for leftover in _staged_pair(cert_path, key_path):
         if leftover.exists():
             log.warning("discarding %s, left by an interrupted certificate renewal", leftover)
-            _unlink_generated(leftover)
+            unlink_generated(leftover)
 
 
 def _renew_generated_pair(
@@ -870,7 +843,7 @@ def _renew_generated_pair(
         for leftover in (staged_cert, staged_key):
             try:
                 if leftover.exists():
-                    _unlink_generated(leftover)
+                    unlink_generated(leftover)
             except OSError as cleanup:
                 # Never mask the renewal's own error. The next start's locked pass discards it.
                 log.warning("could not remove %s after a failed renewal: %s", leftover, cleanup)

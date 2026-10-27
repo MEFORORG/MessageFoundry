@@ -981,7 +981,8 @@ IMPORT_ONLY: dict[str, str] = {
         "that consumes it runs in pipeline/dr_backup.py, which is inventoried"
     ),
     "messagefoundry/transports/ai_broker.py": (
-        "carries a HopPosture value to the refusal check; builds no context"
+        "names HopPosture only to annotate the factory's unread posture parameter; builds no "
+        "context"
     ),
     "messagefoundry/transports/base.py": (
         "hands a caller's ssl context to asyncio.open_connection and tells an SSLError from an "
