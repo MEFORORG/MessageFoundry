@@ -667,19 +667,30 @@ def _bound_phrase(seconds: float) -> str:
 
 
 _OPENSSL_NAME_RE = re.compile(r"`(OPENSSL_[A-Z_]+)`")
+_CIPHER_PARAGRAPH_LEAD = "**The host cipher read gives PowerShell script text.**"
+_OPENSSL_ITEM_LEAD = "The `openssl` start in `verify/cipher_policy.py`"
+_BLANK_LINE = "\n\n"
 
 
 def _cipher_probe_drift(
     text: str, live_seconds: float, openssl_names: tuple[str, ...]
 ) -> list[str]:
-    """Section 4 must state the host cipher probes' timeout as the code sets it, and name exactly
-    the variables the ``openssl`` probe passes on top of its allowlist (vault BACKLOG #3804 items
-    3 and 5). Before this, both were doc-side text that nothing read."""
+    """Section 4 must state the host cipher probes' timeout as the code sets it, in the probe
+    paragraph, and name exactly the variables the ``openssl`` probe passes on top of its allowlist,
+    in that start's environment-list item (vault BACKLOG #3804 items 3 and 5). Each is read from its
+    own place, so a match elsewhere in the section cannot stand in for it (#4083 finding 7)."""
+    section = _section(text, 4)
+    paragraph = section.partition(_CIPHER_PARAGRAPH_LEAD)[2].partition(_BLANK_LINE)[0]
+    items = [item for item in _env_list_items(text) if item.startswith(_OPENSSL_ITEM_LEAD)]
+    if not paragraph or len(items) != 1:
+        return [
+            f"section 4 has no {_CIPHER_PARAGRAPH_LEAD!r} paragraph or not one "
+            f"{_OPENSSL_ITEM_LEAD!r} item"
+        ]
     # Whitespace is collapsed, so a re-wrap of the paragraph does not read as drift.
-    section = " ".join(_section(text, 4).split())
     rendered = f"{_bound_phrase(live_seconds)} (`_PROBE_TIMEOUT_S`)"
-    problems = [] if rendered in section else [f"section 4 does not state {rendered!r}"]
-    named = set(_OPENSSL_NAME_RE.findall(section))
+    problems = [] if rendered in " ".join(paragraph.split()) else [f"no {rendered!r} there"]
+    named = set(_OPENSSL_NAME_RE.findall(items[0]))
     if named != set(openssl_names):
         problems.append(
             f"section 4 names {sorted(named)} for the openssl probe, the code passes "
@@ -746,6 +757,18 @@ def test_cipher_probe_text_drift_is_reported() -> None:
     assert _cipher_probe_drift(text, seconds + 1, names)
     assert _cipher_probe_drift(text, seconds, (*names, "OPENSSL_NEW"))
     assert _cipher_probe_drift(text, seconds, names[1:])
+    # Each is read only where it belongs (#4083 finding 7): the same text moved elsewhere in
+    # section 4 is reported, where a section-wide match read it as present.
+    stated = f"{_bound_phrase(seconds)} (`_PROBE_TIMEOUT_S`)"
+    moved, count = _loose(stated).subn("limited", text)
+    assert count == 1
+    tray = "**The tray opens files"
+    moved = _replace_once(moved, tray, f"Probes are {stated}.{_BLANK_LINE}{tray}")
+    assert _cipher_probe_drift(moved, seconds, names)
+    last = names[-1]
+    stray = _replace_once(text, f" and `{last}`", "")
+    stray = _replace_once(stray, "- The sandbox worker,", f"- The sandbox worker (`{last}`),")
+    assert _cipher_probe_drift(stray, seconds, names)
 
     source = _package_sources()["verify/cipher_policy.py"]
     assert not _cipher_probe_code_problems(source)
@@ -799,9 +822,8 @@ def _env_list_drift(text: str, sources: Mapping[str, str]) -> list[str]:
         return ["section 4's environment list has no items"]
     problems: list[str] = []
     for item in items:
-        ticked = _TICKED_RE.findall(item)
-        modules = [tok for tok in ticked if tok.endswith(".py")]
-        builders = {tok for tok in ticked if tok in _BUILDERS}
+        modules = _TICKED_PY_RE.findall(item)
+        builders = {tok for tok in _TICKED_RE.findall(item) if tok in _BUILDERS}
         head = " ".join(item.split())[:60]
         if not modules or not builders:
             problems.append(f"the item {head!r} names no module or no builder")
