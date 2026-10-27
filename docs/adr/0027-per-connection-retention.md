@@ -230,10 +230,14 @@ the window measured time-since-**edited** and a preset an operator ran daily but
 aged out. A `last_used_at` column (all three backends, stamped by `get_search_preset`) now carries the
 recall, and the purge keys on the **null-safe greater of `updated_at` and `last_used_at`**. The
 greatest-of-two is spelled per dialect (SQLite `max()` + `COALESCE`, Postgres `GREATEST` + `COALESCE`,
-T-SQL as the equivalent predicate pair — `GREATEST` is 2022+ and this backend's floor is 2016 SP1), and
+T-SQL as the equivalent predicate pair — `GREATEST` is 2022+, and this query keeps to T-SQL that 2016 SP1
+runs; that is a code choice, not the supported floor, which
+[`SYSTEM-REQUIREMENTS.md`](../SYSTEM-REQUIREMENTS.md#databases-message-store) states), and
 a row that predates the column (NULL) still ages out on `updated_at` alone, so the upgrade itself
 neither deletes nor reprieves anything. The keep-forever default is unchanged. See also
 [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md) §1.
+*(Until 2026-10-27 the parenthesis read "this backend's floor is 2016 SP1". Vault BACKLOG #3714
+item 14 reconciled it with the support statement.)*
 
 ## To resolve on acceptance
 
