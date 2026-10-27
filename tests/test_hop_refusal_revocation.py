@@ -19,9 +19,11 @@ pre-clamp ALLOW and now assert the refusal; each says so at its own docstring.
 
 Loopback / attested hops are byte-identical; a non-enforcing hop WARNs. A synthetic-instance
 relaxation went with BACKLOG #1279 -- every instance carries patient data -- and a proven-terminator
-one with BACKLOG #3514 item 5 (pinned below). It
-COMPOSES with #200: #200 refuses the CLEARTEXT / verify-off hop, so revocation fires ONLY on a VERIFYING
-hop — the two gates key on disjoint conditions and never double-refuse one hop.
+one with BACKLOG #3514 item 5 (pinned below).
+
+The revocation refusal COMPOSES with #200: #200 refuses the CLEARTEXT / verify-off hop, so revocation
+fires ONLY on a VERIFYING hop — the two gates key on disjoint conditions and never double-refuse one
+hop.
 """
 
 from __future__ import annotations
@@ -137,7 +139,7 @@ def test_revocation_hop_disposition_matrix() -> None:
     # BACKLOG #299: this hop's own context checks a CRL → ALLOW, the relaxation that replaces a
     # declaration with a real in-engine check.
     assert disp(enforcing=True, crl_checked=True) is HopDisposition.ALLOW
-    # A fourth ALLOW arm sat here -- `not is_phi`, the synthetic instance -- and went with BACKLOG
+    # Another ALLOW arm sat here -- `not is_phi`, the synthetic instance -- and went with BACKLOG
     # #1279. Every instance carries patient data, so it had no input left to fire on and this row,
     # which used to ALLOW, now falls through to the refusal below.
     #
@@ -190,10 +192,11 @@ def test_blanket_attestation_does_not_defeat_an_enforcing_posture() -> None:
 
 
 def test_the_authority_takes_no_egress_terminator_input() -> None:
-    """BACKLOG #3514 item 5 removed ``proxy_proven``: no call site ever set it, so its ALLOW arm never
-    fired. DEPLOYMENT.md and CONNECTIONS.md now say the authority has no input for an egress
+    """BACKLOG #3514 item 5 removed ``proxy_proven``: no call site ever set it True, so its ALLOW arm
+    never fired. DEPLOYMENT.md and CONNECTIONS.md now say the authority has no input for an egress
     terminator, so a change that adds any new input, under any name, must change those pages too.
-    The exact set is pinned for that reason, not only the absence of the old name."""
+    The exact sets are pinned for that reason, not only the absence of the old name: the
+    authority's parameters, the guard's ``capture`` parameters, and the guard's fields."""
     assert set(inspect.signature(revocation_hop_disposition).parameters) == {
         "enforcing",
         "is_loopback_hop",
@@ -201,8 +204,29 @@ def test_the_authority_takes_no_egress_terminator_input() -> None:
         "crl_checked",
         "blanket_attested",
     }
-    assert "proxy_proven" not in inspect.signature(RevocationHopGuard.capture).parameters
-    assert "proxy_proven" not in {f.name for f in dataclasses.fields(RevocationHopGuard)}
+    assert set(inspect.signature(RevocationHopGuard.capture).parameters) == {
+        "host",
+        "cell",
+        "description",
+        "attested",
+        "context",
+        "posture",
+        "ways_across",
+        "attested_reason",
+        "connection",
+    }
+    assert {f.name for f in dataclasses.fields(RevocationHopGuard)} == {
+        "host",
+        "cell",
+        "description",
+        "attested",
+        "posture",
+        "blanket_attested",
+        "crl_checked",
+        "ways_across",
+        "attested_reason",
+        "connection",
+    }
 
 
 # --- the guard: construction gate + unstamped no-op + attestation audit ------------------------------

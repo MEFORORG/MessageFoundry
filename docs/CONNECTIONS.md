@@ -317,9 +317,8 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > `MEFOR_TLS_REVOCATION_ATTESTED=1` no longer crosses an enforcing outbound hop (BACKLOG #299): one
 > variable cannot say which hop's PKI was reviewed. Routing egress through a revocation-checking
 > proxy does **not** change the decision: the authority has no input for one. Anything else is a
-> *posture change* rather than
-> a fix: `[security].enforcement = warn` downgrades it to a WARN. Nothing silences it instance-wide
-> any more — the synthetic declaration that did was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
+> *posture change* rather than a fix: `[security].enforcement = warn` downgrades it to a WARN.
+> Nothing silences it instance-wide any more — the synthetic declaration that did was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
 >
 > **Some of the engine's other verifying TLS hops are not gated at all** — the inbound FTPS poll,
 > the `Database(...)` destination / `DatabasePoll(...)` source, the SQL Server store

@@ -2438,7 +2438,7 @@ def revocation_hop_disposition(
     A ``not is_phi`` ALLOW arm sat fourth until BACKLOG #1279. Every instance carries patient data now,
     so it could no longer fire and its removal leaves the remaining relaxations as the whole set. A
     ``proxy_proven`` ALLOW arm, for revocation proven by a declared revocation-checking egress
-    terminator, sat third until BACKLOG #3514 item 5: no call site ever set it, so it never fired.
+    terminator, sat third until BACKLOG #3514 item 5: no call site ever set it True, so it never fired.
 
     Unlike :func:`insecure_hop_disposition` this carries NO global-escape (``audited_opt_out``) arm — the
     only relaxations an ENFORCING hop has are the on-box carve-out, an in-engine CRL check and a

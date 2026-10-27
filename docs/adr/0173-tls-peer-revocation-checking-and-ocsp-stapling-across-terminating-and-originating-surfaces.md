@@ -261,6 +261,10 @@ false-premise defect:
    one call, `_TokenEndpointProvider._open_token_hop` in `transports/smart.py`, so one site now
    serves two hops. Read the list as *"at least these"* and locate each by symbol: these line numbers were
    written in August and the §4.3 build moved several of them.
+   *(Note 2026-10-27: on an originating hop, revocation "proven in front" no longer crosses the
+   refusal: the `proxy_proven` parameter is gone from `revocation_hop_disposition` and
+   `RevocationHopGuard`, vault BACKLOG #3514 item 5, and the docstring of
+   `revocation_hop_disposition` says why. The item keeps its original wording.)*
 2. **Terminating `[api]` TLS — `in_process_tls_revocation_refused`** (`config/tls_policy.py:344`),
    wired at `__main__.py:1722`. `serve` refuses an in-process off-loopback `[api]` TLS bind unless a
    declared TLS-terminating reverse proxy (WP-15) or `MEFOR_TLS_REVOCATION_ATTESTED` proves
