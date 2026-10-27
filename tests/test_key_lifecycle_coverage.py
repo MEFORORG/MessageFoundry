@@ -114,7 +114,8 @@ _CONN_SERVER = "Per-connection TLS server key"
 _MTLS_CLIENT = "Outbound mTLS client key"
 _LOG_FORWARD = "Off-box log-forward client key"
 _API_CLIENT = "Native API client key"
-_NONPROD = "Non-production self-signed key"
+#: Not "non-production": a site may serve the `cert self-signed` placeholder (vault BACKLOG #3514).
+_SELF_SIGNED = "CLI placeholder and load-test harness key"
 _TOTP = "TOTP shared secret"
 _ANON_SALT = "Anonymizer re-identification salt"
 _SEALED = "Sealed-cache key"
@@ -145,7 +146,7 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/dr_backup.py": frozenset({_DEK}),
     "messagefoundry/pipeline/secret_rotation.py": frozenset({_DEK}),
     "messagefoundry/uploads.py": frozenset({_DEK}),
-    "messagefoundry/__main__.py": frozenset({_DEK, _NONPROD}),
+    "messagefoundry/__main__.py": frozenset({_DEK, _SELF_SIGNED}),
     # Private keys the engine loads or mints.
     "messagefoundry/transports/signing.py": frozenset({_JWS, _SMART, _OIDC_ASSERTION}),
     # BACKLOG #296: builds the private_key_jwt signer from the operator's key.
@@ -169,8 +170,8 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/keywrap.py": frozenset(
         {_API_TLS, _CONN_SERVER, _MTLS_CLIENT, _LOG_FORWARD, _API_CLIENT}
     ),
-    "messagefoundry/pki.py": frozenset({_NONPROD}),
-    "harness/load/tlsmat.py": frozenset({_NONPROD}),
+    "messagefoundry/pki.py": frozenset({_SELF_SIGNED}),
+    "harness/load/tlsmat.py": frozenset({_SELF_SIGNED}),
     # Secret keys the engine holds or feeds.
     "messagefoundry/auth/totp.py": frozenset({_TOTP}),
     "messagefoundry/auth/service.py": frozenset({_TOTP}),
