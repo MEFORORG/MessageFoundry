@@ -759,6 +759,7 @@ def _lines_naming(
         pytest.param("not-a-state", ValueError, _CANNOT_JUDGE, False, id="unknown-state-value"),
         pytest.param("unproven", RuntimeError, _CANNOT_JUDGE, True, id="unproven-runtime"),
         pytest.param("uncheckable", TypeError, _CANNOT_JUDGE, True, id="uncheckable-type"),
+        pytest.param("unproven", ssl.SSLError, _CANNOT_JUDGE, True, id="unproven-ssl"),
         pytest.param("verified", RuntimeError, _SCAN_FAILED, False, id="verified-runtime"),
         pytest.param("not-a-state", TypeError, _SCAN_FAILED, False, id="unknown-state-type"),
         pytest.param("bad", ValueError, _PROVEN_BAD, False, id="bad-value"),
@@ -806,7 +807,7 @@ def test_a_later_block_the_signature_check_cannot_read_leaves_the_file_unjudged(
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
-@pytest.mark.parametrize("error", [ValueError, RuntimeError, TypeError])
+@pytest.mark.parametrize("error", [ValueError, RuntimeError, TypeError, ssl.SSLError])
 @pytest.mark.parametrize("first", ["unproven", "uncheckable"])
 def test_an_unchecked_later_crl_calls_its_log_once_and_takes_no_outer_path(
     ca: _Ca,
