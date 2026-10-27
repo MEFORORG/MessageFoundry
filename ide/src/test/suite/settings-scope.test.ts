@@ -85,6 +85,29 @@ suite("settings scope (SEC-005)", () => {
   });
 });
 
+suite("caFile is reachable only through a machine-scoped setting (SEC-005, BACKLOG #1695)", () => {
+  // A caFile becomes the request's `ca`, which decides whom the extension sends credentials to. It
+  // lives INSIDE messagefoundry.environments so it inherits that setting's machine scope; a top-level
+  // key would be classified separately and could be mis-scoped. Read the manifest to pin both.
+  test("caFile is declared on environment entries and shards, and nowhere at the top level", () => {
+    const props = pkg().contributes.configuration.properties as Record<
+      string,
+      { scope?: string; items?: { properties?: Record<string, { items?: unknown }> } }
+    >;
+    const env = props["messagefoundry.environments"];
+    assert.strictEqual(env.scope, "machine");
+    const entry = env.items?.properties ?? {};
+    assert.ok(entry.caFile, "environment entries declare no caFile");
+    const shard = (entry.shards?.items as { properties?: Record<string, unknown> } | undefined)
+      ?.properties;
+    assert.ok(shard?.caFile, "shard entries declare no caFile");
+    assert.ok(
+      !Object.keys(props).some((key) => /cafile|trust|cert/i.test(key)),
+      "a top-level trust setting appeared; it needs its own SEC-005 review",
+    );
+  });
+});
+
 suite("untrusted-workspace capability (SEC-004)", () => {
   test("the extension declares untrustedWorkspaces.supported === 'limited'", () => {
     assert.strictEqual(pkg().capabilities?.untrustedWorkspaces?.supported, "limited");

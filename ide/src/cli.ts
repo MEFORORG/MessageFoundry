@@ -97,6 +97,9 @@ export function engineUrl(): string {
 export interface Shard {
   name: string;
   url: string;
+  /** Optional full path to a PEM to trust for this instance; falls back to its environment's. See
+   *  `trustPinsFor` in engineTrustModel.ts, which validates it (BACKLOG #1695). */
+  caFile?: unknown;
 }
 
 export interface EnvironmentTarget {
@@ -109,6 +112,13 @@ export interface EnvironmentTarget {
    * backward-compatible: an environment that omits `shards` is unchanged.
    */
   shards?: Shard[];
+  /**
+   * Optional full path to a PEM (the issuing CA, or the engine's own self-signed certificate) to
+   * trust for this environment's engine(s). Machine-scoped with the rest of the setting, so a
+   * workspace cannot set it. `unknown` because nothing has type-checked it yet: `trustPinsFor` in
+   * engineTrustModel.ts validates it and logs a refusal (BACKLOG #1695).
+   */
+  caFile?: unknown;
 }
 
 /** Drop malformed {name,url} entries from a raw config array (shared by environments()/shards()). */
@@ -127,7 +137,11 @@ export function environments(): EnvironmentTarget[] {
   const envs = validTargets<EnvironmentTarget>(config().get("environments", []));
   return envs.map((e) => {
     const shards = shardsOf(e);
-    return shards.length > 0 ? { ...e, shards } : { name: e.name, url: e.url };
+    const base: EnvironmentTarget = { name: e.name, url: e.url };
+    if (e.caFile !== undefined) {
+      base.caFile = e.caFile;
+    }
+    return shards.length > 0 ? { ...base, shards } : base;
   });
 }
 

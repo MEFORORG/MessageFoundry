@@ -197,7 +197,9 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 - `messagefoundry.environments` (default `[]`) — named promote targets `[{ "name": "DEV", "url": … },
   { "name": "PROD", "url": … }]`; an entry may also list `shards` (engine instances), in which case
   promote asks which instance. When set, *Stage → Promote* asks which to target; each engine
-  resolves its own environment values. **Machine-scoped**, same reason as `engineUrl`.
+  resolves its own environment values. **Machine-scoped**, same reason as `engineUrl`. An entry or
+  a shard may also set `caFile`, a full path to a PEM to trust for that engine — see *Trusting the
+  engine's certificate* below.
 - `messagefoundry.messageSetsDir` (default `samples/messages`) — default folder for the Test Bench's
   *Load Message Set* dialog.
 - `messagefoundry.sourceControl.autoPrompt` (default `true`) — offer to set up version control +
@@ -225,13 +227,46 @@ the extension asks the engine where it is and verifies against it:
 **Verification is never disabled.** There is no "trust anyway" option, and the extension never imports
 anything into your OS certificate store. If it cannot verify, the request fails and says so.
 
-This happens at startup and again whenever you change `messagefoundry.engineUrl` or
-`messagefoundry.serviceConfig`. Every part of it fails soft — with no engine on `PATH`, an untrusted
+This happens at startup and again whenever you change `messagefoundry.engineUrl`,
+`messagefoundry.environments` or `messagefoundry.serviceConfig`. Every part of it fails soft — with no engine on `PATH`, an untrusted
 workspace, or a `serviceConfig` that names nothing, the extension simply trusts nothing extra.
 
 If a request reports that it cannot verify the certificate, check two things: that
 `messagefoundry.serviceConfig` names the settings TOML of the engine you are pointing at, and that
 that engine has run at least once (it mints its certificate on the first run, not at install).
+
+**Remote engines, and any engine you want to pin.** `messagefoundry.serviceConfig` describes the
+engine on this machine only, so it is used only for a loopback `engineUrl`. For any other engine,
+set `caFile` on its `messagefoundry.environments` entry (or on one shard):
+
+```json
+"messagefoundry.environments": [
+  { "name": "PROD", "url": "https://prod-host:8765", "caFile": "C:\\pki\\prod-issuing-ca.pem" }
+]
+```
+
+- `caFile` names the issuing CA's certificate, or the engine's own self-signed certificate, as PEM.
+  Requests to that `host:port` then verify against that file **instead of** the default roots. A pin
+  applies to every request to that `host:port`, including `messagefoundry.engineUrl` when it names
+  the same engine, and it wins over the certificate `messagefoundry.serviceConfig` names.
+- It must be a full path (a drive-letter, UNC or `/` path); a relative path is refused, so a
+  workspace can never choose the file. The setting is machine-scoped, so a checked-in
+  `.vscode/settings.json` cannot add or change a pin. A shard without its own `caFile` uses its
+  environment's.
+- A refused or unreadable `caFile` is named in the **MessageFoundry Engine** log, and so is an https
+  target that has no anchor at all.
+
+**A renewed certificate is followed.** The engine renews its generated certificate at startup, into
+the same file. When a request fails verification, the extension re-reads the file its anchor came
+from and, if the certificate changed, retries that request once against the new one. For the loopback
+engine with no anchor yet (it was started after the window opened), it asks the engine again, at most
+once a minute. Verification stays on for the retry.
+
+**The OS trust store.** Unmeasured. VS Code's `http.systemCertificates` (on by default) is meant to
+add the OS store to an extension's https requests. Reading the `@vscode/proxy-agent` 0.45.0 that VS
+Code 1.142.0 bundles, it does so only for a request that carries no CA of its own: so a target with
+no `caFile` and no local anchor should verify against a CA installed in the OS store, and a pinned
+target never consults the OS store. Nobody has yet run this against a real engine.
 
 Where a reverse proxy terminates TLS in front of the engine (`[api].tls_terminated_upstream`), the
 engine mints nothing and speaks plaintext behind the proxy. Point `messagefoundry.engineUrl` at the

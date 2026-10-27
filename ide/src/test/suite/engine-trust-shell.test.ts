@@ -156,7 +156,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     invocations = [];
     logged = [];
     stubInventory = undefined;
-    engineClient.clearEngineTrustAnchors();
+    trust.forgetEngineTrust();
     childProcess.execFile = ((
       _file: string,
       args: string[],
@@ -171,7 +171,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
   teardown(() => {
     childProcess.execFile = realExecFile;
-    engineClient.clearEngineTrustAnchors();
+    trust.forgetEngineTrust();
     fs.rmSync(ws, { recursive: true, force: true });
     // The modules loaded above keep reading this stub. Leaving it pointing at the directory just
     // deleted would hand a later suite a workspace that does not exist; no workspace at all is the
@@ -333,5 +333,139 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
     // The control: with nothing left to drop, a second remote refresh really is a no-op.
     assert.strictEqual(await trust.refreshEngineTrust(), false);
+  });
+
+  // ---- residual (a): an explicit per-target caFile in messagefoundry.environments ----
+
+  const RENEWED = "-----BEGIN CERTIFICATE-----\nrenewed\n-----END CERTIFICATE-----\n";
+
+  test("a caFile pins a REMOTE environment target — the case serviceConfig cannot cover", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.engineUrl = REMOTE;
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+    assert.ok(
+      !logged.some((line) => line.includes("with no trust anchor")),
+      `a pinned target was reported unanchored: ${JSON.stringify(logged)}`,
+    );
+  });
+
+  test("a pin applies with no workspace open, and spawns nothing", async () => {
+    // The setting is machine-scoped, so the file is the machine user's choice; the CLI and the
+    // workspace guard that protects it have nothing to do with it.
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    stubWorkspace = undefined;
+
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+    assert.strictEqual(invocations.length, 0);
+  });
+
+  test("a RELATIVE caFile is refused and logged, even when the file exists in the workspace", async () => {
+    plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile: "pki/prod-ca.pem" }];
+
+    assert.strictEqual(await trust.refreshEngineTrust(), false);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
+    assert.ok(
+      logged.some((line) => line.includes(`not pinning ${REMOTE}`)),
+      `the refusal was silent: ${JSON.stringify(logged)}`,
+    );
+  });
+
+  test("a target with no caFile is named in the log as unanchored", async () => {
+    stubConfig.environments = [{ name: "PROD", url: REMOTE }];
+
+    await trust.refreshEngineTrust();
+
+    assert.ok(
+      logged.some((line) => line.includes("with no trust anchor") && line.includes(REMOTE)),
+      `an unanchored target went unreported: ${JSON.stringify(logged)}`,
+    );
+  });
+
+  test("a caFile for the loopback engine wins over the certificate serviceConfig names", async () => {
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    const caFile = path.join(ws, "pki", "local-ca.pem");
+    fs.mkdirSync(path.dirname(caFile), { recursive: true });
+    fs.writeFileSync(caFile, RENEWED);
+    stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile }];
+
+    await trust.refreshEngineTrust();
+
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
+    assert.strictEqual(invocations.length, 1, "the CLI still runs, for its scheme check");
+  });
+
+  // ---- residual (c): following a certificate the engine renewed ----
+
+  test("a renewed certificate in the same file is followed without spawning the CLI", async () => {
+    const cert = plantCert(path.join("state", "api-cert.pem"));
+    stubInventory = inventoryFor(cert, "generated");
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+
+    fs.writeFileSync(cert, RENEWED); // the engine renews at startup, into the same file
+    const spawned = invocations.length;
+
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, PEM), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
+    assert.strictEqual(invocations.length, spawned, "a re-read of a known file must not spawn");
+  });
+
+  test("a renewed caFile is followed for a remote target too", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+
+    fs.writeFileSync(caFile, RENEWED);
+
+    assert.strictEqual(await trust.followCertificateChange(REMOTE, PEM), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, RENEWED);
+  });
+
+  test("an unchanged file is not a reason to retry — the control", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+
+    assert.strictEqual(await trust.followCertificateChange(REMOTE, PEM), false);
+    assert.strictEqual(invocations.length, 1, "a remote target must never fall back to the CLI");
+  });
+
+  test("an engine that minted its certificate after the window opened is picked up, rate-limited", async () => {
+    // The first-run gap: at activation the engine had not run, so there was nothing to anchor.
+    stubInventory = {
+      api_tls: { scheme: "https", source: "generated", cert: "/nowhere.pem", cert_present: false },
+    };
+    assert.strictEqual(await trust.refreshEngineTrust(), false);
+
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+
+    // The rate limit: a second failure straight away does not spawn the CLI again.
+    const spawned = invocations.length;
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, PEM), false);
+    assert.strictEqual(invocations.length, spawned);
+  });
+
+  test("a pinned LOOPBACK target whose file is unchanged never falls back to the CLI", async () => {
+    // The pin wins over the CLI's answer, so asking the engine again could change nothing.
+    const caFile = plantCert(path.join("pki", "local-ca.pem"));
+    stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile }];
+    await trust.refreshEngineTrust();
+    const spawned = invocations.length;
+
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, PEM), false);
+    assert.strictEqual(invocations.length, spawned);
+  });
+
+  test("an unpinned remote target follows nothing and spawns nothing", async () => {
+    assert.strictEqual(await trust.followCertificateChange(REMOTE, undefined), false);
+    assert.strictEqual(invocations.length, 0);
   });
 });

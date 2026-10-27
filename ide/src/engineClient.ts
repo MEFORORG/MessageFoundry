@@ -7,7 +7,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 
 import { serveCommandLine } from "./engineControlModel";
-import { engineHostKey, isRecord, trustRemedy } from "./engineTrustModel";
+import { engineHostKey, isRecord, isTlsTrustError, trustRemedy } from "./engineTrustModel";
 
 /**
  * What a step-up refusal asked for (403 + `X-Step-Up-Required`). `action` is the
@@ -173,14 +173,71 @@ export function setEngineTrustAnchor(url: string, pem: string | undefined): void
   }
 }
 
-/** Drop every registered anchor, and report whether there WAS one. `engineTrust.ts` calls this before
- *  each refresh, so a target the user edits away from does not leave its certificate registered for
- *  the life of the window. The return value is what tells that caller the trust state changed even
- *  when the refresh ends up registering nothing — dropping an anchor is a change worth re-probing. */
-export function clearEngineTrustAnchors(): boolean {
-  const had = trustAnchors.size > 0;
+/** Drop every registered anchor. `engineTrust.ts` calls this before each refresh, so a target the user
+ *  edits away from does not leave its certificate registered for the life of the window. */
+export function clearEngineTrustAnchors(): void {
   trustAnchors.clear();
-  return had;
+}
+
+/** The anchor registered for `url`'s engine, if any. The ONE lookup: {@link tlsOptions} and
+ *  {@link withRenewalRetry} must agree on which anchor a request carried. */
+function anchorFor(url: string): string | undefined {
+  const key = engineHostKey(url);
+  return key === undefined ? undefined : trustAnchors.get(key);
+}
+
+/**
+ * Called when a request to `url` failed certificate verification while `usedCa` (the anchor that
+ * request carried, or `undefined`) was registered. Resolves true when a DIFFERENT anchor is now
+ * registered for that engine, so the request is worth one more attempt.
+ */
+export type TrustFailureHandler = (url: string, usedCa: string | undefined) => Promise<boolean>;
+
+let trustFailureHandler: TrustFailureHandler | undefined;
+
+/**
+ * Install (or, with `undefined`, remove) the handler {@link withRenewalRetry} consults.
+ *
+ * A hook rather than an import because `engineTrust.ts` already imports this module, and re-reading
+ * a certificate is file and subprocess work that does not belong in the HTTP client.
+ */
+export function setTrustFailureHandler(handler: TrustFailureHandler | undefined): void {
+  trustFailureHandler = handler;
+}
+
+/**
+ * Run `attempt`, and run it ONCE more if it failed verification and the trust handler registered a
+ * new anchor for that engine (BACKLOG #1695, residual c).
+ *
+ * The engine renews its generated certificate at startup, into the same file. The anchor this client
+ * holds was read earlier, so after an engine restart every request failed verification until the
+ * window was reloaded or a setting changed. The engine's own Python client follows a renewal the
+ * same way: re-read the pin on the first verification failure, retry only if it changed.
+ *
+ * Retrying a POST is safe on this path and only this one: a trust failure ends the TLS handshake,
+ * and Node writes the request only after the handshake succeeds, so the engine never saw the first
+ * attempt. Verification is never relaxed for the retry; it simply runs against the new anchor.
+ */
+async function withRenewalRetry<T>(baseUrl: string, attempt: () => Promise<T>): Promise<T> {
+  const usedCa = anchorFor(baseUrl);
+  try {
+    return await attempt();
+  } catch (err) {
+    const handler = trustFailureHandler;
+    if (!(err instanceof NetworkError) || !isTlsTrustError(err.code) || handler === undefined) {
+      throw err;
+    }
+    let followed = false;
+    try {
+      followed = await handler(baseUrl, usedCa);
+    } catch {
+      // Best-effort: the request's own trust error is the useful outcome to report.
+    }
+    if (!followed) {
+      throw err;
+    }
+    return attempt();
+  }
 }
 
 /**
@@ -207,10 +264,9 @@ export function tlsOptions(url: URL): https.RequestOptions {
   if (url.protocol !== "https:") {
     return {};
   }
-  // engineHostKey on BOTH sides of the Map. Spelling the normalization inline here and calling the
-  // helper in setEngineTrustAnchor would let a later change to one make every lookup silently miss.
-  const key = engineHostKey(url.href);
-  const ca = key === undefined ? undefined : trustAnchors.get(key);
+  // engineHostKey on BOTH sides of the Map (via anchorFor). Spelling the normalization inline here
+  // would let a later change to one side make every lookup silently miss.
+  const ca = anchorFor(url.href);
   const base: https.RequestOptions = { minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS };
   return ca === undefined ? base : { ...base, ca };
 }
@@ -257,7 +313,8 @@ export function postJson<T>(
   token?: string,
   timeoutMs?: number,
 ): Promise<T> {
-  return postReply(baseUrl, route, body, token, timeoutMs).then((reply) => {
+  const attempt = (): Promise<PostReply> => postReply(baseUrl, route, body, token, timeoutMs);
+  return withRenewalRetry(baseUrl, attempt).then((reply) => {
     const outcome = classifyApprovable<T>(reply.status, reply.body);
     if (outcome.kind === "held") {
       throw new HeldError(outcome.hold.approvalId);
@@ -343,7 +400,7 @@ export function postApprovable<T>(
   body: unknown,
   token?: string,
 ): Promise<Approvable<T>> {
-  return postReply(baseUrl, route, body, token).then((reply) =>
+  return withRenewalRetry(baseUrl, () => postReply(baseUrl, route, body, token)).then((reply) =>
     classifyApprovable<T>(reply.status, reply.body),
   );
 }
@@ -432,6 +489,16 @@ export function getJson<T>(
   route: string,
   token?: string,
   timeoutMs: number = GET_TIMEOUT_MS,
+): Promise<T> {
+  return withRenewalRetry(baseUrl, () => getOnce<T>(baseUrl, route, token, timeoutMs));
+}
+
+/** One GET attempt; {@link getJson} adds the renewal retry. */
+function getOnce<T>(
+  baseUrl: string,
+  route: string,
+  token: string | undefined,
+  timeoutMs: number,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let url: URL;

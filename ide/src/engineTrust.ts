@@ -1,39 +1,150 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-// The shell around engineTrustModel: ask the ENGINE where its certificate is, read it, and register
-// it with engineClient (BACKLOG #1695). Every decision worth testing lives in the model; this file
-// is the vscode + filesystem + subprocess half.
+// The shell around engineTrustModel: ask the ENGINE where its certificate is, read it, read any
+// per-target `caFile` pins, and register them with engineClient (BACKLOG #1695). Every decision worth
+// testing lives in the model; this file is the vscode + filesystem + subprocess half.
 import * as vscode from "vscode";
 
 import { engineUrl, environments, isExecGated, runJson, serviceConfig, workspaceDir } from "./cli";
-import { clearEngineTrustAnchors, setEngineTrustAnchor } from "./engineClient";
+import {
+  clearEngineTrustAnchors,
+  setEngineTrustAnchor,
+  setTrustFailureHandler,
+} from "./engineClient";
 import { engineLog } from "./engineLog";
-import { parseApiTls, schemeMismatch, trustAnchorForTarget } from "./engineTrustModel";
-import type { ApiTlsFacts } from "./engineTrustModel";
+import { isLocalEngine } from "./engineTarget";
+import {
+  engineHostKey,
+  isHttpsUrl,
+  parseApiTls,
+  pinTargetsOf,
+  schemeMismatch,
+  trustAnchorForTarget,
+  trustPinsFor,
+} from "./engineTrustModel";
+import type { PinTarget } from "./engineTrustModel";
 import { readCapped } from "./symbolIndex";
 
 /**
  * How much of a certificate file we are willing to read. A PEM chain is kilobytes; this only bounds
  * the damage if `messagefoundry.serviceConfig` names a TOML whose `[api].tls_cert_file` points at
- * something enormous, which would otherwise be read whole into the extension host.
+ * something enormous, or a `caFile` names one, which would otherwise be read whole into the
+ * extension host.
  */
 const MAX_PEM_BYTES = 512 * 1024;
 
 /**
- * Ask the engine's CLI which certificate its API bind presents, and register it as the trust anchor
- * for the configured `messagefoundry.engineUrl`.
- *
- * **Fail-soft throughout.** Every failure here — no engine on PATH, no workspace, an untrusted
- * workspace, a `serviceConfig` that names nothing, an older CLI with no `api_tls` key, a certificate
- * not minted yet — leaves the client on Node's default CA set with verification on. The request then
- * fails with a trust error carrying the remedy (`trustRemedy`), which is a better outcome than a
- * half-configured client and is why nothing here throws.
- *
- * Resolves to true when what the client TRUSTS changed — an anchor registered, or a live one dropped
- * — so the caller can re-probe rather than leave a stale verdict on screen. Dropping counts because a
- * retarget to a remote engine registers nothing and still invalidates the verdict on screen.
+ * The shortest gap between two full refreshes started by a verification failure rather than by
+ * activation or a settings change. Each one spawns the engine's CLI, and the status bar probes every
+ * 15 seconds, so an engine that keeps failing verification would otherwise spawn one per probe.
  */
-export async function refreshEngineTrust(): Promise<boolean> {
+const FAILURE_REFRESH_MIN_MS = 60_000;
+
+/** An anchor this file registered: the file it came from, so a renewal can be re-read, the PEM, and
+ *  whether it is a `caFile` pin (which the engine's CLI can never replace, so it is never asked). */
+interface Registered {
+  readonly file: string;
+  readonly pem: string;
+  readonly pinned: boolean;
+}
+
+/**
+ * What this file has registered with engineClient, keyed like engineClient's own map
+ * ({@link engineHostKey}). Kept here, not read back from the client, because following a renewal
+ * needs the FILE an anchor came from and the client holds only its contents.
+ */
+const registered = new Map<string, Registered>();
+
+/** When the last failure-started full refresh began, for {@link FAILURE_REFRESH_MIN_MS}. */
+let lastFailureRefresh = Number.NEGATIVE_INFINITY;
+
+/** The tail of the refresh chain. Refreshes run one at a time; see {@link refreshEngineTrust}. */
+let refreshTail: Promise<unknown> = Promise.resolve();
+
+function register(url: string, anchor: Registered): void {
+  const key = engineHostKey(url);
+  if (key === undefined) {
+    return;
+  }
+  registered.set(key, anchor);
+  setEngineTrustAnchor(url, anchor.pem);
+}
+
+/** What the client trusts, as one comparable string: host keys and PEMs, never the file paths. */
+function trustState(): string {
+  return JSON.stringify([...registered].map(([key, r]) => [key, r.pem]).sort());
+}
+
+/**
+ * Re-learn every trust anchor: the per-target `caFile` pins from `messagefoundry.environments`, then
+ * the local engine's certificate as its CLI reports it.
+ *
+ * **Fail-soft throughout.** Every failure here leaves the affected target on Node's default CA set
+ * with verification on. The request then fails with a trust error carrying the remedy
+ * (`trustRemedy`), which is a better outcome than a half-configured client and is why nothing here
+ * throws.
+ *
+ * Resolves to true when what the client TRUSTS changed, compared as host keys and PEM contents, so
+ * the caller can re-probe rather than leave a stale verdict on screen. Dropping an anchor counts,
+ * because a retarget to a remote engine registers nothing and still invalidates the verdict on
+ * screen. Re-reading the same certificate does not count, so a refresh started by a verification
+ * failure cannot re-probe itself into a loop.
+ *
+ * Refreshes run ONE AT A TIME. Each clears the anchors and then awaits a subprocess, so two
+ * interleaved runs could each clear what the other had just registered.
+ */
+export function refreshEngineTrust(): Promise<boolean> {
+  const run = refreshTail.then(refreshOnce, refreshOnce);
+  refreshTail = run.catch(() => undefined);
+  return run;
+}
+
+async function refreshOnce(): Promise<boolean> {
+  const before = trustState();
+  // Drop every anchor first. Editing `messagefoundry.engineUrl` across hosts would otherwise leave
+  // the previous host's certificate registered for the life of the extension host, so a target the
+  // user moves away from and back to would be trusted from a cached read rather than a fresh one.
+  clearEngineTrustAnchors();
+  registered.clear();
+  const targets = pinTargetsOf(environments());
+  const pinned = applyPins(targets);
+  await anchorLocalEngine(pinned);
+  warnAboutUnanchoredTargets(targets);
+  return trustState() !== before;
+}
+
+/**
+ * Register every `caFile` pin `messagefoundry.environments` names, and return the host keys pinned.
+ *
+ * No workspace and no CLI are involved, and that is why this runs BEFORE the workspace guard in
+ * {@link anchorLocalEngine}: the setting is machine-scoped, so the file it names was chosen by the
+ * user of this machine, and a pin is just as valid with no folder open or in an untrusted workspace.
+ */
+function applyPins(targets: readonly PinTarget[]): Set<string> {
+  const pinned = new Set<string>();
+  for (const pin of trustPinsFor(targets)) {
+    if (pin.kind === "refused") {
+      engineLog().warn(`messagefoundry.environments: not pinning ${pin.url}: ${pin.reason}`);
+      continue;
+    }
+    const read = readAnchorPem(pin.file);
+    if (read.pem === undefined) {
+      engineLog().warn(`${read.problem} — not pinning ${pin.url}`);
+      continue;
+    }
+    register(pin.url, { file: pin.file, pem: read.pem, pinned: true });
+    pinned.add(pin.key);
+    engineLog().info(`trusting ${pin.file} for ${pin.url} (its caFile in messagefoundry.environments)`);
+  }
+  return pinned;
+}
+
+/**
+ * Ask the engine's CLI which certificate its API bind presents, and register it as the trust anchor
+ * for the configured `messagefoundry.engineUrl` — unless an explicit `caFile` pin already covers that
+ * `host:port`. The user named the pin; the CLI's answer is inferred from a workspace setting.
+ */
+async function anchorLocalEngine(pinned: ReadonlySet<string>): Promise<void> {
   // The same guard the three sibling CLI calls in extension.ts use. Without it, opening a loose .py
   // file with no folder spawns a Python interpreter for a command that can only fail: isExecGated()
   // is false when there is no workspace, so it does not cover this on its own.
@@ -47,13 +158,8 @@ export async function refreshEngineTrust(): Promise<boolean> {
   // the extension host's own cwd — the defect the resolution below exists to remove.
   const workspace = workspaceDir();
   if (!workspace || isExecGated()) {
-    return false;
+    return;
   }
-
-  // Drop every anchor first. Editing `messagefoundry.engineUrl` across hosts would otherwise leave
-  // the previous host's certificate registered for the life of the extension host, so a target the
-  // user moves away from and back to would be trusted from a cached read rather than a fresh one.
-  const hadAnchor = clearEngineTrustAnchors();
 
   let payload: unknown;
   try {
@@ -65,9 +171,8 @@ export async function refreshEngineTrust(): Promise<boolean> {
       workspace,
     );
   } catch {
-    // No engine, no TOML, an older CLI — all "we learned nothing". The anchors are gone either way,
-    // so this still reports a change when there was one to report.
-    return hadAnchor;
+    // No engine, no TOML, an older CLI — all "we learned nothing".
+    return;
   }
 
   const facts = parseApiTls(payload);
@@ -77,16 +182,25 @@ export async function refreshEngineTrust(): Promise<boolean> {
   // engine's trust anchor, so the two arrive together or not at all. The decision also carries WHY it
   // declined, because re-deriving that here is the same split the bug came from.
   const decision = trustAnchorForTarget(facts, url, workspace);
-  const anchorFile = decision.kind === "anchor" ? decision.file : undefined;
-  const pem = anchorFile === undefined ? undefined : readAnchorPem(anchorFile);
-  setEngineTrustAnchor(url, pem);
-  if (pem !== undefined) {
-    engineLog().info(`trusting the engine certificate at ${anchorFile} for ${url}`);
+  const key = engineHostKey(url);
+  if (decision.kind === "anchor" && key !== undefined && pinned.has(key)) {
+    engineLog().info(
+      `${url} is pinned by a caFile in messagefoundry.environments, so the certificate ` +
+        `messagefoundry.serviceConfig names (${decision.file}) is not used for it.`,
+    );
+  } else if (decision.kind === "anchor") {
+    const read = readAnchorPem(decision.file);
+    if (read.pem === undefined) {
+      engineLog().warn(`${read.problem} — not trusting it`);
+    } else {
+      register(url, { file: decision.file, pem: read.pem, pinned: false });
+      engineLog().info(`trusting the engine certificate at ${decision.file} for ${url}`);
+    }
   } else if (decision.kind === "notLocal") {
     // The engine named a usable certificate and the model declined it because the target is not
-    // loopback. Say so, for the reason warnAboutUnanchoredTargets says it below: a silently
-    // unanchored target fails later with no explanation the user can act on. The REMEDY is not
-    // repeated here — `trustRemedy` owns that wording and delivers it when the request itself fails.
+    // loopback. Say so: a silently unanchored target fails later with no explanation the user can
+    // act on. The REMEDY is not repeated here — `trustRemedy` owns that wording and delivers it when
+    // the request itself fails.
     engineLog().info(
       `${url} is not a loopback address, so messagefoundry.serviceConfig — which describes the ` +
         `LOCAL engine — is not used to trust it.`,
@@ -97,83 +211,137 @@ export async function refreshEngineTrust(): Promise<boolean> {
   if (mismatch !== undefined) {
     engineLog().warn(mismatch);
   }
-  warnAboutUnanchoredTargets(facts);
-  // `|| hadAnchor`, because DROPPING one is also a change to what the client trusts. Without it,
-  // retargeting `messagefoundry.engineUrl` from the loopback engine to a remote one clears a live
-  // anchor and then reports "nothing happened", so the status bar keeps the stale verdict until the
-  // next 15-second poll.
-  return pem !== undefined || hadAnchor;
 }
 
+/** A certificate read: the PEM, or why there is none, worded for the log. */
+type PemRead = { pem: string; problem?: undefined } | { pem?: undefined; problem: string };
+
 /**
- * Read a certificate PEM, or `undefined` if it is unreadable or over {@link MAX_PEM_BYTES}.
+ * Read a certificate PEM, or say why it cannot be used.
  *
- * `anchor` arrives ABSOLUTE, from {@link trustAnchorForTarget}. It has to: `readCapped` ends in a bare
- * `fs.openSync`, which resolves a relative path against the extension host's own cwd — a directory
- * that has nothing to do with the workspace the inventory reading was taken in.
+ * `file` arrives ABSOLUTE, from {@link trustAnchorForTarget} or {@link trustPinsFor}. It has to:
+ * `readCapped` ends in a bare `fs.openSync`, which resolves a relative path against the extension
+ * host's own cwd — a directory that has nothing to do with the workspace or the setting.
  *
  * `readCapped` rather than a statSync/readFileSync pair: it resolves the path ONCE and checks the
  * size against that descriptor, which is the CodeQL `js/file-system-race` fix `symbolIndex.ts`
- * already carries and pins. It also returns `undefined` on both failure modes, so "register
- * whatever we got, even nothing" stays one unconditional call at the site above.
+ * already carries and pins.
+ *
+ * The caller logs the problem, not this function: a re-read after a verification failure runs on
+ * every failing probe, and logging there each time would bury the log in one repeated line.
  */
-function readAnchorPem(anchor: string | undefined): string | undefined {
-  if (anchor === undefined) {
-    return undefined;
-  }
-  const pem = readCapped(anchor, MAX_PEM_BYTES);
+function readAnchorPem(file: string): PemRead {
+  const pem = readCapped(file, MAX_PEM_BYTES);
   if (pem === undefined) {
-    engineLog().warn(`could not read the engine certificate at ${anchor} — not trusting it`);
-    return undefined;
+    return { problem: `could not read the engine certificate at ${file}` };
   }
   // A readable file is not yet a certificate, and the difference is invisible downstream: Node's
   // `tls.createSecureContext` treats a FALSY `ca` as "use the default roots", so an empty or
-  // truncated file would register an anchor that silently does nothing while this function's caller
-  // logs "trusting the engine certificate" and reports success. Check the one marker every PEM chain
+  // truncated file would register an anchor that silently does nothing while the caller logs
+  // "trusting the engine certificate" and reports success. Check the one marker every PEM chain
   // carries. A DER file fails it, correctly — `readCapped` decodes utf8, so DER never worked here.
   if (!pem.includes("-----BEGIN CERTIFICATE-----")) {
-    engineLog().warn(
-      `the engine certificate at ${anchor} is not PEM (no BEGIN CERTIFICATE block) — not trusting it`,
-    );
-    return undefined;
+    return {
+      problem: `the engine certificate at ${file} is not PEM (no BEGIN CERTIFICATE block)`,
+    };
   }
-  return pem;
+  return { pem };
 }
 
 /**
- * Say so when configured targets are NOT anchored, rather than letting them fail unexplained.
+ * Follow a certificate that changed under a registered anchor — BACKLOG #1695, residual c.
+ *
+ * engineClient calls this when a request to `url` failed verification while it carried `usedCa`. It
+ * resolves true only when an anchor DIFFERENT from `usedCa` is now registered for that engine, which
+ * is engineClient's cue to retry the request once.
+ *
+ * Two cases, cheapest first:
+ *   * an anchor is registered for that `host:port`: re-read ITS file. The engine renews its generated
+ *     pair at startup into the same file (ADR 0172, 2026-09-26 amendment), and a `caFile` an
+ *     administrator rotates in place behaves the same way. Nothing is spawned.
+ *   * otherwise, or when that file has not changed, and the target is loopback: run the full refresh,
+ *     at most once per {@link FAILURE_REFRESH_MIN_MS}. That covers an engine whose certificate moved,
+ *     and the first-run gap: an engine started after the window opened mints its certificate only
+ *     then, so activation found nothing to anchor.
+ *
+ * A non-loopback target with no pin gets nothing: no file of this machine describes it.
+ *
+ * Exported for the shell test; production reaches it through {@link registerEngineTrust}.
+ */
+export async function followCertificateChange(
+  url: string,
+  usedCa: string | undefined,
+): Promise<boolean> {
+  const key = engineHostKey(url);
+  if (key === undefined) {
+    return false;
+  }
+  const held = registered.get(key);
+  const read = held === undefined ? undefined : readAnchorPem(held.file).pem;
+  if (held !== undefined && read !== undefined && read !== usedCa) {
+    if (read !== held.pem) {
+      register(url, { ...held, pem: read });
+      engineLog().info(`the certificate at ${held.file} changed; trusting the new one for ${url}`);
+    }
+    // Equal to `held.pem` means another request already followed it; this one retries all the same.
+    return true;
+  }
+  // A pin is never replaced by the CLI's answer, so asking the engine again would spawn for nothing.
+  const now = Date.now();
+  if (
+    held?.pinned === true ||
+    !isLocalEngine(url) ||
+    now - lastFailureRefresh < FAILURE_REFRESH_MIN_MS
+  ) {
+    return false;
+  }
+  lastFailureRefresh = now;
+  await refreshEngineTrust();
+  const after = registered.get(key);
+  return after !== undefined && after.pem !== usedCa;
+}
+
+/** Drop every anchor and reset the failure-refresh rate limit. For the shell test only. */
+export function forgetEngineTrust(): void {
+  clearEngineTrustAnchors();
+  registered.clear();
+  lastFailureRefresh = Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * Say so when configured targets have NO anchor, rather than letting them fail unexplained.
  *
  * `messagefoundry.environments` can name several engines, and the status bar probes the FIRST of
- * them rather than `engineUrl`. The anchor here comes from `messagefoundry.serviceConfig`, which
- * describes the local engine only — a remote engine reads its own filesystem — so those targets get
- * nothing from this path. Anchoring them needs a per-target trust source, which is unfiled work;
- * until then the honest thing is to name the gap in the log the user is told to read.
+ * them rather than `engineUrl`. A target with no `caFile` and no loopback certificate from
+ * `messagefoundry.serviceConfig` is verified against the default roots only, which is right for a
+ * publicly trusted chain and fails for anything else.
  */
-function warnAboutUnanchoredTargets(facts: ApiTlsFacts | undefined): void {
-  const named = environments();
-  if (named.length === 0 || facts === undefined) {
+function warnAboutUnanchoredTargets(targets: readonly PinTarget[]): void {
+  const unanchored = targets.filter((t) => {
+    const key = engineHostKey(t.url);
+    return key !== undefined && isHttpsUrl(t.url) && !registered.has(key);
+  });
+  if (unanchored.length === 0) {
     return;
   }
   engineLog().info(
-    `messagefoundry.environments names ${named.length} target(s); their certificates are not ` +
-      `trusted from messagefoundry.serviceConfig, which describes the local engine only. A remote ` +
-      `engine's issuing CA has to be in this machine's trust store.`,
+    `messagefoundry.environments names ${unanchored.length} https target(s) with no trust anchor ` +
+      `(${unanchored.map((t) => t.url).join(", ")}); they verify against the default roots only. ` +
+      `Set caFile on the entry to trust a private CA or a self-signed engine certificate.`,
   );
 }
 
 /**
- * Refresh at activation, and again whenever a target or the service TOML setting moves.
- *
- * Activation-time is enough for the ordinary case because the engine mints its pair on its FIRST
- * run and reuses it forever after (`ensure_api_tls_material` refuses to overwrite a key). The one
- * gap is an engine that has never run when the window opens; that request fails with the trust
- * error and its remedy, and the next window — or a settings change — picks the certificate up.
+ * Refresh at activation, and again whenever a target or the service TOML setting moves; follow a
+ * changed certificate when a request fails verification.
  *
  * The re-check afterwards matters because the status bar starts probing on the same tick and its
  * first probe necessarily runs before the subprocess answers. Without it, a healthy engine renders
  * as "cannot verify" until the next 15-second poll, on every window open.
  */
 export function registerEngineTrust(context: vscode.ExtensionContext): void {
+  setTrustFailureHandler(followCertificateChange);
+  context.subscriptions.push({ dispose: () => setTrustFailureHandler(undefined) });
   void refreshEngineTrustThenRecheck();
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {

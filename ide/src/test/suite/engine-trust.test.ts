@@ -12,6 +12,7 @@
 //   C https, ca = the minted certificate   → HTTP 200          <- what this change does
 //   D https, rejectUnauthorized: false     → HTTP 200          (control; never shipped)
 import * as assert from "assert";
+import { EventEmitter } from "events";
 import * as fs from "fs";
 import * as path from "path";
 import type * as httpsTypes from "https";
@@ -19,7 +20,9 @@ import type * as httpsTypes from "https";
 import {
   clearEngineTrustAnchors,
   getJson,
+  postJson,
   setEngineTrustAnchor,
+  setTrustFailureHandler,
   TLS_12_SUITES,
   TLS_13_SUITES,
   TLS_CIPHERS,
@@ -29,11 +32,14 @@ import { describeNetworkCode } from "../../engineStatusModel";
 import {
   TLS_TRUST_CODES,
   engineHostKey,
+  isFullyQualifiedPath,
   isTlsTrustError,
   parseApiTls,
+  pinTargetsOf,
   schemeMismatch,
   trustAnchorFor,
   trustAnchorForTarget,
+  trustPinsFor,
   trustRemedy,
 } from "../../engineTrustModel";
 
@@ -354,5 +360,198 @@ suite("the http default is pinned in BOTH places (BACKLOG #1695)", () => {
     const fallback = /config\(\)\.get<string>\("engineUrl",\s*"([^"]+)"\)/.exec(cli);
     assert.ok(fallback, "engineUrl()'s fallback moved — re-point this scan before trusting it");
     assert.strictEqual(fallback![1], EXPECTED);
+  });
+});
+
+suite("per-target caFile pins (BACKLOG #1695, residual a)", () => {
+  const WIN_PIN = "C:\\pki\\prod-ca.pem";
+  const POSIX_PIN = "/etc/mf/prod-ca.pem";
+
+  test("a shard takes its own caFile, else its environment's", () => {
+    assert.deepStrictEqual(
+      pinTargetsOf([
+        {
+          url: "https://prod:8765",
+          caFile: POSIX_PIN,
+          shards: [
+            { url: "https://prod-1:8765" },
+            { url: "https://prod-2:8765", caFile: "/etc/mf/other.pem" },
+          ],
+        },
+        { url: "https://dev:8765" },
+      ]),
+      [
+        { url: "https://prod:8765", caFile: POSIX_PIN },
+        { url: "https://prod-1:8765", caFile: POSIX_PIN },
+        { url: "https://prod-2:8765", caFile: "/etc/mf/other.pem" },
+        { url: "https://dev:8765", caFile: undefined },
+      ],
+    );
+  });
+
+  test("no caFile is the ordinary case: no pin and no refusal", () => {
+    const targets = [{ url: "https://dev:8765" }, { url: "https://qa:8765", caFile: "" }];
+    assert.deepStrictEqual(trustPinsFor(targets, path.posix), []);
+  });
+
+  test("a full path pins its target, keyed by host:port", () => {
+    assert.deepStrictEqual(
+      trustPinsFor([{ url: "https://Prod:8765", caFile: POSIX_PIN }], path.posix),
+      [{ kind: "pin", url: "https://Prod:8765", key: "prod:8765", file: POSIX_PIN }],
+    );
+    assert.deepStrictEqual(
+      trustPinsFor([{ url: "https://prod:8765", caFile: WIN_PIN }], path.win32),
+      [{ kind: "pin", url: "https://prod:8765", key: "prod:8765", file: WIN_PIN }],
+    );
+  });
+
+  test("a path that depends on a cwd is refused, never resolved", () => {
+    // A relative path would be read against the workspace or the extension host's cwd, and the
+    // machine scope exists to keep a workspace out of this decision. On Windows a ROOT-relative path
+    // depends on the current drive, so it is refused even though path.win32.isAbsolute accepts it.
+    const cases: [string, typeof path.posix][] = [
+      ["certs/ca.pem", path.posix],
+      ["./ca.pem", path.posix],
+      ["certs\\ca.pem", path.win32],
+      ["\\pki\\ca.pem", path.win32],
+      ["C:pki\\ca.pem", path.win32],
+    ];
+    for (const [caFile, flavour] of cases) {
+      const [decision] = trustPinsFor([{ url: "https://prod:8765", caFile }], flavour);
+      assert.strictEqual(decision?.kind, "refused", caFile);
+    }
+    // The controls: the full spellings on each flavour are accepted, and the root-relative case
+    // really is one that path.win32.isAbsolute would have let through.
+    assert.ok(isFullyQualifiedPath("C:/pki/ca.pem", path.win32));
+    assert.ok(isFullyQualifiedPath("\\\\pki-host\\share\\ca.pem", path.win32));
+    assert.ok(isFullyQualifiedPath(POSIX_PIN, path.posix));
+    assert.ok(path.win32.isAbsolute("\\pki\\ca.pem"));
+  });
+
+  test("a non-string caFile, an http url and an unparseable url are refused", () => {
+    const decisions = trustPinsFor(
+      [
+        { url: "https://prod:8765", caFile: 42 },
+        { url: "http://prod:8765", caFile: POSIX_PIN },
+        { url: "not a url", caFile: POSIX_PIN },
+      ],
+      path.posix,
+    );
+    assert.deepStrictEqual(
+      decisions.map((d) => d.kind),
+      ["refused", "refused", "refused"],
+    );
+  });
+
+  test("a second, different file for one host:port is refused; the same file twice is not", () => {
+    const decisions = trustPinsFor(
+      [
+        { url: "https://prod:8765", caFile: POSIX_PIN },
+        { url: "https://PROD:8765/mf", caFile: POSIX_PIN },
+        { url: "https://prod:8765", caFile: "/etc/mf/other.pem" },
+      ],
+      path.posix,
+    );
+    assert.deepStrictEqual(
+      decisions.map((d) => d.kind),
+      ["pin", "refused"],
+    );
+    const refusal = decisions[1];
+    assert.ok(refusal?.kind === "refused");
+    assert.match(refusal.reason, /already pinned to \/etc\/mf\/prod-ca\.pem/);
+  });
+
+  test("the remote remedy names caFile", () => {
+    assert.match(
+      trustRemedy("DEPTH_ZERO_SELF_SIGNED_CERT", "https://prod-host:8765") ?? "",
+      /set `caFile` on its `messagefoundry\.environments` entry/,
+    );
+  });
+});
+
+suite("a request that fails verification follows a changed anchor once (BACKLOG #1695, c)", () => {
+  const TARGET = "https://127.0.0.1:8765";
+  const OLD = "-----BEGIN CERTIFICATE-----\nold\n-----END CERTIFICATE-----\n";
+  const NEW = "-----BEGIN CERTIFICATE-----\nnew\n-----END CERTIFICATE-----\n";
+  const httpsModule = require("node:https") as { request: typeof httpsTypes.request };
+  let realRequest: typeof httpsTypes.request;
+  let calls: { ca: unknown }[];
+
+  /** A request that fails the handshake the way Node reports an untrusted self-signed certificate. */
+  function failingRequest(_url: unknown, options: httpsTypes.RequestOptions): unknown {
+    calls.push({ ca: options.ca });
+    const req = new EventEmitter() as EventEmitter & Record<string, unknown>;
+    req.setTimeout = (): unknown => req;
+    req.write = (): boolean => true;
+    req.destroy = (): unknown => req;
+    req.end = (): unknown => {
+      const err = Object.assign(new Error("self-signed certificate"), {
+        code: "DEPTH_ZERO_SELF_SIGNED_CERT",
+      });
+      setImmediate(() => req.emit("error", err));
+      return req;
+    };
+    return req;
+  }
+
+  setup(() => {
+    calls = [];
+    clearEngineTrustAnchors();
+    setEngineTrustAnchor(TARGET, OLD);
+    realRequest = httpsModule.request;
+    httpsModule.request = failingRequest as unknown as typeof httpsTypes.request;
+  });
+
+  teardown(() => {
+    httpsModule.request = realRequest;
+    setTrustFailureHandler(undefined);
+    clearEngineTrustAnchors();
+  });
+
+  test("a handler that registers a new anchor gets exactly one retry, carrying it", async () => {
+    const seen: (string | undefined)[] = [];
+    setTrustFailureHandler(async (url, usedCa) => {
+      seen.push(usedCa);
+      setEngineTrustAnchor(url, NEW);
+      return true;
+    });
+    await assert.rejects(getJson(TARGET, "/health"), /cannot verify/);
+    assert.deepStrictEqual(
+      calls.map((c) => c.ca),
+      [OLD, NEW],
+      "the retry must carry the new anchor, and there is exactly one",
+    );
+    assert.deepStrictEqual(seen, [OLD], "the handler is told which anchor the failed request used");
+  });
+
+  test("a POST is retried the same way", async () => {
+    setTrustFailureHandler(async (url) => {
+      setEngineTrustAnchor(url, NEW);
+      return true;
+    });
+    await assert.rejects(postJson(TARGET, "/config/reload", {}));
+    assert.deepStrictEqual(
+      calls.map((c) => c.ca),
+      [OLD, NEW],
+    );
+  });
+
+  test("a handler that changed nothing gets no retry — the control", async () => {
+    setTrustFailureHandler(async () => false);
+    await assert.rejects(getJson(TARGET, "/health"), /cannot verify/);
+    assert.strictEqual(calls.length, 1);
+  });
+
+  test("with no handler installed the request fails once, as before", async () => {
+    await assert.rejects(getJson(TARGET, "/health"), /cannot verify/);
+    assert.strictEqual(calls.length, 1);
+  });
+
+  test("a handler that throws does not replace the trust error", async () => {
+    setTrustFailureHandler(async () => {
+      throw new Error("boom");
+    });
+    await assert.rejects(getJson(TARGET, "/health"), /cannot verify/);
+    assert.strictEqual(calls.length, 1);
   });
 });
