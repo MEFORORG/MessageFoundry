@@ -939,11 +939,13 @@ def test_a_worker_that_keeps_dying_is_respawned_on_a_doubling_backoff(tmp_path: 
     assert runner._respawn_delay(Stage.ROUTED, "IB") == 0.0
 
 
-# --- step 2: a node that lost the lease stops re-pending ------------------------------------------
+# --- step 2: a node that is not the leader sends no re-pend -----------------------------------------
 #
 # The re-pend writes are unfenced by design (a fenced re-pend would turn a permitted duplicate into a
-# forbidden strand), so the retry itself has to stop once this node is no longer the leader: a write
-# sent after a successor re-claimed the rows would re-pend rows the successor holds.
+# forbidden strand), so the retry reads leadership before every write: one sent after a successor
+# re-claimed the rows would re-pend rows the successor holds. It holds the lane meanwhile rather than
+# giving up, so a demote-then-re-promote with no teardown neither strands the lane nor lets a later
+# row overtake the held ones.
 
 
 class _Lease(NullCoordinator):
@@ -964,68 +966,90 @@ async def _claimed_ingress_row(store: MessageStore) -> str:
     return item.id
 
 
-@pytest.mark.parametrize("lost", ["control-kept", "during-the-write", "during-the-backoff"])
-async def test_the_pooled_repend_retry_stands_down_once_the_lease_is_lost(
-    store: MessageStore,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    lost: str,
-) -> None:
-    """The serializer's re-pend fails twice, then the store heals. Leadership kept (the control):
-    it retries and lands, so the row is pending again. Lost while the first write is failing, or
-    during the backoff after it: it returns False after that one write, sends no other, and the
-    row stays in flight for the successor's recovery."""
-    _fast_backoffs(monkeypatch)
-    lease = _Lease()
-    dispatcher = stage_dispatcher.StageDispatcher(
+def _bare_dispatcher(store: MessageStore, **kwargs: Any) -> stage_dispatcher.StageDispatcher:
+    return stage_dispatcher.StageDispatcher(
         Stage.INGRESS,
         store,
         process_item=None,  # type: ignore[arg-type]  # the retry under test never runs a body
         lane_provider=set,
         per_lane_limit=1,
-        is_leader=lease.is_leader,
+        **kwargs,
     )
+
+
+# Each case: (leader at the start, lose the lease during the first write, what the 3rd backoff does).
+_LEASE_CASES = {
+    "control-kept": (True, False, None),
+    "lost-during-the-write-then-stop": (True, True, "stop"),
+    "lost-before-the-first-write-then-stop": (False, False, "stop"),
+    "lost-then-regained-with-no-teardown": (True, True, "regain"),
+}
+
+
+@pytest.mark.parametrize("case", list(_LEASE_CASES))
+async def test_the_pooled_repend_retry_sends_nothing_while_not_the_leader(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+) -> None:
+    """The serializer's first re-pend fails, the store then heals. Kept lease (the control): the
+    second write lands after one backoff. Not the leader, from the start or from the failing write
+    on: no write at all while it lasts, one WARNING, and the stop that the demotion teardown sends
+    returns False with the row in flight. Leading again with no teardown resumes the retry, which
+    lands."""
+    _fast_backoffs(monkeypatch)
+    leader, lose_in_write, third_backoff = _LEASE_CASES[case]
+    lease = _Lease()
+    lease.held = leader
+    dispatcher = _bare_dispatcher(store, is_leader=lease.is_leader)
     row = await _claimed_ingress_row(store)
     writes = 0
 
     async def repend() -> None:
         nonlocal writes
         writes += 1
-        if lost == "during-the-write":
+        if lose_in_write:
             lease.held = False
-        if writes < 3:
+        if writes == 1:
             raise RuntimeError("simulated store outage in release_claimed")
         await store.release_claimed([row])
 
-    if lost == "during-the-backoff":
-        real_sleep = dispatcher._sleep_or_stop
+    backoffs = 0
+    real_sleep = dispatcher._sleep_or_stop
 
-        async def sleep_then_lose(seconds: float) -> None:
-            lease.held = False
-            await real_sleep(seconds)
+    async def backoff(seconds: float) -> None:
+        nonlocal backoffs
+        backoffs += 1
+        if backoffs == 3 and third_backoff == "regain":
+            lease.held = True
+        elif backoffs == 3 and third_backoff == "stop":
+            dispatcher._stop.set()
+        await real_sleep(seconds)
 
-        monkeypatch.setattr(dispatcher, "_sleep_or_stop", sleep_then_lose)
+    monkeypatch.setattr(dispatcher, "_sleep_or_stop", backoff)
     with caplog.at_level(logging.WARNING):
         landed = await dispatcher._land_while_holding("IB", "release_claimed of 1 row(s)", repend)
-    if lost == "control-kept":
-        assert landed is True
-        assert writes == 3
-        assert await _ingress_inflight(store) == 0
-        assert "no longer the leader" not in caplog.text
-        return
-    assert landed is False
-    assert writes == 1  # no write after leadership was lost
-    assert await _ingress_inflight(store) == 1
-    assert caplog.text.count("no longer the leader") == 1
+    held_lines = caplog.text.count("this node is not the leader")
+    if case == "control-kept":
+        assert (landed, writes, backoffs, held_lines) == (True, 2, 1, 0)
+    elif third_backoff == "regain":
+        assert (landed, writes, backoffs, held_lines) == (True, 2, 3, 1)
+    else:
+        assert (landed, writes, backoffs, held_lines) == (False, 1 if leader else 0, 3, 1)
+    assert await _ingress_inflight(store) == (0 if landed else 1)
 
 
-@pytest.mark.parametrize("lost", [False, True], ids=["control-kept", "during-the-backoff"])
-async def test_the_per_lane_repend_retry_sends_no_write_after_a_backoff_that_lost_the_lease(
-    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lost: bool
+@pytest.mark.parametrize(
+    "case", ["control-kept", "lost-during-the-backoff-then-stop", "lost-then-regained"]
+)
+async def test_the_per_lane_repend_retry_sends_nothing_while_not_the_leader(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    """The per-lane twin. Leadership is lost while the worker sleeps out the backoff after a failed
-    re-pend, so the next write must not be sent. The control keeps the lease: the retry goes on
-    and lands once the store heals."""
+    """The per-lane twin. The first re-pend fails and the store heals during the backoff after it.
+    Kept lease (the control): the second write lands. Lease lost during that backoff: no write is
+    sent after it, and the teardown's stop returns True, so the caller returns rather than claiming
+    past the held row. Lease regained with no teardown: the retry resumes and lands."""
     _fast_backoffs(monkeypatch)
     lease = _Lease()
     runner = RegistryRunner(
@@ -1038,22 +1062,29 @@ async def test_the_per_lane_repend_retry_sends_no_write_after_a_backoff_that_los
     calls: dict[str, int] = {}
     down = _fail_while(monkeypatch, store, "reschedule_claimed", calls)
     real_sleep = runner._stop_or_sleep
+    backoffs = 0
 
-    async def sleep(delay: float) -> bool:
-        if lost:
-            lease.held = False
-        elif calls["reschedule_claimed"] >= 2:
+    async def backoff(delay: float) -> bool:
+        nonlocal backoffs
+        backoffs += 1
+        if backoffs == 1:
             down.clear()  # the store heals
+            lease.held = case == "control-kept"
+        elif backoffs == 3:
+            if case == "lost-then-regained":
+                lease.held = True
+            else:
+                runner._stop.set()
         return await real_sleep(delay)
 
-    monkeypatch.setattr(runner, "_stop_or_sleep", sleep)
+    monkeypatch.setattr(runner, "_stop_or_sleep", backoff)
     stopped = await runner._repend_claimed_on_fault("router", "IB", [row])
-    assert stopped is False
-    if lost:
-        assert calls["reschedule_claimed"] == 1  # nothing after the backoff that lost the lease
+    if case == "lost-during-the-backoff-then-stop":
+        assert (stopped, calls["reschedule_claimed"], backoffs) == (True, 1, 3)
         assert await _ingress_inflight(store) == 1
     else:
-        assert calls["reschedule_claimed"] == 3
+        expected_backoffs = 1 if case == "control-kept" else 3
+        assert (stopped, calls["reschedule_claimed"], backoffs) == (False, 2, expected_backoffs)
         assert await _ingress_inflight(store) == 0
 
 
@@ -1076,11 +1107,4 @@ async def test_the_runner_hands_its_coordinators_leadership_to_every_dispatcher(
         assert dispatcher._is_leader() is True
         lease.held = False
         assert dispatcher._is_leader() is False
-    default = stage_dispatcher.StageDispatcher(
-        Stage.INGRESS,
-        store,
-        process_item=None,  # type: ignore[arg-type]
-        lane_provider=set,
-        per_lane_limit=1,
-    )
-    assert default._is_leader() is True
+    assert _bare_dispatcher(store)._is_leader() is True
