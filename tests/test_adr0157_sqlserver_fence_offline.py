@@ -83,6 +83,7 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     "release_claimed": (1, 0),
     "reschedule_claimed": (1, 0),
     "reset_stale_inflight": (1, 0),
+    "reclaim_stale_inflight": (1, 0),
     # --- TERMINAL resolves: fail-OPEN guarded through _resolve_guard (Inc 3). ---
     "dead_letter_now": (1, 1),
     "mark_done": (1, 1),
@@ -129,6 +130,10 @@ _UNGUARDED_REASONS: dict[str, str] = {
     "reset_stale_inflight": (
         "Startup and promotion recovery. On promotion it runs on the successor, by definition unfenced,"
         " and it is the backstop when D1's re-pend fails."
+    ),
+    "reclaim_stale_inflight": (
+        "BACKLOG #1611 step 2: the single-node runtime reclaim. The runner never calls it on a"
+        " clustered coordinator, so no epoch applies."
     ),
     "dead_letter_missing_destinations": (
         "ADR 0157 D11: writes over PENDING rows, where D1's re-pend is meaningless. Runs only from"

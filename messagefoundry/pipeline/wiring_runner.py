@@ -1720,8 +1720,7 @@ class RegistryRunner:
         self._inflight_watch: asyncio.Task[None] | None = None
         # BACKLOG #1611 step 2a: per (stage, lane), the wall clock just before a per_lane worker's
         # claim, held until that pass resolves. Every row the worker holds was claimed at or after
-        # it, so the stale in-flight reclaim (_reclaim_stale_inflight) never re-pends one. A worker
-        # that returns may leave its entry behind, which only errs toward not reclaiming.
+        # it, so the stale in-flight reclaim (_reclaim_stale_inflight) never re-pends one.
         self._held_since: dict[tuple[str, str], float] = {}
         # BACKLOG #1611 step 2b: how long a row must sit in flight, past every live holder, before the
         # reclaim re-pends it. An instance attribute so a test can shorten it.
@@ -10643,10 +10642,13 @@ class RegistryRunner:
             held = await self.store.inflight_by_lane(stage=stage.value)
             # Read after that await and with none before the store call's own, so each watermark is
             # current; a claim landing in the store call's await is younger than the cutoff.
+            # A lane whose bound is at or below its oldest in-flight row has nothing to move.
             bounds = {
-                lane: self._held_bound(stage, lane, cutoff)
+                lane: bound
                 for lane, (_count, oldest) in held.items()
-                if lane in lanes and oldest < cutoff
+                if lane in lanes
+                and oldest < cutoff
+                and (bound := self._held_bound(stage, lane, cutoff)) > oldest
             }
             if not bounds:
                 continue

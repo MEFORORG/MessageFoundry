@@ -133,6 +133,7 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     "release_claimed": (1, 0),
     "reschedule_claimed": (1, 0),
     "reset_stale_inflight": (1, 0),
+    "reclaim_stale_inflight": (1, 0),
     "reclaim_expired_leases": (1, 0),
     "recover_inflight_on_promotion": (1, 0),
     # --- TERMINAL resolves: fail-OPEN guarded, spliced via the _resolve_guard helper. ---
@@ -190,6 +191,7 @@ _UNGUARDED_REASONS: dict[str, str] = {
         "C1: same as release_claimed, with a durable backoff deadline instead of an unchanged one."
     ),
     "reset_stale_inflight": "Startup/DR recovery. Runs before any epoch is armed.",
+    "reclaim_stale_inflight": "#1611 step 2 single-node runtime reclaim; never on a clustered engine.",
     "reclaim_expired_leases": (
         "Owner-BLIND periodic recovery, by its own docstring. Bounded to already-expired row leases."
     ),
