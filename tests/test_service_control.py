@@ -345,14 +345,19 @@ def test_installer_checks_the_environment_with_the_python_text() -> None:
     Matched as a whole live line, not a substring, so a commented-out check fails, and it must come
     before the first line that writes ``--env $Environment`` into the service's parameters."""
     lines = [ln.strip() for ln in _install_script_text().splitlines()]
+    # The whole installer was read, not a stub or a truncated copy: it is well over a thousand lines
+    # and still opens with its param block.
+    assert len(lines) >= 1000, f"CONTROL FAILED: install-service.ps1 read as {len(lines)} lines"
+    assert "param(" in lines, "CONTROL FAILED: install-service.ps1 has no param( line"
     expected = f"if ($Environment -cnotmatch '{service_control._SAFE_ENV_NAME.pattern}') {{"
     checks = [i for i, ln in enumerate(lines) if ln == expected]
     assert len(checks) == 1, f"expected exactly one live line {expected!r}, found {len(checks)}"
-    # Any other live -Environment pattern test would be a second, unpinned copy. The candidates
-    # include the expected line, so a filter that matched nothing fails here, not vacuously below.
-    candidates = [ln for ln in lines if ln.startswith("if ($Environment -") and "match" in ln]
-    assert len(candidates) >= 1, "CONTROL FAILED: no live -Environment pattern check was found"
-    others = [ln for ln in candidates if ln != expected]
+    # Any other live -Environment pattern test would be a second, unpinned copy.
+    others = [
+        ln
+        for ln in lines
+        if ln.startswith("if ($Environment -") and "match" in ln and ln != expected
+    ]
     assert others == [], others
     uses = [
         i for i, ln in enumerate(lines) if "--env $Environment" in ln and not ln.startswith("#")
@@ -370,16 +375,12 @@ def test_environment_guard_matches_the_engine_charset() -> None:
     one side only, fails (BACKLOG #1680)."""
     from messagefoundry.config.settings import _ENV_NAME_ALLOWED
 
-    # 26 + 26 letters, 10 digits, and `.`, `_`, `-`; and the whole BMP is what the walk asks.
-    assert len(_ENV_NAME_ALLOWED) >= 65, sorted(_ENV_NAME_ALLOWED)
-    code_points = range(0x10000)
-    assert len(code_points) >= 0x10000
-    differ = [
-        hex(cp)
-        for cp in code_points
-        if is_safe_environment(chr(cp)) != (chr(cp) in _ENV_NAME_ALLOWED)
-    ]
-    assert differ == []
+    # Exactly the 26 + 26 ASCII letters, 10 digits, and `.`, `_`, `-`.
+    assert len(_ENV_NAME_ALLOWED) == 65, sorted(_ENV_NAME_ALLOWED)
+    assert {"a", "Z", "0", "9", ".", "_", "-"} <= _ENV_NAME_ALLOWED
+    # The single characters service.py accepts, in code-point order, must be settings' set exactly.
+    accepted = [chr(cp) for cp in range(0x10000) if is_safe_environment(chr(cp))]
+    assert accepted == sorted(_ENV_NAME_ALLOWED)
 
 
 def test_service_uses_the_one_guard_from_service_status() -> None:
@@ -487,8 +488,12 @@ def test_is_safe_environment_rejects_invalid(name: str) -> None:
     assert is_safe_environment(name) is False
 
 
-def test_install_service_refuses_a_non_str_environment_with_value_error() -> None:
+def test_install_service_refuses_a_non_str_environment_with_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """An untyped caller gets the documented ValueError, which the CLI turns into exit 2."""
+    # Off Windows, so a guard regression returns UNSUPPORTED and fails here instead of elevating.
+    monkeypatch.setattr(service_control.sys, "platform", "linux")
     with pytest.raises(ValueError, match="unsafe environment name"):
         install_service("script.ps1", None, config=_CFG)  # type: ignore[arg-type]
 
