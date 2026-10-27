@@ -2123,14 +2123,17 @@ line before you act. That holds for this event only: the CRL expiry alert's `det
 reason, once the held copy nears its `nextUpdate`. The expiry date, `held_copy` and `shared_with`
 belong to the CRL expiry alert too. This event carries none of them.
 
+The rows run strongest first. Where one file calls for more than one class, the event carries the
+first of them in this table.
+
 | `remedy_class` | What to do |
 |---|---|
 | `fix_file` | Fix the file. A start would refuse it too. |
-| `lapses_first` | Fix the file now with a CRL that is in effect. The hop's copy lapses before the file's CRL takes effect, and every peer is refused in between. A restart does not help, and a start can refuse the file too. |
 | `bad_signature` | The engine proved a CRL in the file badly signed under rule 2: the CRL names the key of a CA the hop lists, and that key does not verify it. Fix the file. A start that finds the same proof refuses it too, at any time. |
+| `not_provable` | Give the setting a bare CRL. The file carries a certificate the reload cannot prove the hop trusts. |
+| `lapses_first` | Fix the file now with a CRL that is in effect. The hop's copy lapses before the file's CRL takes effect, and every peer is refused in between. A restart does not help, and a start can refuse the file too. |
 | `unproven_signature` | The key of the CA the hop lists for a CRL's issuer does not verify it, but the CRL names no key of that CA, so the engine cannot prove it badly signed. Check the file: after a CA renews its key it can be right. Then restart the engine to apply it. |
 | `uncheckable_signature` | The engine could not check a CRL's signature with the key of the CA the hop lists for its issuer, as with a signature of another kind than that key. Check the file, then restart the engine to apply it. |
-| `not_provable` | Give the setting a bare CRL. The file carries a certificate the reload cannot prove the hop trusts. |
 | `restart` | Restart the engine to apply the file. |
 | `no_issuer` | Restart the engine to apply the file. Adding the issuing intermediate CA to the hop's own CA file does not apply this file; it lets later reloads verify the CRL without a restart. |
 | `retry` | The engine tries again every pass. A restart applies the file now. |
@@ -2229,8 +2232,9 @@ Where a CRL setting names it too, as `[store].ssl_crl_file` can, the check comes
 restart. A start judges that setting. A hop may still hold a stale copy through a CRL setting.
 Only then does the restart wait for the reload's verdict. So after the CA-file step, `detail` says
 to restart once the reload has applied the file. Or it gives a refused reload's remedy and reason.
-The CA-file hop's restart follows, unless that remedy itself orders a restart of the engine, as
-those of `restart`, `no_issuer`, `retry`, `unproven_signature` and `uncheckable_signature` do. The scan
+The CA-file hop's restart follows, unless that remedy orders a restart of the engine with no
+condition before it. A remedy that restarts only once a check passes, and says to fix the file
+otherwise, is followed by it: the reload applies a fixed file to the CRL-setting hops alone. The scan
 may log a WARNING that it could not check the signature of a later CRL in the CA file. It does so
 only after a CRL that `detail` would ask you to check. Then `detail` does not ask for a check: it
 says to replace the CRL before restarting. Put a CRL in the hop's CRL setting instead to have it

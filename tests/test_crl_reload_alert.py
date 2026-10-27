@@ -351,9 +351,9 @@ def _signature_case(pki: _Pki, case: str, *, issued: datetime.timedelta) -> byte
 async def test_the_signature_remedy_names_what_the_check_found(
     pki: _Pki, case: str, remedy: str, token: str
 ) -> None:
-    """Vault BACKLOG #3506 item 8. ``crl_signature_refusal`` folds three states into one flag, so
-    the reload told an operator to fix a file that can be right, as after a CA renews its key.
-    Each state now has its own remedy and token. Before, all three read ``bad_signature``."""
+    """Vault BACKLOG #3506 item 8. The reload's check used to fold three states into one flag, so
+    one remedy hedged across a file to fix and one that can be right, as after a CA renews its
+    key. Each state now has its own remedy and token. Before, all three read ``bad_signature``."""
     hop = pki.outbound_hop()
     sink = _Sink()
     pki.crl.write_bytes(_signature_case(pki, case, issued=_DAY))  # in effect
@@ -389,6 +389,8 @@ async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_ref
     assert "Restart the engine" not in BAD_SIGNATURE
     assert "at least until then" not in outcome.refusal.reason
     assert not outcome.start_refuses
+    # A file to fix, final until its bytes change, as FIX is: no caveat reopens it each pass.
+    assert outcome.refusal.sticky
     assert "at any time, not only while a CRL in the file is not yet in effect" in BAD_SIGNATURE
     (payload,) = sink.refused()
     assert payload["remedy_class"] == "bad_signature" and payload["start_refuses"] is False
@@ -434,6 +436,30 @@ async def test_a_signature_short_of_proof_for_a_file_not_in_effect_says_not_to_r
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+@pytest.mark.parametrize("case", ["unproven", "uncheckable"])
+async def test_a_held_copy_that_lapses_first_outranks_a_signature_short_of_proof(
+    pki: _Pki, case: str
+) -> None:
+    """Vault BACKLOG #3506 code review. A remedy short of proof asks for a check, then a restart.
+    Where the hop's copy lapses before the file's CRL takes effect, a restart comes too late
+    whatever the check finds, so the fix that names the lapse is reported. Before this repair the
+    signature remedy outranked it, with a caveat to restart once the CRL took effect, after every
+    peer had been refused."""
+    hop = pki.outbound_hop()  # its copy lapses in about five and a half days
+    sink = _Sink()
+    pki.crl.write_bytes(_signature_case(pki, case, issued=-7 * _DAY))  # in effect in seven days
+
+    (outcome,) = _pass(_runner(sink))
+
+    assert outcome.refusal is not None
+    assert outcome.refusal.remedy == crl_reload.LAPSES_FIRST, outcome.refusal
+    assert "lapses earlier" in outcome.refusal.reason
+    assert not outcome.start_refuses and not outcome.refusal.sticky
+    (payload,) = sink.refused()
+    assert payload["remedy_class"] == "lapses_first"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
 async def test_the_caveat_quotes_a_long_issuer_name_with_a_bound(pki: _Pki) -> None:
     """Vault BACKLOG #3506: the caveat quotes the issuer of the CRL not yet in effect the way the
     signature check quotes one, cut to a bound, since a name has no length bound of its own."""
@@ -466,6 +492,10 @@ def test_every_remedy_has_its_own_class_token() -> None:
     for token in tokens:
         assert token == token.lower() and " " not in token
         assert f"| `{token}` |" in guide, token
+    # The guide says the reload names the strongest "in the order of the rows below", so its rows
+    # follow the rank (vault BACKLOG #3506 code review).
+    rows = [guide.index(f"| `{token}` |") for token in tokens]
+    assert rows == sorted(rows), tokens
     assert ReloadOutcome("p", 1, None).remedy_class is None
     assert ReloadOutcome("p", 0, ReloadRefusal((1, 2), "why", FIX), 1).remedy_class == "fix_file"
 

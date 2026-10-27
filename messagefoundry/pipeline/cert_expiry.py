@@ -53,8 +53,6 @@ from messagefoundry.pipeline.crl_reload import (
     RELOAD_INTERVAL_SECONDS,
     RESTART,
     RETRY,
-    UNCHECKABLE_SIGNATURE,
-    UNPROVEN_SIGNATURE,
 )
 from messagefoundry.pki import (
     UNCONFIRMED_SIGNATURE,
@@ -730,8 +728,8 @@ def _ca_file_crl_refusal(
             f"{log_timestamp(early.this_update)}, before restarting: until then it refuses every "
             "peer under its issuer",
         )
-    # The states of the file's CRLs, merged. pki.crl_signature_refusal's flag is True for three of
-    # them, and only ``bad`` proves a failure (BACKLOG #3512). Bound before the ``try``, so its
+    # The states of the file's CRLs, merged. Three of them are short of a pass, and only ``bad``
+    # proves a failure (BACKLOG #3512). Bound before the ``try``, so its
     # handler can read it. The signature loop is the last step in the ``try``, so an error that
     # finds an unconfirmed state recorded was raised by the signature check on a later block.
     states: set[str] = set()
@@ -787,7 +785,7 @@ def _ca_file_crl_refusal(
         )
     if states - _PASSING - _UNCONFIRMED:
         # A state this scan does not name, beside any other: never a pass and never the weaker
-        # check. pki.crl_signature_refusal flags every state but the two passing ones (#3512).
+        # check (#3512).
         return unjudged
     if states & _UNCONFIRMED:
         # Not proven either way, and pki.CrlSignature names a case where handshakes still pass.
@@ -819,14 +817,13 @@ _CA_FILE_HOP_RESTARTS = (
 #: set main's "Restart the engine" substring test chose, named so a new remedy is a decision here
 #: (BACKLOG #3512).
 #:
-#: Vault BACKLOG #3506 added the two signature remedies short of proof, and both are here. Each
-#: orders a check and then a plain restart of the engine, which applies the CA file too. If the
-#: check finds the file wrong, the operator replaces it, and the new bytes get a verdict of their
-#: own, so a second restart after these would only repeat the first. ``BAD_SIGNATURE``, the proven
-#: case, is not here: it orders a fix and no restart, so the CA-file hop's restart follows it.
-_RESTARTS_THE_ENGINE = frozenset(
-    {RESTART, NO_ISSUER, RETRY, UNPROVEN_SIGNATURE, UNCHECKABLE_SIGNATURE}
-)
+#: Vault BACKLOG #3506 added two signature remedies short of proof, and neither is here. Each
+#: orders a restart only once a check passes, and says to fix the file otherwise, which applies
+#: it to the CRL-setting hops through the reload and never to the CA-file hop. Their restart is
+#: conditional, as ``_NOT_PROVABLE``'s is, so the CA-file hop's restart follows them, as it
+#: follows ``BAD_SIGNATURE``. Before #3506 those states read ``BAD_SIGNATURE``, so this keeps
+#: main's step for them.
+_RESTARTS_THE_ENGINE = frozenset({RESTART, NO_ISSUER, RETRY})
 
 
 def _after_the_reload(refused: ReloadRefusal | None) -> str:

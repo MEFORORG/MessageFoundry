@@ -55,7 +55,7 @@ from messagefoundry.pipeline.crl_reload import (
     UNPROVEN_SIGNATURE,
     reload_replaced_crls,
 )
-from messagefoundry.pki import crl_signature_finding, crl_signature_refusal, judge_crl_signatures
+from messagefoundry.pki import crl_signature_finding, judge_crl_signatures
 from tests.test_crl_held_copy_alert import _bundle_scan
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
 from tests.test_trust_anchor_byte_binding import _handshake
@@ -310,15 +310,13 @@ def test_two_cas_with_one_subject(
 
 
 @pytest.mark.parametrize(("listed", "signer", "names", "state"), _TWIN_CASES)
-def test_the_reload_flag_follows_the_states(
+def test_the_reload_finding_follows_the_states(
     twins: _Twins, listed: str, signer: str, names: str | None, state: str
 ) -> None:
-    # The reload's flag is wider than what a start refuses, on purpose. This pins the flag to
-    # the states. That it equals what the reload returned before this change rests on the
-    # older tests in tests/test_crl_reload.py, which pass unchanged.
-    verdict = crl_signature_refusal(twins.write_crl(signer, names), _ders(twins.ca_file(listed)))
-    expected = {"verified": None, "unlisted": False}.get(state, True)
-    assert (verdict if verdict is None else verdict[1]) == expected
+    # The reload holds back more than a start refuses, on purpose: every state but ``verified``.
+    # This pins the reload's finding to the states, one for one (vault BACKLOG #3506).
+    finding = crl_signature_finding(twins.write_crl(signer, names), _ders(twins.ca_file(listed)))
+    assert (None if finding is None else finding.state) == (None if state == "verified" else state)
 
 
 # --- what OpenSSL does with those files ----------------------------------------------------------
@@ -377,8 +375,6 @@ def test_a_key_of_another_kind_than_the_signature_is_cannot_check_not_bad(tmp_pa
     # So the reload holds it back as a signature it could not check, whose remedy names a
     # restart, and not with BAD_SIGNATURE, which says a start refuses the file. Item 8: before,
     # the folded flag gave BAD_SIGNATURE here, and that remedy then had to hedge for every state.
-    verdict = crl_signature_refusal(pem, [der])
-    assert verdict is not None and verdict[1] is True  # the folded flag, unchanged
     finding = crl_signature_finding(pem, [der])
     assert finding is not None and finding.state == "uncheckable"
     assert crl_reload._SIGNATURE_REMEDY[finding.state] == UNCHECKABLE_SIGNATURE
@@ -607,7 +603,7 @@ def test_a_crl_under_the_listed_cas_name_in_other_ascii_case_is_judged_by_that_c
 
     pem = _named_crl(twins, twins.new_key, _NAME_IN_OTHER_CASE)
     assert [s.state for s in judge_crl_signatures(pem, _ders(twins.new_ca))] == ["verified"]
-    assert crl_signature_refusal(pem, _ders(twins.new_ca)) is None
+    assert crl_signature_finding(pem, _ders(twins.new_ca)) is None
     with caplog.at_level("WARNING"):
         hop = twins.hop("new")
     assert _warnings(caplog) == []
@@ -626,8 +622,8 @@ def test_a_crl_under_the_listed_cas_name_in_other_ascii_case_is_judged_by_that_c
         _handshake(_raw_hop(twins.new_ca, twins.crl), server)
     with pytest.raises(ValueError, match="does not verify the CRL's signature"):
         twins.hop("new")
-    verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
-    assert verdict is not None and verdict[1] is True  # the reload's BAD_SIGNATURE case
+    finding = crl_signature_finding(pem, _ders(twins.new_ca))
+    assert finding is not None and finding.state == "bad"  # the reload's BAD_SIGNATURE case
 
 
 def test_an_akid_issuer_name_in_other_ascii_case_still_fits_the_ca(twins: _Twins) -> None:
@@ -684,9 +680,9 @@ def test_a_name_that_genuinely_differs_is_still_unlisted(
         hop = twins.hop("new")  # loads: no proof
     (line,) = _warnings(caplog)
     assert pki_module.UNLISTED_SIGNATURE in line
-    verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
-    assert verdict is not None and verdict[1] is False  # the reload's NO_ISSUER case
-    assert pki_module.UNLISTED_SIGNATURE in verdict[0]  # one sentence for both
+    finding = crl_signature_finding(pem, _ders(twins.new_ca))
+    assert finding is not None and finding.state == "unlisted"  # the reload's NO_ISSUER case
+    assert pki_module.UNLISTED_SIGNATURE in finding.why  # one sentence for both
     # The premise: OpenSSL finds no CRL for the leaf's issuer in this file, so it does not judge
     # the peer by it, and a leaf-checking hop fails for want of one, not on the signature.
     with pytest.raises(ssl.SSLError, match="unable to get certificate CRL"):
@@ -754,8 +750,6 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
     assert [s.state for s in judge_crl_signatures(control, ders)] == ["verified"]
     assert [s.state for s in judge_crl_signatures(good, ders)] == ["uncheckable"]
     assert [s.state for s in judge_crl_signatures(forged, ders)] == ["bad"]
-    verdict = crl_signature_refusal(good, ders)
-    assert verdict is not None and verdict[1] is True  # the folded flag
     # The reload's own reading keeps them apart (vault BACKLOG #3506): the good one could not be
     # checked, and only the forged one is proven bad.
     assert (finding := crl_signature_finding(good, ders)) is not None
@@ -775,7 +769,7 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
 def test_the_reload_s_finding_keeps_the_three_states_apart_and_reports_the_strongest(
     twins: _Twins,
 ) -> None:
-    """Vault BACKLOG #3506 item 8. ``crl_signature_refusal`` folds ``bad``, ``unproven`` and
+    """Vault BACKLOG #3506 item 8. The reload's check used to fold ``bad``, ``unproven`` and
     ``uncheckable`` into one flag, so the reload could not tell a renewed CA key from a forgery.
     ``crl_signature_finding`` keeps the state, and across blocks reports the strongest: a proof,
     then a CA checked and failed, then a CA not checked, then no CA matched, in file order among
@@ -815,10 +809,6 @@ def test_the_reload_s_finding_keeps_the_three_states_apart_and_reports_the_stron
         assert pki_module.UNCONFIRMED_SIGNATURE[finding.state] in finding.why
     finding = crl_signature_finding(unlisted, ders)
     assert finding is not None and pki_module.UNLISTED_SIGNATURE in finding.why
-    # The folded flag is unchanged for its callers: True for all three, False for unlisted alone.
-    for pem in (unproven, uncheckable, bad):
-        assert (verdict := crl_signature_refusal(pem, ders)) is not None and verdict[1] is True
-    assert (verdict := crl_signature_refusal(unlisted, ders)) is not None and verdict[1] is False
 
 
 def test_a_version_that_logs_nothing_in_between_does_not_reset_the_record(

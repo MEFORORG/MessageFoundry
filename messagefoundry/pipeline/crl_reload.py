@@ -196,8 +196,8 @@ LAPSES_FIRST = (
 #: The signature remedies, one per :class:`~messagefoundry.pki.CrlSignature` state the reload
 #: holds a file back for (vault BACKLOG #2905, #3506). A start refuses only the proven case,
 #: state ``bad``, and loads the others with a warning; the handshake then decides. Before #3506
-#: one remedy covered all three, because :func:`~messagefoundry.pki.crl_signature_refusal` folds
-#: them into one flag, so a renewed CA key was told to fix a file that was right.
+#: one remedy, class ``bad_signature``, covered all three, because the reload's check folded them
+#: into one flag. Its words hedged across every state, so they could not say which one held.
 #:
 #: ``bad``: a file to fix. It names no restart, so it takes no not-in-effect caveat
 #: (:data:`_LEADS_TO_A_START`): a start whose check finds the same refuses the file whatever the
@@ -246,15 +246,17 @@ _RETRIED = frozenset({WAIT, LAPSES_FIRST, RETRY, NO_ISSUER})
 #: Which remedy a refusal names when the contexts of one file disagree: the earliest here. A file
 #: to fix, then a restart, outrank a wait, because waiting would not apply the file.
 #: :data:`LAPSES_FIRST` is a fix too, and the most urgent one: every peer is refused, restart or not.
-#: The two signature remedies short of proof sit where the one signature remedy sat before vault
-#: BACKLOG #3506 split it, just under the proven case, so no other remedy changed rank against them.
+#: The two signature remedies short of proof (vault BACKLOG #3506) ask for a check, then a restart,
+#: so they rank with the restarts, under every fix: a file whose held copy lapses first needs a
+#: CRL in effect whatever its signature check says. ``docs/CONFIGURATION.md`` lists the classes
+#: in this order.
 _PRECEDENCE = (
     FIX,
     BAD_SIGNATURE,
-    UNPROVEN_SIGNATURE,
-    UNCHECKABLE_SIGNATURE,
     _NOT_PROVABLE,
     LAPSES_FIRST,
+    UNPROVEN_SIGNATURE,
+    UNCHECKABLE_SIGNATURE,
     RESTART,
     NO_ISSUER,
     RETRY,

@@ -81,7 +81,7 @@ from messagefoundry.pipeline.crl_reload import (
 from messagefoundry.pki import (
     CrlBlock,
     _crl_attribute_key,
-    crl_signature_refusal,
+    crl_signature_finding,
     judge_every_crl,
     read_soonest_crl_facts,
 )
@@ -1388,10 +1388,10 @@ def test_a_badly_signed_crl_is_reported_over_one_whose_ca_is_not_listed(
     )
     anchors = [x509.load_pem_x509_certificate(pki.ca_pem).public_bytes(serialization.Encoding.DER)]
     unlisted_first = other.crl.read_bytes() + forged
-    verdict = crl_signature_refusal(unlisted_first, anchors)
-    assert verdict is not None and verdict[1] is True and "block 2" in verdict[0]
-    alone = crl_signature_refusal(other.crl.read_bytes(), anchors)  # control: unlisted alone
-    assert alone is not None and alone[1] is False
+    verdict = crl_signature_finding(unlisted_first, anchors)
+    assert verdict is not None and verdict.state == "bad" and "block 2" in verdict.why
+    alone = crl_signature_finding(other.crl.read_bytes(), anchors)  # control: unlisted alone
+    assert alone is not None and alone.state == "unlisted"
 
 
 # --- Lander hold on PR 1963: a CRL block OpenSSL does not load -------------------------------------
