@@ -638,6 +638,8 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
     """Before BACKLOG #2034 only the inline route ran the settings-anchor preflight, so a reload held
     for a second approver went live on a substituted anchor when it was released. The engine now
     runs it on every real reload. The control is a release before the swap, which goes live."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+
     good = _block(b"good")
     anchor = tmp_path / "ad-ca.pem"
     anchor.write_bytes(good)
@@ -699,7 +701,17 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
         rows = await store.list_audit(limit=100)
         assert "approval.failed" in [r["action"] for r in rows]
         failed = [json.loads(r["detail"]) for r in rows if r["action"] == "config_reload_failed"]
-        assert failed == [{"requested": None, "dry_run": False, "reason": "trust_anchor"}]
+        # The settings preflight runs before the digest check, so the row says it was not reached
+        # and names the approval it stopped (vault BACKLOG #2596).
+        assert failed == [
+            {
+                "requested": None,
+                "dry_run": False,
+                "approved_fingerprint": config_fingerprint(cfg),
+                "approval_digest_check": "not_reached",
+                "reason": "trust_anchor",
+            }
+        ]
         events = [json.loads(r["detail"])["event"] for r in rows if r["action"] == ta.AUDIT_ACTION]
         assert "pin_mismatch" in events
     finally:
@@ -1479,7 +1491,49 @@ async def test_a_load_failure_on_the_approved_bytes_is_still_invalid_config(
     )
     assert r.status_code == 422, r.text
     assert r.json()["detail"] == "invalid configuration"
-    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
+    # The digest check ran and passed, so the row carries no not-reached marker.
+    assert await _failed_reload_rows(engine) == [
+        {"requested": None, "dry_run": False, "reason": "invalid_config"}
+    ]
+
+
+async def test_a_release_refused_by_the_source_trust_check_names_its_approval(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tamper that also loosens the config directory's permissions is refused by the trust check,
+    which runs before the digest check, so its row reads ``invalid_config`` and not
+    ``digest_mismatch``. The row now names the approval's digest and says the digest check was not
+    reached, so it is not read as a refusal of the approved bytes (vault BACKLOG #2596). The
+    loosening is the trust check's own refusal, stubbed, as a permission change cannot be made the
+    same way on every platform; the stub is the name the snapshot read calls."""
+    from messagefoundry.config import wiring
+    from messagefoundry.config.fingerprint import config_fingerprint
+
+    cfg, marker = tmp_path / "cfg", tmp_path / "ran.txt"
+    approved = config_fingerprint(cfg)
+
+    def _loosened(directory: Path) -> None:
+        raise WiringError(f"refusing to load config from {directory}: it is writable by others")
+
+    def _tamper() -> None:
+        _edit_with_marker(cfg, marker)
+        monkeypatch.setattr(wiring, "_assert_safe_config_source", _loosened)
+
+    service = await _service(engine)
+    _approval_id, r = await _hold_then_release(engine, service, {}, between=_tamper)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == "invalid configuration"
+    assert not marker.exists(), "the edited module ran before the refusal"
+    # Digests and the marker only: the row's exact keys show no path or file content entered it.
+    assert await _failed_reload_rows(engine) == [
+        {
+            "requested": None,
+            "dry_run": False,
+            "approved_fingerprint": approved,
+            "approval_digest_check": "not_reached",
+            "reason": "invalid_config",
+        }
+    ]
 
 
 async def test_a_digest_that_cannot_be_taken_at_release_says_so(

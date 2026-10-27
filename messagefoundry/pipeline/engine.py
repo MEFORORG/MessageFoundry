@@ -131,6 +131,7 @@ __all__ = [
     "ClusteredConfigWrite",
     "ConfigDigestMismatch",
     "ConfigDigestUnavailable",
+    "ConfigRefusedBeforeApprovalCheck",
     "ConfigReloadDenied",
     "Engine",
     "ReloadOutcome",
@@ -235,6 +236,18 @@ class ConfigDigestUnavailable(Exception):
             "the config's digest could not be taken"
             + ("" if approved is None else " to check it against its approval")
         )
+        self.approved = approved
+
+
+class ConfigRefusedBeforeApprovalCheck(WiringError):
+    """A released reload refused as a ``WiringError`` before its snapshot's digest was checked
+    against its approval (vault BACKLOG #2596): by the settings preflight, or by the config
+    source's trust check, which stats paths and reads no contents. It keeps the refusal's message,
+    cause and traceback, so it is audited as that refusal is. ``approved`` is the digest the hold
+    captured, or ``None``, so the audit row can name the approval the refusal stopped."""
+
+    def __init__(self, refusal: WiringError, approved: str | None) -> None:
+        super().__init__(str(refusal))
         self.approved = approved
 
 
@@ -3089,8 +3102,9 @@ class Engine:
             # py/log-injection as the reload refusal logs scrub theirs.
             log.warning(
                 "config content digest failed for %s: %s. The reload's snapshot could not be "
-                "read whole, so a released reload is refused, and any other reload reads the "
-                "directory again and refuses only a file it needs",
+                "read whole, so a released reload is refused. Any other reload reads the "
+                "directory again and refuses any file the load reads that it cannot read, every "
+                "*.py module and helper included; only an environment value file is left out",
                 scrub_log_argument(str(path)),
                 safe_exc(exc),
             )
@@ -3286,16 +3300,26 @@ class Engine:
         """
         failures: list[ReloadStepFailure] = []
         restart_required: tuple[str, ...] = ()
-        if not dry_run:
-            # First, so every reload route refuses a bad settings anchor at the point the reload
-            # route used to, before anything is read or swapped (BACKLOG #2034).
-            restart_required = await self.preflight_settings()
-        path = await self._existing_reload_target(config_dir)
-        # The one read of the directory this reload runs (vault BACKLOG #2596): load_config
-        # compiles and parses these bytes and nothing else, the audit digest is theirs, and an
-        # approval is checked against them before any of them runs. None when a file cannot be
-        # read, which is logged; an ungated reload then lets load_config read and refuse it.
-        snapshot = await self._reload_snapshot(path)
+        try:
+            if not dry_run:
+                # First, so every reload route refuses a bad settings anchor at the point the
+                # reload route used to, before anything is read or swapped (BACKLOG #2034).
+                restart_required = await self.preflight_settings()
+            path = await self._existing_reload_target(config_dir)
+            # The one read of the directory this reload runs (vault BACKLOG #2596): load_config
+            # compiles and parses these bytes and nothing else, the audit digest is theirs, and an
+            # approval is checked against them before any of them runs. None when a file cannot be
+            # read, which is logged; an ungated reload then lets load_config read and refuse it.
+            snapshot = await self._reload_snapshot(path)
+        except WiringError as exc:
+            if approval is None:
+                raise
+            # A released reload refused before its digest check: marked, so its audit row can say
+            # the check was not reached rather than read as a refusal of the approved bytes. The
+            # cause is kept, so a trust-anchor or store refusal is audited as it was.
+            raise ConfigRefusedBeforeApprovalCheck(exc, approval.fingerprint).with_traceback(
+                exc.__traceback__
+            ) from exc.__cause__
         if approval is not None:
             # Before load_config, which runs every config module's top-level code, so bytes
             # changed since the request are refused before they run. An edit after this read
