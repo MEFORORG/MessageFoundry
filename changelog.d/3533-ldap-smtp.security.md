@@ -10,3 +10,7 @@
   refused at load, at every posture. `[security].allow_unverified_alert_smtp_tls` still permits
   such a hop with no login, but it no longer lets the SMTP AUTH password cross. See
   [ADR 0029](../docs/adr/0029-email-smtp-destination.md). (`BACKLOG #3533`)
+- **A string in a connector's default-on TLS setting is refused rather than read with `bool()`.**
+  An empty string for `tls_verify`, `verify_tls`, `use_tls`, `tls_check_hostname` or
+  `encrypt` turned the check off, and `"false"` read as on. An `env()` reference was already
+  cast strictly; this covers a string written past every factory. (`BACKLOG #3533`)

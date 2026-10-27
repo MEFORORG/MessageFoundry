@@ -358,7 +358,7 @@ class WebhookTransport:
         # Refuse a plaintext http:// webhook target unless the explicit dev escape is set: the alert
         # POST otherwise crosses the network in cleartext (ASVS 12.2.1 — no insecure fallback). https
         # is the only scheme accepted by default; http(s) remain the only schemes at all (see _post).
-        # Same refuse-unless-MEFOR_ALLOW_INSECURE_TLS pattern as LDAPS / SQL Server / MLLP. #329: read
+        # Same refuse-unless-MEFOR_ALLOW_INSECURE_TLS pattern as SQL Server / MLLP. #329: read
         # the escape through the ADR-0092 clamp (weakened_tls_escape_permitted) so on an enforcing-PHI
         # instance the blunt env var can never re-permit a cleartext alert POST. The webhook sink is
         # built out of the connector-construction gate (notifier_from_settings, in the app lifespan), so
