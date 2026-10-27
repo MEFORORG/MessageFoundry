@@ -1349,11 +1349,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > one connection — an `outbound(...)` or a `FhirLookup(...)` — declared next to the host it governs, with
 > a mandatory `cleartext_reason` recorded for the audit trail.
 > [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
-- **What you lose:** the payload crosses that hop **unencrypted and unauthenticated**, readable and
-  modifiable by anything on the path. There is no partial protection here: it is plaintext PHI on
-  the wire for that connection. An HTTP-family credential to a host off this machine is refused
-  whatever this says (vault BACKLOG #3533 item 4). The forward-proxy login is the exception: it
-  crosses its cleartext leg under this declaration, as the
+- **What you lose:** the payload — and any credential that connection carries — crosses that hop
+  **unencrypted and unauthenticated**, readable and modifiable by anything on the path. There is no
+  partial protection here: it is plaintext PHI on the wire for that connection. The exception is an
+  HTTP-family credential to a host off this machine, which is refused whatever this says (vault
+  BACKLOG #3533 item 4). A forward-proxy login is not in that exception: it crosses its cleartext
+  leg under this declaration, as the
   [credential rule](#no-escape-sends-a-credential-to-an-unverified-peer) says.
 - **When acceptable:** a peer that genuinely cannot do TLS — vendor firmware that predates it, or a
   transport with no TLS support at all. For `Tcp()` and `X12()` the declaration is **permanent and

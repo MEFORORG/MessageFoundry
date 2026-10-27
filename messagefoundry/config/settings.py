@@ -9696,9 +9696,10 @@ def security_loosenings(
             (
                 "cleartext_accepted",
                 f"{len(cleartext_hops)} connection(s) cross a CLEARTEXT hop by declaration "
-                f"({named}) — the payload rides those hops unencrypted and readable by anything on "
-                "the path, and so does a forward-proxy login; an HTTP-family credential to a host "
-                "off this machine is still refused (vault BACKLOG #3533 item 4)",
+                f"({named}) — the payload, and any credential the connection carries, ride those hops "
+                "unencrypted and readable by anything on the path, except an HTTP-family credential "
+                "other than a forward-proxy login, which is still refused to a host off this machine "
+                "(vault BACKLOG #3533 item 4)",
             )
         )
     if expiry_relaxed_hops:

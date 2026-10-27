@@ -1182,7 +1182,9 @@ def FhirLookup(
     :func:`env`. TLS is on by default. ``verify_tls=False`` to an off-box host is refused unless
     ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
     ``[security].enforcement = warn``, and never crosses a cleartext ``http`` url (that takes
-    ``tls_hop_attested`` or ``cleartext_accepted``, below). The pure
+    ``tls_hop_attested`` or ``cleartext_accepted``, below). Neither declaration lifts a refusal of a
+    lookup that sends a credential, over ``verify_tls=False`` or over cleartext ``http`` off this
+    machine (vault BACKLOG #3230, #3533 item 4). The pure
     ``parsing/fhir/`` codec parses the reply, so a ``FhirLookup``-declaring graph needs the optional
     ``messagefoundry[fhir]`` extra.
 
@@ -1651,6 +1653,9 @@ def _is_secret_header(name: str, value: object = None) -> bool:
     #3230). Since vault BACKLOG #3533 that refusal also takes any name off its own allowlist. For
     that refusal, narrowing the NAME arm here changes only how a refused header is labelled, and
     narrowing the VALUE arm narrows it for the allowlisted names. Either still narrows the masking.
+    **Over cleartext http off this machine there is no allowlist** (vault BACKLOG #3533 item 4):
+    this function alone decides whether a static or per-message header is a credential the hop
+    refuses, so narrowing EITHER arm lets that header cross there in the clear.
     """
     if _looks_like_a_credential_value(value):
         return True

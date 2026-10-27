@@ -708,6 +708,24 @@ def test_a_static_proxy_authorization_with_no_proxy_is_refused_at_build(
         )
 
 
+def test_a_credential_typed_into_a_proxy_authorization_key_is_not_echoed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 3: with no proxy, a Proxy-Authorization spelling now refuses the cleartext
+    hop at build, and its key may hold a credential typed into the name (vault BACKLOG #3457). The
+    refusal shows the key only as far as the plain name."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD), pytest.raises(InsecureHopRefused) as exc:
+        _build(
+            _CLEARTEXT["REST"],
+            accepted=True,
+            headers={"Proxy-Authorization Basic c3ludGhldGljOnB3": "x"},
+        )
+    text = str(exc.value)
+    assert "Proxy-Authorization" in text
+    assert "c3ludGhldGljOnB3" not in text
+
+
 def test_control_a_static_proxy_authorization_beside_a_proxy_is_left_to_the_proxy_rule(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

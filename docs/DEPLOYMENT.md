@@ -759,8 +759,8 @@ the opposite claim, "secure by other means", and ALLOWs the hop. It is reported 
 enforce`. That holds for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP and anonymous FTPS cells and, since #329,
 the SFTP host key of a key-only login and the webhook sink. That clamp once also required the
-instance to be PHI; every instance carries patient data now (BACKLOG #1279), so that conjunct is
-gone. Either way, on the shipped posture those cells are inert;
+instance to be PHI; by design every instance is now treated as carrying patient data (BACKLOG
+#1279), so that conjunct is gone. Either way, on the shipped posture those cells are inert;
 no bullet above is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.
 
 **Never set `MEFOR_ALLOW_INSECURE_TLS` in production.** Its presence is the single **environment-variable**

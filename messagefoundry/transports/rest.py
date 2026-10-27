@@ -1184,10 +1184,18 @@ def http_credentials_sent(
     if isinstance(static, Mapping):
         for name, value in static.items():
             key = str(name)
-            if proxied and is_proxy_credential_header_name(key):
+            proxy_spelling = is_proxy_credential_header_name(key)
+            if proxied and proxy_spelling:
                 continue
             if (held := _header_held(key, value, allowlist=not cleartext)) is not None:
-                sent.append(f"{_display_name(key)}{held}")
+                # A Proxy-Authorization spelling may carry a credential typed into the name
+                # (vault BACKLOG #3457), so it is shown only as far as the plain name.
+                shown = (
+                    proxy_credential_header_name_shown(key)
+                    if proxy_spelling
+                    else _display_name(key)
+                )
+                sent.append(f"{shown}{held}")
     url = settings.get("url")
     if isinstance(url, str) and (names := credential_query_params(url)):
         sent.append(f"url query parameter {', '.join(names)}")
