@@ -1421,11 +1421,85 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
   });
 
+  test("an anchor dropped by a new pin re-probes the status bar", async () => {
+    stubInventory = plantedEngine();
+    const subscriptions: { dispose(): unknown }[] = [];
+    held.push(() => subscriptions.forEach((d) => d.dispose()));
+    trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
+    await settle();
+    const listener = configListener as ConfigListener | undefined;
+    assert.ok(listener !== undefined, "no settings listener was subscribed");
+    let rechecks = 0;
+    const realExecute = vscodeStub.commands.executeCommand;
+    vscodeStub.commands.executeCommand = () => {
+      rechecks++;
+      return Promise.resolve(undefined);
+    };
+    held.push(() => (vscodeStub.commands.executeCommand = realExecute));
+
+    stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile: path.join(ws, "pki", "missing.pem") }];
+    listener({ affectsConfiguration: (s) => s === "messagefoundry.environments" });
+    await settle();
+    for (let i = 0; i < 5; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    assert.ok(rechecks > 0, "the verdict earned with the dropped anchor was left on screen");
+  });
+
+  test("a refresh that started before a pin was added does not commit another source for that host", async () => {
+    stubInventory = plantedEngine();
+    const caFile = path.join(ws, "pki", "missing.pem");
+    childProcess.execFile = cliThatFirst(() => {
+      stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile }];
+    });
+
+    await trust.refreshEngineTrust();
+
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+  });
+
+  test("a pinned host whose caFile outlasts a request's wait is read by a background refresh", async () => {
+    const caFile = path.join(ws, "pki", "slow-ca.pem");
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    plantCert(path.join("pki", "slow-ca.pem"));
+    trust.setEngineTrustLimitsForTest({ followReadMs: 20 });
+    openHook = (file) =>
+      file === path.normalize(caFile)
+        ? new Promise((resolve) => setTimeout(resolve, 80)).then(() => realOpen(file))
+        : undefined;
+
+    assert.strictEqual(await trust.followCertificateChange(REMOTE, undefined), false);
+    await settle();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+  });
+
+  test("a loopback host pinned since the last refresh never spawns the CLI on failure", async () => {
+    stubInventory = NO_CERT_YET;
+    await trust.refreshEngineTrust();
+    const spawned = invocations.length;
+    stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile: path.join(ws, "pki", "missing.pem") }];
+
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), false);
+    await settle();
+    assert.strictEqual(invocations.length, spawned);
+  });
+
+  test("a host whose caFile was refused is not told to set a caFile", async () => {
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile: "pki/prod-ca.pem" }];
+    await trust.refreshEngineTrust();
+    assert.ok(
+      !logged.some((line) => line.includes(`${UNANCHORED} (${REMOTE}`)),
+      `told to set the caFile it has: ${JSON.stringify(logged)}`,
+    );
+  });
+
   test("a caFile caught holding only a BOM or a line break keeps its anchor, like an empty one", async () => {
     const caFile = plantCert(path.join("pki", "prod-ca.pem"));
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
     await trust.refreshEngineTrust();
-    for (const partial of ["﻿", "\r\n"]) {
+    for (const partial of [String.fromCharCode(0xfeff), "\r\n"]) {
       fs.writeFileSync(caFile, partial);
       await trust.refreshEngineTrust();
       assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM, JSON.stringify(partial));

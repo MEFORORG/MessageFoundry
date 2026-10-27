@@ -246,8 +246,8 @@ export function trustRemedy(code: string | undefined, url: string): string | und
     return (
       `not sent to ${url}: its caFile in \`messagefoundry.environments\` has not been read yet, or ` +
       `could not be read as a PEM certificate, and a pinned engine is never verified against the ` +
-      `default CAs. Check that the file exists and is readable from this machine; each refused request ` +
-      `reads it again, and the MessageFoundry Engine log names what went wrong.`
+      `default CAs. Check that the file exists and is readable from this machine; a refused request ` +
+      `tries to read it again, and the MessageFoundry Engine log names what went wrong.`
     );
   }
   const head = `cannot verify the TLS certificate ${url} presented (${code}).`;

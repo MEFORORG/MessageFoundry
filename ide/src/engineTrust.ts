@@ -334,17 +334,36 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   // Swap only now, after the subprocess has answered. Clearing first and then awaiting left EVERY
   // engine unanchored for as long as `cert inventory` ran.
   claimedKeys = claimed;
-  commit(outcomes);
-  warnAboutUnanchoredTargets(targets, files);
+  commit(outcomes, files);
+  warnAboutUnanchoredTargets(targets, files, claimed);
   return trustState() !== before;
 }
 
-/** Replace the registered set by applying each key's {@link Outcome} to what is registered now. */
-function commit(outcomes: ReadonlyMap<string, Outcome>): void {
+/**
+ * Replace the registered set by applying each key's {@link Outcome} to what is registered now.
+ *
+ * `files` is the pin set this refresh read from. The settings may have pinned a host since: such a
+ * host takes no outcome from another source or another file, and this refresh's silence about it is
+ * not an answer, so an anchor from the file the settings pin it to now is kept.
+ */
+function commit(outcomes: ReadonlyMap<string, Outcome>, files: ReadonlyMap<string, string>): void {
   const previous = new Map(registered);
+  const pinnedNow = configuredPinFiles();
   clearEngineTrustAnchors();
   registered.clear();
+  for (const [key, live] of previous) {
+    const pin = pinnedNow.get(key);
+    const readHere = files.get(key);
+    const unread = readHere === undefined || !sameFile(readHere, pin ?? readHere);
+    if (pin !== undefined && unread && live.pinned && sameFile(live.file, pin)) {
+      register(live);
+    }
+  }
   for (const [key, outcome] of outcomes) {
+    const pin = pinnedNow.get(key);
+    if (pin !== undefined && !(outcome.pinned && outcome.file !== undefined && sameFile(outcome.file, pin))) {
+      continue; // pinned since this refresh read its settings, to a different file or none
+    }
     const live = previous.get(key);
     const sameSource =
       live !== undefined &&
@@ -401,15 +420,18 @@ function configuredPinFiles(): Map<string, string> {
  * a file the setting named before) is dropped here too, in both stores: the pin wins from the moment
  * it is set, and a refresh would not keep such an anchor for that host anyway.
  */
-function publishPinnedHosts(files: ReadonlyMap<string, string>): void {
+function publishPinnedHosts(files: ReadonlyMap<string, string>): boolean {
+  let dropped = false;
   for (const [key, file] of files) {
     const live = registered.get(key);
     if (live !== undefined && !(live.pinned && sameFile(live.file, file))) {
       registered.delete(key);
       setEngineTrustAnchor(live.url, undefined);
+      dropped = true;
     }
   }
   setPinnedEngineHosts(files.keys());
+  return dropped;
 }
 
 /**
@@ -747,6 +769,8 @@ function cliCouldAnchor(key: string): boolean {
     !!workspaceDir() &&
     !isExecGated() &&
     !claimedKeys.has(key) &&
+    // The settings as they are now too: a host claimed since the last refresh is no longer the CLI's.
+    !claimedBy(trustPinsFor(pinTargetsOf(environments()))).has(key) &&
     registered.get(key)?.pinned !== true &&
     key === engineHostKey(url) &&
     isLocalEngine(url)
@@ -820,11 +844,15 @@ export async function followCertificateChange(
   // a pin added or moved since the last refresh is read here rather than waiting for that refresh to
   // commit. With no pin, the file an unpinned (CLI) anchor came from. Read again after the read, so a
   // setting changed meanwhile is seen.
-  const fileFor = (): string | undefined => {
+  const sourceFor = (): { readonly file: string | undefined; readonly pinned: boolean } => {
+    const pin = configuredPinFiles().get(key);
+    if (pin !== undefined) {
+      return { file: pin, pinned: true };
+    }
     const live = registered.get(key);
-    return configuredPinFiles().get(key) ?? (live?.pinned === true ? undefined : live?.file);
+    return { file: live?.pinned === true ? undefined : live?.file, pinned: false };
   };
-  const file = fileFor();
+  const { file, pinned } = sourceFor();
   // A read already running when this request failed may predate the rotation. Only when it returns
   // the certificate that just failed is the file read again; anything else answers this request.
   const deadline = performance.now() + limits.followReadMs;
@@ -844,10 +872,11 @@ export async function followCertificateChange(
     sameFile(held.file, file) &&
     held.readAt > (stamped?.readAt ?? 0);
   const changed = read !== undefined && read !== usedCa;
-  if (file !== undefined && stamped !== undefined && changed && sameFile(file, fileFor() ?? "") && !newer) {
+  const after = sourceFor();
+  const stillTheSource =
+    after.file !== undefined && file !== undefined && after.pinned === pinned && sameFile(file, after.file);
+  if (file !== undefined && stamped !== undefined && changed && stillTheSource && !newer) {
     if (read !== held?.pem) {
-      // A pin's file when the settings pin this host now (fileFor's first choice), else the CLI's.
-      const pinned = configuredPinFiles().has(key);
       register({ url, file, pem: read, pinned, readAt: stamped.readAt });
       engineLog().info(`the certificate at ${file} changed; trusting it for ${url}`);
     }
@@ -861,8 +890,24 @@ export async function followCertificateChange(
   }
   if (cliCouldAnchor(key)) {
     noteCliAnchorableFailure(key, usedCa);
+  } else if (pinned && held === undefined && stamped?.readAt === 0) {
+    // A pinned host with no anchor whose file took longer than this request could wait. Every request
+    // to it is refused, and each would cut its own read short the same way, so let a refresh read it
+    // with the refresh's longer allowance; rate-limited like a CLI-started one.
+    noteSlowPin();
   }
   return false;
+}
+
+/** Start a refresh for {@link followCertificateChange}'s slow pin: none while one is pending, and at
+ *  most one per {@link FAILURE_REFRESH_MIN_MS}, the limit a failure-started CLI refresh shares. */
+function noteSlowPin(): void {
+  const now = performance.now();
+  if (refreshesPending > 0 || now - lastFailureRefresh < FAILURE_REFRESH_MIN_MS) {
+    return;
+  }
+  lastFailureRefresh = now;
+  void refreshThenRecheck(false);
 }
 
 /** Resolves once no refresh is queued or running, a follow-up included. For the shell test only. */
@@ -905,6 +950,7 @@ export function forgetEngineTrust(): void {
 function warnAboutUnanchoredTargets(
   targets: readonly PinTarget[],
   pinned: ReadonlyMap<string, string>,
+  claimed: ReadonlySet<string>,
 ): void {
   const missing = targets.filter((t) => {
     const key = engineHostKey(t.url);
@@ -913,7 +959,11 @@ function warnAboutUnanchoredTargets(
   const unread = [
     ...new Set(missing.filter((t) => pinned.has(engineHostKey(t.url) ?? "")).map((t) => t.url)),
   ];
-  const unanchored = missing.filter((t) => !unread.includes(t.url));
+  // A host whose caFile was refused already has its own log line saying how to fix the value, so it
+  // is not told to set a caFile it has.
+  const unanchored = missing.filter(
+    (t) => !unread.includes(t.url) && !claimed.has(engineHostKey(t.url) ?? ""),
+  );
   if (unread.length > 0) {
     engineLog().warn(
       `messagefoundry.environments pins ${unread.length} https target(s) with no certificate read ` +
@@ -960,8 +1010,10 @@ export function registerEngineTrust(context: vscode.ExtensionContext): void {
         e.affectsConfiguration("messagefoundry.environments") ||
         e.affectsConfiguration("messagefoundry.serviceConfig")
       ) {
-        publishPinnedHosts(configuredPinFiles()); // now, not when the queued refresh starts
-        void refreshEngineTrustThenRecheck();
+        // Now, not when the queued refresh starts. An anchor dropped here is gone before that refresh
+        // takes its own before-and-after reading, so it would not count as a change there.
+        const dropped = publishPinnedHosts(configuredPinFiles());
+        void refreshThenRecheck(false, dropped);
       }
     }),
   );
@@ -973,8 +1025,8 @@ export function refreshEngineTrustThenRecheck(): Promise<void> {
   return refreshThenRecheck(false);
 }
 
-async function refreshThenRecheck(followUp: boolean): Promise<void> {
-  if (!(await queueRefresh(followUp))) {
+async function refreshThenRecheck(followUp: boolean, changedAlready = false): Promise<void> {
+  if (!(await queueRefresh(followUp)) && !changedAlready) {
     return; // nothing changed about what we trust, so nothing to re-probe
   }
   try {

@@ -23,6 +23,7 @@ import {
   getJson,
   postJson,
   setEngineTrustAnchor,
+  setPinnedEngineHosts,
   setTrustFailureHandler,
   snapshotEngineTrustAnchors,
   TLS_12_SUITES,
@@ -286,6 +287,7 @@ suite("the registered anchor reaches the TLS layer", () => {
   setup(() => {
     captured = undefined;
     restoreAnchors = snapshotEngineTrustAnchors();
+    setPinnedEngineHosts([]); // the activated extension's own pins must not refuse these requests
     clearEngineTrustAnchors();
     realRequest = httpsModule.request;
     httpsModule.request = ((_url: unknown, options: httpsTypes.RequestOptions): unknown => {
@@ -554,6 +556,7 @@ suite("a request that fails verification follows a changed anchor once (BACKLOG 
   setup(() => {
     calls = [];
     restoreAnchors = snapshotEngineTrustAnchors();
+    setPinnedEngineHosts([]); // the activated extension's own pins must not refuse these requests
     clearEngineTrustAnchors();
     setEngineTrustAnchor(TARGET, OLD);
     savedHandler = setTrustFailureHandler(undefined);

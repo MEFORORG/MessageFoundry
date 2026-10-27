@@ -262,8 +262,10 @@ set `caFile` on its `messagefoundry.environments` entry (or on one engine shard)
   a certificate read from that file, never with the default roots or the certificate
   `messagefoundry.serviceConfig` names. While no certificate from that file is held, because it has
   not been read yet or holds no PEM certificate, the request is refused before it is sent, with an
-  error naming the `caFile` in `messagefoundry.environments`. The refusal reads the file again, and
-  if that read succeeds the request is sent once with it. A certificate already read from the file
+  error naming the `caFile` in `messagefoundry.environments`. The refusal tries to read the file
+  again, waiting up to two seconds, and if that read succeeds the request is sent once with it; a
+  file slower than that is left to a background pass, at most once a minute, with the longer wait
+  a pass allows (see *Every wait is bounded*). A certificate already read from the file
   stays in use when a later read fails, as the next sections say. The pin covers the `host:port`
   exactly as the entry spells it: the same server reached under another name or by its IP address is
   a different host here and is not pinned.
