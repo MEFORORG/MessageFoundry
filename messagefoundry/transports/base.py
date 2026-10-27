@@ -32,7 +32,8 @@ import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, ClassVar, Protocol
+from pathlib import Path
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
@@ -57,6 +58,7 @@ __all__ = [
     "ReplyOutcome",
     "SyncReplyResolver",
     "ProcessedFileLedger",
+    "ProcessedArchive",
     "FILE_KEY_SCHEME",
     "FILE_KEY_SCHEMES",
     "FileKeyError",
@@ -624,6 +626,34 @@ class InboundReply:
 #: CI-enforced freedom from ``store/`` and ``pipeline/`` imports (AC-17) while still returning bytes
 #: that came out of the store.
 SyncReplyResolver = Callable[[str], Awaitable[InboundReply]]
+
+
+@runtime_checkable
+class ProcessedArchive(Protocol):
+    """A running inbound that archives what it read into a directory the retention pass may age out:
+    the local File source's ``.processed`` (owner ruling A2 of 2026-10-08, BACKLOG #1188).
+
+    The retention runner reads these from the live graph each pass and never imports a transport. It
+    hands every archive the watch and ``.error`` directories of all of them as ``protected``, so one
+    whose archive directory is, or holds, any of those deletes nothing: a misconfigured
+    ``processed_subdir`` must never let an age sweep reach undelivered drops or the ``.error`` copies,
+    whose deletion nobody has ruled on (#3335)."""
+
+    directory: Path
+    processed_dir: Path
+    error_dir: Path
+
+    async def prune_processed_archive(
+        self,
+        older_than: float,
+        *,
+        protected: frozenset[Path],
+        deadline_hit: Callable[[], bool],
+    ) -> int:
+        """Delete archived files whose archive time is before ``older_than`` (epoch seconds), and
+        return how many went. A file it cannot remove is skipped and tried again next pass; an
+        ``OSError`` that escapes (a failed alternate credential, say) the caller contains."""
+        ...
 
 
 class ProcessedFileLedger(Protocol):

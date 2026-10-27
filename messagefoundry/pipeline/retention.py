@@ -35,7 +35,7 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,7 +44,9 @@ from messagefoundry.config.wiring import Registry
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store import Store, StripResult
+from messagefoundry.transports.base import ProcessedArchive
 
 __all__ = [
     "DiskFloorReading",
@@ -269,6 +271,10 @@ class RetentionPass:
     # declares. Metadata only: a count, never a key or a value. 0 when the window is unset, when no
     # registry is wired, or when the registry declares no reference sets (the positive-signal skip).
     reference_snapshots_purged: int = 0
+    # Archived copies DELETEd from running File inbounds' `.processed` directories this pass, past
+    # `processed_archive_days` (owner ruling A2 of 2026-10-08, BACKLOG #1188). A count only, never a
+    # file or connection name. 0 when the window is unset or no File inbound is bound.
+    processed_archives_deleted: int = 0
     # This pass hit the `max_pass_seconds` between-phase duration cap (#121, ADR 0137) and SKIPPED its
     # remaining phases — the skipped tail (incl. any due WAL-checkpoint/VACUUM) re-runs next interval with
     # its last-run marker unadvanced. Always False when the cap is off (`max_pass_seconds<=0`, the
@@ -311,6 +317,7 @@ class RetentionPass:
             or self.app_logs_compressed > 0
             or self.search_presets_purged > 0
             or self.reference_snapshots_purged > 0
+            or self.processed_archives_deleted > 0
             or self.vacuumed
             or self.over_limit
             or self.capped
@@ -333,8 +340,13 @@ class RetentionRunner:
         coordinator: ClusterCoordinator | None = None,
         registry_source: Callable[[], Registry | None] | None = None,
         log_dir: str | None = None,
+        archive_source: Callable[[], Sequence[ProcessedArchive]] | None = None,
     ) -> None:
         self._store = store
+        # The bound inbounds whose `.processed` archive the `processed_archive_days` sweep ages out
+        # (BACKLOG #1188), read from the LIVE graph each pass like the registry. None (embedding,
+        # tests) = nothing to sweep.
+        self._archive_source = archive_source
         self._settings = settings
         # The SQLite store file the low-disk floor measures (BACKLOG #290); None when the floor
         # cannot apply to this store. See sqlite_store_file for the rule.
@@ -385,6 +397,7 @@ class RetentionRunner:
             or s.connection_event_retention_hours
             or s.search_preset_days
             or s.reference_snapshot_days
+            or s.processed_archive_days
             or s.max_db_mb
             or s.audit_log_warn_rows
             or self._wal_truncate_applies()
@@ -418,7 +431,8 @@ class RetentionRunner:
         log.info(
             "retention enabled: messages_days=%d dead_letter_days=%d max_db_mb=%d "
             "min_free_disk_mb=%d audit_log_warn_rows=%d wal_checkpoint_seconds=%g vacuum_at=%r "
-            "app_log_days=%d app_log_compress_days=%d max_pass_seconds=%g (every %gs)",
+            "app_log_days=%d app_log_compress_days=%d processed_archive_days=%d "
+            "max_pass_seconds=%g (every %gs)",
             self._settings.messages_days,
             self._settings.dead_letter_days,
             self._settings.max_db_mb,
@@ -428,6 +442,7 @@ class RetentionRunner:
             self._settings.vacuum_at,
             self._settings.app_log_days,
             self._settings.app_log_compress_days,
+            self._settings.processed_archive_days,
             self._settings.max_pass_seconds,
             self._settings.purge_interval_seconds,
         )
@@ -703,6 +718,16 @@ class RetentionRunner:
                 self._compress_app_logs, now, _deadline_hit
             )
 
+        # The File source's `.processed` archive (owner ruling A2 of 2026-10-08, BACKLOG #1188): a
+        # clear-text copy of every inbound payload, aged out on ARCHIVE time at the body window. Each
+        # source does its own blocking I/O off the loop and under its own credential, re-reading the
+        # deadline per file, so a large directory releases the pass like the compressor does.
+        processed_archives_deleted = 0
+        if not _deadline_hit() and s.processed_archive_days > 0:
+            processed_archives_deleted = await self._prune_processed_archives(
+                now - s.processed_archive_days * _SECONDS_PER_DAY, _deadline_hit
+            )
+
         # Maintenance phases (WAL-checkpoint, then daily VACUUM). Their cadence markers advance ONLY when
         # the phase actually runs, so a phase SKIPPED by the cap stays due for the next pass (#121). A
         # running VACUUM is non-interruptible: the deadline is checked only BEFORE it is dispatched.
@@ -761,6 +786,7 @@ class RetentionRunner:
             app_log_bytes_reclaimed=app_log_bytes_reclaimed,
             search_presets_purged=search_presets_purged,
             reference_snapshots_purged=reference_snapshots_purged,
+            processed_archives_deleted=processed_archives_deleted,
             capped=capped,
             below_disk_floor=below_disk_floor,
             wal_left_untruncated=wal_left_untruncated,
@@ -769,6 +795,46 @@ class RetentionRunner:
         if result.did_work:
             await self._audit(result)
         return result
+
+    async def _prune_processed_archives(
+        self, older_than: float, deadline_hit: Callable[[], bool]
+    ) -> int:
+        """Run each bound archive's sweep, and return how many files went in all (BACKLOG #1188).
+
+        Every archive is handed the watch and ``.error`` directories of all of them, so one whose
+        archive directory overlaps another connection's drops or quarantine deletes nothing. A
+        directory two connections share is swept once. A fault in one connection is logged by
+        connection name and the others still run, because a sweep must never stop the pass."""
+        archives = list(self._archive_source()) if self._archive_source is not None else []
+        protected = frozenset(
+            path for archive in archives for path in (archive.directory, archive.error_dir)
+        )
+        swept: set[str] = set()
+        deleted = 0
+        for archive in archives:
+            if deadline_hit():
+                break
+            # realpath, as the overlap check reads it, so a directory reached through a link is
+            # still recognised as shared.
+            key = os.path.normcase(os.path.realpath(archive.processed_dir))
+            if key in swept:
+                continue
+            swept.add(key)
+            try:
+                deleted += await archive.prune_processed_archive(
+                    older_than, protected=protected, deadline_hit=deadline_hit
+                )
+            except OSError as exc:
+                # A file fault is the sweep's own to absorb; this catches what escapes it, such as
+                # the alternate credential failing. safe_exc, because an OSError renders its path
+                # and below the archive directory a path is a partner's file name.
+                log.warning(
+                    "the [retention].processed_archive_days sweep failed for the archive directory "
+                    "%s (%s); nothing more was deleted there this pass",
+                    archive.processed_dir.name,
+                    safe_exc(exc),
+                )
+        return deleted
 
     # --- per-connection retention overrides (#34, ADR 0027) ------------------
 
@@ -1268,6 +1334,10 @@ class RetentionRunner:
                 # narrow which patient cohort was dropped; the count is what an assessor needs.
                 "reference_snapshot_days": self._settings.reference_snapshot_days,
                 "reference_snapshots_purged": result.reference_snapshots_purged,
+                # `.processed` archive copies deleted (BACKLOG #1188) + the window. The COUNT only:
+                # never a file name, which can carry an identifier, nor a connection name.
+                "processed_archive_days": self._settings.processed_archive_days,
+                "processed_archives_deleted": result.processed_archives_deleted,
                 # Between-phase duration cap (#121, ADR 0137): the configured ceiling + whether THIS pass
                 # hit it and skipped its remaining phases. Timing metadata only — no PHI.
                 "max_pass_seconds": self._settings.max_pass_seconds,

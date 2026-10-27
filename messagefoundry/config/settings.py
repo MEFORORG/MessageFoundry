@@ -2876,6 +2876,15 @@ class RetentionSettings(_Section):
     # closed cell; do not let a classification table describe this window as covering `reference.value`
     # generally, which would machine-bless a false claim.
     reference_snapshot_days: int = 0
+    # Past N days, DELETE the archived copies a File inbound left in its `.processed` directory
+    # (`processed_subdir`), keyed on ARCHIVE time: the File source sets each file's mtime to the moment
+    # it archives it, so a partner's preserved old mtime cannot age a fresh copy out early. Each copy
+    # is the full clear-text inbound payload, a second PL-1 copy beside the stored body, so it is
+    # auto-bounded at the body window (owner ruling A2 of 2026-10-08, BACKLOG #1188). One level, regular
+    # files only, never through a link; `.error` is NOT swept. Only a running File inbound's directory is
+    # swept, and one that overlaps any File inbound's watch or `.error` directory is refused. 0 = keep
+    # forever, which an enforcing PHI instance refuses unless `allow_unbounded_phi` is set.
+    processed_archive_days: int = 0
     # Past N HOURS, DELETE connection_event rows (#46) — the Corepoint-style transport/lifecycle log can
     # be high-volume (a connect-per-message sender, a probe storm), so it has its own short window in
     # HOURS (not days). 0 = inherit the message-body window (messages_days), the ADR 0021 §7.5 default.
@@ -2972,9 +2981,10 @@ class RetentionSettings(_Section):
     vacuum_at: str = ""
     # Secure-by-default opt-out (#186a, ASVS 14.2.4): `serve` refuses to start under
     # [security].enforcement=enforce (warns under enforcement = warn) when an auto-bounded PHI window
-    # is unbounded — `messages_days`, `dead_letter_days` and `reference_snapshot_days`
-    # (`auto_bounded_windows()` is the list; the first two keep FULL raw message bodies until
-    # purged, the third covers orphaned reference snapshots only) — so PHI does not
+    # is unbounded — `messages_days`, `dead_letter_days`, `reference_snapshot_days` and
+    # `processed_archive_days` (`auto_bounded_windows()` is the list; the first two keep FULL raw
+    # message bodies until purged, the third covers orphaned reference snapshots only, the fourth the
+    # File source's `.processed` copies) — so PHI does not
     # accumulate without bound. Unless this override is set, an UNSET window is auto-bounded to 30
     # days, so only an explicit 0 trips the gate. Setting this true is the explicit, audited override
     # that lets an instance run with unbounded (keep-forever) retention. Operators write it as
@@ -2996,6 +3006,7 @@ class RetentionSettings(_Section):
         "app_log_compress_days",
         "search_preset_days",
         "reference_snapshot_days",
+        "processed_archive_days",
     )
     @classmethod
     def _non_negative_days(cls, value: int) -> int:

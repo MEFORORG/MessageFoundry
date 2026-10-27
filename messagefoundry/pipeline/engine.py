@@ -2015,6 +2015,13 @@ class Engine:
                 ),
                 # [logging].log_dir for application-log-file retention (#120); None → sweep no-ops.
                 log_dir=self._log_dir,
+                # The bound File inbounds whose `.processed` archive processed_archive_days ages out
+                # (BACKLOG #1188), read live each pass for the same reason as registry_source.
+                archive_source=lambda: (
+                    self._registry_runner.processed_archives()
+                    if self._registry_runner is not None
+                    else ()
+                ),
             )
             self._retention_runner.start()
         # [backup] turnkey DR backup (ADR 0049, #60) — a maintenance task like retention: independent of

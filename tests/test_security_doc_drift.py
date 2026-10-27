@@ -3867,8 +3867,8 @@ def test_retention_gate_reader_detects_a_planted_violation() -> None:
         ),
         # A window dropped from the posture paragraph while a table row still names it.
         "window-unnamed": (
-            "`[security].delete_message_bodies_after_days`, `[retention].dead_letter_days` and",
-            "`[retention].dead_letter_days` and",
+            "`[security].delete_message_bodies_after_days`, `[retention].dead_letter_days`,",
+            "`[retention].dead_letter_days`,",
             "delete_message_bodies_after_days",
         ),
     }

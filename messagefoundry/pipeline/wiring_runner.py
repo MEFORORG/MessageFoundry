@@ -222,6 +222,7 @@ from messagefoundry.transports.base import (
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
+    ProcessedArchive,
     ReplyBodyDropped,
     SyncReplyResolver,
     check_file_key,
@@ -3040,6 +3041,12 @@ class RegistryRunner:
     def listening_inbounds(self) -> frozenset[str]:
         """The inbounds whose listener is bound now."""
         return frozenset(self._sources)
+
+    def processed_archives(self) -> tuple[ProcessedArchive, ...]:
+        """The bound inbounds whose source archives what it read, such as the File source's
+        ``.processed`` directory, for the retention pass's age sweep (BACKLOG #1188). Only bound
+        ones: a stopped or undeployed inbound has no source object to resolve its directories."""
+        return tuple(s for s in self._sources.values() if isinstance(s, ProcessedArchive))
 
     async def park_intake(self, standby: Priority, *, keep: frozenset[str] = frozenset()) -> None:
         """Make this box a passive standby for intake and unbind every inbound, in one span of the

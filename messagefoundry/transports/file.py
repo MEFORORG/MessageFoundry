@@ -704,6 +704,10 @@ class FileSource(SourceConnector):
         # BACKLOG #2507: paths already refused as links, so each is warned about once. See
         # _log_unconfined. In memory only and never logged.
         self._refused: set[str] = set()
+        # The connection, as the `.processed` age sweep names it in a log line (BACKLOG #1188), and
+        # whether that sweep has already said it refuses this archive directory, so it says so once.
+        self._label = config.name or str(self.directory)
+        self._prune_refusal_logged = False
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (a missing dir is logged-and-retried each poll, never fails start).
         self.validate_directory: bool = bool(s.get("validate_directory", False))
@@ -1662,9 +1666,11 @@ class FileSource(SourceConnector):
                         safe_exc(exc, file_name=path.name),
                     )
         else:
-            self._move(path, self.processed_dir, read_id)
+            self._move(path, self.processed_dir, read_id, stamp=True)
 
-    def _move(self, path: Path, dest_dir: Path, read_id: _FileId | None = None) -> bool:
+    def _move(
+        self, path: Path, dest_dir: Path, read_id: _FileId | None = None, *, stamp: bool = False
+    ) -> bool:
         """Archive ``path`` into ``dest_dir`` under a name claimed ATOMICALLY (BACKLOG #1046). Returns
         whether a copy now sits in ``dest_dir``. A quarantine is recorded only then (BACKLOG #1621): a
         file that could not be archived at all is logged here and examined again next scan.
@@ -1692,11 +1698,19 @@ class FileSource(SourceConnector):
         the original would survive). If the unlink fails after the claim the file is archived AND
         left in place to be re-read — the same duplicate-read outcome the pre-existing failure arm
         already had, and logged the same way. A Windows rename by handle moves the file in one step,
-        so there the original cannot stay behind."""
+        so there the original cannot stay behind.
+
+        ``stamp`` sets the file's modification time to now just before it is archived, which is what
+        the ``.processed`` age sweep keys on (:meth:`prune_processed_archive`, BACKLOG #1188). Before
+        the claim, not after: a link or a rename keeps the drop's own mtime, which a partner's copy
+        tool may have preserved from long ago, and a sweep running between the claim and a later stamp
+        would delete a copy archived a moment earlier."""
         pin = self._pinned(path, read_id)
         if pin is None:
             return False
         with pin:
+            if stamp:
+                self._stamp_archive_time(pin, path)
             try:
                 with _open_dest(dest_dir, self.directory, self._root_real) as dest:
                     gone = _archive(pin, dest, path.name)
@@ -1723,6 +1737,137 @@ class FileSource(SourceConnector):
                         safe_exc(exc, file_name=path.name),
                     )
         return True  # archived, even if the original stayed and will be re-read
+
+    def _stamp_archive_time(self, pin: _Pin, path: Path) -> None:
+        """Set the pinned file's mtime to now, so the ``.processed`` sweep ages it from its archive.
+
+        Through the pin, never by a fresh name lookup: POSIX names it relative to the checked
+        directory without following a link, and Windows reopens the checked handle itself. A failure
+        is logged and the archive goes ahead, because refusing to archive would re-read the file on
+        every poll; that copy then keeps its drop-time mtime and may age out sooner than its window."""
+        now_ns = time.time_ns()
+        try:
+            if pin.fd is None:
+                os.utime(pin.name, ns=(now_ns, now_ns), dir_fd=pin.dir_fd, follow_symlinks=False)
+            else:
+                _win_stamp_write_time(pin.fd, now_ns)
+        except OSError as exc:
+            logger.warning(
+                "could not set the archive time on %s before moving it to %s (%s); the "
+                "[retention].processed_archive_days sweep will age that copy from its own earlier "
+                "modification time",
+                safe_name(path.name),
+                self.processed_dir.name,
+                _describe_os_error(exc, file_name=path.name),
+            )
+
+    async def prune_processed_archive(
+        self,
+        older_than: float,
+        *,
+        protected: frozenset[Path],
+        deadline_hit: Callable[[], bool],
+    ) -> int:
+        """Delete files in ``processed_dir`` archived before ``older_than``; return how many went.
+
+        The ``[retention].processed_archive_days`` sweep (owner ruling A2 of 2026-10-08, BACKLOG
+        #1188), run by the retention pass. Off the event loop, and under this connection's alternate
+        credential when one is set, through :meth:`_run_fs`. See :meth:`_prune_processed`."""
+        return await self._run_fs(self._prune_processed, older_than, protected, deadline_hit)
+
+    def _prune_processed(
+        self, older_than: float, protected: frozenset[Path], deadline_hit: Callable[[], bool]
+    ) -> int:
+        """Blocking half of :meth:`prune_processed_archive`.
+
+        What it deletes, and what it never does:
+
+        * Only REGULAR files directly in ``processed_dir``: one level, since every archive move names
+          its copy by the bare file name. A subdirectory, a link and a junction are left alone, and
+          the removal itself never follows a link (POSIX unlinks the name relative to the opened
+          directory; Windows removes a link as itself).
+        * Keyed on mtime, which :meth:`_move` sets at archive time. File content is never read, and
+          no file name is logged: a drop's name can carry an identifier.
+        * Nothing at all when ``processed_dir`` is, or holds, this connection's watch directory or
+          ``.error``, or any directory in ``protected``. A ``processed_subdir`` of ``"."`` or ``".."``
+          would otherwise age out undelivered drops, and ``.error`` deletion is unruled (#3335).
+        * The directory is opened as an archive move opens it (:func:`_open_dest`), so below the
+          watch root a link or junction put where ``.processed`` was is refused, not swept through.
+
+        Re-reads ``deadline_hit`` before each file, so a large directory releases the pass between
+        files. Never raises for a filesystem fault: what it cannot read or remove stays for the next
+        pass."""
+        guarded = protected | {self.directory, self.error_dir}
+        if _archive_overlaps(self.processed_dir, guarded):
+            if not self._prune_refusal_logged:
+                self._prune_refusal_logged = True
+                logger.warning(
+                    "file source %s: the [retention].processed_archive_days sweep skips this "
+                    "connection, because its archive directory is, or contains, a File inbound's "
+                    "watch or error directory; set processed_subdir to a directory of its own",
+                    self._label,
+                )
+            return 0
+        try:
+            dest = _open_dest(self.processed_dir, self.directory, self._root_real)
+        except FileNotFoundError:
+            return 0  # nothing archived yet, or a leave-mode source that never made one
+        except OSError as exc:
+            logger.warning(
+                "file source %s: the [retention].processed_archive_days sweep could not open the "
+                "archive directory %s (%s); nothing was deleted this pass",
+                self._label,
+                self.processed_dir.name,
+                _describe_os_error(exc),
+            )
+            return 0
+        with dest:
+            return _prune_entries(dest, older_than, deadline_hit)
+
+
+def _archive_overlaps(archive: Path, protected: frozenset[Path]) -> bool:
+    """Whether ``archive`` is, or holds, any path in ``protected``, compared with links resolved and
+    case folded where the platform folds it. Blocking (``realpath``)."""
+    mine = os.path.normcase(os.path.realpath(archive))
+    for other in protected:
+        theirs = os.path.normcase(os.path.realpath(other))
+        try:
+            if os.path.commonpath([mine, theirs]) == mine:
+                return True
+        except ValueError:
+            continue  # another Windows drive, so neither holds the other
+    return False
+
+
+def _prune_entries(dest: _Dest, older_than: float, deadline_hit: Callable[[], bool]) -> int:
+    """Remove each regular file directly in ``dest`` whose mtime is before ``older_than``."""
+    deleted = 0
+    try:
+        listing = os.scandir(dest.fd if dest.fd is not None else dest.path)
+    except OSError as exc:
+        logger.warning(
+            "the [retention].processed_archive_days sweep could not list %s (%s)",
+            dest.path.name,
+            _describe_os_error(exc),
+        )
+        return 0
+    with listing:
+        for entry in listing:
+            if deadline_hit():
+                break
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if entry.stat(follow_symlinks=False).st_mtime >= older_than:
+                    continue
+                if dest.fd is not None:
+                    os.unlink(entry.name, dir_fd=dest.fd)
+                else:
+                    os.unlink(entry.path)
+            except OSError:
+                continue  # locked, vanished or refused: it stays, and the next pass tries again
+            deleted += 1
+    return deleted
 
 
 # --- helpers -----------------------------------------------------------------
@@ -2636,6 +2781,45 @@ def _rename_by_handle(fd: int, target: Path) -> None:
         raise _win_error()
 
 
+#: ``FILE_BASIC_INFO``'s class id, and the access ``ReOpenFile`` asks for to write it.
+_FILE_BASIC_INFO = 0
+_FILE_WRITE_ATTRIBUTES = 0x0100
+#: 100-nanosecond intervals between 1601-01-01 (the FILETIME epoch) and 1970-01-01.
+_FILETIME_EPOCH_OFFSET = 116_444_736_000_000_000
+
+
+class _BasicInfo(ctypes.Structure):
+    """``FILE_BASIC_INFO``. A zero time leaves that time as it is."""
+
+    _fields_ = (
+        ("creation_time", ctypes.c_int64),
+        ("last_access_time", ctypes.c_int64),
+        ("last_write_time", ctypes.c_int64),
+        ("change_time", ctypes.c_int64),
+        ("file_attributes", ctypes.c_uint32),
+    )
+
+
+def _win_stamp_write_time(fd: int, when_ns: int) -> None:
+    """Windows: set the last-write time of the file open on ``fd`` to ``when_ns`` (epoch ns).
+
+    The checked handle was opened for read and delete only, so it is reopened with
+    ``FILE_WRITE_ATTRIBUTES`` by ``ReOpenFile``, which names no path: the time lands on exactly the
+    file checked (BACKLOG #1188). Only the last-write time moves; zeros keep the others."""
+    k32 = _kernel32()
+    handle = k32.ReOpenFile(_os_handle(fd), _FILE_WRITE_ATTRIBUTES, _SHARE_ALL, 0)
+    if handle is None or handle == _INVALID_HANDLE:
+        raise _win_error()
+    try:
+        info = _BasicInfo(0, 0, when_ns // 100 + _FILETIME_EPOCH_OFFSET, 0, 0)
+        if not k32.SetFileInformationByHandle(
+            handle, _FILE_BASIC_INFO, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            raise _win_error()
+    finally:
+        k32.CloseHandle(handle)
+
+
 def _delete_by_handle(fd: int) -> None:
     """Windows: delete the file open on ``fd``. POSIX semantics first, so the name goes at once even
     while another process holds the file open; the classic disposition where the volume has no such
@@ -2706,6 +2890,8 @@ def _kernel32() -> Any:
     k32.CreateFileW.restype = wintypes.HANDLE
     k32.CloseHandle.argtypes = (wintypes.HANDLE,)
     k32.CloseHandle.restype = wintypes.BOOL
+    k32.ReOpenFile.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD)
+    k32.ReOpenFile.restype = wintypes.HANDLE
     for info_call in (k32.GetFileInformationByHandleEx, k32.SetFileInformationByHandle):
         info_call.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
         info_call.restype = wintypes.BOOL

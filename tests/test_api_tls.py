@@ -1784,6 +1784,7 @@ def test_serve_loopback_emits_no_new_stderr(
         "security.delete_message_bodies_after_days = 30\n"
         "retention.dead_letter_days = 30\n"
         "retention.reference_snapshot_days = 30\n"
+        "retention.processed_archive_days = 30\n"
         # The two PL-2 tiers the engine deliberately does NOT default, because each keys on a
         # timestamp that only moves on a write, so a silent default would delete data still in use.
         # They warn when unset, which on this test's own terms is a line on a stream it asserts is
