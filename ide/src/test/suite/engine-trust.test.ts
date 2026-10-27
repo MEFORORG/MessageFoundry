@@ -305,7 +305,7 @@ suite("a trust failure is not an absent engine (BACKLOG #1695)", () => {
     const text = trustRemedy(CAFILE_REFUSED_CODE, url, "caFile pki/ca.pem is not an absolute path") ?? "";
     assert.match(text, /\(caFile pki\/ca\.pem is not an absolute path\)/);
     assert.match(text, /never verified against the default CAs/);
-    assert.match(text, /Correct the caFile, or remove it/);
+    assert.match(text, /Correct the caFile .*, or remove it/);
     assert.ok(!/exists/.test(text), `sends the user to look for a file: ${text}`);
     // With no reason (the status bar has only the code), it still names the setting and the fix.
     const bare = describeNetworkCode(CAFILE_REFUSED_CODE, url);

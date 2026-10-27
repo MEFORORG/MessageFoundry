@@ -218,9 +218,10 @@ export const CAFILE_UNREAD_CODE = "MF_CAFILE_UNREAD";
 
 /**
  * Our own code for a request refused BEFORE it was sent because an https entry's `caFile` CLAIMS its
- * `host:port` but {@link trustPinsFor} refused the value (not a string, not a full path, a second file
- * for a pinned host). The user meant to pin that host, so it fails closed: it is never verified against
- * the default roots, and no file is read for it, since there is no file to read. Kept apart from
+ * `host:port`, {@link trustPinsFor} refused the value (at least: not a string, not a full path), and no
+ * accepted pin names that host ({@link hostPinsOf}). The user meant to pin that host, so it fails
+ * closed: it is never verified against the default roots, and no file is read for it until the value
+ * is corrected, since there is no file to read. Kept apart from
  * {@link CAFILE_UNREAD_CODE} because the remedy differs: that one is a file to make readable, this one
  * is a setting to correct.
  */
@@ -275,8 +276,9 @@ export function trustRemedy(
     return (
       `not sent to ${url}: its caFile in \`messagefoundry.environments\` was refused ` +
       `(${reason ?? "the MessageFoundry Engine log says why"}), and an engine whose https entry sets ` +
-      `a caFile is never verified against the default CAs. Correct the caFile, or remove it to put ` +
-      `this engine back on the default CAs.`
+      `a caFile is never verified against the default CAs. Correct the caFile (an engine shard ` +
+      `without its own inherits its environment's), or remove it to put this engine back on the ` +
+      `default CAs.`
     );
   }
   const head = `cannot verify the TLS certificate ${url} presented (${code}).`;

@@ -124,6 +124,9 @@ const registered = new Map<string, Registered>();
  */
 let claimedKeys: HostPins = new Map();
 
+/** What {@link publishPinnedHosts} last told engineClient, as one comparable string. */
+let lastPublished = "[]";
+
 /** When the last failure-started full refresh began, on the MONOTONIC clock (`performance.now`), so
  *  a wall clock stepped backward cannot hold the limit shut. For {@link FAILURE_REFRESH_MIN_MS}. */
 let lastFailureRefresh = Number.NEGATIVE_INFINITY;
@@ -401,19 +404,26 @@ function configuredPins(): HostPins {
  * a file the setting named before; anything at all when only a refused value claims it) is dropped
  * here too, in both stores: the claim wins from the moment it is set, and a refresh would not keep
  * such an anchor for that host anyway.
+ *
+ * Returns true when that changed what a request may be sent with: a claim was added, removed or
+ * changed, or an anchor was dropped. The settings listener re-probes on it.
  */
 function publishPinnedHosts(hosts: HostPins): boolean {
-  let dropped = false;
+  // A claim added or removed changes whether requests are sent even when no anchor moves (a host only
+  // a refused value claims never has one), so it counts as a change too.
+  const published = JSON.stringify([...hosts].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+  let changed = published !== lastPublished;
+  lastPublished = published;
   for (const key of hosts.keys()) {
     const live = registered.get(key);
     if (live !== undefined && !fromPinFile(live, pinnedFile(hosts, key))) {
       registered.delete(key);
       setEngineTrustAnchor(live.url, undefined);
-      dropped = true;
+      changed = true;
     }
   }
   setPinnedEngineHosts(hosts);
-  return dropped;
+  return changed;
 }
 
 /**
@@ -649,9 +659,10 @@ async function readAnchorPem(file: string): Promise<PemRead> {
   // An EMPTY file is not `notACertificate`: a file rewritten in place is empty between the truncate
   // and the write, so an empty read says nothing about what the file now holds.
   if (!pem.includes(PEM_MARKER)) {
-    // trim(): a rewrite can also leave only a BOM or a line break for a moment. trim removes both.
-    // A strict prefix of the marker is the same moment a few bytes later, so it proves nothing either.
-    const seen = pem.trim();
+    // trim(): a rewrite can also leave only a BOM or a line break for a moment. trim removes both;
+    // the leading U+FFFD is part of a BOM whose three bytes had not all landed. A strict prefix of the
+    // marker is the same moment a few bytes later, so it proves nothing either.
+    const seen = pem.replace(/^\uFFFD+/, "").trim();
     return {
       problem: `the engine certificate at ${file} is not PEM (no BEGIN CERTIFICATE block)`,
       notACertificate: seen.length > 0 && !PEM_MARKER.startsWith(seen),
@@ -933,6 +944,7 @@ export function forgetEngineTrust(): void {
   setPinnedEngineHosts([]);
   registered.clear();
   claimedKeys = new Map();
+  lastPublished = "[]";
   lastFailureRefresh = Number.NEGATIVE_INFINITY;
   lateFailure = undefined;
   inflightReads.clear();
@@ -1020,8 +1032,8 @@ export function registerEngineTrust(context: vscode.ExtensionContext): void {
       ) {
         // Now, not when the queued refresh starts. An anchor dropped here is gone before that refresh
         // takes its own before-and-after reading, so it would not count as a change there.
-        const dropped = publishPinnedHosts(configuredPins());
-        void refreshThenRecheck(false, dropped);
+        const changed = publishPinnedHosts(configuredPins());
+        void refreshThenRecheck(false, changed);
       }
     }),
   );

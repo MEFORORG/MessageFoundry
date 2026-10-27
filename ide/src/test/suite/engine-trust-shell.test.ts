@@ -1484,12 +1484,21 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     );
   });
 
-  test("a caFile caught holding only a BOM or a line break keeps its anchor, like an empty one", async () => {
+  test("a caFile caught holding only a BOM, a line break or the start of the marker keeps its anchor", async () => {
     const caFile = plantCert(path.join("pki", "prod-ca.pem"));
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
     await trust.refreshEngineTrust();
-    // The last two: a rewrite caught a few bytes in, before the marker is whole.
-    for (const partial of [String.fromCharCode(0xfeff), "\r\n", "-", "\r\n-----BEGIN CERTIF"]) {
+    // Then: a BOM caught after one or two of its three bytes (decoded as U+FFFD), and a rewrite caught
+    // a few bytes in, before the marker is whole.
+    const partials: (string | Buffer)[] = [
+      String.fromCharCode(0xfeff),
+      "\r\n",
+      Buffer.from([0xef]),
+      Buffer.from([0xef, 0xbb]),
+      "-",
+      "\r\n-----BEGIN CERTIF",
+    ];
+    for (const partial of partials) {
       fs.writeFileSync(caFile, partial);
       await trust.refreshEngineTrust();
       assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM, JSON.stringify(partial));
@@ -1705,6 +1714,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     stubInventory = plantedEngine();
     const subscriptions: { dispose(): unknown }[] = [];
     held.push(() => subscriptions.forEach((d) => d.dispose()));
+    configListener = undefined;
     trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
     await settle();
     const listener = configListener as ConfigListener | undefined;
@@ -1716,6 +1726,39 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
     assert.strictEqual(engineClient.pinRefusal(new URL(LOOPBACK))?.code, CAFILE_REFUSED_CODE);
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+  });
+
+  test("a refused caFile added or removed on an unanchored host re-probes the status bar", async () => {
+    // No anchor moves (a host only a refused value claims never has one), yet whether its requests
+    // are sent changed both times, so the verdict on screen is stale both times.
+    stubConfig.environments = [{ name: "PROD", url: REMOTE }];
+    const subscriptions: { dispose(): unknown }[] = [];
+    held.push(() => subscriptions.forEach((d) => d.dispose()));
+    configListener = undefined;
+    trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
+    await settle();
+    const listener = configListener as ConfigListener | undefined;
+    assert.ok(listener !== undefined, "no settings listener was subscribed");
+    let rechecks = 0;
+    const realExecute = vscodeStub.commands.executeCommand;
+    vscodeStub.commands.executeCommand = () => {
+      rechecks++;
+      return Promise.resolve(undefined);
+    };
+    held.push(() => (vscodeStub.commands.executeCommand = realExecute));
+    const change = async (environments: unknown[]): Promise<number> => {
+      const before = rechecks;
+      stubConfig.environments = environments;
+      listener({ affectsConfiguration: (s) => s === "messagefoundry.environments" });
+      await settle();
+      await ticks();
+      return rechecks - before;
+    };
+
+    assert.ok((await change([{ name: "PROD", url: REMOTE, caFile: "pki/ca.pem" }])) > 0, "added");
+    assert.ok((await change([{ name: "PROD", url: REMOTE }])) > 0, "removed");
+    // The control: a settings change that moves nothing does not re-probe.
+    assert.strictEqual(await change([{ name: "PROD", url: REMOTE }]), 0, "nothing moved");
   });
 
   /** A file handle that serves `text` once, standing in for an open that finished long ago. Hoisted,

@@ -258,17 +258,21 @@ set `caFile` on its `messagefoundry.environments` entry (or on one engine shard)
   setting names it, before any file is read. A request to that `host:port` is sent only with a
   certificate read from an accepted `caFile`; otherwise it is refused before it is sent, with an
   error naming the `caFile` in `messagefoundry.environments`. To fix it, correct the `caFile` or
-  remove it; removing it is the only way to put the host back on the default roots.
+  remove it. An empty `caFile` (`""`) or `null` counts as no `caFile`, and so does any entry the
+  extension does not read at all (one without a string `name` and `url`), so such an entry pins
+  nothing.
   - **Accepted, not read yet.** While no certificate from the file is held, because it has not been
     read yet or holds no PEM certificate, the refusal tries to read the file again, waiting up to two
     seconds, and if that read succeeds the request is sent once with it. A file slower than that is
     left to a background pass, at most once a minute, with the longer wait a pass allows (see *Every
     wait is bounded*). A certificate already read from the file stays in use when a later read
     fails, as the next sections say.
-  - **Refused.** The error names why, and nothing is read or retried, because there is no file to
-    read. At least these are refused: a value that is not a string, and a path that is not a full
-    path. A second, different `caFile` for a `host:port` an earlier entry pins is refused too, but
-    there the earlier pin stays in force and anchors the host.
+  - **Refused.** The request's error, and the log, say why. Nothing is read while the value stays
+    refused, because there is no file to read; once you correct it, the next request reads the new
+    file and is sent with it. At least these are refused: a value that is not a string, and a path
+    that is not a full path. An engine shard without its own `caFile` inherits a refused one from its
+    environment. A second, different `caFile` for a `host:port` an earlier entry pins is refused too,
+    but there the earlier pin stays in force and anchors the host.
 - The exception is a `caFile` on an `http://` entry, which has no certificate to pin. It is refused
   and claims nothing, so an https engine on the same `host:port` is treated as if it were absent.
 - The pin covers the `host:port` exactly as the entry spells it: the same server reached under

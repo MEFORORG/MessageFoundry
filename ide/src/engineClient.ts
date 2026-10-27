@@ -267,12 +267,12 @@ export function pinRefusal(url: URL): NetworkError | undefined {
     return undefined;
   }
   const key = engineHostKey(url.href);
-  if (key === undefined || !pinnedHosts.has(key) || trustAnchors.has(key)) {
+  const host = key === undefined ? undefined : pinnedHosts.get(key);
+  if (key === undefined || host === undefined || trustAnchors.has(key)) {
     return undefined;
   }
-  const host = pinnedHosts.get(key);
   const [code, reason] =
-    host?.kind === "refused" ? [CAFILE_REFUSED_CODE, host.reason] : [CAFILE_UNREAD_CODE, undefined];
+    host.kind === "refused" ? [CAFILE_REFUSED_CODE, host.reason] : [CAFILE_UNREAD_CODE, undefined];
   return new NetworkError(trustRemedy(code, url.origin, reason) ?? "", code);
 }
 
