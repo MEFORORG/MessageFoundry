@@ -199,10 +199,13 @@ def _token_setting() -> str | None:
     else the environment (vault BACKLOG #2595). A directory that cannot be used raises
     :class:`SecretProviderError`, so the subsystem fails closed as it does for any other bad Vault
     setting."""
+    # The refusal is raised outside the handler and carries only the message, so nothing the
+    # directory read held rides along on its chain (BACKLOG #2307 states the rule).
     try:
         return secret_setting(_ENV_TOKEN)
     except SecretsDirectoryError as exc:
-        raise SecretProviderError(str(exc)) from exc
+        refusal = str(exc)
+    raise SecretProviderError(refusal)
 
 
 class VaultSecretProvider:

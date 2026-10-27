@@ -117,8 +117,13 @@ def _name_key(name: str) -> str:
 
 
 #: An ``env()`` value's file name: the prefix, then letters, digits and underscores, as a variable
-#: name is spelled. Anything else is refused, so a name printed in a refusal is plain text.
-_VALUE_NAME = re.compile(re.escape(VALUE_PREFIX) + r"[A-Za-z0-9_]+")
+#: name is spelled. Anything else is refused, so a name printed in a refusal is plain text. Spelled
+#: as a literal, with :data:`VALUE_PREFIX` in it, so the static ReDoS scanner can read it.
+_VALUE_NAME = re.compile(r"MEFOR_VALUE_[A-Za-z0-9_]+")
+
+#: Every name the directory may hold is ASCII letters, digits and underscores. A name is held to
+#: that BEFORE it is case-folded, because ``str.upper`` maps some non-ASCII letters onto ASCII ones.
+_FILE_NAME = re.compile(r"[A-Za-z0-9_]+")
 
 
 def _is_value_name(key: str) -> bool:
@@ -142,18 +147,45 @@ def _check(path: Path, what: str, *, directory: bool = False) -> None:
         raise SecretsDirectoryError(f"{what} is not restricted: {problem}. {_REMEDY}")
 
 
-#: What a refusal may print of a file name that names no setting: a variable-shaped name with the
-#: engine's prefix. Anything else may be a value someone typed as a name, so it is cited by position.
-_PRINTABLE_ENTRY = re.compile(r"MEFOR_[A-Za-z0-9_]*")
-
-
 def _cite(entry: str, position: int, total: int) -> str:
-    """``entry`` as a refusal may print it: never the part after an ``=``, which in a name written
-    like an environment line is the value, and only a name shaped like one of the engine's
-    variables. Otherwise its position in name order, which still lets an operator find it."""
-    name = entry.split("=", 1)[0]
-    shown = name if _PRINTABLE_ENTRY.fullmatch(name) else f"entry {position} of {total}"
-    return f"{shown} (with what follows its '=' left out)" if "=" in entry else shown
+    """``entry`` as a refusal may print it. A name that names no setting may hold a value typed in
+    the wrong place, with or without an ``=``, so it is cited by its position in name order and
+    never spelled. Where the part before an ``=`` is a setting's exact name, that name is given too,
+    since it is no secret and says what the file was meant to be."""
+    shown = f"entry {position} of {total} in name order"
+    before, equals, _ = entry.partition("=")
+    if equals and _name_key(before) in _ALLOWED_KEYS | _STORE_KEY_KEYS:
+        return f"{shown} ({before} followed by '=' and more, which is left out)"
+    return shown
+
+
+def _not_a_regular_file(path: Path) -> str | None:
+    """Why ``path`` is not a regular file to read, or ``None`` when it is."""
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return "was removed after the directory was listed; start again"
+    except OSError as exc:
+        return f"could not be examined ({exc.strerror or type(exc).__name__})"
+    return None if stat.S_ISREG(mode) else "is not a regular file"
+
+
+def _read_capped(path: Path) -> bytes | str:
+    """Up to one byte past :data:`MAX_FILE_BYTES` of ``path``, or why it could not be read."""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(MAX_FILE_BYTES + 1)
+    except OSError as exc:
+        return exc.strerror or type(exc).__name__
+
+
+def _utf8(raw: bytes) -> str | None:
+    """``raw`` as text, or ``None`` when it is not UTF-8. utf-8-sig drops the byte-order mark an
+    editor such as Notepad may write first. The decode error, which holds the bytes, ends here."""
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,24 +224,23 @@ class SecretsDirectory:
     def _read_file(self, on_disk: str) -> str:
         path = self.path / on_disk
         what = f"the secrets directory's file {on_disk}"
+        # Each refusal below is raised outside any exception handler, so it carries no __context__.
+        # An OSError names only the file; a UnicodeDecodeError keeps the file's bytes on .object,
+        # which a refusal raised inside its handler would carry along (BACKLOG #2307 states the rule).
+        # Before the access check, so a file removed since the listing is reported as that, not as
+        # an access problem. A FIFO or a device named for a setting would block the read for good.
+        problem = _not_a_regular_file(path)
+        if problem is not None:
+            raise SecretsDirectoryError(f"{what} {problem}")
         _check(path, what)
-        try:
-            # A FIFO or a device named for a setting would block the open or read without end.
-            if not stat.S_ISREG(path.stat().st_mode):
-                raise SecretsDirectoryError(f"{what} is not a regular file")
-            with path.open("rb") as handle:
-                raw = handle.read(MAX_FILE_BYTES + 1)
-        except OSError as exc:
-            raise SecretsDirectoryError(
-                f"{what} could not be read ({exc.strerror or type(exc).__name__})"
-            ) from exc
+        raw = _read_capped(path)
+        if isinstance(raw, str):
+            raise SecretsDirectoryError(f"{what} could not be read ({raw})")
         if len(raw) > MAX_FILE_BYTES:
             raise SecretsDirectoryError(f"{what} is larger than {MAX_FILE_BYTES} bytes")
-        try:
-            # utf-8-sig drops the byte-order mark an editor such as Notepad may write first.
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            raise SecretsDirectoryError(f"{what} is not UTF-8 text") from None
+        text = _utf8(raw)
+        if text is None:
+            raise SecretsDirectoryError(f"{what} is not UTF-8 text")
         # A file written by an editor or `echo` ends with a line break nobody meant as part of the
         # value. Only line breaks are dropped: a space may be part of a password.
         text = text.rstrip("\r\n")
@@ -256,6 +287,9 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
     for position, entry in enumerate(entries, start=1):
         if entry.startswith("."):
             continue  # a hidden file, such as an editor's swap file, names no setting
+        if _FILE_NAME.fullmatch(entry) is None:
+            refused.append(_cite(entry, position, len(entries)))
+            continue
         key = _name_key(entry)
         if key in _STORE_KEY_KEYS:
             raise SecretsDirectoryError(
@@ -302,7 +336,10 @@ def secret_settings(
     if unknown:
         raise ValueError(f"{', '.join(unknown)} is not a secret-class setting")
     environ = os.environ if environ is None else environ
-    directory = open_secrets_directory(environ)
+    # A store-key name is never read from the directory, so a read of those alone does not open it
+    # and cannot fail on it.
+    reads_directory = any(name not in KEY_CLASS_NAMES for name in wanted)
+    directory = open_secrets_directory(environ) if reads_directory else None
     found: dict[str, str | None] = {}
     for name in wanted:
         value = None

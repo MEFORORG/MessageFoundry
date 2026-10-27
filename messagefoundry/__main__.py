@@ -10225,10 +10225,16 @@ def _connection(args: argparse.Namespace) -> int:
             if env_name is not None
             else {}
         )
-    except SecretsDirectoryError as exc:
-        # Vault BACKLOG #2595: a MEFOR_VALUE_* file the secrets directory cannot supply. Its message
-        # names the file and never a value, so it is printed as the refusal it is.
-        return _emit_error(str(exc), as_json=args.json)
+    except (ValueError, RecursionError, OSError) as exc:
+        # Vault BACKLOG #2595: a MEFOR_VALUE_* file the secrets directory cannot supply names the
+        # file and never a value, so it is printed as the refusal it is. Anything else from the read
+        # is a malformed or unreadable value file, reported the way serve's reader reports it,
+        # through safe_exc, rather than as a traceback the IDE bridge sees as no output.
+        if isinstance(exc, SecretsDirectoryError):
+            return _emit_error(str(exc), as_json=args.json)
+        from messagefoundry.redaction import safe_exc
+
+        return _emit_error(f"could not read environment values: {safe_exc(exc)}", as_json=args.json)
 
     def validate(config_dir: Path) -> None:
         # allow_empty: this is an AUTHORING surface, and removing the last connection is a legitimate

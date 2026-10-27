@@ -2307,10 +2307,12 @@ secret. Each file in that directory holds one setting and is named exactly as it
   are read: at a `serve` start and on each reload, by `messagefoundry check`, and by
   `messagefoundry connection upsert` and `remove`, at least. A command that loads the settings and
   not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
-  named for no setting is cited without anything after an `=` in its name, or by its position.
+  named for no setting is cited by its position, never spelled, since its name may be a value.
 - **The access check is a list of known broad groups.** It does not refuse one named account that
-  can write the directory, the way the config-directory checks do, so restrict the directory as
-  below rather than relying on the check.
+  can write the directory, the way the config-directory checks do, and it does not read the
+  folders above the directory: a broad group that can write one of those could replace the
+  directory. Restrict the directory, and the folders above it, as below rather than relying on
+  the check.
 - **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
   [`[store].encryption_key_file`](#store).

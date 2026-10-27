@@ -434,10 +434,13 @@ def store_token_setting() -> str | None:
     the environment (vault BACKLOG #2595). A directory that cannot be used raises
     :class:`KeyProviderError`, so the store refuses to open as it does for any other bad Vault
     setting. Shared with ``crypto_transit``, which reads the same token."""
+    # The refusal is raised outside the handler and carries only the message, so nothing the
+    # directory read held rides along on its chain (BACKLOG #2307 states the rule).
     try:
         return secret_setting(_ENV_TOKEN)
     except SecretsDirectoryError as exc:
-        raise KeyProviderError(str(exc)) from exc
+        refusal = str(exc)
+    raise KeyProviderError(refusal)
 
 
 def _kek_name() -> str | None:

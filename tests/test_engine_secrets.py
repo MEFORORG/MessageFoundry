@@ -162,7 +162,9 @@ def test_an_unset_or_blank_directory_variable_reads_no_directory() -> None:
 def test_a_file_named_for_no_setting_is_refused(tmp_path: Path) -> None:
     directory = _directory(tmp_path)
     _put(directory, "MEFOR_STORE_PASSWROD", _FROM_FILE)
-    with pytest.raises(SecretsDirectoryError, match="MEFOR_STORE_PASSWROD, which names no setting"):
+    with pytest.raises(
+        SecretsDirectoryError, match="entry 1 of 1 in name order, which names no setting"
+    ):
         open_secrets_directory(_env(directory))
     (directory / "MEFOR_STORE_PASSWROD").unlink()
     _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)  # the control: the right spelling opens
@@ -406,10 +408,11 @@ _CANARY = "synthetic-canary-9f3c"
 @pytest.mark.parametrize(
     ("before", "shown"),
     [
-        ("MEFOR_STORE_PASSWORD" + "=", "MEFOR_STORE_PASSWORD (with what follows"),
-        ("", "entry 1 of 1"),
+        ("MEFOR_STORE_PASSWORD" + "=", "entry 1 of 1 in name order (MEFOR_STORE_PASSWORD followed"),
+        ("", "entry 1 of 1 in name order"),
+        ("MEFOR_STORE_PASSWORD_", "entry 1 of 1 in name order"),
     ],
-    ids=["env-line", "bare-value"],
+    ids=["env-line", "bare-value", "value-run-on"],
 )
 def test_a_misnamed_file_is_cited_without_any_value_in_its_name(
     tmp_path: Path, before: str, shown: str
@@ -541,6 +544,79 @@ def test_a_connection_edit_reports_a_directory_refusal_and_no_traceback(
     assert "MEFOR_VALUE_EPIC_PASSWORD is not restricted" in out.out + out.err
     assert "Traceback" not in out.out + out.err
     assert _FROM_FILE not in out.out + out.err
+
+
+def test_a_connection_edit_reports_a_malformed_value_file_and_no_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same arm as the directory refusal, for the value file it reads beside it."""
+    import json
+
+    from messagefoundry.__main__ import main
+    from tests.test_connections_cli import LOGIC
+
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "logic.py").write_text(LOGIC, encoding="utf-8")
+    (tmp_path / "environments").mkdir()
+    (tmp_path / "environments" / "dev.toml").write_text("a = [\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(SECRETS_DIRECTORY_VARIABLE, raising=False)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    svc = config / "svc.toml"
+    svc.write_text("", encoding="utf-8")
+    obj = {"direction": "inbound", "name": "IB", "transport": "mllp", "router": "r"}
+    args = ["connection", "upsert", "--config", str(config), "--service-config", str(svc)]
+    rc = main([*args, "--data", json.dumps({**obj, "settings": {"port": 2600}}), "--json"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert "could not read environment values" in out.out + out.err
+    assert "Traceback" not in out.out + out.err
+
+
+def test_a_name_that_is_not_ascii_is_refused_before_it_is_case_folded(tmp_path: Path) -> None:
+    """``str.upper`` maps some non-ASCII letters onto ASCII ones, so an unchecked fold would read a
+    long-s spelling as the store password on Windows."""
+    directory = _directory(tmp_path)
+    _put(directory, "MEFOR_\u017fTORE_PASSWORD", _FROM_FILE)
+    with pytest.raises(SecretsDirectoryError, match="entry 1 of 1 in name order"):
+        open_secrets_directory(_env(directory))
+
+
+def test_a_not_utf8_refusal_carries_no_chain_that_holds_the_bytes(tmp_path: Path) -> None:
+    directory = _directory(tmp_path)
+    _put(directory, "MEFOR_STORE_PASSWORD", b"p\xe4ss")
+    with pytest.raises(SecretsDirectoryError, match="is not UTF-8") as caught:
+        secret_setting("MEFOR_STORE_PASSWORD", environ=_env(directory))
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_a_vault_token_refusal_carries_no_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config.secretprovider_vault import secrets_vault_token
+    from messagefoundry.store.keyprovider_vault import store_token_setting
+
+    directory = _directory_in_process(tmp_path, monkeypatch)
+    _put(directory, "MEFOR_STORE_VAULT_TOKEN", b"t\xe4k")
+    _put(directory, "MEFOR_SECRETS_VAULT_TOKEN", b"t\xe4k")
+    with pytest.raises(KeyProviderError, match="is not UTF-8") as store_refusal:
+        store_token_setting()
+    with pytest.raises(SecretProviderError, match="is not UTF-8") as connector_refusal:
+        secrets_vault_token()
+    for caught in (store_refusal, connector_refusal):
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+
+
+def test_a_store_key_read_does_not_open_the_directory(tmp_path: Path) -> None:
+    directory = _directory(tmp_path)
+    _put(directory, "notes", _FROM_FILE)  # a directory every other read refuses
+    environ = _env(directory, MEFOR_STORE_ENCRYPTION_KEY=_FROM_ENV)
+    assert secret_setting("MEFOR_STORE_ENCRYPTION_KEY", environ=environ) == _FROM_ENV
+    with pytest.raises(SecretsDirectoryError):  # the control
+        secret_setting("MEFOR_STORE_PASSWORD", environ=environ)
 
 
 # --- no moved module reads a secret-class variable straight from the environment --------------------

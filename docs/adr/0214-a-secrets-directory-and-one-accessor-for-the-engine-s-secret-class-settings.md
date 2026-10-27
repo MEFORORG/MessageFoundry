@@ -52,14 +52,15 @@ nothing that starts today.
 3. **The directory.** `MEFOR_SECRETS_DIRECTORY` names it by absolute path. Unset, nothing is read.
    Each file is named exactly as its variable. The reader refuses, at every enforcement setting:
    a relative path; a directory, or a file, that a known broad group can read or change, judged by
-   `config.key_file_access.key_file_problem`, the check key files get; a link on Windows; a file
+   `restricted_file.broad_access_problem`, the check key files get; a link on Windows; a file
    that is not a regular file; a file named for no setting, so a typo does not fall back to the
    environment unseen, and two `env()` files whose names differ only in case; an empty file, one
    that is not UTF-8, or one over 64 KiB. A file whose name starts with `.`, such as an editor's
    swap file, is ignored. A refusal names the file and never the value; a file named for no
-   setting is cited without anything after an `=` in its name, or by its position when its name is
-   not shaped like one of the engine's variables, since such a name may be a value typed in the
-   wrong place. The settings load reads
+   setting is cited by its position in name order and never spelled, since its name may be a value
+   typed in the wrong place; where the part before an `=` is a setting's exact name, that name is
+   given too. A name that is not ASCII letters, digits and underscores is refused before it is
+   case-folded. The settings load reads
    every file the directory holds for a setting, so a file nothing else would read, such as a
    Vault token on a site with no Vault, is still refused at start.
 4. **The directory's own access list is read.** A group that can add a file to the directory could
@@ -125,7 +126,9 @@ point operators to.
 not been shown reachable by the intended accounts alone. In particular it does not apply the
 config-source owner policy the settings file and the `env()` value file get: a directory or file
 writable by one named non-administrator account, or owned on POSIX by another account the engine
-can read as root, passes. A file in the directory also outranks the environment for every process
+can read as root, passes. Nor are the folders above the directory checked: one that a broad
+group can write lets that group replace the directory with one of its own, restricted to itself,
+which then passes. A file in the directory also outranks the environment for every process
 that names the directory, so a one-off override through a variable in such a shell does not take
 effect. The directory is opened and checked again by each reader, several times in one start. A
 file changed between its check and its read is read as changed; the directory check limits who can make that change. A plain file is in

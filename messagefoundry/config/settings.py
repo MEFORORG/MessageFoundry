@@ -10011,10 +10011,6 @@ def load_settings(
     # does not hide a mistyped variable until the next start.
     for line in _unread_env_lines(environ, data):
         _log.warning("%s", line)
-    # The secrets directory (vault BACKLOG #2595, ADR 0214), after those warnings so a directory it
-    # refuses does not hide a mistyped variable until the next start. It writes only secret values,
-    # which nothing above reads.
-    _merge(data, _secrets_directory_overrides(environ))
     _reject_relocated_keys(data)
     # After _reject_relocated_keys so a MOVED key keeps its specific "moved to [security].X" message, and
     # over `file_data` rather than `data` so it never sees a key the env overlay or the desugar wrote.
@@ -10024,6 +10020,10 @@ def load_settings(
     # typo that causes a validation error is named. Over `environ` itself, so it reports the
     # variable as the operator spelled it; `data` is read for what the settings name.
     _reject_unknown_env_keys(environ, data)
+    # The secrets directory (vault BACKLOG #2595, ADR 0214), after the unread-variable warnings and
+    # the refusals above, so a directory it refuses does not hide a mistyped variable or key
+    # until the next start. It writes only secret values, which nothing above reads.
+    _merge(data, _secrets_directory_overrides(environ))
     _desugar_security(data)
 
     if cli:
