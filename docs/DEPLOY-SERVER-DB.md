@@ -563,7 +563,10 @@ Server ODBC 18.1+ `ServerCertificate=<file>` leaf-pin), a leaf rotation **breaks
 update the pin in lockstep. On SQL Server that is a window in which every new store connection
 is refused. On PostgreSQL, pin the **CA**, not the leaf, to keep rotations
 make-before-break. The SQL Server pin is an exact match, so a CA file there matches nothing; on SQL
-Server, use the machine-store CA import (§5.2) for make-before-break rotation.
+Server, use the machine-store CA import (§5.2) for make-before-break rotation. **Never pin the
+self-signed certificate SQL Server generates when none is installed:** it is new at each service
+start, so the pin breaks at the next restart. The `ssl_root_cert` row of
+[`CONFIGURATION.md`](CONFIGURATION.md) says why.
 
 > Windows-box gate: §5.2's machine-store import + §5.3's SQL Server steps run on the deployment host
 > (LocalMachine store), not on hosted CI. Validate them on the target Windows box / the dogfood box.
