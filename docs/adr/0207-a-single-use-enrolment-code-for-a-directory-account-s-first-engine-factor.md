@@ -335,6 +335,7 @@ problems. This command is not #2711's answer.
 | `auth.enrolment_code_revoked` | an Administrator cleared one | the Administrator | the target account |
 | `auth.enrolment_code_used` | a ceremony spent one | the account that enrolled | `ceremony`: `totp` or `webauthn` |
 | `auth.enrolment_code_refused` | a binding step refused | the account whose session tried | `reason`: `not_presented` (the request carried no code), `code_refused` (a code was sent and refused: never issued, wrong, expired or already spent), or `factor_present` (the account gained a factor; prove it first) |
+| `auth.enrolment_code_spent_notice` | a ceremony spent a code an Administrator issued (Amendment A, A5) | the issuing Administrator, as the row's **recipient**: the issuer did not act | `actor_role`: `recipient`, which marks the actor column as the notice's recipient and not the account that acted; the account that spent the code; `ceremony`: `totp` or `webauthn` |
 
 **Who reads these rows.** Every audit row stays with `Permission.AUDIT_READ`, as today. All four
 actions also start `auth.`, so `GET /me/security-events` returns each to the account named as its
@@ -553,8 +554,11 @@ ADR 0197 Amendment A's wave 1. It changes a security control, so it gets its own
 
 ## To resolve on acceptance
 
-- [ ] Require the code with `[security].require_mfa` off as well. Recommended yes, for the reason in
-  Decision section 1.
+- [x] Require the code with `[security].require_mfa` off as well. **Answered yes (Amendment A,
+  2026-10-27).** Beyond the reason in Decision section 1: once owner ruling A5 removes the
+  directory re-bind, Amendment A1 makes the code the only proof at the binding step. A *no* would
+  either leave a bind on a stolen session token alone for a `require_mfa`-off site, or keep the
+  re-bind for such sites, which contradicts ruling A5: it removes the re-bind unconditionally.
 - [ ] Keep the lifetime fixed at 24 hours. The alternative is an `[auth]` setting, as
   `initial_password_expiry_hours` is for a local credential. Recommended fixed, since the code exists
   for one handover.
@@ -565,11 +569,30 @@ ADR 0197 Amendment A's wave 1. It changes a security control, so it gets its own
 
 ## Amendment A (2026-10-27) -- the re-proof once the directory re-bind goes, a re-baseline, and an enforced engine-stopped rule
 
-**Decided by the batch 447 Manager under the owner's delegation of 2026-10-27**, after an
-adversarial review that returned *accept with named amendments*. The question was how to proceed
-with this record, and the owner's answer was *"/driver"*. That is how the batch 447 Manager's brief
-records it; the verbatim question is in that Manager's own chat. This amendment changes the design
-the record proposes.
+**Decided by the batch 447 Manager under the Owner's delegation of 2026-10-27** (CLAUDE.md section
+5, "A delegated decision counts as that ruling", owner ruling 2026-10-22). The Manager asked the
+owner, in its own chat by `AskUserQuestion` on 2026-10-27 at about 13:35 UTC, this question,
+quoted verbatim:
+
+> "ADR 0207 review result: ACCEPT WITH NAMED AMENDMENTS (reviewer confidence medium-high). The core
+> design held up: a 128-bit, single-use code bound to one account, spent atomically, issued by an
+> Administrator with step-up. The reviewer found no way to replay it, guess it, or use it on another
+> account. Four amendments: (1) say what a factorless Kerberos session must re-prove after ruling A5
+> removes the directory re-bind. If this stays open, a Builder could simply drop the gate. That is
+> the one unsafe-build gap. (2) Re-baseline to today's tree: BACKLOG #3025 and #3014 already shipped
+> parts of it, so three acceptance tests can no longer 'fail before the build'. (3) Fix the order of
+> checks against the newer _directory_vouches_for_factor lookup. (4) Enforce, rather than only
+> document, that the host command runs with the engine stopped, so the audit chain can't fork.
+> Optional: also notify the issuing Administrator when a code is used, and shorten the 24h
+> lifetime. How do you want to proceed?"
+
+The options offered were "Amend, then I accept (Recommended)", "Accept as written now" and "Not
+now". The owner answered *"/driver"*, which delegated that question to the Manager. The review the
+delegation requires is two adversarial reviews: the first, of the record as proposed, returned
+*accept with named amendments*; the second, of this amendment at `1d119a284`, returned *accept
+after named small fixes* (its fixes F1 to F4, applied below) and affirmed A4's SQLite-only refusal
+after verifying in code that all three backends serialize the audit append. Decision log id
+`d20261027T133727170-18c43f`. This amendment changes the design the record proposes.
 **It accepts nothing: the record stays Proposed until it is accepted.**
 
 Every fact below was read at engine `origin/main` `93f6438c7` on 2026-10-27, by symbol. Where this
@@ -609,17 +632,30 @@ new address is refused. That is not permanent: a fresh Windows SSO sign-in from 
 mints a session anchored there. So the check is kept, and a stolen token replayed from another
 address still cannot reach the binding step.
 
-**This rests on the code being required with `require_mfa` off.** *To resolve on acceptance* still
-lists that as open. Once the re-bind goes, the code is the only proof at the binding step in every
-posture. If the owner answers that item *no*, the re-bind must not be removed for a session with
-`require_mfa` off, or a stolen session token alone would bind a factor.
+**This rests on the code being required with `require_mfa` off**, which *To resolve on acceptance*
+now answers yes. Once the re-bind goes, the code is the only proof at the binding step in every
+posture, so with `require_mfa` off and no code a stolen session token alone would bind a factor.
 
 **Why session termination is refused rather than admitted.** The route comment on
 `revoke_my_session`, and the matching comments on the console's revoke routes, say a no-factor user
 must remain able to revoke. For this session class that no longer holds. Whoever holds the directory password alone could otherwise sign every other session of
 the account out, the real holder's included, with no proof beyond the sign-in. An Administrator can
 still end an account's sessions, and the holder can still sign out the session in hand. The build
-that removes the re-bind changes those comments.
+that removes the re-bind changes those comments, and owes two more changes with them:
+
+- **`docs/SECURITY.md`, wherever it says a no-factor user can still end its sessions.** At least
+  these passages: the gate-wrapper row for `require_reauth_only_action` ("deadlock avoidance on
+  the MFA-enrollment lanes, and on session terminate"); the step-up paragraph that says four routes
+  take the password-only variant "so a required-but-unenrolled user cannot deadlock", which names
+  `DELETE /me/sessions/{session_id}` and `DELETE /me/sessions` among them; the session-termination
+  paragraph that says a second-factor gate "would deadlock an MFA-required-but-unenrolled operator
+  out of revoking their own sessions"; and the route rows for `DELETE /me/sessions/{session_id}`,
+  `DELETE /me/sessions`, `POST /ui/account/sessions/revoke-others` and
+  `POST /ui/account/sessions/{session_id}/revoke`. Each must say that a factorless directory
+  session whose step-up is not at the identity provider is refused there.
+- **A vault re-read of the session-termination cell** of the security record, whose evidence
+  rests on a no-factor user being able to revoke. The build names that re-read in its pull request,
+  and a Manager dispatches it as record work.
 
 **What it does not change.** A local account still re-proves by its password. An `oidc` session
 still steps up at the identity provider (ADR 0142 Amendment B), with or without a factor. A
@@ -628,8 +664,11 @@ directory session on an account that holds a factor steps up with that factor, a
 **Sequencing.** The binding step demands the code whether or not the session also re-proved a
 password, so this ADR's build does not depend on the re-bind's removal. Before that removal a
 Kerberos session re-proves its password and then shows a code; after it, the code alone. Whichever
-build removes `_reauth_ad` carries the gate change in the table and AC-16. It must not remove the
-re-bind without admitting the binding steps, or a factorless directory account could never enrol.
+build removes `_reauth_ad` must cite this Amendment's A1 and AC-16, and must carry the gate change
+in the table above in the same change. It must not remove the re-bind without admitting the
+binding steps, or a factorless directory account could never enrol, and it must not admit them
+without the code check this ADR's build adds. That build's ledger row is unfiled: it is the build
+that removes the directory re-bind under owner ruling A5, and the Lander files it.
 
 **Two costs, named.**
 
@@ -719,9 +758,19 @@ build, with what the challenge does at each refusal:
 8. Pop the challenge, and verify the attestation.
 9. The discoverable check, then the duplicate check on the credential id, then **new: a read of
    whether the account already holds a passkey with this label**.
-10. **New: the spend**, one conditional write. A spend that changes no row is refused as
-    `code_refused`. The challenge is already popped, so that ceremony ends, and nothing is written.
+10. **New: the spend**, one conditional write. It clears the code's digest only where the digest
+    still matches and has not expired, the account is enabled, TOTP is still off, and the account
+    holds no passkey, the way the TOTP fold below conditions its write on TOTP still being off. So a
+    factor bound by a path that asks no code, after the step 6 re-check and before this write, is
+    not skipped over. A spend that changes no row is refused, as `factor_present` when a re-read
+    shows the account now holds a factor and as `code_refused` otherwise. The challenge is already
+    popped, so that ceremony ends, nothing is written, and the code is not spent.
 11. Write the credential, then stamp and rotate the session.
+
+**The residual after step 10, named.** A factor bound by a path that asks no code between the spend
+and the credential write in step 11 is not seen. That window holds no network round trip and no
+user wait, unlike the one between steps 6 and 10, which holds the attestation verify. The code is
+spent by then, and the second passkey binds on a code the holder did show.
 
 **The label check before the spend is new.** Today the method checks only the label's length before
 the pop. A clash with another of the account's labels shows only when `add_webauthn_credential`
@@ -816,7 +865,11 @@ the code was used, or from where. **When a code is spent, the issuing Administra
   (`_security_events_where`). Widening that query to a detail field would give up the index. The
   issuer's own feed therefore returns the notice row with no query change. **The cost:** a filter by
   actor over the audit log returns this row under the issuer, though the issuer did not act. Its
-  action name says it is a notice, and its detail names the account that did act.
+  action name says it is a notice, its detail marks the actor column as the recipient
+  (`actor_role`: `recipient`, section 7), and its detail names the account that did act. The build
+  documents that, in `docs/SECURITY.md`'s Audit section, as the one audit row whose actor is not
+  the account that acted, so an investigator filtering by actor does not read it as the issuer's
+  act.
 - Where the issuer has a `notify_email`, the engine sends it a notice that the code was spent,
   naming the account and the time and never the code. As in section 4, that notice is a courtesy:
   the security-event row is the record.
@@ -880,5 +933,7 @@ factorless directory Administrator every step-up action, the issuing route's inc
   as `factor_present`, THE SYSTEM SHALL pop the passkey challenge. In both binding steps the code
   SHALL be read after `_directory_vouches_for_factor` and the factor check that follows it. WHEN a
   TOTP confirm's enable matches no row, THE SYSTEM SHALL leave the code unspent. WHEN a passkey
-  label clashes with one the account holds, THE SYSTEM SHALL refuse before the spend.
+  label clashes with one the account holds, THE SYSTEM SHALL refuse before the spend. IF the
+  account gains TOTP or a passkey after the passkey finish's step 6 re-check and before its spend,
+  THEN THE SYSTEM SHALL refuse the spend, leave the code unspent, and write no credential row.
   → `tests/test_directory_enrolment_code.py`
