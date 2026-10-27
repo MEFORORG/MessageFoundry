@@ -62,10 +62,14 @@ from harness.load.report import EXIT_OK, EXIT_SLO_VIOLATION, SloCheck
 from harness.load.sender import ConnectionPool, Dispatcher
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context, harness_tls_material
-from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS
 from messagefoundry.proctree import ADOPT_CREATIONFLAGS, resume_into_job, terminate_job
 
 log = logging.getLogger(__name__)
+
+#: The interpreter option a node's engine starts with. Spelled as the engine's own children spell
+#: it (``messagefoundry.childenv.CHILD_INTERPRETER_FLAGS``); the interpreter accepts and ignores
+#: other spellings, and ``tests/test_harness_engine_spawn_remote_debug_off.py`` holds the two equal.
+REMOTE_DEBUG_OFF = ("-X", "disable-remote-debug")
 
 _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let the final ACKs/arrivals settle before the truly-final engine sample
@@ -243,13 +247,14 @@ class EngineNode:
         :meth:`kill` takes one node's tree and never a peer's. POSIX keeps the single-process
         behaviour it had; nothing measured leaks there yet.
 
-        The interpreter starts with the engine's child flags (vault BACKLOG #2700): remote debugging
-        off, as ruling (b) asks of every rig start, and ``-P``, so the node's working directory is
-        not on its import path. ``-P`` rather than ``-I``: a rig passes the environment it was
-        started with, and ``-I`` would silently drop a ``PYTHONPATH`` a developer relies on."""
+        The interpreter starts with remote debugging off, as ruling (b) asks of every rig start
+        (vault BACKLOG #2700). Only that option, and not the rest of ``CHILD_INTERPRETER_FLAGS``:
+        ``-P`` or ``-I`` would take the node's working directory off its import path. A rig run as
+        ``python -m harness`` imports from that directory, so the node would then import whatever
+        tree the venv's ``.pth`` names, which in a worktree can be another checkout's engine."""
         self._end_tree()
         proc = await self._exec(
-            sys.executable, *CHILD_INTERPRETER_FLAGS, "-m", "messagefoundry", "serve", *serve_args
+            sys.executable, *REMOTE_DEBUG_OFF, "-m", "messagefoundry", "serve", *serve_args
         )
         try:
             self._job = resume_into_job(proc.pid, who=f"node {self.node_id}")

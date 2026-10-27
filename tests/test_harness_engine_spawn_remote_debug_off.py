@@ -5,21 +5,22 @@
 
 ``tests/test_ci_serve_starts_remote_debug_off.py`` reads the starts a workflow step spells out. The
 rigs that start their engines from Python sit behind a step that names only ``python -m harness``,
-so it cannot see them. They all spawn through one seam, ``harness.load.failover.EngineNode._spawn``:
-the failover profile, multishard, estate, connscale and its batch box, and the ingress probe.
+so it cannot see them. At least the failover profile, multishard, shardcert, estate, connscale and
+its batch box, and the ingress probe spawn through one seam,
+``harness.load.failover.EngineNode._spawn``.
 
 Two readings. The argument list the seam hands its subprocess call, read off the real method. And a
 scan of every Python file under ``harness/`` and ``scripts/`` for an argument list that runs
-``-m messagefoundry serve`` or ``supervise``, which must carry the child flags or the option itself
-ahead of ``-m``. The scan reads literal lists, tuples and call arguments; an argument list
-assembled across statements is missed.
+``-m messagefoundry serve`` or ``supervise``, which must carry the option, or a shared flag tuple
+that holds it, among the interpreter's own options ahead of ``-m``. The scan reads literal lists,
+tuples and call arguments; an argument list assembled across statements is missed.
 """
 
 from __future__ import annotations
 
 import ast
 import asyncio
-import os
+import itertools
 from pathlib import Path
 
 import pytest
@@ -28,31 +29,42 @@ from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SUBCOMMANDS = ("serve", "supervise")
+_MODULES = ("messagefoundry", "messagefoundry.__main__")
 _OPTION = ("-X", "disable-remote-debug")
-_FLAG_NAMES = ("CHILD_INTERPRETER_FLAGS", "ISOLATED_LAUNCH_OPTIONS")
+#: Shared tuples that hold the option, spread into an argument list as ``*NAME``.
+_FLAG_NAMES = ("CHILD_INTERPRETER_FLAGS", "ISOLATED_LAUNCH_OPTIONS", "REMOTE_DEBUG_OFF")
 
 
 def _constant(node: ast.expr) -> str | None:
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
 
 
-def _sets_the_option(before: list[ast.expr]) -> bool:
-    """Whether the elements ahead of ``-m`` turn remote debugging off: the shared flags spread in,
-    or the option spelled as two literals."""
-    for at, node in enumerate(before):
-        if isinstance(node, ast.Starred):
-            name = node.value
-            attr = name.attr if isinstance(name, ast.Attribute) else getattr(name, "id", None)
-            if attr in _FLAG_NAMES:
-                return True
-        if at + 1 < len(before) and (_constant(node), _constant(before[at + 1])) == _OPTION:
+def _spread_name(node: ast.expr) -> str | None:
+    if not isinstance(node, ast.Starred):
+        return None
+    value = node.value
+    return value.attr if isinstance(value, ast.Attribute) else getattr(value, "id", None)
+
+
+def _sets_the_option(options: list[ast.expr]) -> bool:
+    """Whether the interpreter's own options, the elements between the interpreter and ``-m``,
+    turn remote debugging off. A literal word that is no option (a script, a module) or ``-c``
+    ends the interpreter's options, so an option after it is another program's."""
+    words = iter(options)
+    for node in words:
+        if _spread_name(node) in _FLAG_NAMES:
+            return True
+        word = _constant(node)
+        if word is None or word in ("-c", "-m") or not word.startswith("-"):
+            return False
+        if word == _OPTION[0] and _constant(next(words, ast.Constant(None))) == _OPTION[1]:
             return True
     return False
 
 
 def spawn_problems(source: str, filename: str = "<planted>") -> list[str]:
     """``file:line`` of each argument list in ``source`` that runs ``-m messagefoundry serve`` or
-    ``supervise`` without remote debugging turned off ahead of ``-m``."""
+    ``supervise`` without remote debugging turned off among the interpreter's own options."""
     problems = []
     for node in ast.walk(ast.parse(source, filename)):
         if isinstance(node, ast.Call):
@@ -62,11 +74,10 @@ def spawn_problems(source: str, filename: str = "<planted>") -> list[str]:
         else:
             continue
         words = [_constant(e) for e in elements]
-        for at in range(len(words) - 2):
-            starts = (
-                words[at : at + 2] == ["-m", "messagefoundry"] and words[at + 2] in _SUBCOMMANDS
-            )
-            if starts and not _sets_the_option(elements[:at]):
+        for at in range(1, len(words) - 2):
+            starts = words[at] == "-m" and words[at + 1] in _MODULES
+            # The first element is the interpreter; the options are what lies between it and -m.
+            if starts and words[at + 2] in _SUBCOMMANDS and not _sets_the_option(elements[1:at]):
                 problems.append(f"{filename}:{node.lineno}")
     return problems
 
@@ -84,9 +95,16 @@ def test_no_harness_or_script_spawns_the_engine_with_remote_debugging_on() -> No
         for found in spawn_problems(path.read_text(encoding="utf-8"), str(path.relative_to(_ROOT)))
     ]
     assert not problems, (
-        "pass messagefoundry.childenv.CHILD_INTERPRETER_FLAGS ahead of `-m messagefoundry` "
-        f"(vault BACKLOG #2700): {problems}"
+        "pass `-X disable-remote-debug` ahead of `-m messagefoundry` (vault BACKLOG #2700): "
+        f"{problems}"
     )
+
+
+def test_the_seam_spells_the_option_as_the_engine_children_do() -> None:
+    from harness.load.failover import REMOTE_DEBUG_OFF
+
+    assert REMOTE_DEBUG_OFF == _OPTION
+    assert _OPTION in itertools.pairwise(CHILD_INTERPRETER_FLAGS)
 
 
 @pytest.mark.parametrize(
@@ -95,6 +113,7 @@ def test_no_harness_or_script_spawns_the_engine_with_remote_debugging_on() -> No
         # The seam's own spawn before this item.
         'exec(sys.executable, "-m", "messagefoundry", "serve", *args)',
         '[sys.executable, "-m", "messagefoundry", "supervise", "--config", c]',
+        '[sys.executable, "-m", "messagefoundry.__main__", "serve"]',
         # Misspelt, or another -X option.
         '(sys.executable, "-X", "disable_remote_debug", "-m", "messagefoundry", "serve")',
         '[sys.executable, "-X", "utf8", "-m", "messagefoundry", "serve"]',
@@ -102,6 +121,9 @@ def test_no_harness_or_script_spawns_the_engine_with_remote_debugging_on() -> No
         'exec(sys.executable, "-m", "messagefoundry", "serve", *CHILD_INTERPRETER_FLAGS)',
         # Another tuple spread in.
         'exec(sys.executable, *OTHER_FLAGS, "-m", "messagefoundry", "serve")',
+        # The option belongs to a wrapper module or to -c, not to the interpreter.
+        'exec(sys.executable, "-m", "coverage", "run", *REMOTE_DEBUG_OFF, "-m", "messagefoundry", "serve")',
+        '(sys.executable, "-c", "x", "-X", "disable-remote-debug", "-m", "messagefoundry", "serve")',
     ],
 )
 def test_the_scan_objects_to_a_planted_spawn(source: str) -> None:
@@ -111,7 +133,7 @@ def test_the_scan_objects_to_a_planted_spawn(source: str) -> None:
 @pytest.mark.parametrize(
     "source",
     [
-        'exec(sys.executable, *CHILD_INTERPRETER_FLAGS, "-m", "messagefoundry", "serve", *args)',
+        'exec(sys.executable, *REMOTE_DEBUG_OFF, "-m", "messagefoundry", "serve", *args)',
         '[sys.executable, *childenv.CHILD_INTERPRETER_FLAGS, "-m", "messagefoundry", "supervise"]',
         '(sys.executable, "-P", "-X", "disable-remote-debug", "-m", "messagefoundry", "serve")',
         # Not an engine start.
@@ -129,23 +151,24 @@ class _Spawned(Exception):
     """Stops the seam at its subprocess call, carrying the argument list it was handed."""
 
 
-def test_the_engine_node_seam_spawns_with_the_child_flags(tmp_path: Path) -> None:
-    """Read off the real ``EngineNode._spawn``, with only the subprocess call replaced."""
+def test_the_engine_node_seam_spawns_with_remote_debugging_off(tmp_path: Path) -> None:
+    """Read off the real ``EngineNode._spawn``, with only the subprocess call replaced. An empty
+    environment, as the neighbouring node tests use, so no ambient variable redirects the log."""
     from harness.load.failover import EngineNode
 
     class Recording(EngineNode):
         async def _exec(self, *argv: str) -> asyncio.subprocess.Process:
             raise _Spawned(argv)
 
-    node = Recording("argv", 1, env=dict(os.environ), config_dir="cfg", cwd=tmp_path)
+    node = Recording("argv", 1, env={}, config_dir="cfg", cwd=tmp_path)
     try:
         with pytest.raises(_Spawned) as spawned:
             asyncio.run(node._spawn("--config", "cfg"))
     finally:
         node._log.close()
-        os.unlink(node._log.name)
+        Path(node._log.name).unlink()
     argv = spawned.value.args[0]
     module_at = argv.index("-m")
-    assert argv[1:module_at] == CHILD_INTERPRETER_FLAGS, argv
     assert argv[module_at : module_at + 3] == ("-m", "messagefoundry", "serve"), argv
-    assert _OPTION in zip(argv[1:module_at], argv[2:module_at], strict=False), argv
+    assert _OPTION in itertools.pairwise(argv[1:module_at]), argv
+    assert spawn_problems(f"exec({', '.join(map(repr, argv))})") == [], argv

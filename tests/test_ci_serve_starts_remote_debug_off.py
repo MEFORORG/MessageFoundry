@@ -12,10 +12,10 @@ The interpreter accepts ``-X disable_remote_debug`` and does nothing with it
 
 THESE READ TEXT, NOT A RUN. Most of those legs run on a schedule, on dispatch or in the merge queue,
 so a pull request never shows their result, and no step reads the flag back off its running engine.
-At least these start an engine where no step text shows it, and nothing here reads them: the
+At least these start an engine where no step text shows it, and this file does not read them: the
 Windows service smoke (NSSM, read by ``tests/test_isolated_launch.py``), the image smoke (the
-image's entry point, read there too), and any engine a harness module starts from Python, such as
-the failover profile's nodes in ``harness/load/failover.py``.
+image's entry point, read there too), and the engines a harness module starts from Python (read by
+``tests/test_harness_engine_spawn_remote_debug_off.py``).
 
 THE READER IS A TOKEN SCAN, NOT A SHELL PARSER. Some shapes it cannot place read as a problem: at
 least an interpreter named through a variable (``"$PY" -m messagefoundry serve``), the
@@ -52,7 +52,12 @@ _CONTINUATION = re.compile(r"[\\`]\r?\n")
 _TAKES_ARGUMENT = frozenset("XW")
 #: ``-m`` closing a cluster of single-letter options, and the same with the module attached.
 _MODULE_FLAG = re.compile(r"-([A-Za-z]*)m")
-_MODULE_ATTACHED = re.compile(r"-([A-Za-z]*)m(messagefoundry)")
+_MODULE_ATTACHED = re.compile(r"-([A-Za-z]*)m(messagefoundry(\.__main__)?)")
+#: What follows ``-m`` in an engine start, and the console-script launcher's names.
+_MODULES = ("messagefoundry", "messagefoundry.__main__")
+_LAUNCHERS = ("messagefoundry", "messagefoundry.exe")
+#: A cluster of single-letter options whose last one takes the next word as its argument.
+_ARGUMENT_CLUSTER = re.compile(r"-[A-Za-z]*[XW]")
 
 
 def _name(token: str) -> str:
@@ -70,8 +75,8 @@ def _options_problem(options: list[str]) -> str | None:
     words = iter(options)
     for word in words:
         if word.startswith("--"):
-            if word == "--check-hash-based-pycs":
-                next(words, None)
+            if word == "--check-hash-based-pycs" and next(words, None) is None:
+                return f"{word} takes the -m as its argument"
             continue
         if not word.startswith("-") or word == "-":
             return f"the module follows {word!r}, so it is not the interpreter's own -m"
@@ -79,7 +84,9 @@ def _options_problem(options: list[str]) -> str | None:
             if letter in "cm":
                 return f"the module follows {word!r}, so it is not the interpreter's own -m"
             if letter in _TAKES_ARGUMENT:
-                argument = word[at + 1 :] or next(words, "")
+                argument = word[at + 1 :] or next(words, None)
+                if argument is None:
+                    return f"{word} takes the -m as its argument"
                 found = found or (letter, argument) == (_OPTION[0][1], _OPTION[1])
                 break
     return None if found else "remote debugging is not turned off"
@@ -91,7 +98,7 @@ def _interpreter_before(tokens: list[str], end: int) -> int:
     for i in range(end - 1, -1, -1):
         if tokens[i] in _SEPARATORS:
             return -1
-        if tokens[i].startswith("-") or (i > 0 and tokens[i - 1] in ("-X", "-W")):
+        if tokens[i].startswith("-") or (i > 0 and _ARGUMENT_CLUSTER.fullmatch(tokens[i - 1])):
             continue
         if _INTERPRETER.fullmatch(_name(tokens[i])):
             return i
@@ -111,9 +118,9 @@ def engine_starts(script: str) -> list[tuple[str, str | None]]:
                 continue
             if attached := _MODULE_ATTACHED.fullmatch(token):
                 flag_at, cluster = at, attached.group(1)
-            elif _name(token) not in ("messagefoundry", "messagefoundry.exe"):
+            elif _name(token) not in (*_MODULES, *_LAUNCHERS):
                 continue
-            elif at and (flag := _MODULE_FLAG.fullmatch(tokens[at - 1])):
+            elif at and token in _MODULES and (flag := _MODULE_FLAG.fullmatch(tokens[at - 1])):
                 flag_at, cluster = at - 1, flag.group(1)
             else:
                 # The console-script launcher cannot pass an option to the interpreter it starts.
@@ -233,6 +240,11 @@ def test_the_option_is_the_one_the_shipped_launch_passes() -> None:
         "python -m coverage run -X disable-remote-debug -m messagefoundry serve",
         "python script.py -X disable-remote-debug -m messagefoundry serve",
         "python -c pass -X disable-remote-debug -m messagefoundry serve",
+        # The engine's __main__ named as the module.
+        "python -m messagefoundry.__main__ serve --config c",
+        # An option that takes the next word takes the -m, so the module is never run as one.
+        "python -X disable-remote-debug -IW -m messagefoundry serve",
+        "python -X disable-remote-debug --check-hash-based-pycs -m messagefoundry serve",
     ],
 )
 def test_the_reader_objects_to_a_planted_start(start: str) -> None:
@@ -258,6 +270,8 @@ def test_the_reader_objects_to_a_planted_start(start: str) -> None:
         "python -IXdisable-remote-debug -m messagefoundry serve",
         "python -IX disable-remote-debug -mmessagefoundry serve",
         "python -X disable-remote-debug -Im messagefoundry serve",
+        "python -X disable-remote-debug -IX pycache_prefix=/x/python -m messagefoundry serve",
+        "python -I -X disable-remote-debug -m messagefoundry.__main__ serve",
     ],
 )
 def test_the_reader_passes_a_start_with_the_option(start: str) -> None:
