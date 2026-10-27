@@ -19,7 +19,7 @@ pre-clamp ALLOW and now assert the refusal; each says so at its own docstring.
 
 Loopback / attested hops are byte-identical; a non-enforcing hop WARNs. A synthetic-instance
 relaxation went with BACKLOG #1279 -- every instance carries patient data -- and a proven-terminator
-one with BACKLOG #3514 item 5 (pinned below).
+arm, which no engine call site ever set, with BACKLOG #3514 item 5 (pinned below).
 
 The revocation refusal COMPOSES with #200: #200 refuses the CLEARTEXT / verify-off hop, so revocation
 fires ONLY on a VERIFYING hop — the two gates key on disjoint conditions and never double-refuse one
@@ -192,11 +192,13 @@ def test_blanket_attestation_does_not_defeat_an_enforcing_posture() -> None:
 
 
 def test_the_authority_takes_no_egress_terminator_input() -> None:
-    """BACKLOG #3514 item 5 removed ``proxy_proven``: no call site ever set it True, so its ALLOW arm
-    never fired. DEPLOYMENT.md and CONNECTIONS.md now say the authority has no input for an egress
-    terminator, so a change that adds any new input, under any name, must change those pages too.
-    The exact sets are pinned for that reason, not only the absence of the old name: the
-    authority's parameters, the guard's ``capture`` parameters, and the guard's fields."""
+    """BACKLOG #3514 item 5 removed ``proxy_proven``: no engine call site ever set it True, so its
+    ALLOW arm never fired outside tests. At least DEPLOYMENT.md, CONNECTIONS.md and ADR 0173 now say
+    the authority has no input for an egress terminator, so a change that adds a new decision input,
+    under any name, must change those pages too. The exact name sets are pinned for that reason, not
+    only the absence of the old name: the authority's parameters, the guard's ``capture``
+    parameters, and the guard's fields. This pins names only; it cannot see a wrapper that feeds a
+    new fact through an existing slot such as ``attested``."""
     assert set(inspect.signature(revocation_hop_disposition).parameters) == {
         "enforcing",
         "is_loopback_hop",
@@ -204,6 +206,8 @@ def test_the_authority_takes_no_egress_terminator_input() -> None:
         "crl_checked",
         "blanket_attested",
     }
+    # A name that is not a revocation decision input (an audit or message field) only needs adding
+    # to these sets; a decision input needs the pages above changed too.
     assert set(inspect.signature(RevocationHopGuard.capture).parameters) == {
         "host",
         "cell",
