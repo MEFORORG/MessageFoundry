@@ -222,10 +222,11 @@ class TransitCipher(_UnmarkedPolicy):
         (ADR-draft decision D14). Returns Transit's ``vault:v<N>:...`` string, which names the
         version. Blocking: the sealer calls it in a worker thread. Any failure raises
         :class:`CipherError`, type and Vault text only, never the input."""
+        inp = base64.b64encode(data).decode("ascii")
         try:
             response: Any = self._client.secrets.transit.generate_hmac(
                 name=self._audit_key,
-                hash_input=base64.b64encode(data).decode("ascii"),
+                hash_input=inp,
                 algorithm=AUDIT_TRANSIT_HASH_ALGO,
             )
             mac = response["data"]["hmac"]
@@ -250,10 +251,11 @@ class TransitCipher(_UnmarkedPolicy):
         :class:`CipherError`. A version below the key's minimum still reads as ``False``: the reply
         does not say which version range the key holds. Blocking: the sealer calls it in a worker
         thread."""
+        inp = base64.b64encode(data).decode("ascii")
         try:
             response: Any = self._client.secrets.transit.verify_signed_data(
                 name=self._audit_key,
-                hash_input=base64.b64encode(data).decode("ascii"),
+                hash_input=inp,
                 hmac=mac,
                 hash_algorithm=AUDIT_TRANSIT_HASH_ALGO,
             )

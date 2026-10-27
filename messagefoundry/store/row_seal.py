@@ -411,7 +411,7 @@ class TransitRowSealer:
     def _unavailable(self, exc: Exception) -> TransitSealUnavailableError:
         if self._throttle.due("transit"):
             log.error(
-                "a row seal could not be made or checked because Vault Transit did not answer; the"
+                "a row seal could not be made or checked because Vault transit did not answer; the"
                 " request was refused and no seal failure was recorded (BACKLOG #2592): %s",
                 exc,
             )

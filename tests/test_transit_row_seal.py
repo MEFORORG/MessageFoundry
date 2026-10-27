@@ -244,7 +244,7 @@ async def test_an_outage_denies_without_a_seal_failure_and_recovers(
     transit.down = True
     with pytest.raises(TransitSealUnavailableError):
         await service.identity_for_token(token)
-    assert "Vault Transit did not answer" in caplog.text  # the provider alert
+    assert "Vault transit did not answer" in caplog.text  # the provider alert
     # An outage is not a forgery: no seal-failure audit row, and the session was not ended.
     assert _seal_failures(path) == 0
     row = await store.get_session(hash_token(token))
