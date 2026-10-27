@@ -104,16 +104,20 @@ def _registry(tmp_path: Path) -> Registry:
     return reg
 
 
-async def _ingress_inflight(store: MessageStore) -> int:
-    """Counted with its own SQL, not through ``inflight_by_lane``, so a broken read cannot make a
-    stranded row look recovered."""
+async def _inflight_at(store: MessageStore, stage: Stage) -> int:
+    """``IB``'s in-flight rows at ``stage``, counted with its own SQL, not through
+    ``inflight_by_lane``, so a broken read cannot make a stranded row look recovered."""
     cur = await store._db.execute(
         "SELECT COUNT(*) AS c FROM queue WHERE stage=? AND channel_id=? AND status=?",
-        (Stage.INGRESS.value, "IB", "inflight"),
+        (stage.value, "IB", "inflight"),
     )
     row = await cur.fetchone()
     assert row is not None
     return int(row["c"])
+
+
+async def _ingress_inflight(store: MessageStore) -> int:
+    return await _inflight_at(store, Stage.INGRESS)
 
 
 async def _until(pred: Any, *, timeout: float = 5.0) -> None:
@@ -1368,6 +1372,92 @@ async def test_a_pause_ends_a_held_delivery_lane_so_purge_is_not_refused(
             assert dispatcher._states["OB"].phase is stage_dispatcher._LanePhase.PAUSED
         else:
             assert not runner._workers["OB"].done()  # the worker lives on, at its pause gate
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+@pytest.mark.parametrize(
+    ("stage", "handoff", "kind"),
+    [
+        (Stage.INGRESS, "route_handoff", "router"),
+        (Stage.ROUTED, "transform_handoff", "transform"),
+    ],
+)
+@pytest.mark.parametrize("variant", ["shipped", "control-deaf-to-the-halt"])
+async def test_the_log_halt_ends_a_held_internal_lane(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claim_mode: str,
+    stage: Stage,
+    handoff: str,
+    kind: str,
+    variant: str,
+) -> None:
+    """The #122 fail-closed halt (application log unwritable) pauses a router or transform lane in
+    the pooled claim mode and returns the per-lane worker at its loop-top gate. A lane HELD on a
+    failed re-pend must read that halt too, or it keeps retrying under it until the store heals.
+    The handoff faults and the re-pend keeps failing on a 30 s backoff; the halt must end the hold
+    within 2 s: the pooled lane reaches PAUSED, the per-lane worker returns cleanly. The row stays
+    in flight, as one failed write left it before step 2. The control passes no abandon predicate
+    to the backoff, which was the shipped code for these lanes, and the hold outlives the 2 s."""
+    _fast_backoffs(monkeypatch)
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.05)
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.05)
+    # Every backoff 30 s, so only the halt can end the hold inside the test.
+    monkeypatch.setattr(stage_dispatcher, "_capped_backoff", lambda base, exp, cap: 30.0)
+    monkeypatch.setattr(wiring_runner, "_capped_backoff", lambda base, exp, cap: 30.0)
+    if variant == "control-deaf-to-the-halt":
+        real_wait = stage_dispatcher.wait_to_retry
+
+        async def deaf(delay: float, *, abandon: Any, **k: Any) -> Any:
+            return await real_wait(delay, abandon=None, **k)
+
+        monkeypatch.setattr(stage_dispatcher, "wait_to_retry", deaf)
+        monkeypatch.setattr(wiring_runner, "wait_to_retry", deaf)
+    calls: dict[str, int] = {}
+    _fail_while(monkeypatch, store, handoff, calls)
+    _fail_while(monkeypatch, store, "reschedule_claimed", calls)
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        claim_mode=claim_mode,
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    try:
+        await store.enqueue_ingress(channel_id="IB", raw=RAW)
+        runner.notify_work()
+
+        async def holding() -> bool:
+            return calls.get("reschedule_claimed", 0) >= 1
+
+        await _until(holding)
+        await asyncio.sleep(0.2)  # inside the 30 s backoff
+        runner._halt_inbound_processing(["IB"])
+        if claim_mode == "pooled":
+            states = runner._dispatchers[stage]._states
+
+            async def ended() -> bool:
+                return states["IB"].phase is stage_dispatcher._LanePhase.PAUSED
+
+        else:
+            worker = runner._inbound_worker_dict(kind)["IB"]
+
+            async def ended() -> bool:
+                return worker.done()
+
+        if variant == "control-deaf-to-the-halt":
+            with pytest.raises(AssertionError, match="timed out"):
+                await _until(ended, timeout=2.0)
+            return
+        await _until(ended, timeout=2.0)
+        assert calls["reschedule_claimed"] == 1  # the hold sent no retry after the halt
+        assert await _inflight_at(store, stage) == 1
+        if claim_mode == "per_lane":
+            assert worker.exception() is None  # returned at its halt gate, not crashed
     finally:
         await runner.stop()
 
