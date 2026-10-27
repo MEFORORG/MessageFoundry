@@ -23,6 +23,7 @@ All material is synthetic and minted by ``tests/test_crl_reload.py``. No PHI.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import gc
 import logging
 import os
@@ -36,7 +37,8 @@ from typing import Any, cast
 
 import pytest
 from cryptography import x509
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric.types import CertificateIssuerPrivateKeyTypes
 from cryptography.x509.oid import NameOID
 from pydantic import ValidationError
 
@@ -61,6 +63,8 @@ from messagefoundry.pipeline.crl_reload import (
     BAD_SIGNATURE,
     FIX,
     RESTART,
+    UNCHECKABLE_SIGNATURE,
+    UNPROVEN_SIGNATURE,
     WAIT,
     CrlReloadRunner,
     ReloadOutcome,
@@ -314,50 +318,123 @@ async def test_a_restart_that_a_start_would_refuse_too_says_so(pki: _Pki) -> Non
     assert capped.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
-async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_refuses_it_too(
+#: A CRL authority key identifier that names no key: it fits the CA by name alone, so a CRL that
+#: carries it and is signed by another key is unproven, not proven bad.
+_NAMES_NO_KEY = x509.AuthorityKeyIdentifier(None, None, None)
+
+
+def _signature_case(pki: _Pki, case: str, *, issued: datetime.timedelta) -> bytes:
+    """A CRL from ``pki``'s issuer whose signature the reload reads as ``case``: ``bad`` names the
+    CA's key and another key signed it, ``unproven`` names no key and another key signed it, and
+    ``uncheckable`` names the CA's key and carries an RSA signature, which an EC key cannot
+    check."""
+    if case == "uncheckable":
+        signer: CertificateIssuerPrivateKeyTypes = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048
+        )
+    else:
+        signer = ec.generate_private_key(ec.SECP256R1())
+    aki = _NAMES_NO_KEY if case == "unproven" else None
+    return pki.crl_pem(issued=issued, lasts=90 * _DAY, signer=signer, aki=aki)
+
+
+@pytest.mark.parametrize(
+    ("case", "remedy", "token"),
+    [
+        pytest.param("bad", BAD_SIGNATURE, "bad_signature", id="bad"),
+        pytest.param("unproven", UNPROVEN_SIGNATURE, "unproven_signature", id="unproven"),
+        pytest.param(
+            "uncheckable", UNCHECKABLE_SIGNATURE, "uncheckable_signature", id="uncheckable"
+        ),
+    ],
+)
+async def test_the_signature_remedy_names_what_the_check_found(
+    pki: _Pki, case: str, remedy: str, token: str
+) -> None:
+    """Vault BACKLOG #3506 item 8. ``crl_signature_refusal`` folds three states into one flag, so
+    the reload told an operator to fix a file that can be right, as after a CA renews its key.
+    Each state now has its own remedy and token. Before, all three read ``bad_signature``."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    pki.crl.write_bytes(_signature_case(pki, case, issued=_DAY))  # in effect
+
+    (outcome,) = _pass(_runner(sink))
+
+    assert outcome.refusal is not None and outcome.refusal.remedy == remedy, outcome.refusal
+    assert outcome.refusal.sticky and not outcome.start_refuses
+    (payload,) = sink.refused()
+    assert payload["remedy_class"] == token
+    # Only the proven case says to fix the file; the two short of proof ask for a check first.
+    assert remedy.startswith("Fix the file") is (case == "bad")
+    assert ("Restart the engine" in remedy) is (case != "bad")
+    assert ("can be right" in remedy) is (case == "unproven")
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_refuses_it_at_any_time(
     pki: _Pki,
 ) -> None:
-    """Vault BACKLOG #3506, the Manager's item 1. The ``bad_signature`` remedy says a start can
-    load the file, which is false while it is not in effect, so the refusal carries the same
-    caveat a restart remedy does. Before, it carried none."""
+    """Vault BACKLOG #3506. A proven bad signature refuses a start whatever the time, so its
+    refusal must not say a start refuses the file "at least until" a CRL takes effect, nor flag
+    ``start_refuses``: its remedy names no restart. Before item 8 it carried both, because the
+    reload could not tell a proven bad signature from an unproven one."""
     hop = pki.outbound_hop()
     sink = _Sink()
     runner = _runner(sink)
-    forged = pki.crl_pem(
-        issued=-_DAY, lasts=90 * _DAY, signer=ec.generate_private_key(ec.SECP256R1())
-    )
-    pki.crl.write_bytes(forged)  # not in effect, and badly signed
+    pki.crl.write_bytes(_signature_case(pki, "bad", issued=-_DAY))  # not in effect, proven bad
 
     (outcome,) = _pass(runner)
 
     assert outcome.refusal is not None and outcome.refusal.remedy == BAD_SIGNATURE
-    assert "Restart the engine" not in BAD_SIGNATURE  # the remedy itself is unchanged
+    assert "Restart the engine" not in BAD_SIGNATURE
+    assert "at least until then" not in outcome.refusal.reason
+    assert not outcome.start_refuses
+    assert "at any time, not only while a CRL in the file is not yet in effect" in BAD_SIGNATURE
+    (payload,) = sink.refused()
+    assert payload["remedy_class"] == "bad_signature" and payload["start_refuses"] is False
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+    # Once such a CRL is in effect, a start still refuses it, on the signature this time.
+    pki.crl.write_bytes(_signature_case(pki, "bad", issued=_DAY))
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        pki.outbound_hop()
+
+
+@pytest.mark.parametrize("case", ["unproven", "uncheckable"])
+async def test_a_signature_short_of_proof_for_a_file_not_in_effect_says_not_to_restart_yet(
+    pki: _Pki, case: str
+) -> None:
+    """Vault BACKLOG #3506, the Manager's item 1, for the remedies that name a restart since item
+    8. A start refuses the file while it is not in effect, so the refusal carries the caveat and
+    the alert ``start_refuses``. Control: the same case in effect carries neither."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+    remedy = UNPROVEN_SIGNATURE if case == "unproven" else UNCHECKABLE_SIGNATURE
+    pki.crl.write_bytes(_signature_case(pki, case, issued=-_DAY))  # not in effect
+
+    (outcome,) = _pass(runner)
+
+    assert outcome.refusal is not None and outcome.refusal.remedy == remedy
     assert "a start refuses this file too at least until then" in outcome.refusal.reason
     assert outcome.start_refuses
     (payload,) = sink.refused()
-    assert payload["remedy_class"] == "bad_signature" and payload["start_refuses"] is True
-    # The detail a notifier builds from what the alert carried.
+    assert payload["start_refuses"] is True
     detail = crl_reload_refused_detail(
         remedy_class=payload["remedy_class"],
         stale_contexts=payload["stale_contexts"],
         remedy=payload["remedy"],
         start_refuses=payload["start_refuses"],
     )
-    # Review finding F3: the time is no promise. A start refuses a proven bad signature after it
-    # too, and the reload cannot tell proven from unproven, so the text says "at least", inside
-    # the first 200 characters the alert list keeps. The remedy that follows says when.
+    # The warning leads, inside the first 200 characters the alert list keeps, ahead of the
+    # remedy's restart.
     assert "at least until its CRL takes effect, so do not restart before then." in detail[:200]
-    assert detail.index("at least until") < detail.index(BAD_SIGNATURE)
-    # The old wording, which read the time as the moment a start loads the file, is gone.
-    assert "too until its CRL takes effect" not in detail
+    assert detail.index("at least until") < detail.index("Restart the engine")
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
-    # Control: the same forgery in effect carries no such caveat.
-    pki.crl.write_bytes(
-        pki.crl_pem(issued=_DAY, lasts=90 * _DAY, signer=ec.generate_private_key(ec.SECP256R1()))
-    )
+    pki.crl.write_bytes(_signature_case(pki, case, issued=_DAY))  # control: in effect
     (in_effect,) = _pass(runner)
-    assert in_effect.refusal is not None and in_effect.refusal.remedy == BAD_SIGNATURE
+    assert in_effect.refusal is not None and in_effect.refusal.remedy == remedy
     assert not in_effect.start_refuses
     assert "at least until then" not in in_effect.refusal.reason
 

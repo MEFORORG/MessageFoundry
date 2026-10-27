@@ -154,8 +154,8 @@ def crl_reload_refused_detail(
     ]
     if start_refuses:
         # "At least": the time is when one cause of a refusal ends, not a promise that a start
-        # loads the file then. A proven bad signature, or a private copy a start cannot make,
-        # still refuses after it (vault BACKLOG #3506); the remedy that follows says when.
+        # loads the file then. A private copy a start cannot make, for one, still refuses after
+        # it (vault BACKLOG #3506).
         parts.append(
             "A start refuses this file too at least until its CRL takes effect, so do not restart "
             "before then."

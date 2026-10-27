@@ -560,19 +560,10 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
         )
 
 
-#: Why a start could not confirm a CRL's signature, by :class:`~messagefoundry.pki.CrlSignature`
-#: state, in the words of the one warning :func:`_check_crl_signatures` logs. ``unlisted`` is not
-#: here: its words are :data:`~messagefoundry.pki.UNLISTED_SIGNATURE`, which the reload's refusal
-#: uses too, so the two cannot drift apart (vault BACKLOG #3506).
-_UNCONFIRMED_SIGNATURE = {
-    "unproven": (
-        "a listed CA has that name, ASCII letter case aside, and its key does not "
-        "verify the CRL, but the CRL does not "
-        "name that CA's key, so a renewed CA key could explain it"
-    ),
-    "uncheckable": "the engine cannot check its signature with the listed CA's key",
-}
-#: How many CRLs that warning describes before it only counts the rest.
+#: How many CRLs the warning :func:`_check_crl_signatures` logs describes before it only counts
+#: the rest. Its words for each are :data:`~messagefoundry.pki.UNCONFIRMED_SIGNATURE` and
+#: :data:`~messagefoundry.pki.UNLISTED_SIGNATURE`, which the reload's refusal uses too, so the two
+#: cannot drift apart (vault BACKLOG #3506).
 _UNCONFIRMED_SHOWN = 3
 
 
@@ -614,7 +605,12 @@ def _check_crl_signatures(
     There is no setting that turns this off and none that widens it, as for the expired-CRL
     refusal in :func:`judge_crl_bytes`."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
-    from messagefoundry.pki import UNLISTED_SIGNATURE, CrlSignature, judge_crl_signatures
+    from messagefoundry.pki import (
+        UNCONFIRMED_SIGNATURE,
+        UNLISTED_SIGNATURE,
+        CrlSignature,
+        judge_crl_signatures,
+    )
 
     fingerprint = crl_fingerprint(pem)
     judged: list[CrlSignature] = []
@@ -649,7 +645,7 @@ def _check_crl_signatures(
     finding = tuple(signature.state for signature in judged)
     if not unconfirmed or not first_unconfirmed_signature(crl_file, fingerprint, finding):
         return
-    words = {**_UNCONFIRMED_SIGNATURE, "unlisted": UNLISTED_SIGNATURE}
+    words = {**UNCONFIRMED_SIGNATURE, "unlisted": UNLISTED_SIGNATURE}
     shown = "; ".join(
         f"{signature.where}: {words[signature.state]}"
         for signature in unconfirmed[:_UNCONFIRMED_SHOWN]
@@ -737,7 +733,7 @@ def judge_crl_bytes(
 
     No signature is checked here, because this has no CA list. A start checks it in
     :func:`_check_crl_signatures`, and the reload in
-    :func:`~messagefoundry.pki.crl_signature_refusal`. The two do not refuse the same files."""
+    :func:`~messagefoundry.pki.crl_signature_finding`. The two do not refuse the same files."""
     from messagefoundry.pki import judge_every_crl, soonest_crl
 
     try:

@@ -51,7 +51,10 @@ __all__ = [
     "CrlFacts",
     "CrlIssuerKey",
     "CrlSignature",
+    "CrlSignatureFinding",
+    "UNCONFIRMED_SIGNATURE",
     "UNLISTED_SIGNATURE",
+    "crl_signature_finding",
     "crl_signature_refusal",
     "judge_crl_signatures",
     "judge_every_crl",
@@ -463,7 +466,7 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
 
     OpenSSL checks a CRL's signature at the handshake, not when it loads the file. This is the
     engine's own check, for at least a start (``harden_crl_check``), the running-hop reload
-    (:func:`crl_signature_refusal`) and the expiry scan's check of a CRL in a CA file (BACKLOG
+    (:func:`crl_signature_finding`) and the expiry scan's check of a CRL in a CA file (BACKLOG
     #3512). A CA that ``cryptography`` cannot read is ignored
     (:data:`_UNREADABLE_CA`): it cannot be shown to be an issuer, and a trust store may hold one
     that OpenSSL loads. Before vault BACKLOG #2905 such a CA raised out of the reload's check,
@@ -889,6 +892,73 @@ UNLISTED_SIGNATURE = (
     "the CRL's authority key identifier, where it carries one)"
 )
 
+#: Why the engine could not confirm a CRL's signature against a CA it matched, by
+#: :class:`CrlSignature` state, for a start's warning and a reload's refusal alike, so the two
+#: cannot drift apart (vault BACKLOG #3506). ``unlisted`` has its own words,
+#: :data:`UNLISTED_SIGNATURE`.
+UNCONFIRMED_SIGNATURE: dict[CrlSignatureState, str] = {
+    "unproven": (
+        "a listed CA has that name, ASCII letter case aside, and its key does not "
+        "verify the CRL, but the CRL does not "
+        "name that CA's key, so a renewed CA key could explain it"
+    ),
+    "uncheckable": "the engine cannot check its signature with the listed CA's key",
+}
+
+#: The states :func:`crl_signature_finding` reports, the strongest first. A proof outranks the
+#: rest, and a CA that was checked and failed outranks one that could not be checked.
+_FINDING_ORDER: tuple[CrlSignatureState, ...] = ("bad", "unproven", "uncheckable", "unlisted")
+
+
+@dataclass(frozen=True)
+class CrlSignatureFinding:
+    """The strongest thing a hop's CA list says against the CRLs of one file (vault BACKLOG
+    #3506). ``state`` is a :class:`CrlSignature` state other than ``verified``, and ``why`` names
+    the block and says what was found, for a message."""
+
+    why: str
+    state: CrlSignatureState
+
+
+def crl_signature_finding(pem: bytes, ca_ders: Iterable[bytes]) -> CrlSignatureFinding | None:
+    """The strongest :class:`CrlSignatureFinding` for the CRLs in ``pem`` against the CAs in
+    ``ca_ders``, or ``None`` when each CRL is verified (vault BACKLOG #3506).
+
+    The running-hop reload calls this before a live load, because a load cannot be undone
+    (BACKLOG #299), and OpenSSL checks a CRL's signature only at the handshake. It keeps the three
+    states :func:`crl_signature_refusal` folds into one flag apart, so the reload can tell a CRL
+    proven badly signed, a file to fix, from one it could not confirm, which can be right, as after
+    a CA renews its key. :data:`_FINDING_ORDER` picks the state reported, the first block of it in
+    file order among equals. It stops at the first ``bad`` block, since nothing outranks it.
+
+    A CA that does not parse is ignored. ``pem`` must be bytes :func:`judge_every_crl` accepted;
+    a block that does not parse raises ``ValueError``."""
+    strongest: CrlSignature | None = None
+    for signature in judge_crl_signatures(pem, ca_ders):
+        if signature.state == "verified":
+            continue
+        if strongest is None or _FINDING_ORDER.index(signature.state) < _FINDING_ORDER.index(
+            strongest.state
+        ):
+            strongest = signature
+        if strongest.state == "bad":
+            break
+    if strongest is None:
+        return None
+    if strongest.state == "bad":
+        why = (
+            "the CRL names the key of the CA certificate this hop trusts for that issuer, and "
+            "that key does not verify the CRL's signature. A handshake OpenSSL judges by this "
+            "CRL fails with 'CRL signature failure'"
+        )
+    elif strongest.state == "unlisted":
+        why = UNLISTED_SIGNATURE
+    else:
+        why = (
+            f"the engine could not confirm its signature: {UNCONFIRMED_SIGNATURE[strongest.state]}"
+        )
+    return CrlSignatureFinding(f"{strongest.where}: {why}", strongest.state)
+
 
 def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bool] | None:
     """Why a CA in ``ca_ders`` is not confirmed to have signed some CRL in ``pem``, or ``None``
@@ -899,14 +969,13 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     means. A block with the True flag is reported over one with the False flag, wherever it sits
     in the file. OpenSSL checks a CRL's signature at the handshake, not at the load. So OpenSSL
     itself loads a CRL with the right issuer name and Authority Key Identifier but a bad
-    signature, and then every handshake it judges fails with ``CRL signature failure``. The
-    running-hop reload calls this before a live load, because a load cannot be undone
-    (BACKLOG #299).
+    signature, and then every handshake it judges fails with ``CRL signature failure``.
 
     **The flag is wider than what a start refuses (vault BACKLOG #2905).** It is True for every
     :class:`CrlSignature` state but ``verified`` and ``unlisted``. A start refuses only ``bad``,
-    the proven case, and loads the other two with a warning. So the reload holds back some files
-    that a start would load.
+    the proven case, and loads the other two with a warning. So the flag cannot tell a file to fix
+    from one that can be right. The running-hop reload uses :func:`crl_signature_finding`
+    instead, which keeps the states apart (vault BACKLOG #3506).
 
     A CA that does not parse is ignored. ``pem`` must be bytes :func:`judge_every_crl` accepted;
     a block that does not parse raises ``ValueError``."""

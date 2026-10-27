@@ -48,8 +48,14 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.keywrap import der_children, read_der_tlv
 from messagefoundry.pipeline import crl_reload
-from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE, FIX, reload_replaced_crls
-from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
+from messagefoundry.pipeline.crl_reload import (
+    BAD_SIGNATURE,
+    FIX,
+    UNCHECKABLE_SIGNATURE,
+    UNPROVEN_SIGNATURE,
+    reload_replaced_crls,
+)
+from messagefoundry.pki import crl_signature_finding, crl_signature_refusal, judge_crl_signatures
 from tests.test_crl_held_copy_alert import _bundle_scan
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
 from tests.test_trust_anchor_byte_binding import _handshake
@@ -367,12 +373,16 @@ def test_a_key_of_another_kind_than_the_signature_is_cannot_check_not_bad(tmp_pa
     hop = _hop(tmp_path / "ca.pem", tmp_path / "crl.pem")
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
-    # Vault BACKLOG #3506. The reload holds this file back with BAD_SIGNATURE, and a start has
-    # just loaded it, though the CRL names the CA's key. So that remedy may promise a start
-    # refusal for the proven case only.
+    # Vault BACKLOG #3506. A start has just loaded this file, though the CRL names the CA's key.
+    # So the reload holds it back as a signature it could not check, whose remedy names a
+    # restart, and not with BAD_SIGNATURE, which says a start refuses the file. Item 8: before,
+    # the folded flag gave BAD_SIGNATURE here, and that remedy then had to hedge for every state.
     verdict = crl_signature_refusal(pem, [der])
-    assert verdict is not None and verdict[1] is True
-    assert "only where it proves the signature bad" in BAD_SIGNATURE
+    assert verdict is not None and verdict[1] is True  # the folded flag, unchanged
+    finding = crl_signature_finding(pem, [der])
+    assert finding is not None and finding.state == "uncheckable"
+    assert crl_reload._SIGNATURE_REMEDY[finding.state] == UNCHECKABLE_SIGNATURE
+    assert "Restart the engine" in UNCHECKABLE_SIGNATURE
     assert "names that CA's key, a start refuses" not in BAD_SIGNATURE
 
 
@@ -745,7 +755,13 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
     assert [s.state for s in judge_crl_signatures(good, ders)] == ["uncheckable"]
     assert [s.state for s in judge_crl_signatures(forged, ders)] == ["bad"]
     verdict = crl_signature_refusal(good, ders)
-    assert verdict is not None and verdict[1] is True  # the reload's BAD_SIGNATURE case
+    assert verdict is not None and verdict[1] is True  # the folded flag
+    # The reload's own reading keeps them apart (vault BACKLOG #3506): the good one could not be
+    # checked, and only the forged one is proven bad.
+    assert (finding := crl_signature_finding(good, ders)) is not None
+    assert finding.state == "uncheckable"
+    assert (finding := crl_signature_finding(forged, ders)) is not None
+    assert finding.state == "bad"
 
     ca_file, crl_file = tmp_path / "ca.pem", tmp_path / "crl.pem"
     ca_file.write_bytes(ca.public_bytes(_PEM))
@@ -754,6 +770,54 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
     crl_file.write_bytes(forged)
     with pytest.raises(ValueError, match="does not verify the CRL's signature"):
         _hop(ca_file, crl_file)
+
+
+def test_the_reload_s_finding_keeps_the_three_states_apart_and_reports_the_strongest(
+    twins: _Twins,
+) -> None:
+    """Vault BACKLOG #3506 item 8. ``crl_signature_refusal`` folds ``bad``, ``unproven`` and
+    ``uncheckable`` into one flag, so the reload could not tell a renewed CA key from a forgery.
+    ``crl_signature_finding`` keeps the state, and across blocks reports the strongest: a proof,
+    then a CA checked and failed, then a CA not checked, then no CA matched, in file order among
+    equals."""
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ders = _ders(twins.new_ca)
+    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-unlisted")])
+    unlisted = _crl(twins.stranger, names=None, name=other)
+    unproven = _crl(twins.stranger, names=None)  # names no key, and another key signed it
+    uncheckable = _crl(rsa_key, names=twins.new_key)  # an RSA signature, an EC key
+    bad = _crl(twins.stranger, names=twins.new_key)
+    good = _crl(twins.new_key, names=twins.new_key)
+    states = [s.state for s in judge_crl_signatures(unproven + uncheckable + bad, ders)]
+    assert states == ["unproven", "uncheckable", "bad"]  # the premise: each block reads its state
+
+    cases = [
+        (good, None),
+        (unlisted, ("unlisted", 1)),
+        (unlisted + uncheckable, ("uncheckable", 2)),
+        (uncheckable + unproven, ("unproven", 2)),
+        (unproven + uncheckable + bad, ("bad", 3)),
+        (bad + unproven, ("bad", 1)),
+        (unproven + unproven, ("unproven", 1)),
+    ]
+    for pem, expected in cases:
+        finding = crl_signature_finding(pem, ders)
+        if expected is None:
+            assert finding is None
+            continue
+        state, block = expected
+        assert finding is not None and finding.state == state, (expected, finding)
+        assert finding.why.startswith(f"CRL block {block} of "), (expected, finding.why)
+    # The words of each state are the start's own, so the two cannot drift apart.
+    for pem, state in ((unproven, "unproven"), (uncheckable, "uncheckable")):
+        finding = crl_signature_finding(pem, ders)
+        assert finding is not None and pki_module.UNCONFIRMED_SIGNATURE[state] in finding.why
+    finding = crl_signature_finding(unlisted, ders)
+    assert finding is not None and pki_module.UNLISTED_SIGNATURE in finding.why
+    # The folded flag is unchanged for its callers: True for all three, False for unlisted alone.
+    for pem in (unproven, uncheckable, bad):
+        assert (verdict := crl_signature_refusal(pem, ders)) is not None and verdict[1] is True
+    assert (verdict := crl_signature_refusal(unlisted, ders)) is not None and verdict[1] is False
 
 
 def test_a_version_that_logs_nothing_in_between_does_not_reset_the_record(
@@ -1268,8 +1332,10 @@ _WITHDRAWN_FROM_THE_CODE = (
 def test_the_withdrawn_sentences_stay_out_of_the_code() -> None:
     texts = [
         BAD_SIGNATURE,
+        UNPROVEN_SIGNATURE,
+        UNCHECKABLE_SIGNATURE,
         pki_module.UNLISTED_SIGNATURE,
-        *tls_policy._UNCONFIRMED_SIGNATURE.values(),
+        *pki_module.UNCONFIRMED_SIGNATURE.values(),
     ]
     # Control: the texts searched are the ones those sentences sat in.
     assert any("a start refuses the file too" in text for text in texts)

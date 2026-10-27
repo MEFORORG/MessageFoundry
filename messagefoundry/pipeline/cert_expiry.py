@@ -48,7 +48,14 @@ from messagefoundry.config.tls_policy import (
     staged_crl,
 )
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, crl_expiry_detail
-from messagefoundry.pipeline.crl_reload import NO_ISSUER, RELOAD_INTERVAL_SECONDS, RESTART, RETRY
+from messagefoundry.pipeline.crl_reload import (
+    NO_ISSUER,
+    RELOAD_INTERVAL_SECONDS,
+    RESTART,
+    RETRY,
+    UNCHECKABLE_SIGNATURE,
+    UNPROVEN_SIGNATURE,
+)
 from messagefoundry.pki import (
     CertFacts,
     CrlFacts,
@@ -808,7 +815,15 @@ _CA_FILE_HOP_RESTARTS = (
 #: is conditional, on the CRL-setting hop's trust, and says nothing of the CA-file hop. This is the
 #: set main's "Restart the engine" substring test chose, named so a new remedy is a decision here
 #: (BACKLOG #3512).
-_RESTARTS_THE_ENGINE = frozenset({RESTART, NO_ISSUER, RETRY})
+#:
+#: Vault BACKLOG #3506 added the two signature remedies short of proof, and both are here. Each
+#: orders a check and then a plain restart of the engine, which applies the CA file too. If the
+#: check finds the file wrong, the operator replaces it, and the new bytes get a verdict of their
+#: own, so a second restart after these would only repeat the first. ``BAD_SIGNATURE``, the proven
+#: case, is not here: it orders a fix and no restart, so the CA-file hop's restart follows it.
+_RESTARTS_THE_ENGINE = frozenset(
+    {RESTART, NO_ISSUER, RETRY, UNPROVEN_SIGNATURE, UNCHECKABLE_SIGNATURE}
+)
 
 
 def _after_the_reload(refused: ReloadRefusal | None) -> str:

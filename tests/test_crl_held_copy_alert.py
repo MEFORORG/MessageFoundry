@@ -1182,6 +1182,8 @@ def test_the_ca_file_step_survives_the_alert_list_s_cut(
         pytest.param(crl_reload.LAPSES_FIRST, id="lapses-first"),
         pytest.param(crl_reload.RESTART, id="restart"),
         pytest.param(crl_reload.BAD_SIGNATURE, id="bad-signature"),
+        pytest.param(crl_reload.UNPROVEN_SIGNATURE, id="unproven-signature"),
+        pytest.param(crl_reload.UNCHECKABLE_SIGNATURE, id="uncheckable-signature"),
         pytest.param(crl_reload._NOT_PROVABLE, id="not-provable"),
         pytest.param(crl_reload.NO_ISSUER, id="no-issuer"),
         pytest.param(crl_reload.RETRY, id="retry"),
