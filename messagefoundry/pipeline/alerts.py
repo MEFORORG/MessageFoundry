@@ -29,8 +29,6 @@ __all__ = [
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
     "REMINDER_SECONDS",
-    "BAD_SIGNATURE_AFTER",
-    "BAD_SIGNATURE_CLASS",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
@@ -56,15 +54,6 @@ INTAKE_DISK_REASON = "disk_floor"
 #: cooldown, ``[alerts].realert_seconds``, which an operator can raise; a cooldown longer than this
 #: throttles some reminders, by that operator's choice.
 REMINDER_SECONDS = 300.0
-
-#: The ``remedy_class`` token of the ``bad_signature`` remedy. Defined here so the reload's token
-#: map (``pipeline/crl_reload.py``) and :func:`crl_reload_refused_detail` share one spelling.
-BAD_SIGNATURE_CLASS = "bad_signature"
-#: What a ``bad_signature`` refusal for a CRL file not yet in effect adds after its time, in the
-#: reload's reason and in the alert (vault BACKLOG #3506). The reload cannot tell a proven bad
-#: signature from an unproven one, and a start refuses the proven case after that time too, so the
-#: time alone would read as the moment a start loads the file.
-BAD_SIGNATURE_AFTER = "After then too, a start refuses the file where it proves the signature bad"
 
 
 def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str) -> str:
@@ -164,15 +153,13 @@ def crl_reload_refused_detail(
         "copy they hold."
     ]
     if start_refuses:
-        # "At least" for bad_signature, inside the first 200 characters: the time is no promise
-        # there, and the sentence that says why comes after the cut.
-        until = "at least until" if remedy_class == BAD_SIGNATURE_CLASS else "until"
+        # "At least": the time is when one cause of a refusal ends, not a promise that a start
+        # loads the file then. A proven bad signature, or a private copy a start cannot make,
+        # still refuses after it (vault BACKLOG #3506); the remedy that follows says when.
         parts.append(
-            f"A start refuses this file too {until} its CRL takes effect, so do not restart "
+            "A start refuses this file too at least until its CRL takes effect, so do not restart "
             "before then."
         )
-        if remedy_class == BAD_SIGNATURE_CLASS:
-            parts.append(f"{BAD_SIGNATURE_AFTER}.")
     if remedy:
         parts.append(f"{remedy}.")
     parts.append("The crl_reload ERROR line in the engine log gives the reason.")
@@ -421,7 +408,7 @@ class AlertSink(Protocol):
         the latest count, not the one first raised. ``remedy`` is the engine's own fixed
         sentence for that class. ``start_refuses`` is True when the remedy can send the operator
         to a restart, as one that names a restart or says a start can load the file does, and a
-        start would refuse the file too, until one of its CRLs takes effect.
+        start would refuse the file too, at least until one of its CRLs takes effect.
 
         **No CRL contents.** The refusal's reason quotes CRL issuer names and dates, so it stays
         in the engine log and is never passed here. Not a connection-scoped event: one CRL file

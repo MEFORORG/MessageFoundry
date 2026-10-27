@@ -50,8 +50,6 @@ from messagefoundry.connection_names import is_connection_name
 from messagefoundry.pipeline import crl_reload
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import (
-    BAD_SIGNATURE_AFTER,
-    BAD_SIGNATURE_CLASS,
     AlertSink,
     LoggingAlertSink,
     crl_reload_refused_detail,
@@ -300,7 +298,9 @@ async def test_a_restart_that_a_start_would_refuse_too_says_so(pki: _Pki) -> Non
     (outcome,) = _pass(runner, max_reloads=1)
 
     assert outcome.refusal is not None and outcome.refusal.remedy == RESTART
-    assert "a start until then refuses this file too" in outcome.refusal.reason  # the control
+    assert (
+        "a start refuses this file too at least until then" in outcome.refusal.reason
+    )  # the control
     assert outcome.start_refuses
     (payload,) = sink.refused()
     assert payload["remedy_class"] == "restart" and payload["start_refuses"] is True
@@ -330,13 +330,10 @@ async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_ref
 
     assert outcome.refusal is not None and outcome.refusal.remedy == BAD_SIGNATURE
     assert "Restart the engine" not in BAD_SIGNATURE  # the remedy itself is unchanged
-    assert "a start until then refuses this file too" in outcome.refusal.reason
-    # Review finding F3: the time is no promise for this remedy. A start refuses a proven bad
-    # signature after it too, and the reload cannot tell proven from unproven.
-    assert BAD_SIGNATURE_AFTER in outcome.refusal.reason
+    assert "a start refuses this file too at least until then" in outcome.refusal.reason
     assert outcome.start_refuses
     (payload,) = sink.refused()
-    assert payload["remedy_class"] == BAD_SIGNATURE_CLASS and payload["start_refuses"] is True
+    assert payload["remedy_class"] == "bad_signature" and payload["start_refuses"] is True
     # The detail a notifier builds from what the alert carried.
     detail = crl_reload_refused_detail(
         remedy_class=payload["remedy_class"],
@@ -344,15 +341,13 @@ async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_ref
         remedy=payload["remedy"],
         start_refuses=payload["start_refuses"],
     )
-    assert f"do not restart before then. {BAD_SIGNATURE_AFTER}." in detail
-    # The alert list keeps about the first 200 characters; the hedge must be inside them.
+    # Review finding F3: the time is no promise. A start refuses a proven bad signature after it
+    # too, and the reload cannot tell proven from unproven, so the text says "at least", inside
+    # the first 200 characters the alert list keeps. The remedy that follows says when.
     assert "at least until its CRL takes effect, so do not restart before then." in detail[:200]
-    # Control: a restart remedy keeps the plain caveat, with no such sentence.
-    plain = crl_reload_refused_detail(
-        remedy_class="restart", stale_contexts=1, remedy=RESTART, start_refuses=True
-    )
-    assert "too until its CRL takes effect, so do not restart before then" in plain
-    assert "at least" not in plain and BAD_SIGNATURE_AFTER not in plain
+    assert detail.index("at least until") < detail.index(BAD_SIGNATURE)
+    # The old wording, which read the time as the moment a start loads the file, is gone.
+    assert "too until its CRL takes effect" not in detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
     # Control: the same forgery in effect carries no such caveat.
@@ -363,7 +358,6 @@ async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_ref
     assert in_effect.refusal is not None and in_effect.refusal.remedy == BAD_SIGNATURE
     assert not in_effect.start_refuses
     assert "a start until then refuses" not in in_effect.refusal.reason
-    assert BAD_SIGNATURE_AFTER not in in_effect.refusal.reason
 
 
 def test_every_remedy_has_its_own_class_token() -> None:

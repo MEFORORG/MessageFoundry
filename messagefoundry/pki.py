@@ -37,6 +37,7 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.keywrap import (
     MalformedDer,
     Pkcs12EncryptedPart,
+    der_children,
     pkcs12_encrypted_parts,
     read_der_tlv,
     refuse_weak_pkcs12,
@@ -503,8 +504,9 @@ _NameKey = tuple[tuple[tuple[str, bool, str | bytes], ...], ...]
 @dataclass(frozen=True)
 class _ListedCa:
     """One CA from a hop's list, as :func:`_signature_state` reads it. ``serial`` is the serial
-    number the certificate carries, which can differ from ``cert.serial_number``
-    (:func:`_listed_ca` says when)."""
+    number the certificate carries. ``cert`` can be a copy with its serial numbers rewritten
+    (:func:`_listed_ca` says when), so it is read for its names, extensions and key only, never
+    for its serial, its fingerprint or as the CA's identity."""
 
     name: _NameKey
     cert: x509.Certificate
@@ -515,53 +517,80 @@ def _listed_ca(der: bytes) -> _ListedCa:
     """The CA certificate ``der``, read for :func:`judge_crl_signatures` (vault BACKLOG #3506).
 
     **A serial number that is not positive is read without ``cryptography``'s warning.** At
-    least some system roots carry serial 0. ``cryptography`` warns when it parses such a CA and
-    again when it reads the serial, and where warnings are errors the warning is raised instead.
-    That CA was then skipped, so a forged CRL naming its key read ``unlisted`` and loaded with a
-    warning. Silencing the warning needs a change to the process's warning filters, and a start
-    and a reload can run this on two threads at once. So instead the serial's first byte is
-    rewritten to ``0x01`` in a copy of the bytes, which keeps the length and makes the number
-    positive, and the copy is parsed. The real serial is kept in :attr:`_ListedCa.serial` for the
-    Authority Key Identifier match. The copy's own signature is then wrong, which nothing here
-    reads: the check uses the subject, the issuer, the extensions and the public key, and those
-    bytes are unchanged. A serial that is not minimally encoded is left as it is, so the parse
-    refuses it as before. ``cryptography`` says it will refuse such a serial outright in a later
-    release; this reads the CA all the same."""
-    span = _der_serial_span(der)
-    if span is None:  # not that shape: the parse judges it, and reads its serial
+    least some system roots carry serial 0, and some of those name it again in their own
+    Authority Key Identifier. ``cryptography`` warns when it parses such a CA, when it reads the
+    serial, and when it reads that extension, and where warnings are errors the warning is raised
+    instead. That CA was then skipped, so a forged CRL naming its key read ``unlisted`` and loaded
+    with a warning. Silencing the warning needs a change to the process's warning filters, and a
+    start and a reload can run this on two threads at once. So instead the first byte of each
+    such serial is rewritten to ``0x01`` in a copy of the bytes, which keeps the length and makes
+    the number positive, and the copy is parsed. The real serial is kept in
+    :attr:`_ListedCa.serial` for the Authority Key Identifier match. The copy's own signature is
+    then wrong, which nothing here reads: the check uses the subject, the issuer, the Subject Key
+    Identifier and the public key, and those bytes are unchanged. A serial that is not minimally
+    encoded is left as it is, so the parse refuses it as before. ``cryptography`` says it will
+    refuse such a serial outright in a later release; this reads the CA all the same."""
+    spans = _der_serial_spans(der)
+    if spans is None:  # not that shape: the parse judges it, and reads its serial
         ca = x509.load_der_x509_certificate(der)
         return _ListedCa(_issuer_name_key(ca.subject), ca, ca.serial_number)
-    start, end = span
-    content = der[start:end]
-    # Zero, or negative and minimally encoded: a non-minimal one is left for the parse to refuse.
-    if content == b"\x00" or (
-        content[0] >= 0x80 and not (content[0] == 0xFF and len(content) > 1 and content[1] >= 0x80)
-    ):
-        der = der[:start] + b"\x01" + der[start + 1 :]
+    start, end = spans[0]
+    serial = int.from_bytes(der[start:end], "big", signed=True)
+    for start, end in spans:
+        if _not_positive(der[start:end]):
+            der = der[:start] + b"\x01" + der[start + 1 :]
     ca = x509.load_der_x509_certificate(der)
-    return _ListedCa(_issuer_name_key(ca.subject), ca, int.from_bytes(content, "big", signed=True))
+    return _ListedCa(_issuer_name_key(ca.subject), ca, serial)
 
 
-def _der_serial_span(der: bytes) -> tuple[int, int] | None:
-    """Where the serial number's content sits in the certificate ``der``, or ``None`` when the
-    bytes do not have that shape; the parse then judges them. A certificate is a SEQUENCE whose
-    first element, the TBSCertificate, is a SEQUENCE that starts with an optional explicit
-    version, tag ``[0]``, and then the serial, an INTEGER."""
+def _not_positive(content: bytes) -> bool:
+    """Whether the INTEGER content ``content`` is zero, or negative and minimally encoded. A
+    non-minimal one is left for the parse to refuse."""
+    return content == b"\x00" or (
+        content[0] >= 0x80 and not (content[0] == 0xFF and len(content) > 1 and content[1] >= 0x80)
+    )
+
+
+#: The Authority Key Identifier's OID, ``id-ce-authorityKeyIdentifier``, as the content of its
+#: DER encoding.
+_AKID_OID = bytes.fromhex("551d23")
+
+
+def _der_serial_spans(der: bytes) -> list[tuple[int, int]] | None:
+    """Where the serial numbers sit in the certificate ``der``, as content spans: its own first,
+    then any its own Authority Key Identifier carries. ``None`` when the bytes do not have that
+    shape; the parse then judges them. A certificate is a SEQUENCE whose first element, the
+    TBSCertificate, is a SEQUENCE that starts with an optional explicit version, tag ``[0]``,
+    and then the serial, an INTEGER. Its extensions are under tag ``[3]``, and an Authority Key
+    Identifier carries a serial under tag ``[2]``."""
     try:
         certificate = read_der_tlv(der, 0, len(der))
         tbs = read_der_tlv(der, certificate.start, certificate.end)
-        element = read_der_tlv(der, tbs.start, tbs.end)
-        if element.tag == 0xA0:
-            element = read_der_tlv(der, element.end, tbs.end)
+        fields = der_children(der, tbs)
+        if fields and fields[0].tag == 0xA0:
+            fields = fields[1:]
+        if (certificate.tag, tbs.tag) != (0x30, 0x30) or not fields:
+            return None
+        serial = fields[0]
+        if serial.tag != 0x02 or serial.start == serial.end:
+            return None
+        spans = [(serial.start, serial.end)]
+        for field in fields:
+            if field.tag != 0xA3:
+                continue
+            for extension in der_children(der, read_der_tlv(der, field.start, field.end)):
+                parts = der_children(der, extension)
+                if len(parts) < 2 or der[parts[0].start : parts[0].end] != _AKID_OID:
+                    continue
+                akid = read_der_tlv(der, parts[-1].start, parts[-1].end)
+                spans += [
+                    (part.start, part.end)
+                    for part in der_children(der, akid)
+                    if part.tag == 0x82 and part.start < part.end
+                ]
     except MalformedDer:
         return None
-    if (certificate.tag, tbs.tag, element.tag) != (
-        0x30,
-        0x30,
-        0x02,
-    ) or element.start == element.end:
-        return None
-    return element.start, element.end
+    return spans
 
 
 #: The 26 ASCII capitals to their lower case, and no other character.

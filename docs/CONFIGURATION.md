@@ -2098,7 +2098,7 @@ transport it is a WARNING in the log, beside the reload's ERROR.
 | `remedy_class` | a short token for what to do next; see the next table |
 | `stale_contexts` | how many running TLS contexts still held the old copy at the last reload pass that reported the refusal. A reminder carries that latest count, so it can differ from the count the alert was first raised with |
 | `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
-| `start_refuses` | `true`, and present only then. The remedy could lead you to restart, by naming a restart or by saying a start can load the file, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then. With `bad_signature` that time is no promise: a start refuses the file after it too, where it proves the signature bad |
+| `start_refuses` | `true`, and present only then. The remedy could lead you to restart, by naming a restart or by saying a start can load the file, and a start would refuse the file too at least until one of its CRLs takes effect. Do not restart before then. That time is no promise that a start loads the file: with `bad_signature`, for one, a start refuses it after then too, where it proves the signature bad |
 
 This event carries no CRL contents. The reason for the refusal quotes CRL issuer names and dates, so
 it is left out of this event. It is in the engine log, in the `crl_reload` ERROR line. Read that

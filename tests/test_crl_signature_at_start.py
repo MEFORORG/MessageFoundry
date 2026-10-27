@@ -867,13 +867,16 @@ def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
 _ZERO_NAME = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-zero-serial")])
 
 
-def _zero_serial_ca(key: ec.EllipticCurvePrivateKey, serial: int = 0x00) -> bytes:
+def _zero_serial_ca(
+    key: ec.EllipticCurvePrivateKey, serial: int = 0x00, *, own_akid: bool = False
+) -> bytes:
     """A CA certificate for ``key``, as DER, whose serial number is the one byte ``serial``: 0x00
     for 0, as at least some system roots carry, or 0x80 for -128. It is built with serial 1 and
     then edited, since the builder refuses both; its own signature then fails, which neither
     ``cryptography``'s parse nor OpenSSL's load checks. It carries a Subject Key Identifier, so a
-    CRL can name its key."""
-    der = (
+    CRL can name its key. With ``own_akid`` it also carries an Authority Key Identifier naming
+    itself by key, name and that same serial, as at least some such roots do."""
+    builder = (
         x509.CertificateBuilder()
         .subject_name(_ZERO_NAME)
         .issuer_name(_ZERO_NAME)
@@ -883,12 +886,20 @@ def _zero_serial_ca(key: ec.EllipticCurvePrivateKey, serial: int = 0x00) -> byte
         .not_valid_after(_NOW + _DAY)
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
-        .sign(key, hashes.SHA256())
-        .public_bytes(serialization.Encoding.DER)
     )
+    if own_akid:
+        ski = x509.SubjectKeyIdentifier.from_public_key(key.public_key()).digest
+        akid = x509.AuthorityKeyIdentifier(ski, [x509.DirectoryName(_ZERO_NAME)], 1)
+        builder = builder.add_extension(akid, False)
+    der = builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.DER)
     version_and_serial = bytes.fromhex("a003020102020101")  # v3, then INTEGER 1
     assert der.count(version_and_serial) == 1
-    return der.replace(version_and_serial, version_and_serial[:-1] + bytes([serial]))
+    der = der.replace(version_and_serial, version_and_serial[:-1] + bytes([serial]))
+    if own_akid:
+        akid_serial = bytes.fromhex("820101")  # the AKID's [2] serial, 1
+        assert der.count(akid_serial) == 1
+        der = der.replace(akid_serial, akid_serial[:-1] + bytes([serial]))
+    return der
 
 
 def test_a_root_with_a_zero_serial_does_not_end_the_judgment_where_warnings_are_errors(
@@ -908,16 +919,29 @@ def test_a_root_with_a_zero_serial_does_not_end_the_judgment_where_warnings_are_
     assert judged == ["bad"]
 
 
+@pytest.mark.parametrize("own_akid", [False, True], ids=["no-own-akid", "own-akid"])
 @pytest.mark.parametrize("serial", [0x00, 0x80], ids=["zero", "negative"])
 def test_a_forged_crl_from_a_root_with_a_serial_not_positive_refuses_the_start(
-    tmp_path: Path, serial: int
+    tmp_path: Path, serial: int, own_akid: bool
 ) -> None:
     """Review finding F1 on vault BACKLOG #3506. Where warnings are errors, a CA whose serial is
     not positive was skipped, so a forged CRL naming its key read ``unlisted`` and the start
-    loaded it with a warning. That CA is read now, and the start refuses."""
+    loaded it with a warning. That CA is read now, and the start refuses. A root that names that
+    serial again in its own Authority Key Identifier is read too: reading its extensions warned
+    as well."""
     key = ec.generate_private_key(ec.SECP256R1())
+    odd = _zero_serial_ca(key, serial, own_akid=own_akid)
+    if own_akid:
+        # Control: the instrument is real. The parse of the extension itself warns.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", CryptographyDeprecationWarning)
+            cert = x509.load_der_x509_certificate(odd)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CryptographyDeprecationWarning)
+            with pytest.raises(CryptographyDeprecationWarning):
+                cert.extensions  # noqa: B018 -- the read is the point
     ca_file = tmp_path / "zero-serial-ca.pem"
-    ca_file.write_text(ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key, serial)), "ascii")
+    ca_file.write_text(ssl.DER_cert_to_PEM_cert(odd), "ascii")
     crl = tmp_path / "crl.pem"
     crl.write_bytes(_crl(ec.generate_private_key(ec.SECP256R1()), names=key, name=_ZERO_NAME))
     with warnings.catch_warnings():
@@ -928,6 +952,25 @@ def test_a_forged_crl_from_a_root_with_a_serial_not_positive_refuses_the_start(
         # Control: the CRL that CA's key signed loads, so the refusal is about the signature.
         crl.write_bytes(_crl(key, names=key, name=_ZERO_NAME))
         assert _hop(ca_file, crl).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_ca_whose_parse_raises_a_deprecation_is_skipped_alone(
+    twins: _Twins, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``CryptographyDeprecationWarning`` stays in ``_UNREADABLE_CA`` for any other deprecation
+    a CA's parse raises where warnings are errors: that CA is skipped, and the judgment goes on."""
+    real = pki_module._listed_ca
+    odd = _ders(twins.old_ca)[0]
+
+    def deprecated(der: bytes) -> pki_module._ListedCa:
+        if der == odd:
+            raise CryptographyDeprecationWarning("a deprecation this parse warns of")
+        return real(der)
+
+    monkeypatch.setattr(pki_module, "_listed_ca", deprecated)
+    forged = _crl(twins.stranger, names=twins.new_key)
+    judged = [s.state for s in judge_crl_signatures(forged, [odd, *_ders(twins.new_ca)])]
+    assert judged == ["bad"]
 
 
 def test_a_root_with_a_zero_serial_is_matched_by_its_real_serial_and_prints_no_warning() -> None:
@@ -965,6 +1008,8 @@ def test_a_root_with_a_zero_serial_is_matched_by_its_real_serial_and_prints_no_w
     with warnings.catch_warnings(record=True) as shown:
         warnings.simplefilter("always")
         assert [s.state for s in judge_crl_signatures(plain, [odd])] == ["bad"]
+        named = _zero_serial_ca(key, own_akid=True)
+        assert [s.state for s in judge_crl_signatures(plain, [named])] == ["bad"]
     assert not [w for w in shown if issubclass(w.category, CryptographyDeprecationWarning)]
 
 

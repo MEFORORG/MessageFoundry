@@ -71,6 +71,7 @@ __all__ = [
     "KeyWrapRefused",
     "MalformedDer",
     "Pkcs12EncryptedPart",
+    "der_children",
     "key_wrap_refusal",
     "load_checked_cert_chain",
     "load_connection_cert_chain",
@@ -186,12 +187,6 @@ def _read_tlv(buf: bytes, pos: int, limit: int) -> _Tlv:
     return _Tlv(tag, pos, pos + length)
 
 
-#: The DER reader under public names, for :mod:`messagefoundry.pki`'s read of a CA's serial number
-#: (vault BACKLOG #3506). One reader, so the two modules cannot drift apart on what DER they accept.
-MalformedDer = _Malformed
-read_der_tlv = _read_tlv
-
-
 def _children(buf: bytes, tlv: _Tlv) -> list[_Tlv]:
     """The TLVs inside a constructed value, which must fill it exactly."""
     out: list[_Tlv] = []
@@ -201,6 +196,15 @@ def _children(buf: bytes, tlv: _Tlv) -> list[_Tlv]:
         out.append(child)
         pos = child.end
     return out
+
+
+#: The DER reader under public names, for :mod:`messagefoundry.pki`'s read of a CA's serial
+#: numbers (vault BACKLOG #3506). One reader, so the two modules cannot drift apart on what they
+#: accept. It reads definite lengths and single-byte tags, and does not insist that a long-form
+#: length is minimal, so it accepts some BER that is not DER.
+MalformedDer = _Malformed
+read_der_tlv = _read_tlv
+der_children = _children
 
 
 def _oid(buf: bytes, tlv: _Tlv) -> str:

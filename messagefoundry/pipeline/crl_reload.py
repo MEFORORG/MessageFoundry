@@ -132,13 +132,7 @@ from messagefoundry.config.tls_policy import (
     judge_crl_bytes,
     staged_crl,
 )
-from messagefoundry.pipeline.alerts import (
-    BAD_SIGNATURE_AFTER,
-    BAD_SIGNATURE_CLASS,
-    REMINDER_SECONDS,
-    AlertSink,
-    LoggingAlertSink,
-)
+from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.pki import CrlBlock, CrlFacts, CrlIssuerKey, crl_signature_refusal
 from messagefoundry.redaction import log_timestamp
@@ -237,7 +231,7 @@ _REMEDY_CLASS = {
     FIX: "fix_file",
     WAIT: "wait",
     LAPSES_FIRST: "lapses_first",
-    BAD_SIGNATURE: BAD_SIGNATURE_CLASS,
+    BAD_SIGNATURE: "bad_signature",
     NO_ISSUER: "no_issuer",
     RETRY: "retry",
     _NOT_PROVABLE: "not_provable",
@@ -291,8 +285,8 @@ class ReloadOutcome:
     #: Contexts still on the copy they held when this pass ended. 0 when ``refusal`` is ``None``.
     stale: int = 0
     #: True when the remedy can send the operator to a restart (:data:`_LEADS_TO_A_START`) and a
-    #: start would refuse the file too, until one of its CRLs takes effect. The reason says so
-    #: with the time; an alert carries only this flag.
+    #: start would refuse the file too, at least until one of its CRLs takes effect. The reason
+    #: says so with the time; an alert carries only this flag.
     start_refuses: bool = False
 
     @property
@@ -440,7 +434,7 @@ class _Refusals:
         #: An unexpected failure, logged with its traceback once per file version.
         self.error: BaseException | None = None
         #: True when the refusal reported can send the operator to a restart and a start would
-        #: refuse the file too, until one of its CRLs takes effect
+        #: refuse the file too, at least until one of its CRLs takes effect
         #: (:attr:`ReloadOutcome.start_refuses`).
         self.start_refuses = False
 
@@ -760,13 +754,14 @@ def _reload_path(
         # ``_pending`` never replays it without the flag.
         refusals.start_refuses = True
         why, remedy = refusals.strongest
-        caveat = (
-            f"{why}. Not before {log_timestamp(unmet.this_update)}: a start until then refuses this "
-            f"file too, since its CRL from issuer {unmet.issuer!r} is not in effect"
+        # "At least": the time ends one cause of a refusal, and a start can refuse after it for
+        # another, such as a proven bad signature, which the reload cannot tell from an unproven
+        # one (vault BACKLOG #3506). The remedy says when.
+        refusals.strongest = (
+            f"{why}. Not before {log_timestamp(unmet.this_update)}: a start refuses this file too at least until then, "
+            f"since its CRL from issuer {unmet.issuer!r} is not in effect",
+            remedy,
         )
-        if remedy == BAD_SIGNATURE:
-            caveat += f". {BAD_SIGNATURE_AFTER}"
-        refusals.strongest = (caveat, remedy)
         # Judged again each pass, so the warning goes once its time has passed.
         refusals.reopen()
     return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)
