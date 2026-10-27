@@ -579,6 +579,24 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
   // ---- round 3: the refresh gate, the CLI timeout, and the http claim ----
 
+  /** An engine that has not minted its certificate yet. */
+  const NO_CERT_YET = {
+    api_tls: { scheme: "https", source: "generated", cert: "/nowhere.pem", cert_present: false },
+  };
+
+  /** An engine that has minted its certificate: plant it and answer with it. */
+  function plantedEngine(): unknown {
+    return inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+  }
+
+  /** The answering CLI, running `before` first, while the CLI is still "running". */
+  function cliThatFirst(before: () => void): typeof childProcess.execFile {
+    return ((...args: unknown[]) => {
+      before();
+      return (answeringCli as (...a: unknown[]) => unknown)(...args);
+    }) as unknown as typeof childProcess.execFile;
+  }
+
   test(
     "a caFile naming /dev/zero or a FIFO is refused without hanging",
     async function () {
@@ -635,7 +653,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
     // The count is back to 0, so a failure starts a refresh, and that one anchors the engine.
     childProcess.execFile = answeringCli;
-    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    stubInventory = plantedEngine();
     assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), false);
     await settle();
     assert.strictEqual(invocations.length, 2, "the failure-started refresh never ran");
@@ -651,14 +669,12 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
   test("a failure after the refresh's CLI answered runs one more refresh when it finishes", async () => {
     // The pending refresh asked the engine before the certificate existed, so it cannot pick it up.
-    stubInventory = {
-      api_tls: { scheme: "https", source: "generated", cert: "/nowhere.pem", cert_present: false },
-    };
+    stubInventory = NO_CERT_YET;
     const marker = remotePinLoggedAfterTheCli();
     onLog = (line): void => {
       if (line.includes(marker) && invocations.length === 1) {
         // The engine mints its certificate now, after its CLI answered, and a request fails.
-        stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+        stubInventory = plantedEngine();
         void trust.followCertificateChange(LOOPBACK, undefined);
       }
     };
@@ -671,13 +687,12 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
   });
 
   test("a failure while the CLI is still running is left to that refresh — the control", async () => {
-    const planted = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
-    childProcess.execFile = ((...args: unknown[]) => {
+    const planted = plantedEngine();
+    childProcess.execFile = cliThatFirst(() => {
       // Before the CLI answers: the answer below already includes the certificate.
       void trust.followCertificateChange(LOOPBACK, undefined);
       stubInventory = planted;
-      return (answeringCli as (...a: unknown[]) => unknown)(...args);
-    }) as unknown as typeof childProcess.execFile;
+    });
 
     await trust.refreshEngineTrust();
     await settle();
@@ -688,9 +703,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
   test("late failures run one follow-up, never a chain", async () => {
     // The engine never mints: each refresh, the follow-up included, sees a failure after its CLI.
-    stubInventory = {
-      api_tls: { scheme: "https", source: "generated", cert: "/nowhere.pem", cert_present: false },
-    };
+    stubInventory = NO_CERT_YET;
     const marker = remotePinLoggedAfterTheCli();
     onLog = (line): void => {
       if (line.includes(marker)) {
@@ -719,10 +732,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
   test("a caFile rotated while the CLI runs is not overwritten by an older read", async () => {
     const caFile = plantCert(path.join("pki", "prod-ca.pem"));
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
-    childProcess.execFile = ((...args: unknown[]) => {
-      fs.writeFileSync(caFile, RENEWED);
-      return (answeringCli as (...a: unknown[]) => unknown)(...args);
-    }) as unknown as typeof childProcess.execFile;
+    childProcess.execFile = cliThatFirst(() => fs.writeFileSync(caFile, RENEWED));
 
     await trust.refreshEngineTrust();
 
@@ -731,7 +741,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
   test("a caFile on an http:// entry does not take the anchor from an https engineUrl", async () => {
     // Host keys carry no scheme, so a claim from the http entry would land on the https engine.
-    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    stubInventory = plantedEngine();
     const caFile = plantCert(path.join("pki", "dev-ca.pem"));
     stubConfig.environments = [{ name: "DEV", url: "http://127.0.0.1:8765", caFile }];
 
@@ -745,14 +755,12 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
   });
 
   test("nor does it stop a failure from asking the CLI again", async () => {
-    stubInventory = {
-      api_tls: { scheme: "https", source: "generated", cert: "/nowhere.pem", cert_present: false },
-    };
+    stubInventory = NO_CERT_YET;
     stubConfig.environments = [
       { name: "DEV", url: "http://127.0.0.1:8765", caFile: plantCert(path.join("pki", "dev-ca.pem")) },
     ];
     await trust.refreshEngineTrust();
-    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    stubInventory = plantedEngine();
 
     assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), false);
     await settle();

@@ -87,12 +87,12 @@ let lastFailureRefresh = Number.NEGATIVE_INFINITY;
  *  see {@link lateFailureKey} for the one case the pending refresh cannot cover. */
 let refreshesPending = 0;
 
-/** The running refresh's CLI call has returned (or was never made), so a certificate minted from now
- *  on is invisible to it. */
-let cliAnswered = false;
-
-/** The running refresh was itself started by {@link lateFailureKey}; it schedules no further one. */
-let runningIsFollowUp = false;
+/**
+ * The running refresh's CLI call has returned (or was never made), so a certificate minted from now
+ * on is invisible to it, AND that refresh is not itself a follow-up: a failure now may ask for one
+ * more refresh ({@link lateFailureKey}).
+ */
+let acceptsLateFailure = false;
 
 /**
  * The host key of a CLI-anchorable failure that arrived after the last pending refresh's CLI had
@@ -147,16 +147,12 @@ export function refreshEngineTrust(): Promise<boolean> {
 
 function queueRefresh(followUp: boolean): Promise<boolean> {
   refreshesPending++;
-  const once = (): Promise<boolean> => {
-    runningIsFollowUp = followUp;
-    cliAnswered = false;
-    return refreshOnce();
-  };
+  const once = (): Promise<boolean> => refreshOnce(followUp);
   // `finally`, so the count returns to 0 however the refresh ended; the CLI's timeout is what makes
   // sure it does end.
   const run = refreshTail.then(once, once).finally(() => {
     refreshesPending--;
-    cliAnswered = false;
+    acceptsLateFailure = false;
     if (refreshesPending === 0) {
       startLateFollowUp();
     }
@@ -186,7 +182,7 @@ function stage(next: Staged, url: string, anchor: Registered): void {
   }
 }
 
-async function refreshOnce(): Promise<boolean> {
+async function refreshOnce(followUp: boolean): Promise<boolean> {
   const before = trustState();
   const next: Staged = new Map();
   const targets = pinTargetsOf(environments());
@@ -195,7 +191,7 @@ async function refreshOnce(): Promise<boolean> {
   try {
     await anchorLocalEngine(claimed, next);
   } finally {
-    cliAnswered = true;
+    acceptsLateFailure = !followUp;
   }
   // The pin FILES are read only now, after the CLI has answered, so nothing a request follows while
   // the CLI runs (a caFile rotated in place) is overwritten below by a read taken before it.
@@ -216,21 +212,15 @@ async function refreshOnce(): Promise<boolean> {
 }
 
 /**
- * Every host key a `caFile` CLAIMS, whether or not its pin can be used.
- *
- * A claimed key whose pin is refused or unreadable gets NO anchor, not the certificate
- * `messagefoundry.serviceConfig` names. The user pinned that host so that a workspace-chosen file
- * would not decide it; falling back to one when the pin breaks would undo that.
- *
- * The one exception is a pin on an `http://` url. Host keys carry no scheme, so claiming one would let
- * a plain-http entry, which has no handshake to pin, take the anchor away from an https `engineUrl`
- * on the same `host:port`. Such an entry pins nothing whatever its file says, so it claims nothing.
+ * Every host key a `caFile` CLAIMS, whether or not its pin can be used ({@link TrustPin} says which
+ * refusals claim). A claimed key whose pin is refused or unreadable gets NO anchor, not the
+ * certificate `messagefoundry.serviceConfig` names.
  */
 function claimedBy(pins: readonly TrustPin[]): Set<string> {
   const claimed = new Set<string>();
   for (const pin of pins) {
-    const key = engineHostKey(pin.url);
-    if (key !== undefined && isHttpsUrl(pin.url)) {
+    const key = pin.kind === "pin" ? pin.key : pin.claims;
+    if (key !== undefined) {
       claimed.add(key);
     }
   }
@@ -245,12 +235,20 @@ function claimedBy(pins: readonly TrustPin[]): Set<string> {
  * machine.
  */
 async function stagePins(pins: readonly TrustPin[], next: Staged): Promise<void> {
+  // All at once, one read per distinct file (an engine shard inherits its environment's), so several
+  // files on an unreachable share cost one share timeout rather than one each.
+  const reads = new Map<string, Promise<PemRead>>();
+  for (const pin of pins) {
+    if (pin.kind === "pin" && !reads.has(pin.file)) {
+      reads.set(pin.file, readAnchorPem(pin.file));
+    }
+  }
   for (const pin of pins) {
     if (pin.kind === "refused") {
       engineLog().warn(`messagefoundry.environments: not pinning ${pin.url}: ${pin.reason}`);
       continue;
     }
-    const read = await readAnchorPem(pin.file);
+    const read = await (reads.get(pin.file) as Promise<PemRead>);
     if (read.pem === undefined) {
       engineLog().warn(`${read.problem} — not pinning ${pin.url}`);
       continue;
@@ -461,7 +459,7 @@ function cliCouldAnchor(key: string): boolean {
  */
 function noteCliAnchorableFailure(key: string): void {
   if (refreshesPending > 0) {
-    if (refreshesPending === 1 && cliAnswered && !runningIsFollowUp) {
+    if (refreshesPending === 1 && acceptsLateFailure) {
       lateFailureKey = key;
     }
     return;

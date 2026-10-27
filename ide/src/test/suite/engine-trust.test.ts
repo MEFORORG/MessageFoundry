@@ -450,6 +450,12 @@ suite("per-target caFile pins (BACKLOG #1695, residual a)", () => {
       decisions.map((d) => d.kind),
       ["refused", "refused", "refused"],
     );
+    // An https refusal still claims its host, so it is not handed the workspace's certificate. An
+    // http one claims nothing: its key has no scheme and would take an https engine's anchor.
+    assert.deepStrictEqual(
+      decisions.map((d) => (d.kind === "refused" ? d.claims : d.key)),
+      ["prod:8765", undefined, undefined],
+    );
   });
 
   test("a second, different file for one host:port is refused; the same file twice is not", () => {

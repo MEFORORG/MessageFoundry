@@ -309,10 +309,23 @@ export function pinTargetsOf(envs: readonly PinnableEnvironment[]): PinTarget[] 
   return out;
 }
 
-/** What the pin pass decided for one target that named a `caFile`. */
+/**
+ * What the pin pass decided for one target that named a `caFile`.
+ *
+ * A refusal still CLAIMS its host (`claims`, the host key) when the target is https: the user meant
+ * to pin that host, so a broken pin must leave it unanchored rather than hand it to the certificate a
+ * workspace setting names. An `http://` target claims nothing. Host keys carry no scheme, so a claim
+ * there would take the anchor from an https engine on the same `host:port`, and plain http has no
+ * handshake to pin anyway.
+ */
 export type TrustPin =
   | { readonly kind: "pin"; readonly url: string; readonly key: string; readonly file: string }
-  | { readonly kind: "refused"; readonly url: string; readonly reason: string };
+  | {
+      readonly kind: "refused";
+      readonly url: string;
+      readonly reason: string;
+      readonly claims: string | undefined;
+    };
 
 /** The two path flavours {@link isFullyQualifiedPath} distinguishes; `node:path` itself is one. */
 type PathFlavour = Pick<typeof path, "sep" | "isAbsolute" | "normalize">;
@@ -370,14 +383,17 @@ export function trustPinsFor(
     if (caFile === undefined || caFile === null || caFile === "") {
       continue;
     }
+    const parsed = engineHostKey(url);
+    const key = parsed !== undefined && isHttpsUrl(url) ? parsed : undefined;
     if (typeof caFile !== "string") {
-      out.push({ kind: "refused", url, reason: "caFile is not a string" });
+      out.push({ kind: "refused", url, reason: "caFile is not a string", claims: key });
       continue;
     }
     if (!isFullyQualifiedPath(caFile, flavour)) {
       out.push({
         kind: "refused",
         url,
+        claims: key,
         reason:
           flavour.sep === "\\"
             ? `caFile ${caFile} is not a full path (on Windows: a drive-letter or UNC path)`
@@ -385,9 +401,13 @@ export function trustPinsFor(
       });
       continue;
     }
-    const key = engineHostKey(url);
-    if (key === undefined || !isHttpsUrl(url)) {
-      out.push({ kind: "refused", url, reason: "caFile applies only to an https:// url" });
+    if (key === undefined) {
+      out.push({
+        kind: "refused",
+        url,
+        reason: "caFile applies only to an https:// url",
+        claims: undefined,
+      });
       continue;
     }
     const file = flavour.normalize(caFile);
@@ -401,6 +421,7 @@ export function trustPinsFor(
           kind: "refused",
           url,
           reason: `${key} is already pinned to ${earlier} by an earlier entry`,
+          claims: key,
         });
       }
       continue;
