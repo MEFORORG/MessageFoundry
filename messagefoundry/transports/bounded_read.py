@@ -133,7 +133,6 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast, overload
 
 from messagefoundry.config.tls_policy import is_loopback_hop_host, verifies_peer_fully
-from messagefoundry.controlchars import CONTROL_CATEGORIES
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.transports.base import DeliveryError, NegativeAckError, ReplyBodyDropped
 
@@ -1106,12 +1105,27 @@ def proxy_credential_header_name_shown(name: str) -> str:
 def _is_shown_separator(ch: str) -> bool:
     """Whether an error may show ``ch`` beside the plain name (vault BACKLOG #3457).
 
-    Whitespace and the invisible characters of :data:`CONTROL_CATEGORIES`: no printable
-    credential is made of them, and an operator cannot see them in the key, so the error is the
-    one place that names them. And a colon, which a key copied from a ``Name: value`` header line
-    ends in. A colon is printable and a credential may hold one, so a credential that starts with
-    colons has those colons shown; nothing else of it is."""
-    return ch == ":" or ch.isspace() or unicodedata.category(ch) in CONTROL_CATEGORIES
+    Whitespace, control characters (category ``Cc``) and the few invisible format characters in
+    :data:`_SHOWN_FORMAT_CHARACTERS`: an operator cannot see them in the key, so the error is the
+    one place that names them, and none carries text. The set is fixed here on purpose rather
+    than read from :data:`~messagefoundry.controlchars.CONTROL_CATEGORIES`, whose safe direction
+    is the opposite (adding to it escapes more, where adding here shows more), and which holds
+    the tag characters and lone surrogates that can spell a credential one to one. And a colon,
+    which a key copied from a ``Name: value`` header line ends in. A colon is printable and a
+    credential may hold one, so a credential that starts with colons has those colons shown;
+    nothing else of it is."""
+    return (
+        ch == ":"
+        or ch.isspace()
+        or unicodedata.category(ch) == "Cc"
+        or ch in _SHOWN_FORMAT_CHARACTERS
+    )
+
+
+#: Invisible format characters an error may show beside the plain name: soft hyphen, zero-width
+#: space, non-joiner and joiner, word joiner, and byte-order mark. Each is one fixed character
+#: and carries no text, unlike the tag characters (U+E0000 block) of the same category.
+_SHOWN_FORMAT_CHARACTERS = frozenset("\u00ad\u200b\u200c\u200d\u2060\ufeff")
 
 
 def _is_spelled_plainly(name: str | bytes) -> bool:

@@ -1771,7 +1771,16 @@ def test_a_plain_value_is_asked_about_once_an_open_and_only_when_it_could_be_ref
         (":" + _NAME, repr(":" + _NAME)),
         (_NAME + "\x85\u3000\u2028\u2029", repr(_NAME + "\x85\u3000\u2028\u2029")),
         ("\ufeff" + _NAME + "\u200b\u00ad", repr("\ufeff" + _NAME + "\u200b\u00ad")),
-        (_NAME + "\ue000", repr(_NAME + "\ue000")),
+        (_NAME + "\ue000", repr(_NAME) + " followed by more text, not shown"),
+        (
+            _NAME + "".join(chr(0xE0000 + ord(c)) for c in "S3cret"),
+            repr(_NAME) + " followed by more text, not shown",
+        ),
+        (_NAME + "\udcc3\udca4", repr(_NAME) + " followed by more text, not shown"),
+        (
+            "\U000e0053" + _NAME,
+            "a key holding Proxy-Authorization after other text, not shown",
+        ),
     ],
     ids=[
         "plain",
@@ -1792,12 +1801,16 @@ def test_a_plain_value_is_asked_about_once_an_open_and_only_when_it_could_be_ref
         "c1-and-unicode-separators",
         "format-characters",
         "private-use",
+        "tag-characters",
+        "lone-surrogates",
+        "tag-character-before",
     ],
 )
 def test_an_error_shows_nothing_but_separators_around_the_plain_name(name: str, shown: str) -> None:
     """A credential typed into the key may hold letters and digits in any script, and
-    punctuation too: base64 holds ``+``, ``/`` and ``=``. So around the plain name only
-    whitespace, invisible characters and colons are shown, and a cut at the cap is named, so
-    the shown key never reads as whole when it is not."""
+    punctuation too: base64 holds ``+``, ``/`` and ``=``, and tag characters or lone
+    surrogates can spell one a character at a time. So around the plain name only whitespace,
+    control characters, a few fixed invisible format characters and colons are shown, and a
+    cut at the cap is named, so the shown key never reads as whole when it is not."""
     assert is_proxy_credential_header_name(name)
     assert bounded_read.proxy_credential_header_name_shown(name) == shown
