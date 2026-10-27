@@ -1967,7 +1967,8 @@ rule 1 would also stop the engine starting, so fix the file. A file whose CRL fa
 check under rule 2 is held back too. On the signature, a start refuses it only where the engine
 proves the signature bad, so fix that file. Short of that proof the signature does not stop a
 start: unless another rule refuses the file, a start loads it with a warning, and each handshake
-then decides. The next paragraphs say what counts as proof, and name cases that load.
+then decides. *A start checks each CRL's signature too*, further down, says what counts as proof,
+and names cases that load.
 
 **The private copy is about the temporary directory, not the CRL.** The reload loads a private copy
 of the file, made in the engine's temporary directory. When it cannot make that copy, it refuses with
@@ -2029,18 +2030,22 @@ three cases warn:
   over SHA-1 that the CA did make.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
-it judged before the failure is proved badly signed, which refuses the file; the other CRLs it
-judged warn. The CRLs after the failure are not judged, so a bad one there loads (vault BACKLOG
-#3506).
+it judged before the failure is proved badly signed, which refuses the file. Where it loads, a CRL
+it judged and could not confirm is named in the WARNING too; one it verified is not. The CRLs after
+the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
-engine process logs the WARNING once while the file keeps the same bytes. It keeps that record for
-one version only, the last one it logged a line for. So an earlier version is logged again when it
-returns after another version that was logged. A version in between that logged nothing, because
-it verified or was refused, does not reset the record. A hop whose CA list
+engine process logs the WARNING once while the file keeps the same bytes, and the ERROR above
+once too. It keeps that record for one version only, the last one it logged either line for. So
+an earlier version is logged again when it returns after another version that was logged. A
+version in between that logged neither line does not reset the record: one that verified, or one
+refused with no failure in the check. A version refused after the check failed part way did log
+its ERROR, so it does reset the record. A hop whose CA list
 gives a different result for the same file logs its own line, and each engine shard logs its own. A system
-root the hop has loaded counts as a listed CA. So the same proof against a system root's key refuses
-the start too.
+root the hop has loaded counts as a listed CA, including one whose serial number is not positive,
+as at least some roots carry. So the same proof against a system root's key refuses the start too.
+A CA certificate the engine cannot read at all is the exception: it is skipped, so a CRL it issued
+reads as matched to no listed CA.
 
 The reload is stricter than a start. Under rule 2 it holds back every CRL it cannot confirm against
 a listed CA. Where the engine matches the CRL to a listed CA and cannot confirm the signature with
@@ -2092,7 +2097,7 @@ transport it is a WARNING in the log, beside the reload's ERROR.
 | `remedy_class` | a short token for what to do next; see the next table |
 | `stale_contexts` | how many running TLS contexts still held the old copy at the last reload pass that reported the refusal. A reminder carries that latest count, so it can differ from the count the alert was first raised with |
 | `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
-| `start_refuses` | `true`, and present only then. The remedy could lead you to restart, by naming a restart or by saying a start can load the file, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then |
+| `start_refuses` | `true`, and present only then. The remedy could lead you to restart, by naming a restart or by saying a start can load the file, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then. With `bad_signature` that time is no promise: a start refuses the file after it too, where it proves the signature bad |
 
 This event carries no CRL contents. The reason for the refusal quotes CRL issuer names and dates, so
 it is left out of this event. It is in the engine log, in the `crl_reload` ERROR line. Read that

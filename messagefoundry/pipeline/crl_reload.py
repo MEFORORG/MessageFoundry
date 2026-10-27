@@ -132,7 +132,13 @@ from messagefoundry.config.tls_policy import (
     judge_crl_bytes,
     staged_crl,
 )
-from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import (
+    BAD_SIGNATURE_AFTER,
+    BAD_SIGNATURE_CLASS,
+    REMINDER_SECONDS,
+    AlertSink,
+    LoggingAlertSink,
+)
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.pki import CrlBlock, CrlFacts, CrlIssuerKey, crl_signature_refusal
 from messagefoundry.redaction import log_timestamp
@@ -231,7 +237,7 @@ _REMEDY_CLASS = {
     FIX: "fix_file",
     WAIT: "wait",
     LAPSES_FIRST: "lapses_first",
-    BAD_SIGNATURE: "bad_signature",
+    BAD_SIGNATURE: BAD_SIGNATURE_CLASS,
     NO_ISSUER: "no_issuer",
     RETRY: "retry",
     _NOT_PROVABLE: "not_provable",
@@ -754,11 +760,13 @@ def _reload_path(
         # ``_pending`` never replays it without the flag.
         refusals.start_refuses = True
         why, remedy = refusals.strongest
-        refusals.strongest = (
+        caveat = (
             f"{why}. Not before {log_timestamp(unmet.this_update)}: a start until then refuses this "
-            f"file too, since its CRL from issuer {unmet.issuer!r} is not in effect",
-            remedy,
+            f"file too, since its CRL from issuer {unmet.issuer!r} is not in effect"
         )
+        if remedy == BAD_SIGNATURE:
+            caveat += f". {BAD_SIGNATURE_AFTER}"
+        refusals.strongest = (caveat, remedy)
         # Judged again each pass, so the warning goes once its time has passed.
         refusals.reopen()
     return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)

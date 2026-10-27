@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime
 import ssl
+import warnings
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ from cryptography import x509
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, padding, rsa
+from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.x509.oid import NameOID
 
 from messagefoundry import pki as pki_module
@@ -534,8 +536,8 @@ def test_a_ca_cryptography_cannot_read_is_skipped_alone(
     real = pki_module._akid_fit
     old = x509.load_pem_x509_certificate(twins.old_ca.read_bytes())
 
-    def fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
-        if ca == old:
+    def fit(crl: x509.CertificateRevocationList, ca: pki_module._ListedCa) -> bool | None:
+        if ca.cert == old:
             raise x509.UnsupportedGeneralNameType("x400Address is not supported")
         return real(crl, ca)
 
@@ -830,14 +832,12 @@ def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
     real = pki_module._signature_state
     calls = 0
 
-    def second_fails(
-        crl: x509.CertificateRevocationList, cas: list[tuple[object, x509.Certificate]]
-    ) -> str:
+    def second_fails(crl: x509.CertificateRevocationList, cas: list[pki_module._ListedCa]) -> str:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise RuntimeError("a defect in the check")
-        return real(crl, cas)  # type: ignore[arg-type]
+        return real(crl, cas)
 
     monkeypatch.setattr(pki_module, "_signature_state", second_fails)
     twins.crl.write_bytes(
@@ -863,39 +863,41 @@ def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
     assert [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
 
 
-def _zero_serial_ca() -> bytes:
-    """A CA certificate, as DER, whose serial number is 0, as at least some system roots carry. It
-    is built with serial 1 and then edited, since the builder refuses 0; its signature then fails,
-    which ``cryptography``'s parse does not check."""
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-zero-serial")])
+#: The name of the CA :func:`_zero_serial_ca` makes.
+_ZERO_NAME = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-zero-serial")])
+
+
+def _zero_serial_ca(key: ec.EllipticCurvePrivateKey, serial: int = 0x00) -> bytes:
+    """A CA certificate for ``key``, as DER, whose serial number is the one byte ``serial``: 0x00
+    for 0, as at least some system roots carry, or 0x80 for -128. It is built with serial 1 and
+    then edited, since the builder refuses both; its own signature then fails, which neither
+    ``cryptography``'s parse nor OpenSSL's load checks. It carries a Subject Key Identifier, so a
+    CRL can name its key."""
     der = (
         x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
+        .subject_name(_ZERO_NAME)
+        .issuer_name(_ZERO_NAME)
         .public_key(key.public_key())
         .serial_number(1)
         .not_valid_before(_NOW - _DAY)
         .not_valid_after(_NOW + _DAY)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
         .sign(key, hashes.SHA256())
         .public_bytes(serialization.Encoding.DER)
     )
     version_and_serial = bytes.fromhex("a003020102020101")  # v3, then INTEGER 1
     assert der.count(version_and_serial) == 1
-    return der.replace(version_and_serial, version_and_serial[:-1] + bytes(1))
+    return der.replace(version_and_serial, version_and_serial[:-1] + bytes([serial]))
 
 
-def test_a_root_with_a_zero_serial_is_skipped_alone_where_warnings_are_errors(
+def test_a_root_with_a_zero_serial_does_not_end_the_judgment_where_warnings_are_errors(
     twins: _Twins,
 ) -> None:
     """The Manager's item 3. Under warnings as errors, ``cryptography``'s warning about a serial
     number that is not positive used to end the whole judgment, so a CRL proven badly signed
-    loaded. Now that one CA is skipped, and the proof from another CA stands."""
-    import warnings
-
-    from cryptography.utils import CryptographyDeprecationWarning
-
-    odd = _zero_serial_ca()
+    loaded. The proof from another CA stands beside such a CA."""
+    odd = _zero_serial_ca(ec.generate_private_key(ec.SECP256R1()))
     forged = _crl(twins.stranger, names=twins.new_key)
     with warnings.catch_warnings():
         warnings.simplefilter("error", CryptographyDeprecationWarning)
@@ -904,6 +906,66 @@ def test_a_root_with_a_zero_serial_is_skipped_alone_where_warnings_are_errors(
             x509.load_der_x509_certificate(odd)
         judged = [s.state for s in judge_crl_signatures(forged, [odd, *_ders(twins.new_ca)])]
     assert judged == ["bad"]
+
+
+@pytest.mark.parametrize("serial", [0x00, 0x80], ids=["zero", "negative"])
+def test_a_forged_crl_from_a_root_with_a_serial_not_positive_refuses_the_start(
+    tmp_path: Path, serial: int
+) -> None:
+    """Review finding F1 on vault BACKLOG #3506. Where warnings are errors, a CA whose serial is
+    not positive was skipped, so a forged CRL naming its key read ``unlisted`` and the start
+    loaded it with a warning. That CA is read now, and the start refuses."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    ca_file = tmp_path / "zero-serial-ca.pem"
+    ca_file.write_text(ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key, serial)), "ascii")
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(_crl(ec.generate_private_key(ec.SECP256R1()), names=key, name=_ZERO_NAME))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        with pytest.raises(ValueError, match="does not verify the CRL's signature") as refused:
+            _hop(ca_file, crl)
+        assert "mefor-3506-zero-serial" in str(refused.value)
+        # Control: the CRL that CA's key signed loads, so the refusal is about the signature.
+        crl.write_bytes(_crl(key, names=key, name=_ZERO_NAME))
+        assert _hop(ca_file, crl).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_root_with_a_zero_serial_is_matched_by_its_real_serial_and_prints_no_warning() -> None:
+    """The Authority Key Identifier match reads the serial the CA carries, not the one the parsed
+    copy carries. In a normal run that CA prints no raw ``cryptography`` warning either."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    stranger = ec.generate_private_key(ec.SECP256R1())
+    odd = _zero_serial_ca(key)
+
+    def forged(serial: int) -> bytes:
+        akid = x509.AuthorityKeyIdentifier(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()).digest,
+            [x509.DirectoryName(_ZERO_NAME)],
+            serial,
+        )
+        return (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(_ZERO_NAME)
+            .last_update(_NOW - _DAY)
+            .next_update(_NOW + 30 * _DAY)
+            .add_extension(akid, False)
+            .sign(stranger, hashes.SHA256())
+            .public_bytes(_PEM)
+        )
+
+    with warnings.catch_warnings():
+        # Reading a serial of 0 in the CRL's own key identifier warns too. That is the CRL's
+        # warning, not the CA's, so this test keeps it quiet.
+        warnings.simplefilter("ignore", CryptographyDeprecationWarning)
+        assert [s.state for s in judge_crl_signatures(forged(0), [odd])] == ["bad"]
+        # Control: serial 1, the parsed copy's serial, is not that CA's, so no CA fits.
+        assert [s.state for s in judge_crl_signatures(forged(1), [odd])] == ["unlisted"]
+
+    plain = _crl(stranger, names=key, name=_ZERO_NAME)  # a key identifier alone, as is usual
+    with warnings.catch_warnings(record=True) as shown:
+        warnings.simplefilter("always")
+        assert [s.state for s in judge_crl_signatures(plain, [odd])] == ["bad"]
+    assert not [w for w in shown if issubclass(w.category, CryptographyDeprecationWarning)]
 
 
 def test_a_long_issuer_name_is_quoted_with_a_bound(twins: _Twins) -> None:

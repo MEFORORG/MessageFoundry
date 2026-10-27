@@ -36,6 +36,8 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry.keywrap import (
     Pkcs12EncryptedPart,
+    _Malformed,
+    _read_tlv,
     pkcs12_encrypted_parts,
     refuse_weak_pkcs12,
     refuse_weak_pkcs12_contents,
@@ -445,11 +447,10 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
     that OpenSSL loads. Before vault BACKLOG #2905 such a CA raised out of the reload's check,
     which then retried every pass. ``pem`` must be bytes :func:`judge_every_crl` accepted; a
     block that does not parse raises ``ValueError``."""
-    cas: list[tuple[_NameKey, x509.Certificate]] = []
+    cas: list[_ListedCa] = []
     for der in ca_ders:
         try:
-            ca = x509.load_der_x509_certificate(der)
-            cas.append((_issuer_name_key(ca.subject), ca))
+            cas.append(_listed_ca(der))
         except _UNREADABLE_CA:
             continue
     blocks = list(_crl_blocks(pem))
@@ -484,12 +485,10 @@ def _quoted_issuer(issuer: str) -> str:
 #: What ``cryptography`` raises for a CA certificate it cannot read, at least. A CA that raises
 #: one is skipped by :func:`judge_crl_signatures`, alone. ``InvalidVersion`` comes from the
 #: parse, and ``UnsupportedGeneralNameType`` from reading extensions; neither is a ``ValueError``.
-#: ``CryptographyDeprecationWarning`` is raised only where warnings are errors: the parse warns of a
-#: CA whose serial number is not positive, which at least some system roots carry, and so does
-#: reading that serial. As an error it used to end the whole judgment (vault BACKLOG #3506). Now
-#: that CA alone is skipped, so a CRL it issued reads ``unlisted``, the warning arm. The warning is
-#: not silenced in a normal run: ``warnings.catch_warnings`` swaps the process's filters, and a
-#: start and a reload can run this on two threads at once.
+#: ``CryptographyDeprecationWarning`` is raised only where warnings are errors. A CA whose serial
+#: number is not positive no longer raises it, because :func:`_listed_ca` reads that CA without
+#: the warning. It stays here for any other deprecation the parse warns of, so such a CA is
+#: skipped alone rather than ending the whole judgment (vault BACKLOG #3506).
 _UNREADABLE_CA = (
     ValueError,
     x509.InvalidVersion,
@@ -499,6 +498,73 @@ _UNREADABLE_CA = (
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
 _NameKey = tuple[tuple[tuple[str, bool, str | bytes], ...], ...]
+
+
+@dataclass(frozen=True)
+class _ListedCa:
+    """One CA from a hop's list, as :func:`_signature_state` reads it. ``serial`` is the serial
+    number the certificate carries, which can differ from ``cert.serial_number``
+    (:func:`_listed_ca` says when)."""
+
+    name: _NameKey
+    cert: x509.Certificate
+    serial: int
+
+
+def _listed_ca(der: bytes) -> _ListedCa:
+    """The CA certificate ``der``, read for :func:`judge_crl_signatures` (vault BACKLOG #3506).
+
+    **A serial number that is not positive is read without ``cryptography``'s warning.** At
+    least some system roots carry serial 0. ``cryptography`` warns when it parses such a CA and
+    again when it reads the serial, and where warnings are errors the warning is raised instead.
+    That CA was then skipped, so a forged CRL naming its key read ``unlisted`` and loaded with a
+    warning. Silencing the warning needs a change to the process's warning filters, and a start
+    and a reload can run this on two threads at once. So instead the serial's first byte is
+    rewritten to ``0x01`` in a copy of the bytes, which keeps the length and makes the number
+    positive, and the copy is parsed. The real serial is kept in :attr:`_ListedCa.serial` for the
+    Authority Key Identifier match. The copy's own signature is then wrong, which nothing here
+    reads: the check uses the subject, the issuer, the extensions and the public key, and those
+    bytes are unchanged. A serial that is not minimally encoded is left as it is, so the parse
+    refuses it as before. ``cryptography`` says it will refuse such a serial outright in a later
+    release; this reads the CA all the same."""
+    serial: int | None = None
+    if (span := _der_serial_span(der)) is not None:
+        start, end = span
+        content = der[start:end]
+        # Zero, or negative and minimally encoded: a non-minimal one is left for the parse to refuse.
+        if content == b"\x00" or (
+            content[0] >= 0x80
+            and not (content[0] == 0xFF and len(content) > 1 and content[1] >= 0x80)
+        ):
+            serial = int.from_bytes(content, "big", signed=True)
+            der = der[:start] + b"\x01" + der[start + 1 :]
+    ca = x509.load_der_x509_certificate(der)
+    return _ListedCa(
+        _issuer_name_key(ca.subject), ca, ca.serial_number if serial is None else serial
+    )
+
+
+def _der_serial_span(der: bytes) -> tuple[int, int] | None:
+    """Where the serial number's content sits in the certificate ``der``, or ``None`` when the
+    bytes do not have that shape; the parse then judges them. A certificate is a SEQUENCE whose
+    first element, the TBSCertificate, is a SEQUENCE that starts with an optional explicit
+    version, tag ``[0]``, and then the serial, an INTEGER."""
+    try:
+        certificate = _read_tlv(der, 0, len(der))
+        tbs = _read_tlv(der, certificate.start, certificate.end)
+        element = _read_tlv(der, tbs.start, tbs.end)
+        if element.tag == 0xA0:
+            element = _read_tlv(der, element.end, tbs.end)
+    except _Malformed:
+        return None
+    if (certificate.tag, tbs.tag, element.tag) != (
+        0x30,
+        0x30,
+        0x02,
+    ) or element.start == element.end:
+        return None
+    return element.start, element.end
+
 
 #: The 26 ASCII capitals to their lower case, and no other character.
 _ASCII_FOLD = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
@@ -608,15 +674,15 @@ def _crl_attribute_key(attribute: x509.NameAttribute[str | bytes]) -> tuple[str,
 
 
 def _signature_state(
-    crl: x509.CertificateRevocationList, cas: list[tuple[_NameKey, x509.Certificate]]
+    crl: x509.CertificateRevocationList, cas: list[_ListedCa]
 ) -> CrlSignatureState:
     """Which :class:`CrlSignature` state ``cas`` gives ``crl``."""
     issuer = _issuer_name_key(crl.issuer)
     fitting = False
     named = False  # the CRL names some fitting CA's key
     unchecked = False
-    for subject, ca in cas:
-        if subject != issuer:
+    for ca in cas:
+        if ca.name != issuer:
             continue
         try:
             names_key = _akid_fit(crl, ca)
@@ -626,7 +692,7 @@ def _signature_state(
             continue
         fitting = True
         named = named or names_key
-        answer = _verifies(crl, ca)
+        answer = _verifies(crl, ca.cert)
         if answer:
             return "verified"
         unchecked = unchecked or answer is None
@@ -684,9 +750,10 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     return None if unlisted is None else (unlisted, False)
 
 
-def _akid_fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
-    """How ``ca`` fits ``crl``'s Authority Key Identifier, the way OpenSSL's ``X509_check_akid``
-    matches one: each part the AKID carries must match the CA. ``None`` when it does not fit.
+def _akid_fit(crl: x509.CertificateRevocationList, listed: _ListedCa) -> bool | None:
+    """How the CA ``listed`` fits ``crl``'s Authority Key Identifier, the way OpenSSL's
+    ``X509_check_akid`` matches one: each part the AKID carries must match the CA. ``None`` when
+    it does not fit.
 
     When it fits, the answer is whether the CRL **names the CA's key**: the AKID carries a key
     identifier, the CA carries a Subject Key Identifier, and the two are equal. A CRL with no key
@@ -697,6 +764,7 @@ def _akid_fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
         return False
     except x509.DuplicateExtension:
         return None
+    ca = listed.cert
     names_key = False
     if akid.key_identifier is not None:
         try:
@@ -710,7 +778,7 @@ def _akid_fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
                 return None
             names_key = True
     serial = akid.authority_cert_serial_number
-    if serial is not None and serial != ca.serial_number:
+    if serial is not None and serial != listed.serial:
         return None
     names = [
         name.value
