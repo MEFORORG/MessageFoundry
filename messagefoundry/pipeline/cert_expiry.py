@@ -586,14 +586,16 @@ class _HeldCopyLog:
         )
 
     def unchecked_later_crl(self, cert: MonitoredCert) -> None:
-        """Log that a later CRL in ``cert``'s CA file did not parse for the signature check, so an
-        earlier CRL's unconfirmed verdict stands (BACKLOG #3512). Called inside the ``except``, so
-        the line carries the cause. Folded as :meth:`warn` folds."""
+        """Log that a later CRL in ``cert``'s CA file did not parse for the signature check, after
+        an earlier CRL's signature was not confirmed, so the alert says the engine cannot judge the
+        file (BACKLOG #3512). Called inside the ``except``, so the line carries the cause. Folded
+        as :meth:`warn` folds."""
         self._log_once(
             cert,
             _UNCHECKED_LATER_CRL,
-            "cert_expiry: could not check the signature of a later CRL in %r CA file %s, so an "
-            "earlier CRL's unconfirmed signature decides the alert.%s",
+            "cert_expiry: row %r: could not check the signature of a later CRL in the CA file %s, "
+            "after an earlier CRL's signature was not confirmed, so the alert says the engine "
+            "cannot judge the file.%s",
             failure="could not log the unchecked CRL of",
             exc_info=True,
         )
@@ -645,6 +647,12 @@ def held_crl_label(path: str) -> str:
     return f"held-crl:{path}"
 
 
+#: The signature states of a :class:`~messagefoundry.pki.CrlSignature` the engine could not confirm
+#: either way. Named once, for the remedy that asks for a check and for the guard that catches an
+#: unread later block after one of them (BACKLOG #3512).
+_UNCONFIRMED = frozenset({"unproven", "uncheckable"})
+
+
 def _ca_file_crl_refusal(
     pem: bytes,
     now: float,
@@ -669,8 +677,8 @@ def _ca_file_crl_refusal(
     refused: the issuer can be an intermediate the peer sends, which the reload treats the same
     way. ``file_facts`` is the lenient reading, which tells an expired CRL from one that cannot be
     judged. ``on_unchecked`` is called, inside the ``except``, when a later CRL does not parse
-    and an earlier one's verdict stands. Each remedy leads, because the alert instance keeps only
-    the start of it."""
+    after an earlier one's signature was not confirmed, which leaves the file unjudged. Each
+    remedy leads, because the alert instance keeps only the start of it."""
     if not crl_pem_blocks(pem):
         return None  # the CRL was moved out, and a CA file with none starts
     unjudged = (
@@ -714,13 +722,16 @@ def _ca_file_crl_refusal(
                 if sig.state == "bad":
                     break  # proven: no later block changes the remedy
         except ValueError:
-            # Before BACKLOG #3512 the check stopped at the first unconfirmed block, so a later
-            # block that does not parse, the one failure judge_crl_signatures documents, never cost
-            # that verdict. Keep the verdict the earlier blocks gave. Any other type is unexpected
-            # and takes the outer path, as before.
-            if not states - {"verified", "unlisted"}:
+            # A later block that does not parse, the one failure judge_crl_signatures documents.
+            # It is caught here only after an unconfirmed block. The unread block could be proven
+            # bad, so the file is one the engine cannot judge: replace the CRL before restarting,
+            # not the unconfirmed remedy's check. Any other set of states re-raises to the outer
+            # path, so a state not in _UNCONFIRMED is never swallowed (BACKLOG #3512). An error of
+            # another type is not caught here, so it says the scan could not check the file.
+            if not states & _UNCONFIRMED:
                 raise
             on_unchecked()
+            return unjudged
     except ValueError:
         return unjudged  # OpenSSL loads other CRLs than were judged
     except ssl.SSLError as exc:
@@ -748,7 +759,7 @@ def _ca_file_crl_refusal(
             "OpenSSL judges by it fails. If a good CRL from that issuer is already in the file, "
             "remove this one instead",
         )
-    if states & {"unproven", "uncheckable"}:
+    if states & _UNCONFIRMED:
         # Not proven either way, and pki.CrlSignature names a case where handshakes still pass.
         # So the remedy asks for a check and claims no failure. ``why`` says which CA was tried.
         unconfirmed = "the engine could not confirm its signature"
