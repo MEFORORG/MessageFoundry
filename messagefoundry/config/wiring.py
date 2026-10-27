@@ -4417,9 +4417,10 @@ def Sftp(
 
 
 def _protocol_for_tls(flag: Any) -> str:
-    """``"ftps"`` or ``"ftp"`` for an ``Ftp`` ``tls`` value read strictly; ``None`` is off, the
-    setting's default."""
-    return "ftps" if _read_bool_setting(flag, False) else "ftp"
+    """``"ftps"`` or ``"ftp"`` for an ``Ftp`` ``env()`` ``tls`` value read strictly. A ``None`` is
+    FTPS, not the literal's default of off: before vault BACKLOG #3234 every ``env()`` ``tls`` meant
+    FTPS, and a ref that resolves to ``None`` must not turn TLS off. Only a false spelling does."""
+    return "ftps" if _read_bool_setting(flag, True) else "ftp"
 
 
 @dataclass(frozen=True)
@@ -4449,8 +4450,9 @@ def _ftp_protocol(tls: bool | EnvRef) -> str | EnvRef:
     is truthy, so ``"ftps" if tls`` chose FTPS whatever the environment said, and a value of
     ``false`` could not turn TLS off. The derived reference reads the value with the reference's own
     cast and then strictly, as a ``bool`` setting is read, so ``false`` reads as plain FTP and an
-    unknown spelling is refused with the value withheld. A ``None`` is ``tls``'s default, off. A
-    ``default=`` is read here, because :func:`resolve_env_settings` never casts a default.
+    unknown spelling is refused with the value withheld. A ``None``, from ``default=None`` or from
+    the author's cast, reads as FTPS (:func:`_protocol_for_tls` says why). A ``default=`` is read
+    here, because :func:`resolve_env_settings` never casts a default.
 
     A literal is mapped as it always was, with ``bool()``: a code-first literal is outside this
     item's scope, for the reason the literal arm of :func:`resolve_env_settings` gives."""

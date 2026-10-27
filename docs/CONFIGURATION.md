@@ -500,8 +500,9 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   It covers `Ftp(tls=...)` too, which the factory turns into the protocol, so `false` means plain
   FTP there. An empty value is refused, not read as false. A `None` default takes the setting's
   own default, such as on for `verify_tls`. On the SMART and OAuth2 composers' `enabled` flag it
-  reads as off, and signing refuses it. Not
-  every reading is covered. A code-first literal is passed as written. At least some checks read
+  reads as off, and signing refuses it. On `Ftp(tls=...)` a `None`, from the default or from your
+  own cast, reads as FTPS, as every `env()` there did before: only a false spelling turns TLS off.
+  Not every reading is covered. A code-first literal is passed as written. At least some checks read
   a setting before `env()` resolves, so they see the reference and not its value. A cast you write
   yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a boolean
   `cast=bool`, or a real `True`/`False` literal.

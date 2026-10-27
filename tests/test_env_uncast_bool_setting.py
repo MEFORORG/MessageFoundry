@@ -356,12 +356,34 @@ def test_an_env_ftp_tls_resolves_to_the_protocol_it_spells(
     assert got == ("ftps" if want else "ftp")
 
 
+@pytest.mark.parametrize("cast", [None, str, bool], ids=["uncast", "str", "bool"])
 @pytest.mark.parametrize(
-    ("default", "want"), [("false", "ftp"), ("on", "ftps"), (None, "ftp"), (True, "ftps")]
+    ("default", "want"), [("false", "ftp"), ("on", "ftps"), (None, "ftps"), (True, "ftps")]
 )
-def test_an_env_ftp_tls_default_is_read_strictly(default: object, want: str) -> None:
-    spec = Ftp(host="ftp.example.org", remote_dir="/in", tls=env("t", default=default))
+def test_an_env_ftp_tls_default_is_read_strictly(default: object, want: str, cast: Any) -> None:
+    # A None default is FTPS, as every env() tls was before #3234 (_protocol_for_tls says why).
+    spec = Ftp(host="ftp.example.org", remote_dir="/in", tls=env("t", default=default, cast=cast))
     assert resolve_env_settings(spec.settings, {})["protocol"] == want
+
+
+def test_an_env_ftp_tls_whose_cast_returns_none_reads_ftps() -> None:
+    def to_none(_raw: object) -> None:
+        return None
+
+    spec = Ftp(host="ftp.example.org", remote_dir="/in", tls=env("ftp_tls", cast=to_none))
+    assert resolve_env_settings(spec.settings, {"ftp_tls": "anything"})["protocol"] == "ftps"
+
+
+def test_a_ca_beside_an_env_ftp_tls_that_resolves_to_none_builds_as_ftps(tmp_path: Path) -> None:
+    # The resolved-CA refusal reads the protocol, so a None read as plain ftp would refuse this hop.
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import Ftp, env, outbound\n"
+        "outbound('OB_FTP', Ftp(host='ftp.example.org', remote_dir='/in', "
+        "tls=env('ftp_tls', default=None), tls_ca_file='/ca.pem'))\n",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path)
+    assert _dest(reg, "OB_FTP", {})["protocol"] == "ftps"
 
 
 def test_an_env_ftp_tls_unknown_spelling_is_refused_value_withheld() -> None:
