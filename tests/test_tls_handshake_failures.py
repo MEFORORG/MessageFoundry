@@ -63,22 +63,26 @@ def _refuse_the_certificate(port: int) -> bool:
     After the alert it reads to the server's EOF before it closes (vault BACKLOG #4329). Closing
     with the server's later records unread sends a reset, and Windows discards the server's unread
     alert when a reset arrives, so the server saw a hang-up, which is not counted. The server
-    closes only after it has handled the alert, so when this returns the failure is counted."""
+    closes only after it has read the alert, so the failure is seen before this returns. A server
+    may still hand the count to its loop afterwards, as the DICOM SCP does, so callers wait for
+    it. A server that never closes fails this with ``TimeoutError``."""
     ctx = ssl.create_default_context()
+    # wrap_socket detaches ``raw``, so ``drain`` is a second handle on the same TCP stream: the
+    # bytes after the failed handshake are read there, not through the TLS socket.
     with (
         socket.create_connection(("127.0.0.1", port), timeout=5.0) as raw,
+        raw.dup() as drain,
         ctx.wrap_socket(raw, server_hostname="127.0.0.1", do_handshake_on_connect=False) as tls,
     ):
         try:
             tls.do_handshake()
-            return False
         except ssl.SSLCertVerificationError:
-            pass
-        tls.shutdown(socket.SHUT_WR)  # drops the TLS layer; recv below reads the raw socket
-        with contextlib.suppress(OSError):
-            while tls.recv(4096):
-                pass
-        return True
+            with contextlib.suppress(ConnectionError):  # a reset after the alert also ends it
+                drain.shutdown(socket.SHUT_WR)
+                while drain.recv(4096):
+                    pass
+            return True
+        return False
 
 
 async def _plaintext_peer(port: int) -> None:
