@@ -5587,8 +5587,9 @@ class RegistryRunner:
         budget_seconds: float | None = None,
     ) -> None:
         """Stop the graph. ``reason`` is keyword-only with a SHUTDOWN default, so all ~170 existing
-        ``runner.stop()`` call sites across the engine, the tests and the harness are unchanged and
-        behave identically (ADR 0157 C6)."""
+        ``runner.stop()`` call sites across the engine, the tests and the harness are unchanged (ADR
+        0157 C6). Their SHUTDOWN teardown now stops the inbounds concurrently (BACKLOG #1620);
+        :meth:`_teardown_unsafe` states what else that changed."""
         async with self._reload_lock:  # serialize against an in-flight reload (no torn-down state)
             had_state = self._running or bool(self._sources or self._workers or self._destinations)
             await self._teardown_unsafe(reason, budget_seconds=budget_seconds)
@@ -5763,8 +5764,8 @@ class RegistryRunner:
         ``reason`` (ADR 0157 C6) selects the SOURCE + DISPATCHER phases and the bound on the
         lookup-executor close wait (:meth:`_teardown_body` states it); every other phase, and
         their order, is shared. Under SHUTDOWN the executed statements are the pre-ADR-0157 ones,
-        except that the source stops now run concurrently (BACKLOG #1620); none is bounded or
-        abandoned.
+        except at least that the source stops now run concurrently and a failed one is raised only
+        after the rest of teardown has run (BACKLOG #1620); none is bounded or abandoned.
 
         **THE INVARIANT: ``self._running = False`` must execute on every path.**
         ``Engine._reconcile_graph``'s bring-up branch is ``is_leader() and not running``, so a teardown
@@ -5828,6 +5829,8 @@ class RegistryRunner:
             self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
         else:
             self._wake_worker_lanes()
+        failed_sources: dict[str, SourceConnector] = {}
+        first_stop_failure: BaseException | None = None
         if demote:
             # ADR 0157 Inc 5: DEMOTE INVERTS the ADR 0066 D3 order below, deliberately. Egress is the
             # split-brain-relevant action, so its budget must start NOW rather than after the source
@@ -5840,19 +5843,27 @@ class RegistryRunner:
             await self._quiesce_dispatchers_demote(budget * _DEMOTE_QUIESCE_SHARE)
             await self._stop_sources_demote(budget * (1.0 - _DEMOTE_QUIESCE_SHARE))
         else:
-            # BACKLOG #1620: concurrent, so N slow sources cost one, not N. Deliberately NOT bounded
-            # here: every stop is joined before the dispatchers stop (ADR 0066 D3) and before start()
-            # can rebind on its failed-start and residual-state teardowns (review M-8). A runner-side
-            # cut or abandon breaks both: a DICOM port still held, a second File/Database poller, a
-            # stop cancelled inside the store call it waits out. The bound is each source's own
-            # stop(); FileSource's is BACKLOG #1620's source half. A failed stop is logged, so it no
-            # longer aborts the rest of teardown.
+            # BACKLOG #1620: concurrent, so N slow inbound stops cost one, not N. Deliberately NOT
+            # bounded here: every stop is joined before the dispatchers stop (ADR 0066 D3) and before
+            # start() can rebind on its failed-start and residual-state teardowns (review M-8). A
+            # runner-side cut or abandon breaks both: a DICOM port still held, a second File/Database
+            # poller, a stop cancelled inside the store call it waits out. So this phase is only as
+            # bounded as each inbound's own stop(), and Database/RemoteFile/Timer join their poll
+            # task with no timeout; FileSource's bound is BACKLOG #1620's source half.
+            # A failed stop no longer aborts the rest of teardown. Its inbound is put back into
+            # _sources after the clears below and the first failure is re-raised there, so it stays
+            # residual state and the next stop()/start() retries it (DicomSource.stop() keeps its
+            # server for exactly that retry).
+            sources = list(self._sources.items())  # snapshot BEFORE the await (ADR 0157 Inc 4)
             results = await asyncio.gather(
-                *(source.stop() for source in self._sources.values()), return_exceptions=True
+                *(source.stop() for _, source in sources), return_exceptions=True
             )
-            for name, result in zip(self._sources, results, strict=True):
+            for (name, source), result in zip(sources, results, strict=True):
                 if isinstance(result, BaseException):
                     log.warning("inbound %r: stop() failed: %s", name, safe_exc(result))
+                    failed_sources[name] = source
+                    if first_stop_failure is None:
+                        first_stop_failure = result
             # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
             # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
             # _stop.set(). The shared _stop already broke their loops; d.stop() cancels each
@@ -6001,6 +6012,11 @@ class RegistryRunner:
         # ADR 0071 B5: reset the fusion degraded gauge so a start()-after-stop() begins clean (the
         # executors + pools were already torn down above; _fusion_active reset there too).
         self._fusion_pool_open_failed = False
+        if first_stop_failure is not None:
+            # BACKLOG #1620: the rest of teardown ran; now restore what a failed stop used to leave,
+            # the inbound itself as residual state, and the raise, so start() never builds over it.
+            self._sources.update(failed_sources)
+            raise first_stop_failure
         # NOTE: `self._running = False` is NOT here — it moved into _teardown_unsafe's `finally`
         # (ADR 0157 D7) so a raised or cancelled teardown still leaves this node re-promotable.
 
