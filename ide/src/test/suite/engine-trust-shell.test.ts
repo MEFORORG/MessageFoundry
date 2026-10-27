@@ -896,21 +896,38 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     return { opens, most: () => most };
   }
 
-  /** A CLI that does not answer until the returned function is called; it then fails. */
-  function hungCli(): () => void {
-    let answer: (() => void) | undefined;
+  type Done = (err: Error, stdout: string, stderr: string) => void;
+
+  /** A stubbed CLI that records each call and hands its completion callback to `onCall`. */
+  function stubCli(onCall: (done: Done) => void): void {
     childProcess.execFile = ((
       _file: string,
       args: string[],
       options: { cwd?: string },
-      done: (err: Error, stdout: string, stderr: string) => void,
+      done: Done,
     ) => {
       invocations.push({ args, cwd: options.cwd });
-      answer = () => done(Object.assign(new Error("killed"), { killed: true }), "", "");
-      held.push(answer);
+      onCall(done);
       return undefined;
     }) as unknown as typeof childProcess.execFile;
-    return () => answer?.();
+  }
+
+  /** A CLI that does not answer until the returned function (or teardown) is called; it then fails,
+   *  once. */
+  function hungCli(): () => void {
+    let answer: (() => void) | undefined;
+    stubCli((done) => {
+      answer = () => done(Object.assign(new Error("killed"), { killed: true }), "", "");
+      held.push(answer);
+    });
+    return () => {
+      const release = answer;
+      answer = undefined;
+      if (release !== undefined) {
+        held.splice(held.indexOf(release), 1);
+        release();
+      }
+    };
   }
 
   test("pin, fresh: a caFile read again replaces the anchor", async () => {
@@ -1011,16 +1028,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
   test("CLI, kept: a CLI that fails keeps the loopback anchor", async () => {
     stubInventory = plantedEngine();
     await trust.refreshEngineTrust();
-    childProcess.execFile = ((
-      _file: string,
-      args: string[],
-      options: { cwd?: string },
-      done: (err: Error, stdout: string, stderr: string) => void,
-    ) => {
-      invocations.push({ args, cwd: options.cwd });
-      done(Object.assign(new Error("exit 2"), { code: 2 }), "", "");
-      return undefined;
-    }) as unknown as typeof childProcess.execFile;
+    stubCli((done) => done(Object.assign(new Error("exit 2"), { code: 2 }), "", ""));
 
     assert.strictEqual(await trust.refreshEngineTrust(), false);
     assert.strictEqual(invocations.length, 2, "the failing CLI never ran");

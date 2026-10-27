@@ -284,10 +284,10 @@ anchor in force: a file that could not be read or was read too slowly, or an eng
 failed, did not answer, or was not started. So does a renewal a failing request followed meanwhile.
 A kept `caFile` anchor is always one read from the file the setting names now, and a kept engine
 certificate is kept only while `engineUrl` still names that engine and no `caFile` claims it.
-Dropping it instead would put that engine back on the default roots, which trust more than the
-anchor did. So deleting
-or emptying a `caFile` does not by itself stop the extension trusting the certificate it last read
-from it; change or remove the setting to do that. The log names each anchor it keeps.
+Dropping an anchor instead would put that engine back on the default roots, which trust more than
+the anchor did. So deleting or emptying a `caFile` does not by itself stop the extension trusting
+the certificate it last read from it; change or remove the setting to do that. The log names each
+anchor it keeps.
 
 **Every wait is bounded.** The engine gets 35 seconds to answer. All the certificate files of one
 pass then get 10 seconds together, and a file not read by then counts as a failure that proves

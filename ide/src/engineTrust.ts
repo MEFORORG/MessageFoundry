@@ -271,9 +271,14 @@ function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () => T): P
  *     (the pin was removed or refused, `engineUrl` moved, the CLI answered with no certificate, or no
  *     trusted workspace remains to ask). Drop it.
  */
-type Outcome =
-  | { readonly kind: "fresh"; readonly anchor: Registered }
-  | { readonly kind: "keep"; readonly pinned: boolean; readonly file?: string };
+interface Outcome {
+  /** The source: a `caFile` pin, or the CLI. */
+  readonly pinned: boolean;
+  /** The file that source names, when it named one. */
+  readonly file?: string;
+  /** The certificate read, for `fresh`; absent for `keep`. */
+  readonly fresh?: Registered;
+}
 
 /** A certificate file a refresh reads, and the host key it would anchor. */
 interface ToRead {
@@ -293,34 +298,27 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   lateFailure = undefined;
   acceptsLateFailure = !followUp;
   const reads = pinsToRead(pins);
-  const cli = await askCli(claimed);
-  if (cli !== undefined && "file" in cli) {
-    reads.push(cli);
-  } else if (cli !== undefined) {
-    outcomes.set(cli.key, { kind: "keep", pinned: false });
-  }
+  await askCli(claimed, reads, outcomes);
   // Every file is read only now, after the CLI has answered, so a file rotated in place while the CLI
   // ran is read as rotated: a read already running from before (`since`) is read again.
   const since = readSeq;
   const deadline = performance.now() + limits.refreshReadMs;
-  const results = await Promise.all(reads.map((r) => readSince(r.file, deadline, since)));
-  reads.forEach((r, i) => {
-    const { read, readAt } = results[i];
+  const results = await Promise.all(
+    reads.map(async (r) => [r, await readSince(r.file, deadline, since)] as const),
+  );
+  for (const [{ key, url, file, pinned }, { read, readAt }] of results) {
     if (read.pem === undefined) {
-      engineLog().warn(`${read.problem} — not ${r.pinned ? "pinning" : "trusting"} ${r.url}`);
-      outcomes.set(r.key, { kind: "keep", pinned: r.pinned, file: r.file });
-      return;
+      engineLog().warn(`${read.problem} — not ${pinned ? "pinning" : "trusting"} ${url}`);
+      outcomes.set(key, { pinned, file });
+      continue;
     }
-    outcomes.set(r.key, {
-      kind: "fresh",
-      anchor: { url: r.url, file: r.file, pem: read.pem, pinned: r.pinned, readAt },
-    });
+    outcomes.set(key, { pinned, file, fresh: { url, file, pem: read.pem, pinned, readAt } });
     engineLog().info(
-      r.pinned
-        ? `trusting ${r.file} for ${r.url} (its caFile in messagefoundry.environments)`
-        : `trusting the engine certificate at ${r.file} for ${r.url}`,
+      pinned
+        ? `trusting ${file} for ${url} (its caFile in messagefoundry.environments)`
+        : `trusting the engine certificate at ${file} for ${url}`,
     );
-  });
+  }
   // Swap only now, after the subprocess has answered. Clearing first and then awaiting left EVERY
   // engine unanchored for as long as `cert inventory` ran.
   claimedKeys = claimed;
@@ -339,13 +337,13 @@ function commit(outcomes: ReadonlyMap<string, Outcome>): void {
     const live = previous.get(key);
     const sameSource =
       live !== undefined &&
-      live.pinned === (outcome.kind === "fresh" ? outcome.anchor.pinned : outcome.pinned);
-    if (outcome.kind === "fresh") {
+      live.pinned === outcome.pinned &&
+      (outcome.file === undefined || live.file === outcome.file);
+    if (outcome.fresh !== undefined) {
       // A request may have followed the same file while this refresh read it. Keep whichever read
       // STARTED later, so a rotation the follow path saw is not undone by this older read.
-      const { anchor } = outcome;
-      register(sameSource && live.file === anchor.file && live.readAt > anchor.readAt ? live : anchor);
-    } else if (sameSource && (outcome.file === undefined || live.file === outcome.file)) {
+      register(sameSource && live.readAt > outcome.fresh.readAt ? live : outcome.fresh);
+    } else if (sameSource) {
       register(live);
       engineLog().info(`keeping the certificate read earlier from ${live.file} for ${live.url}`);
     }
@@ -397,12 +395,15 @@ function pinsToRead(pins: readonly TrustPin[]): ToRead[] {
  * `messagefoundry.engineUrl` — unless an explicit `caFile` pin already covers that `host:port`. The
  * user named the pin; the CLI's answer is inferred from a workspace setting.
  *
- * Returns the file to read, `{ key }` when the CLI's answer is inconclusive for that key (it failed,
- * did not answer in time, or was not started), or `undefined` when it decides nothing to anchor.
+ * Adds the file to read to `reads`, or a `keep` {@link Outcome} for that key when the CLI's answer is
+ * inconclusive (it failed, did not answer in time, or was not started); adds nothing when it decides
+ * there is nothing to anchor.
  */
 async function askCli(
   claimed: ReadonlySet<string>,
-): Promise<ToRead | { readonly key: string } | undefined> {
+  reads: ToRead[],
+  outcomes: Map<string, Outcome>,
+): Promise<void> {
   // The same guard the three sibling CLI calls in extension.ts use. Without it, opening a loose .py
   // file with no folder spawns a Python interpreter for a command that can only fail: isExecGated()
   // is false when there is no workspace, so it does not cover this on its own.
@@ -416,16 +417,21 @@ async function askCli(
   // the extension host's own cwd — the defect the resolution below exists to remove.
   const workspace = workspaceDir();
   if (!workspace || isExecGated()) {
-    return undefined;
+    return;
   }
   const url = engineUrl();
   const key = engineHostKey(url);
-  const inconclusive = key === undefined || claimed.has(key) ? undefined : { key };
+  const inconclusive = (): void => {
+    if (key !== undefined && !claimed.has(key)) {
+      outcomes.set(key, { pinned: false });
+    }
+  };
 
   if (cliRun !== undefined) {
     cliSkipped = true;
     engineLog().warn("an earlier `cert inventory` run has not exited; not starting another");
-    return inconclusive;
+    inconclusive();
+    return;
   }
   let payload: unknown;
   try {
@@ -452,11 +458,13 @@ async function askCli(
     payload = await withDeadline(call, limits.cliAnswerMs, () => CLI_SILENT);
   } catch {
     // A run killed at the timeout, no engine, no TOML: we learned nothing.
-    return inconclusive;
+    inconclusive();
+    return;
   }
   if (payload === CLI_SILENT) {
     engineLog().warn(`\`cert inventory\` did not report within ${limits.cliAnswerMs / 1000} s`);
-    return inconclusive;
+    inconclusive();
+    return;
   }
 
   const facts = parseApiTls(payload);
@@ -465,14 +473,13 @@ async function askCli(
   // engine's trust anchor, so the two arrive together or not at all. The decision also carries WHY it
   // declined, because re-deriving that here is the same split the bug came from.
   const decision = trustAnchorForTarget(facts, url, workspace);
-  let answer: ToRead | undefined;
   if (decision.kind === "anchor" && key !== undefined && claimed.has(key)) {
     engineLog().info(
       `${url} has a caFile in messagefoundry.environments, so the certificate ` +
         `messagefoundry.serviceConfig names (${decision.file}) is not used for it.`,
     );
   } else if (decision.kind === "anchor" && key !== undefined) {
-    answer = { key, url, file: decision.file, pinned: false };
+    reads.push({ key, url, file: decision.file, pinned: false });
   } else if (decision.kind === "notLocal") {
     // The engine named a usable certificate and the model declined it because the target is not
     // loopback. Say so: a silently unanchored target fails later with no explanation the user can
@@ -488,7 +495,6 @@ async function askCli(
   if (mismatch !== undefined) {
     engineLog().warn(mismatch);
   }
-  return answer;
 }
 
 /**
@@ -642,11 +648,18 @@ async function sharedRead(file: string, deadline: number): Promise<StampedRead> 
 /**
  * {@link sharedRead}, but never a read that started at or before `since` (a {@link readSeq} value):
  * a joined read that began before the caller's reason to read may predate the rotation it is looking
- * for, so once it ends the file is read again, within the same deadline.
+ * for, so once it ends the file is read again, within the same deadline. `worthAgain` lets a caller
+ * skip that second read when the first already answers it.
  */
-async function readSince(file: string, deadline: number, since: number): Promise<StampedRead> {
+async function readSince(
+  file: string,
+  deadline: number,
+  since: number,
+  worthAgain: (read: PemRead) => boolean = () => true,
+): Promise<StampedRead> {
   const first = await sharedRead(file, deadline);
-  return first.readAt !== 0 && first.readAt <= since ? sharedRead(file, deadline) : first;
+  const stale = first.readAt !== 0 && first.readAt <= since && worthAgain(first.read);
+  return stale ? sharedRead(file, deadline) : first;
 }
 
 /**
@@ -726,15 +739,19 @@ export async function followCertificateChange(
   if (key === undefined) {
     return false;
   }
+  // Before the first refresh commits there is no snapshot, so this reads the configuration, once.
+  const configured =
+    pinFiles === undefined ? pinFilesOf(trustPinsFor(pinTargetsOf(environments()))) : undefined;
   const fileFor = (): string | undefined =>
-    registered.get(key)?.file ??
-    (pinFiles ?? pinFilesOf(trustPinsFor(pinTargetsOf(environments())))).get(key);
+    registered.get(key)?.file ?? (pinFiles ?? configured)?.get(key);
   const file = fileFor();
-  // A read already running when this request failed may predate the rotation, so it is read again.
+  // A read already running when this request failed may predate the rotation. Only when it returns
+  // the certificate that just failed is the file read again; anything else answers this request.
+  const deadline = performance.now() + limits.followReadMs;
   const stamped =
     file === undefined
       ? undefined
-      : await readSince(file, performance.now() + limits.followReadMs, readSeq);
+      : await readSince(file, deadline, readSeq, (r) => r.pem === usedCa);
   const read = stamped?.read.pem;
   // Read the registration again: a refresh may have committed while the file was being read.
   const held = registered.get(key);
