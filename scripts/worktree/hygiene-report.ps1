@@ -496,13 +496,35 @@ function Get-CloneReport($R) {
     # One that died keeps the lock, and then every reclaimer keeps the tree. Listed, never unlocked here.
     # Each command carries the host circuit breaker CLAUDE.md section 5 requires: on a shared root the
     # other PC has a tree at the same path, maybe with a live seat in it.
+    # It also re-reads the `locked` file when pasted and refuses unless it still holds the exact reason
+    # reported, so a lock handed to a new session since this run is never released by it.
     $thisHost = [Environment]::MachineName
-    $rep.staleSeatLocks = @(foreach ($s in (Get-StaleSeatLocks -Worktrees $others -ConfigRoot $ConfigRoot)) {
-            $unlock = "git -C '$($root -replace "'", "''")' worktree unlock '$($s.Path -replace "'", "''")'"
+    $seatLocks = @(Get-StaleSeatLocks -Worktrees $others -ConfigRoot $ConfigRoot)
+    $rep.staleSeatLocks = @(foreach ($s in @($seatLocks | Where-Object { $_.State -ne 'CODEX' })) {
+            $q = { param($t) "'$(([string]$t) -replace "'", "''")'" }
+            $command = ''; $held = ''
+            # The occupancy veto, as for a removal: a tree a session sits in gets no unlock command.
+            if (-not $occ.Available) { $held = "the liveness fence could not look: $($occ.Detail)" }
+            else {
+                $occupants = @(Get-WorktreeOccupants -Occupancy $occ -Path $s.Path -IncludeNested)
+                if ($occupants.Count -gt 0) { $held = "a session is in it: $(($occupants | ForEach-Object { "$($_.Short) $($_.State)" }) -join ', ')" }
+            }
+            if (-not $held) {
+                # The reason is read with no throw on any path: an unreadable lock reads '' and stops.
+                $command = "if ([Environment]::MachineName -ne $(& $q $thisHost)) { Write-Host ""STOP     this must run on $thisHost, but this is `$([Environment]::MachineName); nothing ran"" } " +
+                    "else { `$g = git -C $(& $q $s.Path) rev-parse --path-format=absolute --git-dir 2>`$null; " +
+                    "`$r = if (`$g) { ([string](Get-Content -LiteralPath ""`$g/locked"" -Raw -ErrorAction SilentlyContinue)).Trim() } else { '' }; " +
+                    "if (`$r -cne $(& $q $s.Reason)) { Write-Host 'STOP     the lock no longer reads the reason this report saw; nothing ran' } " +
+                    "else { git -C $(& $q $root) worktree unlock $(& $q $s.Path) } }"
+            }
             [ordered]@{
                 path = $s.Path; reason = $s.Reason; seat = $s.Seat; session = $s.SessionKey; state = $s.State; detail = $s.Detail
-                command = "if ([Environment]::MachineName -ne '$thisHost') { Write-Host ""STOP     this must run on $thisHost, but this is `$([Environment]::MachineName); nothing ran"" } else { $unlock }"
+                command = $command; heldBecause = $held
             }
+        })
+    # A Codex seat cannot be fenced, so its liveness is unknown: listed apart, with no command.
+    $rep.codexSeatLocks = @(foreach ($s in @($seatLocks | Where-Object { $_.State -eq 'CODEX' })) {
+            [ordered]@{ path = $s.Path; reason = $s.Reason; seat = $s.Seat; session = $s.SessionKey }
         })
     $rep.emptied = @(foreach ($e in (Find-EmptiedWorktrees -PrimaryPath $root -Worktrees $occ.Worktrees -LogRoot $DesktopLogRoot)) {
             [ordered]@{ path = $e.Path; entries = $e.Entries; logLines = @($e.LogLines | ForEach-Object { [ordered]@{ file = $_.File; line = $_.LineNumber; text = $_.Text } }) }
@@ -669,11 +691,22 @@ foreach ($c in $report.clones) {
     else {
         $md.Add("These seats did not unlock at exit, so every reclaimer keeps the tree. ``NO RECORD`` cannot tell an exited session from one that never registered, so check before unlocking:")
         $md.Add("")
-        foreach ($s in $c.staleSeatLocks) { $md.Add("- ``$($s.path)``: ``$($s.reason)``, $($s.state) ($($s.detail))") }
+        foreach ($s in $c.staleSeatLocks) { $md.Add("- ``$($s.path)``: ``$($s.reason)``, $($s.state) ($($s.detail))$(if ($s.heldBecause) { ". No command: $($s.heldBecause)" })") }
+        $cmds = @($c.staleSeatLocks | Where-Object { $_.command })
+        if ($cmds.Count -gt 0) {
+            $md.Add("")
+            $md.Add("Each command refuses on another host, and refuses if the lock no longer reads the reason above:")
+            $md.Add("")
+            $md.Add('```powershell')
+            foreach ($s in $cmds) { $md.Add($s.command) }
+            $md.Add('```')
+        }
+    }
+    if ($c.codexSeatLocks.Count -gt 0) {
         $md.Add("")
-        $md.Add('```powershell')
-        foreach ($s in $c.staleSeatLocks) { $md.Add($s.command) }
-        $md.Add('```')
+        $md.Add("**Codex seat locks ($($c.codexSeatLocks.Count)).** Nothing here can fence a Codex session, so whether each is gone is unknown, and no command is given:")
+        $md.Add("")
+        foreach ($s in $c.codexSeatLocks) { $md.Add("- ``$($s.path)``: ``$($s.reason)``") }
     }
 
     $md.Add("")

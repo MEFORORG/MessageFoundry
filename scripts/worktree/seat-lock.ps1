@@ -6,7 +6,8 @@
 
 .DESCRIPTION
     Dot-source this; it defines functions and does nothing on its own. seat.ps1 calls
-    Set-SeatWorktreeLock on the SessionStart -Prompt path and on -Declare. NOT on every Stop
+    Set-SeatWorktreeLock on the SessionStart -Prompt path, which creates the lock, and on -Declare,
+    which only relabels it (Set-SeatWorktreeLock's -Mode says why). NOT on every Stop
     (-Record): that path runs the PRIMARY's seat.ps1 through the user-scope shim, so it would lock
     trees whose own branch predates the unlock hook and never unlock them, and it follows a `cd` into
     a sibling. Only the SessionEnd hook scripts/hooks/seat-unlock.ps1 calls
@@ -26,8 +27,9 @@
         refusal elsewhere in this repository is that such a session writes nothing for others.
       * Replace another holder's lock. Claude Code locks an `isolation: worktree` agent's tree while it
         is live (docs/SESSION-DRIFT-CONTROLS.md), and a person may lock one by hand. Those are kept, and
-        the caller is told. The one exception is a SEAT lock whose session reads DEAD or STALE: a
-        seat arriving in that tree takes it over, so its own exit can clear it.
+        the caller is told. The exceptions are SEAT locks only: one whose session reads DEAD or STALE
+        is taken over by a seat arriving in that tree, and any one is handed over to the new id on a
+        SessionStart from /clear, /resume or /compact. Either way the new holder's exit clears it.
         The takeover rewrites the `locked` file in place rather than unlocking and re-locking, so
         there is no moment in which the tree is unlocked.
       * Remove a lock this session did not place. Unlock removes only a seat lock naming this session
@@ -68,13 +70,26 @@ function Set-SeatWorktreeLock {
     <#
     .SYNOPSIS
         Lock $Worktree for this seat. Idempotent. Actions include at least locked, relabelled,
-        taken-over, kept-own, kept-foreign, skipped-primary, skipped-cloud, skipped-no-session-id and
-        failed.
+        handed-over, taken-over, kept-own, kept-foreign, not-locked, skipped-primary, skipped-cloud,
+        skipped-no-session-id and failed.
+
+    .DESCRIPTION
+        -Mode says which caller this is:
+          arrive    SessionStart from a startup. Creates the lock; takes over a DEAD or STALE seat's.
+          handover  SessionStart from /clear, /resume or /compact. The process and its seat carry on
+                    in this tree under a new id, and the old id's lock reads LIVE or NO RECORD, so
+                    neither a takeover nor any exit would ever release it. So ANY seat lock here is
+                    rewritten to this id. Another holder's lock is still kept.
+          relabel   -Declare. Rewrites only a lock this session already holds, and NEVER creates one:
+                    the SessionStart that created it and the SessionEnd that releases it come from
+                    the same settings file, while a -Declare can run where that file wires no
+                    SessionEnd (a new-branch worktree under an older primary).
     #>
     param(
         [string]$Worktree, [string]$Seat, [string]$SessionKey, [string[]]$ConfigRoot,
         # Keep this session's existing lock as it reads, for a caller that does not know the seat.
-        [switch]$KeepLabel
+        [switch]$KeepLabel,
+        [ValidateSet('arrive', 'handover', 'relabel')][string]$Mode = 'arrive'
     )
     if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
         return [pscustomobject]@{ Action = 'skipped-cloud'; Detail = 'a cloud session has no Desktop worktree GC to fend off' }
@@ -84,19 +99,27 @@ function Set-SeatWorktreeLock {
     if (-not (Test-SeatLockSessionKey $SessionKey)) {
         return [pscustomobject]@{ Action = 'skipped-no-session-id'; Detail = "'$SessionKey' is not a session id, so nothing could release or report this lock" }
     }
-    $reason = Format-SeatLockReason -Seat $Seat -SessionKey $SessionKey
     $st = Get-WorktreeLockState $Worktree
     if ($st.Error) { return [pscustomobject]@{ Action = 'failed'; Detail = $st.Error } }
     if (-not $st.Linked) { return [pscustomobject]@{ Action = 'skipped-primary'; Detail = 'the primary checkout cannot be locked, and no GC removes it' } }
+    $held = if ($st.Locked) { ConvertFrom-SeatLockReason $st.Reason } else { $null }
+    # A handover keeps the seat the old id declared when this new id has declared none yet.
+    if ($Mode -eq 'handover' -and $held -and ([string]::IsNullOrWhiteSpace($Seat) -or $Seat -eq 'undeclared')) { $Seat = $held.Seat }
+    $reason = Format-SeatLockReason -Seat $Seat -SessionKey $SessionKey
+
+    if ($Mode -eq 'relabel' -and -not ($held -and $held.SessionKey -ceq $SessionKey)) {
+        if ($st.Locked) { return [pscustomobject]@{ Action = 'kept-foreign'; Detail = "locked by another holder: $($st.Reason)" } }
+        return [pscustomobject]@{ Action = 'not-locked'; Detail = "no lock from this session's SessionStart to relabel, and a declaration never creates one" }
+    }
 
     if ($st.Locked) {
         if ($st.Reason -ceq $reason) { return [pscustomobject]@{ Action = 'kept-own'; Detail = $reason } }
-        $held = ConvertFrom-SeatLockReason $st.Reason
         $action = ''
         if ($held -and $held.SessionKey -ceq $SessionKey) {
             if ($KeepLabel) { return [pscustomobject]@{ Action = 'kept-own'; Detail = $st.Reason } }
             $action = 'relabelled'
         }
+        elseif ($held -and $Mode -eq 'handover') { $action = 'handed-over' }
         elseif ($held -and (Get-SeatLockReading -SessionKey $held.SessionKey -ConfigRoot $ConfigRoot).State -in @('DEAD', 'STALE')) {
             # A positive dead signal only. NO RECORD is gone enough to REPORT, but a live seat this
             # reader cannot see (a config root outside USERPROFILE) also reads that way, and taking
@@ -128,7 +151,10 @@ function Set-SeatWorktreeLock {
     # failure, so a race reads as the lock it produced.
     $again = Get-WorktreeLockState $Worktree
     if ($again.Locked) {
-        $a = if ($again.Reason -ceq $reason) { 'kept-own' } else { 'kept-foreign' }
+        # By session, not by the whole reason: this session's own SessionStart and -Declare can race
+        # with two different seat labels.
+        $raced = ConvertFrom-SeatLockReason $again.Reason
+        $a = if ($raced -and $raced.SessionKey -ceq $SessionKey) { 'kept-own' } else { 'kept-foreign' }
         return [pscustomobject]@{ Action = $a; Detail = $again.Reason }
     }
     return [pscustomobject]@{ Action = 'failed'; Detail = "git worktree lock exited $($code): $(($msg | Out-String).Trim())" }

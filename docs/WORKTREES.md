@@ -741,18 +741,22 @@ also drive it against a temp repository with a fake gh.
 
 BACKLOG #2524. A Claude Desktop instance's worktree GC (`[reapUntrackedWorktreeDir]`) runs
 `git worktree remove --force` on another instance's worktree when it looks quiet and clean. On
-Windows that empties and deregisters a folder a live session still holds. The GC keeps a worktree
-whose admin directory holds a `locked` file, and so do `prune-merged.ps1`, `claim-reconcile.ps1`
-and `hygiene-report.ps1`'s removal list.
+Windows that empties and deregisters a folder a live session still holds. The evidence (the vault's
+`docs/reviews/2026-09-30-b184-1917-worktree-emptying.md`) shows the GC's reap path logging
+`(locked)` and keeping a locked folder. It does not show that the GC's manual-cleanup fallback
+respects a lock, so a lock narrows the exposure and is not shown to close it. `prune-merged.ps1`,
+`claim-reconcile.ps1` and `hygiene-report.ps1`'s removal list all keep a locked tree.
 
 So `seat.ps1` runs `git worktree lock --reason "<seat> <session id>"` on the session's worktree. It
-does so on the SessionStart `-Prompt` path and on `-Declare`, not on every Stop. The seat is
-whatever the record holds, or `undeclared`, and `-Declare` relabels the same session's lock in
-place. Only the SessionEnd hook [`seat-unlock.ps1`](../scripts/hooks/seat-unlock.ps1) unlocks it,
-and only a seat lock that names its own session id. It skips a `/clear` or `/resume`, so the old
-id's lock keeps protecting the tree and is reported after the session ends. `-Close` does not
-unlock, because a closed seat is often still open. The rules are in
-[`seat-lock.ps1`](../scripts/worktree/seat-lock.ps1):
+creates it only on the SessionStart `-Prompt` path, because SessionStart and SessionEnd come from
+the same settings file, so the unlock is always wired where the lock was made. `-Declare` only
+relabels a lock this session already holds, and never creates one. Nothing locks on a Stop. The
+seat is whatever the record holds, or `undeclared`. Only the SessionEnd hook
+[`seat-unlock.ps1`](../scripts/hooks/seat-unlock.ps1) unlocks it, and only a seat lock that names
+its own session id. It skips a `/clear` or `/resume`. The SessionStart that follows (`source`
+`clear`, `resume` or `compact`) hands any seat lock in the tree over to the new id, so the new id's
+exit releases it. `-Close` does not unlock, because a closed seat is often still open. The rules are
+in [`seat-lock.ps1`](../scripts/worktree/seat-lock.ps1):
 
 - Another holder's lock is kept. Claude Code locks an `isolation: worktree` agent's tree while it
   runs, and that reason reads `claude agent <name> (pid <n>)`.

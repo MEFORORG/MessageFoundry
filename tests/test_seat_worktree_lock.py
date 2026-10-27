@@ -2,8 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A declared seat's worktree carries git's ``locked`` file, and a clean exit removes only its own.
 
-BACKLOG #2524; why a lock at all is scripts/worktree/worktree-audit.ps1's header. ``seat.ps1`` locks
-the seat's worktree on ``-Prompt`` (SessionStart), ``-Declare`` and ``-Record`` (every Stop), and only
+BACKLOG #2524; why a lock at all is scripts/worktree/worktree-audit.ps1's header. ``seat.ps1``
+creates the lock only on ``-Prompt`` (SessionStart), hands it over on a SessionStart from /clear,
+/resume or /compact, and only relabels it on ``-Declare``. ``-Record`` (every Stop) never locks. Only
 the SessionEnd hook ``seat-unlock.ps1`` unlocks it.
 
 The properties pinned here each fail silently:
@@ -139,10 +140,35 @@ def seat(cwd: Path, home: Path, *args: str, **extra: str) -> subprocess.Complete
     )
 
 
-def declare(w: Path, home: Path, sid: str = SID) -> subprocess.CompletedProcess[str]:
+def arrive(
+    w: Path, home: Path, sid: str = SID, source: str = "startup"
+) -> subprocess.CompletedProcess[str]:
+    """The SessionStart path: the only one that creates a lock. Silent by contract."""
+    proc = seat(w, home, "-Prompt", "-SessionId", sid, "-Source", source)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", "-Prompt is a hook path and must stay silent"
+    return proc
+
+
+def declare(
+    w: Path, home: Path, sid: str = SID, *, arrive_first: bool = True
+) -> subprocess.CompletedProcess[str]:
+    """SessionStart then -Declare, as a real session runs them."""
+    if arrive_first:
+        arrive(w, home, sid)
     proc = seat(w, home, "-Declare", "-Seat", "builder", "-Goal", "g", "-SessionId", sid)
     assert proc.returncode == 0, proc.stderr
     return proc
+
+
+def live_record(home: Path, sid: str) -> subprocess.Popen[bytes]:
+    """A registry record for sid whose pid started just now: LIVE to the fence. Kill it after."""
+    sessions = home / ".claude" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(240)"])
+    record = {"pid": sleeper.pid, "sessionId": sid, "startedAt": int(time.time() * 1000)}
+    (sessions / "1.json").write_text(json.dumps(record), encoding="utf-8")
+    return sleeper
 
 
 def unlock_hook(
@@ -173,21 +199,57 @@ def test_a_declared_seats_worktree_carries_the_locked_file(wt: Path, home: Path)
     assert lock_text(wt) is None, "the fixture worktree must start unlocked"
     proc = declare(wt, home)
     assert lock_text(wt) == f"builder {SID}"
-    assert "worktree lock: locked" in proc.stdout
+    assert "worktree lock: relabelled" in proc.stdout
     # git itself reads it as locked, which is what every reclaimer asks.
     listing = git(wt, "worktree", "list", "--porcelain")
     assert f"locked builder {SID}" in listing
 
 
 def test_the_sessionstart_path_locks_before_any_declaration(wt: Path, home: Path) -> None:
-    proc = seat(wt, home, "-Prompt", "-SessionId", SID)
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "", "-Prompt is a hook path and must stay silent"
+    arrive(wt, home)
     assert lock_text(wt) == f"undeclared {SID}"
     # The declaration then relabels the same session's lock, with no moment unlocked.
-    proc = declare(wt, home)
+    proc = declare(wt, home, arrive_first=False)
     assert "worktree lock: relabelled" in proc.stdout
     assert lock_text(wt) == f"builder {SID}"
+
+
+def test_a_declaration_never_creates_a_lock(wt: Path, home: Path) -> None:
+    """SessionStart and SessionEnd come from one settings file; -Declare can run where that file
+    wires no SessionEnd. So a lock exists only where SessionStart made it."""
+    proc = declare(wt, home, arrive_first=False)
+    assert "worktree lock: not-locked" in proc.stdout, proc.stdout
+    assert lock_text(wt) is None
+
+
+@pytest.mark.parametrize("source", ["clear", "resume"])
+def test_a_clear_or_resume_hands_the_lock_to_the_new_id(wt: Path, home: Path, source: str) -> None:
+    """The old id's lock reads LIVE (the same process carries on), so neither a takeover nor any
+    exit would release it. The SessionStart that follows hands it to the new id."""
+    declare(wt, home)
+    sleeper = live_record(home, SID)
+    try:
+        unlock_hook(wt, home, SID, reason=source)
+        assert lock_text(wt) == f"builder {SID}", "the old id's end must not unlock"
+        arrive(wt, home, OTHER_SID, source=source)
+        assert lock_text(wt) == f"builder {OTHER_SID}", "the seat label is kept across the handover"
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    unlock_hook(wt, home, OTHER_SID)
+    assert lock_text(wt) is None, "the new id's clean exit releases it"
+
+
+def test_a_startup_beside_a_live_seat_lock_keeps_it(wt: Path, home: Path) -> None:
+    """The control for the handover: only clear, resume or compact hand a lock over."""
+    declare(wt, home)
+    sleeper = live_record(home, SID)
+    try:
+        arrive(wt, home, OTHER_SID, source="startup")
+        assert lock_text(wt) == f"builder {SID}"
+    finally:
+        sleeper.kill()
+        sleeper.wait()
 
 
 def test_declaring_again_is_idempotent(wt: Path, home: Path) -> None:
@@ -212,37 +274,34 @@ def test_another_holders_lock_is_kept(wt: Path, home: Path, repo: Path) -> None:
 def test_a_live_seats_lock_is_kept_and_a_dead_ones_is_taken_over(
     wt: Path, home: Path, repo: Path
 ) -> None:
-    # A registry record for OTHER_SID whose pid is a process started just now: LIVE to the fence.
-    sessions = home / ".claude" / "sessions"
-    sessions.mkdir(parents=True)
-    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(240)"])
+    held = f"manager {OTHER_SID}"
+    git(repo, "worktree", "lock", "--reason", held, str(wt))
+    sleeper = live_record(home, OTHER_SID)
     try:
-        record = {"pid": sleeper.pid, "sessionId": OTHER_SID, "startedAt": int(time.time() * 1000)}
-        (sessions / "1.json").write_text(json.dumps(record), encoding="utf-8")
-        git(repo, "worktree", "lock", "--reason", f"manager {OTHER_SID}", str(wt))
-        proc = declare(wt, home)
-        assert "worktree lock: kept-foreign" in proc.stdout, proc.stdout
+        arrive(wt, home)
+        assert lock_text(wt) == held
     finally:
         sleeper.kill()
         sleeper.wait()
+    sessions = home / ".claude" / "sessions"
 
     # No record, but a registry file caught mid-write might be that seat's: still not gone.
     (sessions / "1.json").write_text("{", encoding="utf-8")
-    proc = declare(wt, home)
-    assert "worktree lock: kept-foreign" in proc.stdout, proc.stdout
+    arrive(wt, home)
+    assert lock_text(wt) == held
 
     # No registry record at all: reported elsewhere, but not taken over, because a live seat in a
     # config root this reader cannot see reads the same way.
     (sessions / "1.json").unlink()
-    proc = declare(wt, home)
-    assert "worktree lock: kept-foreign" in proc.stdout, proc.stdout
+    arrive(wt, home)
+    assert lock_text(wt) == held
 
-    # A positive dead signal: the record's pid is not running. Now the arriving seat takes it over.
-    dead = {"pid": 999999, "sessionId": OTHER_SID, "startedAt": int(time.time() * 1000)}
+    # A record missing startedAt must not throw under seat.ps1's StrictMode; its pid is not
+    # running, which is a positive dead signal, so the arriving seat takes the lock over.
+    dead = {"pid": 999999, "sessionId": OTHER_SID}
     (sessions / "1.json").write_text(json.dumps(dead), encoding="utf-8")
-    proc = declare(wt, home)
-    assert "worktree lock: taken-over" in proc.stdout, proc.stdout
-    assert lock_text(wt) == f"builder {SID}"
+    arrive(wt, home)
+    assert lock_text(wt) == f"undeclared {SID}"
 
 
 def test_close_keeps_the_lock_and_a_stop_never_places_one(wt: Path, home: Path) -> None:
@@ -319,6 +378,43 @@ def test_the_primary_checkout_is_skipped_cleanly(repo: Path, home: Path) -> None
     proc = declare(repo, home)
     assert "worktree lock: skipped-primary" in proc.stdout
     assert not (repo / ".git" / "locked").exists()
+
+
+@pytest.mark.parametrize("agent", ["", "codex"])
+def test_the_unlock_key_agrees_with_seat_ps1s_session_key(agent: str) -> None:
+    """seat-unlock.ps1 derives the key with ConvertTo-SeatSessionKey; seat.ps1 locked with
+    Get-SessionKey. If they drift, every clean exit reads kept-foreign and leaks its lock."""
+    samples = [
+        SID,
+        "a b/c:d",
+        "x" * 120,
+        "ID-with.dots_and-dashes",
+    ]
+    probe = (
+        f"$ast = [System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{ROOT / 'scripts' / 'coord' / 'seat.ps1'}', [ref]$null, [ref]$null); "
+        "$fn = $ast.FindAll({ param($n) $n -is "
+        "[System.Management.Automation.Language.FunctionDefinitionAst] -and "
+        "$n.Name -eq 'Get-SessionKey' }, $true) | Select-Object -First 1; "
+        ". ([scriptblock]::Create($fn.Extent.Text)); "
+        f". '{ROOT / 'scripts' / 'worktree' / 'worktree-audit.ps1'}'; "
+        f"$env:KORUS_AGENT = '{agent}'; "
+        "$out = foreach ($s in $input) { [pscustomobject]@{ a = (Get-SessionKey -Payload $null "
+        "-Override $s).Key; b = ConvertTo-SeatSessionKey $s } }; "
+        "ConvertTo-Json -InputObject @($out) -Compress"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", probe],
+        input="\n".join(samples),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+    )
+    rows = json.loads(proc.stdout)
+    assert len(rows) == len(samples), rows
+    for row in rows:
+        assert row["a"] == row["b"], row
 
 
 def test_a_cloud_session_does_not_lock_or_error(wt: Path, home: Path) -> None:

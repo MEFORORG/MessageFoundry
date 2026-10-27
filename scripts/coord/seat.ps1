@@ -113,6 +113,10 @@ param(
     # it can never be read as a declaration. A derived label is a measurement; a declaration is a
     # statement of intent, and this file does not let one wear the other's clothes.
     [Parameter(ParameterSetName = 'Prompt')][string]$DerivedSeat,
+    # The SessionStart hook input's `source`: startup, resume, clear or compact. On the last three the
+    # process and its seat carry on in the same tree under a (possibly) new session id, so the seat
+    # lock is handed over to that id (BACKLOG #2524; scripts/worktree/seat-lock.ps1).
+    [Parameter(ParameterSetName = 'Prompt')][string]$Source,
     # Only for tests and for -Declare from a different cwd. Normally derived.
     [string]$Worktree,
     # Precedence for the record's session key, highest first: this parameter, then the hook's stdin
@@ -845,6 +849,12 @@ function Invoke-ClearHandoff {
     return 0
 }
 
+function Get-SeatLockMode {
+    # A SessionStart from /clear, /resume or /compact continues a seat already in this tree.
+    if ($Source -in @('clear', 'resume', 'compact')) { return 'handover' }
+    return 'arrive'
+}
+
 function Invoke-SeatWorktreeLock {
     <#
     .SYNOPSIS
@@ -852,20 +862,21 @@ function Invoke-SeatWorktreeLock {
 
     .DESCRIPTION
         Why, and the rules, are scripts/worktree/worktree-audit.ps1's and seat-lock.ps1's headers.
-        It runs on -Prompt (SessionStart) and -Declare, and on -Prompt also when the shared registry is
+        It runs on -Prompt (SessionStart, -Mode arrive or handover) and -Declare (-Mode relabel,
+        which never creates a lock), and on -Prompt also when the shared registry is
         down: the lock is local git state, so an outage must not leave a session unlocked. Not on
         -Record; seat-lock.ps1's header says why.
         A copy of this script with no seat-lock.ps1 beside it (a test sandbox that copies seat.ps1
         alone) says so and records nothing: the lock is not this record's to fail.
     #>
-    param([string]$Wt, [string]$Seat, [string]$SessionKey, [switch]$KeepLabel)
+    param([string]$Wt, [string]$Seat, [string]$SessionKey, [switch]$KeepLabel, [string]$Mode = 'arrive')
     $lib = Join-Path (Split-Path -Parent $PSScriptRoot) 'worktree\seat-lock.ps1'
     if (-not (Test-Path -LiteralPath $lib -PathType Leaf)) {
         return 'worktree lock: not attempted (scripts/worktree/seat-lock.ps1 is missing beside this script)'
     }
     try {
         . $lib
-        $lock = Set-SeatWorktreeLock -Worktree $Wt -Seat $Seat -SessionKey $SessionKey -KeepLabel:$KeepLabel
+        $lock = Set-SeatWorktreeLock -Worktree $Wt -Seat $Seat -SessionKey $SessionKey -KeepLabel:$KeepLabel -Mode $Mode
         if ($lock.Action -eq 'failed') { Write-WriterError -Stage 'worktree-lock' -Message $lock.Detail }
         return "worktree lock: $($lock.Action)$(if ($lock.Detail) { " ($($lock.Detail))" })"
     }
@@ -907,7 +918,7 @@ try {
         if ($PSCmdlet.ParameterSetName -in 'Record', 'Prompt') {
             # The lock is local; it does not wait on the share. No seat is known here, so an existing
             # lock of this session's keeps its label.
-            if ($Prompt) { $null = Invoke-SeatWorktreeLock -Wt $wt -SessionKey (Get-SessionKey -Payload $payload -Override $SessionId).Key -KeepLabel }
+            if ($Prompt) { $null = Invoke-SeatWorktreeLock -Wt $wt -SessionKey (Get-SessionKey -Payload $payload -Override $SessionId).Key -KeepLabel -Mode (Get-SeatLockMode) }
             [System.Console]::Error.WriteLine("seat.ps1: the shared seat registry did not resolve, so nothing was recorded: $($seatsRes.Error)")
             exit 0
         }
@@ -1138,10 +1149,13 @@ try {
 
     # The worktree lock (BACKLOG #2524), BEFORE the record write, so a failed write cannot leave the
     # session unlocked. -Close does not unlock: only the SessionEnd hook does (seat-lock.ps1 says why).
+    # -Declare only RELABELS a lock this session's SessionStart placed: SessionStart and SessionEnd
+    # come from the same settings file, so a lock is only ever created where its unlock is wired.
     # The line is printed AFTER `wrote <path>`, which callers parse as stdout's first line.
     $lockLine = ''
     if ($Declare -or $Prompt) {
-        $lockLine = Invoke-SeatWorktreeLock -Wt $wt -Seat ([string]$rec.seat) -SessionKey $sk.Key
+        $mode = if ($Declare) { 'relabel' } else { Get-SeatLockMode }
+        $lockLine = Invoke-SeatWorktreeLock -Wt $wt -Seat ([string]$rec.seat) -SessionKey $sk.Key -Mode $mode
     }
 
     Write-RecordAtomic -Path $recPath -Object $rec

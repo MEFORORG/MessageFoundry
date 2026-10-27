@@ -78,6 +78,9 @@ def layout(tmp_path: Path) -> dict[str, Path]:
         f"refused: error: failed to delete '{fwd}': Permission denied",
         f"2026-09-23 17:15:42 [warn] Git worktree remove failed, will try manual cleanup: error: "
         f"failed to delete '{back}': Permission denied",
+        # A JSON-escaped path, every backslash doubled: still this folder.
+        f'2026-09-23 17:16:00 [warn] Git worktree remove failed, will try manual cleanup: {{"path":"'
+        f'{back.replace(chr(92), chr(92) * 2)}","err":"Permission denied"}}',
         # The marker without its second substring: not a failure line.
         f"2026-09-23 17:20:00 [warn] Git worktree remove failed, will try manual cleanup: fatal: "
         f"'{back}' is not a working tree",
@@ -118,7 +121,8 @@ def test_a_planted_emptied_folder_is_reported_with_its_log_lines(layout: dict[st
     found = {Path(e["Path"]).name: e for e in out["emptied"]}
     assert set(found) == {"seat-a"}, found
     texts = [ln["Text"] for ln in found["seat-a"]["LogLines"]]
-    assert len(texts) == 2, texts
+    assert len(texts) == 3, texts
+    assert any('"path":"' in t for t in texts), "the JSON-escaped line was not attached"
     assert any("reapUntrackedWorktreeDir] git worktree remove refused" in t for t in texts)
     assert any("will try manual cleanup" in t and "Permission denied" in t for t in texts)
     assert not any("is not a working tree" in t for t in texts)

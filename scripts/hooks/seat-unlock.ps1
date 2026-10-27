@@ -33,8 +33,8 @@ try {
     $s = Resolve-CcxHookSession -Text $raw -ReadOnly
     if (-not $s.SessionId) { exit 0 }
     # /clear and /resume end a session id while the process, and its seat, go on in the same tree.
-    # The lock stays and keeps protecting the tree. No later exit names the old id, so it outlives
-    # the session, and hygiene-report.ps1 section e lists it then.
+    # The lock stays and keeps protecting the tree; the SessionStart that follows hands it over to the
+    # new id (seat.ps1 -Prompt -Source), whose own exit then releases it.
     if ($s.Payload -and $s.Payload.PSObject.Properties['reason'] -and [string]$s.Payload.reason -in @('clear', 'resume')) { exit 0 }
     # The pinned worktree first. With no pin (a session since /clear), the input's own `cwd`: the
     # helper refuses to answer for an unpinned linked worktree, but an unlock removes only a lock

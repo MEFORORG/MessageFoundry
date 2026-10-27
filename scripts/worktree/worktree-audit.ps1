@@ -15,9 +15,11 @@
     WHY SEAT WORKTREES ARE LOCKED (BACKLOG #2524). A Claude Desktop instance's worktree GC
     (`[reapUntrackedWorktreeDir]`) runs `git worktree remove --force` on another instance's worktree
     that looks quiet and clean. On Windows a folder that a live session holds open is then EMPTIED and
-    deregistered, with the session still in it. That GC keeps any worktree whose admin directory holds
-    a `locked` file, and so do prune-merged.ps1, claim-reconcile.ps1 and this repository's other
-    reclaimers. So a seat locks its worktree on arrival and unlocks it on a clean exit. A session that
+    deregistered, with the session still in it. What the evidence shows (the vault's
+    docs/reviews/2026-09-30-b184-1917-worktree-emptying.md) is that the GC's reap path logged
+    `(locked)` and kept a locked folder. Its manual-cleanup fallback is NOT shown to respect a lock,
+    so the lock narrows the exposure and does not close it. prune-merged.ps1 and claim-reconcile.ps1
+    keep a locked tree too. So a seat locks its worktree on arrival and unlocks it on a clean exit. A session that
     dies without unlocking leaves a tree nothing reclaims, which is what Get-StaleSeatLocks reports.
 
     THE REASON FORMAT IS `<seat> <session id>`, two tokens and nothing else. It is what the row named,
@@ -86,6 +88,9 @@ function Get-SeatLockReading {
         already read the registry, so a report over many locks reads it once.
     #>
     param([string]$SessionKey, [string[]]$ConfigRoot, [Nullable[int]]$Unreadable)
+    # session-registry.ps1 reads `.sessionId`, `.pid` and `.startedAt` off records that may lack them.
+    # Under a caller's StrictMode (seat.ps1 runs Latest) a missing one throws instead of reading null.
+    Set-StrictMode -Off
     if ($SessionKey.StartsWith('codex-')) {
         return [pscustomobject]@{ State = 'CODEX'; Detail = "Claude's session registry cannot fence a Codex seat"; Gone = $false }
     }
@@ -212,7 +217,8 @@ function Find-EmptiedWorktrees {
             # The log spells a path with either slash. A name must end at the match, so `seat-a` does
             # not claim the line about `seat-ab`.
             $pat = [regex]::Escape((ConvertTo-Norm $e.FullName)) + '(?![A-Za-z0-9._-])'
-            $lines = @($hits | Where-Object { ($_.Line -replace '\\', '/').ToLowerInvariant() -match $pat } | ForEach-Object {
+            # A run of backslashes is one separator, so a JSON-escaped `D:\\Code\\x` matches too.
+            $lines = @($hits | Where-Object { ($_.Line -replace '\\+', '/').ToLowerInvariant() -match $pat } | ForEach-Object {
                     [pscustomobject]@{ File = $_.Path; LineNumber = $_.LineNumber; Text = $_.Line.Trim() }
                 })
             [pscustomobject]@{
