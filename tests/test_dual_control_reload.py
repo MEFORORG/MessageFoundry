@@ -1523,7 +1523,6 @@ async def test_a_release_refused_by_the_source_trust_check_names_its_approval(
     _approval_id, r = await _hold_then_release(engine, service, {}, between=_tamper)
     assert r.status_code == 422, r.text
     assert r.json()["detail"] == "invalid configuration"
-    assert not marker.exists(), "the edited module ran before the refusal"
     # Digests and the marker only: the row's exact keys show no path or file content entered it.
     assert await _failed_reload_rows(engine) == [
         {

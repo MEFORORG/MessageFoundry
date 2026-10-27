@@ -2334,11 +2334,12 @@ digest of the target directory, taken at request time. An approver sees it in th
 release the config source's trust check runs before the directory is read. It stats paths and
 reads no file's contents. The release then reads the directory once, into a snapshot, and checks
 that snapshot's digest against the approved one before any config module runs. The load compiles
-and runs that same snapshot, and the `config_reload` row records its digest. So the bytes checked
-are the bytes that run, and an edit on disk during the load is neither run nor recorded. If the
-digest differs, nothing loads and nothing swaps. The running graph keeps the environment values it
-had. A reload applies the values it re-read only with the swap, and a rolled-back swap puts the
-old ones back. A dry run checks the values and never applies them. The
+and runs that same snapshot, and the `config_reload` row records its digest. So the config
+modules, helpers and tables checked are the ones that run, and an edit to them on disk during the
+load is neither run nor recorded. The environment values are read apart from the snapshot, as the
+limits below say. If the digest differs, nothing loads and nothing swaps. The running graph keeps
+the environment values it had. A reload applies the values it re-read only with the swap, and a
+rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
 approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
 reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold whose
 params carry no digest is refused the same way, with reason `no_approved_digest`. A release that
@@ -2346,15 +2347,20 @@ cannot take the digest now is refused with reason `digest_unavailable`, and the 
 cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
 
 **A release refused before the digest check never reaches it.** At least the settings preflight
-and the config source's trust check run before it. So a tamper that also loosens the permissions
-on the config directory or a file in it is refused as `invalid_config`, not `digest_mismatch`. The
-row for a refusal before the check carries `approved_fingerprint`, the approval's digest, and
-`approval_digest_check` set to `not_reached`, and no `current_fingerprint`, because no digest was
-taken. A load that fails after the digest check passed is a failure of the approved bytes, and
-its row carries neither field.
-Every start and reload refuses a config directory holding a file the load reads that the engine
-cannot read, a `_` helper no module imports included. Only an unreadable `environments/` value
-file is left out.
+and the config source's trust check run before it. So where the trust check refuses rather than
+warns, a tamper that also loosens the permissions on a file it covers, such as a config module,
+is refused as `invalid_config`, not `digest_mismatch`. A `WiringError` refusal made before the
+check, by those two or another step, writes a row carrying `approved_fingerprint`, the approval's
+digest, and `approval_digest_check` set to `not_reached`, and no `current_fingerprint`, because no
+digest was taken. A missing, unlistable or disallowed directory is refused before the check too,
+with its own reason and neither field. A refusal after the digest check passed carries neither
+field either, whether the approved bytes caused it or an input the digest does not cover, such as
+an environment value file or a connection's CA file.
+
+**Every start and reload refuses a config directory holding a file the load reads that the engine
+cannot read, a `_` helper no module imports included.** An unreadable file or folder under
+`environments/` is left out, because the load never reads it. A released reload reads strictly, so
+it refuses that too, as `digest_unavailable`.
 
 This digest fails closed, unlike the provenance fingerprint, which skips what it cannot read. A
 file or folder it covers that cannot be read gives no digest at all, never the digest of the rest.
@@ -2382,10 +2388,12 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   integrity seal, so a writer to the `pending_approvals` table who replaces the digest leaves a
   request the gate refuses. The seal does not stop an older sealed copy of the row being put back,
   and a keyless store checks nothing (vault BACKLOG #2592);
-- the digest covers what `config/fingerprint.py` hashes and no more. An edit to an environment
-  value file outside the config directory, or to a `MEFOR_VALUE_*` variable, changes the values a
-  release applies under an unchanged digest. No `__pycache__` file runs, because the loader
-  compiles each module from the snapshot;
+- the digest covers what `config/fingerprint.py` hashes and no more. The release reads the
+  environment value file again after the digest check, wherever the file sits, so an edit to it,
+  or to a `MEFOR_VALUE_*` variable, changes the values a release applies under an unchanged digest.
+  No config module or `_` helper runs from `__pycache__`, because the loader compiles each from the
+  snapshot. A module a config module imports through the ordinary import system, such as a sibling
+  when the config directory is on `sys.path`, is outside both the snapshot and the digest;
 - the request-time digest is taken before the route checks its step-up proof;
 - the digest checks that each folder it reads can be listed, and then lists it again. A folder
   that becomes unlistable between the two is left out of the digest;

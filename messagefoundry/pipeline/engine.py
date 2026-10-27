@@ -241,10 +241,11 @@ class ConfigDigestUnavailable(Exception):
 
 class ConfigRefusedBeforeApprovalCheck(WiringError):
     """A released reload refused as a ``WiringError`` before its snapshot's digest was checked
-    against its approval (vault BACKLOG #2596): by the settings preflight, or by the config
-    source's trust check, which stats paths and reads no contents. It keeps the refusal's message,
-    cause and traceback, so it is audited as that refusal is. ``approved`` is the digest the hold
-    captured, or ``None``, so the audit row can name the approval the refusal stopped."""
+    against its approval (vault BACKLOG #2596): at least by the settings preflight, or by the
+    config source's trust check, which stats paths and reads no contents. It keeps the refusal's
+    message, cause and traceback, so it is audited with the reason that refusal gets. ``approved``
+    is the digest the hold captured, or ``None``, so the audit row can name the approval the
+    refusal stopped."""
 
     def __init__(self, refusal: WiringError, approved: str | None) -> None:
         super().__init__(str(refusal))
@@ -3104,7 +3105,8 @@ class Engine:
                 "config content digest failed for %s: %s. The reload's snapshot could not be "
                 "read whole, so a released reload is refused. Any other reload reads the "
                 "directory again and refuses any file the load reads that it cannot read, every "
-                "*.py module and helper included; only an environment value file is left out",
+                "*.py module and helper included; only the environments folder and its files "
+                "are left out",
                 scrub_log_argument(str(path)),
                 safe_exc(exc),
             )

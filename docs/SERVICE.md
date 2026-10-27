@@ -714,7 +714,8 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       account for the config directory itself, with no group or other write bit. The shipped
       image's `/config` sits directly under `/`, which is root-owned.
   - **The cache folder is checked although the loader never runs it.** The loader compiles each
-    module from the bytes it read, so no `__pycache__\*.pyc` runs in place of its `.py`. A writer
+    config module and `_` helper from the bytes it read, so no `__pycache__\*.pyc` runs in place
+    of its `.py`. A writer
     of the folder is still a writer inside the config directory, and tools other than the loader,
     such as `python -m`, still run a cache file (vault BACKLOG #2596).
   - **At start, `serve` checks two more files the same way, each with the folder it sits in**: the
