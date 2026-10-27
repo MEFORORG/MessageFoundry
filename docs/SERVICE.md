@@ -713,9 +713,10 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       run `namei -l` on every file there that is a link. Each directory those commands list must be owned by root, or by the engine's own
       account for the config directory itself, with no group or other write bit. The shipped
       image's `/config` sits directly under `/`, which is root-owned.
-  - **The cache folder is checked because it runs.** Python's source loader runs a matching
-    `__pycache__\*.pyc` in place of the `.py` beside it and never compares the two. A cache file
-    the check did not read could run under a source it passed (vault BACKLOG #2596).
+  - **The cache folder is checked although the loader never runs it.** The loader compiles each
+    module from the bytes it read, so no `__pycache__\*.pyc` runs in place of its `.py`. A writer
+    of the folder is still a writer inside the config directory, and tools other than the loader,
+    such as `python -m`, still run a cache file (vault BACKLOG #2596).
   - **At start, `serve` checks two more files the same way, each with the folder it sits in**: the
     service settings file it read (`--service-config`, else `.\messagefoundry.toml`) and the value
     file `environments\<env>.toml`. It refuses to start when another account can write either one
