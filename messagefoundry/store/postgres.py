@@ -8904,7 +8904,9 @@ class PostgresStore:
         if sealer is None:
             return 0, 0
         cipher = self._cipher
-        if not isinstance(cipher, AesGcmCipher):  # no in-process keys, so no sealer either
+        # Only an in-process key moves: rotate-key refuses vault_transit before this pass, and
+        # Transit versions its own seal key (BACKLOG #2592).
+        if not isinstance(cipher, AesGcmCipher):
             return 0, 0
         change = rotation_reseal(
             sealer,

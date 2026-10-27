@@ -292,14 +292,15 @@ class RowSealer:
         return self.verify_held(kind, fields, stored)
 
 
-class TransitSealUnavailableError(CipherError):
+class TransitSealUnavailableError(Exception):
     """A Transit call for a row seal did not complete (ADR-draft decision D14).
 
     Not an integrity failure: the row may be sound and Vault may be restarting. So no caller reads
     it as a failed seal, and no ``integrity.authority_seal_failed`` audit row is written. It
-    propagates instead, which denies the request or rolls the write back, and the sealer logs a
-    provider alert. A :class:`CipherError`, the store's at-rest error class. Its text is Vault's
-    failure text, never row data."""
+    propagates instead, which denies the request or rolls the write back, and the sealer logs an
+    ERROR line. Deliberately NOT a :class:`CipherError`: the handlers that read a ``CipherError``
+    as "this cell did not open" must not file a Vault outage as a factor or cell problem. Its text
+    is Vault's failure text, never row data."""
 
 
 #: The label a Transit seal input starts with. It stands where the HKDF label stands under the
@@ -338,7 +339,12 @@ def _transit_version(mac: str) -> int | None:
     """The key version a Transit MAC string names (``vault:v<N>:<base64>``), or ``None`` when it
     is not that shape. Parsed by hand, so no regex sees stored text. ``N`` follows the audit
     chain's ``_TRANSIT_MAC_VERSION`` rule in ``store.py``: 1 to 10 digits, no leading zero."""
-    if len(mac) > _TRANSIT_MAC_MAX_LEN or not mac.startswith(_TRANSIT_MAC_PREFIX):
+    # ASCII only: a planted non-ASCII value fails here, never later as an encode error.
+    if (
+        len(mac) > _TRANSIT_MAC_MAX_LEN
+        or not mac.isascii()
+        or not mac.startswith(_TRANSIT_MAC_PREFIX)
+    ):
         return None
     version, sep, body = mac[len(_TRANSIT_MAC_PREFIX) :].partition(":")
     if not sep or not body or not version.isascii() or not version.isdigit():
@@ -363,14 +369,16 @@ class TransitRowSealer:
 
     **The cache holds successful checks only**, keyed by a digest of the length-prefixed input and
     the stored Transit string, which carries the version. An entry lives
-    :data:`TRANSIT_SEAL_CACHE_TTL_SECONDS`. The cache is emptied when this process first sees a
-    newer key version, and a check under an older version is answered but not cached. It holds a
-    result and nothing else; the caller reads the row afresh every time.
+    :data:`TRANSIT_SEAL_CACHE_TTL_SECONDS`, which also bounds how long a check outlives a version
+    Transit later retires. The cache is emptied when this process first sees a newer key version.
+    It holds a result and nothing else; the caller reads the row afresh every time.
 
     **An outage is not a failed seal.** A call that does not complete raises
-    :class:`TransitSealUnavailableError` and logs a provider alert, at most once per
-    :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`. Transit refusing the check (HTTP 400: a version it
-    does not hold, or a string it cannot read) means "does not verify".
+    :class:`TransitSealUnavailableError` and logs an ERROR line, at most once per
+    :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`. No alert sink is notified. Transit refusing the
+    check while its key still answers means "does not verify"
+    (:meth:`~messagefoundry.store.crypto_transit.TransitCipher.verify_seal_hmac` says how the two
+    are told apart).
 
     **The seam (CLAUDE.md section 6).** Each Transit call runs in a worker thread
     (:func:`asyncio.to_thread`), so a seal or a check never blocks the event loop. So only the
@@ -451,10 +459,9 @@ class TransitRowSealer:
         if not valid:
             return False
         self._saw_version(version)
-        if version == self._latest_version:
-            if len(self._cache) >= TRANSIT_SEAL_CACHE_MAX:
-                self._cache.pop(next(iter(self._cache)))
-            self._cache[entry] = time.monotonic() + TRANSIT_SEAL_CACHE_TTL_SECONDS
+        if len(self._cache) >= TRANSIT_SEAL_CACHE_MAX:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[entry] = time.monotonic() + TRANSIT_SEAL_CACHE_TTL_SECONDS
         return True
 
     async def verify_held_async(

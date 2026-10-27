@@ -277,6 +277,15 @@ async def test_a_version_transit_refuses_does_not_verify(transit_store: Opened) 
     assert await sealer.verify_async(SESSION_KIND, fields, good) is True
     assert await sealer.verify_async(SESSION_KIND, [("token_hash", "other")], good) is False
 
+    # A 400 while the key itself does not answer (a missing or renamed key) is an outage, not a
+    # forgery: Transit's probe under the latest version must succeed before a 400 means "no".
+    def key_gone(**_: Any) -> dict[str, Any]:
+        raise hvac_exceptions.InvalidRequest("synthetic: no such key")
+
+    transit.generate_hmac = key_gone  # type: ignore[method-assign]
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.verify_async(SESSION_KIND, [("token_hash", "fresh")], forged)
+
 
 # --- the stored form --------------------------------------------------------------------------
 
@@ -291,6 +300,9 @@ async def test_a_version_transit_refuses_does_not_verify(transit_store: Opened) 
         "mfseal:v1:{kid}:vault:v1:",  # no MAC body
         "mfseal:v1:{kid}:vault:vX:abc",  # no version number
         "mfseal:v1:{kid}:vault:v1:" + "A" * 200,  # longer than any Transit HMAC
+        "mfseal:v1:{kid}:vault:v1:é",  # not ASCII: refused, never an encode error
+        "mfseal:v1:{kid}:vault:v01:abc",  # a leading zero, which Transit never writes
+        "mfseal:v1:{kid}:vault:v0:abc",
         "mfseal:v1:{kid}:mac",
     ],
 )

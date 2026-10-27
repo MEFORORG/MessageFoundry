@@ -1070,6 +1070,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
+    # BACKLOG #2592: the approval gate checks each dual-control request's integrity seal
+    # (store.approval_seal_ok) before it acts on the request.
+    "messagefoundry/api/approvals.py": frozenset({"sign_verify:via messagefoundry.store.store"}),
     "messagefoundry/api/security.py": frozenset(
         {"key_cert:via messagefoundry.pipeline.cert_expiry"}
     ),
@@ -1176,6 +1179,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "mac:via messagefoundry.auth.totp",
             "sign_verify:via messagefoundry.auth.oidc.claims",
             "sign_verify:via messagefoundry.auth.webauthn",
+            # BACKLOG #2592: the session loader checks each session row's integrity seal, and the
+            # user loader each account's.
+            "sign_verify:via messagefoundry.store.store",
             "tls_context:via messagefoundry.auth.oidc_http",
         }
     ),
@@ -1457,16 +1463,16 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"csprng:via messagefoundry.store.crypto"}),
     # BACKLOG #2592: HMAC-SHA256 row seals and their constant-time verify, under a key the
-    # store.crypto seam derives (HKDF) and names by a SHA-256 digest. Every store and service seal
-    # check now runs through this module's awaited forms, which call RowSealer.verify (a MAC
-    # check), so the per-backend sign_verify entries moved here. Under vault_transit the MAC and
-    # its check run inside Transit; hashlib.sha256 names the Transit key (the key id) and keys the
-    # cache of successful checks, both non-secret digests.
+    # store.crypto seam derives (HKDF) and names by a SHA-256 digest. The awaited forms call the
+    # synchronous check (RowSealer.verify). Under vault_transit the MAC and its check run inside
+    # Transit; hashlib.sha256 names the Transit key (the key id) and keys the cache of successful
+    # checks, both non-secret digests.
     "messagefoundry/store/row_seal.py": frozenset(
         {
             "compare:hmac.compare_digest",
             "hash:hashlib.sha256",
             "sign_verify:.verify()",
+            "sign_verify:.verify_async()",
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
@@ -1514,6 +1520,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "kdf:via messagefoundry.store.crypto",
             "key_cert:via messagefoundry.config.tls_policy",
             "mac:via messagefoundry.store.store",
+            # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
+            "sign_verify:via messagefoundry.store.store",
             "tls_context:.check_hostname = False",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.create_default_context",
@@ -1542,6 +1550,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.auth.trust_anchors",
             "hash:via messagefoundry.auth.trust_anchors",
             "mac:via messagefoundry.store.store",
+            # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
+            "sign_verify:via messagefoundry.store.store",
         }
     ),
     "messagefoundry/store/store.py": frozenset(
@@ -1558,6 +1568,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
+            # BACKLOG #2592: the seal helpers seal and check identity and authorization rows
+            # through the awaited sealer forms (store.row_seal), under a local key or in Transit.
+            "mac:.seal_async()",
+            "sign_verify:.verify_async()",
+            "sign_verify:.verify_held_async()",
         }
     ),
     # BACKLOG #1352 / #1171: the generic dialect checks a driver client key's wrap (libpq sslkey)

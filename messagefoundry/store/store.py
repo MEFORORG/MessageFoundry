@@ -15435,8 +15435,11 @@ class MessageStore:
         sealer = self._row_sealer
         if sealer is None:
             return 0, 0
-        # A sealer exists only for a cipher that holds its keys in-process, which is AesGcmCipher.
-        cipher = cast("AesGcmCipher", self._cipher)
+        cipher = self._cipher
+        # Only an in-process key moves: rotate-key refuses vault_transit before this pass, and
+        # Transit versions its own seal key (BACKLOG #2592).
+        if not isinstance(cipher, AesGcmCipher):
+            return 0, 0
         change = rotation_reseal(
             sealer,
             cipher.active_marker_prefix,
