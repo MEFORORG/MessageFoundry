@@ -845,7 +845,9 @@ def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
     )
     with caplog.at_level("WARNING"), pytest.raises(ValueError, match="CRL block 1 of 2"):
         twins.hop("new")
-    assert not [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
+    # The failure is still logged, with how far the judgment got.
+    (error,) = [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
+    assert "after judging 1 of them" in error.getMessage() and error.exc_info is not None
 
     # Control: the same failure with no proof reached first still loads, with the ERROR.
     calls = 0
@@ -880,12 +882,10 @@ def _zero_serial_ca() -> bytes:
     return der.replace(version_and_serial, version_and_serial[:-1] + bytes(1))
 
 
-def test_a_root_with_a_zero_serial_is_skipped_alone_where_warnings_are_errors(
-    twins: _Twins,
-) -> None:
+def test_a_root_with_a_zero_serial_neither_ends_the_judgment_nor_warns(twins: _Twins) -> None:
     """The Manager's item 3. Under warnings as errors, ``cryptography``'s warning about a serial
     number that is not positive used to end the whole judgment, so a CRL proven badly signed
-    loaded. Now that one CA is skipped, and the proof stands."""
+    loaded. Now that CA is read with the warning ignored, and the proof stands."""
     import warnings
 
     from cryptography.utils import CryptographyDeprecationWarning
@@ -899,6 +899,11 @@ def test_a_root_with_a_zero_serial_is_skipped_alone_where_warnings_are_errors(
             x509.load_der_x509_certificate(odd)
         judged = [s.state for s in judge_crl_signatures(forged, [odd, *_ders(twins.new_ca)])]
     assert judged == ["bad"]
+    # In a normal run that CA prints no raw warning either.
+    with warnings.catch_warnings(record=True) as shown:
+        warnings.simplefilter("always")
+        list(judge_crl_signatures(forged, [odd]))
+    assert not [w for w in shown if issubclass(w.category, CryptographyDeprecationWarning)]
 
 
 def test_a_long_issuer_name_is_quoted_with_a_bound(twins: _Twins) -> None:
@@ -909,10 +914,14 @@ def test_a_long_issuer_name_is_quoted_with_a_bound(twins: _Twins) -> None:
     pem = _crl(twins.stranger, names=twins.stranger, name=long_name)
     assert len(long_name.rfc4514_string()) > 600  # the premise
     (signature,) = judge_crl_signatures(pem, _ders(twins.new_ca))
-    assert len(signature.where) < 300 and "characters)" in signature.where
+    assert len(signature.where) < 300 and "... (cut: the name is" in signature.where
+    # Escapes count toward the bound: a name of control characters quotes four for each.
+    controls = x509.Name([x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "\x01" * 60)] * 4)
+    (escaped,) = judge_crl_signatures(_crl(twins.stranger, names=None, name=controls), [])
+    assert len(escaped.where) < 300 and "(cut: the name is" in escaped.where
     # Control: a short name is quoted whole.
     (short,) = judge_crl_signatures(_crl(twins.stranger, names=None), _ders(twins.new_ca))
-    assert "CN=mefor-2905-twin-ca" in short.where and "characters)" not in short.where
+    assert "'CN=mefor-2905-twin-ca')" in short.where and "cut:" not in short.where
 
 
 #: Two of the four sentences withdrawn from the code (vault BACKLOG #3506, finding (c)). The guide

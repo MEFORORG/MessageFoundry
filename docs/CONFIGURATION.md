@@ -2028,9 +2028,9 @@ three cases warn:
   Two measured examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature
   over SHA-1 that the CA did make.
 
-If the check itself fails, the engine logs an ERROR that says so, and loads the file. A CRL it
-proved badly signed before the failure still refuses the file, and the CRLs after the failure are
-not judged (vault BACKLOG #3506).
+If the check itself fails, the engine logs an ERROR that says so, and loads the file. The CRLs it
+judged before the failure still count: one proved badly signed refuses the file, and the others
+warn. The CRLs after the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
 engine process logs the WARNING once while the file keeps the same bytes. It keeps that record for
@@ -2138,7 +2138,7 @@ follows a fix. A resolve made by hand in the alert list does not end it.
 
 **Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
 the event carries no `start_refuses`. With any other class a start can refuse the file too, and
-then the engine does not come up. Two of those cases need more:
+then the engine does not come up. Two more points:
 
 - A `retry` whose ERROR line says the reload could not stage the file. A start can need the same
   private copy and refuse too, so fix the temporary directory first (*The private copy is about

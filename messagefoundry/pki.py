@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime
 import ipaddress
 import string
+import warnings
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Literal
@@ -446,45 +447,48 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
     which then retried every pass. ``pem`` must be bytes :func:`judge_every_crl` accepted; a
     block that does not parse raises ``ValueError``."""
     cas: list[tuple[_NameKey, x509.Certificate]] = []
-    for der in ca_ders:
-        try:
-            ca = x509.load_der_x509_certificate(der)
-            cas.append((_issuer_name_key(ca.subject), ca))
-        except _UNREADABLE_CA:
-            continue
+    # A CA whose serial number is not positive, as at least some system roots have, makes the
+    # parse warn. That CA is read all the same, so it is kept, and the warning is not shown. Where
+    # warnings are errors, the warning used to end the whole judgment (vault BACKLOG #3506).
+    # ``catch_warnings`` swaps the process's warning filters while it runs, and a start and a
+    # reload can run it on two threads at once. Where two overlap, the ignore filter can stay for
+    # the life of the process, so a later ``CryptographyDeprecationWarning`` is not shown, and a
+    # filter another thread adds inside that window can be lost.
+    with warnings.catch_warnings(action="ignore", category=CryptographyDeprecationWarning):
+        for der in ca_ders:
+            try:
+                ca = x509.load_der_x509_certificate(der)
+                cas.append((_issuer_name_key(ca.subject), ca))
+            except _UNREADABLE_CA:
+                continue
     blocks = list(_crl_blocks(pem))
     for index, block in enumerate(blocks, start=1):
         crl = x509.load_pem_x509_crl(block)
-        issuer = _bounded(crl.issuer.rfc4514_string())
+        issuer = _quoted_issuer(crl.issuer.rfc4514_string())
         yield CrlSignature(
-            f"CRL block {index} of {len(blocks)} (issuer {issuer!r})", _signature_state(crl, cas)
+            f"CRL block {index} of {len(blocks)} (issuer {issuer})", _signature_state(crl, cas)
         )
 
 
-#: The most characters of a CRL's issuer name a message quotes (vault BACKLOG #3506). A name has
-#: no length bound of its own, and each message that quotes it goes to the log or an exception.
+#: The most characters of a CRL's quoted issuer name the signature check puts in a message (vault
+#: BACKLOG #3506). A name has no length bound of its own, and each message that quotes it goes to
+#: the log or an exception.
 _ISSUER_SHOWN = 200
 
 
-def _bounded(issuer: str) -> str:
-    """``issuer`` whole, or its first :data:`_ISSUER_SHOWN` characters and how long it is."""
-    if len(issuer) <= _ISSUER_SHOWN:
-        return issuer
-    return f"{issuer[:_ISSUER_SHOWN]}... ({len(issuer)} characters)"
+def _quoted_issuer(issuer: str) -> str:
+    """``issuer`` quoted with ``repr``, whole, or cut to :data:`_ISSUER_SHOWN` characters after
+    quoting, so escapes count too. The note on how long the name is stays outside the quotes."""
+    quoted = repr(issuer)
+    if len(quoted) <= _ISSUER_SHOWN:
+        return quoted
+    return f"{quoted[:_ISSUER_SHOWN]}... (cut: the name is {len(issuer)} characters)"
 
 
 #: What ``cryptography`` raises for a CA certificate it cannot read, at least. A CA that raises
 #: one is skipped by :func:`judge_crl_signatures`, alone. ``InvalidVersion`` comes from the
 #: parse, and ``UnsupportedGeneralNameType`` from reading extensions; neither is a ``ValueError``.
-#: ``CryptographyDeprecationWarning`` is raised only where warnings are errors. The parse warns of
-#: a CA whose serial number is not positive, which at least some system roots carry, and as an
-#: error that one root used to end the whole judgment (vault BACKLOG #3506).
-_UNREADABLE_CA = (
-    ValueError,
-    x509.InvalidVersion,
-    x509.UnsupportedGeneralNameType,
-    CryptographyDeprecationWarning,
-)
+_UNREADABLE_CA = (ValueError, x509.InvalidVersion, x509.UnsupportedGeneralNameType)
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
 _NameKey = tuple[tuple[tuple[str, bool, str | bytes], ...], ...]

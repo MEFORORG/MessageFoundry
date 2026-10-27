@@ -595,9 +595,9 @@ def _check_crl_signatures(
     version that logged one, and an earlier version is logged again only when it returns after
     another that logged one. A judgment that fails for any other reason is logged at ERROR,
     once, and the file loads: this is a diagnosis, and a defect in it must not stop a start. The
-    verdicts reached before that failure still count, so a CRL already proven bad refuses the
-    file (vault BACKLOG #3506). The CRLs after it are not judged, and none is when the failure
-    comes before the first verdict.
+    verdicts reached before that failure still count (vault BACKLOG #3506): a CRL already proven
+    bad refuses the file, and the others warn. The CRLs after it are not judged, so a proof
+    there is missed, and none is judged when the failure comes before the first verdict.
 
     **Each CRL is judged on its own, as the expired-CRL refusal judges them.** So a badly signed
     copy refuses the file even beside a newer, good CRL from the same issuer, which OpenSSL
@@ -622,19 +622,19 @@ def _check_crl_signatures(
     except Exception as exc:
         # Not a verdict on the file, and not proof: the judgment itself failed. Broad on purpose.
         # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
-        # that with exception types of its own. The handshake still checks every signature. A
-        # proof already reached still refuses, below.
-        if not any(signature.state == "bad" for signature in judged):
-            if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(exc).__name__)):
-                logger.error(
-                    "%s: the engine could not check the signatures of the CRL(s) in this file at "
-                    "start (%s). That is not a verdict on the file. It is loaded and revocation "
-                    "checking is on, and OpenSSL checks each signature at the handshake",
-                    label,
-                    type(exc).__name__,
-                    exc_info=True,
-                )
-            return
+        # that with exception types of its own. The handshake still checks every signature. The
+        # verdicts already reached are used below: a proof refuses, and the rest warn.
+        if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(exc).__name__)):
+            logger.error(
+                "%s: the engine could not check the signatures of the CRL(s) in this file at "
+                "start (%s), after judging %d of them. That is not a verdict on the rest. Unless "
+                "a CRL it judged is proven badly signed, the file is loaded and revocation "
+                "checking is on, and OpenSSL checks each signature at the handshake",
+                label,
+                type(exc).__name__,
+                len(judged),
+                exc_info=True,
+            )
     if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
         raise ValueError(
             f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "

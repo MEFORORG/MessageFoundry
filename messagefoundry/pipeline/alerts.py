@@ -145,8 +145,8 @@ def crl_reload_refused_detail(
     #2904). Fixed words, a count and the engine's own remedy sentence: nothing read from the CRL.
 
     The alert instance's reason column keeps only about the first 200 characters, so the class
-    and the count lead. A warning not to restart yet comes next, ahead of a remedy that names a
-    restart, because a reader may see only the start of the line. The reason is not part of this
+    and the count lead. A warning not to restart yet comes next, ahead of a remedy that can lead
+    to a restart, because a reader may see only the start of the line. The reason is not part of this
     alert, because it quotes CRL issuer names and dates; the reload's ERROR line has it."""
     parts = [
         f"CRL reload refused ({remedy_class}): {stale_contexts} running TLS context(s) keep the "
