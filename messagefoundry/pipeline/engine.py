@@ -2022,6 +2022,13 @@ class Engine:
                     if self._registry_runner is not None
                     else ()
                 ),
+                # Every registry inbound's watch and `.error` directories, bound or not, which that
+                # sweep must never reach (BACKLOG #1188).
+                guard_source=lambda: (
+                    self._registry_runner.archive_guard_dirs()
+                    if self._registry_runner is not None
+                    else ()
+                ),
             )
             self._retention_runner.start()
         # [backup] turnkey DR backup (ADR 0049, #60) — a maintenance task like retention: independent of

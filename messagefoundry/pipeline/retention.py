@@ -34,8 +34,9 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,7 +47,8 @@ from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import Store, StripResult
-from messagefoundry.transports.base import ProcessedArchive
+from messagefoundry.transports.base import ProcessedArchive, archive_dir_key
+from messagefoundry.transports.wincred import CredentialError
 
 __all__ = [
     "DiskFloorReading",
@@ -341,12 +343,16 @@ class RetentionRunner:
         registry_source: Callable[[], Registry | None] | None = None,
         log_dir: str | None = None,
         archive_source: Callable[[], Sequence[ProcessedArchive]] | None = None,
+        guard_source: Callable[[], Iterable[Path] | None] | None = None,
     ) -> None:
         self._store = store
         # The bound inbounds whose `.processed` archive the `processed_archive_days` sweep ages out
         # (BACKLOG #1188), read from the LIVE graph each pass like the registry. None (embedding,
         # tests) = nothing to sweep.
         self._archive_source = archive_source
+        # Every registry inbound's watch and `.error` directories, bound or not, which no archive sweep
+        # may reach. Returning None means one could not be resolved, so the sweep deletes nothing.
+        self._guard_source = guard_source
         self._settings = settings
         # The SQLite store file the low-disk floor measures (BACKLOG #290); None when the floor
         # cannot apply to this store. See sqlite_store_file for the rule.
@@ -801,33 +807,64 @@ class RetentionRunner:
     ) -> int:
         """Run each bound archive's sweep, and return how many files went in all (BACKLOG #1188).
 
-        Every archive is handed the watch and ``.error`` directories of all of them, so one whose
-        archive directory overlaps another connection's drops or quarantine deletes nothing. A
-        directory two connections share is swept once. A fault in one connection is logged by
-        connection name and the others still run, because a sweep must never stop the pass."""
+        Every archive is handed the watch and ``.error`` directories of every registry inbound, bound
+        or not, so one whose archive directory overlaps any connection's drops or quarantine deletes
+        nothing. When any of those cannot be resolved the whole sweep is skipped: the guard is only as
+        good as its list. A directory two connections share is swept once. A fault in one connection
+        is logged and the others still run, because a sweep must never stop the pass: a pass that
+        raised here would lose the audit row for what it had already purged."""
         archives = list(self._archive_source()) if self._archive_source is not None else []
-        protected = frozenset(
-            path for archive in archives for path in (archive.directory, archive.error_dir)
-        )
+        if not archives:
+            return 0
+        guarded: list[Path] = [p for a in archives for p in (a.directory, a.error_dir)]
+        if self._guard_source is not None:
+            extra = self._guard_source()
+            if extra is None:
+                log.warning(
+                    "the [retention].processed_archive_days sweep deleted nothing this pass: an "
+                    "inbound's directories could not be resolved from its configuration, so the "
+                    "sweep cannot tell what it must not reach"
+                )
+                return 0
+            guarded.extend(extra)
+        try:
+            protected, keys = await asyncio.to_thread(
+                _archive_keys, guarded, [a.processed_dir for a in archives]
+            )
+        except OSError as exc:
+            log.warning(
+                "the [retention].processed_archive_days sweep deleted nothing this pass: a File "
+                "inbound's directory could not be resolved (%s)",
+                safe_exc(exc),
+            )
+            return 0
+        # Set when this task is cancelled, so a sweep already running on a worker thread stops at its
+        # next file instead of deleting on after the engine has stopped.
+        cancelled = threading.Event()
+
+        def stop_hit() -> bool:
+            return cancelled.is_set() or deadline_hit()
+
         swept: set[str] = set()
         deleted = 0
-        for archive in archives:
-            if deadline_hit():
+        for archive, key in zip(archives, keys, strict=True):
+            if stop_hit():
                 break
-            # realpath, as the overlap check reads it, so a directory reached through a link is
-            # still recognised as shared.
-            key = os.path.normcase(os.path.realpath(archive.processed_dir))
             if key in swept:
                 continue
             swept.add(key)
             try:
                 deleted += await archive.prune_processed_archive(
-                    older_than, protected=protected, deadline_hit=deadline_hit
+                    older_than, protected=protected, deadline_hit=stop_hit
                 )
-            except OSError as exc:
-                # A file fault is the sweep's own to absorb; this catches what escapes it, such as
-                # the alternate credential failing. safe_exc, because an OSError renders its path
-                # and below the archive directory a path is a partner's file name.
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            except (OSError, CredentialError, RuntimeError) as exc:
+                # A file fault is the sweep's own to absorb; this catches what escapes it: the
+                # alternate credential failing or already closed by a reload, or its worker shut
+                # down. safe_exc, because an OSError renders its path and below the archive
+                # directory a path is a partner's file name.
                 log.warning(
                     "the [retention].processed_archive_days sweep failed for the archive directory "
                     "%s (%s); nothing more was deleted there this pass",
@@ -1372,3 +1409,11 @@ class RetentionRunner:
     def _day_key(now: float) -> str:
         lt = time.localtime(now)
         return f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
+
+
+def _archive_keys(
+    guarded: Iterable[Path], archives: Sequence[Path]
+) -> tuple[frozenset[str], list[str]]:
+    """Resolve the protected directories once per pass, and each archive directory's key (BACKLOG
+    #1188). Blocking: run off the loop. Raises ``OSError`` when any cannot be resolved."""
+    return frozenset(archive_dir_key(p) for p in guarded), [archive_dir_key(p) for p in archives]

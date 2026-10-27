@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -26,7 +27,11 @@ from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
 from messagefoundry.config.settings import RetentionSettings
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.store import MessageStore
-from messagefoundry.transports.base import ProcessedArchive
+from messagefoundry.transports.base import (
+    ProcessedArchive,
+    archive_dir_key,
+    guarded_source_dirs,
+)
 from messagefoundry.transports.file import FileSource
 
 DAY = 86_400.0
@@ -55,7 +60,7 @@ def _never() -> bool:
 
 
 def _prune(src: FileSource, protected: frozenset[Path] = frozenset()) -> int:
-    return src._prune_processed(_CUTOFF, protected, _never)
+    return src._prune_processed(_CUTOFF, frozenset(archive_dir_key(p) for p in protected), _never)
 
 
 def test_the_window_is_auto_bounded_at_the_body_window() -> None:
@@ -145,8 +150,8 @@ def test_a_linked_archive_directory_below_the_watch_root_is_refused(tmp_path: Pa
 def test_an_archive_directory_holding_the_watch_directory_is_refused(
     tmp_path: Path, subdir: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """`processed_subdir = "."` would make every undelivered drop an 'archive'. Refused, with one
-    warning however many passes run.
+    """`processed_subdir = "."` would make every undelivered drop an 'archive'. Refused, and
+    warned about on every pass, since while it holds the archive has no age bound at all.
 
     Mutation: drop the overlap guard. Red: the waiting drop is deleted."""
     inbox = tmp_path / "in"
@@ -157,7 +162,7 @@ def test_an_archive_directory_holding_the_watch_directory_is_refused(
     assert _prune(src) == 0
     assert drop.exists()
     refusals = [r for r in caplog.records if "skips this connection" in r.getMessage()]
-    assert len(refusals) == 1
+    assert len(refusals) == 2
     assert "waiting.hl7" not in caplog.text
 
 
@@ -183,6 +188,69 @@ def test_another_connections_watch_directory_is_protected(tmp_path: Path, nested
 
     assert _prune(a, frozenset({b_inbox})) == 0
     assert b_drop.exists() and a_copy.exists()
+
+
+def test_the_overlap_guard_folds_case(tmp_path: Path) -> None:
+    """B's watch directory named in another case still protects it: a case-insensitive volume names
+    one directory both ways, and folding on a case-sensitive one only refuses more.
+
+    Mutation: drop `.casefold()` from `archive_dir_key`. Red on a case-sensitive volume."""
+    shared = tmp_path / "Shared"
+    a = _source(tmp_path / "a", processed_subdir=str(shared))
+    a_copy = _aged(a.processed_dir / "done.hl7", 90)
+
+    assert _prune(a, frozenset({tmp_path / "shared"})) == 0
+    assert a_copy.exists()
+
+
+@pytest.mark.parametrize("after_read", ["leave", "delete"])
+def test_a_source_that_does_not_move_sweeps_nothing(tmp_path: Path, after_read: str) -> None:
+    """Only a move archives. A leave source's `.processed` may hold another system's files.
+
+    Mutation: drop the `after_read != "move"` return. Red."""
+    src = _source(tmp_path / "in", after_read=after_read)
+    theirs = _aged(src.processed_dir / "theirs.hl7", 90)
+
+    assert _prune(src) == 0
+    assert theirs.exists()
+
+
+def test_a_read_only_aged_copy_is_removed(tmp_path: Path) -> None:
+    """Windows refuses a plain delete of a file with the read-only attribute, where a POSIX unlink
+    ignores the mode. The sweep must bound both alike.
+
+    Mutation: drop `ignore_readonly=True` from `_win_delete_aged`. Red on Windows."""
+    src = _source(tmp_path / "in")
+    old = _aged(src.processed_dir / "old.hl7", 90)
+    os.chmod(old, stat.S_IREAD)
+    try:
+        assert _prune(src) == 1
+        assert not old.exists()
+    finally:
+        if old.exists():
+            os.chmod(old, stat.S_IREAD | stat.S_IWRITE)
+
+
+async def test_a_stopping_source_stops_its_sweep(tmp_path: Path) -> None:
+    """A source that is stopping stops its sweep between files, deadline or not."""
+    src = _source(tmp_path / "in")
+    old = _aged(src.processed_dir / "old.hl7", 90)
+    src._stop.set()
+
+    assert (
+        await src.prune_processed_archive(_CUTOFF, protected=frozenset(), deadline_hit=_never) == 0
+    )
+    assert old.exists()
+
+
+def test_the_file_source_declares_its_guarded_directories(tmp_path: Path) -> None:
+    """From configuration alone, so a stopped or other-shard inbound is protected too."""
+    inbox = tmp_path / "in"
+    config = Source(
+        type=ConnectorType.FILE, settings={"directory": str(inbox), "error_subdir": "bad"}
+    )
+
+    assert guarded_source_dirs(config) == (inbox, inbox / "bad")
 
 
 def test_a_missing_archive_directory_is_not_an_error(tmp_path: Path) -> None:
@@ -292,6 +360,48 @@ async def test_the_pass_protects_every_connections_directories(
 
     assert result.processed_archives_deleted == 0
     assert b_drop.exists()
+
+
+async def test_an_unbound_inbounds_directories_are_protected(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """B is stopped, so it is not in the archive list; the guard source still names its watch
+    directory, which A's archive directory holds.
+
+    Mutation: ignore `guard_source` in `_prune_processed_archives`. Red."""
+    stopped_inbox = tmp_path / "shared" / "b-inbox"
+    a = _source(tmp_path / "a", processed_subdir=str(tmp_path / "shared"))
+    b_drop = _aged(stopped_inbox / "waiting.hl7", 90)
+    runner = RetentionRunner(
+        store,
+        _settings(processed_archive_days=30),
+        clock=lambda: _NOW,
+        archive_source=lambda: (a,),
+        guard_source=lambda: (stopped_inbox, stopped_inbox / ".error"),
+    )
+
+    result = await runner.run_once()
+
+    assert result.processed_archives_deleted == 0
+    assert b_drop.exists()
+
+
+async def test_an_unresolvable_guard_sweeps_nothing(store: MessageStore, tmp_path: Path) -> None:
+    """A guard list that could not be built fails closed."""
+    src = _source(tmp_path / "in")
+    old = _aged(src.processed_dir / "old.hl7", 90)
+    runner = RetentionRunner(
+        store,
+        _settings(processed_archive_days=30),
+        clock=lambda: _NOW,
+        archive_source=lambda: (src,),
+        guard_source=lambda: None,
+    )
+
+    result = await runner.run_once()
+
+    assert result.processed_archives_deleted == 0
+    assert old.exists()
 
 
 async def test_a_zero_window_sweeps_nothing(store: MessageStore, tmp_path: Path) -> None:

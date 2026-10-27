@@ -37,6 +37,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, auto
+from pathlib import Path
 from typing import Any, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
@@ -226,6 +227,7 @@ from messagefoundry.transports.base import (
     ReplyBodyDropped,
     SyncReplyResolver,
     check_file_key,
+    guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
@@ -3047,6 +3049,32 @@ class RegistryRunner:
         ``.processed`` directory, for the retention pass's age sweep (BACKLOG #1188). Only bound
         ones: a stopped or undeployed inbound has no source object to resolve its directories."""
         return tuple(s for s in self._sources.values() if isinstance(s, ProcessedArchive))
+
+    def archive_guard_dirs(self) -> tuple[Path, ...] | None:
+        """The watch and ``.error`` directories of EVERY registry inbound, bound or not, deployed or
+        not, which the ``.processed`` age sweep must never reach (BACKLOG #1188). Read from the
+        configuration rather than the running sources, so a stopped, failed or DR-parked inbound, or
+        one bound on another engine shard (each loads the whole registry), stays protected. None when
+        one inbound's settings cannot be resolved (a missing env() value, say): the caller then
+        deletes nothing, because a guard that silently drops a directory fails open."""
+        dirs: list[Path] = []
+        for ic in self.registry.inbound.values():
+            try:
+                settings = resolve_env_settings(
+                    ic.spec.settings, self._env_values, connection=inbound_record_name(ic.name)
+                )
+                dirs.extend(
+                    guarded_source_dirs(Source(type=ic.spec.type, name=ic.name, settings=settings))
+                )
+            except (WiringError, ValueError) as exc:
+                log.warning(
+                    "inbound connection %r: its directories could not be resolved for the "
+                    "[retention].processed_archive_days guard (%s)",
+                    ic.name,
+                    type(exc).__name__,
+                )
+                return None
+        return tuple(dirs)
 
     async def park_intake(self, standby: Priority, *, keep: frozenset[str] = frozenset()) -> None:
         """Make this box a passive standby for intake and unbind every inbound, in one span of the

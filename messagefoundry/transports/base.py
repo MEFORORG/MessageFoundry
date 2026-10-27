@@ -27,6 +27,7 @@ import contextlib
 import math
 import numbers
 import operator
+import os
 import re
 import ssl
 from collections.abc import Awaitable, Callable, Mapping
@@ -59,6 +60,8 @@ __all__ = [
     "SyncReplyResolver",
     "ProcessedFileLedger",
     "ProcessedArchive",
+    "archive_dir_key",
+    "guarded_source_dirs",
     "FILE_KEY_SCHEME",
     "FILE_KEY_SCHEMES",
     "FileKeyError",
@@ -634,10 +637,11 @@ class ProcessedArchive(Protocol):
     the local File source's ``.processed`` (owner ruling A2 of 2026-10-08, BACKLOG #1188).
 
     The retention runner reads these from the live graph each pass and never imports a transport. It
-    hands every archive the watch and ``.error`` directories of all of them as ``protected``, so one
-    whose archive directory is, or holds, any of those deletes nothing: a misconfigured
-    ``processed_subdir`` must never let an age sweep reach undelivered drops or the ``.error`` copies,
-    whose deletion nobody has ruled on (#3335)."""
+    hands every archive, as ``protected``, the :func:`archive_dir_key` of each watch and ``.error``
+    directory any registry inbound names, bound or not (:func:`guarded_source_dirs`), so one whose
+    archive directory is, or holds, any of those deletes nothing: a misconfigured ``processed_subdir``
+    must never let an age sweep reach undelivered drops or the ``.error`` copies, whose deletion nobody
+    has ruled on (#3335)."""
 
     directory: Path
     processed_dir: Path
@@ -647,13 +651,32 @@ class ProcessedArchive(Protocol):
         self,
         older_than: float,
         *,
-        protected: frozenset[Path],
+        protected: frozenset[str],
         deadline_hit: Callable[[], bool],
     ) -> int:
         """Delete archived files whose archive time is before ``older_than`` (epoch seconds), and
         return how many went. A file it cannot remove is skipped and tried again next pass; an
         ``OSError`` that escapes (a failed alternate credential, say) the caller contains."""
         ...
+
+
+def archive_dir_key(path: Path) -> str:
+    """The form in which an archive sweep compares directories (BACKLOG #1188): links resolved, and
+    case folded on EVERY platform. A case-sensitive volume holding two directories that differ only in
+    case then reads them as one, which can only make the sweep refuse more, never reach further.
+    Blocking (``realpath``), and it can raise ``OSError`` on an unreachable share."""
+    return os.path.normcase(os.path.realpath(path)).casefold()
+
+
+def guarded_source_dirs(config: Source) -> tuple[Path, ...]:
+    """The directories an inbound built from ``config`` reads drops from or quarantines into, which no
+    archive sweep may reach (BACKLOG #1188). Empty for a connector that declares none. A connector
+    declares them with a ``guarded_dirs(config)`` callable on what it registered, so the pipeline asks
+    without naming a connector type."""
+    declare = getattr(_SOURCES.get(config.type), "guarded_dirs", None)
+    if not callable(declare):
+        return ()
+    return tuple(declare(config))
 
 
 class ProcessedFileLedger(Protocol):
