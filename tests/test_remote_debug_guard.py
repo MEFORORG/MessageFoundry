@@ -629,8 +629,6 @@ class _Installs:
         monkeypatch.setattr(remotedebug, "_start_reporter", self._start)
         # This process started its reporter when the suite imported the command line.
         monkeypatch.setattr(remotedebug, "_reporter_started", False)
-        # No probe was cut off there, and none may be here unless a test says so.
-        monkeypatch.setattr(remotedebug, "_probe_cut_off", False)
 
     def _start(self) -> None:
         self.reporters += 1
@@ -653,40 +651,60 @@ def test_install_adds_one_hook_and_a_second_call_adds_nothing(
     assert wrapped is not before and sys.unraisablehook is wrapped
 
 
-def test_a_hook_behind_a_cut_off_probe_is_added_once_and_still_reported(
+def test_a_hook_behind_a_cut_off_probe_is_still_reported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Vault BACKLOG #3463, state 2 of ``install_remote_debug_guard``: an earlier audit hook raises
-    on the probe event, so the engine's hook is in and refuses but never answers. Until then every
-    call added another copy, started no reporter, and put the interpreter's unraisable hook back,
-    so a refusal was not logged and its full path went to standard error."""
+    on the probe event, so the engine's hook is in and refuses but never answers. Until then each
+    call started no reporter and put the interpreter's unraisable hook back, so a refusal was not
+    logged and its full path went to standard error. The command line's two calls each add, so
+    one extra copy stacks, which the docstring bounds."""
     installs = _Installs(monkeypatch)
     before = sys.unraisablehook
     monkeypatch.setattr(remotedebug, "_probe", lambda: None)
     install_remote_debug_guard()
-    quiet = sys.unraisablehook
     install_remote_debug_guard()
-    install_remote_debug_guard()
-    assert installs.hooks == [remotedebug._guard]
+    assert installs.hooks == [remotedebug._guard, remotedebug._guard]
     assert installs.reporters == 1
-    assert quiet is not before and sys.unraisablehook is quiet
+    assert sys.unraisablehook is not before
 
 
-def test_a_cut_off_probe_that_later_reads_false_is_added_again(
+def test_a_hook_refused_at_import_behind_a_cut_off_probe_goes_in_at_serve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The earlier hook cut the probe off and also refused the add, then stopped doing both. The
-    probe now reads a definite False, so the hook is not in and an add cannot stack: the next
-    call adds it. While the probe stays cut off, no call adds."""
+    """The Lander's first finding on engine PR 2528: an earlier hook cuts the probe off, refuses
+    the add at import, and allows it by the time ``serve`` makes its own call. Main added twice
+    and the hook went in. A call that skipped the add once an earlier probe was cut off left the
+    hook missing for the life of the process. The stand-in drops the first add, as the
+    interpreter does when a hook refuses one, and keeps the second."""
     installs = _Installs(monkeypatch)
-    # Call 1: cut off before and after the add. Call 2: still cut off. Call 3: False, then added.
-    answers = iter([None, None, None, False, True])
+    calls: list[object] = []
+
+    def refuse_then_allow(hook: object) -> None:
+        calls.append(hook)
+        if len(calls) > 1:
+            installs.hooks.append(hook)
+
+    monkeypatch.setattr(sys, "addaudithook", refuse_then_allow)
+    monkeypatch.setattr(remotedebug, "_probe", lambda: None)
+    install_remote_debug_guard()  # at import
+    install_remote_debug_guard()  # first in `_serve`
+    assert installs.hooks == [remotedebug._guard]
+
+
+def test_a_probe_that_reads_false_after_a_cut_off_one_adds_on_every_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Lander's second finding on engine PR 2528: the probe reads None then None, False then
+    False, then None. The second call proves the hook is not in, so the third call must add, as
+    main does. Every call here adds."""
+    installs = _Installs(monkeypatch)
+    answers = iter([None, None, False, False, None, None])
     monkeypatch.setattr(remotedebug, "_probe", lambda: next(answers))
     install_remote_debug_guard()
     install_remote_debug_guard()
-    assert installs.hooks == [remotedebug._guard]
     install_remote_debug_guard()
-    assert installs.hooks == [remotedebug._guard, remotedebug._guard]
+    assert installs.hooks == [remotedebug._guard] * 3
     assert installs.reporters == 1
 
 
@@ -1151,16 +1169,19 @@ def test_the_command_line_still_imports_when_another_hook_refuses_the_guard(
     assert reading["reporter"] is False and reading["quiet"] is False
 
 
-def test_a_hook_behind_one_that_stops_the_probe_is_added_once_and_reported(
+def test_a_hook_behind_one_that_stops_the_probe_is_reported(
     tmp_path: Path,
 ) -> None:
     """Vault BACKLOG #3463, state 2, against a real interpreter: a hook installed earlier raises on
     the probe event only. The engine's hook goes in behind it and reads as missing, so before the
-    fix each later call added another copy, no reporter thread ran, and the interpreter's own
-    unraisable hook was put back. Now: one hook, a reporter, and the quiet wrapper stays."""
+    fix no reporter thread ran, and the interpreter's own unraisable hook was put back. Now a
+    reporter runs and the quiet wrapper stays."""
     reading = _install_probe(tmp_path, "probe-objecting")
     assert reading["before"] is False and reading["after"] is False
-    assert len(cast("list[object]", reading["loaded_at_install"])) == 1
+    # Every call adds while the probe is cut off, so a hook refused at import still goes in later
+    # (the Lander's first finding on engine PR 2528). The probe makes the import's call and both
+    # later ones, one more than a real process makes, as it runs `_serve` or `_supervise`.
+    assert len(cast("list[object]", reading["loaded_at_install"])) == 3
     assert reading["reporter"] is True and reading["quiet"] is True
 
 

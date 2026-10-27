@@ -1843,9 +1843,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   reads it carries the count, which the first case cannot produce. The serve-time warning is
   read once, at start, so it carries a count only for a refusal before then. A count says
   the hook was in at some point, not that it still is, so read the entry as missing either way.
-  In the first case a later install call tries again, and nothing stacks, because the
-  interpreter dropped the hook. In the second, no later call adds the hook again while the
-  other hook keeps cutting the question off, so no copy stacks there either. Without a count,
+  In either case a later install call adds the hook again. So a hook the other one refused at
+  import still goes in if that hook stops refusing by the time `serve` or `supervise` makes its
+  own call. In the first case nothing stacks, because the interpreter dropped the hook. In the
+  second a copy can stack. The command line installs at most twice per process, so at most one
+  extra copy stacks. It changes no count: the first copy refuses the script, and the
+  interpreter asks no hook after one that raised. Without a count,
   the entry cannot tell the cases apart, so read it as the first, and look for what else in the
   process adds an audit hook.
 - **An audit hook added earlier can refuse a script ahead of the engine's, in any state.** Where

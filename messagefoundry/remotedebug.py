@@ -147,10 +147,6 @@ _install_lock = threading.Lock()
 _reports: queue.SimpleQueue[str] = queue.SimpleQueue()
 _refused = 0
 _reporter_started = False
-#: Set once ``sys.addaudithook(_guard)`` has returned and another hook then cut the probe off, so
-#: the hook may be in without answering. :func:`install_remote_debug_guard` says why no later call
-#: adds it again while the probe stays cut off.
-_probe_cut_off = False
 
 
 class RemoteScriptRefused(RuntimeError):
@@ -312,13 +308,19 @@ def install_remote_debug_guard() -> None:
       new hook without an error. The quiet ``sys.unraisablehook`` is put back, no reporter starts,
       and the next call tries again. Nothing can stack, because the hook is not in the list.
     - An earlier hook raised on the probe event and cut it off (None). The hook may be in behind
-      it, refusing, or that hook may also have refused the add. Adding again could stack a copy on
-      each call, so no call adds the hook while the probe stays cut off. The quiet wrapper and
-      the reporter stay, so a refusal is logged and its full path is kept off standard error.
-      Should the probe later read False, the hook is not in, and the next call adds it. What this
-      gives up is a retry where the earlier hook keeps cutting the probe off but stops refusing
-      adds: the install cannot tell that apart from a hook that is in. The posture reads the hook
-      as missing throughout.
+      it, refusing, or that hook may also have refused the add. The quiet wrapper and the reporter
+      stay, so a refusal is logged and its full path is kept off standard error. The posture reads
+      the hook as missing.
+
+    Any call whose first probe does not read True adds the hook, whatever an earlier call read.
+    That keeps the retry for an earlier hook that cuts the probe off and refused the add at
+    import, but no longer refuses it by the time ``serve`` or ``supervise`` makes its own call.
+    The cost is a copy that may stack where the first add did go in behind a cut-off probe. The
+    command line calls this at most twice per process (at import, then first in ``_serve`` or
+    ``_supervise``), so at most one extra copy stacks there. An application that calls it more
+    often can stack one copy per call while the probe stays cut off. A stacked copy changes no
+    count: the first copy raises on ``cpython.remote_debugger_script``, and the interpreter stops
+    at the first hook that raises, so a later copy never sees the event.
 
     Where ``sys.addaudithook`` raised instead of returning, the hook is not in, so the quiet
     wrapper is put back and the next call tries again. Nothing is logged there: the command line
@@ -331,14 +333,11 @@ def install_remote_debug_guard() -> None:
     the only trace of the refusal. It carries the other hook's exception, so the quiet wrapper
     passes it on rather than hide the one record that exists.
     """
-    global _probe_cut_off
     if not sys.is_remote_debug_enabled():
         return
     with _install_lock:
-        answer = _probe()
-        # A cut-off probe after an add that returned may hide a hook that is in, so only a
-        # definite False, or a first attempt, adds.
-        if answer is False or (answer is None and not _probe_cut_off):
+        # A cut-off probe (None) adds too: the docstring says why, and what can stack.
+        if _probe() is not True:
             # Quiet first, so no refusal is ever reported with its full path.
             previous = sys.unraisablehook
             quiet = sys.unraisablehook = _without_own_refusals(previous)
@@ -355,14 +354,11 @@ def install_remote_debug_guard() -> None:
                 if isinstance(exc, Exception):
                     return
                 raise
-            after = _probe()
-            if after is False:
+            if _probe() is False:
                 # Dropped: there is nothing to report for, and nothing to quiet.
                 if sys.unraisablehook is quiet:
                     sys.unraisablehook = previous
                 return
-            if after is None:
-                _probe_cut_off = True
         _ensure_reporter()
 
 
