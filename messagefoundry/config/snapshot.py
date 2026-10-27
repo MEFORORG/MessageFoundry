@@ -184,30 +184,39 @@ class ConfigSnapshot:
         covers. A load refuses when there is any: it cannot run bytes it does not have."""
         return tuple(rel for rel in self.unreadable if not _covered_only(rel))
 
-    def covers_environment_file(self, path: str | Path) -> bool:
-        """Whether ``path`` names a file in this snapshot's ``environments/`` folder, so the digest
-        of the snapshot covers whatever is there, or that nothing is. Compared after following
-        links and, on Windows, without case, so a value file reached through another spelling of
-        the folder still counts. Neither path need exist."""
-        folder = os.path.realpath(self.directory / _ENVIRONMENTS_DIR)
-        parent = os.path.realpath(Path(path).parent)
-        return os.path.normcase(parent) == os.path.normcase(folder)
-
     def environment_file(self, path: str | Path) -> bytes | None:
-        """The bytes this snapshot read for the value file ``path``, which
-        :meth:`covers_environment_file` must accept, or ``None`` when the snapshot read no such
-        file. A caller reading values for a reload parses these instead of reading the file again,
-        so the values it applies are the bytes the digest covered (vault BACKLOG #2596). Raises
-        ``OSError`` when part of ``environments/`` could not be read, so this snapshot cannot say
-        what was there."""
+        """The bytes this snapshot read for the value file ``path``, or ``None`` when it read no
+        such file and none is there now. A caller reading values for a reload parses these instead
+        of reading the file again, so the values it applies are the bytes the digest covered (vault
+        BACKLOG #2596).
+
+        Raises ``LookupError`` when the snapshot cannot vouch for ``path``: it is not in this
+        snapshot's ``environments/`` folder, or the snapshot holds no file by its name while a file
+        is there now, created since or reached by a spelling the listing does not match. The
+        caller then reads the file itself and must check the digest again. Raises ``OSError`` when
+        part of ``environments/`` could not be read, so this snapshot cannot say what was there."""
+        folder, value_file = self.directory / _ENVIRONMENTS_DIR, Path(path)
+        if not _same_folder(value_file.parent, folder):
+            raise LookupError(f"{value_file} is not in the config snapshot's environments folder")
         if any(_covered_only(rel) for rel in self.unreadable):
             raise OSError(errno.EACCES, "the config snapshot could not read environments/")
-        want = os.path.normcase(Path(path).name)
         prefix = f"{_ENVIRONMENTS_DIR}/"
-        for rel, data in self.files.items():
-            if rel.startswith(prefix) and os.path.normcase(rel[len(prefix) :]) == want:
-                return data
-        return None
+        data = self.files.get(prefix + value_file.name)
+        if data is None and os.path.normcase("A") != "A":
+            # Windows names files without case, as the open of this path would; an exact match
+            # above wins first, for a folder set to tell case apart.
+            want = os.path.normcase(value_file.name)
+            data = next(
+                (
+                    bytes_
+                    for rel, bytes_ in self.files.items()
+                    if rel.startswith(prefix) and os.path.normcase(rel[len(prefix) :]) == want
+                ),
+                None,
+            )
+        if data is None and os.path.lexists(value_file):
+            raise LookupError(f"{value_file} is not a file the config snapshot read")
+        return data
 
     def loaded(self, *, code_sets: bool = True) -> ConfigSnapshot:
         """This snapshot without the files only the fingerprint covers: what a sandbox worker
@@ -331,6 +340,18 @@ def _list_folders(base: Path, *, unlistable: set[str] | None) -> set[str]:
             continue
         listable.add(folder)
     return listable
+
+
+def _same_folder(one: Path, other: Path) -> bool:
+    """Whether ``one`` and ``other`` name the same folder: the same path after following links
+    (without case on Windows), which needs neither to exist, or else the same file system object,
+    which catches a spelling the path comparison misses, such as a second mount point."""
+    if os.path.normcase(os.path.realpath(one)) == os.path.normcase(os.path.realpath(other)):
+        return True
+    try:
+        return os.path.samefile(one, other)
+    except OSError:
+        return False
 
 
 def _is_file(path: Path) -> bool:

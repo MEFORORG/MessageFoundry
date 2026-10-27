@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
 from messagefoundry.auth.trust_anchors import LaneAnchorCheck
+from messagefoundry.config.environments import SnapshotEnvValuesProvider
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
@@ -403,19 +404,6 @@ class ApprovedConfig:
     config."""
 
     fingerprint: str | None
-
-
-@runtime_checkable
-class SnapshotEnvValuesProvider(Protocol):
-    """An ``env_values_provider`` that can also read values for a reload from that reload's config
-    snapshot (vault BACKLOG #2596). ``serve``'s provider is one: a value file the snapshot covers is
-    parsed from the snapshot's bytes, so the values a reload applies are the ones its digest names.
-    :meth:`Engine.reload_detail` takes the digest again after any other provider reads, so a
-    released reload refuses an edit made under the config directory in between."""
-
-    def __call__(self) -> Mapping[str, Any]: ...
-
-    def from_snapshot(self, snapshot: ConfigSnapshot) -> Mapping[str, Any]: ...
 
 
 def _require_approved(current: str | None, approval: ApprovedConfig) -> None:
@@ -3293,9 +3281,10 @@ class Engine:
         cannot be read, with nothing swapped; a directory gone since the resolve gives
         :class:`ConfigDirMissing`. ``None`` binds nothing: an ungated reload, a convergence reload
         and a dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint`
-        hashes and no more. A :class:`SnapshotEnvValuesProvider` reads a value file in the
-        snapshot's ``environments/`` folder from the snapshot too; after any other provider reads,
-        a released reload takes the digest again and refuses a change the same way.
+        hashes and no more. A :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider`
+        reads a value file in the snapshot's ``environments/`` folder from the snapshot too; after
+        any other read of the values from disk, a released reload takes the digest again and
+        refuses a change the same way.
 
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``ConfigDirMissing``
         (missing dir; a ``FileNotFoundError`` subclass, which the callers map to not_found),
@@ -3369,17 +3358,19 @@ class Engine:
             # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
             # Vault BACKLOG #2596: the approval digest covers environments/*.toml under the config
-            # directory, so a provider that can is handed the snapshot and parses the bytes the
-            # digest names. Any other provider reads from disk, after the digest check.
+            # directory, so a SnapshotEnvValuesProvider is handed the snapshot and parses the bytes
+            # the digest names. Where it cannot, and for any other provider, the values are read
+            # from disk after the digest check, and a released reload checks the digest again.
+            read: Mapping[str, Any] | None = None
             reads_snapshot = False
             try:
                 # Off the event loop: the CLI provider reads the value file and, before that, its
                 # owner and access list (vault BACKLOG #2626), like every other file the engine reads.
                 # Into a local: the running values change only at the swap (vault BACKLOG #2596).
                 if snapshot is not None and isinstance(provider, SnapshotEnvValuesProvider):
-                    reads_snapshot = True
                     read = await asyncio.to_thread(provider.from_snapshot, snapshot)
-                else:
+                reads_snapshot = read is not None
+                if read is None:  # no snapshot, or one that cannot vouch for the value file
                     read = await asyncio.to_thread(provider)
                 env_values = dict(read)
             except WiringError:

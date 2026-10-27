@@ -27,12 +27,19 @@ from __future__ import annotations
 
 import logging
 import tomllib
+from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from messagefoundry.config.snapshot import ConfigSnapshot
 
 __all__ = [
     "VALUE_ENV_PREFIX",
+    "EnvironmentValuesReader",
+    "SnapshotEnvValuesProvider",
+    "ValuesRead",
     "environment_values_from_bytes",
     "is_drive_relative",
     "load_environment_values",
@@ -44,6 +51,70 @@ __all__ = [
 VALUE_ENV_PREFIX = "MEFOR_VALUE_"
 
 _log = logging.getLogger(__name__)
+
+
+class SnapshotEnvValuesProvider(ABC):
+    """An engine ``env_values_provider`` that can also read a reload's values from that reload's
+    config snapshot (vault BACKLOG #2596). A provider opts in by subclassing, never by having a
+    method of the right name. ``serve``'s provider is one."""
+
+    @abstractmethod
+    def __call__(self) -> Mapping[str, Any]:
+        """The values, read from disk: at start, and on a reload that read no snapshot."""
+
+    @abstractmethod
+    def from_snapshot(self, snapshot: ConfigSnapshot) -> Mapping[str, Any] | None:
+        """The values, with any value file ``snapshot`` covers parsed from its bytes, or ``None``
+        when the snapshot cannot vouch for the value file this provider reads
+        (:meth:`~messagefoundry.config.snapshot.ConfigSnapshot.environment_file`). On ``None`` the
+        engine calls the provider plainly and, on a released reload, checks the digest again."""
+
+
+class ValuesRead(Protocol):
+    """A read of one value file's environment values, from disk, or with ``snapshot`` from the
+    bytes it read, raising ``LookupError`` where
+    :meth:`~messagefoundry.config.snapshot.ConfigSnapshot.environment_file` does."""
+
+    def __call__(
+        self,
+        *,
+        base_dir: Path,
+        dir_name: str,
+        environment: str,
+        snapshot: ConfigSnapshot | None = None,
+    ) -> dict[str, Any]: ...
+
+
+class EnvironmentValuesReader(SnapshotEnvValuesProvider):
+    """A :class:`SnapshotEnvValuesProvider` over one value file,
+    ``<base_dir>/<dir_name>/<environment>.toml``, read by ``read``. ``serve`` passes its own read,
+    which vets the file's owner and access list and names the file in a refusal."""
+
+    __slots__ = ("_read", "base_dir", "dir_name", "environment")
+
+    def __init__(
+        self, read: ValuesRead, *, base_dir: Path, dir_name: str, environment: str
+    ) -> None:
+        self._read = read
+        self.base_dir = base_dir
+        self.dir_name = dir_name
+        self.environment = environment
+
+    def __call__(self) -> dict[str, Any]:
+        return self._read(
+            base_dir=self.base_dir, dir_name=self.dir_name, environment=self.environment
+        )
+
+    def from_snapshot(self, snapshot: ConfigSnapshot) -> dict[str, Any] | None:
+        try:
+            return self._read(
+                base_dir=self.base_dir,
+                dir_name=self.dir_name,
+                environment=self.environment,
+                snapshot=snapshot,
+            )
+        except LookupError:
+            return None
 
 
 def is_drive_relative(value: str) -> bool:

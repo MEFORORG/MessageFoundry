@@ -1716,9 +1716,9 @@ _UNREVIEWED_VALUES = 'HOST = "unreviewed.example.invalid"\n'
 def _serve_values_provider(cfg: Path) -> Any:
     """The value provider ``serve`` builds, anchored at the config directory, so the value file it
     reads is the ``environments/dev.toml`` the approval digest covers."""
-    from messagefoundry.__main__ import _EnvironmentValuesReader
+    from messagefoundry.__main__ import _environment_values_reader
 
-    return _EnvironmentValuesReader(base_dir=cfg, dir_name="environments", environment="dev")
+    return _environment_values_reader(base_dir=cfg, dir_name="environments", environment="dev")
 
 
 def _opaque_values_provider(cfg: Path) -> Callable[[], dict[str, Any]]:
@@ -1771,17 +1771,16 @@ def _edit_values_after_the_snapshot(
     monkeypatch.setattr("messagefoundry.pipeline.engine.read_trusted_snapshot", _read_then_edit)
 
 
-@pytest.mark.parametrize("approved_text", [_APPROVED_VALUES, None], ids=["edited", "created"])
 async def test_a_value_file_edited_after_the_release_read_its_snapshot_never_applies(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved_text: str | None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Vault BACKLOG #2596. The approval digest covers ``environments/dev.toml`` under the config
     directory. ``serve``'s provider reads the snapshot's bytes for it on a reload, so an edit made
-    between the release's read and the provider's read never applies, and neither does a value file
-    created in that window. Before, the provider read the file from disk again, and the edited
-    values applied under the approved digest."""
-    engine, values_file = await _values_engine(tmp_path, approved_text, _serve_values_provider)
-    approved_values = {"host": "approved.example.invalid"} if approved_text is not None else {}
+    between the release's read and the provider's read never applies, and the release goes on with
+    the approved values. Before, the provider read the file from disk again, and the edited values
+    applied under the approved digest."""
+    engine, values_file = await _values_engine(tmp_path, _APPROVED_VALUES, _serve_values_provider)
+    approved_values = {"host": "approved.example.invalid"}
     try:
         assert cast(Any, engine)._env_values == approved_values
         service = await _service(engine)
@@ -1810,21 +1809,31 @@ async def test_a_value_file_edited_after_the_release_read_its_snapshot_never_app
         await engine.stop()
 
 
-async def test_an_opaque_provider_s_value_file_edited_during_the_release_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("provider", "approved_text"),
+    [(_opaque_values_provider, _APPROVED_VALUES), (_serve_values_provider, None)],
+    ids=["opaque-provider-edits", "serve-provider-file-created"],
+)
+async def test_a_value_file_read_from_disk_during_the_release_is_refused_when_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: Callable[[Path], Any],
+    approved_text: str | None,
 ) -> None:
-    """Vault BACKLOG #2596. A provider the engine cannot hand the snapshot reads the file from
-    disk, so the release takes the digest again after that read, and refuses an edit made in the
-    window as ``digest_mismatch``, with nothing swapped and the running values kept."""
+    """Vault BACKLOG #2596. Where the values come from disk rather than the snapshot, the release
+    takes the digest again after that read, and refuses a change made in the window as
+    ``digest_mismatch``, with nothing swapped and the running values kept. Two ways there: a
+    provider the engine cannot hand the snapshot, and ``serve``'s provider where a value file was
+    created after the snapshot, which the snapshot cannot vouch for."""
     from messagefoundry.config.fingerprint import config_fingerprint
 
-    engine, values_file = await _values_engine(tmp_path, _APPROVED_VALUES, _opaque_values_provider)
+    engine, values_file = await _values_engine(tmp_path, approved_text, provider)
     cfg = values_file.parent.parent
     try:
         await engine.reload_detail(dry_run=False)  # a live runner, on the approved values
         runner = engine.registry_runner
         assert runner is not None
-        approved_values = {"host": "approved.example.invalid"}
+        approved_values = {"host": "approved.example.invalid"} if approved_text else {}
         assert cast(Any, engine)._env_values == approved_values
         approved = config_fingerprint(cfg)
         service = await _service(engine)
@@ -1851,6 +1860,30 @@ async def test_an_opaque_provider_s_value_file_edited_during_the_release_is_refu
         ]
     finally:
         await engine.stop()
+
+
+async def test_a_provider_with_a_from_snapshot_method_of_its_own_is_not_handed_the_snapshot(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider opts in to the snapshot by subclassing ``SnapshotEnvValuesProvider``. One that
+    merely has a method of that name, such as an alternate constructor, is called plainly, so the
+    release still checks the digest again after it reads."""
+    calls: list[str] = []
+
+    class _Provider:
+        def __call__(self) -> dict[str, Any]:
+            calls.append("plain")
+            return {}
+
+        def from_snapshot(self, _snapshot: object) -> dict[str, Any]:
+            calls.append("from_snapshot")
+            return {}
+
+    monkeypatch.setattr(engine, "_env_values_provider", _Provider())
+    service = await _service(engine)
+    _approval_id, r = await _hold_then_release(engine, service, {})
+    assert r.status_code == 200, r.text
+    assert calls == ["plain"]
 
 
 async def test_a_directory_moved_away_after_the_resolve_is_refused_as_missing(
