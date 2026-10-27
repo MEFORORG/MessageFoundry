@@ -612,7 +612,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # since, which takes a loopback Vault off the box.
         self.refuse_an_unrevoked_hop(url, proxy)
         # Vault BACKLOG #4028: after this method's refusals, so a send refused here is not named.
-        # What the WARNING claims is in docs/CONFIGURATION.md, the point-of-use paragraphs.
+        # What the WARNING claims is in docs/CONFIGURATION.md, under the sub-heading it names.
         _disclose_ambient_proxy(self._connector, proxy)
         return pool
 
@@ -1028,12 +1028,18 @@ def _disclose_ambient_proxy(connector: str, proxy: str | None) -> None:
     Keyed by a digest of the raw value, never the raw string: why, and what that does not
     protect, is the ``docs/ASVS-L2-PHASE0-CHANGES.md`` section 4 row "Vault hop ambient-proxy
     disclosure dedupe". Keyed by it rather than the label, so an already-named proxy costs one
-    hash rather than a parse on each send (the Transit cipher sends once per stored cell)."""
+    hash rather than a parse on each send (the Transit cipher sends once per stored cell).
+
+    The label is built before the value is marked as named, so a label that failed to build could
+    not leave the value marked and never named."""
     if not proxy:
         return
-    digest = hashlib.sha256(proxy.encode("utf-8", "surrogatepass")).hexdigest()
-    if _first_crossing(connector, f"ambient proxy {digest}"):
-        logger.warning("%s", vault_hop_proxy_warning(connector, _dialled_proxy_label(proxy)))
+    kind = f"ambient proxy {hashlib.sha256(proxy.encode('utf-8', 'surrogatepass')).hexdigest()}"
+    if (connector, kind) in _CROSSINGS_LOGGED:
+        return
+    label = _dialled_proxy_label(proxy)
+    if _first_crossing(connector, kind):
+        logger.warning("%s", vault_hop_proxy_warning(connector, label))
 
 
 def _dialled_proxy_label(proxy: str) -> str:
@@ -1046,7 +1052,8 @@ def _dialled_proxy_label(proxy: str) -> str:
     label = proxy_label(proxy)
     try:
         parsed = urllib3.util.parse_url(requests.utils.prepend_scheme_if_needed(proxy, "http"))
-    except (ValueError, urllib3.exceptions.LocationParseError):
+    # TypeError: requests' prepend joins a userinfo with a host of None, as in "http://u@".
+    except (ValueError, TypeError, urllib3.exceptions.LocationParseError):
         return UNREADABLE_PROXY_LABEL
     if parsed.host is None:  # else the f-string below would compare a host spelled "None"
         return UNREADABLE_PROXY_LABEL

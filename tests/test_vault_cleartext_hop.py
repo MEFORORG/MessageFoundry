@@ -34,6 +34,7 @@ from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.store.keyprovider import KeyProviderError
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 from tests._vault_hop_sockets import _closed_port, _Listener
+from tests._vault_hop_sockets import listener as listener  # noqa: F401  (the fixture, re-exported)
 from tests._wire_proxy import _WireProxy
 
 pytestmark = pytest.mark.skipif(
@@ -82,15 +83,6 @@ def _hop_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "synthetic-kek")
     monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "synthetic-data-key")
-
-
-@pytest.fixture
-def listener() -> Iterator[_Listener]:
-    lst = _Listener()
-    try:
-        yield lst
-    finally:
-        lst.close()
 
 
 # --- the three shipped entry points ---------------------------------------------------------------
