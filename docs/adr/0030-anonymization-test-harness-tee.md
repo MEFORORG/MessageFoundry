@@ -81,12 +81,9 @@
      alone. Once `anon/` is not an engine package there is nothing for the carve-out to cover, so
      the flip is withdrawn rather than left pending.
 
-  What the package does, its rules, its fail-closed behaviour and its limits are unchanged.
-  **Correction in the same amendment:** §1 said the harness imports the package directly. No
-  harness file does, and the owner ruled on 2026-10-12 (BACKLOG #3006 part 3) that the import gives
-  way to the record's claim that no file outside the package imports it. §1 carries the correction
-  where the sentence stood. The Context bullet and §1's *"The harness is unaffected"* describe what
-  the harness may import from the engine in general, not an import of this package.
+  What the package does, its rules, its fail-closed behaviour and its limits are unchanged. The same
+  amendment corrects §1's claim that the harness imports the package; the correction stands where
+  that sentence stood.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
@@ -104,7 +101,7 @@
   slice that flips it) / §7 (redaction is *not* de-id); [CLAUDE.md](../../CLAUDE.md) §9 (de-id planned-not-
   built, centralize the rules) / §8 (read separators from MSH, never string-slice, parse defensively) / §4
   (`parsing/` is the one pure carve-out lib; this ADR extends that carve-out to `anon/` on acceptance —
-  dependency direction one-way) / §12 (don't drift to declarative *logic*).
+  dependency direction one-way; *withdrawn 2026-10-27, see the status-banner amendment*) / §12 (don't drift to declarative *logic*).
 
 ## Context
 
@@ -147,7 +144,8 @@ The anonymizer ships as **`messagefoundry/anon/`**: a small, **pure-stdlib** pac
 `parsing/` it is a pure, side-effect-free library, but the §4 carve-out is **verbatim scoped to `parsing/`**
 and does **not** automatically extend to a new sibling. Accepting this ADR **amends CLAUDE.md §4** to add
 `anon/` to the console carve-out (listed in *To resolve on acceptance*); until then the console may not import
-it. The harness is unaffected — it imports engine packages freely. Files:
+it. *(Withdrawn 2026-10-27: the flip never landed, and ADR 0201 moves `anon/` out of the engine; see
+the status-banner amendment.)* The harness is unaffected — it imports engine packages freely. Files:
 
 - `anon/rules.py` — the **default field-selection map** (data; §2): `FieldRule(path, SurrogateKind)` rows
   naming *which* HL7 field gets *which kind* of surrogate. No transform expressions — just a field→kind map.
@@ -489,7 +487,7 @@ AI-assistant `deidentified` data-scope source (PHI.md §9 forward-links to it on
       `tee export`; requires `--capture-bodies`; errors when no captures exist; no raw bodies to stdout/CI),
       harness `CaptureSink._write` hook, and the file-backed corpus source.
 - [ ] Approve the **doc lockstep, gated on code landing (not acceptance):** add `anon/` to the CLAUDE.md §4
-      console carve-out; flip PHI.md §9 `[ROADMAP]`→built; update CLAUDE.md §9 and PHI.md §12/§13.
+      console carve-out (*withdrawn 2026-10-27, see the status-banner amendment*); flip PHI.md §9 `[ROADMAP]`→built; update CLAUDE.md §9 and PHI.md §12/§13.
 
 ---
 
