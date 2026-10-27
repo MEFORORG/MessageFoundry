@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from messagefoundry import tls_handshake_failures
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.wiring import MLLP, WiringError, redacted_settings
 from messagefoundry.keywrap import KeyWrapRefused
@@ -1125,7 +1126,7 @@ async def test_failed_handshakes_are_counted_and_their_events_throttled(
 ) -> None:
     """Vault BACKLOG #2613: every failure counts. One listener emits the first at once, holds the
     rest of the window, and reports them in one trailing event that names no single peer."""
-    monkeypatch.setattr(mllp_module, "_TLS_FAILURE_EVENT_SECONDS", 0.3)
+    monkeypatch.setattr(tls_handshake_failures, "EVENT_SECONDS", 0.3)
     source, _cert_path = _tls_source(tmp_path)
     events = _Events()
     source.on_connection_event = events
@@ -1138,7 +1139,7 @@ async def test_failed_handshakes_are_counted_and_their_events_throttled(
         (
             "tls_handshake_failed",
             "10.0.0.9",
-            "1 failed handshake(s) since the last event; last cause SSLError",
+            "1 failed handshake(s) since the last report; last cause SSLError",
         )
     ]
     # The trailing event reports the two held back, with no peer, once the window ends.
@@ -1146,7 +1147,7 @@ async def test_failed_handshakes_are_counted_and_their_events_throttled(
     assert events.seen[1] == (
         "tls_handshake_failed",
         None,
-        "2 failed handshake(s) since the last event; last cause ConnectionAbortedError",
+        "2 failed handshake(s) since the last report; last cause ConnectionAbortedError",
     )
     await asyncio.sleep(0.4)
     assert len(events.seen) == 2  # nothing more was held, so nothing more is sent

@@ -13,15 +13,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import logging
 import socket
 import ssl
 import sys
+import weakref
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from messagefoundry import tls_handshake_failures
 from messagefoundry.api.tls import ApiHandshakeRecord
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.tls_handshake_failures import (
@@ -137,6 +141,64 @@ def test_the_hook_reports_a_failed_handshake_and_not_a_completed_one(tmp_path: P
     assert "GET" not in seen[0]
 
 
+#: A TLS close_notify alert record: content type 21, TLS 1.2 record version, level warning.
+_CLOSE_NOTIFY = b"\x15\x03\x03\x00\x02\x01\x00"
+
+
+def _client_hello() -> bytes:
+    """A real ClientHello, as the first bytes a TLS client sends."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    c_in, c_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    client = ctx.wrap_bio(c_in, c_out, server_hostname="127.0.0.1")
+    with pytest.raises(ssl.SSLWantReadError):
+        client.do_handshake()
+    return c_out.read()
+
+
+async def _close_notify_peer(port: int) -> None:
+    """Send a ClientHello, then close_notify, then wait for the listener to drop the socket. The
+    server's handshake raises ``SSLZeroReturnError``, which is counted (vault BACKLOG #3785)."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(_client_hello() + _CLOSE_NOTIFY)
+        await writer.drain()
+        with contextlib.suppress(ConnectionError, TimeoutError):
+            while await asyncio.wait_for(reader.read(4096), timeout=5.0):
+                pass
+    finally:
+        await _close_raw(writer)
+
+
+def test_the_hook_counts_a_close_notify_after_the_client_hello(tmp_path: Path) -> None:
+    """A peer that sends close_notify after its ClientHello makes the server's ``do_handshake``
+    raise ``SSLZeroReturnError`` (measured 2026-10-26 on Windows; the class may differ with
+    another OpenSSL, so only the count is pinned). It was counted before #3785, and still is."""
+    server_ctx, cert = _server_ctx(tmp_path)
+    seen: list[str] = []
+    watch_loop_handshakes(server_ctx, seen.append)
+
+    def after_hello(then: bytes) -> None:
+        c_in, c_out, s_in, s_out = (ssl.MemoryBIO() for _ in range(4))
+        client = _pinned_client(cert).wrap_bio(c_in, c_out, server_hostname="127.0.0.1")
+        server = server_ctx.wrap_bio(s_in, s_out, server_side=True)
+        with pytest.raises(ssl.SSLWantReadError):
+            client.do_handshake()
+        s_in.write(c_out.read())
+        with pytest.raises(ssl.SSLWantReadError):
+            server.do_handshake()
+        s_in.write(then)
+        with pytest.raises(ssl.SSLError):
+            server.do_handshake()
+
+    after_hello(_CLOSE_NOTIFY)
+    assert len(seen) == 1
+    # The same point in the handshake, a record that is no TLS record, is counted too.
+    after_hello(_PLAINTEXT)
+    assert len(seen) == 2
+
+
 def test_a_fault_in_the_recorder_does_not_change_the_handshake_error(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -190,11 +252,14 @@ async def test_note_soon_throttles_as_note_does() -> None:
     failures.note_soon("10.0.0.3", "SSLError")
     await _until(lambda: bool(sent), "no report was sent")
     await asyncio.sleep(0.05)
-    assert sent == [("10.0.0.1", "1 failed handshake(s) since the last event; last cause SSLError")]
+    assert sent == [
+        ("10.0.0.1", "1 failed handshake(s) since the last report; last cause SSLError")
+    ]
     assert failures.count == 3
     assert failures._timer is not None  # the trailing report is armed
+    failures.close()  # as a listener's stop() does, before it flushes
     await failures.flush()
-    assert sent[-1] == (None, "2 failed handshake(s) since the last event; last cause SSLError")
+    assert sent[-1] == (None, "2 failed handshake(s) since the last report; last cause SSLError")
     assert failures._timer is None
     await failures.flush()
     assert len(sent) == 2  # nothing more was held, so nothing more is sent
@@ -203,30 +268,228 @@ async def test_note_soon_throttles_as_note_does() -> None:
 async def test_a_report_due_now_disarms_the_trailing_timer() -> None:
     """A failure that arrives once the window has passed, before the trailing timer has fired (an
     I/O callback runs before a due timer in one loop iteration), reports everything held. The old
-    timer must not fire a second report inside the new window, and cancel() must reach the next."""
+    timer must not fire a second report inside the new window, and close() must reach the next."""
     sent: list[tuple[str | None, str]] = []
 
     async def emit(peer_host: str | None, reason: str) -> None:
         sent.append((peer_host, reason))
 
-    # A window far longer than the test, so no step of it can fall outside one by being slow.
-    failures = HandshakeFailures(emit, window=60.0)
+    # The shipped 60 s window, far longer than the test, so no step can fall outside it by being slow.
+    failures = HandshakeFailures(emit)
     failures.note_soon(None, "SSLError")
     failures.note_soon(None, "SSLError")  # held: arms the trailing timer
     stale = failures._timer
     assert stale is not None
     assert failures._reported_at is not None
-    failures._reported_at -= 61.0  # the window has passed, and the timer has not run yet
+    # The window has passed, and the timer has not run yet.
+    failures._reported_at -= tls_handshake_failures.EVENT_SECONDS + 1
     failures.note_soon(None, "SSLError")
     assert stale.cancelled()
     await _until(lambda: len(sent) == 2, "the due report was not sent")
-    assert sent[1] == (None, "2 failed handshake(s) since the last event; last cause SSLError")
+    assert sent[1] == (None, "2 failed handshake(s) since the last report; last cause SSLError")
     failures.note_soon(None, "SSLError")  # inside the new window: a new timer
     fresh = failures._timer
     assert fresh is not None and fresh is not stale
-    failures.cancel()
+    failures.close()
     assert fresh.cancelled() and failures._timer is None
     assert len(sent) == 2
+
+
+async def test_a_closed_counter_counts_nothing_and_flushes_only_while_closed() -> None:
+    """Vault BACKLOG #3785 item 5: the guard that keeps a stop() from starting new reports lives in
+    the counter. A listener closes it first in stop(), and opens it again at start()."""
+    sent: list[tuple[str | None, str]] = []
+
+    async def emit(peer_host: str | None, reason: str) -> None:
+        sent.append((peer_host, reason))
+
+    failures = HandshakeFailures(emit)
+    await failures.note(None, "SSLError")
+    failures.note_soon(None, "SSLError")  # held: arms the trailing timer
+    timer = failures._timer
+    assert timer is not None and failures.count == 2
+    failures.close()
+    assert timer.cancelled() and failures._timer is None
+    # Closed: a failure is not counted, by either path, and arms no timer.
+    await failures.note(None, "SSLError")
+    failures.note_soon(None, "SSLError")
+    assert failures.count == 2 and failures._timer is None
+    # A restart reached before the old stop() flushes: the held failure is the restart's now.
+    failures.open()
+    await failures.flush()
+    assert len(sent) == 1
+    # The control: closed again, the same flush sends what was held.
+    failures.close()
+    await failures.flush()
+    assert sent[-1] == (None, "1 failed handshake(s) since the last report; last cause SSLError")
+    # Open again, it counts.
+    failures.open()
+    await failures.note(None, "SSLError")
+    assert failures.count == 3
+
+
+async def test_a_restart_during_the_flush_wait_keeps_the_held_failure() -> None:
+    """``flush`` waits for a report in flight before it sends what was held. A same-instance
+    restart reached in that wait makes the held failure the restarted listener's, so the flush
+    sends nothing more. The engine's runner does not restart an instance today; it builds a new
+    one."""
+    sent: list[str] = []
+    gate = asyncio.Event()
+
+    async def emit(_peer_host: str | None, reason: str) -> None:
+        sent.append(reason)
+        await gate.wait()
+
+    failures = HandshakeFailures(emit)
+    failures.note_soon(None, "SSLError A")  # due now: a report in flight, parked on the gate
+    failures.note_soon(None, "SSLError B")  # held
+    failures.close()
+    flushing = asyncio.ensure_future(failures.flush())
+    await asyncio.sleep(0)  # the flush is in its wait
+    failures.open()
+    gate.set()
+    await flushing
+    assert len(sent) == 1 and sent[0].endswith("SSLError A")
+    # The control: closed again, the held failure is sent.
+    failures.close()
+    await failures.flush()
+    assert len(sent) == 2 and sent[1].endswith("SSLError B")
+
+
+async def test_a_cancelled_flush_does_not_cancel_a_report_in_flight() -> None:
+    """A report in flight is already marked as sent. Cancelling the stop() that waits on it in
+    ``flush`` must not cancel it too, or it is lost for good (vault BACKLOG #3785)."""
+    finished: list[str] = []
+    gate = asyncio.Event()
+
+    async def emit(_peer_host: str | None, reason: str) -> None:
+        await gate.wait()
+        finished.append(reason)
+
+    failures = HandshakeFailures(emit)
+    failures.note_soon(None, "SSLError")  # due now: a report in flight, parked on the gate
+    failures.close()
+    flushing = asyncio.ensure_future(failures.flush())
+    await asyncio.sleep(0)  # the flush is in its wait
+    flushing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await flushing
+    gate.set()
+    await _until(lambda: len(finished) == 1, "the report in flight was cancelled with the flush")
+
+
+async def test_a_failure_held_across_an_unflushed_stop_is_reported_after_the_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop() that closes the counter and never flushes leaves a failure held with its timer
+    disarmed. If the SAME instance starts again, open() arms the timer again, so it reports the
+    failure once the window ends rather than with some later failure. The engine's runner builds a
+    new instance to restart a listener, so today this covers only a same-instance restart; a
+    cancelled stop's held failures on a discarded instance are not reported."""
+    monkeypatch.setattr(tls_handshake_failures, "EVENT_SECONDS", 0.2)
+    sent: list[str] = []
+    failures = HandshakeFailures(lambda _peer, reason: sent.append(reason))
+    failures.note_soon(None, "SSLError A")  # reported at once
+    failures.note_soon(None, "SSLError B")  # held
+    failures.close()  # the stop() that never reached flush()
+    failures.open()
+    await _until(lambda: len(sent) == 2, "the held failure was stranded")
+    assert sent[1].endswith("SSLError B")
+
+
+# --- a listener is freed by refcounting (vault BACKLOG #3785 item 1) ---------------------------
+
+
+class _Owner:
+    """An object whose bound method is a counter's emitter, as a listener's is."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def emit(self, _peer_host: str | None, reason: str) -> None:
+        self.sent.append(reason)
+
+
+def _fail_in_memory(ctx: ssl.SSLContext) -> None:
+    """Fail one server handshake on ``ctx``: plaintext where a ClientHello belongs."""
+    s_in, s_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    s_in.write(_PLAINTEXT)
+    server = ctx.wrap_bio(s_in, s_out, server_side=True)
+    with pytest.raises(ssl.SSLError):  # the handshake's own error, whatever the hook does
+        server.do_handshake()
+
+
+def _freed_by_refcount(make: Callable[[], object]) -> bool:
+    """Build an object, drop the last outside reference with the cyclic collector off, and say
+    whether it is gone. Only refcounting can have freed it then."""
+    obj = make()
+    ref = weakref.ref(obj)
+    gc.disable()
+    try:
+        del obj
+        return ref() is None
+    finally:
+        gc.enable()
+
+
+def test_no_listener_is_kept_alive_by_its_hook_or_its_counter(tmp_path: Path) -> None:
+    """Before #3785 each listener sat in two cycles: its context's hooked class held a bound method
+    of it, and so did its own counter. Only the cyclic collector freed one. Now the hook holds the
+    counter and the counter holds its listener weakly, so dropping a listener frees it at once."""
+
+    def mllp() -> object:
+        source, _cert_path = _tls_source(tmp_path / "mllp")
+        # What start() does where the loop runs the handshake.
+        assert source._ssl is not None
+        source._tls_failures.watch(source._ssl)
+        return source
+
+    def http() -> object:
+        return _http_tls_source(tmp_path / "http")[0]  # hooks its context at construction
+
+    for sub in ("mllp", "http", "api"):
+        (tmp_path / sub).mkdir()
+    ctx, _cert_path = _server_ctx(tmp_path / "api")
+    assert _freed_by_refcount(mllp)
+    assert _freed_by_refcount(http)
+    assert _freed_by_refcount(lambda: ApiHandshakeRecord(ctx))
+    # The control: the same probe on an object that IS in a cycle reports it alive.
+    assert not _freed_by_refcount(_cyclic)
+
+
+def _cyclic() -> object:
+    owner = _Owner()
+    owner.me = owner  # type: ignore[attr-defined]
+    return owner
+
+
+async def test_a_counter_whose_listener_is_gone_reports_nothing_and_never_raises(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ctx, _cert_path = _server_ctx(tmp_path)
+    owner = _Owner()
+    failures = HandshakeFailures(owner.emit)
+    failures.watch(ctx)
+    _fail_in_memory(ctx)
+    assert len(owner.sent) == 1  # the control: alive, it is reported
+    gone = weakref.ref(owner)
+    del owner
+    assert gone() is None, "the counter kept its listener alive"
+    failures._reported_at = None  # so the next failure is due at once, not held for the window
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.tls_handshake_failures"):
+        _fail_in_memory(ctx)
+    assert failures.count == 2  # counted, then the report went nowhere
+    assert not [r for r in caplog.records if "recording a failed" in r.getMessage()]
+
+
+async def test_a_plain_function_emitter_is_held_as_it_is() -> None:
+    """``weakref.WeakMethod`` refuses a plain function, and one owns no object, so it is held
+    strongly: an emitter with no other reference still runs. The API's is one."""
+    sent: list[str] = []
+    failures = HandshakeFailures(lambda _peer, reason: sent.append(reason))
+    gc.collect()
+    failures.note_soon(None, "SSLError")
+    assert len(sent) == 1
 
 
 # --- the HTTP intake listener -----------------------------------------------------------------
@@ -285,6 +548,29 @@ async def test_the_http_listener_records_a_failed_handshake(tmp_path: Path) -> N
     failed = [e for e in events.seen if e[0] == "tls_handshake_failed"]
     assert len(failed) == 2
     assert failed[1][2] is not None and failed[1][2].startswith("1 failed handshake(s)")
+
+
+async def test_the_http_listener_window_shortens_through_the_shared_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3785 item 4: HTTP had no window seam, because its counter took the window
+    as a default bound at import. Patched in one place, every listener's window is read from it."""
+    monkeypatch.setattr(tls_handshake_failures, "EVENT_SECONDS", 0.3)
+    source, _cert_path = _http_tls_source(tmp_path)
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_no_reply)
+    try:
+        await _plaintext_peer(source.sockport)
+        await _plaintext_peer(source.sockport)
+        await _until(lambda: source.tls_handshake_failures == 2, "the failures were not counted")
+        # The trailing event arrives at the end of the shortened window, before stop().
+        await _until(
+            lambda: events.kinds().count("tls_handshake_failed") == 2,
+            "the trailing event did not arrive at the shortened window's end",
+        )
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
 # --- the MLLP listener where the loop runs the handshake --------------------------------------
@@ -346,13 +632,70 @@ def test_mllp_records_a_failed_handshake_on_uvloop(tmp_path: Path) -> None:
     asyncio.run(_mllp_loop_run_scenario(tmp_path), loop_factory=uvloop.new_event_loop)
 
 
-def test_a_listener_running_its_own_handshake_does_not_count_twice(tmp_path: Path) -> None:
-    """On the stdlib loop the MLLP listener upgrades each socket itself and counts a failure in
-    `_start_tls`, with the peer. The context hook must stay out of that count."""
+async def test_mllp_running_its_own_handshake_counts_a_close_notify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_start_tls` leaves out only a reset and a broken pipe (`HUNG_UP`), so a close_notify after
+    the ClientHello is counted, as it was before #3785."""
+    monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: True)
     source, _cert_path = _tls_source(tmp_path)
-    source._upgrade_tls = True
-    source._note_loop_tls_failure("SSLError")
-    assert source.tls_handshake_failures == 0
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        await _close_notify_peer(source.sockport)
+        await _until(lambda: source.tls_handshake_failures == 1, "the close_notify not counted")
+        (_kind, _peer, reason) = events.seen[0]
+        # Not the bound, whose cause on MLLP is ConnectionAbortedError.
+        assert reason is not None and "ConnectionAbortedError" not in reason
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_listener_running_its_own_handshake_does_not_count_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the stdlib loop the MLLP listener upgrades each socket itself and counts a failure in
+    `_start_tls`, with the peer. ``loop.start_tls`` builds its TLS object from the same context, so
+    a context an earlier start() hooked would count that failure a second time. start() unhooks it
+    on that path."""
+    monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: True)
+    source, _cert_path = _tls_source(tmp_path)
+    assert source._ssl is not None
+    source._tls_failures.watch(source._ssl)  # as a loop-run start() left it
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        assert source._ssl.sslobject_class is ssl.SSLObject
+        await _plaintext_peer(source.sockport)
+        await _until(lambda: source.tls_handshake_failures >= 1, "the failure was not counted")
+        await asyncio.sleep(0.1)
+        assert source.tls_handshake_failures == 1
+        (_kind, peer, _reason) = events.seen[0]
+        assert peer == "127.0.0.1"  # counted by `_start_tls`, which knows the peer
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_restarted_listener_counts_again(tmp_path: Path) -> None:
+    """stop() closes the counter, so the next start() must open it again or count nothing."""
+
+    async def restart_then_fail(source: Any, handler: Any) -> None:
+        source.on_connection_event = _Events()
+        await source.start(handler)
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+        await source.start(handler)
+        try:
+            await _plaintext_peer(source.sockport)
+            await _until(lambda: source.tls_handshake_failures == 1, "not counted again")
+        finally:
+            await asyncio.wait_for(source.stop(), timeout=10.0)
+
+    for sub in ("mllp", "http"):
+        (tmp_path / sub).mkdir()
+    await restart_then_fail(_tls_source(tmp_path / "mllp")[0], _ack)
+    await restart_then_fail(_http_tls_source(tmp_path / "http")[0], _no_reply)
 
 
 # --- the API ------------------------------------------------------------------------------------

@@ -84,8 +84,12 @@ address to `source_ip_allowlist` to admit it.
 
 **A refused address is logged once a minute, not once per connection.** The SCP writes one
 `WARNING` per refused address per 60 seconds, and at most 20 such lines per 60 seconds over every
-address together. Each line carries the SCP's running count of refusals, logged or not. A TLS
-handshake that fails is logged at `DEBUG` only.
+address together. Each line carries the SCP's running count of refusals, logged or not.
+
+**A failed TLS handshake is counted and logged as a throttled `WARNING`** (vault BACKLOG
+#3784). [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) states what is counted,
+the throttle, and what a line names. Each failure's detail is a `DEBUG` line. The SCP writes
+no connection event for it.
 
 **The C-STORE status the SCP answers tells the sender whether to re-send** (BACKLOG #2103). DICOM PS3.4
 Annex B (Table B.2-1) has no "object too large" status. It has two failure classes that matter here.
