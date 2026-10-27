@@ -40,6 +40,7 @@ from messagefoundry import redaction
 from messagefoundry.auth import trust_anchors
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.connections_file import load_connections_file
+from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.config.wiring import Registry, Send, WiringError
 from messagefoundry.corepoint_import import (
     CorepointImportError,
@@ -1165,17 +1166,22 @@ def test_a_sandbox_bootstrap_unicode_failure_is_reported_without_the_character(
     from messagefoundry.pipeline import _sandbox_worker, sandbox
 
     stdin, stdout = io.BytesIO(), io.BytesIO()
-    boot = codec.encode_boot(config_dir=".", forbidden=(), mem_mb=None, code_sets=None)
+    boot = codec.encode_boot(
+        snapshot=ConfigSnapshot(directory=Path("."), files={}),
+        forbidden=(),
+        mem_mb=None,
+        code_sets=None,
+    )
     sandbox._write_frame(stdin, boot)
     stdin.seek(0)
 
-    def unreadable(config_dir: object) -> object:
+    def unreadable(snapshot: object) -> object:
         raise _encode_error()
 
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(buffer=stdin))
     monkeypatch.setattr(sys, "stdout", types.SimpleNamespace(buffer=stdout))
     monkeypatch.setattr(_sandbox_worker, "_redirect_stdout_to_stderr", lambda: None)
-    monkeypatch.setattr(wiring, "load_config", unreadable)
+    monkeypatch.setattr(wiring, "load_snapshot", unreadable)
     # Should main() stop reaching the patched load, these must still not touch the test process.
     monkeypatch.setattr(_sandbox_worker, "_apply_resource_caps", lambda mem_mb: None)
     monkeypatch.setattr(_sandbox_worker, "_install_import_guard", lambda forbidden: None)

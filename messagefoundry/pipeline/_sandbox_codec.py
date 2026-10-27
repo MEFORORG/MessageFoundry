@@ -48,6 +48,7 @@ never a NAK, never an accept-and-drop, never a crashed connection.
 from __future__ import annotations
 
 import base64
+import binascii
 import datetime as _dt
 import json
 import math
@@ -55,12 +56,14 @@ import re
 import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Final
 
 from messagefoundry.config.code_sets import CodeSet, UnmappedKind, UnmappedPolicy
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.response import CapturedResponse
 from messagefoundry.config.run_context import RunContext
+from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.config.wiring import (
     Send,
     SetMeta,
@@ -985,21 +988,63 @@ def _open(body: bytes, allowed: tuple[str, ...]) -> tuple[dict[str, Any], _Reade
     return header, _Reader(blobs), kind
 
 
+def enc_snapshot(snapshot: ConfigSnapshot, blobs: _Blobs) -> Any:
+    """Describe the config snapshot the engine loaded, for the worker's bootstrap frame.
+
+    The worker runs these bytes and never reads the config directory (vault BACKLOG #2596): a
+    respawn, after a crash or a wall-cap kill, runs what the engine loaded rather than whatever is
+    on disk then. Each file's bytes travel as base64 in a segment, so source in any encoding crosses
+    unchanged. Only what a load reads is sent (:meth:`ConfigSnapshot.loaded`)."""
+    loaded = snapshot.loaded()
+    return {
+        "dir": blobs.ref(str(loaded.directory)),
+        "files": [
+            [rel, blobs.ref(base64.b64encode(data).decode("ascii"))]
+            for rel, data in loaded.files.items()
+        ],
+    }
+
+
+def dec_snapshot(node: Any, reader: _Reader) -> ConfigSnapshot:
+    """Rebuild the engine's config snapshot in the worker. Each path is checked against the closed
+    set of names a snapshot may hold (:class:`ConfigSnapshot`), and nothing is ever opened by it."""
+    obj = _req_obj(node, "config snapshot")
+    directory = reader.text(obj.get("dir"))
+    files: dict[str, bytes] = {}
+    for pair in _req_list(obj.get("files"), "config snapshot files"):
+        if len(_req_list(pair, "config snapshot file")) != 2:
+            raise SandboxCodecError("a config snapshot file must be [path, base64]")
+        rel = _req_str(pair[0], "config snapshot path")
+        if rel in files:
+            raise SandboxCodecError(f"config snapshot path {rel!r} appears twice")
+        try:
+            files[rel] = base64.b64decode(reader.text(pair[1]), validate=True)
+        except binascii.Error as exc:
+            raise SandboxCodecError(f"config snapshot file {rel!r} is not base64: {exc}") from exc
+    try:
+        return ConfigSnapshot(directory=Path(directory), files=files)
+    except ValueError as exc:
+        raise SandboxCodecError(str(exc)) from exc
+
+
 def encode_boot(
     *,
-    config_dir: str,
+    snapshot: ConfigSnapshot,
     forbidden: Sequence[str],
     mem_mb: int | None,
     code_sets: object,
 ) -> bytes:
     """The one-per-spawn bootstrap frame.
 
-    ``env`` is deliberately NOT marshalled: ``load_config()`` takes only a directory and the worker
+    It carries the config snapshot the engine loaded, not a directory: the worker loads the graph
+    from those bytes and reads nothing from disk (vault BACKLOG #2596).
+
+    ``env`` is deliberately NOT marshalled: the worker's load takes only the snapshot and the worker
     never read it — a dead field on the wire is a field nobody validates."""
     blobs = _Blobs()
     header = _envelope(
         {
-            "config_dir": config_dir,
+            "snapshot": enc_snapshot(snapshot, blobs),
             "forbidden": list(forbidden),
             "mem_mb": None if mem_mb is None else int(mem_mb),
             "code_sets": enc_code_sets(code_sets, blobs),
@@ -1013,7 +1058,7 @@ def encode_boot(
 class Boot:
     """The decoded bootstrap frame (child side)."""
 
-    config_dir: str
+    snapshot: ConfigSnapshot
     forbidden: tuple[str, ...]
     mem_mb: int | None
     code_sets: dict[str, CodeSet] | None
@@ -1021,7 +1066,8 @@ class Boot:
 
 def decode_boot(body: bytes) -> Boot:
     header, reader, _ = _open(body, ("boot",))
-    config_dir = _req_str(header.get("config_dir"), "config_dir")
+    # Walk order matches encode_boot: the snapshot's segments BEFORE the code sets'.
+    snapshot = dec_snapshot(header.get("snapshot"), reader)
     forbidden = tuple(
         _req_str(m, "forbidden module") for m in _req_list(header.get("forbidden"), "forbidden")
     )
@@ -1029,7 +1075,7 @@ def decode_boot(body: bytes) -> Boot:
     code_sets = dec_code_sets(header.get("code_sets"), reader)
     reader.finish()
     return Boot(
-        config_dir=config_dir,
+        snapshot=snapshot,
         forbidden=forbidden,
         mem_mb=mem_mb,
         code_sets=code_sets,

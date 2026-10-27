@@ -5490,9 +5490,11 @@ class RegistryRunner:
 
         Returns ``None`` — the byte-identical in-process path — unless ``[sandbox].mode=subprocess``
         AND a config dir is known. The child re-loads the graph to look a function up by name, from
-        ``Registry.source_dir`` (the directory the served graph came from), else the constructor's
-        ``sandbox_config_source``. A reload of a running runner closes the sessions, so a reload
-        from another root moves the children with it (vault BACKLOG #3094). **A graph built in code with no
+        ``Registry.config_snapshot``, the bytes the served graph was loaded from, and never reads
+        the directory (vault BACKLOG #2596). A graph with no snapshot hands the session
+        ``Registry.source_dir``, else the constructor's ``sandbox_config_source``, which the session
+        reads once. A reload of a running runner closes the sessions, so a reload from another root
+        moves the children with it (vault BACKLOG #3094). **A graph built in code with no
         config dir cannot isolate**, and degrades to in-process. That degradation is **silent**: a
         library embedder that asked for ``subprocess`` gets the in-process path and nothing says so.
         Every ``serve`` route carries a config dir. The :class:`SandboxSession` object is created
@@ -5519,6 +5521,9 @@ class RegistryRunner:
                 env=env,
                 graph=self._engine_graph_shape,
                 code_sets=self.registry.code_sets,
+                # The bytes the served graph was loaded from: every worker of this session runs
+                # them and never reads the directory (vault BACKLOG #2596).
+                snapshot=self.registry.config_snapshot,
             )
             self._sandbox_sessions[name] = session
         return session
