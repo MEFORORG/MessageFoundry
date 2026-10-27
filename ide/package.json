@@ -769,7 +769,7 @@
                     },
                     "caFile": {
                       "type": "string",
-                      "markdownDescription": "Optional full path to a PEM to trust for this instance. Defaults to its environment's `caFile`, including one that is refused, which then refuses every request to this instance too."
+                      "markdownDescription": "Optional full path to a PEM to trust for this instance. Defaults to its environment's `caFile`, including one that is refused, which then refuses every request to an `https://` instance too unless another entry pins its `host:port` with a usable `caFile`."
                     }
                   }
                 }

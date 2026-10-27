@@ -257,10 +257,10 @@ set `caFile` on its `messagefoundry.environments` entry (or on one engine shard)
   CAs**, nor to the certificate `messagefoundry.serviceConfig` names. This holds from the moment the
   setting names it, before any file is read. A request to that `host:port` is sent only with a
   certificate read from an accepted `caFile`. Otherwise it is refused before it is sent. Its error
-  names the `caFile` in `messagefoundry.environments`. To fix it, correct the `caFile`, or remove
-  every refused `caFile` for that `host:port`. An empty `caFile` (`""`) or `null` counts as no
-  `caFile`, and so does any entry the extension does not read at all (one without a string `name`
-  and `url`), so such an entry pins nothing.
+  names the `caFile` in `messagefoundry.environments`. To fix it, correct the `caFile` or remove
+  it; where it was refused, remove every refused `caFile` for that `host:port`. An empty `caFile`
+  (`""`) or `null` counts as no `caFile`, and so does any entry the extension does not read at all
+  (one without a string `name` and `url`), so such an entry pins nothing.
   - **Accepted, not read yet.** While no certificate from the file is held, because it has not been
     read yet or holds no PEM certificate, the refusal tries to read the file again, waiting up to two
     seconds, and if that read succeeds the request is sent once with it. A file slower than that is

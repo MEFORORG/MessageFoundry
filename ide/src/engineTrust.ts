@@ -215,10 +215,11 @@ function trustState(): string {
  * Resolves to true when what the client TRUSTS changed, compared as host keys and PEM contents, so
  * the caller can re-probe rather than leave a stale verdict on screen. Dropping an anchor counts,
  * because a retarget to a remote engine registers nothing and still invalidates the verdict on
- * screen. A `caFile` claim that moved is not counted here: every caller publishes the claims first
- * ({@link publishPinnedHosts}), and the settings listener re-probes on what that returns. Re-reading
- * the same certificate does not count, so a refresh started by a verification failure cannot
- * re-probe itself into a loop.
+ * screen. A `caFile` claim that moved is not counted here. Claims move only with the settings, and
+ * the settings listener publishes each change ({@link publishPinnedHosts}) before it queues a
+ * refresh, re-probing on what that publish returns; activation publishes before its first refresh.
+ * Re-reading the same certificate does not count, so a refresh started by a verification failure
+ * cannot re-probe itself into a loop.
  *
  * Refreshes run ONE AT A TIME. Each awaits a subprocess and then replaces the whole set, so two
  * interleaved runs could each replace what the other had just registered with an older reading.
@@ -444,7 +445,8 @@ function pinsToRead(pins: readonly TrustPin[], hosts: HostPins): ToRead[] {
         `messagefoundry.environments: not pinning ${pin.url}: ${pin.reason}` +
           (failsClosed
             ? `. Requests to ${pin.claims} are refused, never verified against the default roots, ` +
-              `until the caFile is corrected or removed.`
+              `until the caFile is corrected, or every refused caFile for ${pin.claims} is ` +
+              `removed.`
             : ""),
       );
     } else {
