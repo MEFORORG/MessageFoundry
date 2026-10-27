@@ -1977,8 +1977,9 @@ rule 1 would also stop the engine starting, so fix the file. A file whose CRL fa
 check under rule 2 is held back too. On the signature, a start refuses it only where the engine
 proves the signature bad, so fix that file. Short of that proof the signature does not stop a
 start: unless another rule refuses the file, a start loads it with a warning, and each handshake
-then decides. *A start checks each CRL's signature too*, further down, says what counts as proof,
-and names cases that load.
+then decides. The remedy says which the reload found (vault BACKLOG #3506): `bad_signature` for a
+proof, and `unproven_signature` or `uncheckable_signature` short of it. *A start checks each CRL's
+signature too*, further down, says what counts as proof, and names cases that load.
 
 **The private copy is about the temporary directory, not the CRL.** The reload loads a private copy
 of the file, made in the engine's temporary directory. When it cannot make that copy, it refuses with
@@ -2060,11 +2061,16 @@ engine can read both that root and the CRL. A CA certificate the engine cannot r
 skipped, as though the hop did not list it.
 
 The reload is stricter than a start. Under rule 2 it holds back every CRL it cannot confirm against
-a listed CA. Where the engine matches the CRL to a listed CA and cannot confirm the signature with
-that CA's key, the remedy is the one the `bad_signature` row below describes. That is so whether or
-not the CRL names a key, and whether the check failed or could not run. After a CA renews its key
-the file can be right, and a restart then loads it with the WARNING above. Where the engine matches
-the CRL to no listed CA, the remedy is the `no_issuer` row's: restart.
+a listed CA, and its remedy says what the check found (vault BACKLOG #3506). Where it has the proof
+described above, the remedy is the `bad_signature` row's below: fix the file, which a start that
+finds the same proof refuses too, at any time. Where it matches the CRL to a listed CA and cannot confirm the signature short of
+that proof, the remedy asks you to check the file, then restart. It is the `unproven_signature`
+row's where the check ran and failed but the CRL names no key of that CA, and the
+`uncheckable_signature` row's where the engine could not check the signature with a matched CA's
+key. After a CA renews its key the file can be right, and a restart then loads it with the WARNING
+above, unless another rule refuses it. Where the engine matches the CRL to no listed CA, the remedy
+is the `no_issuer` row's: restart. Where the CRLs in one file, or the hops holding it, get
+different signature findings, the reload names the strongest, in the order of the rows below.
 
 **What a signature refusal stops.** It has the reach of the expired-CRL refusal, because one check
 raises both. This is read from the code, not measured end to end. At `serve`, a refused outbound
@@ -2109,7 +2115,7 @@ transport it is a WARNING in the log, beside the reload's ERROR.
 | `remedy_class` | a short token for what to do next; see the next table |
 | `stale_contexts` | how many running TLS contexts still held the old copy at the last reload pass that reported the refusal. A reminder carries that latest count, so it can differ from the count the alert was first raised with |
 | `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
-| `start_refuses` | `true`, and present only then. The remedy could lead you to restart, by naming a restart or by saying a start can load the file, and a start would refuse the file too at least until one of its CRLs takes effect. Do not restart before then. That time is no promise that a start loads the file: with `bad_signature`, for one, a start refuses it after then too, where it proves the signature bad |
+| `start_refuses` | `true`, and present only then. The remedy names a restart, and a start would refuse the file too at least until one of its CRLs takes effect. Do not restart before then. That time is no promise that a start loads the file: another rule can refuse it after then, such as a private copy a start cannot make. `bad_signature` never carries this flag: it names no restart, and a start that finds the same proof refuses that file at any time |
 
 This event carries no CRL contents. The reason for the refusal quotes CRL issuer names and dates, so
 it is left out of this event. It is in the engine log, in the `crl_reload` ERROR line. Read that
@@ -2121,15 +2127,17 @@ belong to the CRL expiry alert too. This event carries none of them.
 |---|---|
 | `fix_file` | Fix the file. A start would refuse it too. |
 | `lapses_first` | Fix the file now with a CRL that is in effect. The hop's copy lapses before the file's CRL takes effect, and every peer is refused in between. A restart does not help, and a start can refuse the file too. |
-| `bad_signature` | A CRL in the file fails its signature check under rule 2. The signature paragraphs above say when to fix the file and when a restart loads it. |
+| `bad_signature` | The engine proved a CRL in the file badly signed under rule 2: the CRL names the key of a CA the hop lists, and that key does not verify it. Fix the file. A start that finds the same proof refuses it too, at any time. |
+| `unproven_signature` | The key of the CA the hop lists for a CRL's issuer does not verify it, but the CRL names no key of that CA, so the engine cannot prove it badly signed. Check the file: after a CA renews its key it can be right. Then restart the engine to apply it. |
+| `uncheckable_signature` | The engine could not check a CRL's signature with the key of the CA the hop lists for its issuer, as with a signature of another kind than that key. Check the file, then restart the engine to apply it. |
 | `not_provable` | Give the setting a bare CRL. The file carries a certificate the reload cannot prove the hop trusts. |
 | `restart` | Restart the engine to apply the file. |
 | `no_issuer` | Restart the engine to apply the file. Adding the issuing intermediate CA to the hop's own CA file does not apply this file; it lets later reloads verify the CRL without a restart. |
 | `retry` | The engine tries again every pass. A restart applies the file now. |
 | `wait` | Wait. The engine applies the file once its CRL takes effect. Do not restart before then. |
 
-The engine sends at least these eight. A remedy it has no token for would be sent as `other`, with
-no remedy sentence.
+The engine sends at least the classes in this table. A remedy it has no token for would be sent as
+`other`, with no remedy sentence.
 
 **A reminder while the refusal stands (vault BACKLOG #3543).** The engine raises the alert at once
 when it first refuses a version of the file, and at once again when the file's bytes change or the
@@ -2154,9 +2162,10 @@ the next reminder pages. A cooldown longer than five minutes throttles some remi
 engine resolves the alert itself, that ends the cooldown, so it does not hold back a refusal that
 follows a fix. A resolve made by hand in the alert list does not end it.
 
-**Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
-the event carries no `start_refuses`. With any other class a start can refuse the file too, and
-then the engine does not come up. Two more points:
+**Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, or
+`unproven_signature` or `uncheckable_signature` once you have checked the file, and only when the
+event carries no `start_refuses`. With any other class a start can refuse the file too, and then
+the engine does not come up. Two more points:
 
 - A `retry` whose ERROR line says the reload could not stage the file. A start can need the same
   private copy and refuse too, so fix the temporary directory first (*The private copy is about
@@ -2220,7 +2229,8 @@ Where a CRL setting names it too, as `[store].ssl_crl_file` can, the check comes
 restart. A start judges that setting. A hop may still hold a stale copy through a CRL setting.
 Only then does the restart wait for the reload's verdict. So after the CA-file step, `detail` says
 to restart once the reload has applied the file. Or it gives a refused reload's remedy and reason.
-The CA-file hop's restart follows, unless that remedy is itself a restart of the engine. The scan
+The CA-file hop's restart follows, unless that remedy itself orders a restart of the engine, as
+those of `restart`, `no_issuer`, `retry`, `unproven_signature` and `uncheckable_signature` do. The scan
 may log a WARNING that it could not check the signature of a later CRL in the CA file. It does so
 only after a CRL that `detail` would ask you to check. Then `detail` does not ask for a check: it
 says to replace the CRL before restarting. Put a CRL in the hop's CRL setting instead to have it

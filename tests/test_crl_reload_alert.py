@@ -465,8 +465,13 @@ def test_every_remedy_has_its_own_class_token() -> None:
     tokens = [crl_reload._REMEDY_CLASS[remedy] for remedy in crl_reload._PRECEDENCE]
     assert len(set(tokens)) == len(crl_reload._PRECEDENCE) == len(crl_reload._REMEDY_CLASS)
     assert crl_reload._OTHER_REMEDY_CLASS not in tokens
+    # Each token has its row in the guide's table under [cert_monitor] (vault BACKLOG #3506 added
+    # two). Control: a token no remedy has is not there.
+    guide = (Path(__file__).parents[1] / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
+    assert "| `no_such_token` |" not in guide
     for token in tokens:
         assert token == token.lower() and " " not in token
+        assert f"| `{token}` |" in guide, token
     assert ReloadOutcome("p", 1, None).remedy_class is None
     assert ReloadOutcome("p", 0, ReloadRefusal((1, 2), "why", FIX), 1).remedy_class == "fix_file"
 
