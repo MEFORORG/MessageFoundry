@@ -917,7 +917,8 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 #: How long start() waits for a PRIOR demotion's abandoned stops before cancelling them. Sized to
 #: 2x the client-shutdown grace because MLLP/TCP/X12/HTTP each consume that grace TWICE, serially,
 #: inside one stop() — a 1x bound would cancel in precisely the slow-but-healthy case it exists to
-#: settle, taking the ADR 0031 rebind-failure branch instead.
+#: settle, taking the ADR 0031 rebind-failure branch instead. The plain (SHUTDOWN) source stop and
+#: stop_inbound use the same bound, for the same reason (BACKLOG #1620): one policy, not two.
 _PENDING_STOP_SETTLE_SECONDS = 10.0
 
 
@@ -4643,7 +4644,57 @@ class RegistryRunner:
         """stop_inbound body without the reload lock — for callers that already hold it."""
         source = self._sources.pop(name, None)
         if source is not None:
-            await source.stop()
+            # Bounded (BACKLOG #1620): this runs under _reload_lock, so an unbounded wait on a wedged
+            # share call would wedge reload, shutdown and the connection API with it. The source's own
+            # stop() error still reaches the caller, as before.
+            failed = await self._stop_sources_bounded([(name, source)])
+            if name in failed:
+                raise failed[name]
+
+    async def _stop_sources_bounded(
+        self, sources: Sequence[tuple[str, SourceConnector]]
+    ) -> dict[str, BaseException]:
+        """Stop ``sources`` concurrently under ONE deadline (BACKLOG #1620), and return the error each
+        failed ``stop()`` raised, by inbound name.
+
+        The plain-stop twin of :meth:`_stop_sources_demote`: the same eager ``create_task`` and the same
+        ``asyncio.wait`` deadline, but a stop that misses it is cancelled and joined, never abandoned. A
+        SHUTDOWN must not leave a task at loop close (see :meth:`stop`), and the ADR 0066 D3 order needs
+        every source finished before the dispatchers stop.
+
+        The bound limits how long the RUNNER waits, not the work. A ``stop()`` blocked in
+        ``asyncio.to_thread`` (a share call, a driver call) is cancelled at its await, but CPython
+        cannot kill the thread, which runs on until its call returns. Same accepted-by-design leak as
+        the strict-validate timeout in :meth:`_handle_inbound`.
+
+        A cancel of this coroutine cancels every stop task before it propagates, so none is orphaned.
+        """
+        if not sources:
+            return {}
+        tasks = {asyncio.create_task(src.stop(), name=f"stop:{n}"): n for n, src in sources}
+        try:
+            done, still = await asyncio.wait(tasks, timeout=_PENDING_STOP_SETTLE_SECONDS)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            raise
+        for task in still:
+            task.cancel()
+        if still:
+            await asyncio.gather(*still, return_exceptions=True)
+            log.warning(
+                "%d inbound stop(s) did not finish within %.1fs and were cancelled: %s. A stop "
+                "blocked in a worker thread keeps that thread until its call returns, and a rebind "
+                "of those ports may fail (isolated per connection, ADR 0031)",
+                len(still),
+                _PENDING_STOP_SETTLE_SECONDS,
+                ", ".join(sorted(tasks[task] for task in still)),
+            )
+        return {
+            tasks[task]: exc
+            for task in done
+            if not task.cancelled() and (exc := task.exception()) is not None
+        }
 
     def _record_failed(self, name: str, exc: BaseException, *, kind: Direction) -> None:
         """Isolate a connection that failed to build/bind (ADR 0031): record the reason, log it
@@ -5847,8 +5898,12 @@ class RegistryRunner:
             await self._quiesce_dispatchers_demote(budget * _DEMOTE_QUIESCE_SHARE)
             await self._stop_sources_demote(budget * (1.0 - _DEMOTE_QUIESCE_SHARE))
         else:
-            for source in self._sources.values():
-                await source.stop()
+            # BACKLOG #1620: concurrent and bounded. Fully joined (stragglers cancelled and gathered)
+            # before the dispatcher stop below, so the D3 order holds.
+            for name, exc in (
+                await self._stop_sources_bounded(list(self._sources.items()))
+            ).items():
+                log.warning("inbound %r: stop() failed: %s", name, safe_exc(exc))
             # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
             # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
             # _stop.set(). The shared _stop already broke their loops; d.stop() cancels each
