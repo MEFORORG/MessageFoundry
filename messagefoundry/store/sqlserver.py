@@ -3086,12 +3086,10 @@ class SqlServerStore:
         # against this and re-reads only the sets that differ. Seeded at open (_load_reference_cache)
         # and on every write_reference_snapshot.
         self._reference_versions: dict[str, str] = {}
-        # Serializes audit-chain appends WITHIN THIS PROCESS only. Its premise is one appender per
-        # lock, which engine sharding (ADR 0037 + 0063) breaks: N shard processes are N such locks over
-        # one chain, so `_AUDIT_APPEND_LOCK` at the database is the lock that holds (BACKLOG #1605).
-        # tests/test_control_premises.py pins offline that every append takes it before the head read;
-        # that it holds ACROSS processes only a live server shows, in the gated two-process
-        # tests/test_sqlserver_audit_applock.py. See record_audit.
+        # Serializes audit-chain appends WITHIN THIS PROCESS only; across engine-shard processes
+        # `_AUDIT_APPEND_LOCK` is the lock that holds (why: record_audit). Its premise tests:
+        # tests/test_control_premises.py (offline: the applock is taken before the head read) and
+        # the gated tests/test_sqlserver_audit_applock.py (live: it holds across processes).
         self._audit_lock = asyncio.Lock()
         # H1 fencing token: the held leader epoch + the leader_lease row to validate it against, pushed
         # by the engine on promotion via set_leader_epoch() (the store NEVER imports the coordinator —

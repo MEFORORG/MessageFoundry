@@ -8,8 +8,9 @@
 # checked-in list, so each row is a reviewed claim that a named control has a red.
 #
 # Seeded from the thirteen instances Fable review packet 18 (finding P18-01) named, where the instance
-# is reachable offline. The server-backend locks (#1610) need a live PostgreSQL or SQL Server and are
-# not here; a row for them belongs on the gated live leg, not in this list.
+# is reachable offline. That a server-backend lock HOLDS across processes (#1610) needs a live
+# PostgreSQL or SQL Server and is not here; that belongs on the gated live leg. That a lock is TAKEN
+# is observable with a fake cursor, so a row for that half belongs here (#1746 limb 3).
 #
 # Fields, all required:
 #   id       stable name, used by --only

@@ -19,7 +19,9 @@ from itertools import takewhile
 from pathlib import Path
 from typing import Any
 
-from messagefoundry.store.sqlserver import _AUDIT_APPEND_LOCK, SqlServerStore
+import yaml
+
+from messagefoundry.store.sqlserver import SqlServerStore
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -31,7 +33,8 @@ _ADR_0159 = (
     / "adr"
     / "0159-cancellation-safe-pooled-connection-release-mid-txn-discard-at-the-acquire-chokepoint.md"
 )
-_REFUTED_BORROWER = re.compile(r"no next[- ]borrower")
+#: Case-blind, and blind to markdown emphasis between the words.
+_REFUTED_BORROWER = re.compile(r"\bno[\s*_]+next[\s*_-]+borrower", re.IGNORECASE)
 #: The correction's opening of its quotation of the old sentence. A refuted phrase after this, with
 #: no closing ``"*`` between, is being quoted to deny it.
 _QUOTE_OPEN = 'This bullet used to end: *"'
@@ -95,9 +98,8 @@ def test_the_borrower_check_fires_on_the_original_text() -> None:
 _SQLSERVER = _ROOT / "messagefoundry" / "store" / "sqlserver.py"
 _AUDIT_LOCK_LINE = "self._audit_lock = asyncio.Lock()"
 _LIVE_TEST = "tests/test_sqlserver_audit_applock.py"
-#: Searched over the whole flattened file, not only the lock's comment, so the refuted premise cannot
-#: move to another comment (``record_audit``'s, say); the ``# `` covers a comment line break.
-_REFUTED_AUDIT = re.compile(r"single audit writer per engine (?:# )?process")
+#: Searched in the lock's own comment block only, so a correction elsewhere may quote it.
+_REFUTED_AUDIT = re.compile(r"single audit writer per engine process")
 
 #: The comment and line as they shipped before this limb.
 _ORIGINAL_AUDIT_LOCK = """\
@@ -121,7 +123,7 @@ def audit_lock_premise_faults(source: str) -> list[str]:
     comment = [line.strip().lstrip("#").strip() for line in takewhile(_is_comment, above)]
     block = " ".join(reversed(comment))
     faults: list[str] = []
-    if _REFUTED_AUDIT.search(_flat(source)):
+    if _REFUTED_AUDIT.search(block):
         faults.append("asserts the refuted single-writer premise")
     if "_AUDIT_APPEND_LOCK" not in block:
         faults.append("the comment above the lock does not name _AUDIT_APPEND_LOCK")
@@ -132,10 +134,22 @@ def audit_lock_premise_faults(source: str) -> list[str]:
 
 def test_the_audit_lock_states_its_premise_and_names_its_live_test() -> None:
     assert audit_lock_premise_faults(_SQLSERVER.read_text(encoding="utf-8")) == []
-    # The stated reason is only true while the live test exists and a CI leg runs it.
+    # The stated reason is only true while the live test exists and a CI step runs it with the gate
+    # set; without MEFOR_TEST_SQLSERVER it skips, and a skip reads like a pass.
     assert (_ROOT / _LIVE_TEST).is_file()
-    ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert _LIVE_TEST in ci, f"no ci.yml leg names {_LIVE_TEST}"
+    assert _live_steps_running(_LIVE_TEST) >= 1, f"no ci.yml step runs {_LIVE_TEST} ungated"
+
+
+def _live_steps_running(path: str) -> int:
+    """ci.yml steps whose ``run`` names ``path`` with ``MEFOR_TEST_SQLSERVER`` set on the step or job."""
+    ci = yaml.safe_load((_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+    count = 0
+    for job in ci["jobs"].values():
+        for step in job.get("steps", []):
+            env = {**job.get("env", {}), **step.get("env", {})}
+            if path in str(step.get("run", "")) and env.get("MEFOR_TEST_SQLSERVER"):
+                count += 1
+    return count
 
 
 def test_the_audit_lock_check_fires_on_the_original_text() -> None:
@@ -175,8 +189,13 @@ async def test_every_audit_append_takes_the_database_applock_before_it_reads_the
     statements = [sql for sql, _ in cur.executed]
     assert any(sql.startswith("INSERT INTO audit_log") for sql in statements), statements
     head = next(i for i, sql in enumerate(statements) if "FROM audit_log" in sql)
-    locks = [params for sql, params in cur.executed[:head] if "sp_getapplock" in sql]
-    assert [p[0] for p in locks] == [_AUDIT_APPEND_LOCK], (
-        "the audit append read the chain head without first taking the cross-shard applock; "
+    locks = [(sql, params) for sql, params in cur.executed[:head] if "sp_getapplock" in sql]
+    # The literal, not the imported constant: a per-process resource name would serialize nothing.
+    assert [params[0] for _, params in locks] == ["mefor:audit_append"], (
+        "the audit append read the chain head without first taking the cross-engine-shard applock; "
         "the in-process lock alone forks the chain under engine sharding (BACKLOG #1605)"
     )
+    sql = locks[0][0]
+    assert "@LockMode='Exclusive'" in sql and "@LockOwner='Transaction'" in sql, sql
+    # "Every append" is true only while this method holds the store's one audit_log INSERT.
+    assert _SQLSERVER.read_text(encoding="utf-8").count("INSERT INTO audit_log") == 1

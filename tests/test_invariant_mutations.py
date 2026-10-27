@@ -109,8 +109,13 @@ def test_every_named_test_exists(row: Any) -> None:
         rel, _, name = node.partition("::")
         path = _REPO / rel
         assert path.is_file(), f"{row.id}: {rel} does not exist"
-        # A parametrized id names its function before the bracket; the runner matches the full id.
-        assert name.partition("[")[0] in _test_names(path), f"{row.id}: {rel} defines no {name}"
+        # A parametrized id names its function before the bracket, and its case id must still be
+        # written in that file; the runner matches the full id, so a renamed case scores ERROR.
+        function, bracket, case = name.partition("[")
+        assert function in _test_names(path), f"{row.id}: {rel} defines no {function}"
+        if bracket:
+            source = path.read_text(encoding="utf-8")
+            assert f'"{case.removesuffix("]")}"' in source, f"{row.id}: {rel} has no case {case}"
 
 
 @pytest.mark.parametrize(

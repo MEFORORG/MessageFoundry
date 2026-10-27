@@ -297,12 +297,14 @@ ran*. That is a distinct failure mode and it needs its own control:
 Applies to any gate, in any project adopting this rubric — a deferred or advisory gate that silently
 stops measuring is worse than an absent one, because the scorecard still counts it. A gate whose
 scope is narrower than its scorecard sentence is the same defect wearing a different disguise. Rules
-1 to 5 bind gates in that sense; rules 6 to 9 reach past a gate — to a reviewer's own instruments, to
-a test suite, and to the conduct of a review, on the ground that each of those is a control too — so
+1 to 5 bind gates in that sense; rules 6 to 8 reach past a gate — to a reviewer's own instruments, to
+a test suite, and to the conduct of a review, on the ground that each of those is a control too — and
+rule 9 binds every new control, gate or test, at the moment it is written — so
 read the section heading as the shortest true label for the section rather than its full extent.
 Rules 5 to 7 generalise on the same terms, with one substitution: rule 7's question 3 names this
 engine's failure paths as its worked example,
-and an adopting project answers that question over its own. Rule 8's second half does not generalise
+and an adopting project answers that question over its own. Rule 9 generalises too; the files it
+names are this engine's, and an adopting project uses its own mutation list and premise tests. Rule 8's second half does not generalise
 at all: the lenses it names are this engine's, and an adopting project owes the equivalent list for
 its own invariants.
 
