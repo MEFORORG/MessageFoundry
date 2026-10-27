@@ -19,7 +19,7 @@ pre-clamp ALLOW and now assert the refusal; each says so at its own docstring.
 
 Loopback / attested hops are byte-identical; a non-enforcing hop WARNs. A synthetic-instance
 relaxation went with BACKLOG #1279 -- every instance carries patient data -- and a proven-terminator
-arm, which no engine call site ever set, with BACKLOG #3514 item 5 (pinned below).
+arm, which no engine call site ever set True, with BACKLOG #3514 item 5 (pinned below).
 
 The revocation refusal COMPOSES with #200: #200 refuses the CLEARTEXT / verify-off hop, so revocation
 fires ONLY on a VERIFYING hop — the two gates key on disjoint conditions and never double-refuse one
