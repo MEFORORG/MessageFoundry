@@ -649,12 +649,15 @@ def held_crl_label(path: str) -> str:
 
 
 #: The signature states of a :class:`~messagefoundry.pki.CrlSignature` the engine could not confirm
-#: either way. Named once, for the remedy that asks for a check and for the guard that catches an
-#: unread later block after one of them (BACKLOG #3512).
+#: either way. Named once, for at least the remedy that asks for a check, the guard that catches a
+#: ``ValueError`` the signature check raises on a later block after one of them, and the test for a
+#: state this scan does not name (BACKLOG #3512).
 _UNCONFIRMED = frozenset({"unproven", "uncheckable"})
 
-#: The states that pass a CA file's CRL with no step of its own: ``unlisted`` is a CRL whose issuer
-#: the file does not hold, which the reload passes too. A state named in neither set nor ``bad``,
+#: The states that pass a CA file's CRL with no step of its own. ``unlisted`` is a CRL that no CA
+#: this file lists fits, as :class:`~messagefoundry.pki.CrlSignature` defines a fit: its issuer can
+#: be an intermediate the peer sends. The reload does not pass that state: ``crl_reload``'s module
+#: docstring says how it treats one, under ``NO_ISSUER``. A state named in neither set nor ``bad``,
 #: such as one added to ``pki.CrlSignatureState`` later, leaves the file unjudged.
 _PASSING = frozenset({"verified", "unlisted"})
 
@@ -679,12 +682,12 @@ def _ca_file_crl_refusal(
     from this file for its issuer. Only a signature proven bad says handshakes fail;
     one the engine could not confirm asks for a check (BACKLOG #3512). With ``ca_file_only``, that
     remedy then says to restart. Otherwise a CRL setting names the file too. The caller then orders
-    the restart, after the reload's verdict. A CRL whose issuer this file does not hold is not
-    refused: the issuer can be an intermediate the peer sends, which the reload treats the same
-    way. ``file_facts`` is the lenient reading, which tells an expired CRL from one that cannot be
-    judged. ``on_unchecked`` is called, inside the ``except``, when a later CRL does not parse
-    after an earlier one's signature was not confirmed, which leaves the file unjudged. Each
-    remedy leads, because the alert instance keeps only the start of it."""
+    the restart, after the reload's verdict, only where a hop holds a stale copy through that
+    setting. A CRL that no CA in this file fits is not refused; :data:`_PASSING` says why.
+    ``file_facts`` is the lenient reading, which tells an expired CRL from one that cannot be
+    judged. ``on_unchecked`` is called inside the ``except``. That happens when the signature
+    check raises ``ValueError`` on a later CRL, after one in :data:`_UNCONFIRMED`. The file is then
+    unjudged. Each remedy leads, because the alert instance keeps only the start of it."""
     if not crl_pem_blocks(pem):
         return None  # the CRL was moved out, and a CA file with none starts
     unjudged = (
@@ -733,14 +736,16 @@ def _ca_file_crl_refusal(
             # The unchecked block could be proven bad, so the file is one the engine cannot judge:
             # replace the CRL before restarting, not the unconfirmed remedy's check. Any other set
             # of states re-raises to the outer path, which leaves the file unjudged too, so no
-            # state is swallowed (BACKLOG #3512). An error of another type is not caught here: it
-            # says the scan could not check the file.
+            # state is swallowed (BACKLOG #3512). An error of another type is not caught here. It
+            # takes an outer path, such as the one saying the scan could not check the file.
             if not states & _UNCONFIRMED:
                 raise
             on_unchecked()
             return unjudged
     except ValueError:
-        return unjudged  # OpenSSL loads other CRLs than were judged
+        # At least two causes: OpenSSL loads other CRLs than were judged (crl_scratch_context), or
+        # the signature check raised with no unconfirmed block before it, re-raised above.
+        return unjudged
     except ssl.SSLError as exc:
         # Any block can cause it, a certificate as well as a CRL, and a restart fails on it too.
         return (
