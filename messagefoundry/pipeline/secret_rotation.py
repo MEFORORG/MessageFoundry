@@ -45,7 +45,6 @@ import datetime
 import hashlib
 import hmac
 import logging
-import os
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -53,6 +52,7 @@ from typing import TYPE_CHECKING
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import CONNECTOR_SECRET_EXPIRY_CLASS
+from messagefoundry.engine_secrets import secret_settings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.store.crypto import (
     KEY_ID_SCHEME,
@@ -314,14 +314,12 @@ def _parsed_date(text: str) -> datetime.date | None:
 def held_env_secret_values(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """The fixed ``MEFOR_*`` secret values the engine actually holds — present and non-empty — in
     ``environ`` (default :data:`os.environ`). Returned transiently to be fingerprinted; **never** stored
-    or logged. A class absent from the environment is simply not tracked (deny-by-default)."""
-    env = os.environ if environ is None else environ
-    out: dict[str, str] = {}
-    for name, _label in _ENV_SECRET_CLASSES:
-        val = env.get(name)
-        if val:
-            out[name] = val
-    return out
+    or logged. A class absent from the environment is simply not tracked (deny-by-default).
+
+    Each value is read through the one accessor, so a secret the secrets directory supplies is
+    fingerprinted as one from the environment is (vault BACKLOG #2595, ADR 0214)."""
+    found = secret_settings((name for name, _label in _ENV_SECRET_CLASSES), environ=environ)
+    return {name: val for name, val in found.items() if val}
 
 
 @dataclass(frozen=True)

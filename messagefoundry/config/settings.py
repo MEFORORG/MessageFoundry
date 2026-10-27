@@ -7332,6 +7332,27 @@ def _env_overrides(environ: Mapping[str, str]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _secrets_directory_overrides(environ: Mapping[str, str]) -> dict[str, dict[str, Any]]:
+    """The secret-class settings fields the secrets directory supplies, as ``{section: {key:
+    value}}`` (vault BACKLOG #2595, ADR 0214).
+
+    Merged over the environment layer, so a setting's file wins over its variable, which is the
+    accessor's rule in ``engine_secrets``. Only names that are settings fields: the two Vault tokens
+    are read by their own modules, and the store key is never read from the directory. Raises
+    ``SecretsDirectoryError``, a ``ValueError``, when the directory cannot be used."""
+    from messagefoundry.engine_secrets import DIRECTORY_SETTING_NAMES, open_secrets_directory
+
+    directory = open_secrets_directory(environ)
+    if directory is None:
+        return {}
+    found = {
+        name: directory.read(name)
+        for name in DIRECTORY_SETTING_NAMES
+        if name not in _OUT_OF_BAND_ENV
+    }
+    return _env_overrides({name: value for name, value in found.items() if value is not None})
+
+
 def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | None:
     """The active environment ``MEFOR_AI_ENVIRONMENT`` names, or ``None`` when it is unset or blank.
 
@@ -7551,6 +7572,8 @@ _OUT_OF_BAND_ENV: frozenset[str] = frozenset(
         "MEFOR_SECRETS_VAULT_CA_FILE",
         "MEFOR_SECRETS_VAULT_KV_MOUNT",
         "MEFOR_SECRETS_VAULT_TOKEN",
+        # Where the secrets directory is (engine_secrets.py, vault BACKLOG #2595, ADR 0214).
+        "MEFOR_SECRETS_DIRECTORY",
         # The store's Vault KeyProvider and Transit cipher (store/keyprovider_vault.py,
         # store/crypto_transit.py).
         "MEFOR_STORE_TRANSIT_AUDIT_KEY",
@@ -9968,6 +9991,7 @@ def load_settings(
         _merge(data, file_data)
 
     _merge(data, _env_overrides(environ))
+    _merge(data, _secrets_directory_overrides(environ))
 
     # ADR 0118: the [security] section is the canonical home for the posture switches. Reject the legacy
     # keys in their old sections (file+env), then desugar [security] into the internal fields it replaces

@@ -2269,6 +2269,36 @@ Its text names no part of the proxy URL, and `[security].enforcement` does not r
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
 
+#### The secrets directory, `MEFOR_SECRETS_DIRECTORY`
+
+A secret-class setting can come from a file instead of an environment variable
+([ADR 0214](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md),
+vault BACKLOG #2595). Set `MEFOR_SECRETS_DIRECTORY` to an absolute path. It is a path, not a
+secret. Each file in that directory holds one setting and is named exactly as its variable is:
+`MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_AUTH_OIDC_CLIENT_SECRET`,
+`MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY`, `MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD`,
+`MEFOR_ALERTS_EMAIL_PASSWORD`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_VAULT_TOKEN`,
+`MEFOR_SECRETS_VAULT_TOKEN`, `MEFOR_AI_API_KEY`, or `MEFOR_VALUE_<KEY>` for an `env()` value.
+
+- **A file wins over its variable.** With no file for a setting, the variable is read as before.
+  Unset, no directory is read at all.
+- **The engine refuses, at every `[security].enforcement` setting,** a directory or a file in it
+  that a known broad group (at least Everyone, Authenticated Users and the local Users group; on
+  POSIX, a group or other read or write bit) can read or change, and a link on Windows. It also
+  refuses a relative path, a file named for no setting above, an empty file, one that is not UTF-8,
+  and one over 64 KiB. A refusal names the file, never its value.
+- **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
+  [`[store].encryption_key_file`](#store).
+- A trailing line break is dropped; any other character, a space included, is part of the value.
+- The files are plain, protected by their access list alone. Nothing creates the directory for you
+  yet. A variable a library reads for itself, such as `VAULT_TOKEN` or `PGPASSWORD`, is not read
+  from here.
+
+On Windows, create the directory with inheritance off, granting SYSTEM and Administrators full
+control and the service account read, and nothing else. On POSIX, make it mode `0700` and each file
+`0600`, owned by the engine's account.
+
 ### `[secret_rotation]`
 Periodic **secret-rotation reminder** ([ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) §5.1) —
 the secret-side twin of [`[cert_monitor]`](#cert_monitor). A TLS cert carries its own expiry, but a

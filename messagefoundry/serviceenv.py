@@ -50,20 +50,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
+from messagefoundry import engine_secrets as _setting_names
 from messagefoundry.service_status import is_safe_service_name
 
 _log = logging.getLogger(__name__)
 
 #: The key-class names: the store key and its decrypt-only retired keys. Either one decrypts the
 #: store. In a Windows service's environment lists they refuse the start.
-KEY_CLASS_NAMES: tuple[str, ...] = (
-    "MEFOR_STORE_ENCRYPTION_KEY",
-    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED",
-)
+KEY_CLASS_NAMES: tuple[str, ...] = _setting_names.KEY_CLASS_NAMES
 
 #: The engine's other environment-only secrets. In a Windows service's environment lists each is
-#: named as a loosening. ``tests/test_service_env_secrets.py`` holds this set to the settings'
-#: own lists of environment-only secrets, so a secret added there is not missed here.
+#: named as a loosening. Both lists come from the one list in :mod:`messagefoundry.engine_secrets`,
+#: which ``tests/test_service_env_secrets.py`` holds to the settings' own lists of
+#: environment-only secrets, so a secret added there is not missed here.
 #:
 #: WHY "LOOSENING" AND NOT "SECRET". The identifier names what happens to these names, because
 #: CodeQL's ``py/clear-text-logging-sensitive-data`` takes a value as a secret by the identifier
@@ -71,18 +70,7 @@ KEY_CLASS_NAMES: tuple[str, ...] = (
 #: purpose, so no identifier in this module says such a word. The test file pins that for this
 #: module only, against its own stand-in list of words; a caller that binds the printed lines to
 #: such a name brings the alert back.
-LOOSENING_CLASS_NAMES: tuple[str, ...] = (
-    "MEFOR_STORE_PASSWORD",
-    "MEFOR_AUTH_AD_BIND_PASSWORD",
-    "MEFOR_AUTH_OIDC_CLIENT_SECRET",
-    "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",
-    "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD",
-    "MEFOR_ALERTS_EMAIL_PASSWORD",
-    "MEFOR_API_TLS_KEY_PASSWORD",
-    "MEFOR_STORE_VAULT_TOKEN",
-    "MEFOR_SECRETS_VAULT_TOKEN",
-    "MEFOR_AI_API_KEY",
-)
+LOOSENING_CLASS_NAMES: tuple[str, ...] = _setting_names.DIRECTORY_SETTING_NAMES
 
 #: Names that take either the secret itself or a path to a file that holds it. Only the inline
 #: form is a secret, the rule ``settings._FILE_INLINE_PEM_KEYS`` applies to the config file.
