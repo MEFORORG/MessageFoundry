@@ -425,13 +425,7 @@ def test_a_failed_import_write_leaves_no_file(
     it wrote and says so in its own failure line.
 
     Mutation: drop the cleanup. Red: key.pem is still there."""
-    real_open = Path.open
-
-    def _open(self: Path, *a: Any, **k: Any) -> Any:
-        handle = real_open(self, *a, **k)
-        return _HandleThatDiesMidWrite(handle) if self.name == dies else handle
-
-    monkeypatch.setattr(Path, "open", _open)
+    _cert_open_dies_midway(monkeypatch, dies)
     out = tmp_path / "o"
 
     assert _import_into(tmp_path, monkeypatch, out) == 2
@@ -893,12 +887,12 @@ def test_self_signed_refuses_to_overwrite_an_existing_cert(
     assert not (out / "key.pem").exists()
 
 
-def _cert_open_dies_midway(monkeypatch: pytest.MonkeyPatch) -> None:
+def _cert_open_dies_midway(monkeypatch: pytest.MonkeyPatch, name: str = "cert.pem") -> None:
     real_open = Path.open
 
     def _open(self: Path, *a: Any, **k: Any) -> Any:
         handle = real_open(self, *a, **k)
-        return _HandleThatDiesMidWrite(handle) if self.name == "cert.pem" else handle
+        return _HandleThatDiesMidWrite(handle) if self.name == name else handle
 
     monkeypatch.setattr(Path, "open", _open)
 

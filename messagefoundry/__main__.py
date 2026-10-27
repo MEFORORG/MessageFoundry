@@ -5989,23 +5989,53 @@ def _write_private_key(path: Path, pem: bytes) -> None:
     write_restricted_file(path, pem)
 
 
-def _write_public_pems(
-    key_path: Path, files: list[tuple[Path, bytes, str]], *, as_json: bool
-) -> int | None:
-    """Write each public PEM in ``files`` to a NEW file, once this run has written ``key_path``.
+def _refuse_overwrite(kind: str, path: Path) -> str:
+    """The failure line for a `cert` command that would replace an existing ``kind`` file."""
+    return f"refusing to overwrite an existing {kind} file: {path} (remove it first)"
 
-    ``files`` holds ``(path, pem, refusal)``, where ``refusal`` is the failure line for a ``path``
-    that already exists. Each create is exclusive, so a file that appeared after the caller's
-    existence check is still never replaced. If a write fails, every file this run wrote is
-    removed, the key included, and the failure line names any it could not remove. Returns
-    ``None`` when every file is written, else the command's exit code (BACKLOG #3073; vault
-    BACKLOG #3514 for `cert import`)."""
+
+def _refusal_for_existing(files: list[tuple[Path, str]]) -> str | None:
+    """The refusal for the first of ``files`` (``(path, kind)``) that exists, else ``None``. A
+    `cert` command checks before it writes any file, so a refusal leaves the directory as it was."""
+    for path, kind in files:
+        if path.exists():
+            return _refuse_overwrite(kind, path)
+    return None
+
+
+def _write_cert_files(
+    out_dir: Path,
+    key_path: Path,
+    key_pem: bytes,
+    public: list[tuple[Path, bytes, str]],
+    *,
+    as_json: bool,
+) -> int | None:
+    """Create ``out_dir``, write the private key, then each public PEM, every file NEW.
+
+    ``public`` holds ``(path, pem, kind)``, ``kind`` naming the file in a refusal. Each create is
+    exclusive, so a file that appeared after the caller's :func:`_refusal_for_existing` check is
+    still never replaced. If a public write fails, every file this run wrote is removed, the key
+    included, and the failure line names any it could not remove. Returns ``None`` when every
+    file is written, else the command's exit code (BACKLOG #3073; vault BACKLOG #3514 for
+    `cert import`)."""
     # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
     # It rides out a brief Windows hold on a file, such as a scanner opening the new key.
     from messagefoundry.api.tls import _unlink_generated
 
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _cert_fail(f"cannot create --out-dir {str(out_dir)!r}: {exc}", as_json=as_json)
+    try:
+        _write_private_key(key_path, key_pem)
+    except FileExistsError:
+        return _cert_fail(_refuse_overwrite("key", key_path), as_json=as_json)
+    except OSError as exc:
+        return _cert_fail(f"cannot write {key_path}: {exc}", as_json=as_json)
+
     written = [key_path]
-    for path, pem, refusal in files:
+    for path, pem, kind in public:
         try:
             with path.open("xb") as fh:
                 written.append(path)
@@ -6026,7 +6056,11 @@ def _write_public_pems(
                     removed.append(str(done))
             if not isinstance(exc, OSError):
                 raise
-            reason = refusal if isinstance(exc, FileExistsError) else f"cannot write {path}: {exc}"
+            reason = (
+                _refuse_overwrite(kind, path)
+                if isinstance(exc, FileExistsError)
+                else f"cannot write {path}: {exc}"
+            )
             if removed:
                 reason += f"; removed {', '.join(removed)}, which this run wrote"
             if left:
@@ -6054,7 +6088,7 @@ def _cert_import(args: argparse.Namespace) -> int:
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
     public; key.pem is written by :func:`_write_private_key`. It refuses an existing cert.pem,
     key.pem or (when the bundle carries CAs) ca-chain.pem before it writes, and if a public file is
-    not written, the files this run wrote are removed (:func:`_write_public_pems`)."""
+    not written, the files this run wrote are removed (:func:`_write_cert_files`)."""
     import os
 
     from messagefoundry import pki
@@ -6092,52 +6126,23 @@ def _cert_import(args: argparse.Namespace) -> int:
     cert_path = out_dir / "cert.pem"
     key_path = out_dir / "key.pem"
     ca_path = out_dir / "ca-chain.pem"
-    refuse_key = f"refusing to overwrite an existing key file: {key_path} (remove it first)"
-    public = [
-        (
-            cert_path,
-            pki.cert_to_pem(cert),
-            f"refusing to overwrite an existing certificate file: {cert_path} (remove it first)",
-        )
-    ]
-    wrote_ca = bool(cas)
-    if wrote_ca:
-        public.append(
-            (
-                ca_path,
-                pki.ca_chain_to_pem(cas),
-                f"refusing to overwrite an existing CA chain file: {ca_path} (remove it first)",
-            )
-        )
+    public = [(cert_path, pki.cert_to_pem(cert), "certificate")]
+    if cas:
+        public.append((ca_path, pki.ca_chain_to_pem(cas), "CA chain"))
     # Refuse every file this run would replace before writing any (vault BACKLOG #3514). cert.pem
     # and ca-chain.pem were replaced without a word, as `cert self-signed` replaced cert.pem (#3073).
-    for path, _pem, refusal in public:
-        if path.exists():
-            return _cert_fail(refusal, as_json=args.json)
-    if key_path.exists():
-        return _cert_fail(refuse_key, as_json=args.json)
+    refusal = _refusal_for_existing([(p, kind) for p, _pem, kind in public] + [(key_path, "key")])
+    if refusal is not None:
+        return _cert_fail(refusal, as_json=args.json)
 
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return _cert_fail(f"cannot create --out-dir {args.out_dir!r}: {exc}", as_json=args.json)
-
-    # Key FIRST (O_EXCL), then the public files, each exclusive: all are written or none is.
-    try:
-        _write_private_key(key_path, pki.key_to_pem(key))
-    except FileExistsError:
-        return _cert_fail(refuse_key, as_json=args.json)
-    except OSError as exc:
-        return _cert_fail(f"cannot write {key_path}: {exc}", as_json=args.json)
-
-    failed = _write_public_pems(key_path, public, as_json=args.json)
+    failed = _write_cert_files(out_dir, key_path, pki.key_to_pem(key), public, as_json=args.json)
     if failed is not None:
         return failed
 
     result: dict[str, object] = {
         "cert": str(cert_path),
         "key": str(key_path),
-        "ca_chain": str(ca_path) if wrote_ca else None,
+        "ca_chain": str(ca_path) if cas else None,
         "ca_count": len(cas),
     }
     if args.json:
@@ -6146,7 +6151,7 @@ def _cert_import(args: argparse.Namespace) -> int:
         _safe_print(f"Imported .pfx into {out_dir}:")
         _safe_print(f"  cert:     {cert_path}")
         _safe_print(f"  key:      {key_path} (private; {_key_protection()})")
-        if wrote_ca:
+        if cas:
             _safe_print(f"  ca-chain: {ca_path} ({len(cas)} CA cert(s))")
         else:
             _safe_print("  ca-chain: (none — the bundle carried no CA certs)")
@@ -6385,14 +6390,10 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     cert_path = out_dir / "cert.pem"
     key_path = out_dir / "key.pem"
-    refuse_cert = (
-        f"refusing to overwrite an existing certificate file: {cert_path} (remove it first)"
-    )
-    refuse_key = f"refusing to overwrite an existing key file: {key_path} (remove it first)"
-    if cert_path.exists():
-        return _cert_fail(refuse_cert, as_json=args.json)
-    if key_path.exists():
-        return _cert_fail(refuse_key, as_json=args.json)
+    # Checked before the mint, so a refused run generates no key.
+    refusal = _refusal_for_existing([(cert_path, "certificate"), (key_path, "key")])
+    if refusal is not None:
+        return _cert_fail(refusal, as_json=args.json)
 
     sans = args.san or []
     try:
@@ -6409,19 +6410,9 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
         # names the rejected value and never carries key material.
         return _cert_fail(f"cannot mint the certificate: {exc}", as_json=args.json)
 
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return _cert_fail(f"cannot create --out-dir {args.out_dir!r}: {exc}", as_json=args.json)
-
-    try:
-        _write_private_key(key_path, key_pem)
-    except FileExistsError:
-        return _cert_fail(refuse_key, as_json=args.json)
-    except OSError as exc:
-        return _cert_fail(f"cannot write {key_path}: {exc}", as_json=args.json)
-
-    failed = _write_public_pems(key_path, [(cert_path, cert_pem, refuse_cert)], as_json=args.json)
+    failed = _write_cert_files(
+        out_dir, key_path, key_pem, [(cert_path, cert_pem, "certificate")], as_json=args.json
+    )
     if failed is not None:
         return failed
 
