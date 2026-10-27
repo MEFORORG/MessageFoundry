@@ -18,6 +18,7 @@ import logging
 import socket
 import ssl
 import sys
+import time
 import weakref
 from collections.abc import Callable
 from pathlib import Path
@@ -58,14 +59,37 @@ def _refuse_the_certificate(port: int) -> bool:
     """A client that does not trust the listener's certificate, so it sends an alert the SERVER
     then fails its handshake on: the wrong-certificate case the row names. Blocking, run in a
     thread: asyncio's own client drops the socket without sending the alert, which the server
-    reads as a hang-up. True when the client refused, as it must."""
+    reads as a hang-up. True when the client refused, as it must.
+
+    After the alert it reads to the server's EOF before it closes (vault BACKLOG #4329). A close
+    with the server's later records unread sends a reset. On Windows a reset discards the server's
+    unread bytes, the alert among them. The server then saw a hang-up, which is not counted.
+
+    The server closes only after it has read the alert. A server may still hand the count to its
+    loop after that, as the DICOM SCP does, so callers wait for the count. A server that does not
+    close within 5 seconds fails this with ``TimeoutError``."""
     ctx = ssl.create_default_context()
-    with socket.create_connection(("127.0.0.1", port), timeout=5.0) as raw:
+    # The TLS socket cannot read once its handshake has failed. raw.dup() is a second handle on the
+    # same TCP stream, taken before wrap_socket detaches raw, so the drain reads through it.
+    with (
+        socket.create_connection(("127.0.0.1", port), timeout=5.0) as raw,
+        raw.dup() as drain,
+        ctx.wrap_socket(raw, server_hostname="127.0.0.1", do_handshake_on_connect=False) as tls,
+    ):
         try:
-            with ctx.wrap_socket(raw, server_hostname="127.0.0.1"):
-                return False
+            tls.do_handshake()
         except ssl.SSLCertVerificationError:
+            deadline = time.monotonic() + 5.0
+            # A reset from the server also ends the drain. shutdown() on a socket the server has
+            # already reset raises ENOTCONN, a plain OSError, so it is tolerated on its own line.
+            with contextlib.suppress(OSError):
+                drain.shutdown(socket.SHUT_WR)
+            with contextlib.suppress(ConnectionError):
+                while drain.recv(4096):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("the server did not close after the alert") from None
             return True
+        return False
 
 
 async def _plaintext_peer(port: int) -> None:

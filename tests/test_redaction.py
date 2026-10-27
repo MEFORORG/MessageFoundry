@@ -28,6 +28,7 @@ from messagefoundry.redaction import (
     safe_name,
     safe_text,
 )
+from tests._cpu_clock import cpu_seconds as _cpu_seconds
 from tests.test_log_redaction_secret_domain import PCT_STARTED
 
 ADT = (
@@ -217,13 +218,6 @@ def _best_of(work: Callable[[], object], reps: int = 3) -> float:
     return best
 
 
-#: The least CPU time one ``_cpu_seconds`` sample spends. **A floor, because the clock is coarse:**
-#: ``time.process_time`` reports a resolution of 100 ns on Windows but moves in 15.625 ms ticks,
-#: measured 2026-10-13. One call of a 5 ms arm reads 0 or 15.6 ms, so a sample repeats the call
-#: until this much CPU time has passed and divides by the count. That caps the tick's error at
-#: about 8% of the sample.
-_CPU_SAMPLE_FLOOR_SECONDS = 0.2
-
 #: The line the CPU-time cost arms share. Each arm divides a large input's CPU time by a small one's,
 #: and the sizes are chosen so the shipped code and the regression it guards land on opposite sides
 #: of 24, each with room. **The number is borrowed, the clock is not:**
@@ -235,33 +229,6 @@ _CPU_GROWTH_LINE = 24.0
 #: wall-clock budget, on purpose.** The ratio is what the arm is about; this bound keeps a linear
 #: path with a ruinous constant from passing. It is the same 0.5 s the MRN arm uses.
 _CPU_CEILING_SECONDS = 0.5
-
-
-def _cpu_seconds(work: Callable[[], object], reps: int = 3) -> float:
-    """Best-of-``reps`` CPU seconds per call of ``work``, each sample at least
-    ``_CPU_SAMPLE_FLOOR_SECONDS`` long.
-
-    **CPU time rather than wall time, for the arms whose margin a loaded runner can eat (BACKLOG
-    #2958).** A busy host delays a process without charging it the delay, so the clock this reads
-    stops while the runner is away. **It counts every thread in the process, not only this one**, so
-    a thread an earlier test left running is charged here too. It does not stop everything: a shared
-    core still slows each instruction through the cache, which is why the arms read a RATIO between
-    two sizes timed back to back, under one load, rather than a fixed number of seconds. A wall-clock ratio was built and
-    withdrawn in PR 2000, red 12 times in 25 on a shared Linux core; this is not that instrument.
-
-    The minimum over samples, for the reason ``_best_of`` gives."""
-    best = float("inf")
-    for _ in range(reps):
-        calls = 0
-        start = time.process_time()
-        while True:
-            work()
-            calls += 1
-            spent = time.process_time() - start
-            if spent >= _CPU_SAMPLE_FLOOR_SECONDS:
-                break
-        best = min(best, spent / calls)
-    return best
 
 
 def _redact_seconds(reps: int) -> float:
