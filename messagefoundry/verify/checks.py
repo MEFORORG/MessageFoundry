@@ -435,7 +435,8 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
     from messagefoundry.store.base import open_store
 
     async def _census() -> LockableAccountCensus:
-        handle = await open_store(store, keyless_chain_refusal=None)  # read-only
+        # Read-only (#1708): a census must not migrate or build the store it reads.
+        handle = await open_store(store, read_only=True, keyless_chain_refusal=None)
         try:
             return await lockable_account_census(handle, auth)
         finally:

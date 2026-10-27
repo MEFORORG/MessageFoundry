@@ -1003,8 +1003,8 @@ def test_disposition_helpers_never_create_the_store(tmp_path: Path) -> None:
 
 def test_missing_sqlite_store_gate_is_scoped_to_sqlite_on_disk() -> None:
     """The gate fires only where a *file* would be created. ``:memory:`` writes none, and the server
-    backends are out of its reach — see :func:`smoke.missing_sqlite_store` for what that leaves
-    open on Postgres and SQL Server, which is a real limit rather than a clean bill."""
+    backends are out of its reach. There the read-only open is what stops a build, as
+    :func:`smoke.missing_sqlite_store` says."""
     assert smoke.missing_sqlite_store(StoreSettings(path=":memory:")) is None
     for backend in (StoreBackend.SQLSERVER, StoreBackend.POSTGRES):
         settings = StoreSettings(
@@ -1054,6 +1054,85 @@ def test_every_open_store_in_verify_goes_through_the_gate() -> None:
         "smoke.py::check_store_connectivity",
         "smoke.py::newest_message_id",
     ]
+
+
+def _open_store_calls_in_verify() -> list[tuple[str, ast.Call]]:
+    """Every ``open_store(...)`` call in ``messagefoundry/verify``, named ``file::function``."""
+    calls: list[tuple[str, ast.Call]] = []
+    for source_file in sorted(Path(smoke.__file__).parent.glob("*.py")):
+        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for sub in ast.walk(node):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Name)
+                    and sub.func.id == "open_store"
+                ):
+                    calls.append((f"{source_file.name}::{node.name}", sub))
+    return calls
+
+
+def test_every_open_store_in_verify_opens_read_only() -> None:
+    """#1708's second half: the gate above stops verify CREATING a store, and a writable open of a
+    store that does exist still ran the schema-ensure and migrations as the calling user. Every
+    verify open passes the literal ``read_only=True``, as the support bundle's census open does,
+    so it can neither build nor migrate what it reports on. A computed value would let a later
+    change pass ``False`` through a variable, so only the constant counts."""
+    calls = _open_store_calls_in_verify()
+    writable = [
+        where
+        for where, call in calls
+        if not any(
+            kw.arg == "read_only" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+            for kw in call.keywords
+        )
+    ]
+    assert not writable, (
+        f"{writable} open the store without read_only=True, so verify would schema-ensure and "
+        "migrate the store it reports on, as the calling user (#1708)"
+    )
+    # Positive control: an instrument that finds no call at all would pass vacuously.
+    assert sorted(where for where, _ in calls) == [
+        "checks.py::check_lockable_accounts",
+        "smoke.py::check_smoke_disposition",
+        "smoke.py::check_store_connectivity",
+        "smoke.py::newest_message_id",
+    ]
+
+
+def _sqlite_tables(path: Path) -> set[str]:
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    finally:
+        conn.close()
+    return {str(name) for (name,) in rows}
+
+
+def test_store_connectivity_never_builds_a_store_into_another_database(tmp_path: Path) -> None:
+    """#1708, the defect one level up from the absent file: a ``[store].path`` that names an
+    EXISTING SQLite database that is not a MessageFoundry store. A writable open built the whole
+    schema into it and reported PASS. The read-only open builds nothing, so the check FAILs and the
+    database holds only what it held before."""
+    import sqlite3
+
+    foreign = tmp_path / "other-app.db"
+    conn = sqlite3.connect(foreign)
+    try:
+        conn.execute("CREATE TABLE other_app_rows (id INTEGER PRIMARY KEY, label TEXT)")
+        conn.commit()
+    finally:
+        conn.close()
+    assert _sqlite_tables(foreign) == {"other_app_rows"}
+
+    r = smoke.check_store_connectivity(StoreSettings(path=str(foreign)))
+
+    assert r.status is Status.FAIL, r.detail
+    assert _sqlite_tables(foreign) == {"other_app_rows"}
 
 
 # ---- report -----------------------------------------------------------------------------------

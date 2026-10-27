@@ -63,18 +63,24 @@ these things still write:
 |---|---|---|
 | `host.writable` | every host run | a probe temp file in the store dir, deleted immediately |
 | `host.ciphers` | a host run where `pyodbc` is installed, on Windows or Linux (DEPLOY-SERVER-DB.md section 5.4 says what it reads) | nothing of its own. Its hop census loads the `--config` graph, which can leave Python's `__pycache__` files in that folder, as the self smoke can. On Windows, the PowerShell it starts may write that program's own per-account files, such as its module analysis cache, as any PowerShell start can |
-| `store.connect` | `--section store`, store **already exists** | the schema-ensure and migrations `open_store` runs, plus SQLite `-wal`/`-shm` sidecars — as the calling user |
+| `store.connect` | `--section store`, store **already exists** | no schema-ensure and no migration: the open is read-only. On SQLite, the `-wal`/`-shm` sidecars of a WAL store, as any reader creates them, as the calling user |
 | `smoke.live` | `--smoke live` only | one synthetic message, persisted by the engine |
 
-Two limits of the SQLite gate to know before pointing `verify` at something you care about:
+Every store open `verify` makes is read-only (BACKLOG #1708): `store.connect`, the
+`auth.lockable_accounts` census, and both `--check-disposition` reads. What that means per backend:
 
-- **It is scoped to SQLite.** On PostgreSQL and SQL Server, `open_store` builds the full schema in
-  whatever database it is pointed at. A wrong-but-*existing* database name — `postgres`, or a
-  sibling application's — connects and gets populated, and reports PASS. Only a wrong database
-  *name* fails at connect. Check `[store].database` before running `--section store` against a
-  server backend.
-- **It stops creation, not writing.** Against a store that does exist, `store.connect` still runs
-  the schema-ensure as *you*. If you are elevated, that is still the identity gap above.
+- **SQLite.** The file is opened `mode=ro`, so SQLite itself refuses every write. A file that is not
+  a MessageFoundry store, such as a sibling application's database, is a FAIL, and nothing is built
+  into it.
+- **PostgreSQL and SQL Server.** The open runs no DDL and no `ALTER DATABASE`, whatever
+  `[store].schema_management` says. A wrong database *name* fails at connect. A database that exists
+  but has no `schema_meta` table this login can see, such as `postgres` or a sibling application's,
+  is a FAIL, and nothing is built into it. What stops a write after the open is the login's grants,
+  not the handle.
+- **A stale schema is not reported as such.** A store whose schema differs from this build's is
+  opened as it is, neither migrated nor refused, and the store logs a WARNING. `store.connect` reads
+  PASS for it unless the open itself needs an object the store lacks, so a PASS does not prove the
+  schema is current. A later read that needs a missing object fails on its own row.
 
 ### Handling a captured `id_token`
 

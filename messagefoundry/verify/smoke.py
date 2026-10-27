@@ -13,6 +13,8 @@
   refuses to create the database file first (BACKLOG #1708): ``open_store``'s schema-ensure created
   whatever path it was handed until BACKLOG #1780, so the check used to PASS against a store it had
   just made and leave the database behind — meaning it could not fail for the reason its title names.
+  Every store open here is also ``read_only=True``, so verify never migrates a store or builds one
+  into a database that is not one.
 
 Synthetic HL7 only — never real PHI. The smoke message is inlined below rather than generated, so
 the verifier never imports ``messagefoundry.generators`` (BACKLOG #1192 / ASVS 15.2.3).
@@ -381,13 +383,15 @@ def missing_sqlite_store(store: StoreSettings) -> Path | None:
 
     ``:memory:`` creates nothing on disk and so is outside what this gate exists to stop.
 
-    **Scoped to SQLite, and that is a real limit rather than a proof the others are safe.** What the
-    server backends do not do is ``CREATE DATABASE``, so a wrong database *name* fails at connect.
-    They do build the whole schema into a database that *does* exist: ``open_store`` runs the same
-    ensure-and-migrate on all three. So a Postgres store pointed at ``postgres``, or at a sibling
-    application's database, is still populated by a PASSing check — the same defect one level up
-    from the file. Closing that needs a per-backend schema-presence probe, which is not this gate;
-    ``docs/testing/VERIFY.md`` carries the operator-facing warning meanwhile.
+    **Scoped to SQLite.** The server backends never ``CREATE DATABASE``, so a wrong database *name*
+    fails at connect. What stops verify building a store into a database that *does* exist is not
+    this gate but the ``read_only=True`` every verify ``open_store`` call passes (BACKLOG #1708,
+    pinned by a test). On SQLite that open is ``mode=ro``, so a file that is not a MessageFoundry
+    store is refused rather than filled. On PostgreSQL and SQL Server it runs no DDL and no
+    ``ALTER DATABASE`` whatever ``[store].schema_management`` says, and a database with no
+    ``schema_meta`` table this login can see raises ``StoreNotFoundError``, which
+    :func:`check_store_connectivity` reports as FAIL. A store whose schema is older than this build
+    is opened as it is and only logged as stale; ``store.connect`` does not report that.
     """
     if store.backend is not StoreBackend.SQLITE or store.path == ":memory:":
         return None
@@ -407,8 +411,9 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     running ``verify`` elevated on a fresh box left an administrator-owned store at the configured
     path before the service started under another identity.
 
-    The gate covers SQLite only, and :func:`missing_sqlite_store` says what that leaves open on the
-    server backends.
+    The open is read-only (BACKLOG #1708), so against a store that exists it neither migrates it
+    nor builds one into a database that holds none; :func:`missing_sqlite_store` says what each
+    backend does then.
     """
     from messagefoundry.last_resort import run_guarded
 
@@ -429,8 +434,10 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     from messagefoundry.store.base import open_store
 
     async def _open_close() -> None:
-        # Open and close only, so it cannot start an audit chain (BACKLOG #1916).
-        handle = await open_store(store, keyless_chain_refusal=None)
+        # Open and close only, so it cannot start an audit chain (BACKLOG #1916). Read-only
+        # (BACKLOG #1708): a writable open would schema-ensure and migrate the store as the
+        # calling user, and would build a whole store into a database that is not one.
+        handle = await open_store(store, read_only=True, keyless_chain_refusal=None)
         await handle.close()
 
     try:
@@ -469,7 +476,8 @@ def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
     )  # below the gate — see check_store_connectivity
 
     async def _newest() -> str | None:
-        handle = await open_store(store, keyless_chain_refusal=None)  # read-only (#1916)
+        # Read-only (#1708), so it cannot start an audit chain either (#1916).
+        handle = await open_store(store, read_only=True, keyless_chain_refusal=None)
         try:
             rows = await handle.list_messages(control_id=control_id, limit=1, allowed_channels=None)
             return str(rows[0]["id"]) if rows else None
@@ -479,8 +487,9 @@ def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
     try:
         return run_guarded(_newest())
     except StoreNotFoundError:
-        # BACKLOG #1780: an auto-mode server database with no store in it holds no prior message,
-        # as an absent SQLite file does above. The connectivity check is what reports it.
+        # BACKLOG #1780: a server database with no store in it holds no prior message, as an absent
+        # SQLite file does above. A read-only open raises this there in either schema mode. The
+        # connectivity check is what reports it.
         return None
 
 
@@ -560,7 +569,8 @@ def check_smoke_disposition(
     }
 
     async def _poll() -> str | None:
-        handle = await open_store(store, keyless_chain_refusal=None)  # read-only (#1916)
+        # Read-only (#1708), so it cannot start an audit chain either (#1916).
+        handle = await open_store(store, read_only=True, keyless_chain_refusal=None)
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout
