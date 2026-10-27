@@ -32,6 +32,7 @@ from __future__ import annotations
 import ast
 import builtins
 import hashlib
+import importlib.abc
 import importlib.machinery
 import importlib.util
 import inspect
@@ -51,7 +52,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
-from types import MappingProxyType, ModuleType
+from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, TypeIs
 
 from messagefoundry.config.code_sets import (
@@ -7761,6 +7762,37 @@ def _body_helper_imports(source: bytes, stems: frozenset[str]) -> list[tuple[str
     return found
 
 
+class _SnapshotLoader(importlib.abc.InspectLoader):
+    """The import loader for one config module or helper: it serves the bytes the load's
+    :class:`~messagefoundry.config.snapshot.ConfigSnapshot` holds for the file ``filename`` names.
+
+    It takes the place of the ``SourceFileLoader`` that ``spec_from_file_location`` gave a config
+    module before (vault BACKLOG #2596). The module still executes through the import system's own
+    ``exec_module``; only where the bytes come from changed. It has no bytecode methods, so it never
+    reads or writes a ``__pycache__`` file, and it reads nothing from the directory: a sandbox
+    worker that was sent the snapshot runs the same bytes. ``get_source`` serves the same bytes, so
+    :mod:`inspect` and a traceback can show a line without reading the file.
+
+    No ``get_data``: ``pkgutil.get_data`` and :mod:`importlib.resources` find no resources beside a
+    config module, since the snapshot holds only the files a load reads."""
+
+    def __init__(self, source: bytes, filename: str) -> None:
+        self._source = source
+        self._filename = filename
+
+    def is_package(self, fullname: str) -> bool:
+        return False
+
+    def get_source(self, fullname: str) -> str:
+        return importlib.util.decode_source(self._source)
+
+    def get_code(self, fullname: str) -> CodeType:
+        # Compiled from the bytes, not from get_source's text, so a PEP 263 coding line and a BOM are
+        # read from the bytes, as the source loader reads them. The file name is the path an author
+        # edits, which a traceback and a load diagnostic name.
+        return self.source_to_code(self._source, self._filename)
+
+
 class _HelperImporter:
     """Resolve a config module's ``import _helpers`` to a sibling ``_helpers.py``, for one load only.
 
@@ -7915,9 +7947,13 @@ class _HelperImporter:
         statements resolve helpers through this load.
 
         Its spec names ``path`` as its origin, so ``__file__``, a traceback and a diagnostic name
-        the file an author edits, and has no loader: nothing can run the module again from disk
-        (``importlib.reload`` refuses it) or find a cache file for it."""
-        spec = importlib.machinery.ModuleSpec(mod_name, None, origin=str(path))
+        the file an author edits, and its loader is a :class:`_SnapshotLoader` over this load's
+        snapshot, so it never finds a cache file. ``importlib.reload`` still refuses it: no finder
+        on ``sys.meta_path`` knows its mangled name, so nothing runs it again from disk."""
+        # What importlib.util.spec_from_loader builds for a loader with no get_filename, without
+        # its Optional return.
+        loader = _SnapshotLoader(self._snapshot.files[path.name], str(path))
+        spec = importlib.machinery.ModuleSpec(mod_name, loader, origin=str(path))
         spec.has_location = True  # sets __file__ from the origin
         module = importlib.util.module_from_spec(spec)
         module.__dict__["__cached__"] = None  # no cache file is ever read for it
@@ -7925,16 +7961,15 @@ class _HelperImporter:
         return module
 
     def run(self, module: ModuleType, path: Path) -> None:
-        """Compile the snapshot's bytes for ``path`` and run them as ``module``'s body.
+        """Run ``module``'s body the way ``import`` runs one, by its spec's loader: the
+        :class:`_SnapshotLoader` :meth:`new_module` gave it, over the snapshot's bytes for ``path``.
 
-        Compiled here, from the bytes the load hashed, rather than by Python's source loader, which
-        would run a matching ``__pycache__`` file in place of the source and never compare the two
-        (vault BACKLOG #2596). ``compile`` reads a PEP 263 coding line and a BOM from the bytes, as
-        the source loader does."""
-        code = compile(self._snapshot.files[path.name], str(path), "exec", dont_inherit=True)
-        # Config modules are code by design; the directory's trust check (ADR 0036) is what holds
-        # it, and docs/DANGEROUS-FUNCTIONALITY.md section 2 names this site.
-        exec(code, module.__dict__)  # noqa: S102  # nosec B102
+        Config modules are code by design (CLAUDE.md section 1); the directory's trust check (ADR
+        0036) is what holds them, and docs/DANGEROUS-FUNCTIONALITY.md section 2 names this site."""
+        spec = module.__spec__
+        if spec is None or not isinstance(spec.loader, _SnapshotLoader):  # pragma: no cover
+            raise WiringError(f"error loading config module {path.name}: not a snapshot module")
+        spec.loader.exec_module(module)
 
     def source_of(self, filename: str) -> bytes | None:
         """The snapshot bytes a module compiled under ``filename`` ran, or ``None`` for a file

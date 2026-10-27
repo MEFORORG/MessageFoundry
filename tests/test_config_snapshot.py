@@ -18,11 +18,13 @@ Synthetic HL7 and marker strings only."""
 
 from __future__ import annotations
 
+import importlib
 import importlib.machinery
 import importlib.util
 import marshal
 import os
 import subprocess
+import sys
 import tokenize
 from pathlib import Path, PurePath
 from types import CodeType
@@ -155,12 +157,42 @@ def test_the_loader_never_reads_the_cache_folder(
 
 
 def test_a_helper_runs_the_snapshot_bytes_too(tmp_path: Path) -> None:
+    """A config module and a helper are each executed by an importlib loader over the snapshot,
+    not by the source loader that finds cache files, and that loader's source is the bytes that ran."""
     (tmp_path / "_shared.py").write_text('VERSION = "V1"\n', encoding="utf-8")
-    (tmp_path / "graph.py").write_text(
+    graph = tmp_path / "graph.py"
+    graph.write_text(
         "import _shared\n" + _graph("V0").replace('"V0"', "_shared.VERSION"), encoding="utf-8"
     )
     _plant_cache(tmp_path / "_shared.py", 'VERSION = "V2"\n')
-    assert _ran(load_config(tmp_path)) == "V1"
+    registry = load_config(tmp_path)
+    assert _ran(registry) == "V1"
+    module_globals = registry.handlers["h_ver"].__globals__
+    helper = module_globals["_shared"]
+    for spec, path in (
+        (module_globals["__spec__"], graph),
+        (helper.__spec__, tmp_path / "_shared.py"),
+    ):
+        assert isinstance(spec.loader, wiring._SnapshotLoader)
+        assert spec.origin == str(path)
+    assert module_globals["__file__"] == str(graph)
+    assert module_globals["__cached__"] is None and helper.__cached__ is None
+    graph.write_text("# edited after the load\n", encoding="utf-8")
+    loader = module_globals["__spec__"].loader
+    assert '"h_ver"' in loader.get_source(module_globals["__name__"])  # the snapshot, not the disk
+
+
+def test_a_config_module_cannot_be_reloaded_from_disk(tmp_path: Path) -> None:
+    """``importlib.reload`` finds no spec for the mangled name, so it never re-runs a config module
+    from the directory, its cache included."""
+    graph = tmp_path / "graph.py"
+    graph.write_text(_graph("V1"), encoding="utf-8")
+    registry = load_config(tmp_path)
+    module = sys.modules[registry.handlers["h_ver"].__module__]
+    graph.write_text(_graph("V2"), encoding="utf-8")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.reload(module)
+    assert _ran(registry) == "V1"
 
 
 # --- probe 2: a sandbox worker respawn -------------------------------------------------------------
