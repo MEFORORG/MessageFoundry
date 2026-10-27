@@ -37,9 +37,8 @@ from cryptography.hazmat.primitives.asymmetric import dsa, ec, padding, rsa
 from cryptography.x509.oid import NameOID
 
 from messagefoundry import pki as pki_module
-from messagefoundry.config import loaded_crls
+from messagefoundry.config import loaded_crls, tls_policy
 from messagefoundry.config.tls_policy import (
-    _UNCONFIRMED_SIGNATURE,
     TrustAnchor,
     build_verifying_client_context,
     harden_crl_check,
@@ -668,11 +667,11 @@ def test_a_name_that_genuinely_differs_is_still_unlisted(
     with caplog.at_level("WARNING"):
         hop = twins.hop("new")  # loads: no proof
     (line,) = _warnings(caplog)
-    assert _UNCONFIRMED_SIGNATURE["unlisted"] in line
+    assert pki_module.UNLISTED_SIGNATURE in line
     verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
     assert verdict is not None and verdict[1] is False  # the reload's NO_ISSUER case
     # The reload gives the same state the same words, so the two cannot drift apart.
-    assert _UNCONFIRMED_SIGNATURE["unlisted"] in verdict[0]
+    assert pki_module.UNLISTED_SIGNATURE in verdict[0]
     # The premise: OpenSSL finds no CRL for the leaf's issuer in this file, so it does not judge
     # the peer by it, and a leaf-checking hop fails for want of one, not on the signature.
     with pytest.raises(ssl.SSLError, match="unable to get certificate CRL"):
@@ -693,7 +692,7 @@ def test_a_name_that_differs_only_in_white_space_is_unlisted_though_openssl_matc
     with caplog.at_level("WARNING"):
         hop = twins.hop("new")
     (line,) = _warnings(caplog)
-    words = _UNCONFIRMED_SIGNATURE["unlisted"]
+    words = pki_module.UNLISTED_SIGNATURE
     assert words in line and "white space exactly" in words
     with pytest.raises(ssl.SSLError, match="CRL signature failure"):
         _handshake(hop, twins.server(sends_renewed=False))
@@ -795,3 +794,177 @@ def test_a_crl_that_reaches_a_hop_through_its_ca_file_alone_is_not_signature_che
         twins.hop("new")
     with pytest.raises(ValueError, match="does not verify the CRL's signature"):
         _hop(bundle, bundle)
+
+
+# --- vault BACKLOG #3506: the open findings on engine PR 2309 ------------------------------------
+
+
+def test_on_a_context_that_already_held_a_crl_the_staging_refusal_comes_before_the_signature(
+    twins: _Twins, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Manager's item 2: the seam where vault BACKLOG #2866 and #2905 meet. A context that
+    already holds a CRL proves the load on a private copy first, and the signature check runs
+    only after that, as the last refusal. So a copy that cannot be made refuses as that, even for
+    a forged CRL. The control is the same file with the copy working: the signature refuses."""
+    forged = _crl(twins.stranger, names=twins.new_key)
+    bundle = tmp_path / "ca-and-crl.pem"
+    bundle.write_bytes(twins.new_ca.read_bytes() + forged)
+
+    # Control first: the staged path runs, and the signature check refuses after it.
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        _hop(bundle, bundle)
+
+    def no_copy(pem: bytes) -> object:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tls_policy, "staged_crl", no_copy)
+    with pytest.raises(ValueError, match="could not make or read its private copy") as refused:
+        _hop(bundle, bundle)
+    assert "does not verify" not in str(refused.value)
+
+
+def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
+    twins: _Twins, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Manager's item 9: a failure in the judgment of block 2 no longer discards block 1's
+    proof. Before, the broad ``except`` logged an ERROR and the forged CRL loaded."""
+    real = pki_module._signature_state
+    calls = 0
+
+    def second_fails(
+        crl: x509.CertificateRevocationList, cas: list[tuple[object, x509.Certificate]]
+    ) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("a defect in the check")
+        return real(crl, cas)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pki_module, "_signature_state", second_fails)
+    twins.crl.write_bytes(
+        _crl(twins.stranger, names=twins.new_key)
+        + _crl(twins.stranger, names=twins.stranger, name=_OTHER_NAME)
+    )
+    with caplog.at_level("WARNING"), pytest.raises(ValueError, match="CRL block 1 of 2"):
+        twins.hop("new")
+    assert not [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
+
+    # Control: the same failure with no proof reached first still loads, with the ERROR.
+    calls = 0
+    twins.crl.write_bytes(
+        _crl(twins.new_key, names=twins.new_key) + _crl(twins.stranger, names=twins.new_key)
+    )
+    with caplog.at_level("WARNING"):
+        hop = twins.hop("new")
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
+
+
+def _zero_serial_ca() -> bytes:
+    """A CA certificate, as DER, whose serial number is 0, as at least some system roots carry. It
+    is built with serial 1 and then edited, since the builder refuses 0; its signature then fails,
+    which ``cryptography``'s parse does not check."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-zero-serial")])
+    der = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(_NOW - _DAY)
+        .not_valid_after(_NOW + _DAY)
+        .sign(key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.DER)
+    )
+    version_and_serial = bytes.fromhex("a003020102020101")  # v3, then INTEGER 1
+    assert der.count(version_and_serial) == 1
+    return der.replace(version_and_serial, version_and_serial[:-1] + bytes(1))
+
+
+def test_a_root_with_a_zero_serial_is_skipped_alone_where_warnings_are_errors(
+    twins: _Twins,
+) -> None:
+    """The Manager's item 3. Under warnings as errors, ``cryptography``'s warning about a serial
+    number that is not positive used to end the whole judgment, so a CRL proven badly signed
+    loaded. Now that one CA is skipped, and the proof stands."""
+    import warnings
+
+    from cryptography.utils import CryptographyDeprecationWarning
+
+    odd = _zero_serial_ca()
+    # Control: the instrument is real. Parsing that CA warns, and as an error it raises.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        with pytest.raises(CryptographyDeprecationWarning):
+            x509.load_der_x509_certificate(odd)
+
+    forged = _crl(twins.stranger, names=twins.new_key)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        judged = [s.state for s in judge_crl_signatures(forged, [odd, *_ders(twins.new_ca)])]
+    assert judged == ["bad"]
+
+
+def test_a_long_issuer_name_is_quoted_with_a_bound(twins: _Twins) -> None:
+    """The Lander's list: the issuer name a message quotes has a length bound now."""
+    long_name = x509.Name(
+        [x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, f"unit-{n:03}") for n in range(80)]
+    )
+    pem = _crl(twins.stranger, names=twins.stranger, name=long_name)
+    assert len(long_name.rfc4514_string()) > 600  # the premise
+    (signature,) = judge_crl_signatures(pem, _ders(twins.new_ca))
+    assert len(signature.where) < 300 and "characters)" in signature.where
+    # Control: a short name is quoted whole.
+    (short,) = judge_crl_signatures(_crl(twins.stranger, names=None), _ders(twins.new_ca))
+    assert "CN=mefor-2905-twin-ca" in short.where and "characters)" not in short.where
+
+
+#: Two of the four sentences withdrawn from the code (vault BACKLOG #3506, finding (c)). The guide
+#: test in ``tests/test_docs_security_pathways.py`` pins the two that sat in the guide.
+_WITHDRAWN_FROM_THE_CODE = (
+    # The reload's remedy: false for a good SHA-1 CRL and for a signature of another kind.
+    "Where the CRL names that CA's key, a start refuses the file too",
+    # The warning: wrong where the name differs from a listed CA's only in white space.
+    "no CA certificate this hop lists has that name",
+)
+
+
+def test_the_withdrawn_sentences_stay_out_of_the_code() -> None:
+    texts = [
+        BAD_SIGNATURE,
+        pki_module.UNLISTED_SIGNATURE,
+        *tls_policy._UNCONFIRMED_SIGNATURE.values(),
+    ]
+    # Control: the texts searched are the ones those sentences sat in.
+    assert any("a start refuses the file too" in text for text in texts)
+    for sentence in _WITHDRAWN_FROM_THE_CODE:
+        assert not any(sentence in text for text in texts), sentence
+
+
+def test_a_crl_in_the_postgres_stores_root_cert_is_in_use_and_not_signature_checked(
+    twins: _Twins, tmp_path: Path
+) -> None:
+    """Finding (e), measured: the Postgres store loads ``[store].ssl_root_cert`` with ``cafile=``,
+    so a CRL block in it is loaded, and once ``[store].ssl_crl_file`` turns revocation checking on,
+    it is in use. Neither a start nor a reload checks its signature. The guide says so."""
+    from messagefoundry.config.settings import StoreBackend, StoreSettings
+    from messagefoundry.store.postgres import _verifying_context
+
+    bundle = tmp_path / "root-and-crl.pem"
+    bundle.write_bytes(twins.new_ca.read_bytes() + _crl(twins.stranger, names=twins.new_key))
+    twins.crl.write_bytes(_crl(twins.stranger, names=twins.stranger, name=_OTHER_NAME))
+    settings = StoreSettings(
+        backend=StoreBackend.POSTGRES,
+        server="db.example.test",
+        database="mefor",
+        username="mefor",
+        ssl_root_cert=str(bundle),
+        ssl_crl_file=str(twins.crl),
+    )
+
+    ctx = _verifying_context(settings)  # builds: the forged CRL in the root file is not judged
+
+    assert ctx.cert_store_stats()["crl"] == 2
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
+        _handshake(ctx, twins.server(sends_renewed=False))

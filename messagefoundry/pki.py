@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.serialization import pkcs12
+from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.keywrap import (
@@ -46,6 +47,7 @@ __all__ = [
     "CrlFacts",
     "CrlIssuerKey",
     "CrlSignature",
+    "UNLISTED_SIGNATURE",
     "crl_signature_refusal",
     "judge_crl_signatures",
     "judge_every_crl",
@@ -453,14 +455,36 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
     blocks = list(_crl_blocks(pem))
     for index, block in enumerate(blocks, start=1):
         crl = x509.load_pem_x509_crl(block)
-        where = f"CRL block {index} of {len(blocks)} (issuer {crl.issuer.rfc4514_string()!r})"
-        yield CrlSignature(where, _signature_state(crl, cas))
+        issuer = _bounded(crl.issuer.rfc4514_string())
+        yield CrlSignature(
+            f"CRL block {index} of {len(blocks)} (issuer {issuer!r})", _signature_state(crl, cas)
+        )
+
+
+#: The most characters of a CRL's issuer name a message quotes (vault BACKLOG #3506). A name has
+#: no length bound of its own, and each message that quotes it goes to the log or an exception.
+_ISSUER_SHOWN = 200
+
+
+def _bounded(issuer: str) -> str:
+    """``issuer`` whole, or its first :data:`_ISSUER_SHOWN` characters and how long it is."""
+    if len(issuer) <= _ISSUER_SHOWN:
+        return issuer
+    return f"{issuer[:_ISSUER_SHOWN]}... ({len(issuer)} characters)"
 
 
 #: What ``cryptography`` raises for a CA certificate it cannot read, at least. A CA that raises
 #: one is skipped by :func:`judge_crl_signatures`, alone. ``InvalidVersion`` comes from the
 #: parse, and ``UnsupportedGeneralNameType`` from reading extensions; neither is a ``ValueError``.
-_UNREADABLE_CA = (ValueError, x509.InvalidVersion, x509.UnsupportedGeneralNameType)
+#: ``CryptographyDeprecationWarning`` is raised only where warnings are errors. The parse warns of
+#: a CA whose serial number is not positive, which at least some system roots carry, and as an
+#: error that one root used to end the whole judgment (vault BACKLOG #3506).
+_UNREADABLE_CA = (
+    ValueError,
+    x509.InvalidVersion,
+    x509.UnsupportedGeneralNameType,
+    CryptographyDeprecationWarning,
+)
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
 _NameKey = tuple[tuple[tuple[str, bool, str | bytes], ...], ...]
@@ -602,6 +626,17 @@ def _signature_state(
     return "bad" if named else "unproven"
 
 
+#: Why a CRL reads :class:`CrlSignature` state ``unlisted``, for a start's warning and a reload's
+#: refusal alike. It says what the engine did, not what the CA list holds: a listed CA whose name
+#: differs from the issuer's only in white space reads ``unlisted`` too, and OpenSSL can still use
+#: that CA (:func:`_issuer_name_key` says why).
+UNLISTED_SIGNATURE = (
+    "the engine matched it to no CA certificate this hop lists (it compares the issuer name "
+    "with the case of ASCII letters folded, as OpenSSL does, and white space exactly, and then "
+    "the CRL's authority key identifier, where it carries one)"
+)
+
+
 def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bool] | None:
     """Why a CA in ``ca_ders`` is not confirmed to have signed some CRL in ``pem``, or ``None``
     when each CRL is confirmed.
@@ -625,15 +660,8 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     unlisted: str | None = None
     for signature in judge_crl_signatures(pem, ca_ders):
         if signature.state == "unlisted":
-            # Go on: a block that is known to be badly signed is the stronger finding. The words
-            # are the start warning's (``tls_policy._UNCONFIRMED_SIGNATURE``); a test holds the
-            # two together.
-            unlisted = unlisted or (
-                f"{signature.where}: the engine matched it to no CA certificate this hop lists "
-                "(it compares the issuer name with the case of ASCII letters folded, as OpenSSL "
-                "does, and white space exactly, and then the CRL's authority key identifier, "
-                "where it carries one)"
-            )
+            # Go on: a block that is known to be badly signed is the stronger finding.
+            unlisted = unlisted or f"{signature.where}: {UNLISTED_SIGNATURE}"
         elif signature.state != "verified":
             return (
                 f"{signature.where}: the engine could not confirm its signature with the key "

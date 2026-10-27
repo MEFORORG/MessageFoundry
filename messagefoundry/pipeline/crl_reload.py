@@ -219,8 +219,10 @@ _RETRIED = frozenset({WAIT, LAPSES_FIRST, RETRY, NO_ISSUER})
 #: :data:`LAPSES_FIRST` is a fix too, and the most urgent one: every peer is refused, restart or not.
 _PRECEDENCE = (FIX, BAD_SIGNATURE, _NOT_PROVABLE, LAPSES_FIRST, RESTART, NO_ISSUER, RETRY, WAIT)
 _RANK = {remedy: rank for rank, remedy in enumerate(_PRECEDENCE)}
-#: The remedies that send the operator to a restart, which fails while the file is not in effect.
-_SAYS_RESTART = frozenset({RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE})
+#: The remedies that can send the operator to a restart, which fails while the file is not in
+#: effect. :data:`BAD_SIGNATURE` names no restart, but it says a start can load the file, which is
+#: false until then, so it takes the same caveat (vault BACKLOG #3506).
+_SAYS_RESTART = frozenset({RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE, BAD_SIGNATURE})
 #: A short token per remedy, for the ``crl_reload_refused`` alert (vault BACKLOG #2904). The alert
 #: carries this and the remedy sentence, never the refusal's reason, which quotes CRL issuer
 #: names and dates. ``docs/CONFIGURATION.md`` lists the tokens under ``[cert_monitor]``.
@@ -282,8 +284,9 @@ class ReloadOutcome:
     refusal: ReloadRefusal | None
     #: Contexts still on the copy they held when this pass ended. 0 when ``refusal`` is ``None``.
     stale: int = 0
-    #: True when the remedy names a restart and a start would refuse the file too, until one of
-    #: its CRLs takes effect. The reason says so with the time; an alert carries only this flag.
+    #: True when the remedy can send the operator to a restart (:data:`_SAYS_RESTART`) and a
+    #: start would refuse the file too, until one of its CRLs takes effect. The reason says so
+    #: with the time; an alert carries only this flag.
     start_refuses: bool = False
 
     @property
@@ -430,8 +433,9 @@ class _Refusals:
         self.pending = False
         #: An unexpected failure, logged with its traceback once per file version.
         self.error: BaseException | None = None
-        #: True when the refusal reported names a restart and a start would refuse the file too,
-        #: until one of its CRLs takes effect (:attr:`ReloadOutcome.start_refuses`).
+        #: True when the refusal reported can send the operator to a restart and a start would
+        #: refuse the file too, until one of its CRLs takes effect
+        #: (:attr:`ReloadOutcome.start_refuses`).
         self.start_refuses = False
 
     def add(self, reason: str, remedy: str, *, stops: bool = True) -> None:

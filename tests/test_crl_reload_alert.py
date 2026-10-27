@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
 from pydantic import ValidationError
 
 from messagefoundry.config import loaded_crls
@@ -51,6 +52,7 @@ from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, crl_reload_refused_detail
 from messagefoundry.pipeline.crl_reload import (
     ALERT_PATH_MAX_LENGTH,
+    BAD_SIGNATURE,
     FIX,
     RESTART,
     WAIT,
@@ -302,6 +304,40 @@ async def test_a_restart_that_a_start_would_refuse_too_says_so(pki: _Pki) -> Non
     # The warning comes before the remedy that names a restart: the reason column is cut short.
     assert detail.index("do not restart before then") < detail.index(RESTART)
     assert capped.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_refuses_it_too(
+    pki: _Pki,
+) -> None:
+    """Vault BACKLOG #3506, the Manager's item 1. The ``bad_signature`` remedy says a start can
+    load the file, which is false while it is not in effect, so the refusal carries the same
+    caveat a restart remedy does. Before, it carried none."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+    forged = pki.crl_pem(
+        issued=-_DAY, lasts=90 * _DAY, signer=ec.generate_private_key(ec.SECP256R1())
+    )
+    pki.crl.write_bytes(forged)  # not in effect, and badly signed
+
+    (outcome,) = _pass(runner)
+
+    assert outcome.refusal is not None and outcome.refusal.remedy == BAD_SIGNATURE
+    assert "Restart the engine" not in BAD_SIGNATURE  # the remedy itself is unchanged
+    assert "a start until then refuses this file too" in outcome.refusal.reason
+    assert outcome.start_refuses
+    (payload,) = sink.refused()
+    assert payload["remedy_class"] == "bad_signature" and payload["start_refuses"] is True
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+    # Control: the same forgery in effect carries no such caveat.
+    pki.crl.write_bytes(
+        pki.crl_pem(issued=_DAY, lasts=90 * _DAY, signer=ec.generate_private_key(ec.SECP256R1()))
+    )
+    (in_effect,) = _pass(runner)
+    assert in_effect.refusal is not None and in_effect.refusal.remedy == BAD_SIGNATURE
+    assert not in_effect.start_refuses
+    assert "a start until then refuses" not in in_effect.refusal.reason
 
 
 def test_every_remedy_has_its_own_class_token() -> None:
