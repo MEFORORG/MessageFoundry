@@ -28,8 +28,8 @@ catch it. This module makes that a build failure, modelled on
 This guards the *definition/enumeration* only. It does **not** assert the engine force-rotates or hard-
 expires anything — that stays operator- / secret-manager-driven by design (session tokens are the one
 engine-expired credential). The *detect-and-remind* side of ASVS 13.3.4 is now **built** (BACKLOG #282):
-`pipeline/secret_rotation.py` fingerprints each tracked secret with a DEK-derived **keyed MAC** in store
-meta, tracks the DEK live-by-default off a tracked-since stamp, auto-detects a rotation (a changed
+`pipeline/secret_rotation.py` fingerprints each tracked secret with a **keyed MAC** sealed as a
+store-cipher cell in store meta (BACKLOG #3472), tracks the DEK live-by-default off a tracked-since stamp, auto-detects a rotation (a changed
 fingerprint resets the clock), alerts against the documented cadence, and escalates under
 `[security].enforcement=ENFORCE` — behaviour covered by `tests/test_secret_rotation_watcher.py`. This
 module stays scoped to the enumeration's completeness. PHI-free — it reads only env-var/setting *names*

@@ -13,7 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -59,17 +59,27 @@ def _windows(
     return cipher_policy.read_host_cipher_policy("win32")
 
 
+@pytest.fixture(autouse=True)
+def _no_system_cnf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reads this host's real ``/etc/ssl/openssl.cnf``: the seam names a path that is never
+    there, and a test that wants a system file points it at its own."""
+    absent = Path(__file__).parent / "no-such-folder" / "openssl.cnf"
+    monkeypatch.setattr(cipher_policy, "_SYSTEM_CNF", absent)
+
+
 def _linux(
     monkeypatch: pytest.MonkeyPatch,
     lines: list[str] | Exception,
     settings: list[tuple[str, str]] | Exception,
     section: str | None = "system_default_sect",
 ) -> CheckResult:
+    """The Linux row over one named file, with both its probes stubbed."""
+    monkeypatch.setenv("OPENSSL_CONF", "/etc/ssl/openssl.cnf")
     monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _give(lines))
     monkeypatch.setattr(
         cipher_policy,
         "_openssl_policy_lines",
-        lambda: (cipher_policy._OPENSSL_CNF, section, _give(settings)),
+        lambda path: (path, section, _give(settings)),
     )
     return cipher_policy.read_host_cipher_policy("linux")
 
@@ -333,6 +343,95 @@ def test_the_powershell_command_runs_on_this_host() -> None:
     assert cipher_policy._windows_enabled_suites()
 
 
+def _start_environment(
+    monkeypatch: pytest.MonkeyPatch, probe: Callable[[], list[str]], stdout: str
+) -> dict[str, str]:
+    """The ``env=`` the probe's start is given, with the start itself stubbed to print ``stdout``."""
+    seen: dict[str, str] = {}
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.update(kwargs["env"])
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess, "run", run)
+        assert probe()
+    return seen
+
+
+def _powershell_start_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> dict[str, str]:
+    """The probe's PowerShell environment, taken from a shell whose ``PATH`` and
+    ``PSModulePath`` lead with folders under ``tmp_path``."""
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("PSModulePath", str(tmp_path / "Modules"))
+    return _start_environment(
+        monkeypatch, cipher_policy._windows_enabled_suites, "TLS_AES_256_GCM_SHA384\n"
+    )
+
+
+def test_the_powershell_start_gets_a_fixed_path_and_module_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #3803 S1, the root cause of the PATH-spoof class for the PowerShell start: the
+    operator's ``PATH`` and module path do not reach it. Both are pinned to the system folders.
+    The Linux ``openssl`` start is still found on the operator's ``PATH``, by design."""
+    from messagefoundry.service_status import _system_exe
+
+    env = {
+        name.upper(): value
+        for name, value in _powershell_start_environment(monkeypatch, tmp_path).items()
+    }
+    shell_home = _system_exe(*_POWERSHELL[:2])
+    assert env["PATH"] == os.pathsep.join((_system_exe(), shell_home))
+    assert env["PSMODULEPATH"] == os.path.join(shell_home, "Modules")
+    assert not [value for value in env.values() if str(tmp_path) in value]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
+def test_the_pinned_module_path_holds_no_account_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Given a ``PSModulePath``, Windows PowerShell 5.1 adds the Program Files folder to it and
+    not the account's Documents folder, which it adds when the variable is unset (measured
+    2026-10-26). So every folder the probe's PowerShell can autoload a module from takes an
+    administrator to write. ``PSModulePath`` as that PowerShell itself reports it."""
+    from messagefoundry.service_status import _system_exe
+
+    roots = (_system_exe(), os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+
+    def outside_the_roots(env: dict[str, str]) -> list[str]:
+        done = _run_powershell("$env:PSModulePath", env)
+        assert done.returncode == 0, done.stderr[:300]
+        entries = [entry for entry in done.stdout.strip().split(";") if entry]
+        assert entries, done.stdout
+        return [e for e in entries if not any(e.lower().startswith(r.lower()) for r in roots)]
+
+    # Positive control: unpinned, the same reading shows a folder outside the roots, the
+    # account's Documents one, so a clean reading below is the pin and not an empty account.
+    assert outside_the_roots({})
+    # The overlay keeps every pin: each is a name the start-up names hold, or one they lack.
+    assert outside_the_roots(_powershell_start_environment(monkeypatch, tmp_path)) == []
+
+
+def test_the_openssl_start_gets_its_own_variables_and_no_python_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3803 item 5: ``openssl`` is not Python, so no ``PYTHON*`` name crosses to it.
+    The ``OPENSSL_*`` names do, and so does ``LD_LIBRARY_PATH`` on POSIX, which picks the
+    ``libssl`` the probe loads, as it picks the one the engine's ODBC driver loads."""
+    monkeypatch.setenv("OPENSSL_CONF", "/etc/ssl/probe.cnf")
+    monkeypatch.setenv("PYTHONUTF8", "1")
+    monkeypatch.setenv("PYTHONPATH", os.path.abspath("probe-path"))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/ssl/lib")
+    env = _start_environment(monkeypatch, cipher_policy._openssl_suites, _SSL_AEAD[0] + "\n")
+    names = {name.upper() for name in env}
+    assert "OPENSSL_CONF" in names
+    assert not [name for name in names if name.startswith("PYTHON")]
+    assert ("LD_LIBRARY_PATH" in names) is (sys.platform != "win32")
+
+
 _PLANTED_SUITE = "TLS_PLANTED_AES_256_GCM_SHA384"
 #: At least the two helpers the Lander found shadowed, and the cmdlet the probe exists to run.
 #: ``Import-Module`` is planted too, though a Core cmdlet always wins over a ``PATH`` external.
@@ -347,10 +446,16 @@ _SHADOWABLE_COMMAND = (
 )
 
 
-def _plant_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+def _plant_on_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, keep_the_pin: bool = False
+) -> Path:
     """Put ``.cmd`` files named for the probe's commands first on ``PATH``, each of which writes a
     marker into the returned folder when it runs, so a run is seen whatever this host's execution
-    policy does to the planted module the ``Join-Path`` one points at."""
+    policy does to the planted module the ``Join-Path`` one points at.
+
+    The probe pins its PowerShell's ``PATH`` (BACKLOG #3803 S1), which keeps every plant from
+    being seen. So unless ``keep_the_pin``, the pin is given this ``PATH`` instead, and the
+    command text is tested on its own, as it stood before the pin."""
     fake_module = tmp_path / "fake" / "TLS"
     fake_module.mkdir(parents=True)
     (fake_module / "TLS.psm1").write_text(
@@ -374,6 +479,11 @@ def _plant_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
             encoding="oem",  # cmd.exe reads a batch file in the OEM code page
         )
     monkeypatch.setenv("PATH", f"{planted}{os.pathsep}{os.environ.get('PATH', '')}")
+    if not keep_the_pin:
+        pins = cipher_policy._powershell_pins()
+        monkeypatch.setattr(
+            cipher_policy, "_powershell_pins", lambda: {**pins, "PATH": os.environ["PATH"]}
+        )
     return ran
 
 
@@ -409,6 +519,51 @@ def test_the_plants_run_where_a_bare_name_is_looked_up(
     monkeypatch.setattr(cipher_policy, "_SUITES_COMMAND", _SHADOWABLE_COMMAND)
     _suites_or_refused()
     assert {"Join-Path", "Test-Path"} <= {p.name for p in ran.iterdir()}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="plants .cmd files for Windows PowerShell")
+def test_the_pinned_path_keeps_a_plant_from_answering_a_bare_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #3803 S1: in the environment the probe starts its PowerShell with, PowerShell finds
+    no program or script on ``PATH`` under any name the text as it stood at the hold used bare. With
+    the operator's ``PATH`` in that environment instead, it finds every planted program. The
+    plants go on ``PATH`` before the environment is read, so a pin that took the operator's
+    ``PATH`` would hand them over and fail this test. The probe itself, run under the pin with the
+    plants there, reads what it reads unplanted and runs none of them.
+
+    Running the old text under the pin, as this test once did, makes Windows PowerShell 5.1
+    autoload ``Join-Path``, which with a cold module analysis cache analyses every module ahead of
+    ``$PSHOME`` on the module path: over 30s on the CI runners. :func:`_applications_named` turns
+    autoloading off."""
+    real = cipher_policy._windows_enabled_suites()
+    ran = _plant_on_path(monkeypatch, tmp_path, keep_the_pin=True)
+    assert cipher_policy._windows_enabled_suites() == real
+    assert sorted(p.name for p in ran.iterdir()) == [], "a command planted on PATH ran"
+    env = _start_environment(
+        monkeypatch, cipher_policy._windows_enabled_suites, "TLS_AES_256_GCM_SHA384\n"
+    )
+    planted = _applications_named(_PLANTED_COMMANDS, {**env, "PATH": os.environ["PATH"]})
+    assert sorted(Path(found).stem for found in planted) == sorted(_PLANTED_COMMANDS)
+    assert _applications_named(_PLANTED_COMMANDS, env) == [], "a command planted on PATH was found"
+
+
+def _applications_named(names: tuple[str, ...], env: dict[str, str]) -> list[str]:
+    """The programs and scripts Windows PowerShell finds on ``PATH`` for ``names``, started with
+    ``env`` laid over the start-up names. ``env`` holds every name that overlay sets, under the
+    same spelling, so the child gets ``env`` as given. Module autoloading is off: ``Get-Command``
+    otherwise imports modules, at least those exporting a name it is asked about (measured:
+    Management, Utility and TLS), which is the walk this lookup exists to avoid, and their
+    warnings would reach stdout."""
+    quoted = ",".join(f"'{name}'" for name in names)
+    done = _run_powershell(
+        "$PSModuleAutoLoadingPreference = 'None'; "
+        f"@(Microsoft.PowerShell.Core\\Get-Command -Name {quoted} "
+        "-CommandType Application, ExternalScript -ErrorAction SilentlyContinue).Path",
+        env,
+    )
+    assert done.returncode == 0, done.stderr[:300]
+    return [line.strip() for line in done.stdout.splitlines() if line.strip()]
 
 
 _A, _B = _WIN_AEAD
@@ -508,11 +663,40 @@ def test_linux_missing_openssl_is_manual(monkeypatch: pytest.MonkeyPatch) -> Non
     assert r.status is Status.MANUAL
 
 
-def test_linux_missing_policy_file_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
-    missing = FileNotFoundError(2, "No such file", "/etc/ssl/openssl.cnf")
-    r = _linux(monkeypatch, _SSL_AEAD, missing)
-    assert r.status is Status.MANUAL
-    assert "confirm MinProtocol by hand" in r.detail
+def test_linux_missing_policy_file_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Measured on OpenSSL 3.5.7: with ``OPENSSL_CONF`` naming no file, ``openssl`` ran on its
+    built-in defaults, so no floor is set and the reading is a FAIL, as a file with no chain is."""
+    missing = tmp_path / "absent.cnf"
+    monkeypatch.setenv("OPENSSL_CONF", str(missing))
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.FAIL, r.detail
+    assert f"no file at {missing}, so openssl applies no system-default policy" in r.detail
+
+
+def test_an_unreadable_policy_file_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A file that is there and cannot be read is a reading that broke, not one not taken."""
+    monkeypatch.setenv("OPENSSL_CONF", str(tmp_path))  # a folder: reading it as a file fails
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.ERROR, r.detail
+    assert f"OpenSSL file not read: {tmp_path} could not be read" in r.detail
+
+
+@pytest.mark.parametrize(
+    ("raised", "status", "text"),
+    [
+        (ProbeUnavailable("x not found"), Status.MANUAL, "what not read (x not found); hint"),
+        (ProbeFailed("x exited 1"), Status.ERROR, "what not read: x exited 1"),
+    ],
+)
+def test_each_probe_exception_becomes_one_reading(
+    raised: Exception, status: Status, text: str
+) -> None:
+    """BACKLOG #3803 item 9: the one place a probe's two exceptions become MANUAL and ERROR."""
+    taken = cipher_policy._taken("what", lambda: _give(raised), "; hint")
+    assert taken == cipher_policy._Reading(status, text)
+    assert cipher_policy._taken("what", lambda: 7) == 7
 
 
 def test_no_system_default_section_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -530,7 +714,7 @@ _CHAIN = (
 
 
 def _point_openssl_conf_at(monkeypatch: pytest.MonkeyPatch, cnf: Path, text: str) -> None:
-    cnf.write_text(text, encoding="utf-8")
+    cnf.write_bytes(text.encode("utf-8"))  # as given: write_text would add a CR on Windows
     monkeypatch.setenv("OPENSSL_CONF", str(cnf))
 
 
@@ -538,14 +722,19 @@ def _read_cnf(
     monkeypatch: pytest.MonkeyPatch, cnf: Path, text: str
 ) -> tuple[Path, str | None, list[tuple[str, str]]]:
     _point_openssl_conf_at(monkeypatch, cnf, text)
-    return cipher_policy._openssl_policy_lines()
+    return cipher_policy._openssl_policy_lines(cnf)
+
+
+def _linux_row(monkeypatch: pytest.MonkeyPatch) -> CheckResult:
+    """The whole Linux row, with the suite probe stubbed healthy and the policy file read."""
+    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
+    return cipher_policy.read_host_cipher_policy("linux")
 
 
 def _linux_from_file(monkeypatch: pytest.MonkeyPatch, cnf: Path, text: str) -> CheckResult:
     """The whole Linux row over a real file, with the suite probe stubbed healthy."""
     _point_openssl_conf_at(monkeypatch, cnf, text)
-    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
-    return cipher_policy.read_host_cipher_policy("linux")
+    return _linux_row(monkeypatch)
 
 
 def test_policy_lines_read_the_openssl_conf_file(
@@ -589,6 +778,22 @@ def test_policy_lines_come_from_the_section_openssl_applies(
     )
     assert section == "tls_policy"
     assert settings == [("MinProtocol", "TLSv1")]
+
+
+def test_a_section_name_keeps_its_inner_whitespace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The header's name is what sits between the brackets with only the outer whitespace
+    stripped, as the nested pattern this replaced captured it, so a chain link spelled with the
+    same inner whitespace reaches it."""
+    _, section, settings = _read_cnf(
+        monkeypatch,
+        tmp_path / "openssl.cnf",
+        "openssl_conf = init\n[init]\nssl_conf = ssl\n[ssl]\nsystem_default = tls \t policy\n"
+        "[ \ttls \t policy\t ]\nMinProtocol = TLSv1.2\n",
+    )
+    assert section == "tls \t policy"
+    assert settings == [("MinProtocol", "TLSv1.2")]
 
 
 def test_a_file_with_no_chain_has_no_policy_section(
@@ -659,10 +864,16 @@ def test_other_module_lines_do_not_name_the_ssl_module(
         ('"TLSv1.2"', "TLSv1.2"),
         ("'TLSv1.2'  # quoted", "TLSv1.2"),
         ('"DEFAULT:#x" # comment', "DEFAULT:#x"),
-        (r"a\#b", "a#b"),
+        ("`TLSv1.2`", "TLSv1.2"),  # a backtick is a quote too (measured)
+        ('"TLSv1.2 "  ', "TLSv1.2 "),
         ('" spaced "  ', " spaced "),
         ("TLSv1.2   ", "TLSv1.2"),
         ("", ""),
+        # OpenSSL's whitespace is space, tab and carriage return, and no other (BACKLOG #3803 T5).
+        ("\tTLSv1.2\t\r", "TLSv1.2"),
+        ("TLSv1.2\N{NO-BREAK SPACE}", "TLSv1.2\N{NO-BREAK SPACE}"),
+        ("\N{EM SPACE}TLSv1.2", "\N{EM SPACE}TLSv1.2"),
+        ("TLSv1.2\v", "TLSv1.2\v"),
     ],
 )
 def test_config_values_are_read_as_openssl_reads_them(raw: str, value: str) -> None:
@@ -680,14 +891,29 @@ _BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
         (_CHAIN + _HEALTHY_SECTION + ".include /etc/ssl/more.cnf\n", ".include"),
         (".include = /etc/ssl/more.cnf\n" + _CHAIN + _HEALTHY_SECTION, ".include"),
         (".pragma dollarid:on\n" + _CHAIN + _HEALTHY_SECTION, ".pragma"),
-        (_CHAIN + _HEALTHY_SECTION + "Options = A,\\\n  B\n", "a line continued"),
-        (_CHAIN + _HEALTHY_SECTION + "MinProtocol = $floor\n", "$ variable expansion"),
-        (_CHAIN.replace("ssl_sect\n[", "$name\n[") + _HEALTHY_SECTION, "$ variable expansion"),
+        (_CHAIN + _HEALTHY_SECTION + "Options = A,\\\n  B\n", "a line-end backslash"),
+        (_CHAIN + "[system_default_s\\ect]\n" + _HEALTHY_SECTION[21:], "a backslash"),
+        (_CHAIN + _HEALTHY_SECTION + "x = y # z\0\n", "a NUL"),
+        (_CHAIN + _HEALTHY_SECTION + "home = $ENV::HOME\n", "a variable from the ENV section"),
+        (_CHAIN + _HEALTHY_SECTION + "[ENV]\nhome = $HOME\n", "a variable from the ENV section"),
+        ("# a comment \\\n" + _CHAIN + _HEALTHY_SECTION, "a line-end backslash"),
+        (_CHAIN + _HEALTHY_SECTION + "x = 1 \r y = 2\n", "a carriage return"),
+        ("floor = TLSv1\n" + _CHAIN + _HEALTHY_SECTION + "MinProtocol = $floor\n", "$ variable"),
+        (
+            "name = ssl_sect\n" + _CHAIN.replace("ssl_sect\n[", "$name\n[") + _HEALTHY_SECTION,
+            "$ variable",
+        ),
         (
             _CHAIN + _HEALTHY_SECTION + "[other]\nsystem_default_sect::MinProtocol = TLSv1\n",
             "section::name",
         ),
         (_BOM + ".include /etc/ssl/more.cnf\n" + _CHAIN + _HEALTHY_SECTION, ".include"),
+        # OpenSSL reads a name that starts with .include as the directive: measured on OpenSSL
+        # 3.5.7, both of these included the named file (BACKLOG #3803 T5).
+        (_CHAIN + _HEALTHY_SECTION + ".include_x /etc/ssl/more.cnf\n", ".include"),
+        (_CHAIN + _HEALTHY_SECTION + ".includex=/etc/ssl/more.cnf\n", ".include"),
+        (_CHAIN + _HEALTHY_SECTION + "\t.include /etc/ssl/more.cnf\n", ".include"),
+        (".pragma_x dollarid:on\n" + _CHAIN + _HEALTHY_SECTION, ".pragma"),
     ],
 )
 def test_a_file_using_what_the_check_does_not_follow_is_manual(
@@ -704,12 +930,70 @@ def test_a_file_using_what_the_check_does_not_follow_is_manual(
 def test_a_dollar_outside_the_read_lines_is_not_refused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The stock Ubuntu file uses ``$dir`` in its CA sections, which the TLS policy never reads."""
-    text = "HOME = .\n" + _CHAIN + _HEALTHY_SECTION + "[CA_default]\ncerts = $dir/certs\n"
+    """The stock Ubuntu file uses ``$dir`` in its CA sections, which the TLS policy never reads.
+    Each variable is defined on an earlier line, as OpenSSL needs."""
+    text = (
+        "HOME = .\ntls13 = TLS_AES_256_GCM_SHA384\n"
+        + _CHAIN
+        + _HEALTHY_SECTION
+        + "[CA_default]\ndir = ./demoCA\ncerts = $dir/certs\nkey = ${dir}/k\nhome = $(HOME)\n"
+        + "[other]\nca = $CA_default::dir\nsuites = $::tls13\n"
+    )
     assert _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)[1] == "system_default_sect"
     # Ciphersuites is evidence only, so a $ there does not stop the verdict.
     r = _linux_from_file(monkeypatch, tmp_path / "b.cnf", text + "Ciphersuites = $tls13\n")
     assert r.status is Status.PASS, r.detail
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        "[CA_default]\ncerts = $dir/certs\n",  # never defined
+        "[CA_default]\ncerts = $dir/certs\ndir = ./demoCA\n",  # defined only after it is used
+        "[CA_default]\ndir = ./demoCA\ncerts = ${dir/certs\n",  # an unclosed brace
+        "[CA_default]\ndir = ./demoCA\n[other]\nca = $nowhere::dir\n",
+        "[CA_default]\ncerts = $/certs\n",  # no name at all
+        "[CA_default]\ndir = ./demoCA\ncerts = $::dir\n",  # names section "", not this one
+    ],
+)
+def test_a_variable_openssl_cannot_expand_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lines: str
+) -> None:
+    """Measured on OpenSSL 3.5.7: a ``$dir`` no earlier line defines, in a section the policy never
+    reads, made OpenSSL apply none of the file, and one defined on a later line did too. Before,
+    the row read PASS on each (code-review round 1)."""
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", _CHAIN + _HEALTHY_SECTION + lines)
+    assert r.status is Status.MANUAL, r.detail
+    assert "cannot read as OpenSSL does" in r.detail
+
+
+def test_a_quoted_dollar_is_not_expanded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Measured on OpenSSL 3.5.7: ``'$dir/certs'`` with no ``dir`` left the file applied."""
+    text = _CHAIN + _HEALTHY_SECTION + "[CA_default]\ncerts = '$dir/certs' # $nor_here\n"
+    assert _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text).status is Status.PASS
+
+
+def test_a_lone_carriage_return_is_manual(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Measured on OpenSSL 3.5.7: after ``# x`` and a lone CR in a short line, the rest of the line
+    is comment, so a policy line there is not applied. Read as text, the CR became a line end, and
+    the row read the floor and PASSed (code-review round 1). OpenSSL also ends a line at a CR that
+    falls at the end of a read chunk, so where the CR falls decides; the row does not guess
+    (code-review round 2)."""
+    text = (
+        _CHAIN + "[system_default_sect]\nCipherString = ECDHE+AESGCM # x\rMinProtocol = TLSv1.2\n"
+    )
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.MANUAL, r.detail
+    assert "a carriage return or a line-end backslash on line 7" in r.detail
+
+
+def test_a_comment_line_may_hold_what_a_setting_may_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Measured on OpenSSL 3.5.7: a comment line with a non-ASCII character or a backslash inside
+    it left the file applied, so the row reads it (code-review round 2)."""
+    text = "# Maintainer: Jos\u00e9 Mu\u00f1oz\n# see C:\\certs here\n" + _CHAIN + _HEALTHY_SECTION
+    assert _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text).status is Status.PASS
 
 
 def test_a_byte_order_mark_is_dropped_as_openssl_drops_it(
@@ -720,12 +1004,80 @@ def test_a_byte_order_mark_is_dropped_as_openssl_drops_it(
     assert _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)[1] == "system_default_sect"
 
 
+_NBSP = "\N{NO-BREAK SPACE}"
+
+
+def test_a_no_break_space_in_a_value_is_not_read_as_space(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #3803 T5. Measured on OpenSSL 3.5.7: a ``CipherString`` ending in a no-break space
+    was not applied, so OpenSSL keeps that character. Python's ``strip`` dropped it, and this
+    floor read as ``TLSv1.2`` and PASS. A non-ASCII character is now refused, not read."""
+    text = _CHAIN + _HEALTHY_SECTION.replace("TLSv1.2", f"TLSv1.2{_NBSP}")
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.MANUAL, r.detail
+    assert "a non-ASCII character on line 8" in r.detail
+
+
+@pytest.mark.parametrize(
+    ("line", "said"),
+    [
+        (f"{_NBSP}MinProtocol = TLSv1.2", "non-ASCII"),  # indented with a no-break space
+        (f"MinProtocol{_NBSP}= TLSv1.2", "non-ASCII"),
+        ("\vMinProtocol = TLSv1.2", "cannot read as OpenSSL does"),  # not OpenSSL space either
+        (f"[other{_NBSP}]", "non-ASCII"),
+        ("[other]\njunk", "cannot read as OpenSSL does"),
+        ("[other]\nMin Protocol = TLSv1", "cannot read as OpenSSL does"),
+        ("[other]\na$b = 1", "cannot read as OpenSSL does"),
+        ("[other\n", "cannot read as OpenSSL does"),
+    ],
+)
+def test_a_line_openssl_may_refuse_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, line: str, said: str
+) -> None:
+    """BACKLOG #3803 T5. Measured on OpenSSL 3.5.7, with each line after this healthy file: every
+    one made OpenSSL apply none of the file, so a PASS on the lines read here would not hold.
+    Before, the row read PASS on each: Python's ``\\s`` took the no-break space and the vertical
+    tab as space, and a line matching no pattern was skipped."""
+    cnf = tmp_path / "openssl.cnf"
+    r = _linux_from_file(monkeypatch, cnf, _CHAIN + _HEALTHY_SECTION + line + "\n")
+    assert r.status is Status.MANUAL, r.detail
+    assert str(cnf) in r.detail
+    assert said in r.detail
+
+
+def test_lines_openssl_reads_are_not_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The control for the test above: CRLF ends, tabs, a comment after a header, a spaced
+    section name and the punctuation OpenSSL allows in a name all read, and the row still PASSes.
+    OpenSSL 3.5.7 applied this file, measured."""
+    text = (
+        "# a comment\r\n\t\r\n"
+        + _CHAIN.replace("\n", "\r\n")
+        + "[system_default_sect] # the policy\r\n"
+        + "\tCipherString = ECDHE+AESGCM\t\r\nMinProtocol = TLSv1.2 \r\n"
+        + "[ spaced name ]\na!%&*+,-./;?@^_|~b = 1\n"
+    )
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.PASS, r.detail
+
+
+def test_a_backtick_quotes_a_value(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Measured on OpenSSL 3.5.7: a backtick-quoted ``CipherString`` was applied, so the backtick
+    is a quote. Before, the row read the floor as ```TLSv1.2``` and FAILed (code-review round 1)."""
+    text = (
+        _CHAIN + "[system_default_sect]\nCipherString = `ECDHE+AESGCM`\nMinProtocol = `TLSv1.2`\n"
+    )
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.PASS, r.detail
+
+
 def test_an_empty_openssl_conf_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
     """``openssl`` gets the empty name, so the file it read is not known; the system file is not
     read in its place."""
     monkeypatch.setenv("OPENSSL_CONF", "")
-    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
-    r = cipher_policy.read_host_cipher_policy("linux")
+    r = _linux_row(monkeypatch)
     assert r.status is Status.MANUAL, r.detail
     assert "OPENSSL_CONF is set but empty" in r.detail
 
@@ -739,18 +1091,280 @@ def test_a_quoted_min_protocol_passes(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert r.status is Status.PASS, r.detail
 
 
-def test_without_openssl_conf_the_system_file_is_read(
+def _openssl_returns(monkeypatch: pytest.MonkeyPatch, stdout: str) -> list[list[str]]:
+    """Stub every ``openssl`` start to print ``stdout``; returns the argument lists it was given."""
+    argvs: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        argvs.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return argvs
+
+
+def test_without_openssl_conf_the_binarys_own_file_is_read(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    cnf = tmp_path / "system.cnf"
-    cnf.write_text(_CHAIN + "[system_default_sect]\nMinProtocol = TLSv1.2\n", encoding="utf-8")
+    """BACKLOG #3803 item 2: without ``OPENSSL_CONF``, ``openssl`` loads ``openssl.cnf`` in the
+    ``OPENSSLDIR`` it was built with, which need not be ``/etc/ssl``. Before, the row read
+    ``/etc/ssl/openssl.cnf`` whatever the binary loaded, and could judge the floor from it. With
+    no system file here, the file is read but its PASS is capped at MANUAL (below)."""
+    cnf = tmp_path / "openssl.cnf"
+    cnf.write_bytes((_CHAIN + _HEALTHY_SECTION).encode("utf-8"))
     monkeypatch.delenv("OPENSSL_CONF", raising=False)
-    monkeypatch.setattr(cipher_policy, "_OPENSSL_CNF", cnf)
-    assert cipher_policy._openssl_policy_lines() == (
-        cnf,
-        "system_default_sect",
-        [("MinProtocol", "TLSv1.2")],
+    argvs = _openssl_returns(monkeypatch, f'OPENSSLDIR: "{tmp_path}"\n')
+    r = _linux_row(monkeypatch)
+    assert f"{cnf} [system_default_sect]: one CipherString line" in r.detail
+    assert argvs == [["openssl", "version", "-d"]]
+
+
+def test_with_openssl_conf_no_directory_is_asked_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``OPENSSL_CONF`` wins over ``OPENSSLDIR`` in OpenSSL, so the row starts no second probe,
+    and reads no system file beside the one named."""
+    argvs = _openssl_returns(monkeypatch, 'OPENSSLDIR: "/elsewhere"\n')
+    system = _system_cnf_at(monkeypatch, tmp_path, _CHAIN + _TLSV1_SECTION)
+    r = _linux_from_file(monkeypatch, tmp_path / "named.cnf", _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.PASS, r.detail
+    assert str(tmp_path / "named.cnf") in r.detail
+    assert str(system) not in r.detail
+    assert argvs == []
+
+
+_TLSV1_SECTION = _HEALTHY_SECTION.replace("TLSv1.2", "TLSv1")
+
+
+def _system_cnf_at(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str) -> Path:
+    """Point the system-file seam at a file in ``tmp_path`` holding ``text``."""
+    system = tmp_path / "etc-ssl" / "openssl.cnf"
+    system.parent.mkdir(exist_ok=True)
+    system.write_bytes(text.encode("utf-8"))
+    monkeypatch.setattr(cipher_policy, "_SYSTEM_CNF", system)
+    return system
+
+
+def _system_and_own(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    system: str | None,
+    own: str,
+    own_dir: Path | None = None,
+) -> CheckResult:
+    """The row without ``OPENSSL_CONF``. The system file holds ``system`` (``None``: there is
+    none), and ``openssl version -d`` names ``own_dir``, whose ``openssl.cnf`` holds ``own``."""
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    own_dir = own_dir or tmp_path / "planted"
+    own_dir.mkdir(parents=True, exist_ok=True)
+    (own_dir / "openssl.cnf").write_bytes(own.encode("utf-8"))
+    if system is not None:
+        _system_cnf_at(monkeypatch, tmp_path, system)
+    _openssl_returns(monkeypatch, f'OPENSSLDIR: "{own_dir}"\n')
+    return _linux_row(monkeypatch)
+
+
+def test_a_planted_openssl_cannot_hide_the_system_files_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-3 note 3: the binary on PATH names the folder its file is read from, so a planted one
+    can name a healthy file anywhere. Main read ``/etc/ssl/openssl.cnf`` and FAILed this host. The
+    system file is still read, and its FAIL stands."""
+    r = _system_and_own(monkeypatch, tmp_path, _CHAIN + _TLSV1_SECTION, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.FAIL, r.detail
+    assert "MinProtocol = TLSv1, not TLSv1.2 or higher" in r.detail
+    assert str(tmp_path / "etc-ssl" / "openssl.cnf") in r.detail
+
+
+def test_both_files_healthy_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The control for the test above: both files are read, and both are named."""
+    r = _system_and_own(monkeypatch, tmp_path, _CHAIN + _HEALTHY_SECTION, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.PASS, r.detail
+    assert str(tmp_path / "etc-ssl" / "openssl.cnf") in r.detail
+    assert str(tmp_path / "planted" / "openssl.cnf") in r.detail
+
+
+def test_the_binarys_own_file_failing_fails_the_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The worse reading stands, whichever file gives it (BACKLOG #3803 item 2)."""
+    r = _system_and_own(monkeypatch, tmp_path, _CHAIN + _HEALTHY_SECTION, _CHAIN + _TLSV1_SECTION)
+    assert r.status is Status.FAIL, r.detail
+    assert f"{tmp_path / 'planted' / 'openssl.cnf'} [system_default_sect]: MinProtocol" in r.detail
+
+
+def test_one_file_under_both_names_is_read_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The stock case: the binary's ``OPENSSLDIR`` holds the system file itself."""
+    healthy = _CHAIN + _HEALTHY_SECTION
+    r = _system_and_own(monkeypatch, tmp_path, healthy, healthy, own_dir=tmp_path / "etc-ssl")
+    assert r.status is Status.PASS, r.detail
+    assert r.detail.count(str(tmp_path / "etc-ssl" / "openssl.cnf")) == 1
+
+
+def test_with_no_system_file_a_healthy_binary_file_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-4 findings 1, 3 and 6: the openssl on PATH chose this file and no system file checks
+    it, so a planted binary naming a healthy file anywhere gets no PASS. Main read MANUAL here."""
+    r = _system_and_own(monkeypatch, tmp_path, None, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.MANUAL, r.detail
+    assert "so its PASS is not taken" in r.detail
+
+
+def test_with_no_system_file_a_failing_binary_file_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The file is still read, so a real FAIL in it is not hidden behind a MANUAL."""
+    r = _system_and_own(monkeypatch, tmp_path, None, _CHAIN + _TLSV1_SECTION)
+    assert r.status is Status.FAIL, r.detail
+    assert "MinProtocol = TLSv1, not TLSv1.2 or higher" in r.detail
+
+
+def test_a_system_file_that_cannot_be_stat_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-4 finding 5: only nothing there is absent. Any other ``lstat`` error is an ERROR, as
+    an unreadable file was on main, never a reason to read the binary's file alone."""
+    system = _system_cnf_at(monkeypatch, tmp_path, _CHAIN + _HEALTHY_SECTION)
+    real_lstat = Path.lstat
+
+    def lstat(self: Path) -> os.stat_result:
+        if self == system:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    r = _system_and_own(monkeypatch, tmp_path, None, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.ERROR, r.detail
+    assert f"{system} could not be read" in r.detail
+
+
+def test_a_system_file_that_cannot_be_read_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The control for the test above at the read, which main also made an ERROR."""
+    system = _system_cnf_at(monkeypatch, tmp_path, _CHAIN + _HEALTHY_SECTION)
+    real_read = Path.read_bytes
+
+    def read_bytes(self: Path) -> bytes:
+        if self == system:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    r = _system_and_own(monkeypatch, tmp_path, None, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.ERROR, r.detail
+    assert f"{system} could not be read" in r.detail
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a symbolic link needs a privilege on Windows")
+def test_a_system_file_linking_to_nothing_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-4 finding 5: a link to nothing is there to ``lstat``, so it is not read as absent and
+    the binary's file does not stand alone. It reads MANUAL, as main read it."""
+    system = tmp_path / "etc-ssl" / "openssl.cnf"
+    system.parent.mkdir()
+    system.symlink_to(tmp_path / "nowhere" / "openssl.cnf")
+    monkeypatch.setattr(cipher_policy, "_SYSTEM_CNF", system)
+    r = _system_and_own(monkeypatch, tmp_path, None, _CHAIN + _HEALTHY_SECTION)
+    assert r.status is Status.MANUAL, r.detail
+    assert "OpenSSL file not read (no file at" in r.detail
+    assert "its PASS is not taken" not in r.detail
+
+
+def test_without_openssl_the_system_file_is_still_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Main judged the floor from the system file with no ``openssl`` start. A missing binary,
+    which makes the directory reading MANUAL, must not hide that file's FAIL."""
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError(2, "No such file", argv[0])
+
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    monkeypatch.setattr(subprocess, "run", run)
+    _system_cnf_at(monkeypatch, tmp_path, _CHAIN + _TLSV1_SECTION)
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.FAIL, r.detail
+    assert "OpenSSL file not read (openssl not found)" in r.detail
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a POSIX shell script stands in for openssl")
+def test_a_planted_openssl_binary_on_path_cannot_hide_the_system_files_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The test above with a real program: a fake ``openssl`` first on PATH prints AEAD-only
+    suites and an ``OPENSSLDIR`` holding a healthy file. The system file allows TLSv1, so the row
+    FAILs, as main did."""
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "openssl.cnf").write_bytes((_CHAIN + _HEALTHY_SECTION).encode("utf-8"))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "openssl"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = version ]; then echo \'OPENSSLDIR: "{planted}"\'; '
+        f"else echo '{_SSL_AEAD[0]}'; fi\n",
+        encoding="utf-8",
     )
+    fake.chmod(0o755)
+    _system_cnf_at(monkeypatch, tmp_path, _CHAIN + _TLSV1_SECTION)
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    r = cipher_policy.read_host_cipher_policy("linux")
+    assert r.status is Status.FAIL, r.detail
+    assert "all 1 enabled suites are AEAD" in r.detail  # the planted binary answered
+    assert "MinProtocol = TLSv1, not TLSv1.2 or higher" in r.detail
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["", "OPENSSLDIR: /usr/lib/ssl\n", 'OPENSSLDIR: "/a"\nOPENSSLDIR: "/b"\n', 'OPENSSLDIR: ""\n'],
+)
+def test_a_directory_reading_that_is_not_one_openssldir_line_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    """Which file ``openssl`` loaded is then unknown, so the row neither guesses nor PASSes."""
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    _openssl_returns(monkeypatch, stdout)
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.ERROR, r.detail
+    assert "openssl version -d printed" in r.detail
+
+
+def test_no_openssl_for_the_directory_reading_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError(2, "No such file", argv[0])
+
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    monkeypatch.setattr(subprocess, "run", run)
+    r = _linux_row(monkeypatch)
+    assert r.status is Status.MANUAL, r.detail
+    assert "OpenSSL file not read (openssl not found)" in r.detail
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="no openssl on PATH")
+def test_the_openssl_directory_command_runs_on_this_host() -> None:
+    """A real ``openssl version -d`` prints the one line the row reads its file from, and the row
+    takes the folder that line names. The folder is read here a second way, by splitting on the
+    quotes, so a wrong capture group cannot pass (code-review round 2)."""
+    from messagefoundry.childenv import system_tool_environment
+
+    printed = subprocess.run(
+        ["openssl", "version", "-d"],
+        env=system_tool_environment(extra_names=cipher_policy._OPENSSL_ENV),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    ).stdout
+    folder = printed.split('"')[1]
+    assert folder
+    assert cipher_policy._openssl_default_file() == Path(folder) / "openssl.cnf"
 
 
 def test_a_form_feed_does_not_end_a_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -762,13 +1376,6 @@ def test_a_form_feed_does_not_end_a_line(monkeypatch: pytest.MonkeyPatch, tmp_pa
     )
     r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
     assert r.status is Status.FAIL, r.detail
-
-
-def _openssl_returns(monkeypatch: pytest.MonkeyPatch, stdout: str) -> None:
-    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(subprocess, "run", run)
 
 
 def test_openssl_suite_lines_are_read(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -988,12 +1595,34 @@ def test_verify_on_a_host_with_pyodbc_and_no_hop_does_not_fail(
     from messagefoundry.verify.runner import run_verify
 
     service = _isolate_settings(monkeypatch, tmp_path)
+    # The shell carries the service's own store backend, which overrides the file (R1 below).
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
     graph = tmp_path / "config"
     graph.mkdir()
     _with_pyodbc(monkeypatch, Status.FAIL)
     results = run_verify(config_dir=str(graph), service_config=str(service), sections=["host"])
     row = _host_ciphers_row(results)
     assert row.status is Status.SKIP, row.detail
+
+
+def test_a_sqlite_file_without_the_services_store_variable_reports_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #3803 R1, a fail-open: ``MEFOR_STORE_BACKEND`` overrides the file, and the shell
+    running ``verify`` need not carry the service's own environment. A file that says sqlite,
+    with no such variable here, does not show the service's store, which may be SQL Server. So
+    a FAIL reading is not pinned on the host, and neither is it hidden behind a SKIP."""
+    from messagefoundry.verify.runner import run_verify
+
+    service = _isolate_settings(monkeypatch, tmp_path)
+    service.write_text('[store]\nbackend = "sqlite"\n', encoding="utf-8")
+    graph = tmp_path / "config"
+    graph.mkdir()
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    results = run_verify(config_dir=str(graph), service_config=str(service), sections=["host"])
+    row = _host_ciphers_row(results)
+    assert row.status is Status.MANUAL, row.detail
+    assert "MEFOR_STORE_BACKEND" in row.detail and "sqlite" in row.detail
 
 
 def test_verify_without_a_service_config_reports_manual(
@@ -1096,21 +1725,25 @@ def test_a_generic_dialect_connection_alone_is_unknown(
 
 
 def test_the_census_without_a_hop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """No hop in the graph: "none" when the settings were read from a file, unknown when they did
-    not load or came from the defaults alone, because the store could then be SQL Server."""
+    """No hop in the graph: "none" only when this shell sets ``MEFOR_STORE_BACKEND``, which
+    overrides the file. Unknown when the settings did not load, came from the defaults alone, or
+    came from a file with no such variable here, because the service's own environment could make
+    the store SQL Server (BACKLOG #3803 R1)."""
     from messagefoundry.config.settings import ServiceSettings
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_BACKEND", raising=False)
     _registry_with(monkeypatch)
-    hops = _hops(tmp_path, settings=ServiceSettings())
-    assert (hops.found, hops.unknown) == ((), None)
-    assert repr(str(tmp_path)) in hops.judged
+    unknown = _hops(tmp_path, settings=ServiceSettings()).unknown
+    assert unknown is not None and "MEFOR_STORE_BACKEND" in unknown and "sqlite" in unknown
     unknown = _hops(tmp_path).unknown
     assert unknown is not None and "settings did not load" in unknown
     unknown = _hops(tmp_path, settings=ServiceSettings(), service_config=None).unknown
     assert unknown is not None and "no service config was read" in unknown
     monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
+    hops = _hops(tmp_path, settings=ServiceSettings())
+    assert (hops.found, hops.unknown) == ((), None)
+    assert repr(str(tmp_path)) in hops.judged
     assert _hops(tmp_path, settings=ServiceSettings(), service_config=None).unknown is None
 
 
