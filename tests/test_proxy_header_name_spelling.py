@@ -71,6 +71,8 @@ _VALUE = "Basic " + base64.b64encode(b"u5er:pa55w0rd").decode()
 _URL_CRED = "0ther:s3cret"
 _URL_VALUE = "Basic " + base64.b64encode(_URL_CRED.encode()).decode()
 _NAME = "Proxy-Authorization"
+#: The words only the refusal of a header spelled other than plainly holds: its remedy.
+_MISSPELLED = "rename the header"
 
 _HTTP_TARGET = "http://partner.example.test/x"
 _HTTPS_TARGET = "https://partner.example.test/x"
@@ -97,6 +99,11 @@ _SENDABLE = {
     "leading-parenthesis": "(" + _NAME,
     "quotation-mark": _NAME + '"',
 }
+
+#: Of those, the spellings with punctuation beside the plain name, which an error does not show.
+_PUNCTUATED = frozenset(
+    _SENDABLE[k] for k in ("semicolon", "leading-parenthesis", "quotation-mark")
+)
 
 #: Spellings ``http.client`` refuses before it opens a connection, each with what it raises.
 _UNSENDABLE: dict[str, tuple[str, type[Exception]]] = {
@@ -267,7 +274,7 @@ def test_a_name_is_judged_as_do_open_would_send_it() -> None:
     with _WireProxy() as proxy:
         request = urllib.request.Request(_HTTP_TARGET)
         request.headers[chr(0xDF) + _NAME] = _VALUE
-        _refused(_opener(proxy), request, "#3416")
+        _refused(_opener(proxy), request, _MISSPELLED)
     assert proxy.connections == 0
 
 
@@ -446,6 +453,16 @@ socket.socket().close()
 control = sorted(set(seen))
 seen.clear()
 
+import http.client
+put = []
+original_putheader = http.client.HTTPConnection.putheader
+def counting_putheader(self, header, *values):
+    text = header if isinstance(header, str) else header.decode("latin-1")
+    if "proxy-authorization" in text.lower():
+        put.append(text)
+    return original_putheader(self, header, *values)
+http.client.HTTPConnection.putheader = counting_putheader
+
 plain = "Proxy-Authorization"
 value = "made up"
 def ask(name, value):
@@ -460,33 +477,33 @@ answers = {
     "trailing space": ask(plain + chr(32), value),
     "bytes name": ask(plain.encode() + bytes([32]), value),
 }
-print(json.dumps({"control": control, "seen": seen, "answers": answers}))
+print(json.dumps({"control": control, "seen": seen, "answers": answers, "put": len(put)}))
 """
 
 
 def test_asking_http_client_about_a_header_opens_no_socket_and_resolves_no_name() -> None:
     """The check runs on every request that holds an odd spelling, so it must cost no network.
     It names ``localhost`` and never resolves it. The control shows the hook fires for a socket
-    and for a lookup, and the answers show the check really ran."""
+    and for a lookup, and a count of the questions put to ``http.client`` shows the check
+    really ran."""
     done = subprocess.run(  # noqa: S603 - this interpreter, a fixed script, no input from a test
         [sys.executable, "-c", _AUDIT_SCRIPT],
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=45,
         check=True,
     )
     report = json.loads(done.stdout)
     assert "socket.getaddrinfo" in report["control"]
     assert "socket.__new__" in report["control"]
-    assert report["answers"] == {
-        "leading space": "ValueError",
-        "line feed": "ValueError",
-        "not ascii": "ValueError",
-        "value is None": "TypeError",
-        "trailing space": None,
-        "bytes name": None,
-    }
+    # Which answer each gets is CPython's private rule, which the measured tables above pin.
+    # This test is about sockets, so it reads that each question reached http.client and got an
+    # answer of a kind the opener reads, and not which answer.
+    answers = report["answers"]
+    assert len(answers) == 6
+    assert set(answers.values()) <= {"ValueError", "TypeError", None}
+    assert report["put"] == 6
     assert report["seen"] == []
 
 
@@ -503,8 +520,9 @@ def test_a_caller_set_proxy_header_is_refused_before_a_cleartext_leg_in_any_spel
     """Before the fix, only ``plain`` and ``lower`` were refused. Every other spelling here dialled
     the proxy: the ``http`` target sent it the header in a cleartext request, and the ``https``
     target sent a ``CONNECT`` and kept the header on the request bound for the tunnel."""
+    item = "#3416" if name.lower() == _NAME.lower() else _MISSPELLED
     with _WireProxy() as proxy:
-        _refused(_opener(proxy), _request(name, target), "#3416")
+        _refused(_opener(proxy), _request(name, target), item)
     assert proxy.connections == 0
 
 
@@ -516,7 +534,7 @@ def test_an_admission_never_covers_another_spelling(name: str, target: str) -> N
     tunnel, where the destination reads it. Before the fix, an admitting handler sent each of
     these: to the proxy for the ``http`` target, and into the tunnel for the ``https`` one."""
     with _WireProxy() as proxy:
-        _refused(_opener(proxy, admitted=True), _request(name, target), "#3416")
+        _refused(_opener(proxy, admitted=True), _request(name, target), _MISSPELLED)
     assert proxy.connections == 0
 
 
@@ -552,7 +570,7 @@ def test_an_oddly_spelled_header_does_not_cross_a_verified_tls_leg(
     sure to take any other spelling that way, and could pass it on to the ``http`` destination."""
     with _WireProxy() as proxy:
         opener = _https_proxy_for_http_only(proxy, admitted=admitted)
-        _refused(opener, _request(name, _HTTP_TARGET), "#3416")
+        _refused(opener, _request(name, _HTTP_TARGET), _MISSPELLED)
     assert proxy.connections == 0
 
 
@@ -643,7 +661,7 @@ def test_a_rest_send_with_a_static_proxy_header_is_refused_in_any_spelling(name:
         with pytest.raises(DeliveryError) as raised:
             asyncio.run(dest.send('{"a": 1}'))
     assert isinstance(raised.value.__cause__, ProxyCredentialsRefusedError)
-    assert "#3416" in str(raised.value)
+    assert ("#3416" if name == _NAME else _MISSPELLED) in str(raised.value)
     for part in ("u5er", "pa55w0rd", _VALUE):
         assert part not in str(raised.value), part
     assert proxy.connections == 0
@@ -660,11 +678,17 @@ def test_a_static_proxy_header_beside_proxy_user_is_refused_at_build_in_any_spel
     """The build-time twin of the send-time rule, for a connection that sets ``proxy_user``. It
     reads the key through the same function, so a spelling one rule refuses the other refuses.
     It used ``str.strip`` of its own, which no test pinned. The error names the key in ``repr``
-    form and never the value."""
+    form and never the value, except that punctuation around the plain name may be part of a
+    credential typed into the key, so a key holding any is named as holding more text."""
     with _WireProxy() as proxy, pytest.raises(ValueError, match="#3443") as raised:
         _rest_with_static_header(name, proxy, proxy_user="u5er", proxy_password="pa55w0rd")
     text = str(raised.value)
-    assert repr(name) in text
+    assert f"headers sets {bounded_read.proxy_credential_header_name_shown(name)} and" in text
+    if name in _PUNCTUATED:
+        assert repr(name) not in text
+        assert "not shown" in text
+    else:
+        assert repr(name) in text
     for part in ("u5er", "pa55w0rd", _VALUE):
         assert part not in text, part
     assert proxy.connections == 0
@@ -765,7 +789,7 @@ def test_a_bytes_spelling_of_the_proxy_header_is_refused_before_a_proxy_leg(
     as latin-1 now. An admission never covers it: urllib looks the name up as a ``str`` when it
     fills a ``CONNECT``, so a ``bytes`` one would stay on the request sent inside the tunnel."""
     with _WireProxy() as proxy:
-        _refused(_opener(proxy, admitted=admitted), _bytes_request(name, target), "#3416")
+        _refused(_opener(proxy, admitted=admitted), _bytes_request(name, target), _MISSPELLED)
     assert proxy.connections == 0
 
 
@@ -988,12 +1012,13 @@ def test_a_verdict_does_not_outlive_its_header_on_the_request() -> None:
         opener, url = _on_leg("direct", peer)
         request = _held(_NAME + " ", _VALUE, url)
         _refused(opener, request, "#3417")
-        kept_while_held = _VALUE in repr(vars(request)["_mefor_proxy_header_verdicts"])
+        kept = vars(request)["_mefor_proxy_header_verdicts"]
+        kept_while_held = [verdict.value for verdict in kept.values()]
         request.headers.clear()
         _attempt(opener, request)
-    assert kept_while_held
+    assert kept_while_held == [_VALUE]
     assert peer.connections == 1
-    assert _VALUE not in repr(vars(request))
+    assert vars(request)["_mefor_proxy_header_verdicts"] == {}
 
 
 def test_an_error_over_a_later_header_does_not_lose_an_earlier_verdict() -> None:
@@ -1070,10 +1095,15 @@ def test_a_str_subclass_is_never_taken_as_the_plain_spelling(leg: str, admitted:
     answers ``title()`` itself, so it is judged like any other spelling, and refused."""
     with _WireProxy() as peer:
         opener, url = _on_leg(leg, peer, admitted=admitted)
-        raised = _attempt(opener, _held(_Retitled(_NAME), _VALUE, url))
+        request = _held(_Retitled(_NAME), _VALUE, url)
+        raised = _attempt(opener, request)
     assert peer.connections == 0
     assert isinstance(raised, ProxyCredentialsRefusedError)
-    assert "#3417" in str(raised) if leg == "direct" else "#3416" in str(raised)
+    assert "#3417" in str(raised) if leg == "direct" else _MISSPELLED in str(raised)
+    # The direct refusal takes every judged header, so the verdict is what shows the subclass
+    # was not taken as the plain spelling on that leg too.
+    kept = vars(request)["_mefor_proxy_header_verdicts"].values()
+    assert [verdict.plain for verdict in kept] == [False]
 
 
 class _ClaimsToBeAnyName(str):
@@ -1454,7 +1484,7 @@ def test_an_odd_spelling_never_leaves_the_last_check_whoever_routed_the_request(
     words the proxy handler uses."""
     with _WireProxy() as peer:
         opener = build_strict_opener(urllib.request.ProxyHandler({}))
-        _refused(opener, _routed_by_hand(_NAME + " ", peer, url), "#3416")
+        _refused(opener, _routed_by_hand(_NAME + " ", peer, url), _MISSPELLED)
     assert peer.connections == 0
 
 
@@ -1464,3 +1494,323 @@ def test_control_a_request_routed_by_hand_reaches_the_proxy_with_another_header(
         opener = build_strict_opener(urllib.request.ProxyHandler({}))
         _attempt(opener, _routed_by_hand("X-Trace", peer, url))
     assert len(peer.cleartext) == 1
+
+
+# --- the plain name, a character no name can hold, and more text (vault BACKLOG #3457) ----------
+#
+# Before this section's fix the rule read only characters that no field name can hold after the
+# plain name. A name of the plain name, then a NUL, a space or a tab, then more text, was another
+# header to it, and ``http.client`` sends such a name as it is written. So the header reached the
+# wire on every leg: the proxy read it in the clear, the ``https`` target carried it into the
+# tunnel, and a direct request gave it to the destination. No proxy product was measured.
+# RFC 9112 section 5.1 puts the colon straight after the field name, so a parser that stops the
+# name at the first character a name cannot hold, or a C parser that stops at a NUL, reads the
+# plain name there.
+
+#: Each suffix is a character no field name can hold, then more text.
+_SUFFIXED = {"nul": "\x00x", "space": " x", "tab": "\tx"}
+
+
+@pytest.mark.parametrize("suffix", list(_SUFFIXED.values()), ids=list(_SUFFIXED))
+def test_the_plain_name_then_a_non_name_character_and_more_text_is_read(suffix: str) -> None:
+    assert is_proxy_credential_header_name(_NAME + suffix)
+    assert is_proxy_credential_header_name(_NAME.lower() + suffix + " and more")
+    assert is_proxy_credential_header_name((_NAME + suffix).encode("latin-1"))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Proxy-Authorization-2",
+        "Proxy-Authorizationx",
+        "X-Proxy-Authorization",
+        "Proxy -Authorization",
+        "x Proxy-Authorization",
+        "x\x00Proxy-Authorization",
+    ],
+)
+def test_control_a_name_that_runs_on_or_starts_with_text_is_another_header(name: str) -> None:
+    """Text that runs straight on from the plain name makes a longer token, which is another
+    header. Before the plain name only characters a name cannot hold are skipped: text there
+    makes the name start with something else, and a parser that reads up to the first such
+    character reads that other text."""
+    assert not is_proxy_credential_header_name(name)
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("leg", _LEGS)
+@pytest.mark.parametrize("suffix", list(_SUFFIXED.values()), ids=list(_SUFFIXED))
+def test_the_plain_name_then_more_text_never_reaches_the_wire(
+    suffix: str, leg: str, admitted: bool
+) -> None:
+    """Each leg: a cleartext proxy, a ``CONNECT``, a proxy reached over verified TLS, and direct.
+    ``http.client`` sends each name as written, so before the fix each dialled the peer."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer, admitted=admitted)
+        raised = _attempt(opener, _held(_NAME + suffix, _VALUE, url))
+    assert peer.connections == 0
+    assert isinstance(raised, ProxyCredentialsRefusedError)
+    text = f"{raised!s} {raised!r}"
+    assert ("#3417" if leg == "direct" else _MISSPELLED) in text
+    for part in ("u5er", "pa55w0rd", _VALUE, "127.0.0.1", "partner"):
+        assert part not in text, part
+
+
+@pytest.mark.parametrize("suffix", list(_SUFFIXED.values()), ids=list(_SUFFIXED))
+def test_a_rest_send_with_the_plain_name_then_more_text_is_refused(suffix: str) -> None:
+    """The REST send-time caller. Before the fix the static header reached the proxy in a
+    cleartext request, value and all."""
+    with _WireProxy() as proxy:
+        dest = _rest_with_static_header(_NAME + suffix, proxy)
+        with pytest.raises(DeliveryError) as raised:
+            asyncio.run(dest.send('{"a": 1}'))
+    assert not isinstance(raised.value, NegativeAckError)
+    assert isinstance(raised.value.__cause__, ProxyCredentialsRefusedError)
+    assert _MISSPELLED in str(raised.value)
+    for part in ("u5er", "pa55w0rd", _VALUE):
+        assert part not in str(raised.value), part
+    assert proxy.connections == 0
+
+
+@pytest.mark.parametrize("suffix", list(_SUFFIXED.values()), ids=list(_SUFFIXED))
+def test_the_plain_name_then_more_text_beside_proxy_user_is_refused_at_build(suffix: str) -> None:
+    """The REST build-time caller reads the key through the same function, so it refuses the
+    same names. Before the fix this connection built. The text after the plain name may be a
+    credential typed into the key, so the error shows the key only up to it."""
+    name = _NAME + suffix[0] + "S3cretTail"
+    with _WireProxy() as proxy, pytest.raises(ValueError, match="#3443") as raised:
+        _rest_with_static_header(name, proxy, proxy_user="u5er", proxy_password="pa55w0rd")
+    text = str(raised.value)
+    assert repr(_NAME + suffix[0]) + " followed by more text, not shown" in text
+    for part in ("S3cretTail", "u5er", "pa55w0rd", _VALUE):
+        assert part not in text, part
+    assert proxy.connections == 0
+
+
+# --- the refusal texts, and what a verdict shows (vault BACKLOG #3490) ------------------------------
+
+
+def test_a_verified_tls_leg_refuses_a_misspelled_header_in_words_true_of_that_leg() -> None:
+    """The leg is TLS and the header was set by the caller, so the cleartext text, which names
+    cleartext and points at the proxy URL, would be wrong on both counts."""
+    with _WireProxy() as proxy:
+        opener = _https_proxy_for_http_only(proxy, admitted=True)
+        raised = _attempt(opener, _held(_NAME + " ", _VALUE, _HTTP_TARGET))
+    assert proxy.connections == 0
+    assert isinstance(raised, ProxyCredentialsRefusedError)
+    assert _MISSPELLED in str(raised)
+    assert "cleartext" not in str(raised)
+
+
+def test_control_a_cleartext_leg_with_a_proxy_url_credential_keeps_the_cleartext_text() -> None:
+    """A misspelled header beside a credential from the proxy URL, on a cleartext leg: the leg is
+    refused for the credential too, so the text names that."""
+    with _WireProxy() as proxy:
+        value = f"http://{_URL_CRED}@{proxy.address}"
+        opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
+        _refused(opener, _request(_NAME + " ", _HTTP_TARGET), "#2572")
+    assert proxy.connections == 0
+
+
+def test_the_unsendable_text_does_not_blame_the_name_alone() -> None:
+    """A sendable spelling whose value ``http.client`` refuses: the name is not the only thing
+    that may be at fault, so the fixed text does not say to correct the name."""
+    with _WireProxy() as proxy, pytest.raises(ValueError, match="can never be sent") as raised:
+        _opener(proxy).open(
+            urllib.request.Request(_HTTP_TARGET, headers={_NAME + " ": "made\nup"}), timeout=5
+        )
+    assert "correct the header name" not in str(raised.value)
+    assert proxy.connections == 0
+
+
+def test_a_verdict_prints_neither_the_name_nor_the_value() -> None:
+    """The value is the credential, and a name may hold a credential typed after the plain name.
+    A verdict is kept on the request, where a ``repr`` of the request's attributes would show
+    either."""
+    for name in (_NAME, _NAME + " ", _NAME + " S3cretTail"):
+        verdict = bounded_read._verdict_on(name, _VALUE)
+        assert verdict.name is name
+        assert verdict.value is _VALUE
+        assert _VALUE not in repr(verdict)
+        assert "S3cretTail" not in repr(verdict)
+        assert "plain=" in repr(verdict)
+
+
+def test_the_proxy_handler_refuses_a_misspelled_header_by_itself() -> None:
+    """The check that opens the connection refuses such a header too, so a test through an
+    opener cannot tell whether the proxy handler's own rule still holds. This asks the handler
+    alone, on the one leg only that rule refuses: an admitted header, to a proxy over TLS."""
+    proxy = "https://127.0.0.1:9"
+    handed_on: list[urllib.request.Request] = []
+
+    class _Parent:
+        """Where urllib hands a request rewritten for an ``https`` proxy back to the opener."""
+
+        def open(self, req: urllib.request.Request, timeout: float | None = None) -> str:
+            handed_on.append(req)
+            return "handed on"
+
+    handler = LoopbackDirectProxyHandler({"http": proxy}, caller_header_admitted=True)
+    handler.parent = _Parent()  # type: ignore[assignment]
+    with pytest.raises(ProxyCredentialsRefusedError, match=_MISSPELLED):
+        handler.proxy_open(_held(_NAME + " ", _VALUE, _HTTP_TARGET), proxy, "http")
+    assert handed_on == []
+    # The other polarity: the plain name on the same handler is handed on to the opener.
+    plain = _held(_NAME, _VALUE, _HTTP_TARGET)
+    plain.timeout = 5  # an opener sets it before any handler runs
+    assert handler.proxy_open(plain, proxy, "http") == "handed on"
+    assert handed_on == [plain]
+
+
+class _UnreadableText:
+    """A header value whose text cannot be read."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("the value's text cannot be read")
+
+
+@pytest.mark.parametrize("leg", ["direct", "cleartext-proxy"])
+def test_a_header_that_can_never_be_sent_is_not_read_for_its_text(leg: str) -> None:
+    """Only a header the rule judges has its text read. One ``http.client`` can never send ends
+    in the fixed ``ValueError`` whatever its value reads as: its text is never asked for."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer)
+        raised = _attempt(opener, _held(" " + _NAME, _UnreadableText(), url))
+    assert peer.connections == 0
+    assert type(raised) is ValueError
+    assert "can never be sent" in str(raised)
+
+
+def test_a_judged_value_is_read_before_the_direct_refusal() -> None:
+    """The order in the check that opens the connection: the text of each judged value is read
+    first, so a value whose text cannot be read stops the request with its own error there."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg("direct", peer)
+        raised = _attempt(opener, _held(_NAME, _UnreadableText(), url))
+    assert peer.connections == 0
+    assert type(raised) is RuntimeError
+
+
+# --- a plain name whose value http.client refuses (vault BACKLOG #3490) ------------------------------
+
+#: An admitted plain header the rule lets through, on each leg that lets one through.
+_LEGS_A_PLAIN_HEADER_CROSSES = ("cleartext-proxy", "connect", "verified-tls-proxy")
+
+
+@pytest.mark.parametrize("leg", _LEGS_A_PLAIN_HEADER_CROSSES)
+@pytest.mark.parametrize(
+    "value", [_VALUE + "\nX-Made: up", _VALUE + "\u4e0a"], ids=["line-feed", "not-latin-1"]
+)
+def test_a_plain_header_whose_value_can_never_be_sent_fails_in_fixed_text(
+    value: str, leg: str
+) -> None:
+    """Before the fix ``http.client`` refused the value itself, in text that quotes it, and the
+    value is the credential. The opener now refuses it first, as a ``ValueError`` still, so
+    the REST send maps it as before, and with nothing sent."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer, admitted=True)
+        raised = _attempt(opener, _held(_NAME, value, url))
+    assert peer.connections == 0
+    assert type(raised) is ValueError
+    assert "correct the proxy credential" in str(raised)
+    assert raised.__context__ is None
+    for part in (_VALUE, "pa55w0rd", "Made"):
+        assert part not in f"{raised!s} {raised!r}", part
+
+
+@pytest.mark.parametrize("leg", _LEGS_A_PLAIN_HEADER_CROSSES)
+def test_control_a_plain_header_with_a_sendable_value_still_crosses(leg: str) -> None:
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer, admitted=True)
+        _attempt(opener, _held(_NAME, _VALUE, url))
+    assert peer.connections == 1
+
+
+@pytest.mark.parametrize("leg", _LEGS_A_PLAIN_HEADER_CROSSES)
+def test_a_plain_value_is_asked_about_once_an_open_and_only_when_it_could_be_refused(
+    leg: str, asked: list[tuple[Any, Any]]
+) -> None:
+    """The question about a plain header's value goes through the one function every question
+    to ``http.client`` goes through, so the spy sees it. A printable ASCII ``str`` is never
+    asked about, and any other value is asked about once in an open."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer, admitted=True)
+        _attempt(opener, _held(_NAME, _VALUE, url))
+    assert asked == []
+    odd = _VALUE + "\u4e0a"
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer, admitted=True)
+        _attempt(opener, _held(_NAME, odd, url))
+    assert peer.connections == 0
+    assert asked == [(_NAME, odd)]
+
+
+@pytest.mark.parametrize(
+    ("name", "shown"),
+    [
+        (_NAME, repr(_NAME)),
+        (" " + _NAME + " \t", repr(" " + _NAME + " \t")),
+        (_NAME + " S3cretTail", repr(_NAME + " ") + " followed by more text, not shown"),
+        (
+            _NAME + " " + "".join(map(chr, (0x43F, 0x430, 0x440))),
+            repr(_NAME + " ") + " followed by more text, not shown",
+        ),
+        (_NAME + " ==S3cret", repr(_NAME + " ") + " followed by more text, not shown"),
+        (_NAME + " ~~+/+/Secret", repr(_NAME + " ") + " followed by more text, not shown"),
+        (_NAME + ":~~+/+/Secret", repr(_NAME + ":") + " followed by more text, not shown"),
+        (_NAME + " +/==", repr(_NAME + " ") + " followed by more text, not shown"),
+        (_NAME + "\x00\t", repr(_NAME + "\x00\t")),
+        (_NAME + "\x00;", repr(_NAME + "\x00") + " followed by more text, not shown"),
+        (
+            "\u043f\u0430 " + _NAME,
+            "a key holding Proxy-Authorization after other text, not shown",
+        ),
+        ("/== " + _NAME, "a key holding Proxy-Authorization after other text, not shown"),
+        (" " * 60 + _NAME, repr(" " * 60 + _NAME[:4]) + ", cut at 64 characters,"),
+        ("\x00" * 60 + _NAME, repr("\x00" * 60 + _NAME[:4]) + ", cut at 64 characters,"),
+        (":" + _NAME, repr(":" + _NAME)),
+        (_NAME + "\x85\u3000\u2028\u2029", repr(_NAME + "\x85\u3000\u2028\u2029")),
+        ("\ufeff" + _NAME + "\u200b\u00ad", repr("\ufeff" + _NAME + "\u200b\u00ad")),
+        (_NAME + "\ue000", repr(_NAME) + " followed by more text, not shown"),
+        (
+            _NAME + "".join(chr(0xE0000 + ord(c)) for c in "S3cret"),
+            repr(_NAME) + " followed by more text, not shown",
+        ),
+        (_NAME + "\udcc3\udca4", repr(_NAME) + " followed by more text, not shown"),
+        (
+            "\U000e0053" + _NAME,
+            "a key holding Proxy-Authorization after other text, not shown",
+        ),
+    ],
+    ids=[
+        "plain",
+        "ends",
+        "tail",
+        "non-ascii-tail",
+        "padding",
+        "punctuation-then-letters",
+        "colon-then-punctuation",
+        "punctuation-only",
+        "controls",
+        "control-then-punctuation",
+        "letters-before",
+        "punctuation-before",
+        "long",
+        "long-controls",
+        "colon-before",
+        "c1-and-unicode-separators",
+        "format-characters",
+        "private-use",
+        "tag-characters",
+        "lone-surrogates",
+        "tag-character-before",
+    ],
+)
+def test_an_error_shows_nothing_but_separators_around_the_plain_name(name: str, shown: str) -> None:
+    """A credential typed into the key may hold letters and digits in any script, and
+    punctuation too: base64 holds ``+``, ``/`` and ``=``, and tag characters or lone
+    surrogates can spell one a character at a time. So around the plain name only whitespace,
+    control characters, a few fixed invisible format characters and colons are shown, and a
+    cut at the cap is named, so the shown key never reads as whole when it is not."""
+    assert is_proxy_credential_header_name(name)
+    assert bounded_read.proxy_credential_header_name_shown(name) == shown
