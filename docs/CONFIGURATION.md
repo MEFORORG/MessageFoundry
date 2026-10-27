@@ -2296,12 +2296,18 @@ secret. Each file in that directory holds one setting and is named exactly as it
   Unset, no directory is read at all.
 - **The engine refuses, at every `[security].enforcement` setting,** a directory or a file in it
   that a known broad group (at least Everyone, Authenticated Users and the local Users group; on
-  POSIX, a group or other read or write bit) can read or change, and a link on Windows. It also
+  POSIX, a group or other read or write bit) can read or change, a directory in which such a
+  group may delete a file (Windows `FILE_DELETE_CHILD`), and a link on Windows. It also
   refuses a relative path, a file that is not a regular file, a file named for no setting above
   (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
   whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
-  file whose name starts with `.` is ignored. Every file is checked when the settings load, even
-  one nothing else reads. A refusal names the file, never its value.
+  file whose name starts with `.` is ignored. Every load of the settings, by any command, checks
+  the directory, every file name in it, and every file named for a setting above, even one nothing
+  else reads. A `MEFOR_VALUE_*` file's access and contents are checked only when the `env()` values
+  are read: at a `serve` start and on each reload, by `messagefoundry check`, and by
+  `messagefoundry connection upsert` and `remove`, at least. A command that loads the settings and
+  not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
+  named for no setting is cited without anything after an `=` in its name, or by its position.
 - **The access check is a list of known broad groups.** It does not refuse one named account that
   can write the directory, the way the config-directory checks do, so restrict the directory as
   below rather than relying on the check.

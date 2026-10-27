@@ -10000,7 +10000,6 @@ def load_settings(
         _merge(data, file_data)
 
     _merge(data, _env_overrides(environ))
-    _merge(data, _secrets_directory_overrides(environ))
 
     # ADR 0118: the [security] section is the canonical home for the posture switches. Reject the legacy
     # keys in their old sections (file+env), then desugar [security] into the internal fields it replaces
@@ -10012,6 +10011,10 @@ def load_settings(
     # does not hide a mistyped variable until the next start.
     for line in _unread_env_lines(environ, data):
         _log.warning("%s", line)
+    # The secrets directory (vault BACKLOG #2595, ADR 0214), after those warnings so a directory it
+    # refuses does not hide a mistyped variable until the next start. It writes only secret values,
+    # which nothing above reads.
+    _merge(data, _secrets_directory_overrides(environ))
     _reject_relocated_keys(data)
     # After _reject_relocated_keys so a MOVED key keeps its specific "moved to [security].X" message, and
     # over `file_data` rather than `data` so it never sees a key the env overlay or the desugar wrote.

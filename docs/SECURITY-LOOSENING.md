@@ -2014,9 +2014,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **`service_environment_secret`: another engine secret is in that list.** The entry names each
   one it finds: the store password, the AD bind password, the OIDC client secret, the OIDC
   signing key and its passphrase, the SMTP password, the API TLS key passphrase, both Vault
-  tokens and the AI key. The same ruling would refuse them. No protected way in exists for them
-  yet, so a refusal would leave a Windows service no way to start with one, and the entry names
-  them instead. Refusing them waits on that way in.
+  tokens and the AI key. The same ruling would refuse them. The protected way in is the secrets
+  directory that `MEFOR_SECRETS_DIRECTORY` names, one restricted file per setting
+  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)): move each
+  one there and remove it from the list. A secret left in the list is still named and not refused;
+  the refusal is later work under vault BACKLOG #2595.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. A key in the service's own

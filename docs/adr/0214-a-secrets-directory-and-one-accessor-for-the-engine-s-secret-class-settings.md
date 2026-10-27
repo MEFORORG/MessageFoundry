@@ -56,12 +56,17 @@ nothing that starts today.
    that is not a regular file; a file named for no setting, so a typo does not fall back to the
    environment unseen, and two `env()` files whose names differ only in case; an empty file, one
    that is not UTF-8, or one over 64 KiB. A file whose name starts with `.`, such as an editor's
-   swap file, is ignored. A refusal names the file and never the value. The settings load reads
+   swap file, is ignored. A refusal names the file and never the value; a file named for no
+   setting is cited without anything after an `=` in its name, or by its position when its name is
+   not shaped like one of the engine's variables, since such a name may be a value typed in the
+   wrong place. The settings load reads
    every file the directory holds for a setting, so a file nothing else would read, such as a
    Vault token on a site with no Vault, is still refused at start.
 4. **The directory's own access list is read.** A group that can add a file to the directory could
    supply a setting whatever the access list of the file it adds, so the directory is checked when
-   it is opened, before any file in it.
+   it is opened, before any file in it. On Windows its check also refuses a broad group's right to
+   delete a file inside it (FILE_DELETE_CHILD), which would let that group send a setting back to
+   the environment or to a library's own default.
 5. **The store key is not read from the directory.** Its protected channel is the DPAPI key file,
    and the key-custody design keeps it there. A file named for the store key or its retired keys
    is refused, and the accessor reads those two names from the environment alone.
@@ -122,11 +127,10 @@ config-source owner policy the settings file and the `env()` value file get: a d
 writable by one named non-administrator account, or owned on POSIX by another account the engine
 can read as root, passes. A file in the directory also outranks the environment for every process
 that names the directory, so a one-off override through a variable in such a shell does not take
-effect. The directory is opened and checked again by each reader, several times in one start. A file changed between its check and its
-read is read as changed; the directory check limits who can make that change. A plain file is in
+effect. The directory is opened and checked again by each reader, several times in one start. A
+file changed between its check and its read is read as changed; the directory check limits who can make that change. A plain file is in
 any backup that copies it, so the directory belongs outside what a data-directory backup takes,
-until the wrapping spike decides otherwise. The right to delete a file inside the directory is not
-part of the check; deleting one only sends the setting back to the environment.
+until the wrapping spike decides otherwise.
 
 **Out of scope** — slice B: refusing a secret found in the environment, and turning the NSSM
 reading's named-not-refused into a refusal. Slice C: the installer creating the directory, and the

@@ -14,9 +14,9 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   and a Windows service's NSSM environment, are refused always. The store key has a protected
   alternative on Windows, the DPAPI key file, so the refusal leaves a way to start.
 * **Another engine secret there is named as a loosening, and not refused.** The same ruling
-  covers it, but no protected channel for those secrets exists yet, so a refusal would leave a
-  Windows service with no way to supply a store password or a bind password at all. Refusing
-  them waits on that channel (vault BACKLOG #2595, closing step 3).
+  covers it. Its protected channel is the secrets directory ``MEFOR_SECRETS_DIRECTORY`` names
+  (:mod:`messagefoundry.engine_secrets`, ADR 0214), and the loosening points there. Refusing a
+  secret left in the list is later work (vault BACKLOG #2595, step 3).
 * **A store key that reaches a Windows service through its environment is named** (key-custody
   slice S2a), wherever it came from, since the machine-wide environment is readable by every
   local user too.
@@ -451,8 +451,10 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
             (
                 "service_environment_secret",
                 f"{posture.named_with_source(named)} is set in {_where(posture)}. Any local "
-                "user may be able to read that key, and with it these secrets. The engine has no "
-                "protected channel for them yet, so this is named and not refused",
+                "user may be able to read that key, and with it these secrets. Move each one to "
+                "the secrets directory MEFOR_SECRETS_DIRECTORY names, one restricted file per "
+                "setting (docs/CONFIGURATION.md, The secrets directory), and remove it from the "
+                "list. It is named here and not refused yet",
             )
         )
     return out

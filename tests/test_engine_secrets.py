@@ -162,7 +162,7 @@ def test_an_unset_or_blank_directory_variable_reads_no_directory() -> None:
 def test_a_file_named_for_no_setting_is_refused(tmp_path: Path) -> None:
     directory = _directory(tmp_path)
     _put(directory, "MEFOR_STORE_PASSWROD", _FROM_FILE)
-    with pytest.raises(SecretsDirectoryError, match="'MEFOR_STORE_PASSWROD'.*names no setting"):
+    with pytest.raises(SecretsDirectoryError, match="MEFOR_STORE_PASSWROD, which names no setting"):
         open_secrets_directory(_env(directory))
     (directory / "MEFOR_STORE_PASSWROD").unlink()
     _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)  # the control: the right spelling opens
@@ -365,10 +365,11 @@ def test_a_value_file_name_that_is_not_a_variable_name_is_refused(
         open_secrets_directory(_env(directory))
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Windows file names ignore case")
 def test_two_value_files_that_differ_only_in_case_are_refused(tmp_path: Path) -> None:
     directory = _directory(tmp_path)
     _put(directory, "MEFOR_VALUE_EPIC_PASSWORD", _FROM_FILE)
+    if (directory / "MEFOR_VALUE_Epic_Password").exists():
+        pytest.skip("this file system ignores case (Windows, default macOS), so no twin can exist")
     _put(directory, "MEFOR_VALUE_Epic_Password", _FROM_FILE)
     with pytest.raises(SecretsDirectoryError, match="which name one setting"):
         open_secrets_directory(_env(directory))
@@ -396,6 +397,150 @@ def test_a_settings_load_checks_a_file_nothing_else_would_read(tmp_path: Path) -
         load_settings(environ=_env(directory), default_file=False)
     (directory / "MEFOR_SECRETS_VAULT_TOKEN").unlink()
     load_settings(environ=_env(directory), default_file=False)  # the control
+
+
+#: A synthetic value, joined to a name at run time so no source line reads as a credential.
+_CANARY = "synthetic-canary-9f3c"
+
+
+@pytest.mark.parametrize(
+    ("before", "shown"),
+    [
+        ("MEFOR_STORE_PASSWORD" + "=", "MEFOR_STORE_PASSWORD (with what follows"),
+        ("", "entry 1 of 1"),
+    ],
+    ids=["env-line", "bare-value"],
+)
+def test_a_misnamed_file_is_cited_without_any_value_in_its_name(
+    tmp_path: Path, before: str, shown: str
+) -> None:
+    directory = _directory(tmp_path)
+    _put(directory, before + _CANARY, _FROM_FILE)
+    with pytest.raises(SecretsDirectoryError, match="names no setting") as caught:
+        open_secrets_directory(_env(directory))
+    assert shown in str(caught.value)
+    assert "canary" not in str(caught.value)
+
+
+def test_a_broad_right_to_delete_a_file_in_the_directory_is_refused() -> None:
+    """FILE_DELETE_CHILD on the directory lets a broad group delete any setting's file, sending the
+    setting back to the environment. Refused for a directory; the same entry on a file, where it
+    means nothing, is the control. Synthetic access lists, so it runs on every platform."""
+    from messagefoundry.config.wiring import _WinPathSecurity
+    from messagefoundry.restricted_file import (
+        _DIRECTORY_REACH_MASK,
+        _REACH_MASK,
+        _windows_access_problem,
+    )
+
+    delete_child = _WinPathSecurity(owner_sid="S-1-5-18", aces=((0, 0x40, _USERS),))
+    assert "can read or change it" in str(
+        _windows_access_problem(delete_child, _DIRECTORY_REACH_MASK)
+    )
+    assert _windows_access_problem(delete_child, _REACH_MASK) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows access list, set with icacls")
+def test_a_directory_users_may_delete_files_in_is_refused(tmp_path: Path) -> None:
+    import subprocess
+
+    from messagefoundry.childenv import system_tool_environment
+    from messagefoundry.service_status import _system_exe
+
+    directory = _directory(tmp_path)
+    _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)
+    assert open_secrets_directory(_env(directory)) is not None  # the control, before the grant
+    subprocess.run(  # nosec B603 - a fixed system tool by absolute path, test-only
+        [_system_exe("icacls.exe"), str(directory), "/grant", f"*{_USERS}:(DC)"],
+        check=True,
+        capture_output=True,
+        env=system_tool_environment(),
+    )
+    with pytest.raises(SecretsDirectoryError, match="the secrets directory .* is not restricted"):
+        open_secrets_directory(_env(directory))
+
+
+async def test_a_directory_the_reconcile_cannot_use_refuses_the_start_as_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reconcile's blanket handler used to swallow it, leaving the stamps empty, so the start
+    then failed as an undetermined store-key age. It now refuses as what it is."""
+    from messagefoundry.config.settings import SecretRotationSettings
+    from tests.test_secret_expiry_opt_in import _start_with_old_ad_stamp
+
+    directory = _directory_in_process(tmp_path, monkeypatch)
+    _broaden(_put(directory, "MEFOR_AUTH_AD_BIND_PASSWORD", _FROM_FILE))
+    with pytest.raises(SecretsDirectoryError, match="is not restricted") as caught:
+        await _start_with_old_ad_stamp(tmp_path, monkeypatch, SecretRotationSettings())
+    assert "MEFOR_AUTH_AD_BIND_PASSWORD" in str(caught.value)
+
+
+async def test_a_usable_directory_lets_the_same_start_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config.settings import SecretRotationSettings
+    from tests.test_secret_expiry_opt_in import _start_with_old_ad_stamp
+
+    directory = _directory_in_process(tmp_path, monkeypatch)
+    _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)  # the control: restricted
+    engine = await _start_with_old_ad_stamp(tmp_path, monkeypatch, SecretRotationSettings())
+    await engine.stop()
+
+
+async def test_the_expiry_opt_in_read_refuses_the_start_as_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_expiry_enforced_held_ids` reads the directory outside the reconcile. With the reconcile
+    stubbed, a directory it cannot use refuses the start naming the file."""
+    from messagefoundry.config.settings import SecretRotationSettings
+    from tests.test_secret_expiry_opt_in import _AD, _start_with_old_ad_stamp
+
+    async def _no_stamps(*_a: object, **_k: object) -> dict[str, object]:
+        return {}
+
+    monkeypatch.setattr("messagefoundry.pipeline.engine.reconcile_rotation_meta", _no_stamps)
+    directory = _directory_in_process(tmp_path, monkeypatch)
+    _broaden(_put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE))
+    with pytest.raises(SecretsDirectoryError, match="MEFOR_STORE_PASSWORD is not restricted"):
+        await _start_with_old_ad_stamp(
+            tmp_path,
+            monkeypatch,
+            SecretRotationSettings(
+                enforce_secret_expiry_classes=[_AD], enforce_store_key_expiry=False
+            ),
+        )
+
+
+def test_a_connection_edit_reports_a_directory_refusal_and_no_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from messagefoundry.__main__ import main
+    from tests.test_connections_cli import LOGIC
+
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "logic.py").write_text(LOGIC, encoding="utf-8")
+    directory = _directory_in_process(tmp_path, monkeypatch)
+    _broaden(_put(directory, "MEFOR_VALUE_EPIC_PASSWORD", _FROM_FILE))
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    svc = config / "svc.toml"
+    svc.write_text("", encoding="utf-8")
+    obj = {
+        "direction": "inbound",
+        "name": "IB",
+        "transport": "mllp",
+        "router": "r",
+        "settings": {"port": 2600},
+    }
+    args = ["connection", "upsert", "--config", str(config), "--service-config", str(svc)]
+    rc = main([*args, "--data", json.dumps(obj), "--json"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert "MEFOR_VALUE_EPIC_PASSWORD is not restricted" in out.out + out.err
+    assert "Traceback" not in out.out + out.err
+    assert _FROM_FILE not in out.out + out.err
 
 
 # --- no moved module reads a secret-class variable straight from the environment --------------------
