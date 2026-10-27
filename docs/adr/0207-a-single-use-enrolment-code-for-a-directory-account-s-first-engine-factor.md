@@ -4,8 +4,10 @@
   Owner's delegation of 2026-10-27 (CLAUDE.md section 5, "A delegated decision counts as that
   ruling", owner ruling 2026-10-22), after two adversarial reviews; Amendment A records the
   question, the answer and both reviews. Two repair rounds after both reviews (`2a6f30037`,
-  `83d038b7c`) changed design text, and a third adversarial read at `83d038b7c` covered those
-  commits and returned *keep accepted after named small fixes*, which the commit after it applies. The text below says only the owner can move this record to
+  `83d038b7c`, branch commits the pull request names) changed design text, and a third
+  adversarial read at `83d038b7c` covered those commits and returned *keep accepted after named
+  small fixes*, which the commit after it applies. Amendment A records that read too, and says
+  which text of that last commit no adversarial read has seen. The text below says only the owner can move this record to
   Accepted: that delegation record is the owner's ruling under CLAUDE.md section 5, so the
   acceptance rests on it. Three *To resolve on acceptance* items stay open, each with its
   recommendation; the build follows the recommendation unless the owner rules otherwise.
@@ -317,8 +319,11 @@ Context item 1, so none can call the issuing route.
   write (ADR 0194). ADR 0171 states why host access is a real gate: whoever holds the service
   config, the store and its key already holds the database.
 - **Its write is one conditional sealed write through `_write_user`.** It sets the digest only
-  where the account is `ad`,
-  enabled, and holds no factor. So it has no read-then-write window for a live engine to slip into.
+  where the account is `ad`, enabled, and holds no factor. `_write_user` reads the record, applies
+  the change to what it read, and writes with a compare on the seal it read, so the conditions are
+  judged on the record the write replaces. On a store with no row sealer that seal is empty and the
+  compare guards nothing across processes, which is one reason the next item keeps the engine
+  stopped.
 - **Whether it may run beside a live engine is not settled here.** That turns on whether a second
   process may append to the audit chain safely. Until the build shows it can, the command follows
   `admin-unlock`'s rule and runs with the engine stopped. That rule is documented in `admin-unlock`,
@@ -620,7 +625,11 @@ returned *keep accepted after named small fixes*: record that read in the Status
 name how the new columns survive the users-row seal, name the code's writes as conditional sealed
 writes through `_write_user`, and list the spent notice among the audit rows docs/PHI.md says
 store a client address. The commit after
-`83d038b7c` applies them. Decision log id
+`83d038b7c` applies them. The third read asked for the seal mechanism to be named, not for a
+mechanism it had approved, so the mechanism that commit names (each new column sealed only when
+non-null), the issuer capture in A5, and the qualifications it adds to the seal and the host
+command's write are design text no adversarial read has seen; the pull request names that commit.
+The original acceptance's decision log id is
 `d20261027T133727170-18c43f`. This amendment changes the design the record proposes, and the
 record was accepted with it on 2026-10-27, under the same delegation (see Status).
 
@@ -915,7 +924,11 @@ the code was used, or from where. **When a code is spent, the issuing Administra
 - The `users` row records the issuer with the digest: a third nullable column holding the issuing
   Administrator's account id, or null for a code the host command issued. Issuing writes it with
   the digest, and every statement that clears the digest clears it too. The spend's conditional
-  write returns the issuer it cleared, so the step that writes the rows below knows whom to tell.
+  sealed write returns the issuer it cleared, so the step that writes the rows below knows whom to
+  tell. `_write_user` returns the record after the change, where the issuer is already null, so the
+  spend's change captures the issuer from the record `_write_user` read, in the same write, and
+  never from a separate read before it, which a re-issue between the two would make name the wrong
+  Administrator.
 - `auth.enrolment_code_used` does not name the issuer. Section 7 returns that row to the account
   that spent the code, and whoever spent it, an interceptor included, should not learn which
   Administrator issued it. Its client column records where the spend came from, as every audit
@@ -964,17 +977,22 @@ kinds, not one: the issue notice and the spent notice. The TOTP enable's conditi
 spends the code (A3), and so does the passkey spend, each conditioned on the account holding no
 factor; the condition binds only the code-carrying write, never the enable of a confirm that
 carries no code. The passkey finish gains a label read (A3). The three new columns join the
-`users` row's integrity seal (BACKLOG #2592), so a database write without the sealing key cannot
-plant a code digest or redirect the spent notice. They cannot simply become sealed fields:
-`UserAuthzRecord.seal_fields` seals every `UserRow` field but `authz_seal`, and `seal_bytes`
-encodes a `None` field by its name, so three new fields would change the sealed bytes of every
-existing user and break its seal, and `reseal_user_records` refuses a record that fails its seal.
-So each new column enters the sealed field set only when it is non-null, as `passkey_digest`
-already does for a passkey's `discoverable` (it leaves the field out of the digest while it is
-false): a user who never held a code keeps the seal it was sealed under, and a code digest planted
-outside the store still fails the seal. Every write that sets or clears them, the code's issue, its
-spend and the TOTP fold, is a conditional sealed write through `_write_user`, which
-`tests/test_user_seal.py` pins every `users` UPDATE to. The host command gains the SQLite probe refusals and the non-database refusal (A4).
+`users` row's integrity seal (BACKLOG #2592), so on a store with a row sealer a database write
+without the sealing key cannot plant a code digest or redirect the spent notice. A store with no
+row sealer has no such control, as for every other sealed column. Added as plain sealed fields they
+would break every existing user's seal: `UserAuthzRecord.seal_fields` seals every `UserRow` field
+but `authz_seal`, and `seal_bytes` encodes a `None` field by its name, so three new fields change
+the sealed bytes of every existing user, and `reseal_user_records`, rotate-key's pass, refuses a
+record that fails its seal. So each new column enters the sealed field set only when it is
+non-null, as `passkey_digest` already does for a passkey's `discoverable` (it leaves the field out
+of the digest while it is false): a user who never held a code keeps the seal it was sealed under,
+and on a store with a row sealer a code digest planted outside the store still fails the seal. The
+build pins that rule with a test that a non-null value of each column changes the seal. Every
+write that sets or clears them goes through `_write_user`: at least the code's issue, its spend,
+the TOTP fold, the revoke and the disable's clear. The issue, the spend and the fold are
+conditional sealed writes; the disable's clear is unconditional (section 3). The static scan in
+`tests/test_user_seal.py` pins each `users` UPDATE written as SQL text in the store modules to the
+sealing writers. The host command gains the SQLite probe refusals and the non-database refusal (A4).
 **The begin routes' ceremony-budget draw, and the rest of the A1 table, belong to the build that
 removes `_reauth_ad`**, the one that admits the begins with no grant (A1, *Sequencing*; AC-16).
 This ADR's build does not add them, and that build must not admit a begin without the draw. The two lines A2 drops are dropped. Section 6's no-issuer state, "under
