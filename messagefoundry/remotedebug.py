@@ -151,7 +151,9 @@ _PROBE_EVENT: Final = "messagefoundry.remotedebug.probe"
 
 #: The injecting process chooses the script's name, so the logged copy is bounded: the hook keeps
 #: this many characters of it. :func:`_ascii` then spells each one in up to ten characters, and
-#: the spelling is logged whole, so it can be read back.
+#: the spelling is logged whole, so it can be read back. A line can then reach about 1,400
+#: characters. A collector that cuts at the 1,024 bytes RFC 3164 allows drops the end of the name,
+#: never the refusal or the event name, which come first (vault BACKLOG #3673, finding 1).
 _FILE_NAME_LIMIT: Final = 120
 
 #: Refusals waiting for the reporter thread. Past this the refusal is still counted and still
@@ -198,8 +200,8 @@ def _guard(event: str, args: tuple[object, ...]) -> None:
 
 
 def _ascii(name: str) -> str:
-    """``name`` in printable ASCII: the standard ``unicode_escape`` spelling, which escapes every
-    character outside ASCII, every control character and the backslash itself.
+    """``name`` in printable ASCII, spelled by the standard ``unicode_escape`` codec. It escapes
+    every character outside ASCII, every control character and the backslash itself.
 
     The injecting process chooses the name, and a log sink encodes what it is given. Measured on
     the three sinks ``configure_logging`` builds (vault BACKLOG #2742): a lone surrogate fails the
@@ -332,7 +334,7 @@ def install_remote_debug_guard() -> None:
 
     A hook that another hook refused, and a reporter thread the interpreter could not start, do
     not raise here. The command line makes this call at import, ahead of everything that could
-    report a failure, so a hook that did not go in is left for :func:`remote_debug_posture` to
+    report a failure. So a hook that did not go in is left for :func:`remote_debug_posture` to
     report.
 
     Nothing is added where ``sys.is_remote_debug_enabled()`` is False, which is every child started
@@ -388,9 +390,10 @@ def install_remote_debug_guard() -> None:
             quiet = sys.unraisablehook = _without_own_refusals(previous)
             # never-raise: a hook already installed may object to this one. The documented
             # contract is that the interpreter swallows a RuntimeError from it and passes on any
-            # other exception. Measured on CPython 3.14.6 it swallows a ValueError too, so this
-            # holds the line for an interpreter that does what the documentation says. A
-            # BaseException such as KeyboardInterrupt still leaves, with the wrapper put back.
+            # other exception. Measured on CPython 3.14.6, it swallows a ValueError and an
+            # Exception subclass of its own too. So this catch matters only on an interpreter that
+            # does what the documentation says. A BaseException such as KeyboardInterrupt still
+            # leaves, with the wrapper put back.
             try:
                 sys.addaudithook(_guard)
             except BaseException as exc:

@@ -1273,8 +1273,9 @@ def test_the_command_line_still_imports_when_another_hook_refuses_the_guard(
 ) -> None:
     """Against a real interpreter: a hook installed earlier raises a ValueError on every new
     hook. The probe exits non-zero if the import raises, and the reading must say the guard is
-    not there. On CPython 3.14.6 the interpreter swallows that ValueError itself, so this arm
-    does not show that the install contains it. The stand-in test further up does."""
+    not there. On CPython 3.14.6 the interpreter swallows that ValueError itself, as it does any
+    Exception, so this arm does not show that the install contains it and cannot be made to. The
+    stand-in test ``test_install_does_not_raise_when_a_hook_objects_with_any_exception`` does."""
     reading = _install_probe(tmp_path, "objecting")
     assert reading["before"] is False and reading["after"] is False
     # Tried by the import and again by each later call, since nothing answers and nothing cut the
