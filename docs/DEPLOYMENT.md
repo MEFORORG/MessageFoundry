@@ -1013,8 +1013,10 @@ hop is already refused by the [hop authority](#channel--tls-posture-matrix), so 
 decides a hop that is *already* verifying.
 
 **The ways across.** There is no `--allow-insecure-bind` for either gate and `MEFOR_ALLOW_INSECURE_TLS`
-does not reach them — but there are **five** crossings, not three. Items 1–3 are the only ones available
-**at the shipped PHI + `enforce` default**. Items 4–5 are what a *changed* posture does, they apply to
+does not reach them — but there are **six** crossings, not three. Items 1–4 are the only ones available
+**at the shipped PHI + `enforce` default**. For an outbound connection that leaves three, the same three
+[CONNECTIONS.md](CONNECTIONS.md) lists: stay on loopback, load a CRL the hop checks, or attest that one
+connection. Items 5–6 are what a *changed* posture does, they apply to
 the **outbound gate only** (the listener gate reads neither the data label nor `enforcement`, so it
 refuses regardless), and they are the realistic failure mode — a mislabelled box, not a missing
 attestation:
@@ -1052,17 +1054,22 @@ attestation:
    **A Vault hop is not a connection, so it takes neither key.** It crosses on its own settings
    pair, named in the Vault paragraph above.
 3. **Stay on loopback**, which neither gate reaches.
-4. **(Retired.)** `[security].handles_real_patient_data = false` used to sit here and **silenced the
+4. **Check revocation in the engine — outbound gate and mTLS listeners.** Load a CRL with
+   `[tls].crl_file` where it reaches the hop. The guard reads the CRL check off that hop's own TLS
+   context and lets the hop through (BACKLOG #299). This is not a declaration: the engine checks the
+   CRL on the wire. An mTLS listener takes its own `tls_crl_file`, and each non-connection hop names
+   its own CRL setting (above). The Vault hops and the `[api]` listener gate have no CRL lever.
+5. **(Retired.)** `[security].handles_real_patient_data = false` used to sit here and **silenced the
    outbound gate entirely** — ALLOW before the refuse arm, on every hop, with no per-hop record. It was
    the widest crossing on this list, the easiest to reach for by accident, and this page claimed it was
    audited in `security_loosenings()`, which it never was. [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed it; the key is refused at
    load. Nothing on this list silences the gate without a per-hop record any more.
-5. **`[security].enforcement = warn`** — downgrades an outbound revocation refusal to a **warning**
+6. **`[security].enforcement = warn`** — downgrades an outbound revocation refusal to a **warning**
    and lets the hop proceed, wherever the instance posture reaches the guard. It does not reach at
    least one family: a command that opens a store with no posture still refuses an unattested
    off-box Vault (the Vault paragraph above). Also a named loosening in the posture read-out.
 
-Items 4 and 5 are **not supported production settings** and neither is a per-hop decision: both are
+Items 5 and 6 are **not supported production settings** and neither is a per-hop decision: both are
 instance-wide, and both leave the refusal-shaped evidence a reviewer looks for **absent rather than
 recorded**. If you are auditing revocation, check those two switches *before* counting attestations.
 
