@@ -851,10 +851,10 @@ def test_path_false_refuses_at_enforce_and_warns_at_warn(
     # modify grant from its data folder; no grant finding here is about the owner, so no setowner.
     assert "/inheritance:r" not in text and "/grant" not in text and "/setowner" not in text
     assert f"account it ran as ({SERVICE})" in text
-    assert "enforce refuses to start" in text
+    assert "enforce refuses it" in text
     assert text.isascii()
     ta.enforce_anchor(spec, enforcing=False)
-    assert "starting anyway" in caplog.text
+    assert "using it anyway" in caplog.text
 
 
 def test_path_none_refuses_at_enforce_unless_a_pin_matches(
@@ -873,9 +873,9 @@ def test_path_none_refuses_at_enforce_unless_a_pin_matches(
     assert "could not settle" in text and "directory 'C:\\\\x': access denied" in text
     assert "move the anchor" in text and "set [x].pin to" in text
     assert hashlib.sha256(p.read_bytes()).hexdigest() in text
-    assert "enforce refuses to start" in text and text.isascii()
+    assert "enforce refuses it" in text and text.isascii()
     ta.enforce_anchor(spec, enforcing=False)
-    assert "starting anyway" in caplog.text
+    assert "using it anyway" in caplog.text
     caplog.clear()
     pinned = AnchorSpec("t", "[x]", str(p), hashlib.sha256(p.read_bytes()).hexdigest(), "[x].pin")
     assert ta.enforce_anchor(pinned, enforcing=True)

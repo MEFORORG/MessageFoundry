@@ -41,6 +41,7 @@ from messagefoundry.config.settings import (
     EgressSettings,
     EscalationTier,
     LoggingSettings,
+    StoreSettings,
     TlsSettings,
 )
 from messagefoundry.store import MessageStore
@@ -57,8 +58,10 @@ async def store(tmp_path: Path):
 
 @pytest.fixture(autouse=True)
 def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test starts with no consumer load recorded (BACKLOG #2185), whatever ran before it."""
+    """Each test starts with no consumer load recorded (BACKLOG #2185), and no open-time warning
+    (BACKLOG #3714), whatever ran before it."""
     monkeypatch.setattr(ta, "_LOADED", {})
+    monkeypatch.setattr(ta, "_WARNED_AT_OPEN", {})
 
 
 def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[AnchorSpec]:
@@ -69,6 +72,7 @@ def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[
         tls=TlsSettings(),
         alerts=AlertsSettings(),
         log_settings=LoggingSettings(),
+        store=StoreSettings(),
     )
 
 
@@ -696,7 +700,7 @@ def test_group_writable_refusal_carries_its_own_fix(
         assert any(line.startswith(f"Then run icacls {q} again.") for line in lines)
     else:
         assert f"  chmod go-w {shlex.quote(str(p))}" in lines
-    assert lines[-1] == "[security].enforcement=enforce refuses to start"
+    assert lines[-1] == "[security].enforcement=enforce refuses it"
 
 
 @_windows_only
@@ -754,7 +758,7 @@ def test_indeterminate_dacl_refuses_at_enforce_and_names_both_fixes(
     assert "move the anchor" in text
     assert "set [api].tls_client_ca_pin to" in text
     assert hashlib.sha256(b"body").hexdigest() in text
-    assert "enforce refuses to start" in text and text.isascii()
+    assert "enforce refuses it" in text and text.isascii()
 
 
 def test_indeterminate_dacl_with_a_matching_pin_loads_with_a_warning(
@@ -791,7 +795,7 @@ def test_indeterminate_dacl_warns_at_warn(
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     assert enforce_anchor(AnchorSpec("t", "[x]", str(p), None), enforcing=False)
-    assert "could not settle" in caplog.text and "starting anyway" in caplog.text
+    assert "could not settle" in caplog.text and "using it anyway" in caplog.text
     assert "pin it to" in caplog.text  # no pin setting named, so the generic spelling
 
 
@@ -2646,6 +2650,7 @@ def _dialling_specs(
         tls=TlsSettings(**with_ca("internal_ca_file", tls)),
         alerts=AlertsSettings(**with_ca("email_tls_ca_file", alerts)),
         log_settings=LoggingSettings(**with_ca("forward_tls_ca_file", log_settings)),
+        store=StoreSettings(),
     )
 
 
@@ -3037,6 +3042,134 @@ async def test_a_store_fault_on_an_earlier_anchor_does_not_hide_a_later_refusal(
         await preflight()
     assert isinstance(err.value.__cause__, TrustAnchorError)
     assert "[auth].ad_tls_ca_cert_file" in str(err.value)
+
+
+# --- vault BACKLOG #3714 item 1: the SQL Server store pin is a settings anchor ------------------
+
+
+def _sqlserver_pin(tmp_path: Path) -> Path:
+    """A real server certificate, which a SQL Server ``ssl_root_cert`` must be to load."""
+    from messagefoundry import pki
+
+    pin = tmp_path / "db-server.pem"
+    pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])
+    return pin
+
+
+def _store_specs(**store: Any) -> list[AnchorSpec]:
+    """:func:`collect_anchor_specs` with every other section at its default, which names no CA."""
+    base: dict[str, Any] = {"server": "db.example", "database": "mefor", "username": "mefor"}
+    return collect_anchor_specs(
+        AuthSettings(),
+        ApiSettings(),
+        tls=TlsSettings(),
+        alerts=AlertsSettings(),
+        log_settings=LoggingSettings(),
+        store=StoreSettings(**{**base, **store}),
+    )
+
+
+def test_the_sqlserver_store_pin_is_a_settings_anchor(tmp_path: Path) -> None:
+    """Red under: the store section left out of :func:`collect_anchor_specs`. The driver reads the
+    pin by path at each connect, so the spec carries no fingerprint pin and
+    ``loads_verified_bytes=False``."""
+    pin = str(_sqlserver_pin(tmp_path))
+    (spec,) = _store_specs(backend="sqlserver", ssl_root_cert=pin)
+    assert (spec.label, spec.setting, spec.path) == (
+        "store_sqlserver_pin",
+        "[store].ssl_root_cert",
+        pin,
+    )
+    assert spec.pin is None and spec.loads_verified_bytes is False
+
+
+def test_a_postgres_ssl_root_cert_is_not_a_settings_anchor(tmp_path: Path) -> None:
+    """The control for the case above: the same file as a PostgreSQL ``ssl_root_cert`` is not
+    collected, since this check covers the SQL Server pin only (module item 11), and neither is a
+    SQL Server store with no pin. Red under: the backend arm dropped from the store's pin
+    predicate."""
+    pin = str(_sqlserver_pin(tmp_path))
+    assert _store_specs(backend="postgres", ssl_root_cert=pin) == []
+    assert _store_specs(backend="sqlserver") == []
+
+
+async def test_the_sqlserver_store_pin_is_audited_at_start_and_rechecked_at_reload(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's own check at open writes no row, because the store that holds them is not open
+    yet. The settings preflight does: a start writes the ``observed`` row, a reload after a swap
+    writes ``changed``, and a reload after the file becomes writable by others refuses at
+    ``enforce`` with its ``acl_insecure`` row. Red under: the store pin left out of
+    :func:`collect_anchor_specs`, where no row is written and the last reload passes."""
+    from messagefoundry import pki
+    from messagefoundry.config.wiring import WiringError
+
+    acl: dict[str, bool] = {"ok": True}
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: acl["ok"])
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    await run_anchor_preflight(specs, store, enforcing=True)  # the start
+    assert [r["event"] for r in await _rows(store, "store_sqlserver_pin")] == ["observed"]
+    preflight = ta.make_settings_anchor_preflight(specs, store, enforcing=True)
+    assert preflight is not None
+    pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])  # the server's renewed cert
+    assert await preflight() == ()  # the driver reads the file per connect: no restart to report
+    events = [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+    assert sorted(events) == ["changed", "observed"], events
+    acl["ok"] = False
+    with pytest.raises(WiringError, match=r"\[store\]\.ssl_root_cert") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert "acl_insecure" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+
+
+async def test_a_start_at_warn_logs_the_pins_warning_once(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A serve start checks the pin twice: at store open, then in the lifespan preflight. At
+    ``warn`` it logs the warning once, and the preflight still writes its row. The control is the
+    reload after it, which warns again. Red under: the preflight ignoring the open's warning."""
+    import logging
+
+    from messagefoundry import pki
+    from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.store.sqlserver import check_pinned_certificate
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    from messagefoundry.config.settings import StoreBackend
+
+    settings = StoreSettings(
+        backend=StoreBackend.SQLSERVER,
+        server="db.example",
+        database="mefor",
+        username="mefor",
+        ssl_root_cert=str(pin),
+    )
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+
+    def warnings_logged() -> int:
+        return sum("writable by a non-owner" in r.getMessage() for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING, logger=ta.__name__):
+        check_pinned_certificate(settings, posture=HopPosture(enforcing=False))  # the store open
+        await run_anchor_preflight(specs, store, enforcing=False)  # the lifespan
+        assert warnings_logged() == 1
+        assert "acl_insecure" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+        await run_anchor_preflight(specs, store, enforcing=False)  # a reload
+        assert warnings_logged() == 2
+        # The control that can differ: a file swapped between the open and the preflight is a
+        # different verdict, so the preflight warns about it too. Red under: matching on the
+        # label alone, without the verdict.
+        check_pinned_certificate(settings, posture=HopPosture(enforcing=False))
+        pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])
+        await run_anchor_preflight(specs, store, enforcing=False)
+        assert warnings_logged() == 4
 
 
 # --- BACKLOG #3470: the hops built before the audited start check -----------------------------------

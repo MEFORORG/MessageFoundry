@@ -951,7 +951,8 @@ class StoreSettings(_Section):
     # Optional certificate file to verify the DB server WITHOUT installing anything box-globally into the OS
     # trust store (the common hospital-estate posture is a PRIVATE / self-signed CA). Honored by BOTH
     # server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false),
-    # and never applied on a weakened one. The two backends read it differently:
+    # and never applied on a weakened one; SQL Server refuses it at load beside one (BACKLOG #3714).
+    # The two backends read it differently:
     #   * POSTGRES — asyncpg takes an SSLContext, so this loads ssl.create_default_context(cafile=...), a
     #     CA-bundle pin (chain + hostname still verified).
     #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's OWN certificate
@@ -1168,16 +1169,25 @@ class StoreSettings(_Section):
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
                 "SQLite uses no TLS, so pinning a certificate has no effect."
             )
-        sends_pin = self.encrypt and not self.trust_server_certificate  # as the store decides
-        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER and sends_pin:
+        pin = self.sqlserver_pin_path()
+        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER and pin is None:
+            # Vault BACKLOG #3714 item 9: the store sends the pin only on the verifying posture, so
+            # beside a weakened one it would be dropped with nothing said. Refuse rather than ignore,
+            # as _ssl_crl_file_reachable does for its own setting.
+            raise ValueError(
+                "[store].ssl_root_cert requires a verifying SQL Server hop (encrypt=true and "
+                "trust_server_certificate=false); with verification off the store sends no pin, "
+                "so the pinned certificate would NOT be checked."
+            )
+        if pin:
             # Vault BACKLOG #2223: on SQL Server the file is an exact-match pin, so a bundle or a CA
             # certificate would refuse every connect. Say so at load, naming the setting. The file
             # holds only a public certificate, and no part of it goes into the message.
             from messagefoundry.pki import read_pinned_server_certificate
 
-            problem = read_pinned_server_certificate(self.ssl_root_cert)
+            problem = read_pinned_server_certificate(pin)
             if isinstance(problem, str):
-                raise ValueError(f"[store].ssl_root_cert {self.ssl_root_cert!r} {problem}")
+                raise ValueError(f"[store].ssl_root_cert {pin!r} {problem}")
         return self
 
     @field_validator("ssl_crl_file")
@@ -1267,6 +1277,22 @@ class StoreSettings(_Section):
         if self.backend is StoreBackend.SQLITE:
             return SchemaManagement.AUTO
         return self.schema_management or SchemaManagement.EXTERNAL
+
+    def sqlserver_pin_path(self) -> str | None:
+        """The ``ssl_root_cert`` file the SQL Server store sends as its ``ServerCertificate`` pin,
+        or ``None`` (vault BACKLOG #2223). Only SQL Server sends one, and only on the verifying
+        posture: ``encrypt`` on and ``trust_server_certificate`` off.
+
+        The load check, the store and the trust-anchor preflight ask here, so those three cannot
+        disagree on whether a pin is sent (BACKLOG #3714). The certificate-expiry monitor
+        (``pipeline/cert_expiry.py``) still writes the same test out itself. Load refuses a pin beside a weakened
+        posture, so on loaded settings the posture arm is a second guard for settings built
+        without validation."""
+        if self.backend is not StoreBackend.SQLSERVER:
+            return None
+        if not self.encrypt or self.trust_server_certificate:
+            return None
+        return self.ssl_root_cert or None
 
 
 #: The hosts that count as a loopback bind for the OPERATOR API, i.e. not exposed off-box. Both IPv4 and

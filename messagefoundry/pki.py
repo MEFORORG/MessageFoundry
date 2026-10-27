@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
+import os
 import string
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -64,8 +65,12 @@ __all__ = [
     "cert_to_pem",
     "key_to_pem",
     "load_pinned_server_certificate",
+    "PIN_FILE_MAX_BYTES",
     "PinRefused",
+    "oversized_pin_reason",
+    "pinned_server_certificate",
     "read_pinned_server_certificate",
+    "unreadable_pin_reason",
     "load_pkcs12",
     "make_self_signed",
     "read_cert_facts",
@@ -1179,14 +1184,62 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
     completes a sentence starting with the setting and the path (vault BACKLOG #2223).
 
     A reason string rather than an exception, so a caller raises its own refusal outside any
-    handler. The phrase holds an OS error's ``strerror``, a :class:`PinRefused` reason, or the
-    type name of a parser error, never the parser's text or the file's bytes."""
-    reason: str
+    handler. The phrase holds at least an OS error's ``strerror``, a :class:`PinRefused` reason,
+    the size refusal, or the type name of a parser error, never the parser's text or the file's
+    bytes.
+
+    It reads at most :data:`PIN_FILE_MAX_BYTES` and one byte more, so a huge or endless file is
+    refused as too large rather than read whole (BACKLOG #3714)."""
     try:
         with open(path, "rb") as fh:
-            return load_pinned_server_certificate(fh.read())
-    except OSError as exc:
-        reason = f"could not be read: {exc.strerror or type(exc).__name__}"
+            data = fh.read(PIN_FILE_MAX_BYTES + 1)
+    except (OSError, ValueError, TypeError) as exc:  # what open() raises for a bad path
+        return unreadable_pin_reason(exc)
+    return pinned_server_certificate(data)
+
+
+#: The largest SQL Server pin file the engine accepts (BACKLOG #3714). A pin is one certificate,
+#: a few KiB. :func:`read_pinned_server_certificate` reads at most this plus one byte. At store
+#: open the cap is judged on the size on disk, then on the bytes after the anchor checks have read
+#: the file whole. At least a reload, the serve start preflight, the expiry monitor and ``cert
+#: inventory`` read the file with no cap.
+PIN_FILE_MAX_BYTES = 1 << 20
+
+_TOO_LARGE = f"is not a usable SQL Server pin: it is larger than {PIN_FILE_MAX_BYTES} bytes"
+
+
+def oversized_pin_reason(path: str) -> str | None:
+    """The reason a pin file is too large to read, from its size on disk, or ``None``. For a
+    caller whose read is not bounded, such as the trust-anchor checks, to call first. A file
+    that cannot be stat'ed gives ``None``: the read that follows reports it. A file whose size
+    the OS does not report, such as a FIFO or a device, passes here, and the store open does not
+    guard its read: it can block or never end."""
+    try:
+        size = os.stat(path).st_size
+    except (OSError, ValueError, TypeError):
+        return None
+    return _TOO_LARGE if size > PIN_FILE_MAX_BYTES else None
+
+
+def unreadable_pin_reason(exc: OSError | ValueError | TypeError) -> str:
+    """The phrase for a pin file that could not be opened, in the shape of
+    :func:`read_pinned_server_certificate`'s reasons. An ``OSError`` gives its ``strerror``; a
+    ``ValueError`` or ``TypeError`` is a path ``open()`` will not take, such as one holding a NUL.
+    Neither names the path's bytes."""
+    if isinstance(exc, OSError):
+        return f"could not be read: {exc.strerror or type(exc).__name__}"
+    return f"could not be read: the path is not usable ({type(exc).__name__})"
+
+
+def pinned_server_certificate(data: bytes) -> x509.Certificate | str:
+    """:func:`read_pinned_server_certificate` over bytes already read, for a caller that has read
+    the file once for another check (vault BACKLOG #3714). Bytes past
+    :data:`PIN_FILE_MAX_BYTES` are refused as too large, so the cap judges the bytes in hand."""
+    if len(data) > PIN_FILE_MAX_BYTES:
+        return _TOO_LARGE
+    reason: str
+    try:
+        return load_pinned_server_certificate(data)
     except PinRefused as exc:
         reason = f"is not a usable SQL Server pin: {exc}"
     except Exception as exc:  # cryptography's ValueError, DuplicateExtension and the like

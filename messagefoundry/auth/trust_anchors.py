@@ -21,7 +21,7 @@ controls below, and is **dormant when no anchor is configured** — zero anchors
 byte-identical behaviour (no preflight runs, no audit rows, no new settings effects):
 
 1. A **read-only ACL preflight**: a group-/world-**writable** anchor (anyone who can write the file can
-   substitute the CA and defeat authentication) is **refused** at ``[security].enforcement = enforce``
+   substitute the anchor and defeat the TLS check that trusts it) is **refused** at ``[security].enforcement = enforce``
    and **warned + audited** at ``warn``. It reuses ``_secure_file``'s ``icacls`` DACL mechanism as a
    *verify-only* companion — it inspects the DACL and never changes it. Readability is deliberately not
    the threat (a CA certificate is public); tamperability is. The verdict is **tri-state**: a DACL the
@@ -51,8 +51,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    Before this, a file swapped between the check and the load was trusted unchecked. The AD anchor
    joined in BACKLOG #2034: ``ldap3`` used to read it by path on every bind, and now gets the checked
    bytes as ``ca_certs_data``. **Not covered:** the audit row of the central preflight, which records
-   its own read rather than the consumer's, and the dialling CAs of items 9 and 10, which still
-   load by path.
+   its own read rather than the consumer's, and the anchors of items 9 to 11, which still load
+   by path.
 6. **An indeterminate read refuses at ``enforce``, and a matching pin is the escape** (BACKLOG #1142,
    slice 3). When the ACL or the path could not be settled, the engine cannot say who else can
    replace the anchor, so ``enforce`` refuses to load it. A configured SHA-256 pin that matches the
@@ -163,6 +163,29 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     through the alert sinks, the security notifier and the forwarder builder. That is a refactor
     of three modules for a drift no finding has shown. The read and unread tests pin each
     builder's conditions, not their agreement with the hop.
+11. **The SQL Server store pin** (vault BACKLOG #3714). ``[store].ssl_root_cert`` on SQL Server is
+    sent as the ODBC ``ServerCertificate`` pin, under ``Encrypt=strict``, so it is the store hop's
+    only trust anchor. :func:`collect_anchor_specs` adds it under the label
+    ``store_sqlserver_pin`` (:func:`store_pin_anchor_spec`), so it takes the audited checks of
+    items 1 to 4 at start and at every reload. The store checks it too at each open, before any
+    connect, with no audit row, because the store that holds the rows is not open yet. So at
+    ``enforce`` a pin the store refuses stops the start with no row.
+    **Not covered**, as in item 9: the driver reads the file by path at each connect, so the
+    checked bytes are not the loaded bytes, and the spec carries ``loads_verified_bytes=False``
+    and no fingerprint pin. A changed file is used by the next connect and audited by the next
+    reload, which writes ``changed`` and no ``restart_required``.
+
+    **A reload runs the anchor checks and none of the store's content checks.** It checks the
+    ACL, the path and a change (items 1, 3 and 4; the spec has no pin), and refuses a file it
+    cannot read. The store's own content checks run at the next store open, not at a reload: at
+    least that the file is one server certificate, that it is inside its validity period, and
+    the encryption-header refusal (BACKLOG #3090). So a reload can pass a swapped file the next
+    store open refuses, and the driver reads that file at its next connect. At ``warn`` the start logs the pin's warning once: the
+    preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
+
+    **Not added: a PostgreSQL ``ssl_root_cert``.** It is a CA bundle the store loads by path
+    at each new connection, the shape of item 10's CAs, and nothing checks who can write it.
+    This change covers the SQL Server pin only; that gap is unfiled.
 """
 
 from __future__ import annotations
@@ -203,6 +226,7 @@ if TYPE_CHECKING:
         ApiSettings,
         AuthSettings,
         LoggingSettings,
+        StoreSettings,
         TlsSettings,
     )
     from messagefoundry.config.wiring import Registry, WiringError
@@ -255,7 +279,8 @@ class AnchorSpec:
 
     ``label`` is the stable, PHI-free audit key (``"oidc"`` / ``"ad"`` / ``"api_client"`` /
     ``"tls_internal_ca"`` / ``"alerts_email_ca"`` / ``"logging_forward_ca"`` /
-    ``"inbound:<connection>"`` / ``"outbound:<connection>"`` / ``"fhir_lookup:<name>"``);
+    ``"store_sqlserver_pin"`` / ``"inbound:<connection>"`` / ``"outbound:<connection>"`` /
+    ``"fhir_lookup:<name>"``);
     ``setting`` is the human-facing config key for messages; ``path`` is the configured PEM; ``pin``
     is the optional configured pin, as :func:`parse_anchor_pin` reads it; ``pin_setting``
     names where that pin is set, so a refusal can name the escape.
@@ -265,8 +290,8 @@ class AnchorSpec:
     for an unreadable ACL or path, and why the anchor takes the PEM shape checks of
     :func:`anchor_cadata`. **A consumer that reads the file again by path must not reuse a spec
     with this True**: the pin would vouch for bytes it never loaded. The AD anchor did exactly that
-    until BACKLOG #2034. The dialling CAs of module items 9 and 10 still read by path, so their
-    specs carry ``False``."""
+    until BACKLOG #2034. The anchors of module items 9 to 11 still read by path, so their specs
+    carry ``False``."""
 
     label: str
     setting: str
@@ -1023,8 +1048,8 @@ def _acl_message(spec: AnchorSpec) -> str:
     rights it names are :data:`_WRITE_RIGHTS`, so the text cannot drift from the check."""
     lines = [
         f"{spec.setting}: the trust anchor {spec.path!r} is writable by a non-owner (a group or "
-        "world principal can write it). Anyone who can modify it can substitute the CA and defeat "
-        "authentication. Restrict it to owner-only write."
+        "world principal can write it). Anyone who can modify it can substitute the anchor and "
+        "defeat the TLS check that trusts it. Restrict it to owner-only write."
     ]
     if os.name == "nt":
         q = _ps_quote(spec.path)
@@ -1118,7 +1143,7 @@ def _path_fix(verdict: AnchorVerdict) -> list[str]:
 def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     lines = [
         f"{spec.setting}: the trust anchor {spec.path!r} can be replaced through its path, and "
-        "anyone who replaces it can substitute the CA and defeat authentication:"
+        "anyone who replaces it can substitute the anchor and defeat the TLS check that trusts it:"
     ]
     lines += [f"  {f.kind} {f.path!r}: {f.reason}" for f in _findings(verdict, insecure=True)]
     check = verdict.path_check
@@ -1173,9 +1198,20 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     )
 
 
+#: The last line of an enforced refusal and of a warning (BACKLOG #3714 item 4). Neither says
+#: "start": the same check runs at a reload, a lane build and a store open.
+_REFUSED = "[security].enforcement=enforce refuses it"
+_WARNED = "[security].enforcement=warn, using it anyway"
+
+
 def _log_warning(text: str) -> None:
     """The default ``warn`` of :func:`_enforce_verdict`: this module's logger, at WARNING."""
     log.warning("%s", text)
+
+
+def _silent(_text: str) -> None:
+    """A ``warn`` for :func:`_enforce_verdict` that says nothing: for a check whose caller already
+    logged the same warning (:data:`_WARNED_AT_OPEN`). Every refusal is still raised."""
 
 
 def _enforce_verdict(
@@ -1198,21 +1234,18 @@ def _enforce_verdict(
       BACKLOG #2371): there the pin matched bytes the consumer does not load.
 
     ``warn`` takes each warning's text in place of this module's logger. A caller that runs
-    before logging is configured passes it, so it can scrub the text and log it again later."""
+    before logging is configured passes it, so it can scrub the text and log it again later.
+    :func:`_silent` logs none of them."""
     if verdict.pin_ok is False:
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
         if enforcing:
-            raise TrustAnchorError(
-                _acl_message(spec) + "\n[security].enforcement=enforce refuses to start"
-            )
-        warn(_acl_message(spec) + "\n[security].enforcement=warn, starting anyway")
+            raise TrustAnchorError(f"{_acl_message(spec)}\n{_REFUSED}")
+        warn(f"{_acl_message(spec)}\n{_WARNED}")
     if verdict.path_ok is False:
         if enforcing:
-            raise TrustAnchorError(
-                _path_message(spec, verdict) + "\n[security].enforcement=enforce refuses to start"
-            )
-        warn(_path_message(spec, verdict) + "\n[security].enforcement=warn, starting anyway")
+            raise TrustAnchorError(f"{_path_message(spec, verdict)}\n{_REFUSED}")
+        warn(f"{_path_message(spec, verdict)}\n{_WARNED}")
     if verdict.acl_ok is not None and verdict.path_ok is not None:
         return
     # BACKLOG #1142, slice 3. Slice 2 made the checked bytes the loaded bytes, which is what lets a
@@ -1227,18 +1260,48 @@ def _enforce_verdict(
         return
     fix = _indeterminate_fix(spec, verdict)
     if enforcing:
-        raise TrustAnchorError(f"{unknown}\n{fix}\n[security].enforcement=enforce refuses to start")
-    warn(f"{unknown}\n{fix}\n[security].enforcement=warn, starting anyway")
+        raise TrustAnchorError(f"{unknown}\n{fix}\n{_REFUSED}")
+    warn(f"{unknown}\n{fix}\n{_WARNED}")
+
+
+def _warned_state(verdict: AnchorVerdict) -> tuple[object, ...] | None:
+    """What a warning :func:`_enforce_verdict` logged was about, or ``None`` when it logged none
+    (every verdict it passes with a warning has an ACL or path that is not plainly fine)."""
+    if verdict.acl_ok is True and verdict.path_ok is True:
+        return None
+    path_findings = tuple((f.path, f.reason) for f in _findings(verdict, insecure=True))
+    return (verdict.fingerprint, verdict.acl_ok, verdict.path_ok, verdict.pin_ok, path_findings)
+
+
+#: The open-time warnings the settings preflight need not repeat (vault BACKLOG #3714). The SQL
+#: Server store checks its pin when it opens, before the store that holds audit rows exists, and
+#: at ``warn`` that check logs its warning. ``serve``'s lifespan preflight then checks the same
+#: file moments later. So :func:`enforced_anchor` with ``remember_warning`` records the verdict
+#: it warned about, keyed by label and path, and the next preflight of that anchor writes its row
+#: but skips the warning when its verdict matches. It is used once: a reload warns again. A
+#: command that opens the store and runs no preflight still logs the warning at open.
+_WARNED_AT_OPEN: dict[tuple[str, str], tuple[object, ...]] = {}
+
+
+def enforced_anchor(
+    spec: AnchorSpec, *, enforcing: bool, remember_warning: bool = False
+) -> AnchorVerdict:
+    """Construction-site preflight (no store/audit): evaluate + enforce one anchor, returning its
+    verdict, whose ``data`` is the bytes it checked. It loads nothing. A consumer that loads the
+    anchor into a context calls :func:`verified_anchor_cadata` instead and loads what that returns:
+    calling this and then loading the file by path reopens the check-then-load gap BACKLOG #1142,
+    slice 2 closed. A caller that inspects the content itself reads ``data``, so it reads the file
+    once, as the SQL Server pin's validity check does (vault BACKLOG #3714)."""
+    verdict = evaluate_anchor(spec)
+    _enforce_verdict(spec, verdict, enforcing=enforcing)
+    if remember_warning and (state := _warned_state(verdict)) is not None:
+        _WARNED_AT_OPEN[(spec.label, spec.path)] = state
+    return verdict
 
 
 def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
-    """Construction-site preflight (no store/audit): evaluate + enforce one anchor, returning its
-    fingerprint. It loads nothing. A consumer that loads the anchor into a context calls
-    :func:`verified_anchor_cadata` instead and loads what that returns: calling this and then loading
-    the file by path reopens the check-then-load gap BACKLOG #1142, slice 2 closed."""
-    verdict = evaluate_anchor(spec)
-    _enforce_verdict(spec, verdict, enforcing=enforcing)
-    return verdict.fingerprint
+    """:func:`enforced_anchor`, returning only the fingerprint."""
+    return enforced_anchor(spec, enforcing=enforcing).fingerprint
 
 
 def anchor_refusal(
@@ -1281,8 +1344,7 @@ def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
     whoever can write it can change what is revoked, but not what is trusted.
 
     It records the fingerprint of the bytes it returns, for :func:`loaded_fingerprint`."""
-    verdict = evaluate_anchor(spec)
-    _enforce_verdict(spec, verdict, enforcing=enforcing)
+    verdict = enforced_anchor(spec, enforcing=enforcing)
     text = anchor_cadata(verdict.data, spec)
     _LOADED[(spec.label, spec.path)] = verdict.fingerprint
     return text
@@ -1722,6 +1784,20 @@ def log_forward_anchor_spec(log_settings: LoggingSettings) -> AnchorSpec | None:
     )
 
 
+def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
+    """The SQL Server ``[store].ssl_root_cert`` pin's anchor spec, or ``None`` when the store sends
+    no pin (vault BACKLOG #2223, #3714): another backend, an unset file, or a weakened posture,
+    as :meth:`~messagefoundry.config.settings.StoreSettings.sqlserver_pin_path` decides.
+
+    Module item 11 says why it is an anchor and what the check does not cover."""
+    path = store.sqlserver_pin_path()
+    if path is None:
+        return None
+    return AnchorSpec(
+        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
+    )
+
+
 def collect_anchor_specs(
     auth: AuthSettings,
     api: ApiSettings,
@@ -1729,14 +1805,17 @@ def collect_anchor_specs(
     tls: TlsSettings,
     alerts: AlertsSettings,
     log_settings: LoggingSettings,
+    store: StoreSettings,
 ) -> list[AnchorSpec]:
     """Every configured operator-supplied trust anchor in the settings, in a stable order: the OIDC,
     AD and API client CAs, then since vault BACKLOG #3188 the settings CAs an engine hop dials with
-    (module item 10). An anchor with no path set is omitted, and so is a dialling CA its hop does
-    not read, so an install with none yields an empty list: the dormant, byte-identical path.
+    (module item 10), then since vault BACKLOG #3714 the SQL Server store pin
+    (:func:`store_pin_anchor_spec`). An anchor with no path set is omitted, and so is a dialling CA
+    its hop does not read, so an install with none yields an empty list: the dormant,
+    byte-identical path.
 
-    The three dialling sections are keyword arguments with no default on purpose. A caller that
-    left one out would leave its CA unchecked with nothing to say so.
+    The four section keywords have no default on purpose. A caller that left one out would leave
+    its anchor unchecked with nothing to say so.
 
     The per-connection inbound CAs are not here: ``serve`` calls this before any graph is loaded.
     :func:`registry_anchor_specs` collects them each time a graph is loaded, at start and at
@@ -1749,6 +1828,7 @@ def collect_anchor_specs(
         internal_ca_anchor_spec(tls),
         alerts_email_anchor_spec(alerts, auth),
         log_forward_anchor_spec(log_settings),
+        store_pin_anchor_spec(store),
     )
     return [spec for spec in candidates if spec is not None]
 
@@ -2010,8 +2090,13 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
         # even when its audit row failed, so a substituted anchor never reads as a store outage.
         # Only an anchor that passes raises the store fault.
         store_fault = exc
+    # A store open that just logged this warning (_WARNED_AT_OPEN) is not repeated; the row is.
+    warned = _WARNED_AT_OPEN.pop((spec.label, spec.path), None)
+    quiet = warned is not None and warned == _warned_state(verdict)
     try:
-        _enforce_verdict(spec, verdict, enforcing=enforcing)
+        _enforce_verdict(
+            spec, verdict, enforcing=enforcing, warn=_silent if quiet else _log_warning
+        )
         if shape_error is not None:
             raise shape_error
     except TrustAnchorError as refusal:
@@ -2054,8 +2139,8 @@ async def _report_restart_required(
     """Log and audit each settings anchor whose bytes on disk differ from the bytes its consumer
     loaded (:func:`loaded_fingerprint`), and return those anchors' setting names, in spec order
     and once each, for the reload's response (BACKLOG #3015). An anchor no consumer loaded is
-    skipped: a restart would apply nothing there. The dialling settings CAs of module item 10 are
-    always skipped, since their hops load by path and record no fingerprint.
+    skipped: a restart would apply nothing there. The settings anchors of module items 10 and
+    11 are always skipped, since their hops load by path and record no fingerprint.
 
     A name is returned whether or not its audit row was written: the row is advisory, and the
     restart is needed either way.
@@ -2113,8 +2198,8 @@ def make_settings_anchor_preflight(
     differ from its consumer's (:func:`loaded_fingerprint`), and returns those anchors' setting
     names, which the reload's response reports as ``restart_required`` (BACKLOG #3015). That
     repeats on every reload until a restart. The specs are frozen here, pins included, so a
-    reload re-reads the paths and pins the engine started with. The report skips the dialling
-    settings CAs of module item 10."""
+    reload re-reads the paths and pins the engine started with. The report skips the settings
+    anchors of module items 10 and 11."""
     if not specs:
         return None
     from messagefoundry.config.wiring import WiringError
