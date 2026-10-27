@@ -1614,20 +1614,21 @@ environment. The operator API client and the tray ignore the environment proxy.
 ##### The Vault and OpenBao clients also name a proxy where they use it
 
 The start WARNING reads the environment once, and only under `serve` and `supervise` (vault
-BACKLOG #4028). So when the client's adapter picks the connection for a send, after its own
-refusals at that point, it names the proxy `requests` picked, in one WARNING. A refusal later in
-the same send, before or at connect time, can still follow it, so the WARNING says the proxy was
-picked, not that the request reached Vault. It names the proxy as the start WARNING does, and
-names it "an unreadable value" where the parser that dials the proxy reads a different scheme,
-host or port from it. The engine gives these clients no proxy setting, so any proxy they pick
-came from the environment or the system settings.
+BACKLOG #4028). So the client's adapter names the proxy `requests` picked for a send, in one
+WARNING. It does so when it picks the connection, once its own refusals at that point pass. A
+refusal later in the same send can still follow, before or at connect time. So the WARNING says
+the proxy was picked, not that the request reached Vault. It names the proxy as the start
+WARNING does. The parser that dials the proxy may read a different scheme, host or port from it.
+Then the WARNING names it "an unreadable value". The engine gives these clients no proxy
+setting, so any proxy they pick came from the environment or the system settings. Which Vault
+hosts go direct, a loopback one included, is in *Some hosts go direct* above.
 
 It logs once per hop and distinct proxy value in a process. A value the hop has not named before is
 named on the first send that picks it, which is how a proxy set after start is disclosed. A hop that
 goes back to a proxy it already named does not name it again, so the last line for a hop need not
 name the proxy in use now. It is a WARNING, so a log level above WARNING hides it, as it hides the
-start WARNING. A send that goes direct, because no proxy is set or a bypass list names the Vault
-host, logs nothing.
+start WARNING. A send that goes direct logs nothing. It goes direct at least when no proxy is
+set for its scheme, or a bypass list names the Vault host.
 
 It is logged by every command whose Vault client sends, at least `serve`, `supervise`,
 `check-privileges`, `verify`, and the commands that open a store keyed from Vault. The urllib hops
