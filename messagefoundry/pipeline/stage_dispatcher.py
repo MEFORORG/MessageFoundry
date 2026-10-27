@@ -1460,6 +1460,31 @@ class StageDispatcher:
         the count is really a duration gate."""
         return _capped_backoff(_LANE_ERROR_BACKOFF_SECONDS, streak, self._infra_fault_backoff_cap)
 
+    def _page_held_lane(self, lane: str, what: str, failures: int) -> None:
+        """Raise ``lane_stuck`` once for a lane held by :meth:`_land_while_holding`: a held lane
+        never reaches :meth:`_apply_retry`, so the ADR 0070 fix B streak cannot page it. Marks the
+        episode alerted, so :meth:`_maybe_lane_stuck_alert` does not page it again once the write
+        lands. A sink that raises is logged and swallowed, as :meth:`_to_stopped` does, because the
+        serializer still holds the lane and must not die on an alert."""
+        st = self._states.get(lane)
+        if st is not None:
+            st.lane_stuck_alerted = True
+        try:
+            self._alert_sink.lane_stuck(
+                lane,
+                detail=(
+                    f"{self._stage.value} lane held: {what} failed {failures} consecutive "
+                    "times; retrying"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — an alert must not kill the serializer holding the lane
+            log.warning(
+                "StageDispatcher %s: lane_stuck alert for lane %s failed",
+                self._stage.value,
+                lane,
+                exc_info=True,
+            )
+
     async def _land_while_holding(
         self, lane: str, what: str, write: Callable[[], Awaitable[object]]
     ) -> bool:
@@ -1498,15 +1523,7 @@ class StageDispatcher:
                     level=logging.WARNING,
                 )
                 if run.count == self._infra_fault_stop_after:
-                    # A held lane never reaches _apply_retry, so the ADR 0070 fix B streak cannot
-                    # page it; page once per hold at the same count instead.
-                    self._alert_sink.lane_stuck(
-                        lane,
-                        detail=(
-                            f"{self._stage.value} lane held: {what} failed "
-                            f"{run.count} consecutive times; retrying"
-                        ),
-                    )
+                    self._page_held_lane(lane, what, run.count)
             else:
                 if run.count:
                     run.clear(

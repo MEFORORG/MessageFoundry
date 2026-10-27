@@ -1398,9 +1398,20 @@ async def test_a_held_lane_pages_lane_stuck_once_at_the_infra_fault_bound(
         if failures <= 5:
             raise RuntimeError("simulated store outage")
 
+    dispatcher._states["IB"] = stage_dispatcher._LaneState()
     assert await dispatcher._land_while_holding("IB", "release_claimed", failing) is True
     assert failures == 6
     assert len(stuck) == 1 and "failed 3 consecutive times" in stuck[0]
+    # Marked alerted, so _apply_retry's retry_forever page does not repeat it this episode.
+    assert dispatcher._states["IB"].lane_stuck_alerted is True
+
+    def broken(name: str, *, detail: str) -> None:
+        raise RuntimeError("simulated alert sink fault")
+
+    monkeypatch.setattr(sink, "lane_stuck", broken)
+    failures = 0
+    # A raising sink is logged, never raised: the serializer still holds the lane.
+    assert await dispatcher._land_while_holding("IB", "release_claimed", failing) is True
 
 
 async def test_a_head_retry_that_overruns_its_date_parks_the_lane_until_the_date_written(
