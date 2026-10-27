@@ -47,6 +47,7 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
 )
 from messagefoundry.keywrap import der_children, read_der_tlv
+from messagefoundry.pipeline import crl_reload
 from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE, FIX, reload_replaced_crls
 from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
 from tests.test_crl_held_copy_alert import _bundle_scan
@@ -1150,7 +1151,7 @@ def test_a_crl_whose_extensions_do_not_read_is_refused_by_name(tmp_path: Path) -
 
 
 def test_the_ca_file_scan_does_not_call_a_crl_whose_extensions_do_not_read_unjudged(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The Lander's hold on engine PR 2566 (vault row #4532, BACKLOG #3506). The refusal by name
     above is for a start and the reload. It must not change what the expiry scan reports for a
@@ -1188,15 +1189,52 @@ def test_the_ca_file_scan_does_not_call_a_crl_whose_extensions_do_not_read_unjud
     sink, mine = _bundle_scan(bundle)
     assert [sink.crl_notes[i][1].startswith("Restart the engine") for i in mine] == [True]
 
-    # The reload still refuses such a CRL in a CRL setting as one to fix, by name.
+    # In a CRL setting such a CRL is still refused by name: by a start, and by the reload as one
+    # to fix, which leaves the running hop on the copy it holds. The reload's own records are
+    # this test's, as test_crl_reload.py's fixture keeps them.
     crl.write_bytes(_crl_naming_serial(key, key, 0x01, x400=True))
+    with pytest.raises(ValueError, match="CRL block 1 of 1 cannot be judged: its extensions do"):
+        _hop(bundle, crl)
+    monkeypatch.setattr(loaded_crls, "_REFUSED", {})
+    for record, empty in (("_SEEN", {}), ("_UNREADABLE", set()), ("_FAILED", {}), ("_LABELS", {})):
+        monkeypatch.setattr(crl_reload, record, empty)
     outcomes = reload_replaced_crls()
     (outcome,) = [o for o in outcomes if Path(o.path).exists() and Path(o.path).samefile(crl)]
     assert outcome.refusal is not None and outcome.refusal.remedy == FIX
     assert "CRL block 1 of 1 cannot be judged: its extensions do not read" in (
         outcome.refusal.reason
     )
-    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert outcome.reloaded == 0
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF  # keeps the hop alive to here
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        x509.UnsupportedGeneralNameType("x400Address is not supported"),
+        CryptographyDeprecationWarning("a deprecation raised as an error"),
+    ],
+    ids=["unsupported-name", "deprecation"],
+)
+def test_unread_extensions_refuse_by_name_only_where_asked(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """Both kinds of :data:`pki._UNREAD_EXTENSIONS`, the second of which no CRL built here can
+    raise once the serial rewrite reads it: each refuses by name with the flag a start and the
+    reload pass, and raises as itself without it, as the CA-file scan calls it."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    pem = _crl(key, names=key)
+
+    def _unread(crl: x509.CertificateRevocationList) -> object:
+        raise error
+
+    monkeypatch.setattr(pki_module, "_crl_extensions", _unread)
+    now = _NOW.timestamp()
+    with pytest.raises(ValueError, match="CRL block 1 of 1 cannot be judged: its extensions do"):
+        pki_module.judge_every_crl(pem, now=now, refuse_unread_extensions=True)
+    with pytest.raises(type(error)) as raw:
+        pki_module.judge_every_crl(pem, now=now)
+    assert raw.value is error
 
 
 def test_a_long_issuer_name_is_quoted_with_a_bound(twins: _Twins) -> None:

@@ -2212,11 +2212,13 @@ copy. If another setting names the same file, that file's row still reports thos
 share `warn_days` with certificates. So a CRL reissued more often than `warn_days` sits inside the
 window and alerts on every scan.
 
-The scan's check of a CA file does not judge a CRL whose extensions the engine cannot read, such as
-one naming its CA's issuer as an x400Address, though a start refuses that CRL in a CRL setting
-(vault BACKLOG #3506). A start loads it from a CA file unjudged. The scan logs an ERROR on each pass
-that it could not judge the held copies, and dates that row by the file alone, so an alert for it has
-an empty `detail`. A held copy that lapses sooner than the file then raises no alert of its own.
+One CRL in a CA file gets none of the `detail` remedies above: one that names a general name
+`cryptography` does not support, such as an x400Address, in its authority key identifier or issuer
+extensions. A start refuses that CRL in a CRL setting, and loads it from a CA file unjudged (vault
+BACKLOG #3506). While a hop holds a copy of that CA file's CRLs that differs from the file, each pass
+logs an ERROR that the scan could not judge the copies live hops hold. The row is then dated by the
+file alone, so an alert for it has an empty `detail`, and a held copy that lapses sooner than the
+file raises no alert of its own.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|

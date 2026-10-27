@@ -325,8 +325,8 @@ def judge_every_crl(
     start and the running-hop reload pass it. The expiry scan's check of a CRL in a CA file does
     not, so what it reports for such a CRL is what it reported before #3506: a hold on engine PR
     2566 (vault row #4532) found that that check reported it, by the ``ValueError``, as one to
-    replace before a restart, a report it had not made before. A start loads such a CRL from a CA
-    file unjudged.
+    replace before a restart, a report it had not made before. ``docs/CONFIGURATION.md``, under
+    ``[cert_monitor]``, says what it reports.
 
     The strict sibling of :func:`read_soonest_crl_facts`, for a context load (``harden_crl_check``)
     and the running-hop reload (BACKLOG #299). The monitor skips a block it cannot judge so one bad
