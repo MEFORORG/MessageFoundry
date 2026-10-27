@@ -300,7 +300,9 @@ export function pinTargetsOf(envs: readonly PinnableEnvironment[]): PinTarget[] 
   for (const env of envs) {
     out.push({ url: env.url, caFile: env.caFile });
     for (const shard of env.shards ?? []) {
-      out.push({ url: shard.url, caFile: shard.caFile ?? env.caFile });
+      // "" inherits like an absent key, as trustPinsFor reads "" as "no caFile"; it is not an opt-out.
+      const own = shard.caFile === "" ? undefined : shard.caFile;
+      out.push({ url: shard.url, caFile: own ?? env.caFile });
     }
   }
   return out;
@@ -324,7 +326,9 @@ type PathFlavour = Pick<typeof path, "sep" | "isAbsolute" | "normalize">;
  */
 export function isFullyQualifiedPath(file: string, flavour: PathFlavour = path): boolean {
   if (flavour.sep === "\\") {
-    return /^[A-Za-z]:[\\/]/.test(file) || /^[\\/]{2}[^\\/]/.test(file);
+    // `[^\\/.?]` after the two separators refuses the device namespaces `\\.\` and `\\?\`. A device
+    // such as `\\.\pipe\x` is not a file, and a read of it can block the extension host unbounded.
+    return /^[A-Za-z]:[\\/]/.test(file) || /^[\\/]{2}[^\\/.?]/.test(file);
   }
   return flavour.isAbsolute(file);
 }
@@ -371,7 +375,10 @@ export function trustPinsFor(
       out.push({
         kind: "refused",
         url,
-        reason: `caFile ${caFile} is not a full path (a drive-letter, UNC or / path)`,
+        reason:
+          flavour.sep === "\\"
+            ? `caFile ${caFile} is not a full path (on Windows: a drive-letter or UNC path)`
+            : `caFile ${caFile} is not an absolute path`,
       });
       continue;
     }
@@ -383,7 +390,10 @@ export function trustPinsFor(
     const file = flavour.normalize(caFile);
     const earlier = byKey.get(key);
     if (earlier !== undefined) {
-      if (earlier !== file) {
+      // Windows paths are case-insensitive, so C:\PKI\ca.pem and c:\pki\ca.pem are one file.
+      const same =
+        flavour.sep === "\\" ? earlier.toLowerCase() === file.toLowerCase() : earlier === file;
+      if (!same) {
         out.push({
           kind: "refused",
           url,

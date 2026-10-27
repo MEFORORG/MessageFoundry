@@ -776,7 +776,7 @@
               },
               "caFile": {
                 "type": "string",
-                "markdownDescription": "Optional full path (drive-letter, UNC or `/` path) to a PEM certificate to trust for this engine: its issuing CA, or its own self-signed certificate. Requests to this engine then verify against this file instead of the default roots. Verification is never turned off. The file is re-read when a request fails verification, so a renewed certificate written to the same path is followed."
+                "markdownDescription": "Optional full path (a drive-letter or UNC path on Windows, an absolute path elsewhere) to a PEM certificate to trust for this engine: its issuing CA, or its own self-signed certificate. Requests to this engine then verify against this file instead of the default roots. Verification is never turned off. The file is re-read when a request fails verification, so a renewed certificate written to the same path is followed."
               }
             }
           }

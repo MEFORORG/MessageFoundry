@@ -249,8 +249,10 @@ set `caFile` on its `messagefoundry.environments` entry (or on one shard):
   Requests to that `host:port` then verify against that file **instead of** the default roots. A pin
   applies to every request to that `host:port`, including `messagefoundry.engineUrl` when it names
   the same engine, and it wins over the certificate `messagefoundry.serviceConfig` names.
-- It must be a full path (a drive-letter, UNC or `/` path); a relative path is refused, so a
-  workspace can never choose the file. The setting is machine-scoped, so a checked-in
+- It must be a full path (a drive-letter or UNC path on Windows, an absolute path elsewhere); a
+  relative or root-relative path is refused, so a workspace can never choose the file. A `caFile`
+  that is refused or unreadable leaves that engine with no anchor at all; it never falls back to the
+  certificate `messagefoundry.serviceConfig` names. The setting is machine-scoped, so a checked-in
   `.vscode/settings.json` cannot add or change a pin. A shard without its own `caFile` uses its
   environment's.
 - A refused or unreadable `caFile` is named in the **MessageFoundry Engine** log, and so is an https
@@ -258,9 +260,11 @@ set `caFile` on its `messagefoundry.environments` entry (or on one shard):
 
 **A renewed certificate is followed.** The engine renews its generated certificate at startup, into
 the same file. When a request fails verification, the extension re-reads the file its anchor came
-from and, if the certificate changed, retries that request once against the new one. For the loopback
-engine with no anchor yet (it was started after the window opened), it asks the engine again, at most
-once a minute. Verification stays on for the retry.
+from (or a `caFile` it could not read earlier) and, if the certificate changed, retries that request
+once against the new one. For the loopback `messagefoundry.engineUrl` with no anchor yet (the engine
+was started after the window opened), it asks the engine again in the background, at most once a
+minute; that request still fails, and the status bar picks the certificate up when the answer
+arrives. Verification stays on for the retry.
 
 **The OS trust store.** Unmeasured. VS Code's `http.systemCertificates` (on by default) is meant to
 add the OS store to an extension's https requests. Reading the `@vscode/proxy-agent` 0.45.0 that VS

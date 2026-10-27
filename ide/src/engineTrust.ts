@@ -99,30 +99,54 @@ export function refreshEngineTrust(): Promise<boolean> {
   return run;
 }
 
+/** Anchors one refresh has gathered, keyed by host key, committed together at its end. */
+type Staged = Map<string, { readonly url: string; readonly anchor: Registered }>;
+
+function stage(next: Staged, url: string, anchor: Registered): void {
+  const key = engineHostKey(url);
+  if (key !== undefined) {
+    next.set(key, { url, anchor });
+  }
+}
+
 async function refreshOnce(): Promise<boolean> {
   const before = trustState();
-  // Drop every anchor first. Editing `messagefoundry.engineUrl` across hosts would otherwise leave
-  // the previous host's certificate registered for the life of the extension host, so a target the
-  // user moves away from and back to would be trusted from a cached read rather than a fresh one.
+  const next: Staged = new Map();
+  const targets = pinTargetsOf(environments());
+  const claimed = stagePins(targets, next);
+  await anchorLocalEngine(claimed, next);
+  // Swap only now, after the subprocess has answered. Clearing first and then awaiting left EVERY
+  // engine unanchored for as long as `cert inventory` ran, so a request in that window failed against
+  // an engine trusted a moment earlier. Replacing the whole set still drops a host the user edited
+  // away from, so it is not trusted later from a cached read.
   clearEngineTrustAnchors();
   registered.clear();
-  const targets = pinTargetsOf(environments());
-  const pinned = applyPins(targets);
-  await anchorLocalEngine(pinned);
+  for (const { url, anchor } of next.values()) {
+    register(url, anchor);
+  }
   warnAboutUnanchoredTargets(targets);
   return trustState() !== before;
 }
 
 /**
- * Register every `caFile` pin `messagefoundry.environments` names, and return the host keys pinned.
+ * Stage every `caFile` pin `messagefoundry.environments` names, and return every host key a `caFile`
+ * CLAIMS, whether or not it could be used.
+ *
+ * A claimed key whose pin is refused or unreadable gets NO anchor, not the certificate
+ * `messagefoundry.serviceConfig` names. The user pinned that host so that a workspace-chosen file
+ * would not decide it; falling back to one when the pin breaks would undo that.
  *
  * No workspace and no CLI are involved, and that is why this runs BEFORE the workspace guard in
  * {@link anchorLocalEngine}: the setting is machine-scoped, so the file it names was chosen by the
  * user of this machine, and a pin is just as valid with no folder open or in an untrusted workspace.
  */
-function applyPins(targets: readonly PinTarget[]): Set<string> {
-  const pinned = new Set<string>();
+function stagePins(targets: readonly PinTarget[], next: Staged): Set<string> {
+  const claimed = new Set<string>();
   for (const pin of trustPinsFor(targets)) {
+    const key = engineHostKey(pin.url);
+    if (key !== undefined) {
+      claimed.add(key);
+    }
     if (pin.kind === "refused") {
       engineLog().warn(`messagefoundry.environments: not pinning ${pin.url}: ${pin.reason}`);
       continue;
@@ -132,11 +156,21 @@ function applyPins(targets: readonly PinTarget[]): Set<string> {
       engineLog().warn(`${read.problem} — not pinning ${pin.url}`);
       continue;
     }
-    register(pin.url, { file: pin.file, pem: read.pem, pinned: true });
-    pinned.add(pin.key);
+    stage(next, pin.url, { file: pin.file, pem: read.pem, pinned: true });
     engineLog().info(`trusting ${pin.file} for ${pin.url} (its caFile in messagefoundry.environments)`);
   }
-  return pinned;
+  return claimed;
+}
+
+/** The usable `caFile` configured for `key`, if any: the file a pin read at refresh time could not
+ *  register still deserves a re-read when a request to that engine fails. */
+function configuredPinFile(key: string): string | undefined {
+  for (const pin of trustPinsFor(pinTargetsOf(environments()))) {
+    if (pin.kind === "pin" && pin.key === key) {
+      return pin.file;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -144,7 +178,7 @@ function applyPins(targets: readonly PinTarget[]): Set<string> {
  * for the configured `messagefoundry.engineUrl` — unless an explicit `caFile` pin already covers that
  * `host:port`. The user named the pin; the CLI's answer is inferred from a workspace setting.
  */
-async function anchorLocalEngine(pinned: ReadonlySet<string>): Promise<void> {
+async function anchorLocalEngine(claimed: ReadonlySet<string>, next: Staged): Promise<void> {
   // The same guard the three sibling CLI calls in extension.ts use. Without it, opening a loose .py
   // file with no folder spawns a Python interpreter for a command that can only fail: isExecGated()
   // is false when there is no workspace, so it does not cover this on its own.
@@ -183,9 +217,9 @@ async function anchorLocalEngine(pinned: ReadonlySet<string>): Promise<void> {
   // declined, because re-deriving that here is the same split the bug came from.
   const decision = trustAnchorForTarget(facts, url, workspace);
   const key = engineHostKey(url);
-  if (decision.kind === "anchor" && key !== undefined && pinned.has(key)) {
+  if (decision.kind === "anchor" && key !== undefined && claimed.has(key)) {
     engineLog().info(
-      `${url} is pinned by a caFile in messagefoundry.environments, so the certificate ` +
+      `${url} has a caFile in messagefoundry.environments, so the certificate ` +
         `messagefoundry.serviceConfig names (${decision.file}) is not used for it.`,
     );
   } else if (decision.kind === "anchor") {
@@ -193,7 +227,7 @@ async function anchorLocalEngine(pinned: ReadonlySet<string>): Promise<void> {
     if (read.pem === undefined) {
       engineLog().warn(`${read.problem} — not trusting it`);
     } else {
-      register(url, { file: decision.file, pem: read.pem, pinned: false });
+      stage(next, url, { file: decision.file, pem: read.pem, pinned: false });
       engineLog().info(`trusting the engine certificate at ${decision.file} for ${url}`);
     }
   } else if (decision.kind === "notLocal") {
@@ -255,50 +289,49 @@ function readAnchorPem(file: string): PemRead {
  * resolves true only when an anchor DIFFERENT from `usedCa` is now registered for that engine, which
  * is engineClient's cue to retry the request once.
  *
- * Two cases, cheapest first:
- *   * an anchor is registered for that `host:port`: re-read ITS file. The engine renews its generated
- *     pair at startup into the same file (ADR 0172, 2026-09-26 amendment), and a `caFile` an
- *     administrator rotates in place behaves the same way. Nothing is spawned.
- *   * otherwise, or when that file has not changed, and the target is loopback: run the full refresh,
- *     at most once per {@link FAILURE_REFRESH_MIN_MS}. That covers an engine whose certificate moved,
- *     and the first-run gap: an engine started after the window opened mints its certificate only
- *     then, so activation found nothing to anchor.
+ * Two cases:
+ *   * a file describes that `host:port` — the registered anchor's, or a configured `caFile` that
+ *     could not be read at refresh time (a share not yet mounted): re-read it, synchronously and
+ *     capped. The engine renews its generated pair at startup into the same file (ADR 0172,
+ *     2026-09-26 amendment), and a `caFile` rotated in place behaves the same way. Nothing is
+ *     spawned, so the request's own timeout still bounds the wait.
+ *   * otherwise (no file, or its certificate is the one that just failed), for the engine
+ *     `messagefoundry.engineUrl` names when it is loopback and has no `caFile`: start the full refresh in the BACKGROUND, at most once per
+ *     {@link FAILURE_REFRESH_MIN_MS}, and answer false. That covers the first-run gap (an engine
+ *     started after the window opened mints its certificate only then). It is not awaited because
+ *     it spawns the engine's CLI, which has no timeout; a request waiting on it would no longer
+ *     honour its own. The refresh re-probes the status bar when it registers something.
  *
- * A non-loopback target with no pin gets nothing: no file of this machine describes it.
+ * Every other target gets nothing: the CLI anchors only `engineUrl`'s host, and no file of this
+ * machine describes the rest.
  *
  * Exported for the shell test; production reaches it through {@link registerEngineTrust}.
  */
-export async function followCertificateChange(
-  url: string,
-  usedCa: string | undefined,
-): Promise<boolean> {
+export function followCertificateChange(url: string, usedCa: string | undefined): Promise<boolean> {
   const key = engineHostKey(url);
   if (key === undefined) {
-    return false;
+    return Promise.resolve(false);
   }
   const held = registered.get(key);
-  const read = held === undefined ? undefined : readAnchorPem(held.file).pem;
-  if (held !== undefined && read !== undefined && read !== usedCa) {
-    if (read !== held.pem) {
-      register(url, { ...held, pem: read });
-      engineLog().info(`the certificate at ${held.file} changed; trusting the new one for ${url}`);
+  const file = held?.file ?? configuredPinFile(key);
+  const read = file === undefined ? undefined : readAnchorPem(file).pem;
+  if (file !== undefined && read !== undefined && read !== usedCa) {
+    if (read !== held?.pem) {
+      register(url, { file, pem: read, pinned: held?.pinned ?? true });
+      engineLog().info(`the certificate at ${file} changed; trusting it for ${url}`);
     }
     // Equal to `held.pem` means another request already followed it; this one retries all the same.
-    return true;
+    return Promise.resolve(true);
   }
-  // A pin is never replaced by the CLI's answer, so asking the engine again would spawn for nothing.
   const now = Date.now();
-  if (
-    held?.pinned === true ||
-    !isLocalEngine(url) ||
-    now - lastFailureRefresh < FAILURE_REFRESH_MIN_MS
-  ) {
-    return false;
+  // A caFile, registered or only configured, wins over the CLI's answer, so asking would change nothing.
+  const pinnedHere = held?.pinned === true || (held === undefined && file !== undefined);
+  const cliCanAnchor = !pinnedHere && key === engineHostKey(engineUrl()) && isLocalEngine(url);
+  if (cliCanAnchor && now - lastFailureRefresh >= FAILURE_REFRESH_MIN_MS) {
+    lastFailureRefresh = now;
+    void refreshEngineTrustThenRecheck();
   }
-  lastFailureRefresh = now;
-  await refreshEngineTrust();
-  const after = registered.get(key);
-  return after !== undefined && after.pem !== usedCa;
+  return Promise.resolve(false);
 }
 
 /** Drop every anchor and reset the failure-refresh rate limit. For the shell test only. */

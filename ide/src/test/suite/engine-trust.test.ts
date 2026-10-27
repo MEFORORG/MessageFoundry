@@ -415,6 +415,10 @@ suite("per-target caFile pins (BACKLOG #1695, residual a)", () => {
       ["certs\\ca.pem", path.win32],
       ["\\pki\\ca.pem", path.win32],
       ["C:pki\\ca.pem", path.win32],
+      ["/pki/ca.pem", path.win32],
+      // Device namespaces are not files, and a read of one can block the extension host.
+      ["\\\\.\\pipe\\x", path.win32],
+      ["\\\\?\\C:\\pki\\ca.pem", path.win32],
     ];
     for (const [caFile, flavour] of cases) {
       const [decision] = trustPinsFor([{ url: "https://prod:8765", caFile }], flavour);
@@ -459,6 +463,27 @@ suite("per-target caFile pins (BACKLOG #1695, residual a)", () => {
     const refusal = decisions[1];
     assert.ok(refusal?.kind === "refused");
     assert.match(refusal.reason, /already pinned to \/etc\/mf\/prod-ca\.pem/);
+  });
+
+  test("on Windows two spellings of one file differing only in case are one file", () => {
+    const decisions = trustPinsFor(
+      [
+        { url: "https://prod:8765", caFile: "C:\\PKI\\ca.pem" },
+        { url: "https://prod:8765", caFile: "c:\\pki\\ca.pem" },
+      ],
+      path.win32,
+    );
+    assert.deepStrictEqual(
+      decisions.map((d) => d.kind),
+      ["pin"],
+    );
+  });
+
+  test("a shard's empty caFile inherits its environment's, like an absent one", () => {
+    const [, shard] = pinTargetsOf([
+      { url: "https://prod:8765", caFile: POSIX_PIN, shards: [{ url: "https://p1:8765", caFile: "" }] },
+    ]);
+    assert.strictEqual(shard?.caFile, POSIX_PIN);
   });
 
   test("the remote remedy names caFile", () => {

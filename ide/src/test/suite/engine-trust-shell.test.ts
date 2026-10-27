@@ -339,6 +339,13 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
   const RENEWED = "-----BEGIN CERTIFICATE-----\nrenewed\n-----END CERTIFICATE-----\n";
 
+  /** Let a background refresh finish: the stubbed CLI answers synchronously, so a few turns do. */
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 5; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
   test("a caFile pins a REMOTE environment target — the case serviceConfig cannot cover", async () => {
     const caFile = plantCert(path.join("pki", "prod-ca.pem"));
     stubConfig.engineUrl = REMOTE;
@@ -444,13 +451,72 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(await trust.refreshEngineTrust(), false);
 
     stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
-    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), true);
+    // The refresh runs in the BACKGROUND: it spawns a CLI with no timeout, and a request awaiting it
+    // would stop honouring its own. So this request is not retried; the anchor lands shortly after.
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), false);
+    await settle();
+    assert.strictEqual(invocations.length, 2, "the background refresh never ran");
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
 
     // The rate limit: a second failure straight away does not spawn the CLI again.
-    const spawned = invocations.length;
     assert.strictEqual(await trust.followCertificateChange(LOOPBACK, PEM), false);
+    await settle();
+    assert.strictEqual(invocations.length, 2);
+  });
+
+  test("a loopback target that is not engineUrl's host never spawns the CLI", async () => {
+    // The CLI anchors only engineUrl's host:port, so for this target a spawn could never succeed and
+    // would repeat once a minute for the life of the window.
+    stubConfig.environments = [{ name: "LOCAL", url: "https://localhost:8765" }];
+    await trust.refreshEngineTrust();
+    const spawned = invocations.length;
+
+    assert.strictEqual(await trust.followCertificateChange("https://localhost:8765", undefined), false);
+    await settle();
     assert.strictEqual(invocations.length, spawned);
+  });
+
+  test("a caFile unreadable at refresh time is read when a request to it fails", async () => {
+    const caFile = path.join(ws, "pki", "late-ca.pem"); // e.g. a share not mounted at activation
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
+
+    plantCert(path.join("pki", "late-ca.pem"));
+
+    assert.strictEqual(await trust.followCertificateChange(REMOTE, undefined), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+  });
+
+  test("an unusable loopback caFile leaves NO anchor rather than the serviceConfig certificate", async () => {
+    // The user pinned this host so a workspace-chosen file would not decide it.
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    stubConfig.environments = [
+      { name: "LOCAL", url: LOOPBACK, caFile: path.join(ws, "pki", "missing.pem") },
+    ];
+
+    await trust.refreshEngineTrust();
+
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+    // The control: drop the caFile and the same inventory anchors the loopback engine.
+    stubConfig.environments = [];
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("a refresh keeps the previous anchors in force while the CLI runs", async () => {
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    await trust.refreshEngineTrust();
+
+    let caDuringCli: unknown = "not observed";
+    const answer = childProcess.execFile;
+    childProcess.execFile = ((...args: unknown[]) => {
+      caDuringCli = engineClient.tlsOptions(new URL(LOOPBACK)).ca;
+      return (answer as (...a: unknown[]) => unknown)(...args);
+    }) as unknown as typeof childProcess.execFile;
+    await trust.refreshEngineTrust();
+
+    assert.strictEqual(caDuringCli, PEM, "the anchor was dropped while the subprocess ran");
   });
 
   test("a pinned LOOPBACK target whose file is unchanged never falls back to the CLI", async () => {
