@@ -248,38 +248,53 @@ def test_a_composer_enabled_flag_reads_strictly(spelling: str, want: bool, cast:
 
 
 @pytest.mark.parametrize("key", _COMPOSER_KEYS)
-def test_a_composer_flag_takes_its_default_on_none_and_refuses_an_unknown_spelling(
-    key: str,
-) -> None:
-    assert resolve_env_settings({key: env("k", default=None)}, {})[key] is True
+def test_a_composer_flag_reads_none_as_off_and_refuses_an_unknown_spelling(key: str) -> None:
+    # Off, not the composer's default of on: the readers' rule is that a falsy flag is off, so a
+    # None that used to reach them as off must not now start a token hop.
+    assert resolve_env_settings({key: env("k", default=None)}, {})[key] is False
     with pytest.raises(WiringError, match=f"setting '{key}' \\(env 'k'\\): value is not a valid"):
         resolve_env_settings({key: env("k")}, {"k": "maybe"})
 
 
+def _names_bool(annotation: ast.expr | None) -> bool:
+    """Whether an annotation is ``bool`` or a ``|`` union with ``bool`` as a member."""
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        return _names_bool(annotation.left) or _names_bool(annotation.right)
+    return isinstance(annotation, ast.Name) and annotation.id == "bool"
+
+
 def _composer_bool_params() -> set[tuple[str, str, str]]:
-    """Every keyword parameter annotated ``bool`` on a ``with_*`` function under
-    ``messagefoundry/transports/``, read from the source so no composer is missed for not being
-    imported: ``(module, composer, parameter)``."""
+    """Every keyword parameter whose annotation names ``bool`` on a ``with_*`` function, sync or
+    async, anywhere under ``messagefoundry/transports/``, read from the source so no composer is
+    missed for not being imported: ``(module, composer, parameter)``."""
     import messagefoundry.transports as transports
 
+    root = Path(transports.__file__).parent
     found: set[tuple[str, str, str]] = set()
-    for path in sorted(Path(transports.__file__).parent.glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name.startswith("with_"):
-                for arg in node.args.kwonlyargs:
-                    if arg.annotation is not None and ast.unparse(arg.annotation) == "bool":
-                        module = f"messagefoundry.transports.{path.stem}"
-                        found.add((module, node.name, arg.arg))
+    for path in sorted(root.rglob("*.py")):
+        module = ".".join(
+            ["messagefoundry", "transports", *path.relative_to(root).with_suffix("").parts]
+        )
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(
+                "with_"
+            ):
+                found.update(
+                    (module, node.name, arg.arg)
+                    for arg in node.args.kwonlyargs
+                    if _names_bool(arg.annotation)
+                )
     return found
 
 
-def test_every_composer_bool_parameter_writes_a_listed_key_with_its_default() -> None:
+def test_every_composer_bool_parameter_writes_a_listed_key() -> None:
     # The census: a composer bool flag the strict read does not list would read "false" as True
     # again, silently. The key each flag writes is found by flipping it, so the table is checked
     # against what the composer does, not against a second copy of its key names.
-    written: dict[str, bool] = {}
-    for module, composer, param in _composer_bool_params():
+    params = _composer_bool_params()
+    assert params, "the census found no composer flag, so it is reading nothing"
+    written: set[str] = set()
+    for module, composer, param in params:
         fn = getattr(importlib.import_module(module), composer)
         default = inspect.signature(fn).parameters[param].default
         on = fn(Rest(url="https://partner.example.org/in"), **_COMPOSER_ARGS[composer])
@@ -289,10 +304,9 @@ def test_every_composer_bool_parameter_writes_a_listed_key_with_its_default() ->
             **{param: not default},
         )
         (key,) = [k for k in on.settings if on.settings[k] != off.settings.get(k)]
-        assert on.settings[key] is default
-        written[key] = default
-    assert written == dict(_COMPOSER_BOOL_SETTINGS)
-    assert all(_bool_settings().defaults[key] is d for key, d in written.items())
+        written.add(key)
+    assert written == set(_COMPOSER_BOOL_SETTINGS)
+    assert all(_bool_settings().defaults[key] is False for key in written)
 
 
 _COMPOSER_MODULE = """
@@ -356,9 +370,7 @@ def test_an_env_ftp_tls_unknown_spelling_is_refused_value_withheld() -> None:
     msg = str(ei.value)
     assert "(env 'ftp_tls'): value is not a valid bool for tls" in msg
     assert planted not in msg
-    with pytest.raises(
-        WiringError, match="env reference 't' with a bool cast: default= is not"
-    ) as di:
+    with pytest.raises(WiringError, match="Ftp tls env 't': default= is not a boolean") as di:
         Ftp(host="ftp.example.org", remote_dir="/in", tls=env("t", default=planted))
     assert planted not in str(di.value)
 
@@ -371,6 +383,18 @@ def test_a_literal_ftp_tls_is_mapped_as_before() -> None:
 def test_the_derived_ftp_protocol_ref_has_a_stable_repr() -> None:
     ref = Ftp(host="h", remote_dir="/in", tls=env("T")).settings["protocol"]
     assert repr(ref) == "EnvRef(key='t', default=<unset>, cast=bool for tls)"
+
+
+@pytest.mark.parametrize("cast", [None, str, bool], ids=["uncast", "str", "bool"])
+def test_two_builds_of_one_env_ftp_tls_are_equal(cast: Any) -> None:
+    # A reload decides whether a connection changed by comparing its prior spec with the new one.
+    # A fresh closure per build compared unequal, so every reload read the connection as changed.
+    # The control: a different key is a different spec.
+    def build(key: str) -> Any:
+        return Ftp(host="h", remote_dir="/in", tls=env(key, cast=cast))
+
+    assert build("t") == build("t")
+    assert build("t") != build("u")
 
 
 _FTP_MODULE = """
@@ -417,3 +441,36 @@ def test_a_pin_beside_a_ca_that_an_env_plain_ftp_never_reads_is_refused(tmp_path
         registry_anchor_specs(reg, {"ftp_tls": "false"})
     (spec,) = registry_anchor_specs(reg, {"ftp_tls": "true"})
     assert spec.label == "outbound:OB_FTP"
+
+
+@pytest.mark.parametrize("direction", ["inbound", "outbound"])
+def test_a_ca_beside_an_env_plain_ftp_is_refused_once_resolved(
+    tmp_path: Path, direction: str
+) -> None:
+    # Ftp(tls=False, tls_ca_file=...) is refused when built; with an env() tls the same CA, with no
+    # pin, is refused when the connection's settings resolve, at start, check and dry run alike.
+    # The control: TLS on builds.
+    from messagefoundry.pipeline.wiring_runner import _source_config
+
+    spec = (
+        "Ftp(host='ftp.example.org', remote_dir='/in', tls=env('ftp_tls'), tls_ca_file='/ca.pem')"
+    )
+    if direction == "inbound":
+        graph = f"inbound('X_FTP', {spec}, router='r')\n@router('r')\ndef r(msg):\n    return []\n"
+    else:
+        graph = f"outbound('X_FTP', {spec})\n"
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import Ftp, env, inbound, outbound, router\n" + graph,
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+
+    def build(spelling: str) -> object:
+        values = {"ftp_tls": spelling}
+        if direction == "inbound":
+            return _source_config(reg.inbound["X_FTP"], "127.0.0.1", values)
+        return _dest(reg, "X_FTP", values)
+
+    with pytest.raises(WiringError, match="Ftp tls_ca_file would never be read"):
+        build("false")
+    assert build("true") is not None
