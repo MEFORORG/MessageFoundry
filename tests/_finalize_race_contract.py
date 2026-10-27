@@ -26,15 +26,15 @@ Paired arms against a local PostgreSQL 16.14, running THIS function rather than 
 the lock, all 30 rounds pass; with the per-message finalize advisory lock patched out, it raises at
 round 1, and a counting twin of the same body stranded 28 of 30. ROUND 0 PASSED EVEN IN THE MUTANT
 ARM, so a single-round test would have falsely passed over a store with no lock at all. At roughly a
-0.93 per-round failure rate, 30 rounds is far more headroom than that backend needs -- it is kept
-because the SQL Server rate below is unmeasured, not because Postgres needs it.
+0.93 per-round failure rate, 30 rounds is far more headroom than that backend needs.
 
-The SQL Server figure is CARRIED OVER from Postgres, never measured there -- its applock is a
-different mechanism (``sp_getapplock``) under a different snapshot rule, so the per-round failure
-rate could differ. Read the gated ``sqlserver-store`` CI job for that backend's first real result:
-``test_concurrent_mark_done_strands_rounds_without_the_finalize_applock`` in that suite removes ONLY
-the finalize applock, runs :func:`count_round_statuses`, and prints the per-round failure rate
-(BACKLOG #1610). Replace the carried-over figure with that printed line once it has been read.
+SQL Server was measured separately, because its applock is a different mechanism
+(``sp_getapplock``) under a different snapshot rule. With ONLY the finalize applock removed, 29 of
+30 rounds were stranded (0.97 per round) on both SQL Server 2022 and SQL Server 2025, in CI run
+40452739332 on PR 2554 at head 95def813 (BACKLOG #1610). So 30 rounds gives ample headroom on both
+backends. ``test_concurrent_mark_done_strands_rounds_without_the_finalize_applock`` in the gated
+``sqlserver-store`` suite re-measures this on every run: it removes ONLY the finalize applock, runs
+:func:`count_round_statuses`, and prints the per-round failure rate to the job log.
 
 TWO BACKENDS, DELIBERATELY: THERE IS NO SQLITE ARM, and one would be vacuous rather than missing.
 SQLite has no per-message finalize lock to remove -- ``_lock_finalize_batch`` exists only in

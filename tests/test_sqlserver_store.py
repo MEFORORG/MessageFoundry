@@ -5918,9 +5918,11 @@ async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> No
     the round count; the shared module is what keeps this leg and the Postgres one asking the same
     question rather than two hand-synced copies drifting apart.
 
-    THIS BACKEND'S NUMBER IS UNMEASURED. The 30 rounds were measured against Postgres, whose lock is
-    a different mechanism under a different snapshot rule. The negative control below prints this
-    backend's per-round rate with the lock removed; the ``sqlserver-store`` CI job log carries it.
+    This backend's rate was measured separately, because its lock is a different mechanism under a
+    different snapshot rule from Postgres: with only the finalize applock removed, 29 of 30 rounds
+    were stranded (0.97 per round) on SQL Server 2022 and 2025 alike, in CI run 40452739332 on PR
+    2554 at head 95def813 (BACKLOG #1610). The negative control below re-measures it on every run
+    and prints the rate; the ``sqlserver-store`` CI job log carries it.
     """
     from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
 
