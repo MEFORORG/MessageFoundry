@@ -614,7 +614,9 @@ def test_seat_locks_whose_session_is_gone_are_listed_and_left_locked(fx: Fx, sle
     assert set(stale) == {"repo-wip", "repo-m-unpushed"}, stale
     assert stale["repo-wip"]["state"] == "NO RECORD"
     assert stale["repo-m-unpushed"]["state"] == "DEAD"
-    assert stale["repo-wip"]["command"].endswith(f"worktree unlock '{fx.paths['wip'].as_posix()}'")
+    command = stale["repo-wip"]["command"]
+    assert f"worktree unlock '{fx.paths['wip'].as_posix()}'" in command
+    assert command.startswith("if ([Environment]::MachineName -ne "), "no host circuit breaker"
     md = (fx.out / "latest.md").read_text(encoding="utf-8")
     assert "### e. Seat locks whose session is gone (2)" in md
 
@@ -622,6 +624,17 @@ def test_seat_locks_whose_session_is_gone_are_listed_and_left_locked(fx: Fx, sle
     listed = _git(fx.primary, "worktree", "list", "--porcelain")
     for reason in locks.values():
         assert f"locked {reason}" in listed
+
+    # The proposed command, pasted on this host, unlocks exactly that tree.
+    subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    listed = _git(fx.primary, "worktree", "list", "--porcelain")
+    assert f"locked builder {gone}" not in listed
+    assert f"locked manager {dead}" in listed
 
 
 def test_an_emptied_worktree_folder_is_listed_in_section_f(fx: Fx) -> None:

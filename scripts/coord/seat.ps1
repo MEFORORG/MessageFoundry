@@ -852,8 +852,9 @@ function Invoke-SeatWorktreeLock {
 
     .DESCRIPTION
         Why, and the rules, are scripts/worktree/worktree-audit.ps1's and seat-lock.ps1's headers.
-        It runs on -Prompt (SessionStart), -Declare and -Record (every Stop), and also when the shared
-        registry is down: the lock is local git state, so an outage must not leave a session unlocked.
+        It runs on -Prompt (SessionStart) and -Declare, and on -Prompt also when the shared registry is
+        down: the lock is local git state, so an outage must not leave a session unlocked. Not on
+        -Record; seat-lock.ps1's header says why.
         A copy of this script with no seat-lock.ps1 beside it (a test sandbox that copies seat.ps1
         alone) says so and records nothing: the lock is not this record's to fail.
     #>
@@ -906,7 +907,7 @@ try {
         if ($PSCmdlet.ParameterSetName -in 'Record', 'Prompt') {
             # The lock is local; it does not wait on the share. No seat is known here, so an existing
             # lock of this session's keeps its label.
-            $null = Invoke-SeatWorktreeLock -Wt $wt -SessionKey (Get-SessionKey -Payload $payload -Override $SessionId).Key -KeepLabel
+            if ($Prompt) { $null = Invoke-SeatWorktreeLock -Wt $wt -SessionKey (Get-SessionKey -Payload $payload -Override $SessionId).Key -KeepLabel }
             [System.Console]::Error.WriteLine("seat.ps1: the shared seat registry did not resolve, so nothing was recorded: $($seatsRes.Error)")
             exit 0
         }
@@ -1139,7 +1140,7 @@ try {
     # session unlocked. -Close does not unlock: only the SessionEnd hook does (seat-lock.ps1 says why).
     # The line is printed AFTER `wrote <path>`, which callers parse as stdout's first line.
     $lockLine = ''
-    if ($Declare -or $Prompt -or $Record) {
+    if ($Declare -or $Prompt) {
         $lockLine = Invoke-SeatWorktreeLock -Wt $wt -Seat ([string]$rec.seat) -SessionKey $sk.Key
     }
 

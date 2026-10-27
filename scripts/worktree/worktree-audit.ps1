@@ -115,7 +115,8 @@ function Get-StaleSeatLocks {
 
         Gone is Get-SeatLockReading's rule. A LIVE, UNVERIFIED or UNREADABLE session is never listed:
         this feeds a report that proposes an unlock, and an unlock under a live seat re-opens the tree
-        to the GC. A Codex lock is never listed, because nothing here can tell that it is gone.
+        to the GC. A Codex lock is listed as CODEX: nothing here can tell whether it is gone, and
+        nothing else would ever report one a crashed Codex seat left.
     #>
     param([object[]]$Worktrees, [string[]]$ConfigRoot)
     $out = [System.Collections.Generic.List[object]]::new()
@@ -129,7 +130,7 @@ function Get-StaleSeatLocks {
     foreach ($x in $seatLocks) {
         $w = $x.W; $p = $x.P
         $r = Get-SeatLockReading -SessionKey $p.SessionKey -ConfigRoot $ConfigRoot -Unreadable $unreadable
-        if (-not $r.Gone) { continue }
+        if (-not ($r.Gone -or $r.State -eq 'CODEX')) { continue }
         $out.Add([pscustomobject]@{ Path = $w.Path; Reason = $w.LockReason; Seat = $p.Seat; SessionKey = $p.SessionKey; State = $r.State; Detail = $r.Detail })
     }
     return @($out)
@@ -192,7 +193,10 @@ function Find-EmptiedWorktrees {
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return @() }
     $registered = @{}
     foreach ($w in @($Worktrees)) { if ($w) { $registered[(ConvertTo-Norm $w.Path)] = $true } }
+    # `.ccd-trash~*` is the Desktop's own tombstone for a tree it is deleting in the background; the
+    # Desktop's predicate skips those names too.
     $emptied = @(Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue | Where-Object {
+            -not $_.Name.StartsWith('.ccd-trash~') -and
             -not (Test-Path -LiteralPath (Join-Path $_.FullName '.git')) -and -not $registered.ContainsKey((ConvertTo-Norm $_.FullName))
         })
     if ($emptied.Count -eq 0) { return @() }

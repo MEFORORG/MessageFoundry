@@ -33,10 +33,18 @@ try {
     $s = Resolve-CcxHookSession -Text $raw -ReadOnly
     if (-not $s.SessionId) { exit 0 }
     # /clear and /resume end a session id while the process, and its seat, go on in the same tree.
-    # The lock stays; seat.ps1 -Record takes it over under the new id at the next Stop.
+    # The lock stays and keeps protecting the tree. No later exit names the old id, so it outlives
+    # the session, and hygiene-report.ps1 section e lists it then.
     if ($s.Payload -and $s.Payload.PSObject.Properties['reason'] -and [string]$s.Payload.reason -in @('clear', 'resume')) { exit 0 }
-    $dir = if ($s.Dir) { $s.Dir } else { (Get-Location).ProviderPath }
-    $root = if ($s.Root) { $s.Root } else { Get-CcxWorktreeRoot $dir }
+    # The pinned worktree first. With no pin (a session since /clear), the input's own `cwd`: the
+    # helper refuses to answer for an unpinned linked worktree, but an unlock removes only a lock
+    # naming THIS session id, so following the `cwd` cannot release anyone else's.
+    $root = $s.Root
+    if (-not $root -and $s.Payload -and $s.Payload.PSObject.Properties['cwd']) {
+        $p = Get-CcxHookPayloadCwd -Payload $s.Payload
+        if ($p.Cwd) { $root = Get-CcxWorktreeRoot $p.Cwd }
+    }
+    if (-not $root) { $root = Get-CcxWorktreeRoot (Get-Location).ProviderPath }
     if (-not $root) { exit 0 }
     . (Join-Path (Split-Path -Parent $PSScriptRoot) 'worktree\seat-lock.ps1')
     $null = Remove-SeatWorktreeLock -Worktree $root -SessionKey (ConvertTo-SeatSessionKey $s.SessionId)

@@ -6,10 +6,12 @@
 
 .DESCRIPTION
     Dot-source this; it defines functions and does nothing on its own. seat.ps1 calls
-    Set-SeatWorktreeLock on the SessionStart -Prompt path, on -Declare, and on every Stop (-Record),
-    so a lock lost to a /clear, a shared-root outage or a co-tenant's exit is put back by the next
-    turn. Only the SessionEnd hook scripts/hooks/seat-unlock.ps1 calls Remove-SeatWorktreeLock: a
-    seat that ran -Close is often still open, and an early unlock re-opens it to the GC.
+    Set-SeatWorktreeLock on the SessionStart -Prompt path and on -Declare. NOT on every Stop
+    (-Record): that path runs the PRIMARY's seat.ps1 through the user-scope shim, so it would lock
+    trees whose own branch predates the unlock hook and never unlock them, and it follows a `cd` into
+    a sibling. Only the SessionEnd hook scripts/hooks/seat-unlock.ps1 calls
+    Remove-SeatWorktreeLock: a seat that ran -Close is often still open, and an early unlock re-opens
+    it to the GC.
     Why a lock at all, and the reason format, are in worktree-audit.ps1's header.
 
     NEITHER FUNCTION THROWS. Each returns an Action and a Detail, because both run inside hooks that
@@ -24,8 +26,8 @@
         refusal elsewhere in this repository is that such a session writes nothing for others.
       * Replace another holder's lock. Claude Code locks an `isolation: worktree` agent's tree while it
         is live (docs/SESSION-DRIFT-CONTROLS.md), and a person may lock one by hand. Those are kept, and
-        the caller is told. The one exception is a SEAT lock whose session reads DEAD or STALE, or has
-        no registry record: a seat arriving in that tree takes it over, so its own exit can clear it.
+        the caller is told. The one exception is a SEAT lock whose session reads DEAD or STALE: a
+        seat arriving in that tree takes it over, so its own exit can clear it.
         The takeover rewrites the `locked` file in place rather than unlocking and re-locking, so
         there is no moment in which the tree is unlocked.
       * Remove a lock this session did not place. Unlock removes only a seat lock naming this session
@@ -65,8 +67,9 @@ function Get-WorktreeLockState {
 function Set-SeatWorktreeLock {
     <#
     .SYNOPSIS
-        Lock $Worktree for this seat. Idempotent. Actions: locked, relabelled, taken-over, kept-own,
-        kept-foreign, skipped-primary, skipped-cloud, failed.
+        Lock $Worktree for this seat. Idempotent. Actions include at least locked, relabelled,
+        taken-over, kept-own, kept-foreign, skipped-primary, skipped-cloud, skipped-no-session-id and
+        failed.
     #>
     param(
         [string]$Worktree, [string]$Seat, [string]$SessionKey, [string[]]$ConfigRoot,
@@ -94,7 +97,12 @@ function Set-SeatWorktreeLock {
             if ($KeepLabel) { return [pscustomobject]@{ Action = 'kept-own'; Detail = $st.Reason } }
             $action = 'relabelled'
         }
-        elseif ($held -and (Get-SeatLockReading -SessionKey $held.SessionKey -ConfigRoot $ConfigRoot).Gone) { $action = 'taken-over' }
+        elseif ($held -and (Get-SeatLockReading -SessionKey $held.SessionKey -ConfigRoot $ConfigRoot).State -in @('DEAD', 'STALE')) {
+            # A positive dead signal only. NO RECORD is gone enough to REPORT, but a live seat this
+            # reader cannot see (a config root outside USERPROFILE) also reads that way, and taking
+            # its lock would let the newcomer's exit unlock the tree under it.
+            $action = 'taken-over'
+        }
         if (-not $action) {
             return [pscustomobject]@{ Action = 'kept-foreign'; Detail = "already locked by another holder: $($st.Reason)" }
         }
@@ -129,7 +137,7 @@ function Set-SeatWorktreeLock {
 function Remove-SeatWorktreeLock {
     <#
     .SYNOPSIS
-        Unlock $Worktree only if this session's seat lock holds it. Actions: unlocked, not-locked,
+        Unlock $Worktree only if this session's seat lock holds it. Actions include at least unlocked, not-locked,
         kept-foreign, skipped-primary, skipped-cloud, failed.
     #>
     param([string]$Worktree, [string]$SessionKey)

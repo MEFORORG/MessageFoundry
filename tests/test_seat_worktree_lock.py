@@ -231,16 +231,24 @@ def test_a_live_seats_lock_is_kept_and_a_dead_ones_is_taken_over(
     proc = declare(wt, home)
     assert "worktree lock: kept-foreign" in proc.stdout, proc.stdout
 
-    # The same seat with no registry record at all: gone, so the arriving seat takes it over.
+    # No registry record at all: reported elsewhere, but not taken over, because a live seat in a
+    # config root this reader cannot see reads the same way.
     (sessions / "1.json").unlink()
+    proc = declare(wt, home)
+    assert "worktree lock: kept-foreign" in proc.stdout, proc.stdout
+
+    # A positive dead signal: the record's pid is not running. Now the arriving seat takes it over.
+    dead = {"pid": 999999, "sessionId": OTHER_SID, "startedAt": int(time.time() * 1000)}
+    (sessions / "1.json").write_text(json.dumps(dead), encoding="utf-8")
     proc = declare(wt, home)
     assert "worktree lock: taken-over" in proc.stdout, proc.stdout
     assert lock_text(wt) == f"builder {SID}"
 
 
-def test_close_keeps_the_lock_and_the_next_stop_restores_a_lost_one(wt: Path, home: Path) -> None:
-    """A closed seat is often still open, so -Close must not unlock. And a lock lost while the
-    session runs (a co-tenant's exit, a /clear) is put back by the next Stop's -Record."""
+def test_close_keeps_the_lock_and_a_stop_never_places_one(wt: Path, home: Path) -> None:
+    """A closed seat is often still open, so -Close must not unlock. -Record (every Stop) runs the
+    primary's copy through the user-scope shim, so it must not lock: a tree whose own branch has no
+    unlock hook would never be unlocked."""
     declare(wt, home)
     proc = seat(wt, home, "-Close", "-SessionId", SID)
     assert proc.returncode == 0, proc.stderr
@@ -248,7 +256,36 @@ def test_close_keeps_the_lock_and_the_next_stop_restores_a_lost_one(wt: Path, ho
     git(wt, "worktree", "unlock", str(wt))
     proc = seat(wt, home, "-Record", "-SessionId", SID)
     assert proc.returncode == 0, proc.stderr
-    assert lock_text(wt) == f"builder {SID}"
+    assert lock_text(wt) is None
+
+
+def test_the_sessionend_hook_follows_the_cwd_when_it_starts_in_the_primary(
+    wt: Path, home: Path, repo: Path
+) -> None:
+    """Under the desktop app the hook starts in the primary; with no pin (a session since /clear)
+    it must still find the worktree from the input's cwd."""
+    declare(wt, home)
+    payload = json.dumps(
+        {"session_id": SID, "cwd": str(wt), "hook_event_name": "SessionEnd", "reason": "other"}
+    )
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(repo / "scripts" / "hooks" / "seat-unlock.ps1"),
+        ],
+        cwd=str(repo),
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=env_for(home),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert lock_text(wt) is None
 
 
 def test_the_sessionend_hook_skips_a_clear_and_a_resume(wt: Path, home: Path) -> None:

@@ -494,10 +494,14 @@ function Get-CloneReport($R) {
     }
     # A seat locks its worktree on arrival and unlocks it on a clean exit (worktree-audit.ps1 says why).
     # One that died keeps the lock, and then every reclaimer keeps the tree. Listed, never unlocked here.
+    # Each command carries the host circuit breaker CLAUDE.md section 5 requires: on a shared root the
+    # other PC has a tree at the same path, maybe with a live seat in it.
+    $thisHost = [Environment]::MachineName
     $rep.staleSeatLocks = @(foreach ($s in (Get-StaleSeatLocks -Worktrees $others -ConfigRoot $ConfigRoot)) {
+            $unlock = "git -C '$($root -replace "'", "''")' worktree unlock '$($s.Path -replace "'", "''")'"
             [ordered]@{
                 path = $s.Path; reason = $s.Reason; seat = $s.Seat; session = $s.SessionKey; state = $s.State; detail = $s.Detail
-                command = "git -C '$($root -replace "'", "''")' worktree unlock '$($s.Path -replace "'", "''")'"
+                command = "if ([Environment]::MachineName -ne '$thisHost') { Write-Host ""STOP     this must run on $thisHost, but this is `$([Environment]::MachineName); nothing ran"" } else { $unlock }"
             }
         })
     $rep.emptied = @(foreach ($e in (Find-EmptiedWorktrees -PrimaryPath $root -Worktrees $occ.Worktrees -LogRoot $DesktopLogRoot)) {
@@ -700,8 +704,8 @@ foreach ($f in $files) { Set-Content -LiteralPath $f.Path -Value $f.Text -Encodi
 Set-Content -LiteralPath $lastRun -Encoding utf8NoBOM -Value "OK $($report.generatedAt)"
 
 foreach ($c in $report.clones) {
-    Write-Output ("{0}: {1} worktrees, {2} proposed for removal, {3} need a human look, {4} hook line(s) flagged" -f `
-            $c.root, $c.worktrees.Count, $c.cleanup.remove.Count, $c.cleanup.human.Count, $c.hooks.flagged.Count)
+    Write-Output ("{0}: {1} worktrees, {2} proposed for removal, {3} need a human look, {4} hook line(s) flagged, {5} stale seat lock(s), {6} emptied folder(s)" -f `
+            $c.root, $c.worktrees.Count, $c.cleanup.remove.Count, $c.cleanup.human.Count, $c.hooks.flagged.Count, $c.staleSeatLocks.Count, $c.emptied.Count)
 }
 Write-Output "Report written: $(Join-Path $OutDir "hygiene-$stamp.md")"
 Write-Output "           and: $(Join-Path $OutDir "hygiene-$stamp.json")"
