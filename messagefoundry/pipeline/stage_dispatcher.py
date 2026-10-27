@@ -1305,13 +1305,14 @@ class StageDispatcher:
         if head_reschedule is not None:
             head_id, when = head_reschedule
             # The head is dated `when`, which the RETRY outcome parks the lane until. Only a retry
-            # that runs past it dates the head from now instead, so it never lands past-due.
+            # that runs past it dates the head from now instead, by the same escalated span, so it
+            # never lands past-due and fix A's backoff is kept.
+            span = max(when - self._clock(), _LANE_ERROR_BACKOFF_SECONDS)
             if not await self._land_while_holding(
                 lane,
                 "reschedule_claimed of the head",
                 lambda: self._store.reschedule_claimed(
-                    [head_id],
-                    when if self._clock() < when else self._clock() + _LANE_ERROR_BACKOFF_SECONDS,
+                    [head_id], when if self._clock() < when else self._clock() + span
                 ),
             ):
                 return

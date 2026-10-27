@@ -7094,7 +7094,7 @@ class RegistryRunner:
         CLUSTERED, IT STANDS DOWN, exactly where ``Engine.start()`` skips its unconditional reset
         (``reclaims_inflight()``). An ex-leader may still hold a row on this lane mid-send, and
         nothing here can tell its rows from the dead worker's. Recovery there stays where it was:
-        the leader's lease-reclaim sweep (Postgres) or the on-promotion reset (SQL Server). A node
+        at least the leader's lease-reclaim sweep (Postgres) and the on-promotion reset (SQL Server). A node
         that is not the leader runs nothing either. Single-node and engine-sharded, the lane is
         this node's own: a worker exists only for a lane this shard owns (ADR 0073), and the scope
         is that lane alone, so a sibling shard's rows are out of reach.
@@ -8199,8 +8199,8 @@ class RegistryRunner:
         """Re-pend the rows a per-lane worker was holding when its loop faulted, retrying until the
         write lands (BACKLOG #1611 steps 1 and 2) — the per-lane analogue of the pooled T17 head
         re-pend in :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
-        Returns True when the caller must return rather than claim again: the runner was stopped,
-        or this node lost leadership, while the rows were still held.
+        Returns True when the runner was stopped while the rows were still held, so the caller
+        returns rather than claiming again.
 
         The claim is its own committed transaction, so a fault in the handoff that follows leaves the
         claimed row INFLIGHT. Every claim path selects ``status='pending'``, so a worker that went on
@@ -8216,18 +8216,19 @@ class RegistryRunner:
 
         A runner stop ends the retry and leaves the rows INFLIGHT for ``reset_stale_inflight`` at
         the next start, as a cancelled worker's are; the backoff is :meth:`_stop_or_sleep`, and the
-        task stays cancellable. A node that is no longer the leader stops retrying too, and its
-        worker returns, as the delivery worker's own leadership check does: the rows then belong
-        to the successor's promotion recovery.
+        task stays cancellable. A node that is no longer the leader stops retrying too (False, so
+        the worker survives as it did before; a returned worker is not respawned): the rows then
+        belong to the successor's promotion recovery.
 
         Dates the rows into the future by the same backoff the caller is about to sleep, exactly as
         T17 does and for the same reason: a plain release leaves them past-due, so the sweep re-readies
         them and a broken dependency is re-claimed ~4x/s. ``reschedule_claimed`` is guarded
         ``status='inflight'`` and FIFO-neutral (``seq`` is never re-minted), so rows the worker already
         resolved are left untouched and the survivors keep their lane position — which is why a caller
-        may pass its whole claimed batch without tracking which row died. The claim's ``attempts``
-        increment stands, as it does under ``reset_stale_inflight``: ADR 0057 G6 needs it, so a row
-        that faults every pass is still bounded by ``max_attempts``.
+        may pass its whole claimed batch without tracking which row died. ``reschedule_claimed`` also
+        undoes the claim's ``attempts`` increment, as it always has here, so ``max_attempts`` does NOT
+        bound a row whose handoff faults every pass: the lane stays head-of-line blocked on it, and
+        the in-flight watch and the worker's fault log are what show it.
 
         A failure is caught, never raised: a re-pend that raises inside an except arm would kill the
         worker and leave the rows to the respawn's recovery (:meth:`_recover_respawned_lane`), a
@@ -8270,7 +8271,7 @@ class RegistryRunner:
                     )
                 return False
             if not self._coordinator.is_leader():
-                return True  # the successor's promotion recovery owns them; this worker returns
+                return False  # the successor's promotion recovery owns them now
             delay = _capped_backoff(
                 _WORKER_ERROR_BACKOFF_SECONDS, failures - 1, _REPEND_RETRY_CAP_SECONDS
             )
@@ -8465,7 +8466,7 @@ class RegistryRunner:
                 faults.failed(exc, "delivery worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 if await self._repend_claimed_on_fault("delivery", name, claimed, faults=faults):
-                    return  # stopped or demoted while holding them; see the helper
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9309,7 +9310,7 @@ class RegistryRunner:
                 faults.failed(exc, "router worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 if await self._repend_claimed_on_fault("router", name, claimed, faults=faults):
-                    return  # stopped or demoted while holding them; see the helper
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9657,7 +9658,7 @@ class RegistryRunner:
                 faults.failed(exc, "response worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 if await self._repend_claimed_on_fault("response", name, claimed, faults=faults):
-                    return  # stopped or demoted while holding them; see the helper
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9784,7 +9785,7 @@ class RegistryRunner:
                 )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 if await self._repend_claimed_on_fault("transform", name, claimed, faults=faults):
-                    return  # stopped or demoted while holding them; see the helper
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
