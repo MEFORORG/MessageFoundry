@@ -13,6 +13,7 @@ Every value here is synthetic.
 from __future__ import annotations
 
 import ast
+import os
 import sys
 from pathlib import Path
 
@@ -347,6 +348,56 @@ def test_the_rotation_fingerprint_reads_the_file_too(tmp_path: Path) -> None:
     }
 
 
+def test_a_hidden_file_is_ignored(tmp_path: Path) -> None:
+    directory = _directory(tmp_path)
+    _put(directory, ".MEFOR_STORE_PASSWORD.swp", _FROM_FILE)
+    _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)
+    assert secret_setting("MEFOR_STORE_PASSWORD", environ=_env(directory)) == _FROM_FILE
+
+
+@pytest.mark.parametrize("name", ["MEFOR_VALUE_", "MEFOR_VALUE_a-b", "MEFOR_VALUE_x y"])
+def test_a_value_file_name_that_is_not_a_variable_name_is_refused(
+    tmp_path: Path, name: str
+) -> None:
+    directory = _directory(tmp_path)
+    _put(directory, name, _FROM_FILE)
+    with pytest.raises(SecretsDirectoryError, match="names no setting"):
+        open_secrets_directory(_env(directory))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows file names ignore case")
+def test_two_value_files_that_differ_only_in_case_are_refused(tmp_path: Path) -> None:
+    directory = _directory(tmp_path)
+    _put(directory, "MEFOR_VALUE_EPIC_PASSWORD", _FROM_FILE)
+    _put(directory, "MEFOR_VALUE_Epic_Password", _FROM_FILE)
+    with pytest.raises(SecretsDirectoryError, match="which name one setting"):
+        open_secrets_directory(_env(directory))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a FIFO is a POSIX special file")
+def test_a_file_that_is_not_regular_is_refused_and_never_opened(tmp_path: Path) -> None:
+    directory = _directory(tmp_path)
+    os.mkfifo(directory / "MEFOR_STORE_PASSWORD", 0o600)
+    with pytest.raises(SecretsDirectoryError, match="is not a regular file"):
+        secret_setting("MEFOR_STORE_PASSWORD", environ=_env(directory))
+
+
+def test_a_byte_order_mark_is_not_part_of_the_value(tmp_path: Path) -> None:
+    directory = _directory(tmp_path)
+    _put(directory, "MEFOR_STORE_PASSWORD", b"\xef\xbb\xbf" + _FROM_FILE.encode() + b"\r\n")
+    assert secret_setting("MEFOR_STORE_PASSWORD", environ=_env(directory)) == _FROM_FILE
+
+
+def test_a_settings_load_checks_a_file_nothing_else_would_read(tmp_path: Path) -> None:
+    """A Vault token file on a site with no Vault is read by no provider, so the load checks it."""
+    directory = _directory(tmp_path)
+    _broaden(_put(directory, "MEFOR_SECRETS_VAULT_TOKEN", _FROM_FILE))
+    with pytest.raises(ValueError, match="MEFOR_SECRETS_VAULT_TOKEN is not restricted"):
+        load_settings(environ=_env(directory), default_file=False)
+    (directory / "MEFOR_SECRETS_VAULT_TOKEN").unlink()
+    load_settings(environ=_env(directory), default_file=False)  # the control
+
+
 # --- no moved module reads a secret-class variable straight from the environment --------------------
 
 _MOVED = (
@@ -359,35 +410,64 @@ _MOVED = (
 
 
 def _direct_reads(source: str) -> list[str]:
-    """The secret-class names ``source`` reads with ``os.environ.get``, ``os.environ[...]`` or
-    ``os.getenv``, through a literal or a module-level constant."""
+    """The secret-class names ``source`` reads with ``<environ>.get(...)``, ``os.environ[...]`` or
+    ``getenv(...)``, through a literal or a module-level constant (plain or annotated). An environ
+    is ``*.environ``, a name ``environ``, or a name bound to an expression that mentions one.
+
+    **Its reach, at least what it misses:** a name that is not a literal or a module constant, such
+    as a loop variable over a list of names. The pre-slice ``held_env_secret_values`` read that way,
+    so the per-reader tests above, not this census, are what pin each moved reader."""
     tree = ast.parse(source)
-    constants = {
-        target.id: node.value.value
-        for node in tree.body
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
-        for target in node.targets
-        if isinstance(target, ast.Name) and isinstance(node.value.value, str)
-    }
+    constants: dict[str, object] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = node.value.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.value, ast.Constant)
+        ):
+            constants[node.target.id] = node.value.value
 
     def named(arg: ast.expr) -> object:
         if isinstance(arg, ast.Constant):
             return arg.value
         return constants.get(arg.id) if isinstance(arg, ast.Name) else None
 
-    def is_environ(node: ast.expr) -> bool:
-        return isinstance(node, ast.Attribute) and node.attr == "environ"
+    # Names bound anywhere to an expression that mentions an environment, such as
+    # ``env = os.environ if environ is None else environ``: a ``.get`` on one is an environment read.
+    environ_aliases = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and "environ" in ast.unparse(node.value)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+
+    def is_environ(receiver: ast.expr) -> bool:
+        if isinstance(receiver, ast.Attribute):
+            return receiver.attr == "environ"
+        return isinstance(receiver, ast.Name) and (
+            receiver.id == "environ" or receiver.id in environ_aliases
+        )
 
     found: list[str] = []
-    for node in ast.walk(tree):
+    for item in ast.walk(tree):
         arg: ast.expr | None = None
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.args:
+        if isinstance(item, ast.Call) and item.args:
+            func = item.func
             if (
-                node.func.attr == "get" and is_environ(node.func.value)
-            ) or node.func.attr == "getenv":
-                arg = node.args[0]
-        elif isinstance(node, ast.Subscript) and is_environ(node.value):
-            arg = node.slice
+                isinstance(func, ast.Attribute) and func.attr == "get" and is_environ(func.value)
+            ) or (getattr(func, "attr", getattr(func, "id", None)) == "getenv"):
+                arg = item.args[0]
+        elif (
+            isinstance(item, ast.Subscript)
+            and isinstance(item.value, ast.Attribute)
+            and item.value.attr == "environ"
+        ):
+            arg = item.slice
         value = named(arg) if arg is not None else None
         if value in SECRET_SETTING_NAMES:
             found.append(str(value))
@@ -399,6 +479,15 @@ def test_a_moved_module_reads_no_secret_straight_from_the_environment(relative: 
     assert _direct_reads((_REPO / relative).read_text(encoding="utf-8")) == []
 
 
-def test_the_census_sees_a_direct_read() -> None:
-    planted = '_T = "MEFOR_STORE_VAULT_TOKEN"\nimport os\nx = os.environ.get(_T)\n'
+@pytest.mark.parametrize(
+    "planted",
+    [
+        '_T = "MEFOR_STORE_VAULT_TOKEN"\nimport os\nx = os.environ.get(_T)\n',
+        'import os\nenv = os.environ\nx = env.get("MEFOR_STORE_VAULT_TOKEN")\n',
+        'from os import getenv\n_T: str = "MEFOR_STORE_VAULT_TOKEN"\nx = getenv(_T)\n',
+        'import os\nx = os.environ["MEFOR_STORE_VAULT_TOKEN"]\n',
+    ],
+    ids=["constant", "aliased-environ", "bare-getenv-annotated", "subscript"],
+)
+def test_the_census_sees_a_direct_read(planted: str) -> None:
     assert _direct_reads(planted) == ["MEFOR_STORE_VAULT_TOKEN"]

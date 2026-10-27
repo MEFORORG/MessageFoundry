@@ -445,7 +445,8 @@ async def reconcile_rotation_meta(
     if fp_key is not None:
         current_id = _fingerprint_key_id(fp_key)
         prior_keys = {_fingerprint_key_id(k): k for k in prior_fingerprint_keys}
-        held: dict[str, str] = dict(held_env_secret_values(env_values))
+        # Off the event loop: the secrets directory read is file and access-list I/O.
+        held: dict[str, str] = dict(await asyncio.to_thread(held_env_secret_values, env_values))
         if extra_values:  # per-Connection env() credentials the engine resolved (same mechanism)
             held.update(extra_values)
         labels = dict(_ENV_SECRET_CLASSES)

@@ -36,22 +36,29 @@ without explicit, reviewed configuration."* A secret that unlocks PHI is held to
 
 ## Decision
 
-**A secret-class setting may come from a file in a secrets directory, and every reader of one goes
-through one accessor.** This is slice A of four. It adds a source and moves the readers; it refuses
+**A secret-class setting may come from a file in a secrets directory, read through one module.** This is slice A of four. It adds a source and moves the readers; it refuses
 nothing that starts today.
 
 1. **One list.** `messagefoundry/engine_secrets.py` holds `SECRET_SETTING_NAMES`, every
    secret-class setting by its environment name. `serviceenv` takes its two lists from it, so the
    NSSM reading and the accessor cannot disagree about what a secret is.
-2. **One accessor.** `secret_settings(names)` (and `secret_setting(name)`) returns, for each name,
-   the file's value when the directory has one, else the environment's value exactly as
-   `os.environ.get` gave it. The directory wins, so a site moves one setting at a time.
+2. **One accessor, one reader.** `secret_settings(names)` (and `secret_setting(name)`) returns,
+   for each name, the file's value when the directory has one, else the environment's value
+   exactly as `os.environ.get` gave it. The directory wins, so a site moves one setting at a time.
+   The Vault tokens and the rotation read go through it. Two readers merge a whole layer rather
+   than read named settings, and they use the module's directory reader directly with the same
+   rule: the settings load, which lays the directory's files over the environment layer, and the
+   `env()` values, whose names are the operator's.
 3. **The directory.** `MEFOR_SECRETS_DIRECTORY` names it by absolute path. Unset, nothing is read.
    Each file is named exactly as its variable. The reader refuses, at every enforcement setting:
    a relative path; a directory, or a file, that a known broad group can read or change, judged by
-   `restricted_file.broad_access_problem`, the check the store key file gets; a link on Windows; a
-   file named for no setting, so a typo does not fall back to the environment unseen; an empty
-   file, one that is not UTF-8, or one over 64 KiB. A refusal names the file and never the value.
+   `config.key_file_access.key_file_problem`, the check key files get; a link on Windows; a file
+   that is not a regular file; a file named for no setting, so a typo does not fall back to the
+   environment unseen, and two `env()` files whose names differ only in case; an empty file, one
+   that is not UTF-8, or one over 64 KiB. A file whose name starts with `.`, such as an editor's
+   swap file, is ignored. A refusal names the file and never the value. The settings load reads
+   every file the directory holds for a setting, so a file nothing else would read, such as a
+   Vault token on a site with no Vault, is still refused at start.
 4. **The directory's own access list is read.** A group that can add a file to the directory could
    supply a setting whatever the access list of the file it adds, so the directory is checked when
    it is opened, before any file in it.
@@ -110,7 +117,12 @@ each moved secret has an access check it did not have. The refusal in slice B ha
 point operators to.
 
 **Negative / risks** — the access check is a list of known broad groups, so a file that passes has
-not been shown reachable by the intended accounts alone. A file changed between its check and its
+not been shown reachable by the intended accounts alone. In particular it does not apply the
+config-source owner policy the settings file and the `env()` value file get: a directory or file
+writable by one named non-administrator account, or owned on POSIX by another account the engine
+can read as root, passes. A file in the directory also outranks the environment for every process
+that names the directory, so a one-off override through a variable in such a shell does not take
+effect. The directory is opened and checked again by each reader, several times in one start. A file changed between its check and its
 read is read as changed; the directory check limits who can make that change. A plain file is in
 any backup that copies it, so the directory belongs outside what a data-directory backup takes,
 until the wrapping spike decides otherwise. The right to delete a file inside the directory is not

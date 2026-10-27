@@ -7337,20 +7337,25 @@ def _secrets_directory_overrides(environ: Mapping[str, str]) -> dict[str, dict[s
     value}}`` (vault BACKLOG #2595, ADR 0214).
 
     Merged over the environment layer, so a setting's file wins over its variable, which is the
-    accessor's rule in ``engine_secrets``. Only names that are settings fields: the two Vault tokens
-    are read by their own modules, and the store key is never read from the directory. Raises
-    ``SecretsDirectoryError``, a ``ValueError``, when the directory cannot be used."""
+    accessor's rule in ``engine_secrets``. Every file the directory holds for a setting is read and
+    checked here, so a load refuses an unusable one even when nothing else would read it, such as a
+    Vault token file on a site with no Vault. Only names that are settings fields are returned: the
+    two Vault tokens are read by their own modules, and the store key is never read from the
+    directory. Raises ``SecretsDirectoryError``, a ``ValueError``, when the directory cannot be
+    used."""
     from messagefoundry.engine_secrets import DIRECTORY_SETTING_NAMES, open_secrets_directory
 
     directory = open_secrets_directory(environ)
     if directory is None:
         return {}
-    found = {
-        name: directory.read(name)
-        for name in DIRECTORY_SETTING_NAMES
-        if name not in _OUT_OF_BAND_ENV
-    }
-    return _env_overrides({name: value for name, value in found.items() if value is not None})
+    found = {name: directory.read(name) for name in DIRECTORY_SETTING_NAMES}
+    return _env_overrides(
+        {
+            name: value
+            for name, value in found.items()
+            if value is not None and name not in _OUT_OF_BAND_ENV
+        }
+    )
 
 
 def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | None:
@@ -9966,7 +9971,10 @@ def load_settings(
     environ: Mapping[str, str] | None = None,
     default_file: bool = True,
 ) -> ServiceSettings:
-    """Resolve settings with CLI > env > file > default precedence.
+    """Resolve settings with CLI > secrets directory > env > file > default precedence.
+
+    The secrets directory supplies only the secret-class settings, and only when
+    ``MEFOR_SECRETS_DIRECTORY`` names one (vault BACKLOG #2595, ADR 0214).
 
     ``config_path`` reads that TOML file (error if it's missing); when ``None``, ``./messagefoundry.toml``
     is used **only if it exists**. ``cli`` is a nested ``{section: {key: value}}`` of explicitly-provided

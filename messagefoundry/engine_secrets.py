@@ -36,6 +36,8 @@ Messages here name settings and file names, never a value.
 from __future__ import annotations
 
 import os
+import re
+import stat
 import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -70,8 +72,11 @@ KEY_CLASS_NAMES: Final[tuple[str, ...]] = (
 #: ``tests/test_service_env_secrets.py`` holds it to the settings' own lists of secrets. A
 #: connection secret an operator names through ``env()`` is not here, because its name is the
 #: operator's; the directory supplies those under :data:`VALUE_PREFIX`.
-SECRET_SETTING_NAMES: Final[tuple[str, ...]] = (
-    *KEY_CLASS_NAMES,
+#:
+#: Spelled out under :data:`DIRECTORY_SETTING_NAMES` and joined here, so a reader that takes the
+#: names the directory supplies takes them from an identifier with no word in it that CodeQL's
+#: clear-text-logging query reads as a secret (the reason ``serviceenv`` gives for its own names).
+DIRECTORY_SETTING_NAMES: Final[tuple[str, ...]] = (
     "MEFOR_STORE_PASSWORD",
     "MEFOR_AUTH_AD_BIND_PASSWORD",
     "MEFOR_AUTH_OIDC_CLIENT_SECRET",
@@ -83,11 +88,7 @@ SECRET_SETTING_NAMES: Final[tuple[str, ...]] = (
     "MEFOR_SECRETS_VAULT_TOKEN",
     "MEFOR_AI_API_KEY",
 )
-
-#: The settings the secrets directory may supply: every secret-class setting but the store key's.
-DIRECTORY_SETTING_NAMES: Final[tuple[str, ...]] = tuple(
-    name for name in SECRET_SETTING_NAMES if name not in KEY_CLASS_NAMES
-)
+SECRET_SETTING_NAMES: Final[tuple[str, ...]] = (*KEY_CLASS_NAMES, *DIRECTORY_SETTING_NAMES)
 
 #: The prefix of an ``env()`` value's variable, ``MEFOR_VALUE_<KEY>``. A file in the directory with
 #: this prefix supplies that value. ``config.environments.VALUE_ENV_PREFIX`` is this constant.
@@ -114,9 +115,14 @@ def _name_key(name: str) -> str:
     return name.upper() if sys.platform == "win32" else name
 
 
+#: An ``env()`` value's file name: the prefix, then letters, digits and underscores, as a variable
+#: name is spelled. Anything else is refused, so a name printed in a refusal is plain text.
+_VALUE_NAME = re.compile(re.escape(VALUE_PREFIX) + r"[A-Za-z0-9_]+")
+
+
 def _is_value_name(key: str) -> bool:
-    """Whether ``key`` names an ``env()`` value: the prefix and at least one character after it."""
-    return key.startswith(VALUE_PREFIX) and len(key) > len(VALUE_PREFIX)
+    """Whether ``key`` names an ``env()`` value."""
+    return _VALUE_NAME.fullmatch(key) is not None
 
 
 #: The file names the directory may hold, as the platform compares them, and the store key's.
@@ -171,6 +177,9 @@ class SecretsDirectory:
         what = f"the secrets directory's file {on_disk}"
         _check(path, what)
         try:
+            # A FIFO or a device named for a setting would block the open or read without end.
+            if not stat.S_ISREG(path.stat().st_mode):
+                raise SecretsDirectoryError(f"{what} is not a regular file")
             with path.open("rb") as handle:
                 raw = handle.read(MAX_FILE_BYTES + 1)
         except OSError as exc:
@@ -180,12 +189,13 @@ class SecretsDirectory:
         if len(raw) > MAX_FILE_BYTES:
             raise SecretsDirectoryError(f"{what} is larger than {MAX_FILE_BYTES} bytes")
         try:
-            text = raw.decode("utf-8")
+            # utf-8-sig drops the byte-order mark an editor such as Notepad may write first.
+            text = raw.decode("utf-8-sig")
         except UnicodeDecodeError:
             raise SecretsDirectoryError(f"{what} is not UTF-8 text") from None
         # A file written by an editor or `echo` ends with a line break nobody meant as part of the
         # value. Only line breaks are dropped: a space may be part of a password.
-        text = text.removeprefix("﻿").rstrip("\r\n")
+        text = text.rstrip("\r\n")
         if not text:
             raise SecretsDirectoryError(
                 f"{what} is empty. Write the value into it, or remove the file to read the "
@@ -224,8 +234,11 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
             f"{what} could not be listed ({exc.strerror or type(exc).__name__})"
         ) from exc
     names: dict[str, str] = {}
+    folded: dict[str, str] = {}
     refused: list[str] = []
     for entry in entries:
+        if entry.startswith("."):
+            continue  # a hidden file, such as an editor's swap file, names no setting
         key = _name_key(entry)
         if key in _STORE_KEY_KEYS:
             raise SecretsDirectoryError(
@@ -234,6 +247,13 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
                 "made with `messagefoundry protect-key`) and remove that file"
             )
         if key in _ALLOWED_KEYS or _is_value_name(key):
+            # env() keys are matched lower-cased, so two files that differ only in case would
+            # supply one value with no way to tell which.
+            twin = folded.setdefault(key.lower(), entry)
+            if twin != entry:
+                raise SecretsDirectoryError(
+                    f"{what} holds both {twin} and {entry}, which name one setting. Remove one"
+                )
             names[key] = entry
         else:
             refused.append(ascii(entry))

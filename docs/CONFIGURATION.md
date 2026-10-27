@@ -139,6 +139,9 @@ channel config) with one section per group, plus **environment-variable override
 CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 ```
 
+A secret-class setting can also come from a file in a secrets directory, which then wins over its
+environment variable: see [The secrets directory](#the-secrets-directory-mefor_secrets_directory).
+
 - File location: `./messagefoundry.toml` by default, or `--service-config <path>`. **Under the
   Windows service, `serve` and `supervise` refuse to start without an absolute `--service-config`**,
   so the service never reads a settings file from its working directory. A relative one under
@@ -2285,8 +2288,14 @@ secret. Each file in that directory holds one setting and is named exactly as it
 - **The engine refuses, at every `[security].enforcement` setting,** a directory or a file in it
   that a known broad group (at least Everyone, Authenticated Users and the local Users group; on
   POSIX, a group or other read or write bit) can read or change, and a link on Windows. It also
-  refuses a relative path, a file named for no setting above, an empty file, one that is not UTF-8,
-  and one over 64 KiB. A refusal names the file, never its value.
+  refuses a relative path, a file that is not a regular file, a file named for no setting above
+  (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
+  whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
+  file whose name starts with `.` is ignored. Every file is checked when the settings load, even
+  one nothing else reads. A refusal names the file, never its value.
+- **The access check is a list of known broad groups.** It does not refuse one named account that
+  can write the directory, the way the config-directory checks do, so restrict the directory as
+  below rather than relying on the check.
 - **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
   [`[store].encryption_key_file`](#store).
