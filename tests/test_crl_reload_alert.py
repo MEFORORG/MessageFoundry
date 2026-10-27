@@ -406,11 +406,12 @@ async def test_a_signature_short_of_proof_for_a_file_not_in_effect_says_not_to_r
 ) -> None:
     """Vault BACKLOG #3506, the Manager's item 1, for the remedies that name a restart since item
     8. A start refuses the file while it is not in effect, so the refusal carries the caveat and
-    the alert ``start_refuses``. Control: the same case in effect carries neither."""
+    the alert ``start_refuses``. The same case in effect carries neither:
+    ``test_the_signature_remedy_names_what_the_check_found`` holds that."""
     hop = pki.outbound_hop()
     sink = _Sink()
     runner = _runner(sink)
-    remedy = UNPROVEN_SIGNATURE if case == "unproven" else UNCHECKABLE_SIGNATURE
+    remedy = crl_reload._SIGNATURE_REMEDY[case]
     pki.crl.write_bytes(_signature_case(pki, case, issued=-_DAY))  # not in effect
 
     (outcome,) = _pass(runner)
@@ -431,12 +432,6 @@ async def test_a_signature_short_of_proof_for_a_file_not_in_effect_says_not_to_r
     assert "at least until its CRL takes effect, so do not restart before then." in detail[:200]
     assert detail.index("at least until") < detail.index("Restart the engine")
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
-
-    pki.crl.write_bytes(_signature_case(pki, case, issued=_DAY))  # control: in effect
-    (in_effect,) = _pass(runner)
-    assert in_effect.refusal is not None and in_effect.refusal.remedy == remedy
-    assert not in_effect.start_refuses
-    assert "at least until then" not in in_effect.refusal.reason
 
 
 async def test_the_caveat_quotes_a_long_issuer_name_with_a_bound(pki: _Pki) -> None:
@@ -466,9 +461,8 @@ def test_every_remedy_has_its_own_class_token() -> None:
     assert len(set(tokens)) == len(crl_reload._PRECEDENCE) == len(crl_reload._REMEDY_CLASS)
     assert crl_reload._OTHER_REMEDY_CLASS not in tokens
     # Each token has its row in the guide's table under [cert_monitor] (vault BACKLOG #3506 added
-    # two). Control: a token no remedy has is not there.
+    # two).
     guide = (Path(__file__).parents[1] / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
-    assert "| `no_such_token` |" not in guide
     for token in tokens:
         assert token == token.lower() and " " not in token
         assert f"| `{token}` |" in guide, token

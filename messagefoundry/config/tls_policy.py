@@ -606,6 +606,7 @@ def _check_crl_signatures(
     refusal in :func:`judge_crl_bytes`."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
     from messagefoundry.pki import (
+        PROVEN_BAD_SIGNATURE,
         UNCONFIRMED_SIGNATURE,
         UNLISTED_SIGNATURE,
         CrlSignature,
@@ -636,10 +637,8 @@ def _check_crl_signatures(
             )
     if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
         raise ValueError(
-            f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "
-            "key does not verify the CRL's signature. A handshake OpenSSL judges by this CRL "
-            "fails with 'CRL signature failure'. Give this setting the CRL that CA signed, or "
-            "remove this CRL if a good one from that issuer is already in the file"
+            f"{label}: {bad.where} {PROVEN_BAD_SIGNATURE}. Give this setting the CRL that CA "
+            "signed, or remove this CRL if a good one from that issuer is already in the file"
         )
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
     finding = tuple(signature.state for signature in judged)

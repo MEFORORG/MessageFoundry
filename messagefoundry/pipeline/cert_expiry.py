@@ -57,6 +57,7 @@ from messagefoundry.pipeline.crl_reload import (
     UNPROVEN_SIGNATURE,
 )
 from messagefoundry.pki import (
+    UNCONFIRMED_SIGNATURE,
     CertFacts,
     CrlFacts,
     crl_pem_blocks,
@@ -659,7 +660,7 @@ def held_crl_label(path: str) -> str:
 #: either way. Named once, for at least the remedy that asks for a check, the guard for an error
 #: the signature check raises on a later block after one of them, and the test for a state this
 #: scan does not name (BACKLOG #3512).
-_UNCONFIRMED = frozenset({"unproven", "uncheckable"})
+_UNCONFIRMED = frozenset(UNCONFIRMED_SIGNATURE)
 
 #: The states that pass a CA file's CRL with no step of its own. ``unlisted`` is a CRL that no CA
 #: this file lists fits, as :class:`~messagefoundry.pki.CrlSignature` defines a fit: its issuer can
