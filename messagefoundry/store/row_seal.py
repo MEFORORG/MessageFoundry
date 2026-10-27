@@ -44,6 +44,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import sys
 import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Final
@@ -200,10 +201,10 @@ class RowSealer:
         ``None`` for any other cipher with no in-process root: a keyless store."""
         root = cipher.authz_root()
         if root is None:
-            # Lazy: a store that never selects vault_transit never loads the Vault module.
-            from messagefoundry.store.crypto_transit import TransitCipher  # noqa: PLC0415
-
-            if isinstance(cipher, TransitCipher):
+            # A TransitCipher exists only once its module is loaded, so a keyless store never
+            # imports the Vault module just to learn it is not one.
+            transit = sys.modules.get("messagefoundry.store.crypto_transit")
+            if transit is not None and isinstance(cipher, transit.TransitCipher):
                 return TransitRowSealer(cipher, store_id=store_id)
             return None
         retired = [derive_row_seal_key(r, store_id) for r in cipher.retired_authz_roots()]
@@ -329,7 +330,9 @@ def transit_seal_key_id(key_name: str) -> str:
     A one-way digest of the Transit key's NAME under its own label: fixed-width hex like every
     other key id, so it holds no ``:`` and never matches a local sealer's id. It names the key and
     not its version. Transit's own string, which the seal stores, carries the version, and the MAC
-    input carries the store id, so both things a local key id tells apart are still present."""
+    input carries the store id, so both things a local key id tells apart are still present. Every
+    store passes ``NO_STORE_ID`` until the store-id pin lands (vault BACKLOG #3411), so today that
+    part tells no two stores apart, exactly as under the local sealer."""
     return hashlib.sha256(_TRANSIT_KEY_ID_LABEL + key_name.encode("utf-8")).hexdigest()[
         :_TRANSIT_KEY_ID_LEN
     ]
@@ -347,7 +350,7 @@ def _transit_version(mac: str) -> int | None:
     ):
         return None
     version, sep, body = mac[len(_TRANSIT_MAC_PREFIX) :].partition(":")
-    if not sep or not body or not version.isascii() or not version.isdigit():
+    if not sep or not body or not version.isdigit():
         return None
     if len(version) > 10 or version.startswith("0"):
         return None

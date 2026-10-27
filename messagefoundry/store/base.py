@@ -2821,8 +2821,9 @@ class AuthStore(Protocol):
 
     # --- sessions ------------------------------------------------------------
     def row_sealer(self) -> Sealer | None:
-        """The sealer this store writes authority-row integrity seals with, or ``None`` when its
-        cipher holds no in-process key, in which case no seal is written or checked (BACKLOG #2592).
+        """The sealer this store writes authority-row integrity seals with: a local one, or a
+        Transit one under ``vault_transit``. ``None`` on a keyless store, in which case no seal is
+        written or checked (BACKLOG #2592).
 
         The store writes the seals: every session write that changes a sealed column goes through
         one helper per backend, which verifies the row it read before it re-seals it and raises

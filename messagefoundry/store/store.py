@@ -7939,9 +7939,8 @@ class MessageStore:
         # load — so this is a permanent 0 and there is no increment site in this module.
         self.fenced_writes = 0
         self._cipher: Cipher = cipher or IdentityCipher()
-        # BACKLOG #2592: the row sealer, fixed for the handle's life like the cipher. None when the
-        # cipher holds no in-process authorization root (keyless), and then no seal is written or
-        # checked.
+        # BACKLOG #2592: the row sealer, fixed for the handle's life like the cipher. None on a
+        # keyless store, and then no seal is written or checked; vault_transit gets a Transit one.
         self._row_sealer: Sealer | None = RowSealer.for_cipher(self._cipher)
         # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
         # may already count for another store, so close() must not settle its reserve here.

@@ -320,13 +320,7 @@ class TransitCipher(_UnmarkedPolicy):
                 algorithm=AUDIT_TRANSIT_HASH_ALGO,
             )
             answered = probe["data"]["hmac"]
-        except Exception as exc:  # the key itself fails: an outage, not a refused string
-            log.warning(
-                "Transit refused a row seal check, and the probe under the latest version failed "
-                "too (key=%r): %s",
-                self._audit_key,
-                vault_failure_text(exc),
-            )
+        except Exception:  # the key itself fails: an outage, which the sealer logs, throttled
             return False
         return isinstance(answered, str) and bool(answered)
 
@@ -432,7 +426,8 @@ def build_transit_cipher(
                 "the old key, and audit rows and row seals MACed under it while "
                 f"{_ENV_AUDIT_KEY} is unset, would not read or verify under the new one, and no "
                 "command moves Transit ciphertext between keys. A row seal that does not verify "
-                "refuses its session, account, role or approval."
+                "refuses what it covers: at least sessions, accounts, roles, directory maps and "
+                "approvals."
             ),
         )
         # Same fail-closed existence + type check for a DEDICATED audit key (skip the redundant read
@@ -449,7 +444,8 @@ def build_transit_cipher(
                 after_switch=(
                     "Vault's `hmac` type is the dedicated choice for this key. Audit rows and row "
                     "seals already MACed under the old key would not verify under the new one, and "
-                    "a row seal that does not verify refuses its session, account, role or approval."
+                    "a row seal that does not verify refuses what it covers: at least sessions, "
+                    "accounts, roles, directory maps and approvals."
                 ),
             )
     except KeyProviderError:
