@@ -363,6 +363,7 @@ class StageDispatcher:
         infra_fault_policy: str = "stop",
         infra_fault_stop_after: int = 10,
         infra_fault_backoff_cap: float = 60.0,
+        is_leader: Callable[[], bool] | None = None,
     ) -> None:
         assert claimers_per_stage >= 1
         assert max_processing_lanes >= 1
@@ -404,6 +405,8 @@ class StageDispatcher:
         self._infra_fault_policy = infra_fault_policy
         self._infra_fault_stop_after = infra_fault_stop_after
         self._infra_fault_backoff_cap = infra_fault_backoff_cap
+        # Read by _land_while_holding (BACKLOG #1611). None: a single node, always the leader.
+        self._is_leader: Callable[[], bool] = is_leader or (lambda: True)
 
         self._states: dict[str, _LaneState] = {}
         self._claimers: list[_Claimer] = [
@@ -1302,6 +1305,12 @@ class StageDispatcher:
         # the lane (PROCESSING, slot reserved), so no claim takes a later row past a stranded one. A
         # stop ends the retry and leaves the rows INFLIGHT for reset_stale_inflight at the next start,
         # as a cancelled serializer's are; the in-flight watch pages them meanwhile.
+        #
+        # Losing leadership ends it the same way (False), and both returns below leave the lane
+        # PROCESSING with its slot reserved and no serializer. That is acceptable only because a
+        # demotion tears the graph down: the coordinator's demote edge wakes the engine's graph
+        # supervisor, whose _reconcile_graph -> _stop_graph stops the runner, which sets _stop and
+        # drops this dispatcher; a re-promotion builds a new one. A single node is always the leader.
         if head_reschedule is not None:
             head_id, when = head_reschedule
             # The head is dated `when`, which the RETRY outcome parks the lane until. Only a retry
@@ -1440,10 +1449,29 @@ class StageDispatcher:
         backoff (BACKLOG #1611). Returns False if the dispatcher stopped first; the rows then stay
         INFLIGHT for ``reset_stale_inflight`` at the next start.
 
+        Also returns False, after one WARNING and with no further write, once this node is no longer
+        the leader: read after each failure and again after each backoff, before the next write. The
+        re-pend writes are unfenced by design (see ``ClusterCoordinator.current_epoch``), so one sent
+        after a successor re-claimed the rows would re-pend rows it holds; they belong to its recovery.
+
         The caller still holds the lane, so nothing claims a later row past the ones being re-pended,
         and no clock or ownership guess is needed: the serializer is the lane's only consumer and
         knows which rows it holds. A failure is logged at WARNING on a backoff (1st, 2nd, 4th ...)
         with a line when the write lands; counts and the exception only, never a row's content."""
+
+        def lost_leadership() -> bool:
+            if self._is_leader():
+                return False
+            log.warning(
+                "StageDispatcher %s lane %s: %s failed %d time(s) and this node is no longer the "
+                "leader; standing down with the rows in flight for the successor's recovery",
+                self._stage.value,
+                lane,
+                what,
+                run.count,
+            )
+            return True
+
         run = FailureRun()
         while True:
             try:
@@ -1470,12 +1498,14 @@ class StageDispatcher:
                         level=logging.WARNING,
                     )
                 return True
+            if lost_leadership():
+                return False
             await self._sleep_or_stop(
                 _capped_backoff(
                     _LANE_ERROR_BACKOFF_SECONDS, run.count - 1, _REPEND_RETRY_CAP_SECONDS
                 )
             )
-            if self._stop.is_set():
+            if self._stop.is_set() or lost_leadership():
                 return False
 
     async def _drain_lane(

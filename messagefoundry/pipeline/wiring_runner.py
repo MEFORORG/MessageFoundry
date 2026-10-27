@@ -6289,6 +6289,7 @@ class RegistryRunner:
             infra_fault_policy=self._infra_fault_policy,
             infra_fault_stop_after=self._infra_fault_stop_after,
             infra_fault_backoff_cap=self._infra_fault_backoff_cap,
+            is_leader=self._coordinator.is_leader,
         )
 
     async def _start_pooled_dispatchers(self) -> None:
@@ -8216,7 +8217,8 @@ class RegistryRunner:
 
         A runner stop ends the retry and leaves the rows INFLIGHT for ``reset_stale_inflight`` at
         the next start, as a cancelled worker's are; the backoff is :meth:`_stop_or_sleep`, and the
-        task stays cancellable. A node that is no longer the leader stops retrying too (False, so
+        task stays cancellable. A node that is no longer the leader stops retrying too, read after
+        each failure and again after each backoff, before the next write (False, so
         the worker survives as it did before; a returned worker is not respawned): the rows then
         belong to the successor's promotion recovery.
 
@@ -8277,6 +8279,9 @@ class RegistryRunner:
             )
             if await self._stop_or_sleep(delay):
                 return True
+            # Read again: leadership lost DURING the backoff must stop the next write too.
+            if not self._coordinator.is_leader():
+                return False
 
     async def _release_tail_on_stop(self, worker: str, name: str, ids: Sequence[str]) -> None:
         """Best-effort release of the batch tail a per-lane worker still holds when it RETURNS on a
