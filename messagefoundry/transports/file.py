@@ -1807,7 +1807,10 @@ class FileSource(SourceConnector):
         try:
             return await self._run_fs(self._prune_processed, older_than, protected, stop_hit)
         except (wincred.CredentialError, RuntimeError) as exc:
-            raise OSError(f"the alternate credential could not run: {type(exc).__name__}") from exc
+            raise OSError(
+                "the sweep could not run, under the alternate credential if one is set: "
+                f"{type(exc).__name__}"
+            ) from exc
 
     def _prune_processed(
         self, older_than: float, protected: ArchiveGuard, deadline_hit: Callable[[], bool]
@@ -1861,7 +1864,20 @@ class FileSource(SourceConnector):
             )
             return 0
         with dest:
-            if _opened_id(dest) in guard.ids:
+            opened = _opened_id(dest)
+            if opened is None or not opened[1]:
+                # Cannot tell what was opened, so sweep nothing: an alias of a guarded directory
+                # would otherwise pass, since a guarded identity of inode 0 is never recorded.
+                logger.warning(
+                    "file source %s: the [retention].processed_archive_days sweep skips this "
+                    "connection this pass, because the identity of its archive directory %s could "
+                    "not be read, so it cannot be checked against the File inbounds' watch and "
+                    "error directories",
+                    self._label,
+                    self.processed_dir.name,
+                )
+                return 0
+            if opened in guard.ids:
                 self._log_prune_refusal()
                 return 0
             deleted, failed = _prune_entries(dest, older_than, deadline_hit)
@@ -1901,8 +1917,8 @@ def _opened_id(dest: _Dest) -> _FileId | None:
     """The identity of the archive directory actually opened, to check against
     :attr:`ArchiveGuard.ids`. The path compare in :func:`_archive_overlaps` resolves links, while
     :func:`_open_dest` walks a normalised path below the watch root, so the two can reach different
-    directories, and two paths can name one directory. None, which matches no guard, only when the
-    open directory cannot be stat'ed; the listing that follows then fails too."""
+    directories, and two paths can name one directory. None when the open directory cannot be
+    stat'ed; the caller then sweeps nothing, as it does for an inode of 0."""
     try:
         return _file_id(os.fstat(dest.fd) if dest.fd is not None else os.stat(dest.path))
     except OSError:

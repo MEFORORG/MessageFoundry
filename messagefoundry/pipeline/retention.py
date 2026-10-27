@@ -812,8 +812,10 @@ class RetentionRunner:
 
         Every archive is handed the watch and ``.error`` directories of every registry inbound, bound
         or not, so one whose archive directory overlaps any connection's drops or quarantine deletes
-        nothing. When any of those cannot be resolved the whole sweep is skipped: the guard is only as
-        good as its list. A directory two connections share is swept once. A fault in one connection
+        nothing. When an inbound's directories cannot be read from its configuration the whole sweep is
+        skipped: the guard is only as good as its list. A listed directory the disk cannot resolve is
+        compared by its absolute path, and an archive whose opened directory has no readable identity
+        is not swept. A directory two connections share is swept once. A fault in one connection
         is logged and the others still run, because a sweep must never stop the pass: a pass that
         raised here would lose the audit row for what it had already purged."""
         # Everything up to the sweep itself is contained: a fault here, a connector's declared

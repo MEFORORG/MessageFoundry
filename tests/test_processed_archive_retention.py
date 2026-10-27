@@ -299,6 +299,36 @@ def test_an_aliased_protected_directory_is_refused_once_opened(tmp_path: Path) -
     assert a_copy.exists()
 
 
+@pytest.mark.parametrize("opened", [None, (7, 0)])
+def test_an_archive_directory_with_no_readable_identity_is_not_swept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opened: tuple[int, int] | None
+) -> None:
+    """The opened directory's identity cannot be read, or is inode 0, which the guard never records.
+    Either way an alias of a guarded directory would pass the identity check, so nothing goes.
+
+    Mutation: test only `_opened_id(dest) in guard.ids`. Red."""
+    src = _source(tmp_path / "in")
+    copy = _aged(src.processed_dir / "done.hl7", 90)
+    monkeypatch.setattr(file_transport, "_opened_id", lambda dest: opened)
+
+    assert _prune(src) == 0
+    assert copy.exists()
+
+
+def test_archived_at_is_the_later_of_mtime_and_ctime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real key, which the autouse fixture replaces everywhere else.
+
+    Mutation: return `st.st_mtime`, or `min(...)`. Red."""
+    monkeypatch.undo()
+    st = os.stat_result((0o100644, 1, 1, 1, 0, 0, 0, 0, 100, 200))  # mtime 100, ctime 200
+
+    assert file_transport._archived_at(st) == 200
+    assert (
+        file_transport._archived_at(os.stat_result((0o100644, 1, 1, 1, 0, 0, 0, 0, 300, 200)))
+        == 300
+    )
+
+
 def test_the_registry_runner_guards_an_unbound_file_inbound(tmp_path: Path) -> None:
     """`archive_guard_dirs` reads the configuration, so an inbound that never started is named."""
     inbox = tmp_path / "stopped"
