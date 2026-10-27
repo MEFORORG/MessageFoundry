@@ -378,7 +378,13 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(await trust.refreshEngineTrust(), false);
     assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
     assert.ok(
-      logged.some((line) => line.includes(`not pinning ${REMOTE}`)),
+      // The exact line, not a substring of the URL; the reason is worded per platform path flavour.
+      logged.includes(
+        `messagefoundry.environments: not pinning ${REMOTE}: caFile pki/prod-ca.pem ` +
+          (path.sep === "\\"
+            ? "is not a full path (on Windows: a drive-letter or UNC path)"
+            : "is not an absolute path"),
+      ),
       `the refusal was silent: ${JSON.stringify(logged)}`,
     );
   });
@@ -389,7 +395,11 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     await trust.refreshEngineTrust();
 
     assert.ok(
-      logged.some((line) => line.includes("with no trust anchor") && line.includes(REMOTE)),
+      logged.includes(
+        `messagefoundry.environments names 1 https target(s) with no trust anchor (${REMOTE}); ` +
+          "they verify against the default roots only. " +
+          "Set caFile on the entry to trust a private CA or a self-signed engine certificate.",
+      ),
       `an unanchored target went unreported: ${JSON.stringify(logged)}`,
     );
   });
@@ -474,7 +484,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(await trust.refreshEngineTrust(), false);
     assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
     assert.ok(
-      logged.some((line) => line.includes("could not read") && line.includes(`not pinning ${REMOTE}`)),
+      logged.includes(`could not read the engine certificate at ${dir} — not pinning ${REMOTE}`),
       `the refusal was silent: ${JSON.stringify(logged)}`,
     );
   });

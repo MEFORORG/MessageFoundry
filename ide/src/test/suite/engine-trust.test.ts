@@ -367,7 +367,7 @@ suite("per-target caFile pins (BACKLOG #1695, residual a)", () => {
   const WIN_PIN = "C:\\pki\\prod-ca.pem";
   const POSIX_PIN = "/etc/mf/prod-ca.pem";
 
-  test("a shard takes its own caFile, else its environment's", () => {
+  test("an engine shard takes its own caFile, else its environment's", () => {
     assert.deepStrictEqual(
       pinTargetsOf([
         {
@@ -479,7 +479,7 @@ suite("per-target caFile pins (BACKLOG #1695, residual a)", () => {
     );
   });
 
-  test("a shard's empty caFile inherits its environment's, like an absent one", () => {
+  test("an engine shard's empty caFile inherits its environment's, like an absent one", () => {
     const [, shard] = pinTargetsOf([
       { url: "https://prod:8765", caFile: POSIX_PIN, shards: [{ url: "https://p1:8765", caFile: "" }] },
     ]);
