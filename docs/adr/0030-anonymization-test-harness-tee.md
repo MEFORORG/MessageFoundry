@@ -62,6 +62,31 @@
   characters of any one key or value, and of the list of unknown keys. **This changes none of the
   §2 ratified choices:** the overlay still only maps a field to an existing kind.
   [PHI.md](../PHI.md) §9 is the long form for the retarget.
+- **AMENDED 2026-10-27 (BACKLOG #1192, [ADR 0201](0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)
+  section 5 and slice 5): the package's home is planned to move out of the engine.** This records a
+  planned move and builds nothing. The package is still at `messagefoundry/anon/`, and every path
+  in this ADR still describes the tree until ADR 0201 slice 6 moves it. That slice re-points the
+  guards and tests that pin the path, in the same change. ADR 0201 was accepted on 2026-09-29, and
+  this amendment records the §1 changes it designs:
+  1. **The home becomes `messagefoundry_toolkit/anon/`**, in the `messagefoundry-toolkit`
+     distribution rather than the engine wheel. This replaces the §1 *"engine-owned"* home *"sitting
+     beside `parsing/`"*, one of the forks ratified before the build.
+  2. **The rule table stays the single authority, and the tee still vendors a copy at
+     `tee/anon/`.** Which of its files are byte-identical is recorded by
+     [`tests/test_anon_parity.py`](../../tests/test_anon_parity.py), not by this ADR.
+  3. **The parity check re-points to the new path**, in slice 6.
+  4. **The carve-out language is withdrawn.** The Related line and §1 say acceptance extends the
+     CLAUDE.md §4 pure-library carve-out from `parsing/` to `anon/`, and §8 and *To resolve on
+     acceptance* list that as a doc flip. That flip never landed: CLAUDE.md §4 names `parsing/`
+     alone. Once `anon/` is not an engine package there is nothing for the carve-out to cover, so
+     the flip is withdrawn rather than left pending.
+
+  What the package does, its rules, its fail-closed behaviour and its limits are unchanged.
+  **Correction in the same amendment:** §1 said the harness imports the package directly. No
+  harness file does, and the owner ruled on 2026-10-12 (BACKLOG #3006 part 3) that the import gives
+  way to the record's claim that no file outside the package imports it. §1 carries the correction
+  where the sentence stood. The Context bullet and §1's *"The harness is unaffected"* describe what
+  the harness may import from the engine in general, not an import of this package.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
@@ -165,9 +190,18 @@ SURROGATES: dict[SurrogateKind, Callable[[str, DatasetContext], str]] = { ... }
 
 **The tee vendors a byte-identical copy** at `tee/anon/` (mirroring how `tee/hl7_fields.py`/`tee/mllp.py`
 were vendored), kept in sync by a CI parity check — the same discipline the tee already lives by. The
-**harness imports `messagefoundry.anon` directly** (it already imports `parsing`/`generators`). This is the
-**asymmetric resolution**: both sides run the *same rules*, the harness by import, the tee by a
-parity-pinned vendor copy.
+harness's [`CaptureSink`](../../harness/reconcile/capture.py) takes the anonymizer as a function its
+caller passes in, and no harness file imports the package. This is the **asymmetric resolution**:
+both sides run the *same rules*, the harness through the anonymizer its caller hands the sink, the
+tee by a parity-pinned vendor copy.
+
+**CORRECTED 2026-10-27 (BACKLOG #1192; see the 2026-10-27 status-banner amendment):** the second
+sentence above read *"The **harness imports `messagefoundry.anon` directly** (it already imports
+`parsing`/`generators`)."*, and the third ended *"the harness by import"*. No harness file imports
+the package. The owner ruled on 2026-10-12 (BACKLOG #3006 part 3) that such an import gives way to
+the record's claim that no file outside the package imports it, and an author who needs the package
+waits for its move. `tests/test_dependency_boundaries.py` refuses an import of it from the source
+trees it walks, the harness among them.
 
 ### 2. The rule model: field-*selection* is data, surrogate *production* is code (the load-bearing call)
 
