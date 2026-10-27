@@ -1537,33 +1537,36 @@ def _peer_host(writer: asyncio.StreamWriter) -> str | None:
 
 def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
     """Whether a TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself, so its
-    caps and allowlist run before the handshake (BACKLOG #1606). True on the stdlib loops only.
+    caps and allowlist run before the handshake (BACKLOG #1606). True for ``asyncio.BaseEventLoop``
+    and its subclasses, which the stdlib loops are.
 
     The upgrade is safe only where pausing reading inside ``connection_made`` is known to keep the
     ClientHello out of the plaintext reader. On the stdlib loops it is, read in their source: the
     selector transport arms its reader only if not paused, and the Proactor issues no receive while
-    paused. On uvloop it is not, read in the sdists of 0.22.1 (the pyproject floor) and 0.23.0
-    (the lock), which agree on all three points (BACKLOG #1606):
+    paused. A loop nobody has read keeps the loop-level handshake, because a wrong guess there would
+    stall every TLS connection. uvloop has been read, in its 0.22.1 and 0.23.0 sdists, and the
+    upgrade is unsafe on it; both versions agree on all three points:
 
-    * ``UVBaseTransport._call_connection_made`` (``handles/basetransport.pyx``, lines 120-154)
-      calls ``protocol.connection_made`` and then ``self._start_reading()`` with no check for a
-      pause, so reading always starts once ``connection_made`` returns.
-    * ``UVStream.pause_reading`` (``handles/stream.pyx``, line 715 in 0.22.1, 717 in 0.23.0)
-      returns at once while the stream is not yet reading, so a pause inside ``connection_made``
-      does nothing. The ClientHello can therefore reach the plaintext ``StreamReader`` before the
-      client task first runs.
-    * ``Loop.start_tls`` (``loop.pyx``, about lines 1585-1640) pauses, swaps in its
-      ``SSLProtocol`` and resumes, but has no counterpart to gh-142352: bytes already in the
-      ``StreamReader`` stay there, and the TLS layer never sees them.
+    * ``UVBaseTransport._call_connection_made`` (``handles/basetransport.pyx``) calls
+      ``protocol.connection_made`` and then ``self._start_reading()`` with no check for a pause, so
+      reading always starts once ``connection_made`` returns.
+    * ``UVStream.pause_reading`` (``handles/stream.pyx``) returns at once while the stream is not
+      yet reading, so a pause inside ``connection_made`` does nothing.
+    * ``Loop.start_tls`` (``loop.pyx``) pauses, swaps in its ``SSLProtocol`` and resumes, but has no
+      counterpart to gh-142352: bytes already in the ``StreamReader`` stay there, and the TLS layer
+      never sees them.
 
-    So ``StreamWriter.start_tls`` on a uvloop-accepted socket could leave the handshake waiting on
-    a ClientHello it already lost, until :data:`_TLS_HANDSHAKE_TIMEOUT` aborts it. Any other loop
-    therefore keeps the loop-level handshake, and with it the documented limit: the caps and
-    allowlist apply after the handshake. uvicorn runs the engine on uvloop wherever it is installed,
-    and the engine's own uvloop dependency installs it for CPython outside Windows, so on Linux that
-    limit is the one in force. ``loop.connect_accepted_socket(..., ssl=...)``, which both loops
-    offer, would hand the TLS layer an admitted socket before any read, at the cost of the listener
-    running its own accept loop; it is not built.
+    A TLS client speaks first, so its ClientHello is normally read into the plaintext
+    ``StreamReader`` before the client task first runs, and ``StreamWriter.start_tls`` would then
+    wait on it until :data:`_TLS_HANDSHAKE_TIMEOUT` aborts the handshake: nearly every connection
+    would fail. Re-read those three symbols before enabling the upgrade on a later uvloop.
+
+    So on uvloop the caps and allowlist apply after the handshake. uvicorn runs the engine on uvloop
+    wherever it is installed, and the engine's own uvloop dependency installs it for CPython outside
+    Windows, PyPy and Cygwin, so Linux and macOS run under that limit.
+    ``loop.connect_accepted_socket(..., ssl=...)``, which both loops offer, would hand the TLS layer
+    an admitted socket before any read, at the cost of the listener running its own accept loop; it
+    is not built.
     """
     return isinstance(loop, asyncio.BaseEventLoop)
 
