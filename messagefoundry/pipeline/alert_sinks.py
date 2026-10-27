@@ -128,8 +128,8 @@ class _AlertStateStore(Protocol):
 
 #: Auto-resolution map (ADR 0044 D2): an inverse lifecycle event type resolves the matching open
 #: instance(s) of the failure event type it cancels. ``connection_restored`` cancels the
-#: ``connection_error`` raised on ``connection_lost``; a re-emitted ``connection_started`` clears a
-#: ``connection_stopped``. Keyed by the inverse event's ``type`` → the failure event ``type`` it resolves.
+#: ``connection_error`` raised on ``connection_lost``; ``connection_started``, which the runner emits
+#: once an inbound genuinely comes up (BACKLOG #1741), clears a ``connection_stopped``. Keyed by the inverse event's ``type`` → the failure event ``type`` it resolves.
 _AUTO_RESOLVE: dict[str, str] = {
     "connection_restored": "connection_error",
     "connection_started": "connection_stopped",
@@ -1477,6 +1477,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         alert-state is wired (ADR 0044), **auto-resolves** the matching open ``connection_error`` instance
         so the dashboard clears. A no-op when no store is set (byte-identical to pre-#56)."""
         self._record_state({"type": "connection_restored", "connection": name}, "info")
+
+    def connection_started(self, name: str) -> None:
+        """The inverse of ``connection_stopped`` (BACKLOG #1741; the Protocol says when it fires). No
+        notification; auto-resolves the open instance when alert-state is wired."""
+        self._record_state({"type": "connection_started", "connection": name}, "info")
 
     @staticmethod
     def _apply_escalation(

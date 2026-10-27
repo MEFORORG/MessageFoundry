@@ -209,8 +209,23 @@ class AlertSink(Protocol):
     """
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
-        """An outbound connection's delivery worker halted (``InternalErrorPolicy.STOP`` fired on an
-        internal/code error). The lane is frozen until an operator intervenes (fix + reload/restart)."""
+        """A connection is down until an operator intervenes (fix + reload/restart). At least: an
+        outbound delivery worker halted (``InternalErrorPolicy.STOP`` on an internal/code error, a
+        credential or configuration fault), an inbound's router or transform worker halted under the
+        same policy, a connection failed to build or bind at start (ADR 0031; ``detail`` starts
+        ``failed to start:``), or a log-write halt stopped it (#122). ``name`` is the bare connection
+        name, whichever direction stopped; ``detail`` says what stopped."""
+        ...
+
+    def connection_started(self, name: str) -> None:
+        """An inbound connection genuinely came up: its listener bound and its internal stages are
+        re-armed, with no open cause left on it or on an outbound of the same name (BACKLOG #1741).
+        The **inverse** of :meth:`connection_stopped`, as :meth:`connection_restored` is of
+        :meth:`connection_error`. Emits **no** notification; it exists so durable alert-state (ADR
+        0044) can **auto-resolve** the open ``connection_stopped`` instance for ``name``, such as an
+        inbound's bind failure. Auto-resolve-only, never a rule-targetable alert type. The default
+        :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is the
+        connection label only (no PHI)."""
         ...
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
@@ -890,9 +905,14 @@ class LoggingAlertSink:
     and queue shape are recorded, never a message body."""
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
-        log.warning(
-            "ALERT connection_stopped: outbound %r halted on internal error: %s", name, detail
-        )
+        # The detail names the cause and direction: a start failure, an inbound router or transform
+        # halt and a log-write halt all raise this, not only an outbound internal error (#1741).
+        log.warning("ALERT connection_stopped: connection %r stopped: %s", name, detail)
+
+    def connection_started(self, name: str) -> None:
+        # State-less sink: a recovery needs no page and there is no instance to auto-resolve, so this
+        # is a no-op, as connection_restored is. ADR 0044, BACKLOG #1741.
+        return
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
         log.warning(

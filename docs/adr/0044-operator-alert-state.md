@@ -252,9 +252,13 @@ escalation chains (still deferred, ADR 0014 §3). The cross-node durable dedup o
 - [ ] **Land-order with the store siblings.** Confirm the `alert_instance` `_SCHEMA`/`_migrate` add rebases
   cleanly onto the **pool-prewarm store refactor** (sole store-writer) **and** the **#57 roles migration** —
   coordinate the merge order so the three additive store edits don't clobber one another.
-- [ ] **Auto-resolution coverage.** Confirm which events have a clean inverse the MVP auto-resolves on
+- [x] **Auto-resolution coverage.** Confirm which events have a clean inverse the MVP auto-resolves on
   (`connection_restored`/`connection_started`) and which (`queue_buildup`/`storage_threshold`/`message_stall`)
-  rely on the deferred staleness sweep or manual resolve until it lands.
+  rely on the deferred staleness sweep or manual resolve until it lands. *Resolved 2026-10-27 (BACKLOG
+  #1741):* the runner now raises `connection_started` when an inbound genuinely starts, with no open
+  cause on it or on an outbound of the same name, so an inbound's bind-failure `connection_stopped`
+  resolves itself. An outbound's start failure, and a halt whose name has no inbound, still need a manual
+  resolve.
 - [ ] **Resolved-instance retention window.** Confirm the prune window for resolved instances (a
   `connection_event_retention_hours` analog) and that it rides the **existing** `RetentionRunner.run_once`
   pass + one audit row (never an open/acknowledged instance).

@@ -1656,6 +1656,9 @@ class RegistryRunner:
         # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
+        # BACKLOG #1741: inbounds a reload in progress started, whose connection_started waits for
+        # the swap to commit (reload says why). None outside a reload.
+        self._started_pending: list[str] | None = None
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
         # resolved in _start_pooled_dispatchers AFTER trying to open the sync pools + build the per-stage
@@ -4387,6 +4390,40 @@ class RegistryRunner:
 
         return _hold
 
+    def _note_inbound_started(self, name: str) -> None:
+        """An inbound came up on a door that re-armed its internal stages: emit ``connection_started``
+        now, or after the swap when a reload is in progress (BACKLOG #1741)."""
+        if self._started_pending is not None:
+            self._started_pending.append(name)
+            return
+        self._emit_inbound_started(name)
+
+    def _emit_inbound_started(self, name: str) -> None:
+        """Raise ``connection_started`` for inbound ``name``, so a sink with alert-state resolves the
+        open ``connection_stopped`` instance under that name, such as a bind failure (BACKLOG #1741,
+        ADR 0031 section 1, ADR 0044 D2).
+
+        Only when no known cause still holds the name down IN EITHER DIRECTION, because alerts key on
+        the bare name while every cause here keys on direction (#1813). A skipped resolve leaves an
+        alert open for an operator, which is the safe direction. Never raises: an alert failure must
+        not break a start."""
+        blocked = (
+            not self.inbound_running(name)
+            or self.inbound_failed(name) is not None
+            or ("inbound", name) in self._stop_held
+            or name in self._log_halted
+            or self._delivery_halted
+            or self.outbound_failed(name) is not None
+            or ("outbound", name) in self._stop_held
+            or name in self._outbound_paused
+        )
+        if blocked:
+            return
+        try:
+            self._alert_sink.connection_started(name)
+        except Exception:
+            log.warning("alert sink raised on connection_started for %r", name)
+
     def _release_operator_hold(self, name: str, kind: Direction) -> None:
         """The lane was re-armed (or an operator asked for it), so the scheduler owns its calendar
         again."""
@@ -4629,6 +4666,9 @@ class RegistryRunner:
                 await self._stop_inbound_unsafe(name)
                 return
             self._ensure_inbound_workers(name)
+            # BACKLOG #1741: last, once the listener is bound and the stages are re-armed, so neither
+            # the log-write refusal above nor a halted worker is resolved as a start.
+            self._note_inbound_started(name)
 
     async def _stop_inbound_unsafe(self, name: str) -> None:
         """stop_inbound body without the reload lock — for callers that already hold it."""
@@ -5386,6 +5426,11 @@ class RegistryRunner:
                 self._record_fhir_lookup_failed(
                     lookup_name, failed_lookups[lookup_name], lookup_exc
                 )
+            # BACKLOG #1741: a fresh start re-armed every internal stage, so a connection_stopped an
+            # earlier run left open for an inbound that is now listening is stale, a bind failure an
+            # operator fixed and then restarted the service for among them.
+            for name in list(self._sources):
+                self._emit_inbound_started(name)
             # #147 (ADR 0095): spawn one active-window scheduler task per SCHEDULED connection. Each
             # AUTO-STARTs/STOPs its connection through the same start_inbound/stop_inbound (or
             # start_outbound/stop_outbound) path the API uses — a schedule-park is a clean stop, never a
@@ -7108,6 +7153,7 @@ class RegistryRunner:
             old_lookup_executor = self._lookup_executor
             old_fhir_lookup_executor = self._fhir_lookup_executor
 
+            self._started_pending = []
             try:
                 # 1. Quiesce intake: stop every inbound source so no NEW messages are accepted. Any
                 #    message already in flight completes under its arrival-time registry (snapshotted
@@ -7259,6 +7305,9 @@ class RegistryRunner:
                 # 3. Reconcile outbound connectors/workers (intake already live).
                 await self._reconcile_outbounds(old, new_registry)
             except BaseException as exc:
+                # BACKLOG #1741: the starts this reload made are undone below, so none resolves an
+                # alert. The rollback's own restarts emit directly, for the inbounds they bring back.
+                self._started_pending = None
                 # Roll back to the previous graph's intake so a failed reload leaves the engine
                 # accepting exactly what it did before (the realistic failure is an inbound bind).
                 # BaseException, not Exception (vault BACKLOG #2753): a CANCELLED reload, such as one
@@ -7302,6 +7351,12 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
+            # BACKLOG #1741: the swap committed, and step 3 has settled every outbound, so a held
+            # start is read against the graph that stays.
+            started = self._started_pending or ()
+            self._started_pending = None
+            for name in started:
+                self._emit_inbound_started(name)
             # The swap committed, so nothing can put the previous graph's executor back any more.
             self._retire_lookup_executor(old_lookup_executor)
             # vault BACKLOG #2371: the swap committed, so a lane the pre-check passed loses any old
