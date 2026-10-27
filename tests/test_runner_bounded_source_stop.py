@@ -101,6 +101,18 @@ class _Dispatcher:
         self.events.append("dispatchers")
 
 
+class _Destination:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def aclose(self) -> None:
+        self.events.append("aclose")
+
+
+async def _park() -> None:
+    await asyncio.Event().wait()
+
+
 def _runner(events: list[str], gate: asyncio.Event | None = None, **modes: str) -> RegistryRunner:
     runner = RegistryRunner(Registry(), store=None, egress=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]
     slow = sum(mode == "slow" for mode in modes.values())
@@ -134,17 +146,26 @@ async def test_a_failed_stop_keeps_the_drain_side(
     8bf008396). Red: the dispatchers are stopped and cleared."""
     events: list[str] = []
     runner = _runner(events, IB_OK="ok", IB_BAD="fails")
+    worker: asyncio.Task[None] = asyncio.create_task(_park())
+    runner._workers["OB_X"] = worker
+    runner._destinations["OB_X"] = _Destination(events)  # type: ignore[assignment]
 
-    with (
-        caplog.at_level(logging.WARNING, logger=wiring_runner.log.name),
-        pytest.raises(OSError, match="share went away"),
-    ):
-        await runner.stop()
+    try:
+        with (
+            caplog.at_level(logging.WARNING, logger=wiring_runner.log.name),
+            pytest.raises(OSError, match="share went away"),
+        ):
+            await runner.stop()
 
-    assert "end:IB_OK" in events  # every stop still ran and was joined
-    assert "'IB_BAD': stop() failed" in caplog.text and "OSError" in caplog.text
-    assert "dispatchers" not in events
-    assert list(runner._dispatchers) == [Stage.INGRESS]
+        assert "end:IB_OK" in events  # every stop still ran and was joined
+        assert "'IB_BAD': stop() failed" in caplog.text and "OSError" in caplog.text
+        # The whole drain side survives: dispatchers, workers, destinations.
+        assert "dispatchers" not in events and "aclose" not in events
+        assert list(runner._dispatchers) == [Stage.INGRESS]
+        assert runner._workers == {"OB_X": worker} and not worker.done()
+        assert list(runner._destinations) == ["OB_X"]
+    finally:
+        worker.cancel()
     assert set(runner._sources) == {"IB_OK", "IB_BAD"}
     assert runner.has_residual_state and not runner.running
 
@@ -366,6 +387,30 @@ async def test_a_third_cancel_still_joins_the_cut_stops(
     assert events.index("cut_done:IB_DICOM") < events.index("end:IB_DICOM")
     assert source.stop_calls == 2  # type: ignore[attr-defined]
     assert runner._sources == {}
+
+
+async def test_an_outer_cancel_still_reports_a_stop_cancelled_by_someone_else(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cancel path skips only the stops the runner itself cut. Mutation: skip every cancelled
+    task there. Red: IB_ODD, which ended cancelled before the runner cut anything, is never
+    logged."""
+    events: list[str] = []
+    gate = asyncio.Event()
+    runner = _runner(events, gate, IB_ODD="self_cancels", IB_A="gated")
+
+    task = asyncio.create_task(runner.stop())
+    await _started(events, "IB_ODD", "IB_A")
+    task.cancel()
+    await _yield()
+    gate.set()
+    with (
+        caplog.at_level(logging.WARNING, logger=wiring_runner.log.name),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await task
+
+    assert "'IB_ODD': stop() failed" in caplog.text and "ended cancelled" in caplog.text
 
 
 async def test_control_healthy_stops_log_nothing(caplog: pytest.LogCaptureFixture) -> None:

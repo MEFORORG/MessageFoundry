@@ -1173,13 +1173,14 @@ rest. A plain `gather` over concurrent stops would cut all of them at once. Inst
 
 1. The cancel reaches the `asyncio.wait`, which never cancels its awaitables (D6). The stops keep
    running.
-2. `_join_cancelled_source_stops` gives them up to `_CANCELLED_STOP_GRACE_SECONDS` (2.0s) to
-   finish. The grace spares a stop that ends promptly a cut and a redo, and the DICOM and Database
-   cut hazards below. The bound honours the caller's cancel. It saves no shutdown time: on the one
-   production path, `Engine.stop()`'s 10.0s `wait_for` on the graph supervisor, which can land
-   inside `start()`'s residual-state teardown, `Engine.stop()` next calls `registry_runner.stop()`,
-   which waits on the same stops with no bound. A hung stop is cut here and then hangs, visibly, in
-   that following `stop()`, which covers the rest.
+2. `_join_cancelled_source_stops` gives them up to `_CANCELLED_STOP_GRACE_SECONDS` to finish. The
+   grace spares a stop that ends promptly a cut and a redo, and the DICOM and Database cut hazards
+   below. The bound honours the caller's cancel. It saves no shutdown time, and on the production
+   paths it adds up to its own length. Those paths are at least `start()`'s residual-state
+   teardown and its failed-start unwind, each reachable from the graph supervisor while
+   `Engine.stop()`'s `wait_for` on that supervisor expires. `Engine.stop()` next calls
+   `registry_runner.stop()`, which waits on the same stops with no bound. A hung stop is cut here
+   and then hangs, visibly, in that following `stop()`, which covers the rest.
 3. Stops still running after the grace are cancelled and their cancellation is joined. A second
    cancel cuts at once, whether it arrives during the grace or is coalesced with the first in one
    loop turn. That is read as `current_task().cancelling()` rising by more than one over its value
@@ -1188,14 +1189,22 @@ rest. A plain `gather` over concurrent stops would cut all of them at once. Inst
 4. Every stop that finished with an error is logged by inbound name through `safe_exc`. A further
    cancel during the join of the cut stops does not leave one running: `gather` forwards the cancel
    to them and still resolves only once each has finished, so the teardown returns only after
-   every stop task is done, and no later `stop()` can overlap one. Then the cancel is re-raised. The clears never run, so every
-   source stays in `_sources`, and `_running = False` still runs in `_teardown_unsafe`'s `finally`
+   every stop task is done, and no later `stop()` can overlap one. A stop that ended cancelled
+   although the runner did not cut it is logged as a failure. Then the cancel is re-raised. The
+   clears never run, so every source stays in `_sources`, and `_running = False` still runs in `_teardown_unsafe`'s `finally`
    (the `_running` regression Inc 5's tests pin).
 
 So an outer cancel is bounded by the grace plus each cut stop's own cancellation handling. The serial
 loop's bound was that handling alone. A stop that needs longer than the grace, such as a listener
-in its client drain (`_CLIENT_SHUTDOWN_GRACE`, 5.0s), is cut, as the serial loop cut its one
-in-flight stop.
+in its client drain (`_CLIENT_SHUTDOWN_GRACE`), is cut, as the serial loop cut its one in-flight
+stop.
+
+Two limits come with running the stops as tasks at all, and so with the concurrency itself; the
+DEMOTE path has had both since Inc 4. A canceller of every task, such as `asyncio.run`'s close of
+a loop with the teardown still in flight, cancels each stop task directly and so cuts them all
+with no grace; that is reached only when a shutdown is already being torn down from under it. And
+the listeners' connection events from the stops reach the bounded event queue in one burst rather
+than one stop at a time, so at a large inbound count more of them can be dropped as overflow.
 
 ### What this relies on, per connector
 
@@ -1222,7 +1231,9 @@ turns red if the branch goes back to `gather`. A hung stop is cut after a shorte
 cancel still surfaces, which turns red if the grace wait has no timeout. A second cancel cuts at
 once, which turns red without the second cancel's handler. Two coalesced cancels cut at once, which
 turns red without the `cancelling()` check. A stop that failed before the cancel is still logged by
-name, which turns red if the cancel path skips the failure read. A cancel the task already carried
+name, which turns red if the cancel path skips the failure read. A stop that ended cancelled on
+its own before an outer cancel is still logged, which turns red if the cancel path skips every
+cancelled task. A cancel the task already carried
 does not skip the grace, which turns red without the baseline. A stop that ends cancelled on its
 own is raised as a `RuntimeError`, which turns red if it is re-raised as a cancel. A failed stop
 keeps the drain side, which turns red on head `8bf008396`, where the rest of teardown ran first. A
@@ -1236,7 +1247,11 @@ too: a stop that fails on every attempt keeps every later `start()` from buildin
 re-raised stop failure skips `stop()`'s settle of a prior demotion's abandoned stops;
 Database, RemoteFile and Timer `stop()` still join their poll task with no bound of their own; and
 a stop failure in `start()`'s failed-start unwind replaces the start error, which survives only as
-`__context__`.
+`__context__`. Also as the serial loop did: when `Engine.stop()`'s own `registry_runner.stop()`
+re-raises a stop failure, nothing retries it, so the drain side is never torn down,
+and `Engine.stop()`'s later steps, the coordinator stop and the store close among them, do not
+run. (The `8bf008396` build tore the drain side down before raising; the Lander held that build
+for clearing it under a still-live listener.)
 
 Two findings from review of this amendment are closed in it, not left open: the cleared drain side
 under a still-live listener (fixed above, *Joined is not stopped*), and a third cancel leaving cut

@@ -915,7 +915,7 @@ _PENDING_STOP_SETTLE_SECONDS = 10.0
 #: promptly a cut and a redo, and the DICOM and Database cut hazards. The bound honours the
 #: caller's cancel: a hung stop is cut here and then hangs, visibly, in the following unbounded
 #: stop() (Engine.stop() calls registry_runner.stop() right after cancelling the supervisor), which
-#: covers the rest. It saves no shutdown time on that path, and claims none.
+#: covers the rest. It saves no shutdown time on that path; it ADDS up to its own length there.
 _CANCELLED_STOP_GRACE_SECONDS = 2.0
 
 
@@ -5758,8 +5758,9 @@ class RegistryRunner:
                 _PENDING_STOP_SETTLE_SECONDS,
             )
 
+    @staticmethod
     async def _join_cancelled_source_stops(
-        self, tasks: list[asyncio.Task[None]], cancels_before: int
+        tasks: list[asyncio.Task[None]], cancels_before: int, cut: set[asyncio.Task[None]]
     ) -> None:
         """The SHUTDOWN source phase was cancelled from outside (ADR 0157 Amendment B).
 
@@ -5767,7 +5768,8 @@ class RegistryRunner:
         rest and join their cancellation. A second cancel cuts at once, whether it arrives during
         the grace or was coalesced with the first: ``cancelling()`` is compared against
         ``cancels_before``, read before the wait, so a cancel the task already carried from earlier
-        does not count. The caller re-raises.
+        does not count. Every task this method cancels is added to ``cut`` first, so the caller can
+        tell a stop it cut from one that ended cancelled for any other reason. The caller re-raises.
 
         A further cancel during the final ``gather`` cannot leave a cut stop running: the task's
         cancel is forwarded to the stops, and ``gather`` still resolves only once each has
@@ -5783,6 +5785,7 @@ class RegistryRunner:
             except asyncio.CancelledError:
                 still = {task for task in tasks if not task.done()}
         if still:
+            cut.update(still)
             for task in still:
                 task.cancel()
             log.warning(
@@ -5795,19 +5798,18 @@ class RegistryRunner:
 
     @staticmethod
     def _log_failed_source_stops(
-        sources: list[tuple[str, SourceConnector]],
+        names: list[str],
         tasks: list[asyncio.Task[None]],
-        *,
-        cancelled_is_failure: bool,
-    ) -> list[tuple[str, SourceConnector, BaseException]]:
-        """Log each FINISHED stop that failed, by inbound name, and return them; one still running is
-        skipped. With ``cancelled_is_failure`` a stop that ended cancelled although nobody cut it is
-        a failure, raised as a RuntimeError: a bare CancelledError re-raised from a teardown nobody
-        cancelled reads as the caller's own cancel (the graph supervisor would exit on it). Without
-        it, cancelled tasks are the ones the cancel path cut, already logged as a count."""
-        failed: list[tuple[str, SourceConnector, BaseException]] = []
-        for (name, source), task in zip(sources, tasks, strict=True):
-            if not task.done() or (task.cancelled() and not cancelled_is_failure):
+        cut: Collection[asyncio.Task[None]] = (),
+    ) -> list[BaseException]:
+        """Log each FINISHED stop that failed, by inbound name, and return the failures; one still
+        running, or one in ``cut`` (already logged as a count), is skipped. A stop that ended
+        cancelled although the runner did not cut it is a failure, as a RuntimeError: a bare
+        CancelledError raised from a teardown nobody cancelled reads as the caller's own cancel
+        (the graph supervisor would exit on it)."""
+        failed: list[BaseException] = []
+        for name, task in zip(names, tasks, strict=True):
+            if not task.done() or task in cut:
                 continue
             failure: BaseException | None = (
                 RuntimeError(f"inbound {name!r}: stop() ended cancelled")
@@ -5816,7 +5818,7 @@ class RegistryRunner:
             )
             if failure is not None:
                 log.warning("inbound %r: stop() failed: %s", name, safe_exc(failure))
-                failed.append((name, source, failure))
+                failed.append(failure)
         return failed
 
     async def _teardown_unsafe(
@@ -5918,10 +5920,10 @@ class RegistryRunner:
             # listener may still be live, so its drain side is kept and the next stop()/start()
             # retries it, as the serial loop left it. An OUTER cancel gets a bounded grace rather
             # than cutting every stop at once. ADR 0157 Amendment B states all of it, per connector.
-            sources = list(self._sources.items())  # snapshot BEFORE the await (ADR 0157 Inc 4)
+            names = list(self._sources)  # snapshot BEFORE the await (ADR 0157 Inc 4)
             tasks = [
-                asyncio.create_task(source.stop(), name=f"shutdown-stop:{name}")
-                for name, source in sources
+                asyncio.create_task(self._sources[name].stop(), name=f"shutdown-stop:{name}")
+                for name in names
             ]
             if tasks:
                 current = asyncio.current_task()
@@ -5929,14 +5931,15 @@ class RegistryRunner:
                 try:
                     await asyncio.wait(tasks)  # never cancels its awaitables (D6)
                 except asyncio.CancelledError:
+                    cut: set[asyncio.Task[None]] = set()
                     try:
-                        await self._join_cancelled_source_stops(tasks, cancels_before)
+                        await self._join_cancelled_source_stops(tasks, cancels_before, cut)
                     finally:
-                        self._log_failed_source_stops(sources, tasks, cancelled_is_failure=False)
+                        self._log_failed_source_stops(names, tasks, cut)
                     raise
-            failed_stops = self._log_failed_source_stops(sources, tasks, cancelled_is_failure=True)
+            failed_stops = self._log_failed_source_stops(names, tasks)
             if failed_stops:
-                raise failed_stops[0][2]
+                raise failed_stops[0]
             # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
             # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
             # _stop.set(). The shared _stop already broke their loops; d.stop() cancels each
