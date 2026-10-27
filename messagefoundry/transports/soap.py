@@ -120,6 +120,7 @@ from messagefoundry.transports.rest import (
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
     refuse_verify_off,
+    url_scheme,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
@@ -326,7 +327,7 @@ class SoapDestination(DestinationConnector):
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("SOAP destination requires a 'url' setting")
-        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        scheme = url_scheme(url, "SOAP destination 'url'")
         if scheme not in ("http", "https"):
             raise ValueError(f"SOAP destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "SOAP destination 'url'")

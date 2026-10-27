@@ -26,7 +26,7 @@ from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, Egr
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
-from messagefoundry.transports.rest import PROXY_DEFAULT, refuse_url_credentials
+from messagefoundry.transports.rest import PROXY_DEFAULT, refuse_url_credentials, url_host_label
 
 log = logging.getLogger(__name__)
 
@@ -678,15 +678,16 @@ def _dir_egress_allowed(directory: str, allowed: list[str]) -> bool:
 
 
 def _egress_host_label(url: str) -> str:
-    """The host an egress refusal may print (BACKLOG #1793). urllib unquotes the host, so one that
-    holds an ``@`` once unquoted is userinfo written as ``%40``, and printing it prints the password.
+    """The host an egress refusal may print (BACKLOG #1793, #2686): ``url_host_label``, which
+    withholds the host wherever ``_redact_url`` would. urllib unquotes the host, so one that holds an
+    ``@`` once unquoted is userinfo written as ``%40``. One that holds a ``:`` is a password head
+    whose port both readers in ``refuse_url_credentials`` miss, so the data arms pass it too.
 
     Every egress check runs BEFORE the connector constructor, so the construction refusal in the
     connector never speaks first. The data, token and FhirLookup arms therefore also call
     ``refuse_url_credentials`` up front, for a refusal that names the setting. The proxy arm cannot,
     since a proxy may carry its own userinfo, and this label is what keeps its message clean."""
-    host = urllib.parse.urlsplit(url).hostname or ""
-    return "(withheld: it holds a credential)" if "@" in urllib.parse.unquote(host) else host
+    return url_host_label(url)
 
 
 def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
@@ -695,9 +696,11 @@ def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
 
     A port ``urlsplit`` cannot read is NOT allowed, and this never raises (BACKLOG #1793). The
     ``ValueError`` from ``.port`` quotes the port text, and a password holding an unencoded ``/``,
-    ``?`` or ``#`` ends the authority early, so its head IS that text. ``redact()`` does not match it."""
-    parts = urllib.parse.urlsplit(url)
+    ``?`` or ``#`` ends the authority early, so its head IS that text. ``redact()`` does not match it.
+    A URL ``urlsplit`` cannot parse is not allowed either: that ``ValueError`` quotes the whole
+    netloc, and the proxy arm reaches here with no ``refuse_url_credentials`` in front (#2686)."""
     try:
+        parts = urllib.parse.urlsplit(url)
         port = parts.port
     except ValueError:
         return False

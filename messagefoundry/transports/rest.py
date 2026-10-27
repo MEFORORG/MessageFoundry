@@ -531,16 +531,42 @@ def _redact_url(url: str) -> str:
     holds ``@`` or ``:`` once unquoted is withheld too: ``svc%3APW%40host`` is a userinfo urllib
     unquotes, and ``hostname`` would print it whole. An IPv6 literal, zone and all, keeps its host."""
     p = urllib.parse.urlsplit(url)
-    encoded_userinfo = not p.netloc.rpartition("@")[2].startswith("[") and any(
-        c in urllib.parse.unquote(p.hostname or "") for c in "@:"
-    )
-    if encoded_userinfo or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}"):
+    if _withholds_host(p):
         return f"{p.scheme}://<redacted>"
     try:
         port = f":{p.port}" if p.port else ""
     except ValueError:
         port = ""
     return f"{p.scheme}://{p.hostname or ''}{port}{p.path}"
+
+
+def _withholds_host(p: urllib.parse.SplitResult) -> bool:
+    """Must a render of ``p`` withhold its host? :func:`_redact_url` says why (BACKLOG #2686).
+
+    True for an ``@`` anywhere after the authority, and for an unbracketed host that holds ``@`` or
+    ``:`` once unquoted. A password head written as ``%3A`` then ``%5D`` hides its port from both
+    readers in :func:`refuse_url_credentials`, so such a URL constructs, and its ``hostname`` is the
+    username and the password head."""
+    encoded_userinfo = not p.netloc.rpartition("@")[2].startswith("[") and any(
+        c in urllib.parse.unquote(p.hostname or "") for c in "@:"
+    )
+    return encoded_userinfo or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}")
+
+
+#: What :func:`url_host_label` prints in place of a host it must not print.
+HOST_WITHHELD = "(withheld: the URL may hold a credential)"
+
+
+def url_host_label(url: str) -> str:
+    """The host a refusal may print for ``url``, or :data:`HOST_WITHHELD` (BACKLOG #1793, #2686).
+
+    Withheld whenever :func:`_redact_url` would withhold it, and when ``urlsplit`` cannot parse the
+    URL: its ``ValueError`` quotes the whole netloc. Never raises. A host of ``""`` prints as ``""``."""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return HOST_WITHHELD
+    return HOST_WITHHELD if _withholds_host(p) else (p.hostname or "")
 
 
 def refuse_url_credentials(
@@ -573,18 +599,7 @@ def refuse_url_credentials(
 
     PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
     seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
-    # Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
-    # all, and ``from None`` would leave it on ``__context__`` (#1796).
-    try:
-        parsed: urllib.parse.SplitResult | None = urllib.parse.urlsplit(url)
-    except ValueError:
-        parsed = None
-    if parsed is None:
-        raise error(
-            f"{setting} is not a URL that can be parsed. A password written into the URL can "
-            f"cause this; set credentials in {use} instead"
-        )
-    p = parsed
+    p = _split_or_refuse(url, setting, use=use, error=error)
     if "@" in urllib.parse.unquote(p.netloc):
         raise error(
             f"{setting} must not carry credentials in the URL (the user:password@ part); "
@@ -610,6 +625,40 @@ def refuse_url_credentials(
             f"this; set credentials in {use} instead. Write a literal '@' as %40, or leave out a "
             "default port"
         )
+
+
+def _split_or_refuse(
+    url: str, setting: str, *, use: str, error: type[ValueError]
+) -> urllib.parse.SplitResult:
+    """``urlsplit(url)``, or a refusal that names ``setting`` and nothing of the URL.
+
+    Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
+    all, and ``from None`` would leave it on ``__context__`` (#1796)."""
+    try:
+        parsed: urllib.parse.SplitResult | None = urllib.parse.urlsplit(url)
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        raise error(
+            f"{setting} is not a URL that can be parsed. A password written into the URL can "
+            f"cause this; set credentials in {use} instead"
+        )
+    return parsed
+
+
+def url_scheme(
+    url: str,
+    setting: str,
+    *,
+    use: str = "basic_user/basic_password or bearer_token",
+    error: type[ValueError] = ValueError,
+) -> str:
+    """``url``'s lower-cased scheme, for a constructor that checks it BEFORE
+    :func:`refuse_url_credentials` (BACKLOG #2686). A bare ``urlsplit(url).scheme`` raises urlsplit's
+    own ``ValueError`` on a URL it cannot parse, and that text quotes the whole netloc. This raises
+    the refusal :func:`refuse_url_credentials` would, with the same ``setting``, ``use`` and
+    ``error``, and nothing of the URL on the message or the exception chain."""
+    return _split_or_refuse(url, setting, use=use, error=error).scheme.lower()
 
 
 # --- posture-keyed insecure-hop enforcement (#200, ADR 0092) -----------------------------------
@@ -2210,7 +2259,7 @@ class RestDestination(DestinationConnector):
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("REST destination requires a 'url' setting")
-        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        scheme = url_scheme(url, "REST destination 'url'")
         if scheme not in ("http", "https"):
             raise ValueError(f"REST destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "REST destination 'url'")
