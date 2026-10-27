@@ -2,11 +2,21 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
-    Record THIS lane's own free-slot count. The only writer of a lane level.
+    Record THIS lane's own counts of items in flight and items free by work. The only writer of a
+    lane level.
 
 .DESCRIPTION
-    A builder lane states how many of its slots are free BY WORK. Nothing else in the fleet may write
-    that number -- not the dispatcher, not a hook, not an inference from claims.
+    A builder lane states how many items it is working and how many it holds without working them.
+    Nothing else in the fleet may write those numbers -- not a Manager, not a hook, not an inference
+    from claims.
+
+    THERE IS NO ITEM CEILING (owner ruling 2026-10-26). This header is the tooling's record of the
+    ruling; lane-level.ps1 and tests/test_coord_lane_no_ceiling.py cite it. The four-item lane
+    ceiling, the start-throttle by burn, any WIP limit on briefing, and the -Capacity parameter
+    that defaulted to 4 are retired. Builders and Managers work at full speed; usage is governed by
+    the Steward's holds and the korus Workflow gate, never by this script. Nothing it records is a
+    cap, a slot count or a reason to stop briefing or building. Do not add a capacity back, and do
+    not add a usage throttle here.
 
     THERE IS NO -Lane AND NO -BoxKey PARAMETER, AND ADDING ONE DEFEATS THE WHOLE DESIGN. The box key is
     derived from $PWD, so a session can only ever state its OWN level. The failure this replaces is a
@@ -15,8 +25,11 @@
     numbers were honest. Only the lane knows which is which.
 
     FREE MEANS BY WORK, NOT BY CLAIMS. Built-and-awaiting-land is FREE. Blocked is FREE. Parked on a
-    condition is FREE. A claim you are not currently able to progress is a FREE slot wearing an
-    occupied label, and that mislabelling is the outage.
+    condition is FREE. A claim you are not currently able to progress is FREE work wearing an
+    occupied label, and that mislabelling is the outage. With no ceiling there are no empty slots,
+    so -Free counts those held items and nothing else. A level stated before 2026-10-26 may also
+    count empty slots under the retired ceiling. lane-level.ps1 asks a lane in a worktree named
+    builder* for a fresh level after 15 minutes; a lane in a worktree named otherwise is never asked.
 #>
 [CmdletBinding(DefaultParameterSetName = 'State')]
 param(
@@ -24,11 +37,11 @@ param(
     # set without both, and a Mandatory prompt there hangs a caller with stdin open
     # (tests/_no_prompt.py, vault BACKLOG #3627). The refusal follows this param block, after the
     # cloud refusal.
-    [Parameter(ParameterSetName = 'State')][ValidateRange(0, 99)][int]$Free,
-    [Parameter(ParameterSetName = 'State')][ValidateRange(0, 99)][int]$InFlight,
+    # Non-negative and unbounded above: an upper bound here would be a ceiling by another name.
+    [Parameter(ParameterSetName = 'State')][ValidateRange('NonNegative')][int]$Free,
+    [Parameter(ParameterSetName = 'State')][ValidateRange('NonNegative')][int]$InFlight,
     [Parameter(ParameterSetName = 'State')][string]$Note = '',
-    [Parameter(ParameterSetName = 'State')][ValidateRange(1, 99)][int]$Capacity = 4,
-    # Stamp that a dispatcher asked. Carries NO number and cannot produce an at-capacity reading.
+    # Stamp that a dispatcher asked. Carries NO number.
     [Parameter(ParameterSetName = 'Asked', Mandatory)][switch]$Asked,
     [Parameter(ParameterSetName = 'Show', Mandatory)][switch]$Show
 )
@@ -140,7 +153,7 @@ if (-not $Show -and $rec -and -not (Test-CoordRecordIsHere $rec)) {
 }
 if (-not $rec) {
     $rec = [pscustomobject]@{
-        v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $Capacity
+        v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $null
         statedFree = $null; statedInFlight = $null; statedUtc = $null
         statedBySessionId = $null; statedNote = ''
         tipAtStated = ''; claimHashAtStated = ''; turnsSinceStated = 0
@@ -175,7 +188,7 @@ if ($Show) {
         # between the two reads would print a stated level beside an `absent` reason. The fields
         # match the blank record above; fold the two together once that read keeps its reason.
         $shown = [pscustomobject]@{
-            v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $Capacity
+            v = 1; boxKey = $boxKey; worktree = $worktree; capacity = $null
             statedFree = $null; statedInFlight = $null; statedUtc = $null
             statedBySessionId = $null; statedNote = ''
             tipAtStated = ''; claimHashAtStated = ''; turnsSinceStated = 0
@@ -224,7 +237,6 @@ if ($Asked) {
     $tip = (& git rev-parse HEAD 2>$null)
     if ($LASTEXITCODE -ne 0) { $tip = '' } else { $tip = $tip.Trim() }
 
-    $rec.capacity          = $Capacity
     $rec.statedFree        = $Free
     $rec.statedInFlight    = $InFlight
     $rec.statedUtc         = $nowUtc
@@ -238,6 +250,19 @@ if ($Asked) {
 }
 $rec.worktree = $worktree
 $rec.boxKey   = $boxKey
+# `capacity` IS WRITTEN AS NULL, NEVER DROPPED. An older lane.ps1, run from another worktree's branch,
+# assigns $rec.capacity on every statement, and assigning a property a PSCustomObject lacks throws,
+# so that lane could not restate. Null is a value that names no cap; a record written before the
+# ceiling was retired holds 4 there until a statement replaces it. This branch's lane-level.ps1
+# reads only whether it is null, as a marker of who stated the counts; its header says how. So only
+# a statement nulls it: -Asked writes no counts, and nulling the marker there would leave an older
+# statement's counts reading as this script's. An older copy of that hook falls back to 4 whatever
+# this field holds, and reads 0 free with 2 or more in flight as full, which under the new meaning of
+# -Free it does sooner. Only replacing that reader, wherever it is installed, retires the ceiling there.
+if (-not $Asked) { $rec | Add-Member -NotePropertyName capacity -NotePropertyValue $null -Force }
+elseif (-not ($rec.PSObject.Properties.Name -contains 'capacity')) {
+    $rec | Add-Member -NotePropertyName capacity -NotePropertyValue $null
+}
 # docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this lane is not its own.
 $rec | Add-Member -NotePropertyName host -NotePropertyValue $thisHost -Force
 
@@ -250,7 +275,7 @@ Move-CoordFileReplace -Source $tmp -Destination $file -ReplaceReadOnly
 if ($Asked) {
     Write-Host "lane: recorded that a dispatcher asked. No number written."
 } else {
-    Write-Host "lane: $boxKey -- $Free free / $InFlight in flight of $($rec.capacity), stated $nowUtc"
+    Write-Host "lane: $boxKey -- $Free free / $InFlight in flight, stated $nowUtc"
     if (-not $Note) { Write-Host "      (no note. A note is what makes the number auditable later.)" }
 }
 exit 0
