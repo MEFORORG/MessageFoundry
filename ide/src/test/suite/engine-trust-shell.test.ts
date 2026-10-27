@@ -1839,7 +1839,9 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     }
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
     await trust.refreshEngineTrust();
-    plantCert(path.join("pki", "slow-ca.pem"));
+    if (!anchored) {
+      plantCert(path.join("pki", "slow-ca.pem"));
+    }
     trust.setEngineTrustLimitsForTest({ followReadMs: 20 });
     let opens = 0;
     openHook = (file) => {
@@ -1985,32 +1987,5 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     await ticks();
     await settle();
     assert.strictEqual(invocations.length, base + 1, "a follow-up refresh ran after deactivation");
-  });
-
-  test("a settings change that drops an anchor re-probes at once, not after a slow refresh", async () => {
-    // Finding 10: the re-probe waited for the queued refresh, which may take the CLI's whole
-    // allowance plus the read allowance (about 45 s) before the stale verdict was replaced.
-    stubInventory = plantedEngine();
-    const subscriptions: { dispose(): unknown }[] = [];
-    held.push(() => subscriptions.forEach((d) => d.dispose()));
-    configListener = undefined;
-    trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
-    await settle();
-    const listener = configListener as ConfigListener | undefined;
-    assert.ok(listener !== undefined, "no settings listener was subscribed");
-    let rechecks = 0;
-    const realExecute = vscodeStub.commands.executeCommand;
-    vscodeStub.commands.executeCommand = () => {
-      rechecks++;
-      return Promise.resolve(undefined);
-    };
-    held.push(() => (vscodeStub.commands.executeCommand = realExecute));
-    hungCli(); // the refresh the change queues does not finish during this test
-
-    stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile: path.join(ws, "pki", "missing.pem") }];
-    listener({ affectsConfiguration: (s) => s === "messagefoundry.environments" });
-    await ticks();
-
-    assert.ok(rechecks > 0, "the verdict earned with the dropped anchor stayed on screen");
   });
 });

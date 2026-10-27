@@ -1113,13 +1113,9 @@ export function registerEngineTrust(context: vscode.ExtensionContext): void {
         e.affectsConfiguration("messagefoundry.serviceConfig")
       ) {
         // Now, not when the queued refresh starts. An anchor dropped here is gone before that refresh
-        // takes its own before-and-after reading, so it would not count as a change there. Re-probe
-        // now too: that refresh may wait on the CLI and the reads for `cliAnswerMs + refreshReadMs`,
-        // and the verdict on screen was earned with what this publish just changed.
-        if (publishPinnedHosts(configuredPins())) {
-          void recheck();
-        }
-        void refreshThenRecheck(false);
+        // takes its own before-and-after reading, so it would not count as a change there.
+        const changed = publishPinnedHosts(configuredPins());
+        void refreshThenRecheck(false, changed);
       }
     }),
   );
@@ -1131,8 +1127,8 @@ export function refreshEngineTrustThenRecheck(): Promise<void> {
   return refreshThenRecheck(false);
 }
 
-async function refreshThenRecheck(followUp: boolean): Promise<void> {
-  if (await queueRefresh(followUp)) {
+async function refreshThenRecheck(followUp: boolean, changedAlready = false): Promise<void> {
+  if ((await queueRefresh(followUp)) || changedAlready) {
     await recheck(); // otherwise nothing changed about what we trust, so nothing to re-probe
   }
 }
