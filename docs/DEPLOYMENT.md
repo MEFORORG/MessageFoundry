@@ -1019,7 +1019,7 @@ an outbound connection that leaves three, the same three [CONNECTIONS.md](CONNEC
 on loopback, load a CRL the hop checks, or attest that one connection. Item 6 is what a *changed*
 posture does, and item 5 is what one did until ADR 0186. Both apply to
 the **outbound gate only** (the listener gate reads neither the data label nor `enforcement`, so it
-refuses regardless), and they are the realistic failure mode — a mislabelled box, not a missing
+refuses regardless). Item 6 is the realistic failure mode — a mis-set box, not a missing
 attestation:
 
 1. **Prove revocation in front — API gate only.** Terminate at a revocation-checking reverse proxy:

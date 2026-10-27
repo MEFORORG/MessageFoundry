@@ -390,12 +390,14 @@ def _import_into(
 @pytest.mark.parametrize(
     ("existing", "refusal", "with_ca"),
     [
-        pytest.param("cert.pem", "an existing certificate file", True, id="cert"),
-        pytest.param("ca-chain.pem", "an existing CA chain file", True, id="ca-chain"),
+        pytest.param("cert.pem", "overwrite an existing certificate file", True, id="cert"),
+        pytest.param("ca-chain.pem", "overwrite an existing CA chain file", True, id="ca-chain"),
         # A bundle with no CA writes no ca-chain.pem, but an earlier one would sit beside a key it
-        # does not chain, so it is refused too.
-        pytest.param("ca-chain.pem", "an existing CA chain file", False, id="stale-ca-chain"),
-        pytest.param("key.pem", "an existing key file", True, id="key"),
+        # does not chain, so it is refused too, saying why.
+        pytest.param(
+            "ca-chain.pem", "import beside an existing CA chain file", False, id="stale-ca-chain"
+        ),
+        pytest.param("key.pem", "overwrite an existing key file", True, id="key"),
     ],
 )
 def test_import_refuses_to_overwrite_an_existing_file(
@@ -415,7 +417,7 @@ def test_import_refuses_to_overwrite_an_existing_file(
     (out / existing).write_bytes(b"THE-OPERATORS-FILE\n")
 
     assert _import_into(tmp_path, monkeypatch, out, with_ca=with_ca) == 2
-    assert f"refusing to overwrite {refusal}" in json.loads(capsys.readouterr().out)["error"]
+    assert f"refusing to {refusal}" in json.loads(capsys.readouterr().out)["error"]
     assert (out / existing).read_bytes() == b"THE-OPERATORS-FILE\n"
     assert sorted(p.name for p in out.iterdir()) == [existing]
 
@@ -995,7 +997,8 @@ def test_a_key_the_cleanup_cannot_remove_is_named(
     assert rc == 2
     error = json.loads(capsys.readouterr().out)["error"]
     assert f"could not remove {out / 'key.pem'}" in error
-    assert "remove it before running again" in error
+    # Both the key and the truncated cert are left, so the line says "them" (vault BACKLOG #3514).
+    assert "so remove them before running again" in error
 
 
 @pytest.mark.parametrize(

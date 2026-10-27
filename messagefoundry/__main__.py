@@ -6062,7 +6062,8 @@ def _write_cert_files(
         if removed:
             reason += f"; removed {', '.join(removed)}, which this run wrote"
         if left:
-            reason += f"; could not remove {', '.join(left)}, so remove it before running again"
+            them = "it" if len(left) == 1 else "them"
+            reason += f"; could not remove {', '.join(left)}, so remove {them} before running again"
         return _cert_fail(reason, as_json=as_json)
     return None
 
@@ -6131,8 +6132,13 @@ def _cert_import(args: argparse.Namespace) -> int:
     # without a word, as `cert self-signed` replaced cert.pem (#3073). An earlier ca-chain.pem is
     # refused even when this bundle carries no CA, or it would sit beside a key it does not chain.
     refusal = _refusal_for_existing(
-        [(cert_path, "certificate"), (ca_path, "CA chain"), (key_path, "key")]
+        [(path, kind) for path, _pem, kind in public] + [(key_path, "key")]
     )
+    if refusal is None and ca_path.exists():  # only when the bundle has no CA, so writes no chain
+        refusal = (
+            f"refusing to import beside an existing CA chain file: {ca_path}. This bundle carries "
+            "no CA certs, so that chain does not belong to the new key (remove it first)"
+        )
     if refusal is not None:
         return _cert_fail(refusal, as_json=args.json)
 

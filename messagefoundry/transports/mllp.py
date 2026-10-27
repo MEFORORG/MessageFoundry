@@ -625,7 +625,8 @@ def _mllp_ssl_context(
     exactly as before.
 
     ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142),
-    and for the TLS refusal labels below, as the DICOM destination's do (vault BACKLOG #3514).
+    and for the TLS refusal labels below (vault BACKLOG #3514), as the DICOM destination's suite
+    refusal does. The DICOM listener's labels and the DICOM destination's pin refusal do not yet.
     ``listener_family`` names the listener in those labels: the inbound HTTP listener builds its
     context here too, and passes its own."""
     refuse_an_unread_ca_pin(
@@ -646,7 +647,10 @@ def _mllp_ssl_context(
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         if not cert:
-            raise ValueError("MLLP inbound tls=true requires tls_cert_file (the server identity)")
+            raise ValueError(
+                f"{_tls_label(listener_family, name)}: tls=true requires tls_cert_file "
+                "(the server identity)"
+            )
         load_connection_cert_chain(ctx, cert, key, key_password)
         if ca:  # opt-in mTLS: require + verify a client cert against this trust anchor
             # BACKLOG #1142, slice 3: the CA's pin, ACL, path and PEM checks, then load the bytes
