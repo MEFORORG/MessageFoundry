@@ -206,9 +206,10 @@ def _refuse_toolkit_command(command: str, argv: Sequence[str]) -> int:
     ``_emit_error`` writes JSON to stdout or one line to stderr, never both, and its own return value
     is 1, so it is not returned. ``argv_wants_json`` is the one pre-parse JSON rule both commands use.
 
-    The line names no install command. The toolkit distribution is not yet on PyPI, and
-    tests/test_install_instruction_provenance.py refuses shipped text that tells a user to install
-    an unclaimed name.
+    The line names no install command. It was written while the toolkit name was unclaimed on PyPI,
+    when tests/test_install_instruction_provenance.py refused shipped text telling a user to
+    install it by name. ADR 0201 slice 3 recorded the name as claimed; the docs that give a
+    bare-name install arrive with slice 4.
     """
     _emit_error(
         f"`{command}` is not a messagefoundry command. It is an authoring command: run it as "
