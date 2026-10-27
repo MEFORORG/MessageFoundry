@@ -58,14 +58,27 @@ def _refuse_the_certificate(port: int) -> bool:
     """A client that does not trust the listener's certificate, so it sends an alert the SERVER
     then fails its handshake on: the wrong-certificate case the row names. Blocking, run in a
     thread: asyncio's own client drops the socket without sending the alert, which the server
-    reads as a hang-up. True when the client refused, as it must."""
+    reads as a hang-up. True when the client refused, as it must.
+
+    After the alert it reads to the server's EOF before it closes (vault BACKLOG #4329). Closing
+    with the server's later records unread sends a reset, and Windows discards the server's unread
+    alert when a reset arrives, so the server saw a hang-up, which is not counted. The server
+    closes only after it has handled the alert, so when this returns the failure is counted."""
     ctx = ssl.create_default_context()
-    with socket.create_connection(("127.0.0.1", port), timeout=5.0) as raw:
+    with (
+        socket.create_connection(("127.0.0.1", port), timeout=5.0) as raw,
+        ctx.wrap_socket(raw, server_hostname="127.0.0.1", do_handshake_on_connect=False) as tls,
+    ):
         try:
-            with ctx.wrap_socket(raw, server_hostname="127.0.0.1"):
-                return False
+            tls.do_handshake()
+            return False
         except ssl.SSLCertVerificationError:
-            return True
+            pass
+        tls.shutdown(socket.SHUT_WR)  # drops the TLS layer; recv below reads the raw socket
+        with contextlib.suppress(OSError):
+            while tls.recv(4096):
+                pass
+        return True
 
 
 async def _plaintext_peer(port: int) -> None:
