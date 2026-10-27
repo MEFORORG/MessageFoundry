@@ -1813,8 +1813,9 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > hop is allowed, a per-connection `tls_hop_attested` with its `tls_hop_attested_reason` allows it (audited, and reported),
 > `cleartext_accepted` warns
 > and audits, a non-enforcing instance warns, and an **enforcing** instance **refuses** it. The refusal
-> lands at construction, so it fails `messagefoundry check` / dry-run / reload / the `serve` pre-flight
-> before anything starts.
+> lands at construction: it fails `messagefoundry check`, dry-run and reload as a whole, and in the live
+> build when `serve` starts it fails that connection, which is recorded failed while the rest of the
+> graph starts (ADR 0031).
 >
 > What is gated is the case the classifier can judge: **no** ssl/tls/encrypt keyword, or one pinned to
 > a no-TLS value. A keyword set to anything outside that deny-list is still delegated, because the
@@ -3137,7 +3138,8 @@ elsewhere. Keep a weakly wrapped key out of those places.
 ## Declaring a cleartext hop (`cleartext_accepted`)
 
 An **outbound** connection whose hop has no TLS is **refused** at `messagefoundry check` / dry-run /
-reload / the serve pre-flight under the default `[security].enforcement = enforce`
+reload, and in the live build when `serve` starts (that outbound is recorded failed and the rest of
+the graph starts), under the default `[security].enforcement = enforce`
 ([ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)). No data
 label relaxes that — `data_class = "synthetic"` used to allow every cleartext hop silently, and no longer
 does. There are exactly three ways such a hop crosses:
