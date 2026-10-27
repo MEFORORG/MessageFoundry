@@ -41,6 +41,16 @@ const MAX_PEM_BYTES = 512 * 1024;
  */
 const FAILURE_REFRESH_MIN_MS = 60_000;
 
+/**
+ * How long `cert inventory` may run before it is killed. Refreshes run one at a time, so a CLI that
+ * never answers (an interpreter waiting on a hung share, a debugger-attached Python) would otherwise
+ * hold every later refresh behind it for the life of the window: added pins would never register and
+ * removed ones would keep their anchor. The command reads a TOML and stats a few files; a cold Python
+ * start on Windows takes seconds, so this leaves an order of magnitude of headroom. A killed run is
+ * "we learned nothing", like any other CLI failure here.
+ */
+const CERT_INVENTORY_TIMEOUT_MS = 30_000;
+
 /** An anchor this file registered: the file it came from, so a renewal can be re-read, the PEM, and
  *  whether it is a `caFile` pin (which the engine's CLI can never replace, so it is never asked). */
 interface Registered {
@@ -58,17 +68,43 @@ const registered = new Map<string, Registered>();
 
 /**
  * Every host key a `caFile` claimed at the last refresh, usable or not. Such a host never takes the
- * CLI's certificate (see {@link stagePins}), so a failure there must not spawn the CLI either.
+ * CLI's certificate (see {@link claimedBy}), so a failure there must not spawn the CLI either.
  */
 let claimedKeys: ReadonlySet<string> = new Set();
+
+/**
+ * The usable `caFile` for each host key at the last refresh, read or not. Taken from the SAME pass as
+ * {@link claimedKeys}, so the follow path never pairs a claim from one configuration with a file from
+ * another; a settings change starts a refresh that replaces both together.
+ */
+let pinFiles: ReadonlyMap<string, string> = new Map();
 
 /** When the last failure-started full refresh began, on the MONOTONIC clock (`performance.now`), so
  *  a wall clock stepped backward cannot hold the limit shut. For {@link FAILURE_REFRESH_MIN_MS}. */
 let lastFailureRefresh = Number.NEGATIVE_INFINITY;
 
-/** How many refreshes are queued or running. A failure while one is pending starts no other: the
- *  pending one re-reads everything and re-probes the status bar if anything changed. */
+/** How many refreshes are queued or running. A failure while one is pending starts no other at once:
+ *  see {@link lateFailureKey} for the one case the pending refresh cannot cover. */
 let refreshesPending = 0;
+
+/** The running refresh's CLI call has returned (or was never made), so a certificate minted from now
+ *  on is invisible to it. */
+let cliAnswered = false;
+
+/** The running refresh was itself started by {@link lateFailureKey}; it schedules no further one. */
+let runningIsFollowUp = false;
+
+/**
+ * The host key of a CLI-anchorable failure that arrived after the last pending refresh's CLI had
+ * answered. That refresh cannot see a certificate minted after its answer, so when it finishes, one
+ * more refresh runs if the key is still unanchored. Only one follow-up per refresh, and never one from
+ * a follow-up, so failures cannot chain CLI spawns faster than the rate limit allows.
+ */
+let lateFailureKey: string | undefined;
+
+/** Re-reads the follow path has in flight, by file, so a burst of failing requests against one file
+ *  on an unreachable share queues one read rather than one per request. */
+const followReads = new Map<string, Promise<PemRead>>();
 
 /** The tail of the refresh chain. Refreshes run one at a time; see {@link refreshEngineTrust}. */
 let refreshTail: Promise<unknown> = Promise.resolve();
@@ -102,16 +138,42 @@ function trustState(): string {
  * screen. Re-reading the same certificate does not count, so a refresh started by a verification
  * failure cannot re-probe itself into a loop.
  *
- * Refreshes run ONE AT A TIME. Each clears the anchors and then awaits a subprocess, so two
- * interleaved runs could each clear what the other had just registered.
+ * Refreshes run ONE AT A TIME. Each awaits a subprocess and then replaces the whole set, so two
+ * interleaved runs could each replace what the other had just registered with an older reading.
  */
 export function refreshEngineTrust(): Promise<boolean> {
+  return queueRefresh(false);
+}
+
+function queueRefresh(followUp: boolean): Promise<boolean> {
   refreshesPending++;
-  const run = refreshTail.then(refreshOnce, refreshOnce).finally(() => {
+  const once = (): Promise<boolean> => {
+    runningIsFollowUp = followUp;
+    cliAnswered = false;
+    return refreshOnce();
+  };
+  // `finally`, so the count returns to 0 however the refresh ended; the CLI's timeout is what makes
+  // sure it does end.
+  const run = refreshTail.then(once, once).finally(() => {
     refreshesPending--;
+    cliAnswered = false;
+    if (refreshesPending === 0) {
+      startLateFollowUp();
+    }
   });
   refreshTail = run.catch(() => undefined);
   return run;
+}
+
+/** Run the follow-up {@link lateFailureKey} asked for, if that host is still unanchored and the CLI
+ *  could still anchor it. Past the rate limit on purpose: it is bounded to one per refresh instead. */
+function startLateFollowUp(): void {
+  const key = lateFailureKey;
+  lateFailureKey = undefined;
+  if (key === undefined || registered.has(key) || !cliCouldAnchor(key)) {
+    return;
+  }
+  void refreshThenRecheck(true);
 }
 
 /** Anchors one refresh has gathered, keyed by host key, committed together at its end. */
@@ -130,15 +192,20 @@ async function refreshOnce(): Promise<boolean> {
   const targets = pinTargetsOf(environments());
   const pins = trustPinsFor(targets);
   const claimed = claimedBy(pins);
-  await anchorLocalEngine(claimed, next);
-  // The pin FILES are read only now, after the await, so nothing a request follows while the CLI
-  // runs (a caFile rotated in place) is overwritten below by a read taken before it.
-  stagePins(pins, next);
+  try {
+    await anchorLocalEngine(claimed, next);
+  } finally {
+    cliAnswered = true;
+  }
+  // The pin FILES are read only now, after the CLI has answered, so nothing a request follows while
+  // the CLI runs (a caFile rotated in place) is overwritten below by a read taken before it.
+  await stagePins(pins, next);
   // Swap only now, after the subprocess has answered. Clearing first and then awaiting left EVERY
   // engine unanchored for as long as `cert inventory` ran, so a request in that window failed against
   // an engine trusted a moment earlier. Replacing the whole set still drops a host the user edited
   // away from, so it is not trusted later from a cached read.
   claimedKeys = claimed;
+  pinFiles = new Map(pins.flatMap((pin) => (pin.kind === "pin" ? [[pin.key, pin.file] as const] : [])));
   clearEngineTrustAnchors();
   registered.clear();
   for (const { url, anchor } of next.values()) {
@@ -154,12 +221,16 @@ async function refreshOnce(): Promise<boolean> {
  * A claimed key whose pin is refused or unreadable gets NO anchor, not the certificate
  * `messagefoundry.serviceConfig` names. The user pinned that host so that a workspace-chosen file
  * would not decide it; falling back to one when the pin breaks would undo that.
+ *
+ * The one exception is a pin on an `http://` url. Host keys carry no scheme, so claiming one would let
+ * a plain-http entry, which has no handshake to pin, take the anchor away from an https `engineUrl`
+ * on the same `host:port`. Such an entry pins nothing whatever its file says, so it claims nothing.
  */
 function claimedBy(pins: readonly TrustPin[]): Set<string> {
   const claimed = new Set<string>();
   for (const pin of pins) {
     const key = engineHostKey(pin.url);
-    if (key !== undefined) {
+    if (key !== undefined && isHttpsUrl(pin.url)) {
       claimed.add(key);
     }
   }
@@ -173,13 +244,13 @@ function claimedBy(pins: readonly TrustPin[]): Set<string> {
  * workspace: the setting is machine-scoped, so the file it names was chosen by the user of this
  * machine.
  */
-function stagePins(pins: readonly TrustPin[], next: Staged): void {
+async function stagePins(pins: readonly TrustPin[], next: Staged): Promise<void> {
   for (const pin of pins) {
     if (pin.kind === "refused") {
       engineLog().warn(`messagefoundry.environments: not pinning ${pin.url}: ${pin.reason}`);
       continue;
     }
-    const read = readAnchorPem(pin.file);
+    const read = await readAnchorPem(pin.file);
     if (read.pem === undefined) {
       engineLog().warn(`${read.problem} — not pinning ${pin.url}`);
       continue;
@@ -187,17 +258,6 @@ function stagePins(pins: readonly TrustPin[], next: Staged): void {
     stage(next, pin.url, { file: pin.file, pem: read.pem, pinned: true });
     engineLog().info(`trusting ${pin.file} for ${pin.url} (its caFile in messagefoundry.environments)`);
   }
-}
-
-/** The usable `caFile` configured for `key`, if any: the file a pin read at refresh time could not
- *  register still deserves a re-read when a request to that engine fails. */
-function configuredPinFile(key: string): string | undefined {
-  for (const pin of trustPinsFor(pinTargetsOf(environments()))) {
-    if (pin.kind === "pin" && pin.key === key) {
-      return pin.file;
-    }
-  }
-  return undefined;
 }
 
 /**
@@ -230,9 +290,10 @@ async function anchorLocalEngine(claimed: ReadonlySet<string>, next: Staged): Pr
     payload = await runJson<unknown>(
       ["cert", "inventory", "--service-config", serviceConfig()],
       workspace,
+      { timeoutMs: CERT_INVENTORY_TIMEOUT_MS },
     );
   } catch {
-    // No engine, no TOML, an older CLI — all "we learned nothing".
+    // A run killed at the timeout, no engine, no TOML, an older CLI — all "we learned nothing".
     return;
   }
 
@@ -250,7 +311,7 @@ async function anchorLocalEngine(claimed: ReadonlySet<string>, next: Staged): Pr
         `messagefoundry.serviceConfig names (${decision.file}) is not used for it.`,
     );
   } else if (decision.kind === "anchor") {
-    const read = readAnchorPem(decision.file);
+    const read = await readAnchorPem(decision.file);
     if (read.pem === undefined) {
       engineLog().warn(`${read.problem} — not trusting it`);
     } else {
@@ -280,44 +341,58 @@ async function anchorLocalEngine(claimed: ReadonlySet<string>, next: Staged): Pr
  *
  * Not `readCapped` from symbolIndex.ts, whose cap is a best-effort guard: it trusts `fstat`'s size,
  * which is 0 for `/dev/zero` or a FIFO, and then reads to an EOF that never comes. Not
- * `readSampleCapped` from sampleFile.ts either, which is hard-bounded but accepts any file type and
- * blocks opening a FIFO. A `caFile` is a free-form path, so here the descriptor must be a REGULAR
- * file and the read is bounded by the buffer. `O_NONBLOCK` makes opening a FIFO return at once (POSIX) instead of waiting for a writer;
- * it is ignored on Windows, where a named pipe reached by a UNC host name can still block the open.
+ * `readSampleCapped` from sampleFile.ts either, which is hard-bounded but accepts any file type,
+ * blocks opening a FIFO, and is synchronous. A `caFile` is a free-form path, so here the descriptor
+ * must be a REGULAR file and the read is bounded by the buffer. `O_NONBLOCK` makes opening a FIFO
+ * return at once (POSIX) instead of waiting for a writer; it is ignored on Windows, where a named pipe
+ * reached by a UNC host name can still block the open.
+ *
+ * ASYNCHRONOUS, because the follow path runs on every failing request and a file on an unreachable
+ * share takes the share's own timeout to fail. Synchronous, that wait blocked the extension host; here
+ * it holds one libuv pool thread. The buffer is sized like `readSampleCapped`'s: what `fstat` reports
+ * plus one byte to notice growth, so only a file that grew mid-read gets the full cap.
  * The path is resolved once, into the descriptor every check reads (CodeQL `js/file-system-race`).
  */
-function readRegularFileCapped(file: string, maxBytes: number): string | undefined {
-  let fd: number | undefined;
+async function readRegularFileCapped(file: string, maxBytes: number): Promise<string | undefined> {
+  let handle: fs.promises.FileHandle | undefined;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
-    const stat = fs.fstatSync(fd);
+    handle = await fs.promises.open(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
+    const stat = await handle.stat();
     if (!stat.isFile() || stat.size > maxBytes) {
       return undefined;
     }
-    const buffer = Buffer.alloc(maxBytes + 1);
-    let length = 0;
-    for (;;) {
-      const n = fs.readSync(fd, buffer, length, buffer.length - length, null);
-      if (n === 0) {
-        break;
-      }
-      length += n;
-      if (length > maxBytes) {
-        return undefined; // grew past the cap after the fstat
-      }
+    // allocUnsafe: only the bytes the reads filled are ever decoded.
+    let buffer = Buffer.allocUnsafe(stat.size + 1);
+    let length = await fillFrom(handle, buffer, 0);
+    if (length > stat.size) {
+      const bigger = Buffer.allocUnsafe(maxBytes + 1);
+      buffer.copy(bigger, 0, 0, length);
+      buffer = bigger;
+      length = await fillFrom(handle, buffer, length);
     }
-    return buffer.toString("utf8", 0, length);
+    return length > maxBytes ? undefined : buffer.toString("utf8", 0, length); // over: grew past the cap
   } catch {
     return undefined;
   } finally {
-    if (fd !== undefined) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        /* already gone */
-      }
-    }
+    await handle?.close().catch(() => undefined);
   }
+}
+
+/** Read from `handle` into `buffer` from offset `length` until end of file or a full buffer; the new
+ *  fill level. The asynchronous twin of `fillFrom` in sampleFile.ts. */
+async function fillFrom(
+  handle: fs.promises.FileHandle,
+  buffer: Buffer,
+  length: number,
+): Promise<number> {
+  while (length < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, length, buffer.length - length, null);
+    if (bytesRead === 0) {
+      break;
+    }
+    length += bytesRead;
+  }
+  return length;
 }
 
 /** A certificate read: the PEM, or why there is none, worded for the log. */
@@ -327,14 +402,14 @@ type PemRead = { pem: string; problem?: undefined } | { pem?: undefined; problem
  * Read a certificate PEM, or say why it cannot be used.
  *
  * `file` arrives ABSOLUTE, from {@link trustAnchorForTarget} or {@link trustPinsFor}. It has to:
- * the read ends in a bare `fs.openSync`, which resolves a relative path against the extension
+ * the read ends in a bare `fs.promises.open`, which resolves a relative path against the extension
  * host's own cwd — a directory that has nothing to do with the workspace or the setting.
  *
  * The caller logs the problem, not this function: a re-read after a verification failure runs on
  * every failing probe, and logging there each time would bury the log in one repeated line.
  */
-function readAnchorPem(file: string): PemRead {
-  const pem = readRegularFileCapped(file, MAX_PEM_BYTES);
+async function readAnchorPem(file: string): Promise<PemRead> {
+  const pem = await readRegularFileCapped(file, MAX_PEM_BYTES);
   if (pem === undefined) {
     return { problem: `could not read the engine certificate at ${file}` };
   }
@@ -351,6 +426,53 @@ function readAnchorPem(file: string): PemRead {
   return { pem };
 }
 
+/** {@link readAnchorPem} for the follow path, sharing one read per file while it is in flight. */
+function rereadForFollow(file: string): Promise<PemRead> {
+  let read = followReads.get(file);
+  if (read === undefined) {
+    read = readAnchorPem(file).finally(() => followReads.delete(file));
+    followReads.set(file, read);
+  }
+  return read;
+}
+
+/**
+ * True when a refresh could anchor `key` from the engine's CLI: it is `messagefoundry.engineUrl`'s
+ * host, that host is loopback, and no `caFile` claims it (a pin, usable or not, wins over the CLI's
+ * answer, so asking would change nothing). The CLI anchors no other host.
+ */
+function cliCouldAnchor(key: string): boolean {
+  const url = engineUrl();
+  return (
+    !claimedKeys.has(key) &&
+    registered.get(key)?.pinned !== true &&
+    key === engineHostKey(url) &&
+    isLocalEngine(url)
+  );
+}
+
+/**
+ * Start a full refresh for a failure the CLI could answer, without spawning one per failing probe.
+ *
+ * With no refresh pending, at most one per {@link FAILURE_REFRESH_MIN_MS}. With one pending, none at
+ * once: a refresh that has not yet asked the CLI will see whatever caused this failure. One whose CLI
+ * already answered cannot see a certificate minted after that answer, so the failure is noted and
+ * {@link startLateFollowUp} runs one more refresh when it finishes.
+ */
+function noteCliAnchorableFailure(key: string): void {
+  if (refreshesPending > 0) {
+    if (refreshesPending === 1 && cliAnswered && !runningIsFollowUp) {
+      lateFailureKey = key;
+    }
+    return;
+  }
+  const now = performance.now();
+  if (now - lastFailureRefresh >= FAILURE_REFRESH_MIN_MS) {
+    lastFailureRefresh = now;
+    void refreshThenRecheck(false);
+  }
+}
+
 /**
  * Follow a certificate that changed under a registered anchor — BACKLOG #1695, residual c.
  *
@@ -360,67 +482,73 @@ function readAnchorPem(file: string): PemRead {
  *
  * Two cases:
  *   * a file describes that `host:port` — the registered anchor's, or a configured `caFile` that
- *     could not be read at refresh time (a share not yet mounted): re-read it, synchronously and
- *     capped. The engine renews its generated pair at startup into the same file (ADR 0172,
- *     2026-09-26 amendment), and a `caFile` rotated in place behaves the same way. Nothing is
- *     spawned. The read is synchronous: a file on an unreachable share blocks the extension host
- *     for the share's own timeout, and no request timeout bounds that.
+ *     could not be read at refresh time (a share not yet mounted): re-read it, asynchronously and
+ *     capped, one read per file at a time. The engine renews its generated pair at startup into the
+ *     same file (ADR 0172, 2026-09-26 amendment), and a `caFile` rotated in place behaves the same
+ *     way. Nothing is spawned.
  *   * otherwise (no file, or its certificate is the one that just failed), for the engine
  *     `messagefoundry.engineUrl` names when it is loopback and no `caFile` claims it: start the full
- *     refresh in the BACKGROUND, at most once per {@link FAILURE_REFRESH_MIN_MS} and only when no
- *     refresh is already pending, and answer false. That covers the first-run gap (an engine
- *     started after the window opened mints its certificate only then). It is not awaited because
- *     it spawns the engine's CLI, which has no timeout; a request waiting on it would no longer
- *     honour its own. The refresh re-probes the status bar when it registers something.
+ *     refresh in the BACKGROUND (see {@link noteCliAnchorableFailure} for when), and answer false.
+ *     That covers the first-run gap (an engine started after the window opened mints its certificate
+ *     only then). It is not awaited because it spawns the engine's CLI, which may take up to
+ *     {@link CERT_INVENTORY_TIMEOUT_MS}; a request waiting on it would no longer honour its own
+ *     timeout. The refresh re-probes the status bar when it registers something.
  *
  * Every other target gets nothing: the CLI anchors only `engineUrl`'s host, and no file of this
  * machine describes the rest.
  *
  * Exported for the shell test; production reaches it through {@link registerEngineTrust}.
  */
-export function followCertificateChange(url: string, usedCa: string | undefined): Promise<boolean> {
+export async function followCertificateChange(
+  url: string,
+  usedCa: string | undefined,
+): Promise<boolean> {
   const key = engineHostKey(url);
   if (key === undefined) {
-    return Promise.resolve(false);
+    return false;
   }
+  const fileFor = (): string | undefined => registered.get(key)?.file ?? pinFiles.get(key);
+  const file = fileFor();
+  const read = file === undefined ? undefined : (await rereadForFollow(file)).pem;
+  // Read the registration again: a refresh may have committed while the file was being read.
   const held = registered.get(key);
-  const file = held?.file ?? configuredPinFile(key);
-  const read = file === undefined ? undefined : readAnchorPem(file).pem;
-  if (file !== undefined && read !== undefined && read !== usedCa) {
+  // The file must still be the one that describes this host: a refresh that moved it elsewhere while
+  // the read ran has the newer answer, and the branch below retries against that.
+  if (file !== undefined && read !== undefined && read !== usedCa && file === fileFor()) {
     if (read !== held?.pem) {
       register(url, { file, pem: read, pinned: held?.pinned ?? true });
       engineLog().info(`the certificate at ${file} changed; trusting it for ${url}`);
     }
     // Equal to `held.pem` means another request already followed it; this one retries all the same.
-    return Promise.resolve(true);
+    return true;
   }
   if (held !== undefined && held.pem !== usedCa) {
     // A refresh registered a different anchor while this request was in flight. The re-read above
     // may have failed (a file mid-rewrite), but what is registered now is still worth one retry.
-    return Promise.resolve(true);
+    return true;
   }
-  // A caFile, usable or not, wins over the CLI's answer, so asking would change nothing; and the CLI
-  // anchors only engineUrl's host. A refresh already pending will re-read everything anyway.
-  const now = performance.now();
-  const cliCanAnchor =
-    !claimedKeys.has(key) &&
-    held?.pinned !== true &&
-    key === engineHostKey(engineUrl()) &&
-    isLocalEngine(url) &&
-    refreshesPending === 0;
-  if (cliCanAnchor && now - lastFailureRefresh >= FAILURE_REFRESH_MIN_MS) {
-    lastFailureRefresh = now;
-    void refreshEngineTrustThenRecheck();
+  if (cliCouldAnchor(key)) {
+    noteCliAnchorableFailure(key);
   }
-  return Promise.resolve(false);
+  return false;
 }
 
-/** Drop every anchor and reset the failure-refresh rate limit. For the shell test only. */
+/** Resolves once no refresh is queued or running, a follow-up included. For the shell test only. */
+export async function engineTrustSettled(): Promise<void> {
+  while (refreshesPending > 0) {
+    await refreshTail;
+  }
+}
+
+/** Drop every anchor and reset the failure-refresh state. For the shell test only. */
 export function forgetEngineTrust(): void {
   clearEngineTrustAnchors();
   registered.clear();
   claimedKeys = new Set();
+  pinFiles = new Map();
   lastFailureRefresh = Number.NEGATIVE_INFINITY;
+  lateFailureKey = undefined;
+  followReads.clear();
 }
 
 /**
@@ -473,8 +601,12 @@ export function registerEngineTrust(context: vscode.ExtensionContext): void {
 
 /** Re-learn the engine certificate, and re-probe if what the client trusts changed. Exported for the
  *  workspace-trust grant, which activation cannot re-run (vault BACKLOG #3166). */
-export async function refreshEngineTrustThenRecheck(): Promise<void> {
-  if (!(await refreshEngineTrust())) {
+export function refreshEngineTrustThenRecheck(): Promise<void> {
+  return refreshThenRecheck(false);
+}
+
+async function refreshThenRecheck(followUp: boolean): Promise<void> {
+  if (!(await queueRefresh(followUp))) {
     return; // nothing changed about what we trust, so nothing to re-probe
   }
   try {

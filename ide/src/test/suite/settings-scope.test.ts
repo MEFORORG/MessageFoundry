@@ -95,6 +95,7 @@ suite("caFile is reachable only through a machine-scoped setting (SEC-005, BACKL
       { scope?: string; items?: { properties?: Record<string, { items?: unknown }> } }
     >;
     const env = props["messagefoundry.environments"];
+    assert.ok(env, "package.json no longer contributes messagefoundry.environments");
     assert.strictEqual(env.scope, "machine");
     const entry = env.items?.properties ?? {};
     assert.ok(entry.caFile, "environment entries declare no caFile");

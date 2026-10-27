@@ -86,6 +86,24 @@ export class NetworkError extends Error {
 }
 
 /**
+ * A request that failed verification because the engine's certificate changed, where the client has
+ * since followed the new certificate but did not resend the request (a POST; see
+ * {@link withRenewalRetry}). A plain retry by the user will verify. Whether the engine received the
+ * failed request is not known, so the message asks the user to check before repeating an action.
+ * It keeps the TLS `code`, so a caller classifying by code still reads it as a trust failure.
+ */
+export class CertificateChangedError extends NetworkError {
+  constructor(baseUrl: string, code?: string) {
+    super(
+      `the engine at ${baseUrl} presented a new certificate, which is now trusted; this request was ` +
+        `not sent again. Retry it (for an action, check first whether it already took effect).`,
+      code,
+    );
+    this.name = "CertificateChangedError";
+  }
+}
+
+/**
  * The negotiated TLS floor for every https request this client makes.
  *
  * State the defect precisely, because the overstated version is wrong: Node has defaulted
@@ -179,6 +197,21 @@ export function clearEngineTrustAnchors(): void {
   trustAnchors.clear();
 }
 
+/**
+ * Capture the registered anchors and return a function that puts exactly that set back. For a test
+ * that registers its own anchors: in the Extension Host leg `engineTrust.ts` keeps its own record of
+ * what it registered, and clearing the client's set behind its back would leave the two out of step.
+ */
+export function snapshotEngineTrustAnchors(): () => void {
+  const saved = new Map(trustAnchors);
+  return () => {
+    trustAnchors.clear();
+    for (const [key, pem] of saved) {
+      trustAnchors.set(key, pem);
+    }
+  };
+}
+
 /** The anchor registered for `url`'s engine, if any. The ONE lookup: {@link tlsOptions} and
  *  {@link withRenewalRetry} must agree on which anchor a request carried. */
 function anchorFor(url: string): string | undefined {
@@ -222,7 +255,13 @@ export function setTrustFailureHandler(
  * ONLY A GET RETRIES. Whether Node can flush a request's bytes before its JS-side verification
  * destroys the socket has not been measured, and a POST here can be a reload or a dual-control
  * approval, where a duplicate is costly. A POST still reports the failure, so the anchor is
- * followed and the NEXT request succeeds. Verification is never relaxed for the retry.
+ * followed and the NEXT request succeeds; when it was followed, the POST rejects with a
+ * {@link CertificateChangedError} saying a retry will work, not the trust error's remedy, which would
+ * send the user to a configuration that is not at fault. Verification is never relaxed for the retry.
+ *
+ * The handler may also answer false while starting a background refresh (a loopback engine with no
+ * anchor yet); then the request fails with the ordinary trust error and a later one picks the
+ * certificate up. `engineTrust.ts`'s `followCertificateChange` says when.
  */
 async function withRenewalRetry<T>(
   baseUrl: string,
@@ -243,8 +282,13 @@ async function withRenewalRetry<T>(
     } catch {
       // Best-effort: the request's own trust error is the useful outcome to report.
     }
-    if (!followed || !retry) {
+    if (!followed) {
       throw err;
+    }
+    if (!retry) {
+      // The trust error's own text sends the user to fix `serviceConfig` or a `caFile`, which is wrong
+      // here: the configuration is fine, the engine's certificate moved, and it is already followed.
+      throw new CertificateChangedError(baseUrl, err.code);
     }
     return attempt();
   }

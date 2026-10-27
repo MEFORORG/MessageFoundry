@@ -252,7 +252,9 @@ set `caFile` on its `messagefoundry.environments` entry (or on one engine shard)
 - It must be a full path (a drive-letter or UNC path on Windows, an absolute path elsewhere); a
   relative or root-relative path is refused, so a workspace can never choose the file. A `caFile`
   that is refused or unreadable leaves that engine with no anchor at all; it never falls back to the
-  certificate `messagefoundry.serviceConfig` names. The setting is machine-scoped, so a checked-in
+  certificate `messagefoundry.serviceConfig` names. The exception is a `caFile` on an `http://`
+  entry, which has no certificate to pin: it is refused and claims nothing, so an https engine on
+  the same `host:port` is anchored as if it were absent. The setting is machine-scoped, so a checked-in
   `.vscode/settings.json` cannot add or change a pin. An engine shard without its own `caFile` uses
   its environment's.
 - A refused or unreadable `caFile` is named in the **MessageFoundry Engine** log, and so is an https
@@ -262,10 +264,19 @@ set `caFile` on its `messagefoundry.environments` entry (or on one engine shard)
 the same file. When a request fails verification, the extension re-reads the file its anchor came
 from (or a `caFile` it could not read earlier) and, if the certificate changed, retries that request
 once against the new one; that retry is made for a GET only, so a POST that failed is not sent
-twice, and the next request uses the new certificate. For the loopback `messagefoundry.engineUrl` with no anchor yet (the engine
-was started after the window opened), it asks the engine again in the background, at most once a
-minute; that request still fails, and the status bar picks the certificate up when the answer
-arrives. Verification stays on for the retry.
+twice. Such a POST fails with a message saying the engine's certificate changed and a retry will
+work, rather than the usual advice to check `serviceConfig` or `caFile`; check whether an action
+already took effect before you repeat it. The next request uses the new certificate. The file is
+read without blocking the editor, so a `caFile` on an unreachable share slows only the request
+waiting on it.
+
+For the loopback `messagefoundry.engineUrl` with no anchor yet (the engine was started after the
+window opened), and no `caFile` on an https entry for that `host:port`, a failure asks the engine again in the background:
+at most once a minute, and not while another refresh is already under way, unless that refresh had
+already heard from the engine when the failure arrived, in which case one more runs after it. That
+request still fails, and the status bar picks the certificate up when the answer arrives. Asking the
+engine is given 30 seconds before it is abandoned, so a hung interpreter cannot stop later setting
+changes from taking effect. Verification stays on for the retry.
 
 **The OS trust store.** Unmeasured. VS Code's `http.systemCertificates` (on by default) is meant to
 add the OS store to an extension's https requests. Reading the `@vscode/proxy-agent` 0.45.0 that VS

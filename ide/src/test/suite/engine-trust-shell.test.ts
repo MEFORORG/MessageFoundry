@@ -36,6 +36,13 @@ let stubInventory: unknown;
 let invocations: { args: string[]; cwd: string | undefined }[];
 /** Every line written to the engine log. The log IS the user-facing output of this path. */
 let logged: string[];
+/** Called with each logged line, so a test can act at a known point inside a running refresh. */
+let onLog: ((line: string) => void) | undefined;
+
+function log(line: string): void {
+  logged.push(line);
+  onLog?.(line);
+}
 
 const vscodeStub = {
   workspace: {
@@ -51,9 +58,9 @@ const vscodeStub = {
   },
   window: {
     createOutputChannel: () => ({
-      info: (line: string): void => void logged.push(line),
-      warn: (line: string): void => void logged.push(line),
-      error: (line: string): void => void logged.push(line),
+      info: log,
+      warn: log,
+      error: log,
       show: (): void => {},
       dispose: (): void => {},
     }),
@@ -138,6 +145,18 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
   let ws: string;
 
+  /** The stubbed CLI: records the call and answers at once with {@link stubInventory}. */
+  const answeringCli = ((
+    _file: string,
+    args: string[],
+    options: { cwd?: string },
+    done: (err: null, stdout: string, stderr: string) => void,
+  ) => {
+    invocations.push({ args, cwd: options.cwd });
+    done(null, JSON.stringify(stubInventory), "");
+    return undefined;
+  }) as unknown as typeof childProcess.execFile;
+
   /** A payload in the shape `cert inventory --service-config … --json` prints. */
   function inventoryFor(cert: string, source: "generated" | "operator"): unknown {
     return { certs: [], api_tls: { scheme: "https", source, cert, cert_present: true } };
@@ -158,20 +177,15 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     invocations = [];
     logged = [];
     stubInventory = undefined;
+    onLog = undefined;
     trust.forgetEngineTrust();
-    childProcess.execFile = ((
-      _file: string,
-      args: string[],
-      options: { cwd?: string },
-      done: (err: null, stdout: string, stderr: string) => void,
-    ) => {
-      invocations.push({ args, cwd: options.cwd });
-      done(null, JSON.stringify(stubInventory), "");
-      return undefined;
-    }) as unknown as typeof childProcess.execFile;
+    childProcess.execFile = answeringCli;
   });
 
-  teardown(() => {
+  teardown(async () => {
+    onLog = undefined;
+    childProcess.execFile = answeringCli;
+    await trust.engineTrustSettled(); // nothing from this test may run into the next one
     childProcess.execFile = realExecFile;
     trust.forgetEngineTrust();
     fs.rmSync(ws, { recursive: true, force: true });
@@ -341,11 +355,9 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
   const RENEWED = "-----BEGIN CERTIFICATE-----\nrenewed\n-----END CERTIFICATE-----\n";
 
-  /** Let a background refresh finish: the stubbed CLI answers synchronously, so a few turns do. */
-  async function settle(): Promise<void> {
-    for (let i = 0; i < 5; i++) {
-      await new Promise((resolve) => setImmediate(resolve));
-    }
+  /** Let every background refresh finish, a late follow-up included. */
+  function settle(): Promise<void> {
+    return trust.engineTrustSettled();
   }
 
   test("a caFile pins a REMOTE environment target — the case serviceConfig cannot cover", async () => {
@@ -469,8 +481,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
   });
 
   test("a caFile that is not a regular file is refused, not read", async () => {
-    // A directory here; /dev/zero or a FIFO on POSIX. fstat reports size 0 for those, so a reader
-    // that trusts the size reads to an EOF that never comes.
+    // A directory, which any reader refuses. The POSIX test below holds the cases that matter.
     const dir = path.join(ws, "pki");
     fs.mkdirSync(dir, { recursive: true });
     stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile: dir }];
@@ -564,5 +575,189 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
   test("an unpinned remote target follows nothing and spawns nothing", async () => {
     assert.strictEqual(await trust.followCertificateChange(REMOTE, undefined), false);
     assert.strictEqual(invocations.length, 0);
+  });
+
+  // ---- round 3: the refresh gate, the CLI timeout, and the http claim ----
+
+  test(
+    "a caFile naming /dev/zero or a FIFO is refused without hanging",
+    async function () {
+      if (process.platform === "win32") {
+        this.skip(); // neither exists there; the directory case above is what Windows can run
+      }
+      // fstat reports size 0 for both, so a reader that trusts the size reads /dev/zero forever, and
+      // a blocking open of a FIFO waits for a writer that never comes. Mocha's timeout is the bound.
+      const fifo = path.join(ws, "pki.fifo");
+      (require("node:child_process") as typeof import("node:child_process")).execFileSync("mkfifo", [
+        fifo,
+      ]);
+      for (const caFile of ["/dev/zero", fifo]) {
+        logged = [];
+        stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+        assert.strictEqual(await trust.refreshEngineTrust(), false, caFile);
+        assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined, caFile);
+        assert.ok(
+          logged.some((line) => line.includes(`could not read the engine certificate at ${caFile}`)),
+          `${caFile}: the refusal was silent: ${JSON.stringify(logged)}`,
+        );
+      }
+    },
+  );
+
+  test("a CLI that never answers is killed at a timeout, and later refreshes still run", async () => {
+    let hung: ((err: Error, stdout: string, stderr: string) => void) | undefined;
+    let timeout: unknown;
+    childProcess.execFile = ((
+      _file: string,
+      args: string[],
+      options: { cwd?: string; timeout?: number },
+      done: (err: Error, stdout: string, stderr: string) => void,
+    ) => {
+      invocations.push({ args, cwd: options.cwd });
+      timeout = options.timeout;
+      hung = done;
+      return undefined;
+    }) as unknown as typeof childProcess.execFile;
+
+    const first = trust.refreshEngineTrust();
+    for (let i = 0; i < 5 && hung === undefined; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.ok(hung !== undefined, "the refresh never reached the CLI");
+    assert.ok(
+      typeof timeout === "number" && timeout > 0 && timeout <= 60_000,
+      `cert inventory runs with no bounded timeout (${String(timeout)}), so one hung run stalls ` +
+        `every refresh queued behind it`,
+    );
+    // What Node's execFile reports when its timeout kills the child.
+    hung(Object.assign(new Error("killed"), { killed: true, signal: "SIGTERM" }), "", "");
+    assert.strictEqual(await first, false);
+
+    // The count is back to 0, so a failure starts a refresh, and that one anchors the engine.
+    childProcess.execFile = answeringCli;
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), false);
+    await settle();
+    assert.strictEqual(invocations.length, 2, "the failure-started refresh never ran");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  /** A remote pin, so the refresh reads a file AFTER its CLI answered and logs that it did. */
+  function remotePinLoggedAfterTheCli(): string {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    return `trusting ${caFile} for ${REMOTE}`;
+  }
+
+  test("a failure after the refresh's CLI answered runs one more refresh when it finishes", async () => {
+    // The pending refresh asked the engine before the certificate existed, so it cannot pick it up.
+    stubInventory = {
+      api_tls: { scheme: "https", source: "generated", cert: "/nowhere.pem", cert_present: false },
+    };
+    const marker = remotePinLoggedAfterTheCli();
+    onLog = (line): void => {
+      if (line.includes(marker) && invocations.length === 1) {
+        // The engine mints its certificate now, after its CLI answered, and a request fails.
+        stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+        void trust.followCertificateChange(LOOPBACK, undefined);
+      }
+    };
+
+    await trust.refreshEngineTrust();
+    await settle();
+
+    assert.strictEqual(invocations.length, 2, "the late failure was dropped");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("a failure while the CLI is still running is left to that refresh — the control", async () => {
+    const planted = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    childProcess.execFile = ((...args: unknown[]) => {
+      // Before the CLI answers: the answer below already includes the certificate.
+      void trust.followCertificateChange(LOOPBACK, undefined);
+      stubInventory = planted;
+      return (answeringCli as (...a: unknown[]) => unknown)(...args);
+    }) as unknown as typeof childProcess.execFile;
+
+    await trust.refreshEngineTrust();
+    await settle();
+
+    assert.strictEqual(invocations.length, 1, "a refresh that would see the cause ran again anyway");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("late failures run one follow-up, never a chain", async () => {
+    // The engine never mints: each refresh, the follow-up included, sees a failure after its CLI.
+    stubInventory = {
+      api_tls: { scheme: "https", source: "generated", cert: "/nowhere.pem", cert_present: false },
+    };
+    const marker = remotePinLoggedAfterTheCli();
+    onLog = (line): void => {
+      if (line.includes(marker)) {
+        void trust.followCertificateChange(LOOPBACK, undefined);
+      }
+    };
+
+    await trust.refreshEngineTrust();
+    await settle();
+
+    assert.strictEqual(invocations.length, 2);
+  });
+
+  test("a failed re-read still retries when a refresh registered a different anchor meanwhile", async () => {
+    const cert = plantCert(path.join("state", "api-cert.pem"));
+    stubInventory = inventoryFor(cert, "generated");
+    await trust.refreshEngineTrust();
+    fs.rmSync(cert); // mid-rewrite: the re-read fails
+
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, RENEWED), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+    // The control: the request carried what is registered, so there is nothing new to retry with.
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, PEM), false);
+  });
+
+  test("a caFile rotated while the CLI runs is not overwritten by an older read", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    childProcess.execFile = ((...args: unknown[]) => {
+      fs.writeFileSync(caFile, RENEWED);
+      return (answeringCli as (...a: unknown[]) => unknown)(...args);
+    }) as unknown as typeof childProcess.execFile;
+
+    await trust.refreshEngineTrust();
+
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, RENEWED);
+  });
+
+  test("a caFile on an http:// entry does not take the anchor from an https engineUrl", async () => {
+    // Host keys carry no scheme, so a claim from the http entry would land on the https engine.
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    const caFile = plantCert(path.join("pki", "dev-ca.pem"));
+    stubConfig.environments = [{ name: "DEV", url: "http://127.0.0.1:8765", caFile }];
+
+    await trust.refreshEngineTrust();
+
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+    assert.ok(
+      logged.some((line) => line.includes("caFile applies only to an https:// url")),
+      `the http entry's caFile was not refused: ${JSON.stringify(logged)}`,
+    );
+  });
+
+  test("nor does it stop a failure from asking the CLI again", async () => {
+    stubInventory = {
+      api_tls: { scheme: "https", source: "generated", cert: "/nowhere.pem", cert_present: false },
+    };
+    stubConfig.environments = [
+      { name: "DEV", url: "http://127.0.0.1:8765", caFile: plantCert(path.join("pki", "dev-ca.pem")) },
+    ];
+    await trust.refreshEngineTrust();
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), false);
+    await settle();
+
+    assert.strictEqual(invocations.length, 2);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
   });
 });

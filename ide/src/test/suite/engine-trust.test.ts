@@ -18,11 +18,13 @@ import * as path from "path";
 import type * as httpsTypes from "https";
 
 import {
+  CertificateChangedError,
   clearEngineTrustAnchors,
   getJson,
   postJson,
   setEngineTrustAnchor,
   setTrustFailureHandler,
+  snapshotEngineTrustAnchors,
   TLS_12_SUITES,
   TLS_13_SUITES,
   TLS_CIPHERS,
@@ -264,9 +266,12 @@ suite("the registered anchor reaches the TLS layer", () => {
   const httpsModule = require("node:https") as { request: typeof httpsTypes.request };
   let captured: httpsTypes.RequestOptions | undefined;
   let realRequest: typeof httpsTypes.request;
+  // Restored, not cleared: in the Extension Host leg engineTrust.ts holds its own record of these.
+  let restoreAnchors: () => void;
 
   setup(() => {
     captured = undefined;
+    restoreAnchors = snapshotEngineTrustAnchors();
     clearEngineTrustAnchors();
     realRequest = httpsModule.request;
     httpsModule.request = ((_url: unknown, options: httpsTypes.RequestOptions): unknown => {
@@ -277,7 +282,7 @@ suite("the registered anchor reaches the TLS layer", () => {
 
   teardown(() => {
     httpsModule.request = realRequest;
-    clearEngineTrustAnchors();
+    restoreAnchors();
   });
 
   test("with no anchor registered the request carries only the floor and the suite pin", () => {
@@ -522,9 +527,13 @@ suite("a request that fails verification follows a changed anchor once (BACKLOG 
   // Saved and restored, not just cleared: in the Extension Host leg activation has installed the
   // production handler, and this suite must hand it back for the suites after it.
   let savedHandler: ReturnType<typeof setTrustFailureHandler>;
+  // The same for the anchors: clearing every one at teardown left engineTrust.ts's record of what it
+  // registered disagreeing with what the client holds, for every suite after this one.
+  let restoreAnchors: () => void;
 
   setup(() => {
     calls = [];
+    restoreAnchors = snapshotEngineTrustAnchors();
     clearEngineTrustAnchors();
     setEngineTrustAnchor(TARGET, OLD);
     savedHandler = setTrustFailureHandler(undefined);
@@ -535,7 +544,7 @@ suite("a request that fails verification follows a changed anchor once (BACKLOG 
   teardown(() => {
     httpsModule.request = realRequest;
     setTrustFailureHandler(savedHandler);
-    clearEngineTrustAnchors();
+    restoreAnchors();
   });
 
   test("a handler that registers a new anchor gets exactly one retry, carrying it", async () => {
@@ -563,13 +572,39 @@ suite("a request that fails verification follows a changed anchor once (BACKLOG 
       setEngineTrustAnchor(url, NEW);
       return true;
     });
-    await assert.rejects(postJson(TARGET, "/config/reload", {}), /cannot verify/);
+    // And the user is told a retry will work, not sent to fix a configuration that is not at fault.
+    await assert.rejects(postJson(TARGET, "/config/reload", {}), (err: unknown) => {
+      assert.ok(err instanceof CertificateChangedError, String(err));
+      assert.ok(/new certificate/.test(err.message) && /Retry/.test(err.message), err.message);
+      assert.ok(!/serviceConfig|caFile/.test(err.message), err.message);
+      assert.strictEqual(err.code, "DEPTH_ZERO_SELF_SIGNED_CERT");
+      return true;
+    });
     assert.deepStrictEqual(
       calls.map((c) => c.ca),
       [OLD],
     );
     assert.strictEqual(told, 1, "the handler was not told, so the next request would fail too");
     assert.strictEqual(tlsOptions(new URL(TARGET)).ca, NEW);
+  });
+
+  test("a POST whose handler followed nothing keeps the trust error and its remedy — the control", async () => {
+    setTrustFailureHandler(async () => false);
+    await assert.rejects(postJson(TARGET, "/config/reload", {}), (err: unknown) => {
+      assert.ok(!(err instanceof CertificateChangedError), String(err));
+      assert.ok(/cannot verify/.test(String(err)), String(err));
+      return true;
+    });
+    assert.strictEqual(calls.length, 1);
+  });
+
+  test("a snapshot restores exactly the anchors it captured", () => {
+    const restore = snapshotEngineTrustAnchors();
+    setEngineTrustAnchor("https://other.example.com:8765", NEW);
+    clearEngineTrustAnchors();
+    restore();
+    assert.strictEqual(tlsOptions(new URL(TARGET)).ca, OLD);
+    assert.strictEqual(tlsOptions(new URL("https://other.example.com:8765")).ca, undefined);
   });
 
   test("a handler that changed nothing gets no retry — the control", async () => {
