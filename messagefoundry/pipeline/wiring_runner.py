@@ -8093,9 +8093,10 @@ class RegistryRunner:
           the same lease resumes the retry; leading under another lease returns ``SUPERSEDED``.
         * ``abandon``, read at the base interval through each backoff, returns ``ABANDONED``. The
           delivery worker and the pooled batch guard pass the negation of :meth:`_lane_may_deliver`,
-          so an operator pause or stop of the outbound, and the #122 halt, are not held until the
-          store heals. The router, transform and response workers have no pause, so their hold ends
-          only on a stop or an epoch change.
+          so a stop or pause of the outbound and the #122 halt are not held until the store heals
+          (that method says how a schedule window or a DR park reaches it). The router, transform
+          and response workers pass :meth:`_inbound_log_halted`, the #122 gate their loop top
+          reads, so the halt ends their hold too and the worker returns at that gate.
         * ``give_up_after`` failures return ``EXHAUSTED``. Only the pooled batch guard passes it,
           under ``infra_fault_policy = stop``, since that hold is the pooled dispatcher's. The
           per-lane workers never read the policy and have no STOP path, so they pass none.
@@ -8206,10 +8207,19 @@ class RegistryRunner:
                 exc_info=True,
             )
 
+    def _inbound_log_halted(self, name: str) -> bool:
+        """Whether the #122 halt (ADR 0162) holds inbound ``name``'s internal stages: the gate the
+        router, transform and response workers read at their loop top, and the ``abandon``
+        predicate they pass to a held re-pend (:meth:`_repend_claimed_on_fault`). A new loop-top
+        gate for those workers belongs here as well, or a held re-pend stays deaf to it."""
+        return name in self._log_halted
+
     def _lane_may_deliver(self, name: str) -> bool:
         """The two conditions :meth:`_delivery_worker`'s loop-top gates refuse a claim on (the #122
-        halt and the operator pause), as one predicate for its per-item re-check (#2771). A new
-        loop-top gate belongs here as well, or a claimed batch keeps sending under it."""
+        halt and the pause), as one predicate for its per-item re-check (#2771). A new loop-top
+        gate belongs here as well, or a claimed batch keeps sending under it. The pause is
+        :attr:`_outbound_paused`, which a schedule window or a DR park joins through the same
+        outbound stop an operator's takes; nothing here reads either directly."""
         return not self._delivery_halted and name not in self._outbound_paused
 
     async def _delivery_worker(self, name: str) -> None:
@@ -9195,7 +9205,7 @@ class RegistryRunner:
             # #122 (ADR 0162): the application log is unwritable and this process has fail-closed.
             # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state a
             # STOP-policy halt leaves, re-armed by restarting this inbound.
-            if name in self._log_halted:
+            if self._inbound_log_halted(name):
                 return
             try:
                 # FIFO per inbound: claim the due head (ingress rows never back off, so this is
@@ -9242,7 +9252,12 @@ class RegistryRunner:
                 faults.failed(exc, "router worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 held = await self._repend_claimed_on_fault(
-                    "router", name, claimed, faults=faults, fence=fence
+                    "router",
+                    name,
+                    claimed,
+                    faults=faults,
+                    fence=fence,
+                    abandon=functools.partial(self._inbound_log_halted, name),
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
@@ -9571,7 +9586,7 @@ class RegistryRunner:
         faults = _WorkerFaultLog("response", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
             fence = self._repend_fence()  # #1611: the lease this pass claims under
-            if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
+            if self._inbound_log_halted(name):  # #122 (ADR 0162) — see _router_worker's gate
                 return
             try:
                 item = await self.store.claim_next_fifo(name, stage=Stage.RESPONSE.value)
@@ -9594,7 +9609,12 @@ class RegistryRunner:
                 faults.failed(exc, "response worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 held = await self._repend_claimed_on_fault(
-                    "response", name, claimed, faults=faults, fence=fence
+                    "response",
+                    name,
+                    claimed,
+                    faults=faults,
+                    fence=fence,
+                    abandon=functools.partial(self._inbound_log_halted, name),
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
@@ -9674,7 +9694,7 @@ class RegistryRunner:
         faults = _WorkerFaultLog("transform", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
             fence = self._repend_fence()  # #1611: the lease this pass claims under
-            if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
+            if self._inbound_log_halted(name):  # #122 (ADR 0162) — see _router_worker's gate
                 return
             try:
                 # FIFO per inbound at the routed stage. Under active-passive HA the graph runs on the
@@ -9725,7 +9745,12 @@ class RegistryRunner:
                 )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 held = await self._repend_claimed_on_fault(
-                    "transform", name, claimed, faults=faults, fence=fence
+                    "transform",
+                    name,
+                    claimed,
+                    faults=faults,
+                    fence=fence,
+                    abandon=functools.partial(self._inbound_log_halted, name),
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start

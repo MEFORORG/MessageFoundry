@@ -107,7 +107,7 @@ class HoldResult(Enum):
 
     LANDED = auto()  # the write landed
     STOPPED = auto()  # the engine is stopping: the rows stay INFLIGHT for the next start
-    ABANDONED = auto()  # the lane may not deliver any more, at least an operator pause
+    ABANDONED = auto()  # the lane is paused, at least by an operator or the #122 log halt
     SUPERSEDED = auto()  # another node may have led since the fault, so the rows may be its own
     EXHAUSTED = auto()  # infra_fault_policy = stop, at infra_fault_stop_after failures
 
@@ -1627,10 +1627,11 @@ class StageDispatcher:
             )
 
     def _hold_abandoned(self, lane: str) -> bool:
-        """Whether an operator pause, at least ``pause_lane`` from a stop or pause of the outbound,
-        waits on this lane, so its hold ends and the terminal transition reaches PAUSED. Only the
-        OUTBOUND dispatcher is ever paused: a router, transform or response lane's hold ends only on
-        an engine stop, an epoch change or the stop policy's bound."""
+        """Whether a ``pause_lane`` waits on this lane, so its hold ends and the terminal transition
+        reaches PAUSED. On every stage: at least a stop or pause of an outbound (an operator's, a
+        schedule window's or a DR park's) pauses an OUTBOUND lane, and the #122 fail-closed halt
+        (application log unwritable) pauses the INGRESS, ROUTED and RESPONSE lanes of each halted
+        inbound (``RegistryRunner._pause_internal_lanes``)."""
         st = self._states.get(lane)
         return st is not None and st.pause_pending
 
@@ -1679,9 +1680,9 @@ class StageDispatcher:
         (the demotion teardown) returns ``STOPPED``, and leading again under the same lease with no
         teardown (a flap) resumes the retry. Leading under another lease returns ``SUPERSEDED``.
 
-        **An operator pause ends the hold** (``ABANDONED``). It is read at the base interval
-        through the backoff, so a pause, a stop of the outbound and the purge that waits on it are
-        not held until the store heals. :meth:`_hold_abandoned` says which lanes can be paused.
+        **A pause ends the hold** (``ABANDONED``). It is read at the base interval through the
+        backoff, so a pause, a stop of the outbound, the purge that waits on it and the #122 halt
+        are not held until the store heals. :meth:`_hold_abandoned` says what pauses a lane.
 
         **At ``infra_fault_stop_after`` consecutive failures the policy decides.** Under ``stop``
         the hold ends (``EXHAUSTED``) and :meth:`_run_lane` raises the lane's ``infra_error_streak``
@@ -1726,11 +1727,7 @@ class StageDispatcher:
                 poll=_LANE_ERROR_BACKOFF_SECONDS,
                 sleep=self._slept_into_stop,
                 fence=fence,
-                abandon=(
-                    functools.partial(self._hold_abandoned, lane)
-                    if self._stage is Stage.OUTBOUND
-                    else None  # never paused, so its backoff is one sleep, not 1 s polls
-                ),
+                abandon=functools.partial(self._hold_abandoned, lane),
                 not_leader=functools.partial(
                     log.warning,
                     "StageDispatcher %s lane %s: %s failed %d time(s) and this node is not the "
