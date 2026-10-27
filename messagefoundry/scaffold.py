@@ -277,11 +277,16 @@ jobs:
   # audit's result, and a requirements.txt finding never hides the lock audit's. The lock audit
   # needs the auditor the install brings, so a failed install skips it.
   # It runs engine code from the lock, so the token reads only, and the checkout keeps no credential.
+  # Wheels only for every pip in the job, pip-audit's included: building an sdist runs its build code
+  # here, so a dependency that ships no wheel for Windows fails the job instead. Drop it only once
+  # you have decided that package's build code may run in CI.
   audit-pin:
     runs-on: windows-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      PIP_ONLY_BINARY: ":all:"
     defaults:
       run:
         shell: bash

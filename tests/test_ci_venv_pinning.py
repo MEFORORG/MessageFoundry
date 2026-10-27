@@ -2562,7 +2562,8 @@ def _steps_running_uv_without_no_build(workflow: dict[Any, Any]) -> list[str]:
 def test_every_uv_lock_or_export_builds_no_sdist() -> None:
     """``uv lock --check`` and ``uv export`` read no ``PIP_*`` variable, so ``PIP_ONLY_BINARY`` does not
     stop them building an sdist to read its metadata; ``UV_NO_BUILD`` does (vault BACKLOG #4083
-    finding 5). Every workflow is read, so a new uv step is held to it too."""
+    finding 5). Every workflow is read, but only a line that starts with ``uv lock`` or ``uv export``
+    is seen: at least ``uv sync``, ``uv pip`` and a uv call after ``if !`` or a flag are not."""
     pytest.importorskip("yaml")
     from tests._workflow_contexts import load_workflow
 

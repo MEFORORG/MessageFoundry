@@ -142,8 +142,9 @@ jobs:
     timeout-minutes: 10
     # Wheels only (vault BACKLOG #3861): pip, the auditor's dry-runs included, builds no pinned sdist
     # in this job. uv reads no PIP_* variable, so it takes its own switch, for `uv lock --check` and
-    # the exports. Measured 2026-10-26 with uv 0.12.0 and an empty cache: this lock checks and exports
-    # under it, and a lock needing an sdist-only pin fails "building from source is disabled".
+    # the exports. Measured 2026-10-26 on Windows with uv 0.12.0 and an empty cache: the lock check and
+    # all eight exports below pass under it, unchanged, and a lock needing an sdist-only pin fails
+    # "building from source is disabled".
     env:
       PIP_ONLY_BINARY: ":all:"
       UV_NO_BUILD: "1"
@@ -156,8 +157,8 @@ jobs:
           # Store no job token in the checkout's .git/config, where code a dependency install or
           # audit runs could read it from disk (vault BACKLOG #3861). That removes the copy on disk
           # only. It does not keep the token from that code: on a GitHub-hosted runner any step can
-          # read it from the runner process's memory. What bounds the token is the workflow's
-          # `permissions:` block, read-only contents.
+          # use the runner's passwordless sudo to read it from the runner process's memory. What
+          # bounds the token is the workflow's `permissions:` block, read-only contents.
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
