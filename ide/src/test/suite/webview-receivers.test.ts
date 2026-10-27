@@ -844,6 +844,26 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     }
   });
 
+  test("connection editor: a field with neither value nor defaultValue is accepted", () => {
+    // FieldDescriptor.value and .defaultValue are optional: describe() leaves them undefined in the
+    // ordinary case, and the JSON the host posts drops an undefined member. variant() is that JSON
+    // round trip; deleting both from every field is the extreme of it. Nothing may be discarded.
+    const bare = variant(FIELDS_OK, (c) => {
+      for (const f of c.groups.flatMap((g: Payload) => g.fields)) {
+        delete f.value;
+        delete f.defaultValue;
+      }
+    });
+    const fields = bare.groups.flatMap((g: Payload) => g.fields);
+    assert.ok(fields.length > 0 && fields.every((f: Payload) => !("value" in f) && !("defaultValue" in f)));
+    const p = connection.load();
+    const before = p.snapshot();
+    p.deliver(bare);
+    assert.deepStrictEqual(p.errors.map(String), [], "the page threw");
+    assert.notStrictEqual(p.snapshot(), before, "the message changed nothing");
+    assert.deepStrictEqual(p.warnings, [], "discarded");
+  });
+
   test("the engine prints only setting type tags this page's set holds", () => {
     // FieldDescriptor.type passes through from "connection schema --json". This reads the tags
     // _type_name() can return, so a tag added there fails here instead of the form going quiet.
