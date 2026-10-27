@@ -280,27 +280,28 @@ ran*. That is a distinct failure mode and it needs its own control:
    message body can reach a log from a dependency's logger as readily as from code written here, so
    the question covers what the engine imports and not only what it contains.
 9. **State a new control's premise beside it, and give the premise a red.** A premise is the
-   property the control keys on and the reason that property is enough, for example *one `;` marks a
-   second statement*, or *one in-process lock serializes every appender*. Write it as a short comment
-   or docstring at the control itself, not only in an ADR or a ledger row. Then give it a test that
-   exercises the control and fails when the premise is false, and add a row to
+   property the control keys on and the reason that property is enough. The 2026-09 review's
+   examples were false ones: *one `;` marks a second statement* (T-SQL needs none) and *one
+   in-process lock serializes every appender* (engine shards are separate processes). Write it as a
+   short comment or docstring at the control itself, not only in an ADR or a ledger row. Then give
+   it a test that exercises the control and fails when the premise is false, and add a row to
    `scripts/ci/invariant_mutations.toml` that breaks the control and must turn that test red. Split
    a premise before calling it live-only: that a server-backend lock is *taken* is observable with a
-   fake cursor, and only that it *holds across processes* needs a live server. For the live half, say
-   so beside the control and name the gated test that observes it; do not stand in a mocked test
-   that cannot. Where the
-   premise is prose, as in an ADR, pin the corrected sentence and refuse the refuted one, with the
-   original text as the positive control (`tests/test_control_premises.py`). The 2026-09 review
-   found five controls whose stated premise was false (BACKLOG #1746, limb 3); this is rule 5's third
-   suspicion made a step for each new control.
+   fake cursor, and only that it *holds across processes* needs a live server. For the live half,
+   say so beside the control and name the gated test that observes it; do not stand in a mocked test
+   that cannot. Where the premise is prose, as in an ADR, pin the corrected sentence and refuse the
+   refuted one, with the original text as the positive control (`tests/test_control_premises.py`).
+   The 2026-09 review found five controls whose stated premise was false (BACKLOG #1746, limb 3);
+   this is rule 5's third suspicion made a step for each new control that guards an invariant or
+   a security property.
 
 Applies to any gate, in any project adopting this rubric — a deferred or advisory gate that silently
 stops measuring is worse than an absent one, because the scorecard still counts it. A gate whose
 scope is narrower than its scorecard sentence is the same defect wearing a different disguise. Rules
 1 to 5 bind gates in that sense; rules 6 to 8 reach past a gate — to a reviewer's own instruments, to
 a test suite, and to the conduct of a review, on the ground that each of those is a control too — and
-rule 9 binds every new control, gate or test, at the moment it is written — so
-read the section heading as the shortest true label for the section rather than its full extent.
+rule 9 binds a new control that guards an invariant or a security property, when it is written —
+so read the section heading as the shortest true label for the section rather than its full extent.
 Rules 5 to 7 generalise on the same terms, with one substitution: rule 7's question 3 names this
 engine's failure paths as its worked example,
 and an adopting project answers that question over its own. Rule 9 generalises too; the files it
@@ -585,7 +586,7 @@ The evidence caveats in **§7** are part of this appendix's basis: the metric-in
 
 | Version | Date | Change |
 |----|----|----|
-| 0.17 | October 27, 2026 | **New §4.0 rule 9: a new control's premise is stated beside it and has a red** (BACKLOG #1746, limb 3). A Manager class B decision, taken after adversarial review. The five premises that row named were re-read against the tree; the outcomes are recorded in the pull request, and the new pins are `tests/test_control_premises.py` and two rows in `scripts/ci/invariant_mutations.toml`. No scoring change — A− stands, still 11 signals. |
+| 0.17 | October 27, 2026 | **New §4.0 rule 9: a new control's premise is stated beside it and has a red** (BACKLOG #1746, limb 3). A Manager class B decision, taken after adversarial review. The five premises that row named were re-read against the tree; the outcomes are recorded on the ledger row, BACKLOG #1746, and the new pins are `tests/test_control_premises.py` and two rows in `scripts/ci/invariant_mutations.toml`. No scoring change — A− stands, still 11 signals. |
 | 0.16 | October 7, 2026 | **The ISO/IEC 5055 decline moved.** §4.1 said its reasons live in the [`../CLAUDE.md`](../CLAUDE.md) §12 **Don't** list. They moved verbatim to [ARCHITECTURE.md](ARCHITECTURE.md), *Declined by design*, and §12 keeps a one-line pointer, so §4.1 now points there. No scoring change. |
 | 0.15 | October 2, 2026 | **Review wording matches the process (owner ruling).** Where this rubric said "human review" or "a human arbitrates", it now says what the process in [`../CLAUDE.md`](../CLAUDE.md) section 5 does: review before merge is an AI code-review pass, an AI session judges an advisory finding first, and the owner rules on what is routed to them. No signal, gate or score changed. |
 | 0.14 | September 18, 2026 | **Promoted four review rules into §4.0 — adversarial liveness, how to score a control, test quality as a step, and one rubric per subject.** §4.0's rules 1 to 4 ask a gate to prove it ran and to state its measured scope; a 2026-09 whole-repository re-review found the wider defect those rules only partly reach, in at least three kinds of control and by work packets running independently (BACKLOG #1746): tests that stay green when the behavior they name is broken on purpose, gates returning a clean verdict over an empty input they were handed or created, and controls whose stated premise is false because the property they key on is not the property that makes an input dangerous (the **SDS-3.7** shape, reached from the quality side). New **rule 5** makes the search for that shape the required posture rather than an optional one, and cites [ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md) — which named the class from its own 2026-08 instances and declares its taxonomy open — as the record these shapes extend rather than restate; its empty-input bullet names rules 1 **and** 2 as the repair, because rule 1 only makes the zero visible and rule 2 is what fails an unexplained one. New **rule 6** fixes how a control is scored — exit status and failure lines, never parsed summary text, and the run records which roots it actually collected — after the review's own negative-control driver reported every control green while its expression over the runner's summary matched nothing; that binds any instrument emitting a verdict as hard as the gates (**SDS-3.8**), while the local tools that emit no verdict stay outside it on §5.1's standing ground. New **rule 7** makes test quality a step with four ordered questions ending in a negative control: break the code the most load-bearing covering test protects, confirm that test turns red, and record it. A test that stays green under a deliberate break is itself a finding. Its first three questions apply **signal 3** to one change rather than restating it; the ordering and the negative control are what the rule adds. New **rule 8** requires review against the §4 signals with no second rubric raised beside them, and names the project-specific lenses the generic signals do not reach — at least the reliability invariant, purity, the **client-side half** of the dependency-direction rule, and PHI containment — each cited from [`../CLAUDE.md`](../CLAUDE.md) rather than restated here, with the note that PHI containment reaches what the engine imports and not only what it contains. The dependency lens is deliberately half-width: Appendix A.5 already grades signal 1 Strong for the engine-side rule and records that only the client-side convention has no instrument, so a full-width lens would duplicate a signal. Rules 5 to 7 generalise to any adopting project, rule 7's question 3 substituting the adopter's own failure paths for this engine's; rule 8's lens list does not generalise. Rules 1 to 5 bind gates, while rules 6 to 8 reach past a gate to a reviewer's own instruments, a test suite, and the conduct of a review, which the section's closing paragraph now says rather than leaving the heading to imply. Rule 7's negative control is two-directional, matching rule 4: confirm green, break, confirm red, revert, confirm green again. No scoring change — A− stands, still 11 signals — and no gate placement moved: the mutation and coverage tools keep the advisory standing §4.1 and §5 already give them. Appendix A.5, which shipped under BACKLOG #1092 as rule 4's register and is pinned by `tests/test_quality_record_scope_claims.py`, is untouched by this pass. |

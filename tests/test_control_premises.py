@@ -34,7 +34,7 @@ _ADR_0159 = (
     / "0159-cancellation-safe-pooled-connection-release-mid-txn-discard-at-the-acquire-chokepoint.md"
 )
 #: Case-blind, and blind to markdown emphasis between the words.
-_REFUTED_BORROWER = re.compile(r"\bno[\s*_]+next[\s*_-]+borrower", re.IGNORECASE)
+_REFUTED_BORROWER = re.compile(r"\bno[\s*_-]+next[\s*_-]+borrower", re.IGNORECASE)
 #: The correction's opening of its quotation of the old sentence. A refuted phrase after this, with
 #: no closing ``"*`` between, is being quoted to deny it.
 _QUOTE_OPEN = 'This bullet used to end: *"'
@@ -157,6 +157,7 @@ def test_the_audit_lock_check_fires_on_the_original_text() -> None:
     faults = audit_lock_premise_faults(_ORIGINAL_AUDIT_LOCK)
     assert "asserts the refuted single-writer premise" in faults
     assert "the comment above the lock does not name _AUDIT_APPEND_LOCK" in faults
+    assert f"the comment above the lock does not name {_LIVE_TEST}" in faults
 
 
 class _RecordingCursor:
@@ -193,7 +194,8 @@ async def test_every_audit_append_takes_the_database_applock_before_it_reads_the
     # The literal, not the imported constant: a per-process resource name would serialize nothing.
     assert [params[0] for _, params in locks] == ["mefor:audit_append"], (
         "the audit append read the chain head without first taking the cross-engine-shard applock; "
-        "the in-process lock alone forks the chain under engine sharding (BACKLOG #1605)"
+        "two engine shards would then compute the same seq, and UNIQUE(seq) would refuse one "
+        "audited action (BACKLOG #1605)"
     )
     sql = locks[0][0]
     assert "@LockMode='Exclusive'" in sql and "@LockOwner='Transaction'" in sql, sql
