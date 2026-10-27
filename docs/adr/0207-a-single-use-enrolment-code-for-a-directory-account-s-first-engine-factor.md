@@ -1,8 +1,15 @@
 # 0207 -- A single-use enrolment code for a directory account's first engine factor
 
-- **Status:** Proposed (2026-10-05). Drafted on the owner's direction of 2026-10-05, given in
+- **Status:** Accepted (2026-10-27), with Amendment A. Accepted by the batch 447 Manager under the
+  Owner's delegation of 2026-10-27 (CLAUDE.md section 5, "A delegated decision counts as that
+  ruling", owner ruling 2026-10-22), after two adversarial reviews; Amendment A records the
+  question, the answer and both reviews. The text below says only the owner can move this record to
+  Accepted: that delegation record is the owner's ruling under CLAUDE.md section 5, so the
+  acceptance rests on it. Three *To resolve on acceptance* items stay open, each with its
+  recommendation; the build follows the recommendation unless the owner rules otherwise.
+  Previously Proposed (2026-10-05): drafted on the owner's direction of 2026-10-05, given in
   session to the batch 194 Manager: design this ceremony as an ADR in status Proposed. Merging this
-  record files it as Proposed and accepts nothing. The Lander merges; only the owner can move it to
+  record filed it as Proposed and accepted nothing. The Lander merges; only the owner can move it to
   Accepted. No code may follow until it is Accepted.
 - **Date:** 2026-10-05
 - **Related:** vault BACKLOG #2609 (its closing item 2; item 1 shipped as engine PR 1918) · vault
@@ -592,8 +599,8 @@ delegation requires is two adversarial reviews: the first, of the record as prop
 *accept with named amendments*; the second, of this amendment at `1d119a284`, returned *accept
 after named small fixes* (its fixes F1 to F4, applied below) and affirmed A4's SQLite-only refusal
 after verifying in code that all three backends serialize the audit append. Decision log id
-`d20261027T133727170-18c43f`. This amendment changes the design the record proposes.
-**It accepts nothing: the record stays Proposed until it is accepted.**
+`d20261027T133727170-18c43f`. This amendment changes the design the record proposes, and the
+record was accepted with it on 2026-10-27, under the same delegation (see Status).
 
 Every fact below was read at engine `origin/main` `93f6438c7` on 2026-10-27, by symbol. Where this
 amendment and an earlier section disagree, this amendment wins.
