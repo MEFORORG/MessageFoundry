@@ -693,8 +693,11 @@ _PROVEN_BAD = "Replace the CRL in the CA file with one its CA signed"
         ({"unproven", "verified"}, "Check that the CRL in the CA file"),
         ({"bad", "unproven"}, _PROVEN_BAD),
         ({"unlisted", "verified"}, "Restart the engine to apply the CA file"),
-        # A state the scan does not name is never a pass; an earlier draft returned no refusal.
+        # A state the scan does not name is never a pass, nor the weaker check beside an
+        # unconfirmed one: pki.crl_signature_refusal flags every state but the passing two.
         ({"not-a-state", "verified"}, _CANNOT_JUDGE),
+        ({"not-a-state", "unproven"}, _CANNOT_JUDGE),
+        ({"not-a-state", "uncheckable"}, _CANNOT_JUDGE),
     ],
 )
 def test_the_ca_file_remedy_follows_the_strongest_signature_state(
@@ -766,13 +769,12 @@ def test_a_later_block_the_signature_check_cannot_read_leaves_the_file_unjudged(
     logged: bool,
 ) -> None:
     # BACKLOG #3512: before it, the check stopped at the first unconfirmed block. A later block
-    # that does not parse (ValueError, the failure judge_crl_signatures documents) now leaves the
-    # file unjudged, so the remedy is to replace the CRL before restarting. An earlier draft kept
-    # the unconfirmed verdict, which told a CA-file-only row to check, then restart. Only after an
-    # unconfirmed block is that logged with its cause, naming the CA file.
+    # the check raises ValueError on (the failure judge_crl_signatures documents) now leaves the
+    # file unjudged, so the remedy is to replace the CRL before restarting, never to check, then
+    # restart. Only after an unconfirmed block is that logged with its cause, naming the CA file.
     # Controls: a verified block, or a state the scan does not name, takes the outer path, so no
-    # state outside the named two is swallowed; an earlier draft returned no refusal for one.
-    # Another error type takes the outer path too, and a ``bad`` block stops the check first.
+    # state outside the unconfirmed two is swallowed. Another error type takes the outer path
+    # too, and a ``bad`` block stops the check first.
     hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3))
     monkeypatch.setattr(
         "messagefoundry.pipeline.cert_expiry.judge_crl_signatures", _blocks_then(first, error)

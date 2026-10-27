@@ -586,10 +586,11 @@ class _HeldCopyLog:
         )
 
     def unchecked_later_crl(self, cert: MonitoredCert) -> None:
-        """Log that a later CRL in ``cert``'s CA file did not parse for the signature check, after
-        an earlier CRL's signature was not confirmed, so the scan counts the file as one the
-        engine cannot judge (BACKLOG #3512). The line is logged whether or not an alert is raised. Called inside the ``except``, so the line carries the cause. Folded
-        as :meth:`warn` folds."""
+        """Log that the signature check raised ``ValueError`` on a later CRL in ``cert``'s CA file,
+        after an earlier CRL's signature was not confirmed, so the scan counts the file as one the
+        engine cannot judge (BACKLOG #3512). The line is logged whether or not an alert is raised.
+        Called inside the ``except``, so the line carries the cause. Folded as :meth:`warn`
+        folds."""
         self._log_once(
             cert,
             _UNCHECKED_LATER_CRL,
@@ -652,9 +653,10 @@ def held_crl_label(path: str) -> str:
 #: unread later block after one of them (BACKLOG #3512).
 _UNCONFIRMED = frozenset({"unproven", "uncheckable"})
 
-#: The states that give a CA file's CRL no remedy. A state named in neither set, such as one
-#: added to ``pki.CrlSignatureState`` later, leaves the file unjudged rather than passing it.
-_CONFIRMED = frozenset({"verified", "unlisted"})
+#: The states that pass a CA file's CRL with no step of its own: ``unlisted`` is a CRL whose issuer
+#: the file does not hold, which the reload passes too. A state named in neither set nor ``bad``,
+#: such as one added to ``pki.CrlSignatureState`` later, leaves the file unjudged.
+_PASSING = frozenset({"verified", "unlisted"})
 
 
 def _ca_file_crl_refusal(
@@ -726,12 +728,13 @@ def _ca_file_crl_refusal(
                 if sig.state == "bad":
                     break  # proven: no later block changes the remedy
         except ValueError:
-            # A later block that does not parse, the one failure judge_crl_signatures documents.
-            # It is caught here only after an unconfirmed block. The unread block could be proven
-            # bad, so the file is one the engine cannot judge: replace the CRL before restarting,
-            # not the unconfirmed remedy's check. Any other set of states re-raises to the outer
-            # path, which leaves the file unjudged too, so no state is swallowed (BACKLOG #3512).
-            # An error of another type is not caught here: it says the scan could not check it.
+            # A later block the check raised on, ValueError being the one failure
+            # judge_crl_signatures documents. It is caught here only after an unconfirmed block.
+            # The unchecked block could be proven bad, so the file is one the engine cannot judge:
+            # replace the CRL before restarting, not the unconfirmed remedy's check. Any other set
+            # of states re-raises to the outer path, which leaves the file unjudged too, so no
+            # state is swallowed (BACKLOG #3512). An error of another type is not caught here: it
+            # says the scan could not check the file.
             if not states & _UNCONFIRMED:
                 raise
             on_unchecked()
@@ -763,6 +766,10 @@ def _ca_file_crl_refusal(
             "OpenSSL judges by it fails. If a good CRL from that issuer is already in the file, "
             "remove this one instead",
         )
+    if states - _PASSING - _UNCONFIRMED:
+        # A state this scan does not name, beside any other: never a pass and never the weaker
+        # check. pki.crl_signature_refusal flags every state but the two passing ones (#3512).
+        return unjudged
     if states & _UNCONFIRMED:
         # Not proven either way, and pki.CrlSignature names a case where handshakes still pass.
         # So the remedy asks for a check and claims no failure. ``why`` says which CA was tried.
@@ -777,10 +784,6 @@ def _ca_file_crl_refusal(
             if ca_file_only
             else f"{check} before restarting: {unconfirmed}",
         )
-    if states - _CONFIRMED:
-        # A state this scan does not name. Main refused every state but these two, so an
-        # unknown one is never a pass (BACKLOG #3512).
-        return unjudged
     return None
 
 
