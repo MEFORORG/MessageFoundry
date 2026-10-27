@@ -24,6 +24,7 @@ All material is synthetic and minted here. No PHI.
 from __future__ import annotations
 
 import datetime
+import functools
 import logging
 import ssl
 import warnings
@@ -50,6 +51,7 @@ from messagefoundry.keywrap import der_children, read_der_tlv
 from messagefoundry.pipeline import crl_reload
 from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE, FIX, reload_replaced_crls
 from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
+from tests.test_crl_bundle_anchors import _ku
 from tests.test_crl_held_copy_alert import _bundle_scan
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
 from tests.test_trust_anchor_byte_binding import _handshake
@@ -404,6 +406,158 @@ def test_a_ca_that_does_not_parse_is_ignored(twins: _Twins) -> None:
     pem = twins.write_crl("new", "new")
     judged = list(judge_crl_signatures(pem, [b"not a certificate", *_ders(twins.new_ca)]))
     assert [signature.state for signature in judged] == ["verified"]
+
+
+# --- vault BACKLOG #4159: a CA with no Subject Key Identifier cannot rescue a proven bad CRL ------
+
+
+def _ca_without_ski(key: _CaKey) -> x509.Certificate:
+    """A self-signed CA certificate for ``key`` named :data:`_NAME` that carries no Subject Key
+    Identifier, and so no Authority Key Identifier either: nothing else here names a key."""
+    return (
+        x509.CertificateBuilder()
+        .subject_name(_NAME)
+        .issuer_name(_NAME)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - _DAY)
+        .not_valid_after(_NOW + 365 * _DAY)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(_ku(ca=True), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+
+
+@functools.cache
+def _rsa_key() -> rsa.RSAPrivateKey:
+    """One RSA key for every test that needs only a key the engine cannot check an ECDSA
+    signature with. Generated once: a 2048-bit key takes a noticeable fraction of a second."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def _names_key(pem: bytes, ca: x509.Certificate) -> bool | None:
+    """How ``ca`` fits the CRL ``pem``'s authority key identifier: ``None`` when it does not fit,
+    and otherwise whether the CRL names its key (:func:`messagefoundry.pki._akid_fit`)."""
+    crl = x509.load_pem_x509_crl(pem)
+    listed = pki_module._listed_ca(ca.public_bytes(serialization.Encoding.DER))
+    return pki_module._akid_fit(pki_module._crl_extensions(crl).akid, listed)
+
+
+def _assert_uncheckable_and_the_start_warns(
+    tmp_path: Path, pem: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The warn arm for the CRL ``pem`` against the CAs in ``tmp_path / "ca.pem"``: the state is
+    ``uncheckable``, and a start loads the file with one WARNING that says so."""
+    assert [s.state for s in judge_crl_signatures(pem, _ders(tmp_path / "ca.pem"))] == [
+        "uncheckable"
+    ]
+    with caplog.at_level("WARNING"):
+        hop = _hop(tmp_path / "ca.pem", tmp_path / "crl.pem")
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert len(logged := _warnings(caplog)) == 1
+    assert "cannot check its signature" in logged[0]
+
+
+@pytest.mark.parametrize("no_ski_first", [False, True], ids=["named-ca-first", "no-ski-ca-first"])
+def test_a_crl_its_named_ca_proves_bad_refuses_beside_an_unchecked_ca_with_no_ski(
+    twins: _Twins, tmp_path: Path, no_ski_first: bool
+) -> None:
+    """The mixed case. The new CA carries the key identifier the CRL names, and its key is proven
+    not to verify the CRL. Beside it sits a CA of the same name with no Subject Key Identifier and
+    an RSA key, which fits the CRL and cannot check its ECDSA signature. Before vault BACKLOG #4159
+    that read ``uncheckable`` and the start loaded the file with a WARNING."""
+    no_ski = _ca_without_ski(_rsa_key())
+    named = twins.new_ca.read_bytes()
+    mixed = tmp_path / "mixed.pem"
+    mixed.write_bytes(
+        no_ski.public_bytes(_PEM) + named if no_ski_first else named + no_ski.public_bytes(_PEM)
+    )
+    pem = twins.write_crl("stranger", "new")
+
+    # The case's premises: the CA with no Subject Key Identifier fits without being named, and
+    # the engine cannot check the signature with its key.
+    assert _names_key(pem, no_ski) is False
+    assert pki_module._verifies(x509.load_pem_x509_crl(pem), no_ski) is None
+
+    assert [s.state for s in judge_crl_signatures(pem, _ders(mixed))] == ["bad"]
+    with pytest.raises(ValueError, match="does not verify the CRL's signature") as refused:
+        _hop(mixed, twins.crl)
+    assert "with no Subject Key Identifier does not change that" in str(refused.value)
+
+    # The running-hop reload is unchanged: it held this file back before and still does.
+    verdict = crl_signature_refusal(pem, _ders(mixed))
+    assert verdict is not None and verdict[1] is True
+
+    # Control: OpenSSL itself fails the handshake on this CRL, whichever CA the file lists first,
+    # so the refusal refuses nothing that works on this interpreter's OpenSSL.
+    with pytest.raises(ssl.SSLError, match="signature"):
+        _handshake(_raw_hop(mixed, twins.crl), twins.server(sends_renewed=False))
+
+
+def test_a_strict_engine_context_refuses_a_chain_through_a_ca_with_no_ski(tmp_path: Path) -> None:
+    """(a) The premise the mixed-case refusal rests on: an engine verifying context sets
+    ``VERIFY_X509_STRICT``, and under it OpenSSL refuses a chain through a CA with no Subject Key
+    Identifier, so such a CA cannot make a CRL valid at a handshake. One builder is measured here,
+    the outbound one."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    (tmp_path / "ca.pem").write_bytes(_ca_without_ski(key).public_bytes(_PEM))
+    leaf, leaf_key = _leaf(_NAME, key)
+    (tmp_path / "leaf.pem").write_bytes(leaf.public_bytes(_PEM))
+    (tmp_path / "leaf-key.pem").write_bytes(_key_pem(leaf_key))
+    server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server.load_cert_chain(tmp_path / "leaf.pem", tmp_path / "leaf-key.pem")
+    client = build_verifying_client_context(
+        TrustAnchor(cafile=str(tmp_path / "ca.pem"), load_system_roots=False)
+    )
+
+    assert client.verify_flags & ssl.VERIFY_X509_STRICT
+    with pytest.raises(ssl.SSLError, match="Missing Subject Key Identifier"):
+        _handshake(client, server)
+
+    # Control: the same chain passes once the strict flag is cleared, so it is that check, and
+    # not some other fault in the chain, that refuses it. This is the residual: a context
+    # without the flag could take such a CA for a CRL's issuer.
+    client.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    _handshake(client, server)  # raises if refused
+
+
+def test_a_named_ca_that_cannot_be_checked_still_warns_beside_a_ca_with_no_ski(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(b) The CA the CRL names by key identifier has an RSA key, and the CRL carries an ECDSA
+    signature, so that CA cannot be checked. A CA of the same name with no Subject Key
+    Identifier and an EC key sits beside it, and its key is proven not to verify the CRL. The
+    named CA could still have signed it, so the state stays ``uncheckable`` and the start warns."""
+    rsa_key = _rsa_key()
+    named = _ca(rsa_key, rsa_key)
+    no_ski = _ca_without_ski(ec.generate_private_key(ec.SECP256R1()))
+    (tmp_path / "ca.pem").write_bytes(named.public_bytes(_PEM) + no_ski.public_bytes(_PEM))
+    pem = _crl(ec.generate_private_key(ec.SECP256R1()), names=rsa_key)
+    (tmp_path / "crl.pem").write_bytes(pem)
+    crl = x509.load_pem_x509_crl(pem)
+
+    assert _names_key(pem, named) is True and pki_module._verifies(crl, named) is None
+    assert _names_key(pem, no_ski) is False and pki_module._verifies(crl, no_ski) is False
+
+    _assert_uncheckable_and_the_start_warns(tmp_path, pem, caplog)
+
+
+def test_a_lone_ca_with_no_ski_that_cannot_be_checked_still_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(c) The only CA of that name carries no Subject Key Identifier and has an RSA key. The CRL
+    names a key by identifier and carries an ECDSA signature, so that CA fits, is not named, and
+    cannot be checked. No CA is proven bad, so the start warns."""
+    no_ski = _ca_without_ski(_rsa_key())
+    (tmp_path / "ca.pem").write_bytes(no_ski.public_bytes(_PEM))
+    signer = ec.generate_private_key(ec.SECP256R1())
+    pem = _crl(signer, names=signer)
+    (tmp_path / "crl.pem").write_bytes(pem)
+
+    assert _names_key(pem, no_ski) is False
+    assert pki_module._verifies(x509.load_pem_x509_crl(pem), no_ski) is None
+
+    _assert_uncheckable_and_the_start_warns(tmp_path, pem, caplog)
 
 
 # --- the warn arm: one line for the file, however many contexts load it -------------------------

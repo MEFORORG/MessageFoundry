@@ -2001,7 +2001,13 @@ otherwise (the first bullet below says what that leaves out). The CRL names that
 key identifier. The engine ran the signature check with that key, and the check failed. Where
 several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
-authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
+authority key identifier and that carries a subject key identifier, and no CA of that name may
+verify the CRL. A fitting CA with no subject key identifier that the engine cannot check does not
+stop the refusal (vault BACKLOG #4159). Every verifying context the engine builds uses strict
+verification, under which OpenSSL 3 refuses a chain through such a CA, so it cannot make the CRL
+valid at a handshake. That rests on the OpenSSL build: the engine sets no OpenSSL version floor,
+and a build without that strict check could take such a CA for the CRL's issuer. A handshake
+that OpenSSL judges by such a CRL fails with
 `CRL signature failure`, an error that does not name the file. The refusal names the setting, the
 file and the CRL. Give the setting the CRL that CA signed. No setting turns this check off, as for
 an expired CRL.
@@ -2036,8 +2042,10 @@ three cases warn:
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
 - The engine cannot check the signature with the listed CA's key, even where the CRL names that key.
-  Two measured examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature
-  over SHA-1 that the CA did make.
+  Where the CRL names a listed CA's key, only that CA counts here; a CA of that name with no subject
+  key identifier that cannot be checked does not (the refusal above says why). Two measured
+  examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature over SHA-1
+  that the CA did make.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
 it judged before the failure is proved badly signed, which refuses the file. Where it loads, the

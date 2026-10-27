@@ -570,7 +570,10 @@ _UNCONFIRMED_SIGNATURE = {
         "verify the CRL, but the CRL does not "
         "name that CA's key, so a renewed CA key could explain it"
     ),
-    "uncheckable": "the engine cannot check its signature with the listed CA's key",
+    "uncheckable": (
+        "the engine cannot check its signature with the listed CA's key, where that CA carries "
+        "the key identifier the CRL names, or the CRL names no listed CA's key"
+    ),
 }
 #: How many CRLs that warning describes before it only counts the rest.
 _UNCONFIRMED_SHOWN = 3
@@ -589,8 +592,8 @@ def _check_crl_signatures(
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
 
     **Everything short of proof loads, with one warning.** That covers at least a CRL that names
-    no key, a key the engine cannot check with, and a CRL the engine matches to no listed CA. The
-    last is the usual case in a two-tier PKI, where the peer sends the intermediate that issued
+    no key, a named key the engine cannot check with, and a CRL the engine matches to no listed
+    CA. The last is the usual case in a two-tier PKI, where the peer sends the intermediate that issued
     the CRL, so it must not log per hop. The warning is one line for the file, and
     :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` decides how often it is
     logged. That function is asked only when there is a line to log. So it holds the last file
@@ -642,7 +645,9 @@ def _check_crl_signatures(
         raise ValueError(
             f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "
             "key does not verify the CRL's signature. A handshake OpenSSL judges by this CRL "
-            "fails with 'CRL signature failure'. Give this setting the CRL that CA signed, or "
+            "fails with 'CRL signature failure'. A listed CA of that name with no Subject Key "
+            "Identifier does not change that: strict verification refuses a chain through such "
+            "a CA. Give this setting the CRL that CA signed, or "
             "remove this CRL if a good one from that issuer is already in the file"
         )
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
