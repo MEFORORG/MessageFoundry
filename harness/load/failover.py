@@ -62,6 +62,7 @@ from harness.load.report import EXIT_OK, EXIT_SLO_VIOLATION, SloCheck
 from harness.load.sender import ConnectionPool, Dispatcher
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context, harness_tls_material
+from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS
 from messagefoundry.proctree import ADOPT_CREATIONFLAGS, resume_into_job, terminate_job
 
 log = logging.getLogger(__name__)
@@ -240,9 +241,16 @@ class EngineNode:
         kill-on-close job before it runs (``messagefoundry.proctree``): when this process exits by
         any route, Windows closes the job's handle and ends the tree. A fresh job per spawn, so
         :meth:`kill` takes one node's tree and never a peer's. POSIX keeps the single-process
-        behaviour it had; nothing measured leaks there yet."""
+        behaviour it had; nothing measured leaks there yet.
+
+        The interpreter starts with the engine's child flags (vault BACKLOG #2700): remote debugging
+        off, as ruling (b) asks of every rig start, and ``-P``, so the node's working directory is
+        not on its import path. ``-P`` rather than ``-I``: a rig passes the environment it was
+        started with, and ``-I`` would silently drop a ``PYTHONPATH`` a developer relies on."""
         self._end_tree()
-        proc = await self._exec(sys.executable, "-m", "messagefoundry", "serve", *serve_args)
+        proc = await self._exec(
+            sys.executable, *CHILD_INTERPRETER_FLAGS, "-m", "messagefoundry", "serve", *serve_args
+        )
         try:
             self._job = resume_into_job(proc.pid, who=f"node {self.node_id}")
         except OSError:
