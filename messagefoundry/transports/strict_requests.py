@@ -1226,7 +1226,6 @@ def _crossed_unrevoked(
         return revocation_hop_disposition(
             enforcing=enforcing,
             is_loopback_hop=on_box,
-            proxy_proven=False,
             attested=attested,
             crl_checked=crl_checked,
             blanket_attested=tls_revocation_attested(),
