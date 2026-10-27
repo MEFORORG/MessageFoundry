@@ -655,7 +655,7 @@ def _check_crl_signatures(
         shown = f"{shown}; and {more} more"
     logger.warning(
         "%s: the engine could not confirm at start that a CA this hop lists signed %d of the %d "
-        "CRL(s) in this file. %s. The file is loaded and revocation checking is on. OpenSSL "
+        "CRL(s) it judged in this file. %s. The file is loaded and revocation checking is on. OpenSSL "
         "checks each signature at the handshake. If peers are then refused with 'CRL signature "
         "failure' or 'unable to get certificate CRL', check this file first",
         label,

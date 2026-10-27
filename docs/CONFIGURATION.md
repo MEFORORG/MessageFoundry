@@ -2028,9 +2028,10 @@ three cases warn:
   Two measured examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature
   over SHA-1 that the CA did make.
 
-If the check itself fails, the engine logs an ERROR that says so, and loads the file. The CRLs it
-judged before the failure still count: one proved badly signed refuses the file, and the others
-warn. The CRLs after the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
+If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
+it judged before the failure is proved badly signed, which refuses the file; the other CRLs it
+judged warn. The CRLs after the failure are not judged, so a bad one there loads (vault BACKLOG
+#3506).
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
 engine process logs the WARNING once while the file keeps the same bytes. It keeps that record for

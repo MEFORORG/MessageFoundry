@@ -670,6 +670,7 @@ def test_a_name_that_genuinely_differs_is_still_unlisted(
     assert pki_module.UNLISTED_SIGNATURE in line
     verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
     assert verdict is not None and verdict[1] is False  # the reload's NO_ISSUER case
+    assert pki_module.UNLISTED_SIGNATURE in verdict[0]  # one sentence for both
     # The premise: OpenSSL finds no CRL for the leaf's issuer in this file, so it does not judge
     # the peer by it, and a leaf-checking hop fails for want of one, not on the signature.
     with pytest.raises(ssl.SSLError, match="unable to get certificate CRL"):
@@ -851,6 +852,8 @@ def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
 
     # Control: the same failure with no proof reached first still loads, with the ERROR.
     calls = 0
+    caplog.clear()
+    loaded_crls._UNCONFIRMED.clear()
     twins.crl.write_bytes(
         _crl(twins.new_key, names=twins.new_key) + _crl(twins.stranger, names=twins.new_key)
     )
@@ -882,10 +885,12 @@ def _zero_serial_ca() -> bytes:
     return der.replace(version_and_serial, version_and_serial[:-1] + bytes(1))
 
 
-def test_a_root_with_a_zero_serial_neither_ends_the_judgment_nor_warns(twins: _Twins) -> None:
+def test_a_root_with_a_zero_serial_is_skipped_alone_where_warnings_are_errors(
+    twins: _Twins,
+) -> None:
     """The Manager's item 3. Under warnings as errors, ``cryptography``'s warning about a serial
     number that is not positive used to end the whole judgment, so a CRL proven badly signed
-    loaded. Now that CA is read with the warning ignored, and the proof stands."""
+    loaded. Now that one CA is skipped, and the proof from another CA stands."""
     import warnings
 
     from cryptography.utils import CryptographyDeprecationWarning
@@ -899,11 +904,6 @@ def test_a_root_with_a_zero_serial_neither_ends_the_judgment_nor_warns(twins: _T
             x509.load_der_x509_certificate(odd)
         judged = [s.state for s in judge_crl_signatures(forged, [odd, *_ders(twins.new_ca)])]
     assert judged == ["bad"]
-    # In a normal run that CA prints no raw warning either.
-    with warnings.catch_warnings(record=True) as shown:
-        warnings.simplefilter("always")
-        list(judge_crl_signatures(forged, [odd]))
-    assert not [w for w in shown if issubclass(w.category, CryptographyDeprecationWarning)]
 
 
 def test_a_long_issuer_name_is_quoted_with_a_bound(twins: _Twins) -> None:

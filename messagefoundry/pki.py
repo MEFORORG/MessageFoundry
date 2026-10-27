@@ -18,7 +18,6 @@ from __future__ import annotations
 import datetime
 import ipaddress
 import string
-import warnings
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Literal
@@ -447,20 +446,12 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
     which then retried every pass. ``pem`` must be bytes :func:`judge_every_crl` accepted; a
     block that does not parse raises ``ValueError``."""
     cas: list[tuple[_NameKey, x509.Certificate]] = []
-    # A CA whose serial number is not positive, as at least some system roots have, makes the
-    # parse warn. That CA is read all the same, so it is kept, and the warning is not shown. Where
-    # warnings are errors, the warning used to end the whole judgment (vault BACKLOG #3506).
-    # ``catch_warnings`` swaps the process's warning filters while it runs, and a start and a
-    # reload can run it on two threads at once. Where two overlap, the ignore filter can stay for
-    # the life of the process, so a later ``CryptographyDeprecationWarning`` is not shown, and a
-    # filter another thread adds inside that window can be lost.
-    with warnings.catch_warnings(action="ignore", category=CryptographyDeprecationWarning):
-        for der in ca_ders:
-            try:
-                ca = x509.load_der_x509_certificate(der)
-                cas.append((_issuer_name_key(ca.subject), ca))
-            except _UNREADABLE_CA:
-                continue
+    for der in ca_ders:
+        try:
+            ca = x509.load_der_x509_certificate(der)
+            cas.append((_issuer_name_key(ca.subject), ca))
+        except _UNREADABLE_CA:
+            continue
     blocks = list(_crl_blocks(pem))
     for index, block in enumerate(blocks, start=1):
         crl = x509.load_pem_x509_crl(block)
@@ -477,18 +468,34 @@ _ISSUER_SHOWN = 200
 
 
 def _quoted_issuer(issuer: str) -> str:
-    """``issuer`` quoted with ``repr``, whole, or cut to :data:`_ISSUER_SHOWN` characters after
-    quoting, so escapes count too. The note on how long the name is stays outside the quotes."""
+    """``issuer`` quoted with ``repr``, whole, or cut so the quoted form holds at most
+    :data:`_ISSUER_SHOWN` characters, escapes included. The note on how long the name is stays
+    outside the quotes."""
     quoted = repr(issuer)
     if len(quoted) <= _ISSUER_SHOWN:
         return quoted
-    return f"{quoted[:_ISSUER_SHOWN]}... (cut: the name is {len(issuer)} characters)"
+    # Cut the name, not its quoted form, so the quotes close and no escape is split.
+    kept = _ISSUER_SHOWN
+    while len(quoted := repr(issuer[:kept])) > _ISSUER_SHOWN:
+        kept -= 1
+    return f"{quoted}... (cut: the name is {len(issuer)} characters)"
 
 
 #: What ``cryptography`` raises for a CA certificate it cannot read, at least. A CA that raises
 #: one is skipped by :func:`judge_crl_signatures`, alone. ``InvalidVersion`` comes from the
 #: parse, and ``UnsupportedGeneralNameType`` from reading extensions; neither is a ``ValueError``.
-_UNREADABLE_CA = (ValueError, x509.InvalidVersion, x509.UnsupportedGeneralNameType)
+#: ``CryptographyDeprecationWarning`` is raised only where warnings are errors: the parse warns of a
+#: CA whose serial number is not positive, which at least some system roots carry, and so does
+#: reading that serial. As an error it used to end the whole judgment (vault BACKLOG #3506). Now
+#: that CA alone is skipped, so a CRL it issued reads ``unlisted``, the warning arm. The warning is
+#: not silenced in a normal run: ``warnings.catch_warnings`` swaps the process's filters, and a
+#: start and a reload can run this on two threads at once.
+_UNREADABLE_CA = (
+    ValueError,
+    x509.InvalidVersion,
+    x509.UnsupportedGeneralNameType,
+    CryptographyDeprecationWarning,
+)
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
 _NameKey = tuple[tuple[tuple[str, bool, str | bytes], ...], ...]
