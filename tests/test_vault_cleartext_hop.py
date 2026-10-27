@@ -842,6 +842,8 @@ def test_two_proxies_an_http_vault_is_refused_and_reaches_neither(
         "http://synthetic-user\\@proxy.synthetic.test:3128",
         # Will not parse, so its credentials cannot be ruled out.
         "http://synthetic-user:synthetic-pw@[proxy.synthetic.test:3128",
+        # A userinfo with no host: requests' prepend raises TypeError, not a parser error.
+        "http://synthetic-user@",
     ],
 )
 def test_a_proxy_url_with_cleartext_credentials_is_refused(proxy: str) -> None:

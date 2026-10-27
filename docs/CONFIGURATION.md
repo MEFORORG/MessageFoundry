@@ -1620,8 +1620,8 @@ refusal later in the same send can still follow, before or at connect time. So t
 the proxy was picked, not that the request reached Vault. It names the proxy as the start
 WARNING does. The parser that dials the proxy may read a different scheme, host or port from it.
 Then the WARNING names it "an unreadable value". The engine gives these clients no proxy
-setting, so any proxy they pick came from the environment or the system settings. Which Vault
-hosts go direct, a loopback one included, is in *Some hosts go direct* above.
+setting, so any proxy they pick came from the environment or the system settings. *Some hosts
+go direct*, above, says which Vault hosts go direct, and why a loopback one is proxied.
 
 It logs once per hop and distinct proxy value in a process. A value the hop has not named before is
 named on the first send that picks it, which is how a proxy set after start is disclosed. A hop that

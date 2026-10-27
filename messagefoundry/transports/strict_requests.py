@@ -757,7 +757,8 @@ def _proxy_scheme(proxy: str) -> str:
         scheme = urllib3.util.parse_url(
             requests.utils.prepend_scheme_if_needed(proxy, "http")
         ).scheme
-    except ValueError:  # LocationParseError
+    # LocationParseError; TypeError when the prepend joins a userinfo to no host ("http://u@").
+    except (ValueError, TypeError):
         return ""
     return (scheme or "").lower()
 
@@ -929,7 +930,8 @@ def _proxy_carries_cleartext_credentials(proxy: str) -> bool:
         scheme = urllib3.util.parse_url(
             requests.utils.prepend_scheme_if_needed(proxy, "http")
         ).scheme
-    except ValueError:  # LocationParseError
+    # LocationParseError; TypeError when the prepend joins a userinfo to no host ("http://u@").
+    except (ValueError, TypeError):
         return True
     return (scheme or "").lower() != "https"
 
