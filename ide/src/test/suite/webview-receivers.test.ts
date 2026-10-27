@@ -382,6 +382,14 @@ const FIELDS_OK = {
   }),
 };
 
+/** FIELDS_OK with no field carrying `value` or `defaultValue`: both are optional (FieldDescriptor). */
+const FIELDS_BARE = variant(FIELDS_OK, (c) => {
+  for (const f of c.groups.flatMap((g: Payload) => g.fields)) {
+    delete f.value;
+    delete f.defaultValue;
+  }
+});
+
 const connection: Receiver = {
   panel: "connection editor",
   key: "command",
@@ -407,7 +415,7 @@ const connection: Receiver = {
        <div id="error">${SENTINEL}</div>
        <button id="save"></button><button id="cancel"></button><button id="delete"></button>`,
     ),
-  wellFormed: { error: [ERROR_OK], fields: [FIELDS_OK] },
+  wellFormed: { error: [ERROR_OK], fields: [FIELDS_OK, FIELDS_BARE] },
   malformed: {
     error: badMessages(ERROR_OK),
     fields: [
@@ -814,6 +822,9 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     const fields = FIELDS_OK.groups.flatMap((g) => g.fields);
     assert.ok(fields.some((f) => typeof f.envKey === "string" && typeof f.cast === "string"));
     assert.ok(fields.some((f) => !("envKey" in f) && !("cast" in f)));
+    const bare = FIELDS_BARE.groups.flatMap((g: Payload) => g.fields);
+    assert.ok(fields.some((f) => f.value !== undefined) && fields.some((f) => f.defaultValue !== undefined));
+    assert.ok(bare.length > 0 && bare.every((f: Payload) => !("value" in f) && !("defaultValue" in f)));
     assert.ok(FIELDS_OK.groups.some((g) => typeof g.description === "string"), "no group has a description");
     assert.ok(FIELDS_OK.groups.some((g) => !("description" in g)));
     assert.ok(fields.some((f) => f.choices === null) && fields.some((f) => Array.isArray(f.choices)));
@@ -842,26 +853,6 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       assert.deepStrictEqual(p.errors.map(String), [], `${type}: the page threw`);
       assert.deepStrictEqual(p.warnings, [], `${type}: discarded`);
     }
-  });
-
-  test("connection editor: a field with neither value nor defaultValue is accepted", () => {
-    // FieldDescriptor.value and .defaultValue are optional: describe() leaves them undefined in the
-    // ordinary case, and the JSON the host posts drops an undefined member. variant() is that JSON
-    // round trip; deleting both from every field is the extreme of it. Nothing may be discarded.
-    const bare = variant(FIELDS_OK, (c) => {
-      for (const f of c.groups.flatMap((g: Payload) => g.fields)) {
-        delete f.value;
-        delete f.defaultValue;
-      }
-    });
-    const fields = bare.groups.flatMap((g: Payload) => g.fields);
-    assert.ok(fields.length > 0 && fields.every((f: Payload) => !("value" in f) && !("defaultValue" in f)));
-    const p = connection.load();
-    const before = p.snapshot();
-    p.deliver(bare);
-    assert.deepStrictEqual(p.errors.map(String), [], "the page threw");
-    assert.notStrictEqual(p.snapshot(), before, "the message changed nothing");
-    assert.deepStrictEqual(p.warnings, [], "discarded");
   });
 
   test("the engine prints only setting type tags this page's set holds", () => {
