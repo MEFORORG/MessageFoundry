@@ -675,8 +675,8 @@ def _cipher_probe_drift(
     text: str, live_seconds: float, openssl_names: tuple[str, ...]
 ) -> list[str]:
     """Section 4 must state the host cipher probes' timeout as the code sets it, in the probe
-    paragraph, and name exactly the variables the ``openssl`` probe passes on top of its allowlist,
-    in that start's environment-list item (vault BACKLOG #3804 items 3 and 5). Each is read from its
+    paragraph, and name exactly the variables the ``openssl`` probes pass on top of their allowlist,
+    in those starts' environment-list item (vault BACKLOG #3804 items 3 and 5). Each is read from its
     own place, so a match elsewhere in the section cannot stand in for it (#4083 finding 7)."""
     section = _section(text, 4)
     paragraph = section.partition(_CIPHER_PARAGRAPH_LEAD)[2].partition("\n\n")[0]
