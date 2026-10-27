@@ -1448,22 +1448,6 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
   });
 
-  test("a pinned host whose caFile outlasts a request's wait is read in the background", async () => {
-    const caFile = path.join(ws, "pki", "slow-ca.pem");
-    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
-    await trust.refreshEngineTrust();
-    plantCert(path.join("pki", "slow-ca.pem"));
-    trust.setEngineTrustLimitsForTest({ followReadMs: 20 });
-    openHook = (file) =>
-      file === path.normalize(caFile)
-        ? new Promise((resolve) => setTimeout(resolve, 80)).then(() => realOpen(file))
-        : undefined;
-
-    assert.strictEqual(await trust.followCertificateChange(REMOTE, undefined), false);
-    await settle();
-    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
-  });
-
   test("a loopback host pinned since the last refresh never spawns the CLI on failure", async () => {
     stubInventory = NO_CERT_YET;
     await trust.refreshEngineTrust();
@@ -1879,6 +1863,49 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, RENEWED);
   });
 
+  test("a stale joined read of the old CA, then a re-read cut short, is still followed in the background", async () => {
+    // Round 8 review: readSince hands back the stale read when the re-read is cut short, so the
+    // request did not count as cut short and nothing finished the re-read.
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    trust.setEngineTrustLimitsForTest({ followReadMs: 40 });
+    let releaseStale: (() => void) | undefined;
+    openHook = (file) => {
+      if (file !== path.normalize(caFile)) {
+        return undefined;
+      }
+      if (releaseStale === undefined) {
+        return new Promise((resolve) => (releaseStale = () => resolve(servingHandle(PEM))));
+      }
+      return new Promise((resolve) => setTimeout(resolve, 120)).then(() => realOpen(file));
+    };
+    const earlier = trust.followCertificateChange(REMOTE, PEM); // its read began before the rotation
+    assert.ok(releaseStale !== undefined, "the earlier read never started, so this test proves nothing");
+    fs.writeFileSync(caFile, RENEWED);
+    const later = trust.followCertificateChange(REMOTE, PEM); // joins it, then reads again, slowly
+    releaseStale();
+
+    assert.strictEqual(await later, false);
+    await earlier;
+    await settle();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, RENEWED);
+  });
+
+  test("a deactivated extension's queued refresh does not spawn the CLI, and keeps its anchor", async () => {
+    stubInventory = plantedEngine();
+    const subscriptions: { dispose(): unknown }[] = [];
+    held.push(() => subscriptions.forEach((d) => d.dispose()));
+    trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
+    await settle();
+    const base = invocations.length;
+    subscriptions[0].dispose();
+
+    await trust.refreshEngineTrust();
+    assert.strictEqual(invocations.length, base, "the CLI was spawned after deactivation");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
   test("a slow pin's background re-read spawns no CLI and reads the file once", async () => {
     // Findings 5 and 6: it was a full refresh, which asked the CLI every time (about once a minute for
     // a share that stays slow) and joined the request's read only to read the file a second time.
@@ -1945,9 +1972,12 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     const base = invocations.length;
     stubCli((done) => {
       setImmediate(() => {
-        void trust.followCertificateChange(LOOPBACK, undefined);
-        subscriptions[0].dispose(); // the extension deactivates while this refresh runs
-        setImmediate(() => done(null, JSON.stringify(stubInventory), ""));
+        // The failure is noted first, so the refresh would run a follow-up; then the extension
+        // deactivates while that refresh is still running.
+        void trust.followCertificateChange(LOOPBACK, undefined).then(() => {
+          subscriptions[0].dispose();
+          setImmediate(() => done(null, JSON.stringify(stubInventory), ""));
+        });
       });
     });
 

@@ -75,13 +75,15 @@ interface Limits {
   /**
    * The most a refresh spends reading certificates, all of them together, after the CLI answered. A
    * file not read by then counts as inconclusive, so with the CLI's own bound a refresh ends within
-   * `cliAnswerMs + refreshReadMs` however many files sit on an unreachable share.
+   * `cliAnswerMs + refreshReadMs` however many files sit on an unreachable share. Also the most a
+   * `caFile` read a request cut short is waited for in the background ({@link followSlowPin}).
    */
   readonly refreshReadMs: number;
   /**
    * The most a failing request waits for the follow path's re-read. A request has its own timeout
    * (five seconds for a GET), and a file on an unreachable share would otherwise hold it for the
-   * share's timeout instead. A read cut short is not followed this time.
+   * share's timeout instead. A read cut short fails this request; a `caFile` read cut short is then
+   * finished in the background ({@link followSlowPin}), and a later request uses what it registers.
    */
   readonly followReadMs: number;
 }
@@ -493,6 +495,12 @@ async function askCli(
       outcomes.set(key, { keep: true, pinned: false });
     }
   };
+  if (deactivated) {
+    // A refresh queued before deactivation still runs; it must not spawn the CLI into a host that
+    // is shutting down. Its silence proves nothing, so the CLI's anchor is kept.
+    inconclusive();
+    return;
+  }
 
   if (cliRun !== undefined) {
     cliWanted = true;
@@ -869,32 +877,32 @@ export async function followCertificateChange(
     return false;
   }
   const since = readSeq;
-  const followed = await followFile(url, key, usedCa, since, limits.followReadMs, false);
+  const followed = await followFile(url, key, usedCa, since, limits.followReadMs);
   if (followed.retry) {
     return true;
   }
   if (cliCouldAnchor(key)) {
     noteCliAnchorableFailure(key, usedCa);
-  } else if (followed.pinned && followed.cutShort) {
+  } else if (followed.pinned && followed.noFreshRead) {
     followSlowPin(url, key, usedCa, since);
   }
   return false;
 }
 
-/** What {@link followFile} found: whether the request may retry, whether it registered an anchor
- *  itself, whether the file it read is a `caFile` pin, and whether that read was cut short. */
+/** What {@link followFile} found: whether the request may retry, whether the file it read is a
+ *  `caFile` pin, and whether no read that started after the failure finished in time (the read was
+ *  cut short, or only a stale read answered because the read after it was). */
 interface Followed {
   readonly retry: boolean;
-  readonly registered: boolean;
   readonly pinned: boolean;
-  readonly cutShort: boolean;
+  readonly noFreshRead: boolean;
 }
 
 /**
  * The file half of {@link followCertificateChange}: re-read the file that describes `key`, waiting at
  * most `waitMs`, and register what it holds if that is a certificate other than `usedCa`. `since` is
  * {@link readSeq} when the request failed: a read that started at or before it may predate the
- * rotation. `background` is {@link followSlowPin}'s call, which registers nothing after deactivation.
+ * rotation. Registers nothing after deactivation, when nothing would read it.
  */
 async function followFile(
   url: string,
@@ -902,7 +910,6 @@ async function followFile(
   usedCa: string | undefined,
   since: number,
   waitMs: number,
-  background: boolean,
 ): Promise<Followed> {
   // The file the settings pin this host to NOW, the same reading engineClient refuses requests by, so
   // a pin added or moved since the last refresh is read here rather than waiting for that refresh to
@@ -941,22 +948,23 @@ async function followFile(
   const after = sourceFor();
   const stillTheSource =
     after.file !== undefined && file !== undefined && after.pinned === pinned && sameFile(file, after.file);
-  const cutShort = stamped?.readAt === 0;
-  if (background && deactivated) {
-    return { retry: false, registered: false, pinned, cutShort };
+  // `readSince` hands back a read that started at or before `since` only when it answered (a
+  // different certificate) or when the read after it was cut short; either way no fresh read landed.
+  const noFreshRead = stamped !== undefined && stamped.readAt <= since;
+  if (deactivated) {
+    return { retry: false, pinned, noFreshRead };
   }
   if (file !== undefined && stamped !== undefined && changed && stillTheSource && !newer) {
-    const fresh = read !== held?.pem;
-    if (fresh) {
+    if (read !== held?.pem) {
       register({ url, file, pem: read, pinned, readAt: stamped.readAt });
       engineLog().info(`the certificate at ${file} changed; trusting it for ${url}`);
     }
     // Equal to `held.pem` means another request already followed it; this one retries all the same.
-    return { retry: true, registered: fresh, pinned, cutShort };
+    return { retry: true, pinned, noFreshRead };
   }
   // A refresh registered a different anchor while this request was in flight. The re-read above may
   // have failed (a file mid-rewrite), but what is registered now is still worth one retry.
-  return { retry: held !== undefined && held.pem !== usedCa, registered: false, pinned, cutShort };
+  return { retry: held !== undefined && held.pem !== usedCa, pinned, noFreshRead };
 }
 
 /** {@link followSlowPin}'s runs still going, by host key: at most one per host at a time. */
@@ -967,7 +975,9 @@ const slowPinFollows = new Map<string, Promise<void>>();
  * the request could wait, with or without an anchor held (one held is the old CA, which a rotation in
  * place has made stale). Every request to that host fails until the file is read, and each would cut
  * its own read short the same way, so this waits for that same read with a refresh's allowance
- * (`refreshReadMs`) and registers what it holds, then re-probes the status bar.
+ * (`refreshReadMs`) and registers what it holds. It re-probes the status bar whenever the anchor now
+ * registered differs from the one the request failed with, whoever registered it: the request that
+ * did may not have been the status bar's.
  *
  * Not a refresh: a refresh asks the engine's CLI, which can say nothing about a `caFile`, and reads
  * the file again after joining this read. This joins the read already running and reads again only
@@ -978,13 +988,20 @@ function followSlowPin(url: string, key: string, usedCa: string | undefined, sin
   if (deactivated || slowPinFollows.has(key)) {
     return;
   }
-  const run = followFile(url, key, usedCa, since, limits.refreshReadMs, true)
+  const run: Promise<void> = followFile(url, key, usedCa, since, limits.refreshReadMs)
     .then(async (followed) => {
-      if (followed.registered && !deactivated) {
+      if (followed.retry && !deactivated) {
         await recheck();
       }
     })
-    .finally(() => slowPinFollows.delete(key));
+    .catch((err: unknown) => {
+      engineLog().warn(`following the certificate for ${url} in the background failed: ${String(err)}`);
+    })
+    .finally(() => {
+      if (slowPinFollows.get(key) === run) {
+        slowPinFollows.delete(key);
+      }
+    });
   slowPinFollows.set(key, run);
 }
 

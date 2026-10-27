@@ -323,9 +323,10 @@ export function setTrustFailureHandler(
  * {@link CertificateChangedError} saying a retry will work, not the trust error's remedy, which would
  * send the user to a configuration that is not at fault. Verification is never relaxed for the retry.
  *
- * The handler may also answer false while starting a background refresh (a loopback engine with no
- * anchor yet); then the request fails with the ordinary trust error and a later one picks the
- * certificate up. `engineTrust.ts`'s `followCertificateChange` says when.
+ * The handler may also answer false while starting background work (a refresh for a loopback engine
+ * with no anchor yet, or the rest of a `caFile` read this request could not wait for); then the
+ * request fails with the ordinary trust error and a later one picks the certificate up.
+ * `engineTrust.ts`'s `followCertificateChange` says when.
  */
 async function withRenewalRetry<T>(
   baseUrl: string,

@@ -288,7 +288,9 @@ once against the new one; that retry is made for a GET only, so a POST that fail
 twice. Such a POST fails with a message that says the certificate changed. It does not repeat the
 usual advice about `serviceConfig` or `caFile`. Check whether an action already took effect before
 you repeat it. The next request uses the new certificate. The file is read without blocking the
-editor. A request waits at most two seconds for that read, then fails as it would have.
+editor. A request waits at most two seconds for that read, then fails as it would have. For a
+`caFile`, the read then goes on in the background for up to ten more seconds, and a later request
+uses the certificate it finds.
 
 Sometimes the loopback `messagefoundry.engineUrl` has no anchor yet, because the engine started
 after the window opened. If no https `caFile` covers that `host:port`, a failure asks the engine
