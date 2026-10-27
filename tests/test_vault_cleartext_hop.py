@@ -847,6 +847,10 @@ def test_two_proxies_an_http_vault_is_refused_and_reaches_neither(
     ],
 )
 def test_a_proxy_url_with_cleartext_credentials_is_refused(proxy: str) -> None:
+    from messagefoundry.transports.strict_requests import _proxy_scheme
+
+    # The scheme reader fails closed on the same shapes: a URL it cannot read is not https.
+    assert _proxy_scheme(proxy) != "https"
     from messagefoundry.transports.strict_requests import _refuse_cleartext_proxy_credentials
 
     with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):

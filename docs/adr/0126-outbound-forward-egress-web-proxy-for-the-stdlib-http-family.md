@@ -328,8 +328,8 @@ So a command such as `check-privileges` or `verify` reached Vault through an env
 no disclosure, and so did a proxy set after start. An owner ruling of 2026-10-22 chose to fix the engine (vault BACKLOG
 #4028). The Vault clients' strict adapter now names the proxy `requests` picked for a send, once per
 hop and distinct proxy value in a process. Unlike the start WARNING it is a per-hop claim, but
-not a probe: it names the result of the send's own proxy selection. The start WARNING is unchanged, and so is every
-`proxy_url`. What it says, and what it does not, is in
+not a probe: it names the result of the send's own proxy selection. The start WARNING is
+unchanged, and so is every `proxy_url`. What it says, and what it does not, is in
 [CONFIGURATION.md](../CONFIGURATION.md#the-vault-and-openbao-clients-also-name-a-proxy-where-they-use-it).
 
 ## Deviations from the phase doc
