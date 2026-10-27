@@ -28,9 +28,8 @@ from tests._negative_controls import _test_names
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "scripts" / "ci" / "invariant_mutations.py"
 
-#: Rows at landing: eight, one per offline-reachable instance of the thirteen. A floor, so deleting
-#: rows to make a stale list pass is a visible change to this number.
-_MIN_ROWS = 8
+#: A floor, so deleting rows to make a stale list pass is a visible change to this number.
+_MIN_ROWS = 10
 
 
 def _load() -> Any:
@@ -110,7 +109,8 @@ def test_every_named_test_exists(row: Any) -> None:
         rel, _, name = node.partition("::")
         path = _REPO / rel
         assert path.is_file(), f"{row.id}: {rel} does not exist"
-        assert name in _test_names(path), f"{row.id}: {rel} defines no {name}"
+        # A parametrized id names its function before the bracket; the runner matches the full id.
+        assert name.partition("[")[0] in _test_names(path), f"{row.id}: {rel} defines no {name}"
 
 
 @pytest.mark.parametrize(

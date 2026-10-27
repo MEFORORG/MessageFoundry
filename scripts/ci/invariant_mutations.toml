@@ -168,3 +168,34 @@ replace = '''
 tests = [
     "tests/test_connection_audit_writes.py::test_flag_route_audits_connection_flag_set_under_the_acting_user",
 ]
+
+[[mutation]]
+id = "unsafe-db-lookup-own-argument-only"
+item = 1658
+file = "messagefoundry/checks.py"
+find = '''
+            if _unsafe_lookup_hit(node, lookup_envs.get(id(node))):
+'''
+replace = '''
+            if _unsafe_lookup_hit(node):
+'''
+tests = [
+    "tests/test_checks_handler_security.py::test_handler_security_matrix[db_pos_assign_then_pass_fstring]",
+    "tests/test_checks_handler_security.py::test_handler_security_matrix[db_pos_assign_then_pass_percent]",
+    "tests/test_checks_handler_security.py::test_handler_security_matrix[db_pos_augassign_build]",
+]
+
+[[mutation]]
+id = "sqlserver-audit-append-no-applock"
+item = 1605
+file = "messagefoundry/store/sqlserver.py"
+find = '''
+        await self._applock(cur, _AUDIT_APPEND_LOCK)
+        await cur.execute("SELECT TOP (1) seq, row_hash FROM audit_log ORDER BY seq DESC")
+'''
+replace = '''
+        await cur.execute("SELECT TOP (1) seq, row_hash FROM audit_log ORDER BY seq DESC")
+'''
+tests = [
+    "tests/test_control_premises.py::test_every_audit_append_takes_the_database_applock_before_it_reads_the_head",
+]
