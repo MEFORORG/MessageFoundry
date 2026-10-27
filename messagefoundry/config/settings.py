@@ -8353,6 +8353,44 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       temporary-password life of 0 or less means no expiry, and is named as off. None is gated on
       another setting. The last two entries quote no configured value.
 
+    The rest of step 4 reads every remaining numeric ``[auth]`` field the same way. Each entry
+    below is named in its looser direction only, and only while the code that reads it is built.
+    A load-time bound is not treated as a gate where a value inside it is still looser.
+
+    * ``mfa_recovery_code_count``: enrolment mints this many single-use codes, and any one passes
+      the second factor, so more than the default is looser. 0 mints none, which is stricter. Not
+      gated: any account may enrol TOTP. ``password_min_length``: ``PasswordPolicy`` refuses a
+      password shorter than this, so a lower floor is looser, and 0 or less sets none. Not gated:
+      sign-in is always on. Neither entry quotes the configured value.
+    * ``session_idle_timeout_minutes`` and ``session_absolute_hours`` are the ``[security]``
+      switches ``sign_out_after_idle_minutes`` and ``max_session_hours``, copied in by the desugar.
+      Their ``[auth]`` spellings are refused at load, so the entries carry the ``[security]`` names.
+      ``SessionRecord.is_live`` refuses a session idle past the first or older than the second (its
+      expiry is stamped from it at sign-in), so a longer one is looser, and 0 or less
+      ends every session at once, which is stricter.
+    * The directory reconciler's knobs, named while ``reconciler_configured`` holds:
+      ``ad_session_recheck_seconds`` above its default (a pass runs less often; 0 is the off value
+      :func:`security_loosenings` names), ``ad_session_recheck_strikes`` above its default
+      (``plan_pass`` revokes only at that many failing passes in a row), and
+      ``ad_session_recheck_max_users`` below its default (``select_candidates`` probes at most that
+      many per pass). Each makes a revocation arrive later. ``ad_session_revoke_max`` and
+      ``ad_session_revoke_max_fraction`` feed ``breaker_tripped``, which aborts a pass only when it
+      would revoke more than both. Above the default the brake lets a wider wave through, which is
+      the direction BACKLOG #3085 refuses at 1.0 and warns of at the budget, so that is named.
+      Below it the brake aborts a smaller wave, loudly (an ERROR and an audit row), and that is
+      not named.
+    * The federated sign-in knobs, named while ``oidc_enabled`` holds. ``oidc_clock_skew_seconds``
+      above its default accepts an expired id_token for longer and widens the step-up freshness
+      test. ``oidc_jwks_ttl_seconds`` above its default keeps a withdrawn signing key verifying for
+      longer. ``JwksCache`` also serves a cached key until it may fetch again, so an
+      ``oidc_jwks_min_refetch_seconds`` above the DEFAULT TTL is named for the same reason; below
+      its own default it weakens the bound on fetches an unknown key id can force, and 0 or less
+      removes it. ``oidc_flow_ttl_seconds`` above its default keeps a staged flow redeemable for
+      longer, and ``oidc_max_age_seconds`` above its default accepts an older identity-provider
+      sign-in. The load bounds all but the JWKS pair, each above its default.
+    * ``oidc_session_max_hours`` is never named: the sign-in takes the minimum of it and the
+      token's own expiry, so any value only ends a session sooner.
+
     ``[approvals].min_dwell_seconds``, the dual-control approval floor, is another time floor of the
     same kind. It lives in its own section, so :func:`_approvals_loosenings` names it, read the same
     way (BACKLOG #2489)."""
@@ -8810,6 +8848,189 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 "it for longer, and what it permits includes setting the account's password",
             )
         )
+
+    # --- the rest of vault BACKLOG #2600 step 4. Each is named in its looser direction only, against
+    # the shipped default, and only while the code that reads it is built. The docstring says how
+    # each direction was read.
+
+    # Recovery codes are minted at TOTP enrolment, which any account may do. Each one passes the
+    # second factor on its own. Neither entry quotes the configured value: mfa_* and *password* are
+    # names the clear-text-logging query reads as secret sources (ADR 0034's 2026-10-03 amendment).
+    if auth.mfa_recovery_code_count > _auth_default("mfa_recovery_code_count"):
+        out.append(
+            (
+                "mfa_recovery_code_count",
+                "more single-use recovery codes are minted at enrolment than the default of "
+                f"{_auth_default('mfa_recovery_code_count')}, and any one of them passes the second "
+                "factor alone, so a copied or photographed list carries more ways past it and a "
+                "guess has more codes to match",
+            )
+        )
+    if auth.password_min_length < _auth_default("password_min_length"):
+        out.append(
+            (
+                "password_min_length",
+                "a local password may be shorter than the default of "
+                f"{_auth_default('password_min_length')} characters when it is set, so a "
+                "guessing attack has fewer candidates to try",
+            )
+        )
+
+    # The [security] session limits. They desugar into these two [auth] fields, whose own spellings
+    # the load refuses, so each entry carries the [security] name an operator sets. A value of 0 or
+    # less ends every session at once, which is stricter.
+    for switch, field, unit in (
+        ("sign_out_after_idle_minutes", "session_idle_timeout_minutes", "minute(s)"),
+        ("max_session_hours", "session_absolute_hours", "hour(s)"),
+    ):
+        value, default = getattr(auth, field), _auth_default(field)
+        if value > default:
+            out.append(
+                (
+                    switch,
+                    f"[security].{switch} is {value} {unit}, above the default of {default}, so a "
+                    "session left open or taken over stays usable for longer before it is signed "
+                    "out",
+                )
+            )
+
+    # The directory session reconciler, named only while it runs: with AD off, or its interval at 0,
+    # nothing reads these, and security_loosenings names the 0 interval itself.
+    if auth.reconciler_configured:
+        late = (
+            "a directory account that was disabled or deleted, or whose groups changed, keeps its "
+            "live engine sessions for longer before they are revoked"
+        )
+        interval = auth.ad_session_recheck_seconds
+        if interval > _auth_default("ad_session_recheck_seconds"):
+            out.append(
+                (
+                    "ad_session_recheck_seconds",
+                    f"the directory reconciler runs every {interval} s, less often than the "
+                    f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}",
+                )
+            )
+        strikes = auth.ad_session_recheck_strikes
+        if strikes > _auth_default("ad_session_recheck_strikes"):
+            out.append(
+                (
+                    "ad_session_recheck_strikes",
+                    f"the reconciler revokes only after {strikes} passes in a row find an account "
+                    "absent or disabled, more than the default of "
+                    f"{_auth_default('ad_session_recheck_strikes')}, so {late}",
+                )
+            )
+        if auth.ad_session_recheck_max_users < _auth_default("ad_session_recheck_max_users"):
+            out.append(
+                (
+                    "ad_session_recheck_max_users",
+                    "a reconciler pass probes fewer accounts than the default of "
+                    f"{_auth_default('ad_session_recheck_max_users')}, so a larger estate takes "
+                    f"more passes to cover, and {late}",
+                )
+            )
+        brake = (
+            "so a misconfigured search base, or a lost read right, signs out more of the "
+            "signed-in directory users in one pass before the mass-revoke circuit breaker holds"
+        )
+        cap = auth.ad_session_revoke_max
+        if cap > _auth_default("ad_session_revoke_max"):
+            out.append(
+                (
+                    "ad_session_revoke_max",
+                    f"the mass-revoke circuit breaker's absolute floor is {cap} accounts, above "
+                    f"the default of {_auth_default('ad_session_revoke_max')}, {brake}",
+                )
+            )
+        share = auth.ad_session_revoke_max_fraction
+        if share > _auth_default("ad_session_revoke_max_fraction"):
+            out.append(
+                (
+                    "ad_session_revoke_max_fraction",
+                    f"the mass-revoke circuit breaker's share is {share!r} of the accounts a pass "
+                    f"probed, above the default of {_auth_default('ad_session_revoke_max_fraction')}"
+                    f", {brake}",
+                )
+            )
+
+    # Federated sign-in, named only while OIDC is on: with it off nothing reads these.
+    if auth.oidc_enabled:
+        skew = auth.oidc_clock_skew_seconds
+        if skew > _auth_default("oidc_clock_skew_seconds"):
+            out.append(
+                (
+                    "oidc_clock_skew_seconds",
+                    f"the clock skew allowed on an id_token is {skew} s, more than the default of "
+                    f"{_auth_default('oidc_clock_skew_seconds')} s, so an expired token is accepted "
+                    "for that much longer, and an IdP step-up that was not freshly re-authenticated "
+                    "passes the freshness test from further back",
+                )
+            )
+        ttl, default_ttl = auth.oidc_jwks_ttl_seconds, _auth_default("oidc_jwks_ttl_seconds")
+        withdrawn = (
+            "so a signing key the identity provider withdrew, such as one it rotated out after a "
+            "compromise, keeps verifying id_tokens for longer"
+        )
+        if ttl > default_ttl:
+            out.append(
+                (
+                    "oidc_jwks_ttl_seconds",
+                    f"the JWKS key cache lifetime is {ttl} s, longer than the default of "
+                    f"{default_ttl} s, {withdrawn}",
+                )
+            )
+        refetch = auth.oidc_jwks_min_refetch_seconds
+        default_refetch = _auth_default("oidc_jwks_min_refetch_seconds")
+        if refetch <= 0:
+            out.append(
+                (
+                    "oidc_jwks_min_refetch_seconds",
+                    "there is no least time between two JWKS fetches, so every sign-in callback "
+                    "carrying an unknown key id makes the engine fetch the key set from the "
+                    "identity provider again",
+                )
+            )
+        elif refetch < default_refetch:
+            out.append(
+                (
+                    "oidc_jwks_min_refetch_seconds",
+                    f"the least time between two JWKS fetches is {refetch} s, shorter than the "
+                    f"default of {default_refetch} s, so callbacks carrying unknown key ids make "
+                    "the engine fetch the key set from the identity provider more often",
+                )
+            )
+        elif refetch > default_ttl:
+            # JwksCache serves a cached key past its lifetime until a refetch is allowed again.
+            out.append(
+                (
+                    "oidc_jwks_min_refetch_seconds",
+                    f"the least time between two JWKS fetches is {refetch} s, longer than the "
+                    f"default JWKS lifetime of {default_ttl} s, and the cache keeps serving a key "
+                    f"until it may fetch again, {withdrawn}",
+                )
+            )
+        flow_ttl = auth.oidc_flow_ttl_seconds
+        if flow_ttl > _auth_default("oidc_flow_ttl_seconds"):
+            out.append(
+                (
+                    "oidc_flow_ttl_seconds",
+                    f"a pending federated sign-in lives {flow_ttl} s, longer than the default of "
+                    f"{_auth_default('oidc_flow_ttl_seconds')} s, so its staged state, nonce and "
+                    "PKCE verifier stay redeemable for longer, and an abandoned start holds a "
+                    "flow-cache slot for longer",
+                )
+            )
+        max_age = auth.oidc_max_age_seconds
+        if max_age > _auth_default("oidc_max_age_seconds"):
+            out.append(
+                (
+                    "oidc_max_age_seconds",
+                    f"a federated sign-in is accepted up to {max_age} s after the person last "
+                    "authenticated at the identity provider, longer than the default of "
+                    f"{_auth_default('oidc_max_age_seconds')} s, so an older identity-provider "
+                    "session can still mint an engine session",
+                )
+            )
     return out
 
 

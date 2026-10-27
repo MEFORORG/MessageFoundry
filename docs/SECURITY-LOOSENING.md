@@ -131,8 +131,8 @@ leaves the engine.
 | | `require_memory_encryption_declaration` | `false` (*not* a loosening either — it TIGHTENS, turning that warning into a refusal. Opt-in because the property is a host property most Windows hosts cannot provide: a Windows guest gets it only as an Azure or Azure Local confidential VM ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md#hardware-memory-encryption--required-for-an-asvs-level-3-phi-deployment))) |
 | Sign-in & identity | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
-| | `sign_out_after_idle_minutes` | `30` |
-| | `max_session_hours` | `12` |
+| | `sign_out_after_idle_minutes` | `30` (a value above `30` is named. `0` or less ends every session at once, which is stricter) |
+| | `max_session_hours` | `12` (a value above `12` is named. `0` or less ends every session at once, which is stricter) |
 | Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
 | Store principal | `allow_over_granted_store_principal` | `false` (ADR 0199: accept an over-granted store login under `enforce`, audited) |
 | Interpreter | `allow_remote_debugging` | `false` (vault BACKLOG #2700: accept the interpreter's remote debugging on under `enforce`, which otherwise refuses the start; reported) |
@@ -151,7 +151,9 @@ leaves the engine.
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[store].secure_delete` | `true` (*conditional* — a loosening only on a file-backed SQLite store; `false` leaves a purged body's bytes in the file) |
-| | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
+| | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`; `0` turns the reconciler off, and an interval above `300` s is named) |
+| | `[auth].ad_session_recheck_strikes`, `ad_session_recheck_max_users` | `2` / `200` (*conditional* — a loosening only while the reconciler runs; more strikes, or a smaller per-pass budget, is named) |
+| | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` | `5` / `0.34` (*conditional* — a loosening only while the reconciler runs; a value above its default is named. A lower one is a stricter brake, and is not named) |
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
 | | `[auth].ad_connect_timeout`, `ad_receive_timeout`, `ad_group_search_deadline` | `10` s / `10` s / `120` s (*conditional* — a loosening only once `ad_enabled`; a value above its default is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
 | | `[auth].admin_new_ip_step_up` | `true` |
@@ -168,6 +170,10 @@ leaves the engine.
 | | `[auth].step_up_max_age_seconds` | `300` s (a window above `300` s is named. `0` or less is stricter: it passes no session, except briefly after the system clock steps back) |
 | | `[auth].totp_skew_steps` | `0` (`1` or `2` is named. The load refuses any other value) |
 | | `[auth].initial_password_expiry_hours` | `72` h (a life above `72` h is named, and `0` or less means a temporary password never expires) |
+| | `[auth].mfa_recovery_code_count` | `10` (more codes is named. `0` mints none, which is stricter. The load refuses a value outside `0` to `50`) |
+| | `[auth].password_min_length` | `15` (a shorter floor is named, and `0` or less sets none) |
+| | `[auth].oidc_clock_skew_seconds`, `oidc_jwks_ttl_seconds`, `oidc_flow_ttl_seconds`, `oidc_max_age_seconds` | `60` s / `3600` s / `300` s / `43200` s (*conditional* — a loosening only while OIDC is on; a value above its default is named) |
+| | `[auth].oidc_jwks_min_refetch_seconds` | `300` s (*conditional* — a loosening only while OIDC is on; a value below `300` s, or above the default JWKS lifetime of `3600` s, is named, and `0` or less removes the bound) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
 | | `[api].trusted_proxies` | `[]` (any network covering more than one address is named, once, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
@@ -198,6 +204,8 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[auth].step_up_max_age_seconds`, `[auth].totp_skew_steps`, `[auth].initial_password_expiry_hours`,
+`[auth].mfa_recovery_code_count`, `[auth].password_min_length`, the four other
+`[auth].ad_session_*` reconciler keys, the five `[auth].oidc_*` lifetime and skew keys,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
@@ -418,6 +426,10 @@ false premise.
 - **What you lose:** a longer idle/absolute session window widens the hijack replay window.
 - **When acceptable:** operational ergonomics on a trusted host.
 - **Compensating controls:** keep them bounded; shorter is safer.
+- **Where it is reported:** `security_loosenings()` names a value above `30` minutes or `12` hours
+  (vault BACKLOG #2600), so the serve-time warning, `messagefoundry security show` and
+  `GET /security/posture` list it. A value of `0` or less ends every session at once, which is
+  stricter, and is not named.
 
 ### `block_unlisted_outbound = false` — allow-any outbound egress
 - **What you lose:** deny-by-default egress; a transform may send to **any** destination (PHI exfiltration
@@ -757,6 +769,27 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   design, so it was never a substitute for these.
 - **See:** [ADR 0079](adr/0079-kerberos-idp-session-coordination.md) (2026-07-28 amendment).
 
+### The directory reconciler's knobs looser than their defaults **while it runs** — revocation arrives later, or the brake holds later
+> **Conditional** on the reconciler running: `[auth].ad_enabled` with a non-zero
+> `ad_session_recheck_seconds` (vault BACKLOG #2600). With it off nothing reads these, and the `0`
+> interval is named by the entry above. Each is named alone, with its value or its default.
+- **What you lose:** a revocation the directory calls for arrives later when
+  `ad_session_recheck_seconds` is above `300` s, when `ad_session_recheck_strikes` is above `2` (a pass
+  revokes only after that many in a row find the account absent or disabled), or when
+  `ad_session_recheck_max_users` is below `200` (a larger estate takes more passes to cover). The
+  mass-revoke circuit breaker aborts a pass only when it would revoke more than **both**
+  `ad_session_revoke_max` accounts and `ad_session_revoke_max_fraction` of the accounts it probed. A
+  value above either default lets a misconfigured search base, or a lost read right, sign out a wider
+  wave of directory users before the brake holds. Load already refuses a fraction of `1.0` while the
+  reconciler runs, and warns of a budget at or below the cap (BACKLOG #3085).
+- **Not named:** fewer strikes, a larger budget, or a lower brake threshold. Each is stricter. A lower
+  brake threshold aborts a smaller wave, and an aborted pass says so in an ERROR and an audit row.
+- **When acceptable:** a directory that cannot absorb the bind load of the defaults, or an estate whose
+  ordinary offboarding waves trip the default brake.
+- **Compensating controls:** keep `[security].max_session_hours` and `sign_out_after_idle_minutes`
+  short, and revoke sessions by hand on offboarding.
+- **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
+
 ### `[auth].ad_allow_insecure_ldap = true` **with a plain `ldap://` `ad_server`** — AD binds in cleartext
 > **Conditional**, and reachable only at `[security].enforcement = warn`. Under `enforce` the switch is
 > inert and the config is refused at load, as `MEFOR_ALLOW_INSECURE_TLS` is inert there (vault BACKLOG
@@ -1082,6 +1115,53 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `messagefoundry security show` and `GET /security/posture` list it. Nothing refuses it.
 - **Reversible:** yes, immediately — restore `72` (or delete the line) and restart. Restoring it
   expires every temporary password already older than the restored life.
+
+### `[auth].mfa_recovery_code_count` above `10` — more standing ways past the second factor
+> No other setting gates it: any account may enrol TOTP (vault BACKLOG #2600). `0` mints no recovery
+> code, so an administrator's reset is the only way back, which is stricter and is not named. The
+> load refuses a value outside `0` to `50`. The entry does not quote the configured value.
+- **What you lose:** each recovery code passes the second factor on its own, once. More codes means a
+  copied or photographed list carries more ways past it, and a guess has more codes to match.
+- **When acceptable:** a site whose users lose authenticators often and cannot reach an administrator.
+- **Compensating controls:** none that substitute; enrol a second authenticator or a passkey instead.
+- **Reversible:** yes, for new enrolments — restore `10` and restart. Codes already minted stay valid
+  until used or regenerated.
+
+### `[auth].password_min_length` below `15` — a shorter local password
+> No other setting gates it: sign-in is always on, and every local account has a password (vault
+> BACKLOG #2600). `0` or less sets no length floor at all. The entry does not quote the configured
+> value.
+- **What you lose:** the password policy refuses a local password shorter than this when it is set. A
+  lower floor leaves a guessing attack fewer candidates to try.
+- **When acceptable:** a legacy standard that mandates a shorter floor, with composition rules beside
+  it.
+- **Compensating controls:** keep the three `password_check_*` screens and `[security].require_mfa`
+  on.
+- **Reversible:** yes, for passwords set afterwards — restore `15` and restart. A password already set
+  is not re-checked.
+
+### `[auth].oidc_*` lifetimes and skew looser than their defaults **with OIDC on** — federated sign-in accepts more
+> **Conditional** on `[auth].oidc_enabled` (vault BACKLOG #2600). With it off nothing reads these.
+> Each is named alone, with its value and its default.
+- **What you lose:**
+  - `oidc_clock_skew_seconds` above `60` s accepts an expired id_token for that much longer, and lets
+    an IdP step-up answer that was not freshly re-authenticated pass from further back.
+  - `oidc_jwks_ttl_seconds` above `3600` s keeps a signing key the identity provider withdrew, such
+    as one rotated out after a compromise, verifying id_tokens for longer. The key cache also serves a
+    cached key until it may fetch again, so `oidc_jwks_min_refetch_seconds` above `3600` s does the
+    same. Below its own default of `300` s it weakens the bound on how often an unknown key id can
+    make the engine fetch the key set, and `0` or less removes that bound.
+  - `oidc_flow_ttl_seconds` above `300` s keeps a pending sign-in's staged state, nonce and PKCE
+    verifier redeemable for longer, and holds an abandoned start's flow-cache slot for longer.
+  - `oidc_max_age_seconds` above `43200` s accepts a sign-in whose last identity-provider
+    authentication is older.
+- **Not named:** `oidc_session_max_hours`. The sign-in takes the earlier of it and the id_token's
+  own expiry, so any value only ends a session sooner.
+- **When acceptable:** an identity provider whose clock, key rotation or sign-in flow is measured to
+  need it.
+- **Compensating controls:** fix the clock source, and ask the identity provider to rotate keys on a
+  schedule shorter than the cache lifetime.
+- **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[approvals].min_dwell_seconds` below `2.0` s, or `expiry_hours` above `72` h — a held action is released sooner, or later
 > **Conditional** on `[approvals].enabled` with at least one operation in `[approvals].operations`
@@ -2130,6 +2210,9 @@ chapter was not part of the verification above.
 | `[auth].step_up_max_age_seconds` (step-up re-verification window) | V7 Session Management (7.5.3) | **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication |
 | `[auth].totp_skew_steps` (TOTP acceptance window) | V6 Authentication (6.5.5) | **IA-2(8)** Access to Accounts — Replay Resistant | §164.312(d) Person or Entity Authentication |
 | `[auth].initial_password_expiry_hours` (life of an administrator-issued temporary password) | V6 Authentication (6.4.1, 6.4.5) | **IA-5(1)** Authenticator Management | §164.308(a)(5)(ii)(D) Password Management |
+| `[auth].mfa_recovery_code_count`, `[auth].password_min_length` (recovery codes minted, local password floor) | V6 Authentication | **IA-5(1)** Authenticator Management | §164.308(a)(5)(ii)(D) Password Management |
+| `[auth].ad_session_recheck_strikes`, `ad_session_recheck_max_users`, `ad_session_revoke_max`, `ad_session_revoke_max_fraction` (directory revocation pace and its brake) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.308(a)(3)(ii)(C) Termination Procedures |
+| `[auth].oidc_clock_skew_seconds`, `oidc_jwks_ttl_seconds`, `oidc_jwks_min_refetch_seconds`, `oidc_flow_ttl_seconds`, `oidc_max_age_seconds` (federated token acceptance) | V6 Authentication (6.8) | **IA-2** Identification and Authentication · **IA-8** Identification and Authentication (Non-Organizational Users) | §164.312(d) Person or Entity Authentication |
 | `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, `[[alerts.rules]]` (credential reminders off, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
 | `[api].trusted_proxies` (forwarded header trusted from a multi-address range, up to every peer) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |

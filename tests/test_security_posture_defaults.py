@@ -19,7 +19,9 @@ switch be added at an insecure value with nothing reporting it.
 
 from __future__ import annotations
 
+import base64
 import ipaddress
+import json
 import math
 import re
 from collections.abc import Collection
@@ -29,8 +31,11 @@ from typing import Any
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from messagefoundry.api import create_app
+from messagefoundry.auth.oidc.jwks import JwksCache, JwksError
+from messagefoundry.auth.reconcile import breaker_tripped
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     LOCKOUT_THRESHOLD_CEILING,
@@ -441,6 +446,12 @@ _LOOSER_THAN_DEFAULT = [
     ("initial_password_expiry_hours", 1_000_000),
     ("initial_password_expiry_hours", 0),  # no expiry at all
     ("initial_password_expiry_hours", -1),
+    # Vault BACKLOG #2600 step 4, the rest: more standing recovery codes, a shorter password floor.
+    ("mfa_recovery_code_count", 11),
+    ("mfa_recovery_code_count", 50),  # the load refuses anything above
+    ("password_min_length", 14),
+    ("password_min_length", 1),
+    ("password_min_length", 0),  # no length floor at all
 ]
 
 #: (field, value at or stricter than its shipped default). None is named. The defaults are listed
@@ -496,6 +507,12 @@ _STRICTER_OR_DEFAULT = [
     ("initial_password_expiry_hours", 72),
     ("initial_password_expiry_hours", 71),
     ("initial_password_expiry_hours", 1),
+    # 0 mints no recovery code, so an administrator's reset is the only way back: stricter.
+    ("mfa_recovery_code_count", 10),
+    ("mfa_recovery_code_count", 9),
+    ("mfa_recovery_code_count", 0),
+    ("password_min_length", 15),
+    ("password_min_length", 64),
 ]
 _SIGN_IN_FIELDS = {
     field for field, _ in _SIGN_IN_OFF_VALUES + _LOOSER_THAN_DEFAULT + _STRICTER_OR_DEFAULT
@@ -664,6 +681,218 @@ def test_the_temporary_password_direction_is_the_consumers(
     later one for a longer life. The method reads only its settings, so a stand-in carries them."""
     holder = SimpleNamespace(_settings=AuthSettings(initial_password_expiry_hours=hours))
     assert AuthService.initial_credential_deadline(holder, 0.0) == deadline  # type: ignore[arg-type]
+
+
+# --- vault BACKLOG #2600 step 4, the remaining numeric [auth] knobs ------------------------------
+
+
+@pytest.mark.parametrize("field", ["mfa_recovery_code_count", "password_min_length"])
+def test_the_secret_named_entries_never_quote_the_configured_value(field: str) -> None:
+    """``mfa_*`` and ``*password*`` read as secret sources to the clear-text-logging query, and the
+    entry reaches a log line and stdout, so its text is a literal: two loose values, one text."""
+    loose = (37, 41) if field == "mfa_recovery_code_count" else (7, 3)
+    first = _risk(AuthSettings(**{field: loose[0]}), field)  # type: ignore[arg-type]
+    assert first is not None
+    assert first == _risk(AuthSettings(**{field: loose[1]}), field)  # type: ignore[arg-type]
+    assert str(loose[0]) not in first and str(loose[1]) not in first
+
+
+#: ([security] switch, the [auth] field it desugars into, a longer value). The relocated [auth]
+#: spellings are refused at load, so each entry carries the [security] name an operator sets.
+_SESSION_LIMITS = [
+    ("sign_out_after_idle_minutes", "session_idle_timeout_minutes", 31),
+    ("max_session_hours", "session_absolute_hours", 13),
+]
+
+
+@pytest.mark.parametrize(("switch", "field", "longer"), _SESSION_LIMITS)
+def test_a_session_limit_above_its_default_is_named_under_its_security_name(
+    switch: str, field: str, longer: int
+) -> None:
+    """Named alone, under the [security] name, with the value and the default. At or below the
+    default, or at 0 or less (a session that dies at once), it is not named."""
+    risks = dict(_pairs(auth=AuthSettings(**{field: longer})))  # type: ignore[arg-type]
+    assert list(risks) == [switch]
+    assert f"is {longer}" in risks[switch]
+    assert "above the default of" in risks[switch]
+    default = AuthSettings.model_fields[field].default
+    for value in (default, default - 1, 0, -1):
+        assert _names(auth=AuthSettings(**{field: value})) == []  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(("switch", "field", "longer"), _SESSION_LIMITS)
+def test_a_session_limit_set_in_security_reaches_the_registry(
+    tmp_path: Path, switch: str, field: str, longer: int
+) -> None:
+    """The loaded path: the operator sets the [security] key, the desugar copies it into [auth], and
+    the registry names it."""
+    settings = _load(tmp_path, f"[security]\n{switch} = {longer}\n")
+    assert getattr(settings.auth, field) == longer
+    assert switch in _names(sec=settings.security, auth=settings.auth)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "named"),
+    [
+        ("ad_session_recheck_seconds", 300, False),
+        ("ad_session_recheck_seconds", 60, False),
+        ("ad_session_recheck_seconds", 301, True),
+        ("ad_session_recheck_seconds", 86_400, True),
+        ("ad_session_recheck_strikes", 2, False),
+        ("ad_session_recheck_strikes", 1, False),
+        ("ad_session_recheck_strikes", 3, True),
+        ("ad_session_recheck_strikes", 10, True),  # the load refuses anything above
+        ("ad_session_recheck_max_users", 200, False),
+        ("ad_session_recheck_max_users", 10_000, False),
+        ("ad_session_recheck_max_users", 199, True),
+        ("ad_session_recheck_max_users", 6, True),
+        ("ad_session_revoke_max", 5, False),
+        ("ad_session_revoke_max", 0, False),
+        ("ad_session_revoke_max", 6, True),
+        ("ad_session_revoke_max", 150, True),
+        ("ad_session_revoke_max_fraction", 0.34, False),
+        ("ad_session_revoke_max_fraction", 0.01, False),
+        ("ad_session_revoke_max_fraction", 0.35, True),
+        ("ad_session_revoke_max_fraction", 0.99, True),  # the load refuses 1.0 while it runs
+    ],
+)
+def test_a_reconciler_knob_is_named_only_in_its_looser_direction(
+    field: str, value: float, named: bool
+) -> None:
+    """Each is named alone, while the reconciler runs (AD on, a non-zero interval)."""
+    assert _names(auth=_ad(**{field: value})) == ([field] if named else [])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ad_session_recheck_strikes", 10),
+        ("ad_session_recheck_max_users", 6),
+        ("ad_session_revoke_max", 150),
+        ("ad_session_revoke_max_fraction", 0.99),
+    ],
+)
+def test_a_reconciler_knob_is_not_named_while_no_reconciler_runs(field: str, value: float) -> None:
+    """With AD off nothing reads them, and with the interval at 0 only that off entry is named. The
+    last line is the control that the same value fires once the reconciler runs."""
+    assert _names(auth=AuthSettings(**{field: value})) == []  # type: ignore[arg-type]
+    off = _ad(ad_session_recheck_seconds=0, **{field: value})
+    assert _names(auth=off) == ["ad_session_recheck_seconds"]
+    assert _names(auth=_ad(**{field: value})) == [field]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "named"),
+    [
+        ("oidc_clock_skew_seconds", 60, False),
+        ("oidc_clock_skew_seconds", 0, False),
+        ("oidc_clock_skew_seconds", 61, True),
+        ("oidc_clock_skew_seconds", 300, True),  # the load refuses anything above
+        ("oidc_jwks_ttl_seconds", 3600, False),
+        ("oidc_jwks_ttl_seconds", 0, False),
+        ("oidc_jwks_ttl_seconds", 3601, True),
+        ("oidc_jwks_ttl_seconds", 10_000_000, True),
+        ("oidc_jwks_min_refetch_seconds", 300, False),
+        ("oidc_jwks_min_refetch_seconds", 3600, False),  # no longer than the default TTL
+        ("oidc_jwks_min_refetch_seconds", 299, True),
+        ("oidc_jwks_min_refetch_seconds", 0, True),  # no amplification bound at all
+        ("oidc_jwks_min_refetch_seconds", -1, True),
+        ("oidc_jwks_min_refetch_seconds", 3601, True),  # a withdrawn key verifies longer
+        ("oidc_flow_ttl_seconds", 300, False),
+        ("oidc_flow_ttl_seconds", 30, False),
+        ("oidc_flow_ttl_seconds", 301, True),
+        ("oidc_flow_ttl_seconds", 1800, True),  # the load refuses anything above
+        ("oidc_max_age_seconds", 43_200, False),
+        ("oidc_max_age_seconds", 300, False),
+        ("oidc_max_age_seconds", 43_201, True),
+        ("oidc_max_age_seconds", 86_400, True),  # the load refuses anything above
+        # Only ever lowers a session's end below what the token and the absolute cap allow.
+        ("oidc_session_max_hours", None, False),
+        ("oidc_session_max_hours", 0, False),
+        ("oidc_session_max_hours", 1, False),
+        ("oidc_session_max_hours", 1000, False),
+        ("oidc_session_max_hours", -1, False),
+    ],
+)
+def test_an_oidc_knob_is_named_only_in_its_looser_direction(
+    field: str, value: int | None, named: bool
+) -> None:
+    """Each is named alone, while OIDC is on."""
+    assert _names(auth=_oidc(**{field: value})) == ([field] if named else [])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("oidc_clock_skew_seconds", 300),
+        ("oidc_jwks_ttl_seconds", 10_000_000),
+        ("oidc_jwks_min_refetch_seconds", 0),
+        ("oidc_flow_ttl_seconds", 1800),
+        ("oidc_max_age_seconds", 86_400),
+    ],
+)
+def test_an_oidc_knob_is_not_named_without_oidc(field: str, value: int) -> None:
+    """Nothing reads them with OIDC off. The second line is the control."""
+    assert _names(auth=AuthSettings(**{field: value})) == []  # type: ignore[arg-type]
+    assert _names(auth=_oidc(**{field: value})) == [field]
+
+
+def test_the_two_jwks_refetch_entries_say_which_way_they_loosen() -> None:
+    """One field, two directions, and the text tells them apart."""
+    field = "oidc_jwks_min_refetch_seconds"
+    off = _risk(_oidc(**{field: 0}), field)
+    fast = _risk(_oidc(**{field: 30}), field)
+    slow = _risk(_oidc(**{field: 7200}), field)
+    assert off is not None and fast is not None and slow is not None
+    assert "no least time" in off
+    assert "30 s, shorter than the default of 300 s" in fast
+    assert "7200 s, longer than the default JWKS lifetime of 3600 s" in slow
+    assert "withdrew" in slow
+
+
+def test_the_breaker_direction_is_the_consumers() -> None:
+    """The direction the reconciler entries rest on, read from ``breaker_tripped``: a higher cap or a
+    larger share lets a wave through that the default aborts."""
+    wave = {"revoke_count": 6, "probed": 10}
+    assert breaker_tripped(**wave, max_absolute=5, max_fraction=0.34)
+    assert not breaker_tripped(**wave, max_absolute=6, max_fraction=0.34)
+    assert not breaker_tripped(**wave, max_absolute=5, max_fraction=0.6)
+
+
+def _jwk(kid: str) -> dict[str, str]:
+    """A synthetic P-256 verification key as a JWK."""
+    numbers = ec.generate_private_key(ec.SECP256R1()).public_key().public_numbers()
+
+    def b64u(n: int) -> str:
+        return base64.urlsafe_b64encode(n.to_bytes(32, "big")).rstrip(b"=").decode("ascii")
+
+    return {"kty": "EC", "crv": "P-256", "kid": kid, "x": b64u(numbers.x), "y": b64u(numbers.y)}
+
+
+@pytest.mark.parametrize(
+    ("ttl", "min_refetch", "served"),
+    [(3600, 300, False), (60, 300, False), (60, 4000, True), (4000, 300, True)],
+)
+def test_the_jwks_direction_is_the_consumers(ttl: int, min_refetch: int, served: bool) -> None:
+    """``JwksCache`` keeps verifying with a key the IdP has withdrawn until both its TTL and its
+    refetch floor have passed since the last fetch, so either one past 3600 s keeps that key in use
+    longer than the defaults allow. Read at 3601 s."""
+    old, new = _jwk("old"), _jwk("new")
+    bodies = [{"keys": [old, new]}, {"keys": [new]}]  # the second fetch withdraws "old"
+    now = [0.0]
+    cache = JwksCache(
+        lambda: json.dumps(bodies.pop(0)).encode(),
+        ttl_seconds=ttl,
+        min_refetch_seconds=min_refetch,
+        clock=lambda: now[0],
+    )
+    cache.get_key("old")
+    now[0] = 3601.0
+    if served:
+        cache.get_key("old")
+    else:
+        with pytest.raises(JwksError):
+            cache.get_key("old")
 
 
 def test_the_near_off_values_the_vault_measured_are_named() -> None:
