@@ -1507,7 +1507,6 @@ class StageDispatcher:
         ``infra_fault_stop_after`` consecutive failures it raises one ``lane_stuck`` alert, since a
         held lane never reaches the ADR 0070 streak that would otherwise page it."""
         run = FailureRun()
-        warned = False
         while True:
             try:
                 await write()
@@ -1525,38 +1524,38 @@ class StageDispatcher:
                 if run.count == self._infra_fault_stop_after:
                     self._page_held_lane(lane, what, run.count)
             else:
-                if run.count:
-                    run.clear(
-                        log,
-                        "StageDispatcher %s lane %s: %s",
-                        self._stage.value,
-                        lane,
-                        what,
-                        level=logging.WARNING,
-                    )
+                run.clear(  # logs only after a failure
+                    log,
+                    "StageDispatcher %s lane %s: %s",
+                    self._stage.value,
+                    lane,
+                    what,
+                    level=logging.WARNING,
+                )
                 return True
-            delay = _capped_backoff(
-                _LANE_ERROR_BACKOFF_SECONDS, run.count - 1, _REPEND_RETRY_CAP_SECONDS
+            await self._sleep_or_stop(
+                _capped_backoff(
+                    _LANE_ERROR_BACKOFF_SECONDS, run.count - 1, _REPEND_RETRY_CAP_SECONDS
+                )
             )
-            while True:
-                await self._sleep_or_stop(delay)
+            if self._stop.is_set():
+                return False
+            if self._is_leader():
+                continue
+            # One WARNING per leadership loss; a loss after a regain in this retry warns again.
+            log.warning(
+                "StageDispatcher %s lane %s: %s failed %d time(s) and this node is not the "
+                "leader, so no retry is sent; the lane stays held with the rows in flight, "
+                "and the retry resumes only if this node leads again before it stops",
+                self._stage.value,
+                lane,
+                what,
+                run.count,
+            )
+            while not self._is_leader():
+                await self._sleep_or_stop(_LANE_ERROR_BACKOFF_SECONDS)
                 if self._stop.is_set():
                     return False
-                if self._is_leader():
-                    warned = False  # leading again: a second loss in this retry warns again
-                    break
-                delay = _LANE_ERROR_BACKOFF_SECONDS
-                if not warned:
-                    warned = True
-                    log.warning(
-                        "StageDispatcher %s lane %s: %s failed %d time(s) and this node is not the "
-                        "leader, so no retry is sent; the lane stays held with the rows in flight, "
-                        "and the retry resumes only if this node leads again before it stops",
-                        self._stage.value,
-                        lane,
-                        what,
-                        run.count,
-                    )
 
     async def _drain_lane(
         self, lane: str, items: list[OutboxItem]
@@ -1873,7 +1872,7 @@ class StageDispatcher:
 
     async def _sleep_or_stop(self, seconds: float) -> None:
         # A set stop is read first: with ``seconds`` 0, wait_for cancels the wait before it runs and
-        # raises TimeoutError even on a set Event (see RegistryRunner._stop_or_sleep).
+        # raises TimeoutError even on a set Event, so it would wait instead of reading the stop.
         if self._stop.is_set():
             return
         try:  # noqa: SIM105

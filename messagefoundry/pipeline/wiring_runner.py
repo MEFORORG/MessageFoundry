@@ -8095,9 +8095,13 @@ class RegistryRunner:
         if not ids:
             return False
         rows = list(ids)
-        log_to = faults if faults is not None else _WorkerFaultLog(worker, name)
+        # Without a worker's `faults` (#1844), this call logs on its own backoff and closes it.
+        own = FailureRun()
         failures = 0
-        warned = False
+        message = (
+            "%s worker %r: reschedule_claimed failed for %d claimed row(s); holding the lane "
+            "and retrying, so no later row overtakes them"
+        )
         while True:
             try:
                 await self.store.reschedule_claimed(
@@ -8105,49 +8109,40 @@ class RegistryRunner:
                 )
             except Exception as exc:  # noqa: BLE001 — retried while holding the lane; see the docstring
                 failures += 1
-                log_to.repend_failed(
-                    exc,
-                    "%s worker %r: reschedule_claimed failed for %d claimed row(s); holding the lane "
-                    "and retrying, so no later row overtakes them",
-                    worker,
-                    name,
-                    len(rows),
-                )
+                if faults is not None:
+                    faults.repend_failed(exc, message, worker, name, len(rows))
+                else:
+                    own = own.record(
+                        log, exc, message, worker, name, len(rows), level=logging.WARNING
+                    )
             else:
-                # A worker's own `faults` closes the re-pend run on quiet, with its main run
-                # (#1844); a log made for this call alone is never closed, so it says so here.
-                if failures and faults is None:
-                    log.warning(
-                        "%s worker %r: reschedule_claimed landed for %d claimed row(s) after %d "
-                        "failed attempt(s); the lane resumes",
-                        worker,
-                        name,
-                        len(rows),
-                        failures,
-                    )
+                # A worker's own `faults` closes the re-pend run on quiet, with its main run.
+                own.clear(
+                    log, "%s worker %r: reschedule_claimed", worker, name, level=logging.WARNING
+                )
                 return False
-            delay = _capped_backoff(
-                _WORKER_ERROR_BACKOFF_SECONDS, failures - 1, _REPEND_RETRY_CAP_SECONDS
+            if await self._stop_or_sleep(
+                _capped_backoff(
+                    _WORKER_ERROR_BACKOFF_SECONDS, failures - 1, _REPEND_RETRY_CAP_SECONDS
+                )
+            ):
+                return True
+            if self._coordinator.is_leader():
+                continue
+            # One WARNING per leadership loss; a loss after a regain in this retry warns again.
+            log.warning(
+                "%s worker %r: reschedule_claimed failed %d time(s) for %d claimed row(s) "
+                "and this node is not the leader, so no retry is sent; the lane stays held "
+                "with the rows in flight, and the retry resumes only if this node leads "
+                "again before it stops",
+                worker,
+                name,
+                failures,
+                len(rows),
             )
-            while True:
-                if await self._stop_or_sleep(delay):
+            while not self._coordinator.is_leader():
+                if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return True
-                if self._coordinator.is_leader():
-                    warned = False  # leading again: a second loss in this retry warns again
-                    break
-                delay = _WORKER_ERROR_BACKOFF_SECONDS
-                if not warned:
-                    warned = True
-                    log.warning(
-                        "%s worker %r: reschedule_claimed failed %d time(s) for %d claimed row(s) "
-                        "and this node is not the leader, so no retry is sent; the lane stays held "
-                        "with the rows in flight, and the retry resumes only if this node leads "
-                        "again before it stops",
-                        worker,
-                        name,
-                        failures,
-                        len(rows),
-                    )
 
     async def _release_tail_on_stop(self, worker: str, name: str, ids: Sequence[str]) -> None:
         """Best-effort release of the batch tail a per-lane worker still holds when it RETURNS on a
