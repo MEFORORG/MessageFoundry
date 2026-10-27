@@ -2208,11 +2208,25 @@ each one in a row labelled `held-crl:` and the CA file's path. The reload does n
 file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. A start does
 not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It applies a CRL setting's
 start rules, with no clock skew, and checks each CRL's signature against the CA the file lists for
-its issuer. If the new CRL is expired, not yet in effect, a delta CRL, unreadable, or badly signed,
-`detail` says to fix it in the CA file before restarting. Put a CRL in
-the hop's CRL setting instead to have it applied without a restart. The listeners, OIDC and AD load
-only the certificates from their CA files, so a CRL there is ignored, as the CA file rows above say.
-The PostgreSQL store's `[store].ssl_root_cert` is not watched this way: it records no held copy.
+its issuer. In at least these cases `detail` says to fix the CRL in the CA file before restarting.
+The CRL is expired, not yet in effect, a delta CRL, unreadable, or proven badly signed. For a CRL
+not yet in effect, `detail` offers a wait too. The hop's copy of that issuer's CRL may lapse before
+the new one takes effect. Then waiting refuses that issuer's peers in between, so replace the CRL
+instead. For a proven bad signature it says what a start says of a CRL setting: a handshake
+OpenSSL judges by that CRL fails. The engine may still be unable to confirm the signature, short
+of that proof. Then `detail` asks you to check the CRL, and claims no failure. The start's WARNING
+cases above say why (BACKLOG #3512). Where only CA files load it, `detail` then says to restart.
+Where a CRL setting names it too, as `[store].ssl_crl_file` can, the check comes before the
+restart. A start judges that setting. A hop may still hold a stale copy through a CRL setting.
+Only then does the restart wait for the reload's verdict. So after the CA-file step, `detail` says
+to restart once the reload has applied the file. Or it gives a refused reload's remedy and reason.
+The CA-file hop's restart follows, unless that remedy is itself a restart of the engine. The scan
+may log a WARNING that it could not check the signature of a later CRL in the CA file. It does so
+only after a CRL that `detail` would ask you to check. Then `detail` does not ask for a check: it
+says to replace the CRL before restarting. Put a CRL in the hop's CRL setting instead to have it
+applied without a restart. The listeners, OIDC and AD load only the certificates from their CA
+files, so a CRL there is ignored, as the CA file rows above say. The PostgreSQL store's
+`[store].ssl_root_cert` is not watched this way: it records no held copy.
 
 At least two cases still need a restart: a CRL inside a CA file, and a replacement refused under rule
 3. A hop may hold a CRL from a path no setting above names, such as an inbound `tls_crl_file` given

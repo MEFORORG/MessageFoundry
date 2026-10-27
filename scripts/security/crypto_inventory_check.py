@@ -444,7 +444,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # it as a start judges a CRL setting (tls_policy.judge_crl_bytes, which reads the CRL fields). It
     # loads those bytes into a scratch context (tls_policy.crl_scratch_context) to read the CA
     # certificates OpenSSL takes from them, and checks each CRL's signature against those through
-    # pki.crl_signature_refusal (a public-key verify). The scratch context is discarded: it serves no
+    # pki.judge_crl_signatures (a public-key verify), which tells a signature proven bad from one
+    # it could not confirm (BACKLOG #3512). The scratch context is discarded: it serves no
     # handshake and changes no hop's trust.
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
         {"messagefoundry.config.tls_policy", "ssl"}
@@ -1316,8 +1317,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
-    # BACKLOG #3176: the expiry scan's CA-file CRL check calls pki.crl_signature_refusal itself, when
-    # a pass finds a hop holding an older copy of a CA file; the INVENTORY row above says the rest.
+    # BACKLOG #3176: the expiry scan's CA-file CRL check calls pki.judge_crl_signatures itself
+    # (BACKLOG #3512), when a pass finds a hop holding a copy of a CA file that differs from the
+    # file; the INVENTORY row above says the rest.
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
         {
             "sign_verify:via messagefoundry.pki",

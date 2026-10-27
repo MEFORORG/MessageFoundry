@@ -950,6 +950,15 @@ def test_a_reload_applies_a_replacement_whose_issuer_differs_only_in_ascii_case(
     assert _accepts(hop, pki.server()) is not applies
 
 
+def _judge_ca_file(pem: bytes) -> tuple[str, str] | None:
+    """The expiry monitor's CA-file check of ``pem``, for a CA-file-only row (BACKLOG #3512)."""
+    return _ca_file_crl_refusal(pem, time.time(), None, ca_file_only=True, on_unchecked=_no_log)
+
+
+def _no_log() -> None:
+    """The expiry monitor's log of a later CRL it could not check, which these tests ignore."""
+
+
 def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_restarts(
     pki: _Pki,
 ) -> None:
@@ -957,9 +966,9 @@ def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_re
     so a restart into this CA file is not refused. The control is a future CRL from another name."""
     current = pki.crl.read_bytes()
     future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_in_other_case(pki))
-    assert _ca_file_crl_refusal(pki.ca_pem + current + future, time.time(), None) is None
+    assert _judge_ca_file(pki.ca_pem + current + future) is None
     stray = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_OTHER_CA)
-    refusal = _ca_file_crl_refusal(pki.ca_pem + current + stray, time.time(), None)
+    refusal = _judge_ca_file(pki.ca_pem + current + stray)
     assert refusal is not None and "not yet in effect" in refusal[0], refusal
 
 
