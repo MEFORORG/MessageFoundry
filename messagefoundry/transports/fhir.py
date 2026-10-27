@@ -944,9 +944,7 @@ class FhirDestination(DestinationConnector):
             scheme,
             self._headers,
             self.base_url,
-            attested=attested,
-            cleartext_accepted=accepted,
-            cleartext_reason=accept_reason,
+            credentials=http_credentials_sent(ConnectorType.FHIR, s, cleartext=True),
             connection=config.name,
         )
         # ASVS 12.2.1: the FHIR resource/Bundle body is PHI, so a cleartext http egress to a
@@ -986,9 +984,7 @@ class FhirDestination(DestinationConnector):
                 scheme,
                 {**self._headers, "Authorization": "Bearer"},
                 self.base_url,
-                attested=attested,
-                cleartext_accepted=accepted,
-                cleartext_reason=accept_reason,
+                credentials=(),
                 connection=config.name,
             )
 
@@ -1730,9 +1726,9 @@ class FhirLookupExecutor:
                 scheme,
                 check_headers,
                 url,
-                attested=attested,
-                cleartext_accepted=lk_accepted,
-                cleartext_reason=lk_reason,
+                credentials=http_credentials_sent(
+                    ConnectorType.FHIR, s, lookup=True, cleartext=True
+                ),
                 connection=label,
             )
             # ASVS 12.2.1: a cleartext read pulls the PHI resource/searchset back over the wire, so a

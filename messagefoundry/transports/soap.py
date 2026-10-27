@@ -408,9 +408,7 @@ class SoapDestination(DestinationConnector):
             scheme,
             self._headers,
             self.url,
-            attested=attested,
-            cleartext_accepted=accepted,
-            cleartext_reason=accept_reason,
+            credentials=http_credentials_sent(ConnectorType.SOAP, s, cleartext=True),
             connection=config.name,
         )
         # ASVS 12.2.1: the SOAP envelope body is PHI, so a cleartext http egress to a non-loopback
@@ -499,9 +497,7 @@ class SoapDestination(DestinationConnector):
                 scheme,
                 {**self._headers, "Authorization": "Bearer"},
                 self.url,
-                attested=attested,
-                cleartext_accepted=accepted,
-                cleartext_reason=accept_reason,
+                credentials=(),
                 connection=config.name,
             )
         digest = digest_handler_from_settings(s, url=self.url)
@@ -597,15 +593,12 @@ class SoapDestination(DestinationConnector):
                 )
             pairs.append((str(token), secret))
         # A body-carried credential over a cleartext http hop is a plaintext-credential egress, exactly
-        # like the WS-Security UsernameToken — refuse it under the same posture gate (loopback / attested
-        # stay allowed, byte-identical).
+        # like the WS-Security UsernameToken, so it takes the same rule: only a loopback host lets it
+        # cross (vault BACKLOG #3533 item 4).
         refuse_cleartext_credential_hop(
             scheme,
             self.url,
             credential="SOAP body secret",
-            attested=attested,
-            cleartext_accepted=self._cleartext_accepted,
-            cleartext_reason=self._cleartext_reason,
             connection=self._connection_name,
         )
         return tuple(pairs)
@@ -683,17 +676,14 @@ class SoapDestination(DestinationConnector):
             raise ValueError("SOAP ws_password_type must be 'text' (ADR 0015, BACKLOG #1171)")
         if self._ws_mode and self.version != "1.2":
             raise ValueError("SOAP ws_addressing/ws_security require soap_version='1.2' (ADR 0015)")
-        # A UsernameToken password over cleartext http is a credential on the wire — refuse like the
-        # Authorization-header path, now posture-keyed (#200): a production-PHI hop REFUSES (escape
-        # inert), a non-prod PHI hop refuses unless the clamped escape / a per-hop attestation permits.
+        # A UsernameToken password over cleartext http is a credential on the wire, refused like the
+        # header credentials: only a loopback host lets it cross, never a declaration or the escape
+        # (vault BACKLOG #3533 item 4).
         if self.ws_username:
             refuse_cleartext_credential_hop(
                 scheme,
                 self.url,
                 credential="WS-Security UsernameToken credential",
-                attested=attested,
-                cleartext_accepted=self._cleartext_accepted,
-                cleartext_reason=self._cleartext_reason,
                 connection=self._connection_name,
             )
 

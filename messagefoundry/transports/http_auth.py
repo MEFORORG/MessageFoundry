@@ -157,9 +157,8 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
         # the resolved settings exactly as the SMART sibling reads it. DISTINCT from `attested` above.
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
-        # ADR 0153: the same per-connection cleartext declaration the delivery hop carries. Without it
-        # the token-endpoint hop would refuse a connection whose delivery hop was declared, leaving the
-        # operator no honest way to describe a legacy peer.
+        # Inert on this hop since vault BACKLOG #3533 item 4, with `attested` above: no declaration
+        # lets the token request cross cleartext http off-box. Kept so the callers' keywords hold.
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
         connection: str | None = None,
@@ -180,9 +179,6 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
     ) -> None:
         scheme = self._check_token_url(
             token_url,
-            attested=attested,
-            cleartext_accepted=cleartext_accepted,
-            cleartext_reason=cleartext_reason,
             connection=connection,
         )
         if not client_id:
@@ -351,42 +347,32 @@ def digest_handler_from_settings(
     byte-identical. The connector folds the returned handler into its per-connection opener; urllib then
     answers the endpoint's ``401`` Digest challenge and retries within one ``opener.open()``.
 
-    Refuses to run over cleartext ``http`` (the digest response is a credential) via the SAME
-    posture-keyed authority the REST/SOAP/FHIR delivery cells use (#200, ADR 0092): a production-PHI hop
-    is REFUSED even with the global escape set (inert for prod-PHI), while a non-prod / non-PHI /
-    per-hop-attested / loopback hop decides exactly as the delivery cells do. A missing user/password is a
-    loud :class:`HttpAuthError` (fail-closed, never a silent no-auth request)."""
+    Refuses to run over cleartext ``http`` to an off-box host (the digest response is a credential),
+    through the rule the delivery cells' credentials share (``refuse_cleartext_credential_hop``): only
+    a loopback host lifts it, never ``tls_hop_attested`` or ``cleartext_accepted`` (vault BACKLOG #3533
+    item 4). A missing user/password is a loud :class:`HttpAuthError` (fail-closed, never a silent
+    no-auth request)."""
     if str(s.get("http_auth") or "").lower() != "digest":
         return None
     scheme = urllib.parse.urlsplit(url).scheme.lower()
-    # The digest response is a credential — refuse the cleartext hop through the ONE posture-keyed
-    # authority (``refuse_cleartext_credential_hop``) instead of the blunt global escape, so prod-PHI is
-    # refused even with the escape set (matching the delivery cells). ``url`` is the delivery URL (same
-    # host as the delivery hop), so the connection's ``tls_hop_attested`` applies directly. It raises
-    # ``InsecureHopRefused`` on REFUSE; re-raise as ``HttpAuthError`` to keep this seam's error contract
-    # (both are ``ValueError``s → the loader surfaces either identically). Runs at connector construction
-    # under the gate's stamped posture (fail-closing to prod-PHI when unstamped).
-    # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings by
-    # the runner's _dest_config for exactly this kind of settings-driven seam. A non-bool flag raises
-    # HttpAuthError naming the connection, inside this seam's contract (vault BACKLOG #2232).
-    attested, (accepted, accept_reason, accept_conn), _ = hop_declarations_from_settings(
-        s, HttpAuthError
-    )
+    # The digest response is a credential, so an off-box cleartext hop is refused with no escape
+    # (``refuse_cleartext_credential_hop``, vault BACKLOG #3533 item 4). It raises
+    # ``InsecureHopRefused``; re-raise as ``HttpAuthError`` to keep this seam's error contract (both are
+    # ``ValueError``s, so the loader surfaces either identically). The declarations are still read
+    # strictly: a non-bool flag raises HttpAuthError naming the connection (vault BACKLOG #2232), and
+    # the mirrored connection name heads the refusal.
+    _, (_, _, accept_conn), _ = hop_declarations_from_settings(s, HttpAuthError)
     try:
         refuse_cleartext_credential_hop(
             scheme,
             url,
             credential="digest credential",
-            attested=attested,
-            cleartext_accepted=accepted,
-            cleartext_reason=accept_reason,
             connection=accept_conn,
         )
     except InsecureHopRefused as exc:
         raise HttpAuthError(
             f"{hop_name_prefix(accept_conn)}HTTP Digest over cleartext http would expose the digest "
-            "credential; refused by the "
-            f"instance security posture ({CREDENTIAL_HOP_WAYS_ACROSS})"
+            f"credential; refused ({CREDENTIAL_HOP_WAYS_ACROSS})"
         ) from exc
     user = str(s.get("http_auth_user") or "")
     password = str(s.get("http_auth_password") or "")
@@ -501,8 +487,8 @@ def with_http_digest(
         ))
 
     ``user`` / ``password`` may be :func:`~messagefoundry.config.wiring.env` references. Mutually exclusive
-    with a bearer provider (SMART / OAuth2-CC); refused over cleartext ``http`` by the instance security
-    posture (a production-PHI hop cannot be escaped — #200). Mutates ``spec`` in place and returns it."""
+    with a bearer provider (SMART / OAuth2-CC); refused over cleartext ``http`` to a host off this
+    machine, with no escape (vault BACKLOG #3533 item 4). Mutates ``spec`` in place and returns it."""
     _require_http_spec(spec, "HTTP Digest")
     spec.settings.update(
         {"http_auth": "digest", "http_auth_user": user, "http_auth_password": password}

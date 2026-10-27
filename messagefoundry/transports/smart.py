@@ -275,9 +275,6 @@ class _TokenEndpointProvider(abc.ABC):
         self,
         token_url: str,
         *,
-        attested: bool,
-        cleartext_accepted: bool,
-        cleartext_reason: str | None,
         connection: str | None,
     ) -> str:
         """Validate the token URL and refuse a cleartext hop; return its lower-cased scheme."""
@@ -289,29 +286,24 @@ class _TokenEndpointProvider(abc.ABC):
         refuse_url_credentials(
             token_url, self._URL_SETTING, use=self._CREDENTIAL_SETTINGS, error=self._ERROR
         )
-        # The token POST carries a credential, so this hop goes through the ONE posture-keyed
-        # authority the REST/SOAP/FHIR delivery cells consume (#200, ADR 0092). A production-PHI
-        # hop is refused whatever the process environment says, while a non-prod, non-PHI,
-        # per-hop-attested, declared (ADR 0153) or loopback hop decides as the delivery cells do.
-        # The posture is the one the construction gate stamped, fail-closing to production-PHI
-        # when unstamped. InsecureHopRefused is re-raised as the provider's own error to keep each seam's contract;
-        # both are ValueError subclasses, so the loader surfaces either identically. The message
-        # never carries the credential.
+        # The token POST carries a credential, so an off-box cleartext hop is refused with no
+        # escape, as the delivery cells' credentials are (vault BACKLOG #3533 item 4): neither
+        # tls_hop_attested nor cleartext_accepted lifts it, only a loopback host. InsecureHopRefused
+        # is re-raised as the provider's own error to keep each seam's contract; both are ValueError
+        # subclasses, so the loader surfaces either identically. The message never carries the
+        # credential.
         try:
             refuse_cleartext_credential_hop(
                 scheme,
                 token_url,
                 credential=f"{self._LABEL} {self._CREDENTIAL_NAME}",
-                attested=attested,
-                cleartext_accepted=cleartext_accepted,
-                cleartext_reason=cleartext_reason,
                 connection=connection,
             )
         except InsecureHopRefused as exc:
             raise self._ERROR(
                 f"{hop_name_prefix(connection)}{self._LABEL} token endpoint over cleartext http "
                 "would expose the "
-                f"{self._CREDENTIAL_NAME}; refused by the instance security posture ({CREDENTIAL_HOP_WAYS_ACROSS})"
+                f"{self._CREDENTIAL_NAME}; refused ({CREDENTIAL_HOP_WAYS_ACROSS})"
             ) from exc
         return scheme
 
@@ -491,6 +483,8 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
         # the connection's top-level declaration and its mandatory reason (ADR 0173).
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
+        # Inert on this hop since vault BACKLOG #3533 item 4, with `attested` above: no declaration
+        # lets the token request cross cleartext http off-box. Kept so the callers' keywords hold.
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
         connection: str | None = None,
@@ -516,9 +510,6 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
     ) -> None:
         scheme = self._check_token_url(
             token_url,
-            attested=attested,
-            cleartext_accepted=cleartext_accepted,
-            cleartext_reason=cleartext_reason,
             connection=connection,
         )
         if not client_id:

@@ -281,6 +281,8 @@ ALLOW` before delegating, and passes the clamped global escape as the new arm-3 
 declaration, so refusing them would create a deviation the loosening registry cannot express. Restated,
 not inherited: the scope limit is now a written decision at the one place it applies.
 
+**SUPERSEDED 2026-10-27 by owner ruling; see *Amendment 2026-10-27* at the end. Kept as written.**
+
 **3. `cleartext_accepted` reaches the CREDENTIAL hops as well as the body hops.** The ADR is silent, and
 putting a password on the wire is a materially worse claim than putting a body on it. It is threaded
 anyway — to HTTP Digest, the OAuth2 **and SMART** token endpoints, the forward-proxy credential and the
@@ -345,3 +347,37 @@ Three surfaces cannot see the whole set, and each SAYS so rather than reporting 
 `messagefoundry security show` and `GET /security/posture` on an engine with no loaded graph both emit a
 `loosenings_scope` marker; the `serve`-time loosening warning fires before the graph is loaded and says
 the construction gate reports them separately (it does, moments later, per connection).
+
+## Amendment 2026-10-27: no declaration carries a credential across cleartext http
+
+**Owner ruling 2026-10-26** (vault BACKLOG #3533 item 4). The batch 342 Manager asked the owner
+whether a credential should still cross a cleartext hop that `cleartext_accepted` or
+`tls_hop_attested` lets through. The answer was "Refuse; amend ADR 0153 (Recommended)". This
+amends **build note 3** above, which stays as written so the earlier reasoning remains visible.
+
+**What changed.** An HTTP-family credential over plain `http` to a host off this machine is now
+refused with no escape. Neither declaration lifts it, nor does the posture. A loopback host still
+does, because that hop never leaves the machine. The rule covers the credentials of `Rest()`,
+`Soap()`, `FHIR()`, `DICOMweb()` and `FhirLookup()`, a SOAP WS-Security UsernameToken or body
+secret, an HTTP Digest login, and the OAuth2 and SMART token requests. One function decides it,
+`transports/rest.py` `refuse_cleartext_credential_hop`, and `refuse_cleartext_credentials` wraps it.
+
+**What counts as a credential.** The old test keyed on a header named exactly `Authorization`,
+with that letter case. So a static API-key header, or `authorization` in lower case, did not count.
+The test now counts what the `verify_tls = false` refusal counts (`http_credentials_sent`): every
+auth setting, a static header the redaction screen would mask, a static header whose name is off
+the verify-off allowlist in any letter case, and a credential-looking query parameter.
+
+**What did not change.** `cleartext_accepted` still carries a body with no credential across, with
+the WARN and the audit record decision 2 describes. That was the case decision 2 was written for.
+
+**Why build note 3's argument no longer holds.** It said that refusing a credential would push an
+operator with a legacy Basic-auth peer into writing a false `tls_hop_attested`. The attestation no
+longer lifts the refusal either, so a false one gains nothing. The engine's side of the hop has to
+be `https`. A peer that cannot speak TLS is reached through a TLS-terminating proxy in front of it.
+
+**Not covered: the forward-proxy login.** The question the owner answered named the destination's
+credentials. A `proxy_user` login rides the leg to the proxy, which the engine judges as cleartext
+whatever the proxy's scheme (vault BACKLOG #3416). Applying the ruling there would refuse every
+authenticated proxy off this machine, so this build leaves that leg judged by the declarations as
+before. `docs/SECURITY-LOOSENING.md` lists it among the hops the rule does not reach yet.

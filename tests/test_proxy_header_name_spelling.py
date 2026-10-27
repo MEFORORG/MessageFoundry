@@ -627,12 +627,21 @@ def test_control_a_direct_request_with_another_header_is_sent() -> None:
 # --- the report's shape: a connection with no proxy_user -----------------------------------------
 
 
-def _rest_with_static_header(name: str, proxy: _WireProxy, **extra: str) -> RestDestination:
+def _rest_with_static_header(
+    name: str,
+    proxy: _WireProxy,
+    *,
+    value: str = _VALUE,
+    url: str = _HTTP_TARGET,
+    **extra: str,
+) -> RestDestination:
     """A REST connection that sets one static header and names a cleartext proxy on the box. With
     no ``proxy_user`` in ``extra``, its proxy handler admits no caller-set header.
-    ``cleartext_accepted`` covers the ``http://`` destination hop."""
-    settings = Rest(url=_HTTP_TARGET).settings
-    settings.update({"proxy_url": f"http://{proxy.address}", "headers": {name: _VALUE}, **extra})
+    ``cleartext_accepted`` covers the ``http://`` destination hop. A credential in any other
+    header cannot cross that hop (vault BACKLOG #3533 item 4), so a control that needs one sends
+    it to ``https`` instead."""
+    settings = Rest(url=url).settings
+    settings.update({"proxy_url": f"http://{proxy.address}", "headers": {name: value}, **extra})
     with active_hop_posture(HopPosture(enforcing=True)):
         dest = build_destination(
             Destination(
@@ -697,7 +706,11 @@ def test_a_static_proxy_header_beside_proxy_user_is_refused_at_build_in_any_spel
 def test_control_another_static_header_beside_proxy_user_builds() -> None:
     with _WireProxy() as proxy:
         dest = _rest_with_static_header(
-            "X-Proxy-Authorization", proxy, proxy_user="u5er", proxy_password="pa55w0rd"
+            "X-Proxy-Authorization",
+            proxy,
+            url=_HTTPS_TARGET,
+            proxy_user="u5er",
+            proxy_password="pa55w0rd",
         )
     assert dest._headers["X-Proxy-Authorization"] == _VALUE
 
@@ -746,13 +759,15 @@ def test_control_a_rest_send_with_a_sendable_proxy_header_is_refused_and_retried
 
 def test_control_a_rest_send_with_another_static_header_reaches_the_proxy() -> None:
     """The same connection with a header the rule does not read. The fake proxy may hang up
-    before the body is sent, so the result is not read: what reached the socket is."""
+    before the body is sent, so the result is not read: what reached the socket is. The header
+    is on the allowlist and holds no credential, so the cleartext hop may carry it."""
     with _WireProxy() as proxy:
-        dest = _rest_with_static_header("X-Trace", proxy)
+        dest = _rest_with_static_header("X-Request-ID", proxy, value="t1")
         with contextlib.suppress(DeliveryError):
             asyncio.run(dest.send('{"a": 1}'))
     assert len(proxy.cleartext) == 1
-    assert f"X-Trace: {_VALUE}\r\n".encode() in proxy.cleartext[0]
+    # urllib capitalizes a header name as str.capitalize() does, so the wire spelling differs.
+    assert b"X-Request-Id: t1\r\n" in proxy.cleartext[0]
 
 
 # --- a bytes name ----------------------------------------------------------------------------------

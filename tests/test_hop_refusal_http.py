@@ -611,22 +611,83 @@ def test_soap_ws_username_cleartext_refused_on_prod(monkeypatch: pytest.MonkeyPa
         )
 
 
-def test_soap_ws_username_cleartext_attested_allowed_on_prod(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_soap_ws_username_cleartext_refused_whatever_the_declaration(
+    declared: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Vault BACKLOG #3533 item 4: no declaration lets a credential cross cleartext http off-box."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with (
+        active_hop_posture(_PROD),
+        pytest.raises(InsecureHopRefused, match="UsernameToken credential.*with no escape"),
+    ):
+        _build(
+            _CLEARTEXT["SOAP"],
+            **{declared: True},
+            soap_version="1.2",
+            ws_security=True,
+            ws_username="u",
+            ws_password="p",  # noqa: S106 — synthetic test credential, not a real secret
+        )
+
+
+# --- vault BACKLOG #3533 item 4: no declaration carries a credential across cleartext http ------
+#
+# Owner ruling 2026-10-26: a credential is refused across an off-box cleartext hop that
+# tls_hop_attested or cleartext_accepted would otherwise let through, and the credential test
+# counts what the verify_tls=false rule counts, header names in any case.
+
+#: Each a credential the cleartext rule must count. The last three are static headers the old
+#: test, which keyed on the exact name ``Authorization``, did not see.
+_ITEM4_CREDENTIALS: dict[str, dict[str, Any]] = {
+    "bearer token": {"bearer_token": "synthetic-token"},
+    "lower-case authorization header": {"headers": {"authorization": "Bearer synthetic-token"}},
+    "api-key header": {"headers": {"X-Api-Key": "synthetic-key"}},
+    "neutral header name": {"headers": {"X-Session": "s1"}},
+}
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+@pytest.mark.parametrize("credential", list(_ITEM4_CREDENTIALS))
+def test_a_declared_cleartext_hop_refuses_every_credential(
+    cell: str, declared: str, credential: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with (
+        active_hop_posture(_PROD),
+        pytest.raises(
+            InsecureHopRefused, match="HTTP cleartext credentials: .*with no escape"
+        ) as exc,
+    ):
+        _build(_CLEARTEXT[cell], **{declared: True}, **_ITEM4_CREDENTIALS[credential])
+    assert "connection 'OB'" in str(exc.value)
+    assert "synthetic" not in str(exc.value)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_control_a_declared_cleartext_hop_with_no_credential_still_crosses(
+    cell: str, declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal above is for the credential, not the declared hop: an allowlisted header with
+    a plain value still crosses, so the arm above cannot pass by refusing every declared hop."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_PROD):
         assert (
-            _build(
-                _CLEARTEXT["SOAP"],
-                attested=True,
-                soap_version="1.2",
-                ws_security=True,
-                ws_username="u",
-                ws_password="p",  # noqa: S106 — synthetic test credential, not a real secret
-            )
-            is not None
+            _build(_CLEARTEXT[cell], **{declared: True}, headers={"X-Request-ID": "r1"}) is not None
         )
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("credential", list(_ITEM4_CREDENTIALS))
+def test_control_a_loopback_cleartext_hop_still_carries_a_credential(
+    cell: str, credential: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On-box loopback stays the one way across, so a local test peer keeps working."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD):
+        assert _build(_LOOPBACK[cell], **_ITEM4_CREDENTIALS[credential]) is not None
 
 
 # --- the FhirLookup read path (a cleartext read pulls PHI back over the wire) -------------------------
@@ -790,12 +851,13 @@ def _cleartext_egress(scheme: str, url: str, **declared: Any) -> object:
 
 
 def _cleartext_credential(scheme: str, url: str, **declared: Any) -> object:
+    # No declaration reaches the credential rule (vault BACKLOG #3533 item 4), so it takes none.
+    del declared
     refuse_cleartext_credential_hop(
         scheme,
         url,
         credential="credential (Authorization header)",
         connection=None,
-        **declared,
     )
     return None
 

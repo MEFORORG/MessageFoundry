@@ -2472,9 +2472,12 @@ def revocation_hop_disposition(
 HOP_ATTESTATION_LEVER = "tls_hop_attested=true with a tls_hop_attested_reason"
 
 #: The remedy the credential-bearing token-endpoint refusals share (OAuth2, HTTP Digest, SMART).
+#: It offered the hop attestation and a ``cleartext_accepted`` declaration as well until vault
+#: BACKLOG #3533 item 4 (owner ruling 2026-10-26): neither lets a credential cross cleartext http
+#: off this machine now, so the refusal names the one lever that does.
 CREDENTIAL_HOP_WAYS_ACROSS = (
-    f"use https, attest the hop as secure with {HOP_ATTESTATION_LEVER}, "
-    "or declare cleartext_accepted with a cleartext_reason"
+    "use https; neither tls_hop_attested nor cleartext_accepted lets a credential cross "
+    "cleartext http off this machine"
 )
 
 

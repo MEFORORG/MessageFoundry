@@ -255,9 +255,7 @@ class DicomWebDestination(DestinationConnector):
             scheme,
             self._headers,
             self.base_url,
-            attested=attested,
-            cleartext_accepted=accepted,
-            cleartext_reason=accept_reason,
+            credentials=http_credentials_sent(ConnectorType.DICOMWEB, s, cleartext=True),
             connection=config.name,
         )
         # ASVS 12.2.1: the STOW-RS multipart body carries the DICOM object (PHI), so a cleartext http
