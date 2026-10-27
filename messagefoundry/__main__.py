@@ -2160,6 +2160,7 @@ def _start_logging(
     enforcing: bool,
     spool_dir: str,
     configure: Callable[[SyslogForward | None], bool],
+    deferred_ca_refusals: list[TrustAnchorError] | None = None,
 ) -> int | None:
     """Pass the off-box forwarding gates, then install this process's log handlers.
 
@@ -2168,7 +2169,10 @@ def _start_logging(
     refusal. It does not hold every gate that guards the collector: at least the static-credential
     and open-egress gates run in each caller before it, so a new one must be given to both.
     ``spool_dir`` is this process's own spool directory (:func:`_forward_spool_dir`); the spool
-    locks it.
+    locks it. The last gate checks the collector's CA as a trust anchor (BACKLOG #3470). A caller
+    that passes ``deferred_ca_refusals`` takes that refusal itself: it is appended there, and
+    logging is configured without the forwarder. ``serve`` does, so its audited preflight refuses
+    the start, with a row when it can read the file.
 
     ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
     passed (``None`` with no collector). It stays at the call site because level, format and the
@@ -2317,6 +2321,38 @@ def _start_logging(
             )
             return 2
 
+    # BACKLOG #3470: the collector's CA takes the trust-anchor checks before the forwarder loads
+    # it. In `serve` the audited preflight runs only in the API lifespan, after the forwarder has
+    # sent; `supervise` runs none. trust_anchors module item 10 says what a refusal does.
+    from messagefoundry.auth.trust_anchors import anchor_refusal, log_forward_anchor_spec
+
+    _forward_ca = log_forward_anchor_spec(settings.logging)
+    # Under `warn` the check warns rather than refuses. Its text quotes a configured path, so it is
+    # taken here and printed scrubbed, as the #2375 gate notes above are: no handler is installed
+    # yet, so a logged warning would reach bare stderr with any newline in the path intact.
+    _ca_notes: list[str] = []
+    _ca_refusal = (
+        anchor_refusal(_forward_ca, enforcing=enforcing, warn=_ca_notes.append)
+        if _forward_ca is not None
+        else None
+    )
+    for _ca_note in _ca_notes:
+        print(f"warning: {scrub_control_chars(_ca_note)}", file=sys.stderr)
+    if _ca_refusal is not None:
+        if deferred_ca_refusals is None:
+            # `supervise`: its process has no audited preflight, so it refuses here, before any
+            # engine shard spawns. Scrubbed: the refusal quotes a configured path, and a newline
+            # in it must not forge a line.
+            print(
+                f"error: {scrub_control_chars(str(_ca_refusal))}\nThe start is refused before the "
+                "log forwarder is built, so no record reached the collector.",
+                file=sys.stderr,
+            )
+            return 2
+        # `serve`: no forwarder, and the caller hands the refusal to its audited preflight.
+        deferred_ca_refusals.append(_ca_refusal)
+        log_forward = None
+
     try:
         forwarder_live = configure(log_forward)
     except OSError as exc:
@@ -2354,6 +2390,18 @@ def _start_logging(
     # handlers too. Each caller logs its #1989 static-credential lines next, for the same reason.
     for _gate_note in _gate_notes:
         logging.getLogger(__name__).warning("%s", _gate_note)
+    if deferred_ca_refusals is None:
+        # `supervise` only: its forwarder is up now, so the collector gets the record that this
+        # CA was trusted under `warn`. `serve`'s audited preflight logs the same warning again.
+        for _ca_note in _ca_notes:
+            logging.getLogger(__name__).warning("%s", _ca_note)
+    if _ca_refusal is not None:
+        logging.getLogger(__name__).warning(
+            "off-box log forwarding is off: the collector's CA was refused (%s). The start check "
+            "refuses the start once the store is open. trust_anchors module item 10 says when "
+            "that refusal has an audit row.",
+            _ca_refusal,
+        )
     if forwarder_live and log_forward is not None:
         # Only announce forwarding when configure_logging actually installed the handler. With the
         # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
@@ -2925,6 +2973,10 @@ def _serve(args: argparse.Namespace) -> int:
         if settings.logging.file is not None
         else None
     )
+    # BACKLOG #3470: a refused collector CA does not stop the start here. The forwarder is not
+    # built, and the API lifespan's audited preflight refuses the start. It writes its audit row
+    # when it can read the file.
+    _forward_ca_refusals: list[TrustAnchorError] = []
     _logging_refused = _start_logging(
         settings,
         env_name=env_name,
@@ -2937,6 +2989,7 @@ def _serve(args: argparse.Namespace) -> int:
             log_file=_log_file,
             stop_on_write_failure=settings.logging.on_write_failure is LogWriteFailurePolicy.STOP,
         ),
+        deferred_ca_refusals=_forward_ca_refusals,
     )
     if _logging_refused is not None:
         return _logging_refused
@@ -3379,6 +3432,40 @@ def _serve(args: argparse.Namespace) -> int:
                 "engine, this is expected; otherwise set [api].tls_cert_file + [api].tls_client_ca_file "
                 "so the engine itself requires and verifies the proxy's certificate. The declaration is "
                 "an attestation either way — the engine enforces nothing on this hop.",
+                file=sys.stderr,
+            )
+    elif settings.api.browser_tls_ends_at_proxy:
+        # --- vault BACKLOG #3538: a re-encrypting proxy owes the floor attestation too -----------
+        # `trusted_proxies` with no declared terminator. The loader admits that only with an operator
+        # tls_cert_file (BACKLOG #2055), so the proxy re-encrypts to the engine. The browser's TLS
+        # still ends at the proxy, and `[api].tls_min_version` governs only the proxy-to-engine hop,
+        # so the engine sees the browser-facing floor no better than behind a terminator. The batch
+        # 253 Manager decided, under the driver rule, that this shape owes the same attestation (vault
+        # PR 2404 comment 6152823165, #3475 question 1). That is a Manager decision, not an owner
+        # ruling on the substance. The split is the terminator gate's: refuse when enforcing and off
+        # loopback, warn otherwise.
+        #
+        # `proxy_intra_service_auth` stays terminator-only, because the decision covers the floor
+        # alone. It is not because the hop is TLS here: a terminator with an operator certificate
+        # has the same TLS hop and still owes it. Whether this shape should owe it too is open.
+        if not settings.api.proxy_tls_floor_declared:
+            if enforcing and not settings.api.is_loopback:
+                print(
+                    f"error: refusing to serve on a {'production ' if production else ''}PHI instance "
+                    f"({env_name!r}) behind a reverse proxy named in [api].trusted_proxies without "
+                    "[api].proxy_tls_min_version (attested proxy TLS floor). The browser's TLS ends "
+                    "at that proxy, so [api].tls_min_version governs only the proxy-to-engine hop "
+                    "and the engine cannot see the floor the proxy negotiates with browsers. Declare "
+                    "[api].proxy_tls_min_version (1.2/1.3) as the lowest version the proxy permits. "
+                    "See docs/CONFIGURATION.md, [api] (vault BACKLOG #3538).",
+                    file=sys.stderr,
+                )
+                return 2
+            print(
+                "warning: reverse proxy named in [api].trusted_proxies in a PHI-carrying environment "
+                f"({env_name!r}) without [api].proxy_tls_min_version. Declare it before exposure: "
+                "the browser's TLS ends at that proxy, and the engine cannot see its floor for "
+                "itself (attestation).",
                 file=sys.stderr,
             )
 
@@ -3900,7 +3987,7 @@ def _serve(args: argparse.Namespace) -> int:
     # rather than it being hidden. It is NOT the reason the answer is (a): the reason is that this is
     # the only end where the control measures its own posture instead of measuring whether someone
     # happened to configure an unrelated console setting.
-    if settings.api.tls_terminated_upstream and enforcing and not settings.api.public_origin:
+    if settings.api.browser_tls_ends_at_proxy and enforcing and not settings.api.public_origin:
         # THE REMEDIATION NAMES THE KEY THE LOADER ACCEPTS, NOT THE FIELD THIS CODE READS
         # (BACKLOG #1026). `[api].public_origin` is the INTERNAL field; ADR 0118 relocated the
         # operator-facing key to `[security].web_console_public_address` and REJECTS the old
@@ -3913,8 +4000,9 @@ def _serve(args: argparse.Namespace) -> int:
         # gate itself. tests/test_api_tls.py pins the remediation string AGAINST the relocation map
         # so the two cannot drift apart again.
         print(
-            f"error: refusing to serve on a PHI instance ({env_name!r}) behind a declared TLS "
-            "terminator under `enforce` without an external origin — the ASVS 12.1.1 TLS-floor "
+            f"error: refusing to serve on a PHI instance ({env_name!r}) behind a reverse proxy "
+            "([api].tls_terminated_upstream or [api].trusted_proxies) under `enforce` without an "
+            "external origin — the ASVS 12.1.1 TLS-floor "
             "probe dials that origin, so leaving it unset silently disables the check rather than "
             "failing it. Set [security].web_console_public_address to the origin the browser uses "
             '(e.g. "https://mefor.example.org"). See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.',
@@ -3922,8 +4010,9 @@ def _serve(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Scope is the posture the requirement is about: a declared terminator, PHI, and `enforce`. Every
-    # other posture never reaches here and is byte-identical.
+    # Scope is the posture the requirement is about: a reverse proxy ending the browser's TLS (a
+    # declared terminator, or since vault BACKLOG #3538 a re-encrypting proxy in `trusted_proxies`),
+    # PHI, and `enforce`. Every other posture never reaches here and is byte-identical.
     #
     # `public_origin` appears as a fourth condition and is NOT a fourth scope narrowing: the refusal
     # directly above guarantees it is set for exactly this posture, so the two agree by construction
@@ -3932,22 +4021,23 @@ def _serve(args: argparse.Namespace) -> int:
     # undocumented fourth was the whole defect -- a reader concluded the probe runs whenever a PHI
     # instance sits behind a declared terminator under `enforce`, and it did not.
     #
-    # NOT EVERY EXPOSED POSTURE IS PROBED (vault BACKLOG #3102). `instance_exposed` also counts a
+    # THE RE-ENCRYPTING PROXY IS PROBED TOO (vault BACKLOG #3538). `instance_exposed` also counts a
     # set `trusted_proxies` with no declared terminator (vault BACKLOG #2251): a proxy that
-    # re-encrypts to an operator certificate. This gate and the refusal above it read
-    # `tls_terminated_upstream`, not `instance_exposed`, so that shape is never probed and may leave
-    # `public_origin` unset. Two facts, and neither says the gap is safe:
+    # re-encrypts to an operator certificate. This gate read `tls_terminated_upstream` alone until
+    # #3538, so that shape was never probed and could leave `public_origin` unset. Vault BACKLOG #3102
+    # item 9 raised it. The batch 253 Manager decided, under the driver rule, that the probe covers it
+    # (#3475 question 1); that is a Manager decision, not an owner ruling on the substance. Two facts:
     #  1. On the hop the engine serves there, its own listener enforces the floor: api/tls.py sets
-    #     `minimum_version` from `[api].tls_min_version`, which the loader holds to 1.2 or 1.3.
-    #  2. The browser's hop still ends at the proxy, as it does behind a terminator. Nothing at
-    #     start measures that proxy's floor, and that shape owes no attestation of it either:
-    #     the only gate that asks for `proxy_tls_min_version` is the terminator gate.
-    # Widening this gate is a new control: it would add a start refusal for an unset origin on this
-    # shape, and make that start depend on the proxy being reachable. The terminator case took an
-    # owner ruling (BACKLOG #1026). No ruling covers this shape, so the gate is not widened in
-    # passing here; vault BACKLOG #3102 is where the question was raised. The cost to a running site
-    # is not the reason: there are none (CLAUDE.md section 0).
-    if settings.api.tls_terminated_upstream and enforcing and settings.api.public_origin:
+    #     `minimum_version` from `[api].tls_min_version`. That hop is proxy-to-engine, not the
+    #     browser's, so it is no reason to skip the probe.
+    #  2. The browser's hop ends at the proxy, as it does behind a terminator. At least two gates now
+    #     ask for `proxy_tls_min_version`: the terminator gate and the `trusted_proxies` arm beside it.
+    # The cost is the terminator case's: a start refusal for an unset origin on this shape, and a
+    # start that depends on the proxy being reachable. There are no running sites to pay it (CLAUDE.md
+    # section 0), and that is not the reason for the decision either. One limit is this shape's own:
+    # nothing in it says browsers come through the listed proxy. Where they reach the engine directly,
+    # the origin is the engine's, and the probe dials it before uvicorn listens, so the start refuses.
+    if settings.api.browser_tls_ends_at_proxy and enforcing and settings.api.public_origin:
         from messagefoundry.config.tls_probe import TlsProbeUnavailable, probe_tls_floor
 
         try:
@@ -3963,8 +4053,8 @@ def _serve(args: argparse.Namespace) -> int:
             # would never run — a gate that is trivially defeated is not a gate. The cost is real
             # and is stated in the message rather than left for an assessor to find.
             print(
-                f"error: refusing to serve on a PHI instance ({env_name!r}) behind a declared "
-                f"upstream TLS terminator whose TLS floor does not verify — {probe.describe()}. "
+                f"error: refusing to serve on a PHI instance ({env_name!r}) behind a reverse "
+                f"proxy whose TLS floor does not verify — {probe.describe()}. "
                 "The browser hop is the operator's proxy, so the engine measures it at startup "
                 "rather than trusting [api].proxy_tls_min_version (ASVS 12.1.1). Required: the "
                 "front door must refuse TLS 1.0 and 1.1 and negotiate TLS 1.3 with a "
@@ -4730,6 +4820,8 @@ def _serve(args: argparse.Namespace) -> int:
             log_settings=settings.logging,
         ),
         trust_anchors_enforcing=enforcing,
+        # BACKLOG #3470: the collector CA `_start_logging` refused, for the lifespan to refuse on.
+        prestore_anchor_refusals=tuple(_forward_ca_refusals),
     )
     # log_config=None: uvicorn's loggers propagate to the handler configure_logging installed,
     # so everything shares one format/stream (and one log file under NSSM).
@@ -7557,7 +7649,8 @@ def _offline_security_notifier(
     **ANY failure to build the channel is WARNED and yields ``None`` rather than refusing.** This
     serves a recovery command, and losing the notice is the smaller harm than losing the recovery. A
     build error escaping here would also land after the store was created, leaving no administrator.
-    The audit row then records that no channel was wired.
+    The audit row then records that no channel was wired. That covers a relay CA the trust-anchor
+    checks refuse (BACKLOG #3470): the CA is never loaded, and the notice is dropped.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
     from messagefoundry.pipeline.security_notify import security_notifier_from_settings
@@ -7583,6 +7676,22 @@ def _offline_security_notifier(
             file=sys.stderr,
         )
     try:
+        # BACKLOG #3470: the relay's CA takes the trust-anchor checks `serve` gives it. A refusal
+        # drops the notice, as any other failure here does; the recovery itself goes on.
+        from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
+        from messagefoundry.config.settings import SecurityEnforcement
+        from messagefoundry.controlchars import scrub_control_chars
+
+        relay_ca = smtp_hop_anchor_spec(alerts, settings.auth, settings.tls)
+        enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+        if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
+            # The refusal's text is written for a start. This command does not stop on it.
+            print(
+                f"WARNING: {scrub_control_chars(str(refusal))}\nThis command goes on, but it "
+                "sends no security notice over that relay.",
+                file=sys.stderr,
+            )
+            return None
         return security_notifier_from_settings(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
@@ -9316,8 +9425,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     Run **offline** (engine stopped): set ``MEFOR_STORE_ENCRYPTION_KEY`` to the NEW active key and keep
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
-    rotate. After it finishes and the engine has started once, the retired key can be removed; that
-    start re-keys the secret-rotation fingerprints (BACKLOG #2242).
+    rotate. After it finishes the retired key can be removed. The store pass re-seals the
+    secret-rotation fingerprint cells too, so no engine start needs the retired key to read them
+    (BACKLOG #3472, ADR 0213).
 
     **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
     a store another connection holds, which is how a serving engine holds it; see

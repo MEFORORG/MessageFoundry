@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import errno
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -475,6 +476,17 @@ _NEW_IP_DEDUP_MAX = 4096
 # With _NEW_IP_DEDUP_MAX it bounds the cache at 4096 x 9 address keys.
 _NEW_IP_PER_SESSION_MAX = 8
 
+# BACKLOG #3772: the longest client-address text the new-address signal keeps as it is, in its dedupe
+# keys, the seen_ip, known_ip and client of its audit row, its notice and its past-cap log line. Every
+# IPv4 or IPv6 address without a zone id fits, the longest being 45 characters; only text that does
+# not parse, or an IPv6 address with a long zone id, is longer. That text is caller-supplied on a
+# proxied hop, and without a bound each session could hold nine copies of it. Longer text keeps a
+# short prefix and gains the SHA-256 of the whole, so two long strings that share the prefix stay
+# distinct. The replacement is longer than this bound, so it can never equal text kept as it is.
+# Other sinks of the same text, such as sessions.client and other audit rows, are not bounded here.
+_NEW_IP_TEXT_MAX = 64
+_NEW_IP_TEXT_PREFIX = 24
+
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
 # per-account ``known_login_addresses`` record (vault BACKLOG #2145), read at every session mint with
 # one primary-key lookup. An address last seen before this window reads as NEW -- the signal answers
@@ -548,6 +560,24 @@ def _host_key(address: str) -> str:
     return str(parsed)
 
 
+def _bounded_address_text(address: str) -> str:
+    """``address`` itself when it is at most ``_NEW_IP_TEXT_MAX`` characters, else a short prefix
+    and the SHA-256 of the whole (BACKLOG #3772).
+
+    The same input always gives the same output, so it serves as a dedupe key. At least the
+    new-address signal uses it; :func:`_host_key` stays unbounded, because the persisted
+    known-address record and :meth:`AuthService._same_host` compare by it."""
+    if len(address) <= _NEW_IP_TEXT_MAX:
+        return address
+    # surrogatepass, so a lone surrogate cannot make the digest raise; the encoding is injective, so
+    # distinct text still gives distinct digests. A dedupe key, not a credential, so a plain digest.
+    digest = hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()
+    # The prefix is only a reading aid, so a lone surrogate in it becomes "?" (one character each),
+    # and the result can be stored. Text within the bound is returned as it is, as on main.
+    prefix = address[:_NEW_IP_TEXT_PREFIX].encode("utf-8", "replace").decode("utf-8")
+    return f"{prefix}...sha256:{digest}"
+
+
 #: What :meth:`AuthService._first_new_ip_flag` decided for one request: write the ordinary row, write
 #: the one row that says the session's cap is now reached, or write nothing because the address is a
 #: repeat or the cap was already reached.
@@ -556,6 +586,15 @@ _NewIpFlag = Literal["audit", "audit_cap_reached", "repeat", "over_cap"]
 _HoldStanding = Literal["fresh", "held", "forfeit", "settled"]
 #: The standings under which a pass may resolve the durable hold instance.
 _HOLD_RELEASABLE: Final[frozenset[_HoldStanding]] = frozenset({"held", "settled"})
+#: The probe outcomes that leave an account unanswered for the breaker's and the hold's clears
+#: (BACKLOG #3844; `AuthService._mark_reconcile_clears` says why these and not UNAVAILABLE).
+_UNANSWERED_OUTCOMES: Final[frozenset[reconcile.ProbeOutcome]] = frozenset(
+    {
+        reconcile.ProbeOutcome.REFERRED,
+        reconcile.ProbeOutcome.FAULT,
+        reconcile.ProbeOutcome.MISCONFIGURED,
+    }
+)
 #: `AuthService._reconcile_breaker_standing`: whether this process may resolve a trip (BACKLOG
 #: #2136). Only ``"tripped"`` may.
 _BreakerStanding = Literal["fresh", "tripped", "forfeit"]
@@ -3166,7 +3205,7 @@ class AuthService:
             else None
         )
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
-        # host keys already flagged since the session's last re-verification (BACKLOG #2159). Every
+        # bounded host keys (_bounded_address_text(_host_key(...)), BACKLOG #3772) already flagged since the session's last re-verification (BACKLOG #2159). Every
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
         # and _NEW_IP_PER_SESSION_MAX + 1 keys each (the last is the cap-reached row's address).
         self._new_ip_seen: dict[str, set[str]] = {}
@@ -3237,6 +3276,9 @@ class AuthService:
         #: user_ids signed in at the last pass with a referral and not read PRESENT since (BACKLOG
         #: #2538). `_mark_reconcile_clears` states the test that reads it.
         self._reconcile_referred: set[str] = set()
+        #: user_ids whose probe went unanswered (BACKLOG #3844). `_mark_reconcile_clears` states
+        #: what marks one, what ends it, and the test that reads it.
+        self._reconcile_unanswered: set[str] = set()
         #: Whether THIS process may resolve the referral's durable ``ad_reconcile_aborted``
         #: instance (BACKLOG #2538), on the breaker's rule (`_reconcile_breaker_standing`).
         #: ``"fresh"``: no pass here saw a referral. ``"referred"``: one did. ``"forfeit"``: see
@@ -7783,6 +7825,8 @@ class AuthService:
         self._forfeit_clears_on_attrition(users)
         for episode in self._reconcile_episodes.values():
             episode.intersection_update(users)  # an account that left ends its part (#3083)
+        # BACKLOG #3844. Leaving ends an account's part (`_mark_reconcile_clears`).
+        self._reconcile_unanswered.intersection_update(users)
         announced = (self._forfeited_reconcile_standings() - forfeited) & open_before
         reconcile.prune_ledger(self._reconcile_strikes, users, rank=float)
         reconcile.prune_ledger(self._reconcile_last_probed, users, rank=float)
@@ -7821,6 +7865,10 @@ class AuthService:
                 probes.append(
                     reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNKEYED)
                 )
+            # BACKLOG #3844. Marked with the probe, beside the stamp that sends the account to the
+            # back of the rotation, so a pass that raises later cannot leave it stamped unmarked.
+            if probes[-1].outcome in _UNANSWERED_OUTCOMES:
+                self._reconcile_unanswered.add(user_id)
             self._reconcile_last_probed[user_id] = now
 
         # Resolve the role sets for the role re-diff, and the scope inputs for the scope re-diff (ADR
@@ -7878,6 +7926,8 @@ class AuthService:
         # The outcome record merges the same way, for the same reason (ADR 0195 rule item 4).
         self._reconcile_strikes.update(plan.strikes)
         self._reconcile_outcomes.update(plan.outcomes)
+        # BACKLOG #3844, beside the outcome record it qualifies (`_mark_reconcile_clears`).
+        self._reconcile_unanswered.difference_update(plan.outcomes)
         self._reconcile_hold_latched = plan.latched
         # Vault BACKLOG #3696. Before any return below, so an outage-shaped pass pages too.
         plan = replace(plan, paging_refused=self._note_paging_refusals(probes, plan.outcomes))
@@ -8058,10 +8108,34 @@ class AuthService:
           breaker's and the hold's instances open after their own causes are gone: a missed
           clear, never a false one (BACKLOG #3100 item 7). A pass with a probe fault, or with a
           probe refused for its configuration (BACKLOG #3010), marks none either, for the same
-          reason. For these two clears none is carried to later passes: a later pass whose
-          sample misses the referred, faulting or refused account reads its older answer on
-          record and can still mark one (left open under BACKLOG #3100). Only the referral's own
-          clear below carries its accounts across passes.
+          reason.
+        * **For the breaker and the hold, that carries across passes (BACKLOG #3844), and this is
+          the one statement of it.** An account whose probe was referred, faulted or refused is
+          marked unanswered (``_reconcile_unanswered``) as it is probed, so a pass that raises
+          later still leaves it marked, and no pass marks either clear while an unanswered
+          account is signed in. Without it, a later sample that missed the account would read
+          its older answer as current. Any answer a later pass records ends its part, not only
+          PRESENT: this test asks only whether the answer on record postdates the probe that went
+          unanswered, and the tests below then judge that answer as they judge any other. An
+          unavailable probe is not an answer, so it neither marks nor ends a part; on its own
+          pass it stops no clear, and the older answer it leaves on record still counts (left
+          open, outside BACKLOG #3844, as is a pass that raises after its probes, whose judged
+          answers are never recorded). Until the hold's clear is marked the hold is not settled,
+          so a departure that forfeits an unsettled hold still forfeits it meanwhile: a missed
+          clear. The referral's own clear does not read this
+          set. Its accounts are carried by ``_reconcile_referred``, which marks every candidate
+          at a referral and lets one go only on a PRESENT read, and a fault or a refusal is not
+          its cause, so a faulting account would only keep its message naming a referral that is
+          gone. An unanswered account that leaves takes its part with it, and this rule forfeits
+          nothing for it. An unjudged probe changes neither the outcome and strike records nor
+          ``_reconcile_unconfirmed``, so an account behind a trip or a hold is still behind it on
+          those, and its leaving forfeits on their rule (`_forfeit_clears_on_attrition`), as a
+          referred account's leaving forfeits the referral's. A clear then rests only on the
+          accounts still signed in, each with an answer from after its last unanswered probe. A
+          restart empties the set with the outcome record it qualifies, so the first test asks
+          every account for a fresh answer again. This pass's ``referred``, ``faulted`` and
+          ``misconfigured`` are in the set already, and the first test still reads them, so the
+          predicate holds on a plan handed to it directly.
         * The referral's own instance is clear when, on top of the first test, every account signed
           in at the last referral has since read PRESENT on a pass with no referral
           (``_reconcile_referred``), and ``_reconcile_referral_standing`` is ``"referred"``: a
@@ -8131,7 +8205,11 @@ class AuthService:
             and not plan.faulted
             and not plan.misconfigured
         )
-        settled = covered and undetermined not in outcomes
+        settled = (
+            covered
+            and undetermined not in outcomes
+            and self._reconcile_unanswered.isdisjoint(ids)  # BACKLOG #3844
+        )
         # Called only on a pass that judged something, so a pass that judged nothing never gets
         # here.
         referral_clear = (
@@ -12182,7 +12260,10 @@ class AuthService:
             return False
         if self._same_host(client_ip, session.client):
             return False
-        seen_key = _host_key(client_ip)
+        # Bounded at intake (BACKLOG #3772), so the dedupe sets hold bounded text. The same value is
+        # added below and discarded in the ``finally``.
+        host_key = _host_key(client_ip)
+        seen_key = _bounded_address_text(host_key)
         # New address → force a step-up (return True unconditionally). Emit the audit + notice once per
         # (session, address) between re-verifications, and for at most _NEW_IP_PER_SESSION_MAX
         # addresses, so a replayed token cannot amplify the audit log / notifications even when it
@@ -12195,6 +12276,12 @@ class AuthService:
                 path,
             )
             return True
+        # What the row, the notice and the past-cap log line carry. Text within _NEW_IP_TEXT_MAX,
+        # which is every address without a long zone id, is unchanged, so a search by address still
+        # finds the row (vault BACKLOG #3197); longer text is bounded, so this row's client then
+        # differs from the raw text other rows of the request carry. Text that does not parse is its
+        # own host key, so its bounded form is reused rather than hashed twice.
+        seen_text = seen_key if host_key == client_ip else _bounded_address_text(client_ip)
         if flag == "over_cap":
             # Past the cap no new-address row is written, so this line carries the address. The
             # address is attacker-supplied text on a proxied hop.
@@ -12203,13 +12290,14 @@ class AuthService:
                 "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
                 _NEW_IP_PER_SESSION_MAX,
                 path,
-                scrub_log_argument(client_ip),
+                scrub_log_argument(seen_text),
             )
             return True
+        known_text = _bounded_address_text(session.client)
         detail: dict[str, object] = {
             "path": path,
-            "known_ip": session.client,
-            "seen_ip": client_ip,
+            "known_ip": known_text,
+            "seen_ip": seen_text,
         }
         if flag == "audit_cap_reached":
             # The last row before the session re-verifies, so it says why the next new address
@@ -12220,12 +12308,13 @@ class AuthService:
             user = await self._load_user(session.user_id)
             username = user.username if user is not None else session.user_id
             # The client column too (vault BACKLOG #3197), so a search or export by address finds
-            # this row. `seen_ip` stays in the detail beside `known_ip`, which it is compared with.
+            # this row; over-long text is bounded (BACKLOG #3772). `seen_ip` stays in the detail
+            # beside `known_ip`, which it is compared with.
             await self._audit(
                 "auth.new_address_reverify_required",
                 actor=username,
                 detail=_json(detail),
-                client=client_ip,
+                client=seen_text,
             )
             written = True
         finally:
@@ -12236,14 +12325,14 @@ class AuthService:
                 flagged = self._new_ip_seen.get(token_hash)
                 if flagged is not None:
                     flagged.discard(seen_key)
-        notice: dict[str, object] = {"known_ip": session.client}
+        notice: dict[str, object] = {"known_ip": known_text}
         if flag == "audit_cap_reached":
             notice["cap_reached"] = _NEW_IP_PER_SESSION_MAX
         await self._notify_security(
             NEW_ADDRESS_REVERIFY,
             username=username,
             email=user.notify_email if user is not None else None,
-            client=client_ip,
+            client=seen_text,
             detail=notice,
         )
         return True

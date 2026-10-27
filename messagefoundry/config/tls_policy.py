@@ -79,7 +79,7 @@ MIRRORED_CONNECTION_SETTING = "connection_name"
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from messagefoundry.pki import CrlBlock, CrlFacts
+    from messagefoundry.pki import CrlBlock, CrlFacts, CrlIssuerKey
 
 __all__ = [
     "APPROVED_KEX_GROUPS",
@@ -799,14 +799,16 @@ def crl_not_in_effect(
 ) -> CrlBlock | None:
     """The CRL that decides when every issuer in ``blocks`` has one in effect, or ``None`` when each
     does at ``now``. For each issuer with none in effect, its earliest CRL counts; of those, the
-    latest decides, since the file is whole only once that one takes effect."""
-    in_effect = {block.issuer for block in blocks if crl_in_effect(block, now=now, skew=skew)}
-    earliest: dict[str, CrlBlock] = {}
+    latest decides, since the file is whole only once that one takes effect. An issuer is its
+    ``issuer_key`` (:class:`~messagefoundry.pki.CrlBlock`, vault BACKLOG #3755)."""
+    in_effect = {block.issuer_key for block in blocks if crl_in_effect(block, now=now, skew=skew)}
+    earliest: dict[CrlIssuerKey, CrlBlock] = {}
     for block in blocks:
-        if block.issuer in in_effect:
+        key = block.issuer_key
+        if key in in_effect:
             continue
-        if block.issuer not in earliest or block.this_update < earliest[block.issuer].this_update:
-            earliest[block.issuer] = block
+        if key not in earliest or block.this_update < earliest[key].this_update:
+            earliest[key] = block
     return max(earliest.values(), key=lambda block: block.this_update, default=None)
 
 

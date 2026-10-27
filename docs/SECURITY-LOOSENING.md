@@ -317,11 +317,14 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
   than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (an
   operator `[api].tls_cert_file` or a declared TLS-terminating proxy), and that refusal holds even under
-  `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` only behind a declared
-  terminator (`[api].tls_terminated_upstream`). With an operator certificate, no declared terminator and no
-  address, this check only warns: the `/ui` origin checks then use the request Host, and passkeys fail closed until the
-  address is set. Other gates can still refuse that start, at least the in-process TLS revocation
-  gate (unless `MEFOR_TLS_REVOCATION_ATTESTED=1`) and MFA-at-exposure.
+  `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` behind a declared
+  terminator (`[api].tls_terminated_upstream`). Under `enforce` it also refuses one behind a proxy named
+  in `[api].trusted_proxies` alone, for the ASVS 12.1.1 probe (vault BACKLOG #3538; the
+  `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md#api) has the rule). With an operator
+  certificate, no proxy and no address, this check only warns: the `/ui` origin checks then use the
+  request Host, and passkeys fail closed until the address is set. Other gates can still refuse that
+  start, at least the in-process TLS revocation gate (unless `MEFOR_TLS_REVOCATION_ATTESTED=1`) and
+  MFA-at-exposure.
 
 ### `encrypt_stored_data = false` — let a PHI instance start with no encryption key
 - **What it does:** it sets the **same** keyless-PHI opt-out that turning on `allow_unencrypted_phi` sets. The
@@ -1215,7 +1218,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   Vault even on a `warn` instance.** That includes at least `rotate-key`, `backup` and
   `audit-verify`, at least today. **`verify` passes no posture to either of its Vault hops, on
   purpose:** its store opens and its OIDC client-credential read are judged by one rule. So on a
-  `warn` instance `verify` can fail a Vault hop that `serve` crosses with a WARNING. `warn`
+  `warn` instance `verify` dials neither unattested off-box Vault. Its store rows FAIL there,
+  on a hop `serve` crosses with a WARNING. Its `fed.client_secret` or `fed.client_key` row reads
+  the posture only to classify that refusal. On `warn` that row is MANUAL and says `serve` would
+  cross, and the credential stays unchecked (vault BACKLOG #3619). `warn`
   alone therefore does not make an off-box Vault usable by every command: set the pair. This
   bullet is the one place the docs name callers. `tests/test_vault_posture_census.py` is the list itself: what
   each call passes.

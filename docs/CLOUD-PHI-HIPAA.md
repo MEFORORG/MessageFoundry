@@ -50,7 +50,7 @@ the compliance overlay on top of it.
 
 ## 2. Encryption at rest — KMS CMEK layered with the engine cipher
 
-PHI at rest is protected in **two layers**, and the engine layer is made **fail-closed**:
+PHI at rest is protected in **two layers**, and the engine layer is **fail-closed by default**:
 
 1. **Infrastructure layer (the CSP, under a customer-managed KMS key):** enable **KMS CMEK** (customer
    master / customer-managed key) on:
@@ -61,18 +61,13 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
    revoke. *(NPRM-anticipated: encryption at rest becomes mandatory rather than "addressable.")*
 2. **Application layer (the engine):** MessageFoundry **also** encrypts PHI columns with **AES-256-GCM** in
    the store, independent of the DB's at-rest encryption, so a DB-file or backup exposure does not yield
-   cleartext PHI. Make it **fail-closed**:
-   - `[store].require_encryption = true` (env `MEFOR_STORE_REQUIRE_ENCRYPTION=true`) — `serve` **refuses to
-     start** without a key, in any environment ([`config/settings.py`](../messagefoundry/config/settings.py),
-     [`__main__.py`](../messagefoundry/__main__.py)).
+   cleartext PHI. It is **fail-closed by default**; [PHI.md](PHI.md#3-encryption-at-rest) §3 states the
+   keyless refusal and its audited opt-out.
    - Supply the key via **`MEFOR_STORE_ENCRYPTION_KEY`** (base64 of 32 random bytes —
      `messagefoundry gen-key`), sourced from the secret store (§4); **or** via
-     `[store].encryption_key_file` (a path, e.g. a mounted secret file). These two — `require_encryption`
-     and `MEFOR_STORE_ENCRYPTION_KEY` / `encryption_key_file` — are the **real** controls. (`MEFOR_STORE_REQUIRE_ENCRYPTION=true`
-     IS a real env var — it maps to `[store].require_encryption` — but it does **not** encrypt anything on its
-     own: it only forces a **keyless-start refusal**. You must **also** supply the key var. Earlier drafts
-     implied the boolean alone sufficed; the boolean **and** the key var are both required, names verified
-     against `config/settings.py`.)
+     `[store].encryption_key_file` (a path, e.g. a mounted secret file).
+   - Also set `[store].require_encryption = true` (env `MEFOR_STORE_REQUIRE_ENCRYPTION=true`), so the
+     audited opt-out cannot lift that refusal. It encrypts nothing on its own: supply the key too.
    - Rotate the engine key with `messagefoundry rotate-key` (retired keys via `encryption_keys_retired`).
 
 ---
@@ -142,8 +137,8 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
   states which accounts owe a factor. An instance is exposed when it has an off-loopback bind, a
   declared TLS-terminating proxy, or a set `[api].trusted_proxies` (vault BACKLOG #2251). An exposed instance with `require_mfa=false` **refuses** to start
   under the shipped `enforce`, unless `[security].allow_single_factor_admin_when_exposed` is set.
-- **Deny-by-default egress.** `MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true` + the `MEFOR_EGRESS_ALLOWED_*` lists, so a
-  transform can only send to approved destinations — a fail-closed exfiltration guard.
+- **Deny-by-default egress.** Egress denies by default; populate the `MEFOR_EGRESS_ALLOWED_*` lists
+  ([CONFIGURATION.md](CONFIGURATION.md#egress) states the rule), so a transform can only send to approved destinations — a fail-closed exfiltration guard.
 - **Full audit, off-box to your SIEM.** Every PHI access (raw view, summary) is audited with the acting
   user ([`docs/SECURITY.md`](SECURITY.md)). Ship audit + operational logs to your SIEM using the
   **native TLS-syslog forwarder** (`[logging].forward_protocol = "tls"`, RFC 5425 — ADR 0080), which
@@ -179,15 +174,16 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 
 - [ ] **BAA signed** with the CSP; every PHI-path service is on the provider's **HIPAA-eligible list**.
 - [ ] **KMS CMEK** on the managed DB, block storage, backups/snapshots, and the secret store.
-- [ ] Engine at-rest fail-closed: `MEFOR_STORE_REQUIRE_ENCRYPTION=true` **and** `MEFOR_STORE_ENCRYPTION_KEY`
-      (or `[store].encryption_key_file`) supplied from the secret manager.
+- [ ] Engine at-rest key: `MEFOR_STORE_ENCRYPTION_KEY` (or `[store].encryption_key_file`) supplied from
+      the secret manager, **and** `MEFOR_STORE_REQUIRE_ENCRYPTION=true` so the audited opt-out cannot
+      start the engine keyless ([PHI.md](PHI.md#3-encryption-at-rest) §3).
 - [ ] **TLS in transit** everywhere: API TLS, MLLP-over-TLS (or edge-relay), DB `encrypt=true` /
       `trust_server_certificate=false`; **`MEFOR_ALLOW_INSECURE_TLS` is NOT set**.
 - [ ] raw-TCP/X12 are loopback/segmented (the gate refuses a public bind) — none published publicly.
 - [ ] **Private subnets + PrivateLink**; DB not publicly reachable; **no public MLLP ingress** (edge-relay
       or internal NLB only).
 - [ ] **Region-pinned**: DB, compute, KMS keys, backups, secrets all in the approved region.
-- [ ] **Auth + MFA** on; **deny-by-default egress** with populated allow-lists.
+- [ ] **MFA** left on (sign-in is always on); egress allow-lists populated (egress denies by default).
 - [ ] **Audit + logs to the SIEM** over **TLS** — the native TLS-syslog forwarder
       (`[logging].forward_protocol = "tls"` + `forward_tls_ca_file`, RFC 5425) or a TLS-terminating
       collector; **not** the plaintext UDP/TCP forwarder as-is.
