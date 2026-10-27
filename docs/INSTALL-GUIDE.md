@@ -132,7 +132,7 @@ Three ownership tiers — keeping them separate is the whole design:
 On each host, create a virtual environment and install the engine at a **pinned version**. The block
 below is the general shape, in PowerShell. For the Windows service, the supported v1 install, skip
 it: the service installer builds an environment only administrators can write from the wheel you
-verify below, pinned by its SHA-256, as
+verify below and that release's `requirements.lock`, each pinned by its SHA-256, as
 [SERVICE.md](SERVICE.md#install-the-engine-where-only-administrators-can-write) shows. It refuses a
 venv that anyone but administrators can write, as a `.venv` in your own folder usually is.
 

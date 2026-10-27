@@ -912,10 +912,11 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        34,
+        37,
         OPERATOR,
         "Fixed names under paths the operator passes or the script derives (repo root, install "
         "root and its site-packages, dist-info and wheelhouse folders, the engine wheel's folder, "
+        "the base interpreter's folder and the one above it, "
         "project root, data directory, NSSM directory, temp), the leaf name of the engine wheel "
         "the operator passes, which must match messagefoundry-<version>-*.whl, plus registry keys "
         "named after the service's own images.",

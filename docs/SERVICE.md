@@ -56,32 +56,54 @@ change. So the installer's default engine is a virtual environment under Program
 the engine wheel (vault BACKLOG #2626). An editable install in a checkout is code its developers can
 change, and the service would run their next edit.
 
-1. Get the engine wheel and the release's `requirements.lock` into one folder. Take a release
-   wheel and verify it as [INSTALL-GUIDE.md](INSTALL-GUIDE.md) shows, or build one from a checkout
-   as yourself, not elevated: `python -m pip wheel --no-deps -w dist .`
-2. Take the wheel's SHA-256 in the session that verified it:
-   `(Get-FileHash -Algorithm SHA256 <wheel>).Hash`. `requirements.lock` pins every dependency by
-   hash but not the engine wheel, so this value is the pin on the engine itself.
-3. Pass both to the installer, elevated, with the options [Install](#install) names:
+1. Get the engine wheel and the `requirements.lock` of the same release into one folder. Take a
+   release wheel and verify it as [INSTALL-GUIDE.md](INSTALL-GUIDE.md) shows, with the lock from
+   that release's tag, or build a wheel from a checkout as yourself, not elevated:
+   `python -m pip wheel --no-deps -w dist .`
+2. Take the SHA-256 of each in the session that verified them:
+   `(Get-FileHash -Algorithm SHA256 <file>).Hash`. The lock pins every dependency by hash, but
+   not the engine wheel, and nothing pins the lock but this value.
+3. Pass them to the installer, elevated, with the options [Install](#install) names:
    ```powershell
    .\scripts\service\install-service.ps1 -EngineWheel D:\release\messagefoundry-0.5.2-py3-none-any.whl `
-       -EngineWheelSha256 <hash> -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml
+       -EngineWheelSha256 <wheel hash> -RequirementsLockSha256 <lock hash> `
+       -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml
    ```
 
 **With `-EngineWheel`, the installer builds the root before it checks it** (vault BACKLOG #2626).
 Without it, the installer builds nothing and checks the root that is there; it never falls back to
-an editable install. It makes the root administrator-only before pip runs, installs the lock with
-`--require-hashes` and the wheel with `--no-deps`, and refuses, installing nothing, when the copy
-of the wheel pip would read misses `-EngineWheelSha256`. `Build-EngineInstall` in the script is
-the source of record for the steps and their order.
+an editable install. It makes the root administrator-only before pip runs, and refuses, installing
+nothing, when the copy of the wheel or the lock pip would read misses its pin. It installs the lock
+with `--require-hashes` and the wheel with `--no-deps`, with pip reading no configuration file or
+`PIP_` variable. At least one route still runs code the pins do not name: a source distribution
+the lock pins is built, running its build code as administrator. `Build-EngineInstall` in the
+script is the source of record for the steps and their order.
 
-It refuses to build into a root that already holds files, so it never upgrades in place; see
-[Update to a new build](#update-to-a-new-build-restart-vs-reinstall). A failed build deletes a root
-it made. `-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython`
-defaults to the first `python` on `PATH`, and the installer refuses one that anyone but
-administrators can write, because it runs that interpreter elevated and the venv's `python.exe`
-starts it at every service start. Install the web console wheel into the built root by hand if
-the service serves `/ui`: the installer installs the engine wheel only.
+It refuses to build into a root that already holds files, so it never upgrades in place, and a
+re-run after a later step failed needs `-EngineWheel` left out; see
+[Update to a new build](#update-to-a-new-build-restart-vs-reinstall). An unfinished build deletes a
+root it made. `-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython`
+defaults to the first `python` on `PATH`; `Get-EngineBuildProblem` in the script lists what it
+refuses there, at least a launcher, a shim, a venv's interpreter, a Python older than 3.14 and
+one anyone but administrators can write. The installer installs the engine wheel only. Install
+the web console wheel by hand if the service serves `/ui`, then reset the owner as below.
+
+**To reset an existing root's access list and owner**, such as after an update by hand:
+
+```powershell
+$Root = "$env:ProgramFiles\MessageFoundry\engine"
+$Parent = Split-Path -Parent $Root
+foreach ($Folder in $Parent, $Root) {
+    icacls $Folder /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" `
+        "*S-1-5-32-545:(OI)(CI)RX" "*S-1-5-11:(OI)(CI)RX"
+}
+icacls $Parent /setowner "*S-1-5-32-544"
+icacls $Root /setowner "*S-1-5-32-544" /T /C
+```
+
+A file an administrator creates there can be owned by that administrator's own account, under the
+"Object creator" default-owner policy. That account then counts as another account that can write
+it, and the installer refuses the install.
 
 **The installer refuses an engine install anyone but administrators can write** (vault BACKLOG
 #2626). That holds for the default root and for one you pass with `-AppExe` or `-PythonExe`. It
@@ -249,8 +271,11 @@ Restart-Service MessageFoundry
 curl.exe --cacert C:\ProgramData\MessageFoundry\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
-Install the release's `requirements.lock` first when its dependencies changed. The installer
-refuses an editable install, so a restart never runs whatever branch a checkout has.
+Install the release's `requirements.lock` first when its dependencies changed, then reset the
+owner as
+[Install the engine where only administrators can write](#install-the-engine-where-only-administrators-can-write)
+shows. The installer refuses an editable install, so a restart never runs whatever branch a
+checkout has.
 
 **Reinstall** instead when paths or flags change (port, config dir, data dir) or the service
 definition drifted — the install script is idempotent (it stops and reconfigures in place):
