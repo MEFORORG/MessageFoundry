@@ -352,8 +352,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # anchor-changed audit fingerprint. Integrity/tamper-evidence over a public CA cert, not a secret.
     # BACKLOG #2025: anchor_cadata trial-loads the checked text into a throwaway client
     # SSLContext, so the reload preflight refuses what a consumer's cadata= load refuses. That
-    # context verifies no peer and is discarded.
-    "messagefoundry/auth/trust_anchors.py": frozenset({"hashlib", "ssl"}),
+    # context verifies no peer and is discarded. tls_policy since BACKLOG #3470, for
+    # is_loopback_hop_host alone: smtp_hop_anchor_spec skips the internal CA for a loopback relay,
+    # as resolve_trust_anchor does. It builds no context.
+    "messagefoundry/auth/trust_anchors.py": frozenset(
+        {"hashlib", "ssl", "messagefoundry.config.tls_policy"}
+    ),
     # ADR 0068 (WP-14b): first-party 64-byte WebAuthn ceremony challenges (secrets.token_bytes) —
     # single-use, TTL'd, staged server-side (ASVS 6.7.2 evidence). The `webauthn` library (an optional
     # [webauthn] extra, lazy-imported inside this module's functions) performs the COSE signature
@@ -1029,6 +1033,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.api.tls",  # BACKLOG #1167: evaluate_anchor's pin compare
             "compare:via messagefoundry.auth.totp",
             "compare:via messagefoundry.pipeline.secret_rotation",
+            # BACKLOG #3470: anchor_refusal checks the forwarder's and the SMTP relay's CA before
+            # those hops are built, through evaluate_anchor: its SHA-256 fingerprint, and its pin
+            # compare, which these specs never reach since they carry no pin.
+            "compare:via messagefoundry.auth.trust_anchors",
+            "hash:via messagefoundry.auth.trust_anchors",
             # BACKLOG #1352: cert import opens a PKCS#12 bundle's encrypted parts through pki.
             "cipher:via messagefoundry.pki",
             "csprng:via messagefoundry.auth.totp",
