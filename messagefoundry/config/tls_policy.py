@@ -2977,8 +2977,8 @@ def requests_verify_from_anchor(anchor: TrustAnchor, *, cell: str) -> str | None
     if anchor.crl_file is not None:
         raise ValueError(
             f"{cell}: [tls].crl_file cannot be expressed to a requests-based client, which takes one "
-            f"bundle path and no revocation flag. Leave the CRL unset rather than have it silently "
-            f"ignored here."
+            f"bundle path and no revocation flag. Terminate this hop at a revocation-checking proxy or "
+            f"leave the CRL unset rather than have it silently ignored here."
         )
     if anchor.cafile is None:
         return None

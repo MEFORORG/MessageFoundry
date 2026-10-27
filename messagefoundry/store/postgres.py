@@ -1526,7 +1526,7 @@ _TLS_BUILD_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mefo
 #: default path had no engine-side context for a CRL to load into. Loopback is the other way across.
 _STORE_WAYS_ACROSS = (
     "Set [store].ssl_crl_file so the engine checks a CRL on this hop, or "
-    "put the database on the loopback interface."
+    "put the database on the loopback interface (or a local revocation-checking proxy)."
 )
 
 

@@ -189,11 +189,18 @@ def test_blanket_attestation_does_not_defeat_an_enforcing_posture() -> None:
         ), relaxation
 
 
-def test_the_proven_terminator_input_is_gone() -> None:
+def test_the_authority_takes_no_egress_terminator_input() -> None:
     """BACKLOG #3514 item 5 removed ``proxy_proven``: no call site ever set it, so its ALLOW arm never
     fired. DEPLOYMENT.md and CONNECTIONS.md now say the authority has no input for an egress
-    terminator, so a change that brings one back must change those pages too."""
-    assert "proxy_proven" not in inspect.signature(revocation_hop_disposition).parameters
+    terminator, so a change that adds any new input, under any name, must change those pages too.
+    The exact set is pinned for that reason, not only the absence of the old name."""
+    assert set(inspect.signature(revocation_hop_disposition).parameters) == {
+        "enforcing",
+        "is_loopback_hop",
+        "attested",
+        "crl_checked",
+        "blanket_attested",
+    }
     assert "proxy_proven" not in inspect.signature(RevocationHopGuard.capture).parameters
     assert "proxy_proven" not in {f.name for f in dataclasses.fields(RevocationHopGuard)}
 
@@ -586,9 +593,6 @@ def test_the_store_refusal_names_a_lever_that_exists_for_it() -> None:
     assert "[store].ssl_crl_file" in str(exc.value)
     assert "[store].ssl_root_cert" not in str(exc.value)
     assert "tls_revocation_attested" not in str(exc.value)
-    # BACKLOG #3514 item 5: no proxy is offered. A proxy crosses only when the store is addressed on
-    # loopback, and then by the loopback carve-out, which records nothing.
-    assert "proxy" not in str(exc.value)
 
 
 def test_the_store_crl_closes_its_own_gate_on_the_default_path(bare_crl: str) -> None:
