@@ -213,14 +213,6 @@ AUDIT_MAC_HEX_LEN = 2 * hashlib.sha256().digest_size
 #: so no row can declare its chain keyless; whether a store runs keyless is its configuration.
 AUDIT_KEYLESS_MAC = "sha256"
 
-# HKDF info label for the secret-rotation fingerprint MAC key (ASVS 13.3.4, BACKLOG #282). A DEDICATED,
-# domain-separated subkey off the DEK: the rotation watcher fingerprints each tracked secret with a KEYED
-# MAC (never a salted hash — a salted hash of a low-entropy SMTP/AD password is offline-guessable), and
-# this is the key it is HMAC'd under. Versioned like _AUDIT_MAC_INFO so a future re-derivation is an
-# additive label, never a silent change to an existing deployment's derived key.
-_ROTATION_FP_INFO = b"mefor/secret-rotation-fingerprint/v1"
-_ROTATION_FP_LEN = 32  # bytes — HMAC-SHA256 key
-
 # HKDF info label for the audit body-digest key (vault BACKLOG #2615). An edit-resend's audit row holds
 # a KEYED digest of the original and the edited body, so a site can show afterwards what was sent once
 # retention has blanked both bodies. Keyed, never a plain hash: a short PHI body (one result value, one
@@ -242,7 +234,7 @@ BODY_DIGEST_UNNAMED_KDF = "hkdf-sha256:mefor/audit-chain/v1,hkdf-sha256:mefor/au
 
 # Row integrity seals (BACKLOG #2592). Two HKDF-SHA256 steps, each the shape of
 # `_derive_audit_mac_key`. The AUTHORIZATION ROOT is derived from the DEK under its own purpose label,
-# so it is a different key from the audit key, the rotation-fingerprint key and every data key, and a
+# so it is a different key from the audit key and every data key, and a
 # data-key roll never touches it. The ROW-SEAL KEY is derived from that root under a second label
 # followed by the store id. Both labels are fixed-length, so `label || store_id` is unambiguous.
 _AUTHZ_ROOT_INFO = b"mefor/root/authz/v1"
@@ -846,39 +838,96 @@ def row_seal_key_id(seal_key: bytes) -> str:
     return hashlib.sha256(_ROW_SEAL_KEY_ID_INFO + seal_key).hexdigest()[:_KEY_ID_LEN]
 
 
-def rotation_fingerprint_key(cipher: Cipher) -> bytes | None:
-    """Derive the secret-rotation fingerprint MAC key from the store DEK (ASVS 13.3.4, BACKLOG #282).
-
-    HKDF-SHA256 over the cipher's in-heap audit-MAC key (itself a DEK-derived subkey), under a dedicated
-    ``mefor/secret-rotation-fingerprint/v1`` info label so it is **domain-separated** from the audit-chain
-    key. The rotation watcher fingerprints each tracked secret as ``HMAC(this-key, value)`` — a KEYED MAC,
-    never a salted hash — so the persisted fingerprint of a low-entropy AD/SMTP secret is not offline-
-    guessable and reveals nothing about the value; the key is never stored beside the fingerprint.
-
-    Returns ``None`` when there is no in-heap keying material: the identity (keyless) cipher, OR a
-    ``vault_transit`` cipher whose DEK never enters the engine heap (``audit_mac_key()`` is ``None`` — the
-    audit MAC runs inside Transit). In both cases per-secret fingerprinting is unavailable in-process and
-    the watcher tracks only the non-secret DEK key-id stamp."""
-    base = cipher.audit_mac_key()
-    return None if base is None else _derive_rotation_fp_key(base)
+#: The scheme tag of a stored non-DEK secret-rotation fingerprint (BACKLOG #3472, ADR 0213): a
+#: store-cipher cell sealing a per-row random HMAC-SHA256 key, the value's MAC under it cut to 32
+#: hex, and the row's ``secret_key``. The plaintext layout belongs to
+#: :mod:`messagefoundry.pipeline.secret_rotation`. Changing it, or this sealing, means a new tag.
+ROTATION_FP_SEALED_SCHEME = "sealed-hmac-sha256-32"
 
 
-def rotation_fingerprint_keys(cipher: Cipher) -> list[bytes]:
-    """Every secret-rotation fingerprint key ``cipher`` can derive: the active DEK's and each retired
-    DEK's (BACKLOG #2242). A DEK rotation changes :func:`rotation_fingerprint_key`, so the watcher
-    uses these to recompute a stored fingerprint under the key that made it and tell a re-key from
-    a changed secret. Empty when there is no in-heap keying material."""
-    return [_derive_rotation_fp_key(base) for base in cipher.audit_mac_keyring().values()]
+def rotation_fingerprint_cipher(cipher: Cipher) -> AesGcmCipher | None:
+    """``cipher`` when a store under it fingerprints its secrets, else ``None`` (BACKLOG #3472, ADR
+    0213).
+
+    Only the in-process AES-GCM cipher does, the ``key_provider = vault`` one included. The identity
+    (keyless) cipher has no key to seal under. ``vault_transit`` could seal without a key in heap;
+    whether it should is a separate decision nobody has taken (vault BACKLOG #3473), so it stays off,
+    as it was while the fingerprint key was derived from an in-heap audit key."""
+    return cipher if isinstance(cipher, AesGcmCipher) else None
 
 
-def _derive_rotation_fp_key(audit_mac_key: bytes) -> bytes:
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+def _rotation_fp_aad(secret_key: str) -> bytes:
+    """The cell AAD a sealed fingerprint is bound under: its own row, keyed by ``secret_key``."""
+    return cell_aad("secret_rotation_meta", "fingerprint", secret_key)
 
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(), length=_ROTATION_FP_LEN, salt=None, info=_ROTATION_FP_INFO
+
+def seal_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, cell: str) -> str:
+    """``cell`` sealed as row ``secret_key``'s stored fingerprint, behind
+    :data:`ROTATION_FP_SEALED_SCHEME` (BACKLOG #3472)."""
+    return scheme_tagged(
+        ROTATION_FP_SEALED_SCHEME, cipher.encrypt(cell, aad=_rotation_fp_aad(secret_key))
     )
-    return hkdf.derive(audit_mac_key)
+
+
+def open_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, stored: str) -> str | None:
+    """The plaintext of row ``secret_key``'s sealed fingerprint ``stored``, or ``None``.
+
+    ``None`` when ``stored`` is not a sealed fingerprint (a DEK key id, a pre-#3472 keyed MAC, an
+    unknown tag, a blank), when no configured key opens it under this row's AAD (a key not
+    supplied, a cell moved from another row, a corrupt value), and when the plaintext's third
+    ``:``-field is not exactly ``secret_key``. The first two fields are hex, so only the class id
+    may hold a ``:``. That last check is what refuses a moved cell that the frozen v1 writer sealed
+    with no AAD, so the rotation pass never re-seals one as this row's. The caller keeps that row's
+    dates, so a cell it cannot read never resets a clock."""
+    head, sep, inner = stored.partition(":")
+    if not sep or head != ROTATION_FP_SEALED_SCHEME or not cipher.is_encrypted(inner):
+        return None
+    try:
+        cell = cipher.decrypt(inner, aad=_rotation_fp_aad(secret_key))
+    except CipherError:
+        return None
+    parts = cell.split(":", 2)
+    return cell if len(parts) == 3 and parts[2] == secret_key else None
+
+
+def reseal_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, stored: str) -> str | None:
+    """``stored`` re-sealed under the active key, for ``reencrypt_to_active`` (BACKLOG #3472).
+
+    ``None`` when it cannot be opened, as :func:`open_rotation_fingerprint` says. The rotation then
+    leaves the cell as it is: a fingerprint is not PHI, and a cell no key opens must not stop a key
+    rotation. The next engine start keeps that row's dates and seals a fresh cell."""
+    cell = open_rotation_fingerprint(cipher, secret_key, stored)
+    return None if cell is None else seal_rotation_fingerprint(cipher, secret_key, cell)
+
+
+def rotation_fingerprint_reseal_likes(active_like: str) -> tuple[str, str]:
+    """The two ``LIKE`` patterns each backend's rotation pass selects sealed fingerprints by: sealed,
+    and not already under the active key (``active_like`` is the cipher's active-format prefix and
+    ``%``). Built once, so the three backends select the same rows."""
+    tag = f"{ROTATION_FP_SEALED_SCHEME}:"
+    return f"{tag}%", f"{tag}{active_like}"
+
+
+def reseal_rotation_fingerprints(
+    cipher: AesGcmCipher, rows: Sequence[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """``(new stored value, secret_key)`` for each ``(secret_key, stored)`` row that re-seals under
+    the active key, for the rotation pass of every backend (BACKLOG #3472). A row no configured key
+    opens is left out and counted in one WARNING, by count only: its ``secret_key`` may be an
+    operator-chosen ``env()`` name, never logged here."""
+    updates: list[tuple[str, str]] = []
+    for secret_key, stored in rows:
+        resealed = reseal_rotation_fingerprint(cipher, secret_key, stored)
+        if resealed is not None:
+            updates.append((resealed, secret_key))
+    if len(updates) < len(rows):
+        _log.warning(
+            "key rotation: %d secret-rotation fingerprint(s) could not be read: no configured key "
+            "opens it, or it belongs to another row. They were left as they are. The next engine "
+            "start keeps those secrets' rotation dates and seals a new fingerprint for each.",
+            len(rows) - len(updates),
+        )
+    return updates
 
 
 def _derive_body_digest_key(audit_key: bytes) -> bytes:
