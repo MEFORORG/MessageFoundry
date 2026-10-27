@@ -27,6 +27,7 @@ import pytest
 
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth.permissions import Permission
+from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.row_seal import RowSealError
@@ -41,6 +42,7 @@ from tests._approval_seal_contract import (
     _Sink,
     assert_approval_columns,
     assert_approval_seal_contract,
+    assert_tombstone_reseal_contract,
 )
 from tests._pending_approval_store_contract import _resolve, _StandingStore
 from tests.test_role_seal import _literal_text, _raw_for
@@ -202,6 +204,22 @@ async def test_rotation_leaves_a_failing_request_as_it_is(
     assert bad_row is not None and ApprovalRow.from_mapping(bad_row).seal == foreign
     good_row = await store.get_pending_approval(good)
     assert good_row is not None and approval_seal_ok(sealer, ApprovalRow.from_mapping(good_row))
+
+
+async def test_rotation_moves_a_tombstone_to_the_active_key(tmp_path: Path) -> None:
+    """BACKLOG #3638: a rejected request's tombstone fails its approval seal by design, so the
+    re-seal pass checks it as a tombstone and moves it to the active key rather than count it
+    refused on every rotation. A tombstone or a rejected row changed outside the store is still
+    refused. The control is the request rejected the ordinary way, re-sealed beside them."""
+    path = tmp_path / "tombstone.db"
+
+    async def open_store(key: str, retired: tuple[str, ...]) -> MessageStore:
+        return await MessageStore.open(path, cipher=make_cipher(key, list(retired), write_v2=True))
+
+    first, second = await assert_tombstone_reseal_contract(open_store, lambda _s: _raw_for(path))
+    # The sound request and the tombstone are re-sealed; the forged tombstone and the changed
+    # rejected row are refused, on this pass and on the next, which has nothing else to do.
+    assert first == (2, 2) and second == (0, 2)
 
 
 async def test_a_request_written_before_the_seal_is_named_at_open_and_refused(
@@ -395,6 +413,57 @@ async def test_a_seal_failed_reject_whose_audit_append_fails_moves_nothing(
     ] == [True]
 
 
+async def test_a_seal_failed_reject_that_loses_its_write_still_reports_the_read(
+    keyed: tuple[MessageStore, Path],
+) -> None:
+    """BACKLOG #3638, the Lander's decision of 2026-10-26: the reject's read reports a failing
+    request, throttled, as main's read does, so a reject whose write then moves nothing (another
+    writer changed the row between the read and the write) still leaves the audit row and the
+    alert. The control is the second reject in the interval, whose read reports nothing new."""
+    store, path = keyed
+    sink = _Sink()
+    raw = _raw_for(path)
+
+    class _Racing:
+        """``store``, except that the seal-failed reject finds the row changed again first."""
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(store, name)
+
+        async def reject_seal_failed_approval(self, approval_id: str, **kw: Any) -> bool:
+            await raw(
+                "UPDATE pending_approvals SET seal=? WHERE id=?",
+                (f"moved-{time.time_ns()}", approval_id),
+            )
+            return bool(await store.reject_seal_failed_approval(approval_id, **kw))
+
+    gate = ApprovalGate(
+        _StandingStore(_Racing()),
+        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
+        resolve_identity=_resolve,
+        alert_sink=sink,
+    )
+
+    async def run(_params: Any) -> dict[str, Any]:
+        return {}
+
+    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate, "race")
+    await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 2}', approval_id))
+
+    async def reported() -> int:
+        rows = await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=50)
+        return sum(approval_id in str(r["detail"]) for r in rows)
+
+    for _ in range(2):
+        with pytest.raises(ApprovalError) as lost:
+            await gate.reject(approval_id, approver="a")
+        assert lost.value.status == 409
+        assert await reported() == 1 and len(sink.reasons) == 1  # once, throttled
+    found = await store.get_pending_approval(approval_id)
+    assert found is not None and found["status"] == "pending"
+
+
 # --- static guards --------------------------------------------------------------------------
 
 _APPROVAL_READERS = frozenset(
@@ -465,23 +534,28 @@ def test_the_gate_reads_requests_through_its_seal_check() -> None:
 
 
 #: Where each backend may write ``pending_approvals``: each module-level statement and the one
-#: function that may use it. The tombstone is the seal-failed reject's narrow write (BACKLOG #3638). Every other INSERT, UPDATE, MERGE or DELETE of the table is a problem.
+#: function that may use it. The tombstone is the seal-failed reject's narrow write, and the
+#: tombstone re-seal is ``rotate-key``'s move of one to the active key (BACKLOG #3638). Every other
+#: INSERT, UPDATE, MERGE or DELETE of the table is a problem.
 _SEALING: dict[str, dict[str, frozenset[str]]] = {
     "store.py": {
         "_SQLITE_APPROVAL_INSERT": frozenset({"_write_approval"}),
         "_SQLITE_APPROVAL_INSERT_UNLESS_OPEN": frozenset({"_write_approval"}),
         "_SQLITE_APPROVAL_UPDATE": frozenset({"_write_approval"}),
         "_SQLITE_APPROVAL_TOMBSTONE": frozenset({"_tombstone_approval"}),
+        "_SQLITE_APPROVAL_TOMBSTONE_RESEAL": frozenset({"_reseal_tombstone"}),
     },
     "postgres.py": {
         "_PG_APPROVAL_INSERT": frozenset({"_write_approval"}),
         "_PG_APPROVAL_UPDATE": frozenset({"_write_approval"}),
         "_PG_APPROVAL_TOMBSTONE": frozenset({"_tombstone_approval"}),
+        "_PG_APPROVAL_TOMBSTONE_RESEAL": frozenset({"_reseal_tombstone"}),
     },
     "sqlserver.py": {
         "_MSSQL_APPROVAL_INSERT": frozenset({"_write_approval"}),
         "_MSSQL_APPROVAL_UPDATE": frozenset({"_write_approval"}),
         "_MSSQL_APPROVAL_TOMBSTONE": frozenset({"_tombstone_approval"}),
+        "_MSSQL_APPROVAL_TOMBSTONE_RESEAL": frozenset({"_reseal_tombstone"}),
     },
 }
 

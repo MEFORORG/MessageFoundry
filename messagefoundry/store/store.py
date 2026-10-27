@@ -3867,6 +3867,35 @@ def approval_tombstone(
     )
 
 
+def held_approval_tombstone(sealer: RowSealer | None, found: ByName) -> tuple[str, float] | None:
+    """The approver and decision time of ``found`` when it is a ``rejected`` row whose tombstone
+    seal (:func:`approval_tombstone`) holds under the key it names, the active one or a retired one
+    this process holds, or ``None``. ``rotate-key``'s re-seal moves such a row to the active key
+    rather than count it refused (BACKLOG #3638): a tombstone fails its approval seal by design.
+    A tombstone whose columns changed outside the store fails here too, and stays refused."""
+    if sealer is None:
+        return None
+    try:
+        approval_id, approver = found["id"], found["approver"]
+        decided_at, seal = found["decided_at"], found["seal"]
+        if (
+            found["status"] != "rejected"
+            or not isinstance(approval_id, str)
+            or not isinstance(approver, str)
+            or not isinstance(seal, str)
+            or isinstance(decided_at, bool)
+            or not isinstance(decided_at, int | float)
+        ):
+            return None
+        fields = approval_tombstone_fields(
+            approval_id, approver=approver, decided_at=float(decided_at)
+        )
+        held = sealer.verify_held(APPROVAL_TOMBSTONE_KIND, fields, seal)
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None
+    return (approver, float(decided_at)) if held else None
+
+
 def report_unsealed_approvals(count: int) -> None:
     """Name, at a keyed open, the open dual-control requests that carry no integrity seal (BACKLOG
     #2592). Each can no longer be released or settled, since nothing re-seals a row that fails. A
@@ -6425,6 +6454,12 @@ _SQLITE_APPROVAL_UPDATE = (
 _SQLITE_APPROVAL_TOMBSTONE = (
     "UPDATE pending_approvals SET status = 'rejected', approver = ?, decided_at = ?, seal = ?"
     " WHERE id = ? AND status = 'pending' AND seal = ?"
+)
+#: ``rotate-key``'s move of a tombstone to the active key (BACKLOG #3638). It writes the seal
+#: alone, on a row that is ``rejected`` in the SQL itself and still carries the seal read, so it can
+#: change no status and no other column. Binds the new tombstone, id and the seal read.
+_SQLITE_APPROVAL_TOMBSTONE_RESEAL = (
+    "UPDATE pending_approvals SET seal = ? WHERE id = ? AND status = 'rejected' AND seal = ?"
 )
 
 
@@ -15002,8 +15037,10 @@ class MessageStore:
     async def reseal_approval_records(self) -> tuple[int, int]:
         """Re-seal every approval request under the active key, for ``rotate-key`` (BACKLOG
         #2592), as :meth:`reseal_role_records` does for roles. Each is checked under the key its
-        seal names first; one that fails is left as it is and counted. Returns
-        ``(re-sealed, refused)``."""
+        seal names first; one that fails is left as it is and counted. A ``rejected`` tombstone
+        (BACKLOG #3638) fails its approval seal by design, so it is checked as a tombstone instead
+        (:func:`held_approval_tombstone`) and, when that holds, given a tombstone under the active
+        key and counted re-sealed. Returns ``(re-sealed, refused)``."""
         sealer = self._row_sealer
         if sealer is None:
             return 0, 0
@@ -15026,11 +15063,35 @@ class MessageStore:
                     current = ApprovalRow.from_mapping(found)
                     wrote = await self._write_approval(current, current=current)
                 except RowSealError:
-                    refused += 1
-                    continue
+                    tombstone = held_approval_tombstone(sealer, found)
+                    if tombstone is None:
+                        refused += 1
+                        continue
+                    wrote = await self._reseal_tombstone(
+                        approval_id, *tombstone, seal_read=found["seal"]
+                    )
                 await self._commit()
                 resealed += wrote
         return resealed, refused
+
+    async def _reseal_tombstone(
+        self, approval_id: str, approver: str, decided_at: float, *, seal_read: object
+    ) -> bool:
+        """The one writer of :data:`_SQLITE_APPROVAL_TOMBSTONE_RESEAL` (BACKLOG #3638). Call it
+        inside an open write, on a row :func:`held_approval_tombstone` passed, with what it returned
+        and the seal it read. Writes :func:`approval_tombstone` under the active key, so the row
+        stays a tombstone and never gains an approval seal."""
+        cur = await self._db.execute(
+            _SQLITE_APPROVAL_TOMBSTONE_RESEAL,
+            (
+                approval_tombstone(
+                    self._row_sealer, approval_id, approver=approver, decided_at=decided_at
+                ),
+                approval_id,
+                seal_read,
+            ),
+        )
+        return cur.rowcount > 0
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 

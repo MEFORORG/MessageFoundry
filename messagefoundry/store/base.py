@@ -2027,7 +2027,9 @@ class AuditStore(Protocol):
 
     async def reseal_approval_records(self) -> tuple[int, int]:
         """Re-seal every approval request under the active key, for ``rotate-key`` (BACKLOG
-        #2592). Returns ``(re-sealed, refused)``; one that fails its seal is left as it is."""
+        #2592). Returns ``(re-sealed, refused)``; one that fails its seal is left as it is. A
+        ``rejected`` tombstone (BACKLOG #3638) that holds as a tombstone is given one under the
+        active key and counted re-sealed, never refused."""
         ...
 
     async def audit_anchor(self) -> tuple[int, str]: ...

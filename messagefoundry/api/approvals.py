@@ -2045,9 +2045,10 @@ class ApprovalGate:
 
         A pending request that fails its integrity seal is rejected too (BACKLOG #3638; owner
         ruling 2026-10-26), by :meth:`_reject_seal_failed`, since nothing else would ever close
-        it once ``[approvals].expiry_hours`` is 0."""
+        it once ``[approvals].expiry_hours`` is 0. The read reports it first, throttled, as every
+        read of a failing request does, so a reject that then answers 409 still leaves a report."""
         try:
-            row = await self._require_pending(approval_id, report=False)
+            row = await self._require_pending(approval_id)
         except _SealRefusal as refusal:
             return await self._reject_seal_failed(
                 approval_id, refusal.found, approver=approver, client=client
@@ -2310,8 +2311,8 @@ class ApprovalGate:
         ``seal_failed`` only. The answer names the stored operation and requester, unverified,
         for the caller's page.
 
-        A row that moved, was settled or changed since the read answers 409 and reports nothing:
-        the call that moved it reported it, or the next read of it will. A store fault answers
+        A row that moved, was settled or changed since the read answers 409 and reports nothing
+        more: the gate's read reported it, throttled, before this write. A store fault answers
         503, logs and pages ``audit_write_failed`` for ``approval.rejected`` as any decision's
         fault does (:meth:`_store_fault`), and still reports the seal failure, throttled. That
         runs inside the shielded unit too, so a cancelled caller cannot skip the page. A defect in
@@ -2379,12 +2380,9 @@ class ApprovalGate:
             "rejected_by": approver,
         }
 
-    async def _require_pending(self, approval_id: str, *, report: bool = True) -> ApprovalRow:
+    async def _require_pending(self, approval_id: str) -> ApprovalRow:
         row = await self._load(
-            approval_id,
-            status="pending",
-            wrong=lambda current: f"request is already {current}",
-            report=report,
+            approval_id, status="pending", wrong=lambda current: f"request is already {current}"
         )
         if row.expires_at is not None and row.expires_at <= self._clock():
             raise ApprovalError(409, "request has expired")
@@ -2393,12 +2391,7 @@ class ApprovalGate:
     # --- the request loaders (BACKLOG #2592) -------------------------------------------------------
 
     async def _load(
-        self,
-        approval_id: str,
-        *,
-        status: str,
-        wrong: Callable[[str], str],
-        report: bool = True,
+        self, approval_id: str, *, status: str, wrong: Callable[[str], str]
     ) -> ApprovalRow:
         """The request ``approval_id`` names, in ``status``, its integrity seal checked. With
         :meth:`_verified_rows` and :meth:`_read_back_request`, which checks what it reads through
@@ -2412,8 +2405,8 @@ class ApprovalGate:
         than raising a tamper alarm. A status changed outside the store can only refuse here: a row
         that reads as wanted is still checked whole.
 
-        The seal refusal is a :class:`_SealRefusal` carrying the row read. ``report=False`` leaves
-        the report to the caller: :meth:`reject` writes its own, in its own write (BACKLOG #3638)."""
+        The seal refusal is a :class:`_SealRefusal` carrying the row read, so :meth:`reject` can
+        close it (BACKLOG #3638)."""
         found = await self._read(
             self._store.get_pending_approval(approval_id), what="this approval request"
         )
@@ -2421,7 +2414,7 @@ class ApprovalGate:
             raise ApprovalError(404, "no such approval request")
         if str(found["status"]) != status:
             raise ApprovalError(409, wrong(scrub_log_argument(str(found["status"]))))
-        row = await self._verified(found, report=report)
+        row = await self._verified(found)
         if row is None:
             raise _SealRefusal(found)
         return row
@@ -2441,21 +2434,18 @@ class ApprovalGate:
                 failed.append(each)
         return out
 
-    async def _verified(self, found: Any, *, report: bool = True) -> ApprovalRow | None:
+    async def _verified(self, found: Any) -> ApprovalRow | None:
         """``found`` as a checked :class:`ApprovalRow`, or ``None`` when its seal fails, which is
-        reported unless ``report`` is False. Its params and requester id are what a release acts
-        on and what the self-approval refusal compares, so a row changed outside the store acts
-        on nothing."""
+        reported. Its params and requester id are what a release acts on and what the
+        self-approval refusal compares, so a row changed outside the store acts on nothing."""
         try:
             row = ApprovalRow.from_mapping(found)
         except RowSealError:
-            if report:
-                await self._approval_seal_failed(str(found["id"]))
+            await self._approval_seal_failed(str(found["id"]))
             return None
         if approval_seal_ok(self._store.row_sealer(), row):
             return row
-        if report:
-            await self._approval_seal_failed(row.id)
+        await self._approval_seal_failed(row.id)
         return None
 
     async def _approval_seal_failed(self, approval_id: str) -> None:

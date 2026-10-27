@@ -282,6 +282,7 @@ from messagefoundry.store.store import (
     first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
+    held_approval_tombstone,
     if_applied,
     judge_totp,
     load_audit_chain,
@@ -844,6 +845,12 @@ _MSSQL_APPROVAL_TOMBSTONE: Final = (
     "UPDATE pending_approvals SET status = 'rejected', approver = ?, decided_at = ?, seal = ?"
     " OUTPUT inserted.id WHERE id = ? AND status = 'pending'"
     " AND seal COLLATE Latin1_General_100_BIN2 = ?"
+)
+#: store.py's ``_SQLITE_APPROVAL_TOMBSTONE_RESEAL`` (BACKLOG #3638), which states the contract,
+#: with an ``OUTPUT`` so the caller learns whether it landed. Used only by `_reseal_tombstone`.
+_MSSQL_APPROVAL_TOMBSTONE_RESEAL: Final = (
+    "UPDATE pending_approvals SET seal = ? OUTPUT inserted.id WHERE id = ?"
+    " AND status = 'rejected' AND seal COLLATE Latin1_General_100_BIN2 = ?"
 )
 # The role write and the map seal write (BACKLOG #2592), each a MERGE under HOLDLOCK; store.py
 # states the contract. Used only by `_write_role` and `_write_ad_map`.
@@ -13066,8 +13073,7 @@ class SqlServerStore:
                     )
                     locked = await self._fetch_dicts(cur)
                     if locked:
-                        current = ApprovalRow.from_mapping(locked[0])
-                        resealed += await self._write_approval(cur, current, current=current)
+                        resealed += await self._reseal_approval(cur, locked[0])
                     await self._commit(conn)
                 except RowSealError:
                     await conn.rollback()
@@ -13076,6 +13082,38 @@ class SqlServerStore:
                     await conn.rollback()
                     raise
         return resealed, refused
+
+    async def _reseal_approval(self, cur: Any, found: Mapping[str, Any]) -> bool:
+        """One row of :meth:`reseal_approval_records`, read under its lock: re-sealed as a request,
+        or, when it fails that seal, as a tombstone that holds (BACKLOG #3638). Raises
+        :class:`RowSealError` when neither holds; store.py's twin states the contract."""
+        try:
+            current = ApprovalRow.from_mapping(found)
+            return await self._write_approval(cur, current, current=current)
+        except RowSealError:
+            tombstone = held_approval_tombstone(self._row_sealer, found)
+            if tombstone is None:
+                raise
+            return await self._reseal_tombstone(
+                cur, str(found["id"]), *tombstone, seal_read=found["seal"]
+            )
+
+    async def _reseal_tombstone(
+        self, cur: Any, approval_id: str, approver: str, decided_at: float, *, seal_read: object
+    ) -> bool:
+        """The one writer of :data:`_MSSQL_APPROVAL_TOMBSTONE_RESEAL` (BACKLOG #3638); store.py's
+        ``MessageStore._reseal_tombstone`` states the contract."""
+        await cur.execute(
+            _MSSQL_APPROVAL_TOMBSTONE_RESEAL,
+            (
+                approval_tombstone(
+                    self._row_sealer, approval_id, approver=approver, decided_at=decided_at
+                ),
+                approval_id,
+                seal_read,
+            ),
+        )
+        return bool(await cur.fetchall())
 
     async def _execute_with_audits(
         self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float

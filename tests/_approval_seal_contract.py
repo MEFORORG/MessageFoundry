@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import fields
+from dataclasses import replace as dataclass_replace
 from typing import Any
 from uuid import uuid4
 
@@ -474,6 +475,65 @@ async def assert_seal_failed_reject_contract(store: Any, raw: RawSql) -> None:
     await raw("UPDATE pending_approvals SET status=? WHERE id=?", ("pending", reopened))
     assert (await h.gate.reject(reopened, approver=_APPROVER))["rejected_by"] == _APPROVER
     assert (await h.row(reopened)).status == "rejected"
+
+
+async def assert_tombstone_reseal_contract(
+    open_store: Callable[[str, tuple[str, ...]], Awaitable[Any]],
+    raw_for: Callable[[Any], RawSql],
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """``rotate-key``'s re-seal moves a rejected request's tombstone to the active key (BACKLOG
+    #3638), so a closed request is not counted refused on every later rotation, and still refuses
+    a tombstone or a rejected row changed outside the store.
+
+    ``open_store(key, retired)`` opens a store on one database under ``key``, holding ``retired``;
+    ``raw_for(store)`` is the raw runner for it. Returns ``(re-sealed, refused)`` for the re-seal
+    pass and for a second pass after it, which a caller with a database of its own pins; the server legs share their table with other
+    tests, whose rows count too, so the per-row checks here are the contract."""
+    from messagefoundry.store.crypto import generate_key
+
+    old, new = generate_key(), generate_key()
+    store = await open_store(old, ())
+    try:
+        raw = raw_for(store)
+        h = _Harness(store, raw)
+        sound = await h.request()  # control: a rejected request under its own approval seal
+        await h.gate.reject(sound, approver=_APPROVER)
+        tombstoned = await h.request()
+        await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"t": 1}', tombstoned))
+        await h.gate.reject(tombstoned, approver=_APPROVER)
+        forged = await h.request()  # a tombstone whose approver was changed after the reject
+        await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"f": 1}', forged))
+        await h.gate.reject(forged, approver=_APPROVER)
+        await raw("UPDATE pending_approvals SET approver=? WHERE id=?", ("someone-else", forged))
+        changed = await h.request()  # a rejected row sealed normally, then changed
+        await h.gate.reject(changed, approver=_APPROVER)
+        await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"c": 1}', changed))
+        before = {i: await h.row(i) for i in (tombstoned, forged, changed)}
+    finally:
+        await store.close()
+
+    rotated = await open_store(new, (old,))
+    try:
+        sealer = rotated.row_sealer()
+        assert sealer is not None
+        h = _Harness(rotated, raw_for(rotated))
+        counts = await rotated.reseal_approval_records()
+        resealed = await h.row(sound)  # control
+        assert sealer.is_active(resealed.seal) and approval_seal_ok(sealer, resealed)
+        moved = await h.row(tombstoned)
+        assert sealer.is_active(moved.seal) and not approval_seal_ok(sealer, moved)
+        assert moved == dataclass_replace(before[tombstoned], seal=moved.seal)  # the seal alone
+        assert moved.decided_at is not None and moved.approver == _APPROVER
+        assert moved.seal == approval_tombstone(
+            sealer, tombstoned, approver=_APPROVER, decided_at=moved.decided_at
+        )
+        for refused in (forged, changed):
+            assert await h.row(refused) == before[refused], refused  # left as it was
+        again = await rotated.reseal_approval_records()  # the moved tombstone has no more work
+        assert await h.row(tombstoned) == moved
+    finally:
+        await rotated.close()
+    return counts, again
 
 
 class _Hooked:
