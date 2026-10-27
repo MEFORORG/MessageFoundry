@@ -13,8 +13,14 @@ This file covers the read (``inflight_by_lane``), the runner's in-flight watch t
 the two ``pooled`` rows of P3-03's measured table as failure-injection tests:
 
 * ``route_handoff`` raises once: T17 re-pends the head and the message routes, no restart.
-* ``route_handoff`` AND ``reschedule_claimed`` each raise once: the row strands. It still strands (part
-  B ships no reclaim; see ``_check_inflight_strands``), and now the in-flight watch pages it.
+* ``route_handoff`` AND ``reschedule_claimed`` each raise once: before step 2 the row stranded until
+  a restart, and the in-flight watch paged it.
+
+Step 2 part A recovers it with no restart and no clock: a holder whose re-pend fails retries it
+while it holds the lane, leader-gated after the first write. The last tests show it in both claim
+modes, in FIFO order, with a control that restores the one-shot re-pend and goes red; the leader
+gate; and a prompt stop. A worker killed by a ``BaseException`` still strands its row until the next
+start, as before; recovering it at the worker's respawn is part B, not here.
 """
 
 from __future__ import annotations
@@ -29,7 +35,12 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import BuildupThreshold, ConnectorType, StallThreshold
+from messagefoundry.config.models import (
+    BatchConfig,
+    BuildupThreshold,
+    ConnectorType,
+    StallThreshold,
+)
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -44,6 +55,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1611B|P|2.5.1\r"
+RAW_B = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1611C|P|2.5.1\r"
 
 
 @pytest.fixture
@@ -445,50 +457,673 @@ async def test_pooled_route_handoff_fault_recovers_through_t17(
         await runner.stop()
 
 
-async def test_pooled_double_fault_strands_and_the_watch_pages_it(
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+async def test_a_store_that_stays_down_keeps_the_row_in_flight_and_the_watch_pages_it(
     store: MessageStore,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    claim_mode: str,
 ) -> None:
-    """P3-03's second pooled row: ``route_handoff`` AND ``reschedule_claimed`` each raise once. T17's
-    own re-pend fails, so the row stays ``inflight``, and ``pending_depth`` reads the lane empty.
+    """``route_handoff`` raises once and ``reschedule_claimed`` keeps raising. The holder retries its
+    re-pend (step 2), and nothing it does hides the strand: the row stays in flight, the lane reads
+    empty to ``pending_depth``, and the in-flight watch pages it. Once the store heals, the retry
+    lands and the message routes with no restart and no reload.
 
-    It STILL strands after part B, by design: no reclaim shipped, because the pooled serializer holds
-    claimed rows this runner cannot see, and re-pending a held row sends it twice. What changed is that
-    the strand now pages. If a safe reclaim ever lands, this test is the one to flip: the row should
-    then route instead of staying in flight."""
-    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.01)
-    monkeypatch.setattr(wiring_runner, "_INFLIGHT_WATCH_INTERVAL_SECONDS", 0.05)
+    Before step 2 this was P3-03's second pooled row and stayed stranded until a restart."""
+    _fast_backoffs(monkeypatch)
     calls: dict[str, int] = {}
     _fail_once(monkeypatch, store, "route_handoff", calls)
-    _fail_once(monkeypatch, store, "reschedule_claimed", calls)
+    down = _fail_while(monkeypatch, store, "reschedule_claimed", calls)
     sink = _RecordingSink()
     runner = RegistryRunner(
         _registry(tmp_path),
         store,
         alert_sink=sink,
         buildup_default=BuildupThreshold(max_oldest_seconds=0.3),
-        claim_mode="pooled",
+        claim_mode=claim_mode,
         pooled_sweep_interval=0.05,
         egress=EgressSettings(deny_by_default=False),
     )
-    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+    with caplog.at_level(logging.WARNING):
         await runner.start()
         try:
             mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
-            runner._dispatchers[Stage.INGRESS].mark_ready("IB")
+            runner.notify_work()
 
             async def paged() -> bool:
                 return "held in flight on ingress lane 'IB'" in caplog.text
 
             await _until(paged)
-            # Both faults fired, once each, and nothing retried the row after them.
-            assert calls == {"route_handoff": 1, "reschedule_claimed": 1}
-            msg = await store.get_message(mid)
-            assert msg is not None and msg["status"] == MessageStatus.RECEIVED.value
+            assert calls["reschedule_claimed"] >= 2  # retried, not given up after one
+            assert await _status(store, mid) == MessageStatus.RECEIVED.value
             assert await _ingress_inflight(store) == 1
             assert await store.pending_depth("IB", stage=Stage.INGRESS.value) == (0, None)
             assert any(name == "IB" and depth == 1 for name, depth, _ in sink.buildup)
+            assert "holding the lane and retrying" in caplog.text
+            down.clear()  # the store heals
+
+            async def routed() -> bool:
+                return await _status(store, mid) != MessageStatus.RECEIVED.value
+
+            await _until(routed)
+            assert await _ingress_inflight(store) == 0
         finally:
             await runner.stop()
+
+
+# --- step 2: recover without a restart, and never re-pend a held row -------------------------------
+
+
+def _fast_backoffs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.01)
+    monkeypatch.setattr(stage_dispatcher, "_REPEND_RETRY_CAP_SECONDS", 0.05)
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.01)
+    monkeypatch.setattr(wiring_runner, "_REPEND_RETRY_CAP_SECONDS", 0.05)
+    monkeypatch.setattr(wiring_runner, "_INFLIGHT_WATCH_INTERVAL_SECONDS", 0.05)
+
+
+def _fail_while(
+    monkeypatch: pytest.MonkeyPatch, obj: Any, attr: str, calls: dict[str, int]
+) -> asyncio.Event:
+    """``attr`` raises while the returned Event is set: a store that stays down until the test heals
+    it."""
+    real = getattr(obj, attr)
+    down = asyncio.Event()
+    down.set()
+
+    async def flaky(*a: Any, **k: Any) -> Any:
+        calls[attr] = calls.get(attr, 0) + 1
+        if down.is_set():
+            raise RuntimeError(f"simulated store outage in {attr}")
+        return await real(*a, **k)
+
+    monkeypatch.setattr(obj, attr, flaky)
+    return down
+
+
+async def _status(store: MessageStore, mid: str) -> str | None:
+    msg = await store.get_message(mid)
+    return None if msg is None else str(msg["status"])
+
+
+def _record_handoffs(
+    monkeypatch: pytest.MonkeyPatch,
+    store: MessageStore,
+    handed_off: list[str],
+    *,
+    before: Any = None,
+) -> None:
+    """Wrap ``route_handoff``: run ``before(message_id)`` first (it may raise, or hold), then record
+    the message id of every handoff that COMMITTED, in commit order. Layered over any ``_fail_once``
+    already installed."""
+    real = store.route_handoff
+
+    async def recording(*a: Any, **k: Any) -> Any:
+        if before is not None:
+            await before(k["message_id"])
+        result = await real(*a, **k)
+        handed_off.append(k["message_id"])
+        return result
+
+    monkeypatch.setattr(store, "route_handoff", recording)
+
+
+def _one_shot_repend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CONTROL: put back the pre-step-2 behaviour, one re-pend attempt and then move on, in both
+    claim modes. A test that cannot tell this from the shipped code proves nothing."""
+
+    async def once_per_lane(
+        self: RegistryRunner, worker: str, name: str, ids: Any, *, faults: Any = None
+    ) -> bool:
+        with contextlib.suppress(Exception):
+            await self.store.reschedule_claimed(list(ids), time.time())
+        return False
+
+    async def once_pooled(self: Any, lane: str, what: str, write: Any) -> bool:
+        with contextlib.suppress(Exception):
+            await write()
+        return True
+
+    monkeypatch.setattr(RegistryRunner, "_repend_claimed_on_fault", once_per_lane)
+    monkeypatch.setattr(stage_dispatcher.StageDispatcher, "_land_while_holding", once_pooled)
+
+
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+@pytest.mark.parametrize("variant", ["shipped", "control"])
+async def test_a_double_fault_routes_without_a_restart_and_nothing_overtakes_it(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claim_mode: str,
+    variant: str,
+) -> None:
+    """``route_handoff`` AND the holder's re-pend each raise once, then succeed. Message A is the one
+    that faults; B arrives on the same lane while A is stranded. Shipped: the holder retries its
+    re-pend while it holds the lane, so A routes first, then B, with no restart and no reload.
+
+    The ``control`` variant restores the one-shot re-pend this step replaced: A stays in flight and
+    B overtakes it, which is the defect."""
+    _fast_backoffs(monkeypatch)
+    if variant == "control":
+        _one_shot_repend(monkeypatch)
+    calls: dict[str, int] = {}
+    _fail_once(monkeypatch, store, "reschedule_claimed", calls)
+    second: list[str] = []
+
+    async def fault_a_once(message_id: str) -> None:
+        calls["route_handoff"] = calls.get("route_handoff", 0) + 1
+        if calls["route_handoff"] == 1:
+            # B lands while A is claimed, so only a lane that is held keeps B behind A.
+            second.append(await store.enqueue_ingress(channel_id="IB", raw=RAW_B))
+            raise RuntimeError("simulated transient store fault in route_handoff")
+
+    handed_off: list[str] = []
+    _record_handoffs(monkeypatch, store, handed_off, before=fault_a_once)
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        claim_mode=claim_mode,
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    try:
+        a = await store.enqueue_ingress(channel_id="IB", raw=RAW)
+        runner.notify_work()
+
+        async def b_routed() -> bool:
+            return bool(second) and second[0] in handed_off
+
+        await _until(b_routed)
+        if variant == "control":
+            assert handed_off == [second[0]]  # B overtook A
+            assert await _ingress_inflight(store) == 1  # and A is stranded
+            return
+
+        async def a_routed() -> bool:
+            return a in handed_off
+
+        await _until(a_routed)
+        assert handed_off == [a, second[0]]  # FIFO: A, then B
+        assert calls["reschedule_claimed"] >= 2  # the first re-pend failed and was retried
+        assert await _ingress_inflight(store) == 0
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+async def test_a_stop_during_the_retry_exits_promptly_and_leaves_the_row_in_flight(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, claim_mode: str
+) -> None:
+    """The re-pend keeps failing and its backoff is long (30 s). A stop must end the retry at once,
+    not after the backoff, and leave the row INFLIGHT for the next start's reset, as before."""
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 30.0)
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 30.0)
+    calls: dict[str, int] = {}
+    _fail_once(monkeypatch, store, "route_handoff", calls)
+    _fail_while(monkeypatch, store, "reschedule_claimed", calls)
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        claim_mode=claim_mode,
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    stopped = False
+    try:
+        await store.enqueue_ingress(channel_id="IB", raw=RAW)
+        runner.notify_work()
+
+        async def retrying() -> bool:
+            return calls.get("reschedule_claimed", 0) >= 1
+
+        await _until(retrying)
+        await asyncio.sleep(0.1)  # now inside the 30 s backoff
+        started = time.monotonic()
+        await asyncio.wait_for(runner.stop(), timeout=10.0)
+        stopped = True
+        assert time.monotonic() - started < 5.0  # far inside the 30 s backoff
+        assert calls["reschedule_claimed"] == 1  # no retry ran during the stop
+        assert await _ingress_inflight(store) == 1
+    finally:
+        if not stopped:
+            await runner.stop()
+
+
+@pytest.mark.parametrize("variant", ["shipped", "control-ignores-stop"])
+async def test_a_stop_during_the_batch_extras_hold_ends_the_pass_promptly(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """The pooled batch guard re-pends the coalesced extras itself, now holding the lane until that
+    lands. A stop during its 30 s backoff must end the hold at once: the guard re-raises the batch's
+    fault, so the dispatcher's T17 arm still owns the head, and the extras stay in flight for the
+    next start. The control makes the backoff deaf to the stop; the pass then outlives it."""
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 30.0)
+    runner = RegistryRunner(
+        _registry(tmp_path), store, egress=EgressSettings(deny_by_default=False)
+    )
+    for _ in range(3):
+        await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=1.0)
+    head = await store.claim_next_fifo("OB", now=2.0)
+    assert head is not None
+    calls: dict[str, int] = {}
+    _fail_while(monkeypatch, store, "reschedule_claimed", calls)
+
+    async def coalesce_then_fault(name: str, cfg: Any, items: list[Any]) -> Any:
+        for _ in range(2):
+            more = await store.claim_next_fifo(name, now=2.0)
+            assert more is not None
+            items.append(more)
+        raise RuntimeError("simulated store fault after coalescing")
+
+    monkeypatch.setattr(runner, "_deliver_coalesced_batch", coalesce_then_fault)
+    if variant == "control-ignores-stop":
+        real_sleep = runner._stop_or_sleep
+
+        async def deaf(delay: float) -> bool:
+            await asyncio.sleep(delay)
+            return await real_sleep(0.0)
+
+        monkeypatch.setattr(runner, "_stop_or_sleep", deaf)
+    cfg = BatchConfig(max_count=3, max_wait_ms=1)
+    task = asyncio.ensure_future(runner._process_delivery_batch("OB", head, cfg))
+
+    async def holding() -> bool:
+        return calls.get("reschedule_claimed", 0) >= 1
+
+    await _until(holding)
+    runner._stop.set()
+    if variant == "control-ignores-stop":
+        done, _ = await asyncio.wait({task}, timeout=0.5)
+        assert not done  # the hold outlived the stop: the case this test exists to catch
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return
+    with pytest.raises(RuntimeError, match="simulated store fault after coalescing"):
+        await asyncio.wait_for(task, timeout=5.0)
+    assert calls["reschedule_claimed"] == 1  # no retry ran after the stop
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {"OB": (3, 2.0)}
+
+
+# --- step 2: a node that is not the leader sends no re-pend RETRY -----------------------------------
+# StageDispatcher._land_while_holding's docstring says why; the first write is always sent.
+
+
+class _Lease(NullCoordinator):
+    """A coordinator whose leadership the test flips."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.held = True
+
+    def is_leader(self) -> bool:
+        return self.held
+
+
+async def _claimed_ingress_row(store: MessageStore) -> str:
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
+    item = await store.claim_next_fifo("IB", now=2.0, stage=Stage.INGRESS.value)
+    assert item is not None
+    return item.id
+
+
+def _bare_dispatcher(store: MessageStore, **kwargs: Any) -> stage_dispatcher.StageDispatcher:
+    return stage_dispatcher.StageDispatcher(
+        Stage.INGRESS,
+        store,
+        process_item=None,  # type: ignore[arg-type]  # the retry under test never runs a body
+        lane_provider=set,
+        per_lane_limit=1,
+        **kwargs,
+    )
+
+
+# Each case: (leader at the start, lose the lease during the first write, what the 3rd backoff does).
+_LEASE_CASES = {
+    "control-kept": (True, False, None),
+    "lost-during-the-write-then-stop": (True, True, "stop"),
+    "not-the-leader-from-the-start-then-stop": (False, False, "stop"),
+    "lost-then-regained-with-no-teardown": (True, True, "regain"),
+}
+
+
+@pytest.mark.parametrize("case", list(_LEASE_CASES))
+async def test_the_pooled_repend_retry_sends_nothing_while_not_the_leader(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+) -> None:
+    """The serializer's first re-pend fails, the store then heals. Kept lease (the control): the
+    retry lands after one backoff. Not the leader, from the start or from the failing write on:
+    the first write is still sent (ADR 0157 C1), then no retry while it lasts, one WARNING, and the
+    stop the demotion teardown sends returns False with the row in flight. Leading again with no
+    teardown resumes the retry, which lands."""
+    _fast_backoffs(monkeypatch)
+    leader, lose_in_write, third_backoff = _LEASE_CASES[case]
+    lease = _Lease()
+    lease.held = leader
+    dispatcher = _bare_dispatcher(store, is_leader=lease.is_leader)
+    row = await _claimed_ingress_row(store)
+    writes = 0
+
+    async def repend() -> None:
+        nonlocal writes
+        writes += 1
+        if lose_in_write:
+            lease.held = False
+        if writes == 1:
+            raise RuntimeError("simulated store outage in release_claimed")
+        await store.release_claimed([row])
+
+    backoffs = 0
+    real_sleep = dispatcher._sleep_or_stop
+
+    async def backoff(seconds: float) -> None:
+        nonlocal backoffs
+        backoffs += 1
+        if backoffs == 3 and third_backoff == "regain":
+            lease.held = True
+        elif backoffs == 3 and third_backoff == "stop":
+            dispatcher._stop.set()
+        await real_sleep(seconds)
+
+    monkeypatch.setattr(dispatcher, "_sleep_or_stop", backoff)
+    with caplog.at_level(logging.WARNING):
+        landed = await dispatcher._land_while_holding("IB", "release_claimed of 1 row(s)", repend)
+    held_lines = caplog.text.count("this node is not the leader")
+    if case == "control-kept":
+        assert (landed, writes, backoffs, held_lines) == (True, 2, 1, 0)
+    elif third_backoff == "regain":
+        assert (landed, writes, backoffs, held_lines) == (True, 2, 3, 1)
+    else:
+        assert (landed, writes, backoffs, held_lines) == (False, 1, 3, 1)
+    assert await _ingress_inflight(store) == (0 if landed else 1)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "control-kept",
+        "lost-during-the-backoff-then-stop",
+        "not-the-leader-from-the-start-then-stop",
+        "lost-then-regained",
+    ],
+)
+async def test_the_per_lane_repend_retry_sends_nothing_while_not_the_leader(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """The per-lane twin. The first re-pend fails, on a non-leader too, and the store heals during
+    the backoff after it. Kept lease (the control): the retry lands. Not the leader after that
+    backoff: no retry is sent, and the teardown's stop returns True, so the caller returns rather
+    than claiming past the held row. Lease regained with no teardown: the retry resumes and lands."""
+    _fast_backoffs(monkeypatch)
+    lease = _Lease()
+    lease.held = case != "not-the-leader-from-the-start-then-stop"
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        coordinator=lease,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    row = await _claimed_ingress_row(store)
+    calls: dict[str, int] = {}
+    down = _fail_while(monkeypatch, store, "reschedule_claimed", calls)
+    real_sleep = runner._stop_or_sleep
+    backoffs = 0
+
+    async def backoff(delay: float) -> bool:
+        nonlocal backoffs
+        backoffs += 1
+        if backoffs == 1:
+            down.clear()  # the store heals
+            lease.held = case == "control-kept"
+        elif backoffs == 3:
+            if case == "lost-then-regained":
+                lease.held = True
+            else:
+                runner._stop.set()
+        return await real_sleep(delay)
+
+    monkeypatch.setattr(runner, "_stop_or_sleep", backoff)
+    stopped = await runner._repend_claimed_on_fault("router", "IB", [row])
+    if case.endswith("-then-stop"):
+        assert (stopped, calls["reschedule_claimed"], backoffs) == (True, 1, 3)
+        assert await _ingress_inflight(store) == 1
+    else:
+        expected_backoffs = 1 if case == "control-kept" else 3
+        assert (stopped, calls["reschedule_claimed"], backoffs) == (False, 2, expected_backoffs)
+        assert await _ingress_inflight(store) == 0
+
+
+async def test_the_runner_hands_its_coordinators_leadership_to_every_dispatcher(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """``_make_dispatcher`` wires the coordinator's ``is_leader``, read live, so a demotion reaches a
+    pooled serializer's retry. A dispatcher built without one is a single node: always the leader."""
+    lease = _Lease()
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        claim_mode="pooled",
+        coordinator=lease,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    for stage in Stage:
+        dispatcher = runner._make_dispatcher(stage)
+        lease.held = True
+        assert dispatcher._is_leader() is True
+        lease.held = False
+        assert dispatcher._is_leader() is False
+    assert _bare_dispatcher(store)._is_leader() is True
+
+
+# --- step 2: the stop, the park date, the warning ------------------------------------------
+
+
+async def _ingress_status(store: MessageStore, mid: str) -> str | None:
+    cur = await store._db.execute(
+        "SELECT status FROM queue WHERE stage=? AND message_id=?", (Stage.INGRESS.value, mid)
+    )
+    row = await cur.fetchone()
+    return None if row is None else str(row["status"])
+
+
+async def test_a_stop_already_set_is_read_before_a_zero_delay(store: MessageStore) -> None:
+    """On Python 3.14 ``wait_for(event.wait(), 0)`` raises ``TimeoutError`` even on a SET event,
+    so a zero-delay sleep would report no stop. The dispatcher's ``_sleep_or_stop`` reads a set
+    stop first, so a held lane's retry ends at once on a stop."""
+    dispatcher = _bare_dispatcher(store)
+    dispatcher._stop.set()
+    await asyncio.wait_for(dispatcher._sleep_or_stop(0.0), timeout=1.0)
+
+
+def _lane_run(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, head: str, tail: list[str], when: float
+) -> tuple[stage_dispatcher.StageDispatcher, list[Any]]:
+    """A bare dispatcher whose serializer drained to a T17 RETRY: re-pend ``head`` dated ``when``
+    and release ``tail``. Returns it and the list each applied RETRY outcome lands in."""
+    dispatcher = _bare_dispatcher(store)
+    outcome = stage_dispatcher._LaneOutcome(
+        stage_dispatcher.LaneResultKind.RETRY, when, is_infra_fault=True
+    )
+
+    async def drained(lane: str, items: Any) -> Any:
+        return outcome, tail, (head, when)
+
+    applied: list[Any] = []
+    monkeypatch.setattr(dispatcher, "_drain_lane", drained)
+    monkeypatch.setattr(dispatcher, "_apply_retry", lambda lane, st, out: applied.append(out))
+    dispatcher._states["IB"] = stage_dispatcher._LaneState()
+    return dispatcher, applied
+
+
+@pytest.mark.parametrize("leader", [True, False])
+async def test_a_stop_during_the_head_retry_still_sends_the_tail_release_once(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    leader: bool,
+) -> None:
+    """The head's re-pend keeps failing and a stop lands during its backoff. On the leader the
+    tail release is still sent once, and lands: the tail is pending again for the next start, the
+    head stays in flight for its reset. Before, the stop returned first and the tail stayed in
+    flight too. Not the leader, the late write is not sent, since a successor may hold the rows.
+    Either way a WARNING names the rows left in flight, which quiesce cannot see."""
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
+    await store.enqueue_ingress(channel_id="IB", raw=RAW_B, now=1.0)
+    head, tail = await store.claim_next_fifo_batch(
+        "IB", stage=Stage.INGRESS.value, limit=2, now=2.0
+    )
+    calls: dict[str, int] = {}
+    _fail_while(monkeypatch, store, "reschedule_claimed", calls)
+    released: list[list[str]] = []
+    real_release = store.release_claimed
+
+    async def recording_release(ids: list[str]) -> Any:
+        released.append(list(ids))
+        return await real_release(ids)
+
+    monkeypatch.setattr(store, "release_claimed", recording_release)
+    dispatcher, applied = _lane_run(store, monkeypatch, head.id, [tail.id], time.time() + 60.0)
+
+    async def stop_now(seconds: float) -> None:
+        dispatcher._stop.set()
+
+    monkeypatch.setattr(dispatcher, "_sleep_or_stop", stop_now)
+    monkeypatch.setattr(dispatcher, "_is_leader", lambda: leader)
+    with caplog.at_level(logging.WARNING):
+        await dispatcher._run_lane("IB", [head, tail])
+    assert calls["reschedule_claimed"] == 1
+    assert released == ([[tail.id]] if leader else [])
+    expected_tail = "pending" if leader else "inflight"
+    assert await _ingress_status(store, tail.message_id) == expected_tail
+    assert await _ingress_status(store, head.message_id) == "inflight"
+    assert applied == []  # stopped: no terminal transition
+    held = 1 if leader else 2
+    assert f"stopped while holding {held} claimed row(s)" in caplog.text
+
+
+async def test_a_held_lane_pages_lane_stuck_once_at_the_infra_fault_bound(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held lane never reaches ``_apply_retry``, so the ADR 0070 streak cannot page it. The hold
+    raises one ``lane_stuck`` at ``infra_fault_stop_after`` consecutive failures, not one per
+    failure after it."""
+    _fast_backoffs(monkeypatch)
+    sink = _RecordingSink()
+    stuck: list[str] = []
+    monkeypatch.setattr(sink, "lane_stuck", lambda name, *, detail: stuck.append(detail))
+    dispatcher = _bare_dispatcher(store, alert_sink=sink, infra_fault_stop_after=3)
+    failures = 0
+
+    async def failing() -> None:
+        nonlocal failures
+        failures += 1
+        if failures <= 5:
+            raise RuntimeError("simulated store outage")
+
+    dispatcher._states["IB"] = stage_dispatcher._LaneState()
+    assert await dispatcher._land_while_holding("IB", "release_claimed", failing) is True
+    assert failures == 6
+    assert len(stuck) == 1 and "failed 3 consecutive times" in stuck[0]
+    # Marked alerted, so _apply_retry's retry_forever page does not repeat it this episode.
+    assert dispatcher._states["IB"].lane_stuck_alerted is True
+
+    def broken(name: str, *, detail: str) -> None:
+        raise RuntimeError("simulated alert sink fault")
+
+    monkeypatch.setattr(sink, "lane_stuck", broken)
+    failures = 0
+    # A raising sink is logged, never raised: the serializer still holds the lane.
+    assert await dispatcher._land_while_holding("IB", "release_claimed", failing) is True
+
+
+async def test_a_head_retry_that_overruns_its_date_parks_the_lane_until_the_date_written(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The head's re-pend fails once and the retry lands after ``when`` has passed, so the head is
+    dated from now instead. The lane parks until that date, not the old ``when``, which would wake
+    it at once for an empty claim."""
+    _fast_backoffs(monkeypatch)
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
+    head = await store.claim_next_fifo("IB", stage=Stage.INGRESS.value, now=2.0)
+    assert head is not None
+    calls: dict[str, int] = {}
+    _fail_once(monkeypatch, store, "reschedule_claimed", calls)
+    when = time.time() + 0.05
+    dispatcher, applied = _lane_run(store, monkeypatch, head.id, [], when)
+    real_sleep = dispatcher._sleep_or_stop
+
+    async def overrun(seconds: float) -> None:
+        await real_sleep(0.1)  # past `when`
+
+    monkeypatch.setattr(dispatcher, "_sleep_or_stop", overrun)
+    await dispatcher._run_lane("IB", [head])
+    assert calls["reschedule_claimed"] == 2
+    (outcome,) = applied
+    cur = await store._db.execute("SELECT next_attempt_at FROM queue WHERE id=?", (head.id,))
+    row = await cur.fetchone()
+    assert row is not None
+    assert outcome.park_until == pytest.approx(row["next_attempt_at"])
+    assert outcome.park_until > when
+
+
+async def test_a_second_leadership_loss_in_one_retry_warns_again(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Pooled and per-lane: the re-pend fails, the lease is lost (one WARNING), regained (the retry
+    is sent and fails again), and lost again. The second loss warns too; before, it was silent."""
+    _fast_backoffs(monkeypatch)
+    lease = _Lease()
+    dispatcher = _bare_dispatcher(store, is_leader=lease.is_leader)
+    backoffs = 0
+
+    def flip(stop: asyncio.Event) -> None:
+        nonlocal backoffs
+        backoffs += 1
+        if backoffs in (1, 3):
+            lease.held = False
+        elif backoffs == 2:
+            lease.held = True
+        elif backoffs == 4:
+            stop.set()
+
+    async def failing() -> None:
+        raise RuntimeError("simulated store outage")
+
+    real_sleep = dispatcher._sleep_or_stop
+
+    async def pooled_backoff(seconds: float) -> None:
+        flip(dispatcher._stop)
+        await real_sleep(seconds)
+
+    monkeypatch.setattr(dispatcher, "_sleep_or_stop", pooled_backoff)
+    with caplog.at_level(logging.WARNING):
+        assert await dispatcher._land_while_holding("IB", "release_claimed", failing) is False
+    assert caplog.text.count("this node is not the leader") == 2
+
+    caplog.clear()
+    backoffs = 0
+    lease.held = True
+    runner = RegistryRunner(
+        _registry(tmp_path), store, coordinator=lease, egress=EgressSettings(deny_by_default=False)
+    )
+    row = await _claimed_ingress_row(store)
+    _fail_while(monkeypatch, store, "reschedule_claimed", {})
+    real_runner_sleep = runner._stop_or_sleep
+
+    async def per_lane_backoff(delay: float) -> bool:
+        flip(runner._stop)
+        return await real_runner_sleep(delay)
+
+    monkeypatch.setattr(runner, "_stop_or_sleep", per_lane_backoff)
+    with caplog.at_level(logging.WARNING):
+        assert await runner._repend_claimed_on_fault("router", "IB", [row]) is True
+    assert caplog.text.count("this node is not the leader") == 2

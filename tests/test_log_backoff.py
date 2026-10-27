@@ -652,7 +652,8 @@ async def test_a_failed_batch_pass_records_its_re_pend_once(
     finally:
         await _stop(runner, task)
 
-    # One re-pend per failed pass, naming every row the pass held.
+    # Every re-pend write, the pass's first and each retry while it holds the lane (#1611), is ONE
+    # write naming every row the pass held, never head and extras apart.
     assert all(ids == ["head", "extra-1", "extra-2"] for ids in store.reschedules)
     repends = [
         r
