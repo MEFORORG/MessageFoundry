@@ -1908,7 +1908,7 @@ def test_the_removed_opt_in_is_refused_by_name_at_load(tmp_path: Path, enforceme
 def test_the_removed_opt_in_is_refused_by_name_when_built_in_code() -> None:
     """A section built in code skips the loader, and ``extra="ignore"`` would drop the key."""
     with pytest.raises(ValueError, match="ad_allow_insecure_ldap was REMOVED"):
-        AuthSettings(ad_allow_insecure_ldap=True)  # type: ignore[call-arg]
+        AuthSettings.model_validate({"ad_allow_insecure_ldap": True})
 
 
 def test_surrounding_whitespace_does_not_hide_an_ldaps_address() -> None:

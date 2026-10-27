@@ -5581,7 +5581,7 @@ class AlertsSettings(_Section):
             else "email_tls_verify = false, so the hop accepts any certificate"
         )
         raise ValueError(
-            f"[alerts].email_username is set and [alerts].{knob}: the SMTP AUTH password would "
+            f"[alerts].email_username is set and [alerts].{knob}: the SMTP login password would "
             "reach a relay the engine has not verified. Refused, with no escape; "
             "[security].allow_unverified_alert_smtp_tls covers only a hop with no login. Turn "
             "email_use_tls and email_tls_verify on, and pin the relay's CA with "
