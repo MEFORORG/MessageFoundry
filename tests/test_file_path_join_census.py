@@ -442,7 +442,7 @@ SITES: dict[str, Site] = {
     ),
     # --- messagefoundry/ ---
     "messagefoundry/__main__.py::_cert_import": Site(3, OPERATOR, _CERT_OUT),
-    "messagefoundry/__main__.py::_cert_self_signed": Site(2, OPERATOR, _CERT_OUT),
+    "messagefoundry/__main__.py::_cert_self_signed": Site(3, OPERATOR, _CERT_OUT),
     "messagefoundry/__main__.py::_check_env_file_present": Site(
         1,
         REVIEWED,

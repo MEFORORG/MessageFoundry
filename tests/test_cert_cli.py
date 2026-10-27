@@ -372,6 +372,81 @@ def test_import_refuses_to_overwrite_existing_key(
     assert (out / "key.pem").read_bytes() == original
 
 
+# --- cert import: no silent replacement, all files or none (vault BACKLOG #3514) -------------
+
+
+def _import_into(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path, *, with_ca: bool = True
+) -> int:
+    """Import a fresh bundle, by default one that carries a CA, so the run writes all three files."""
+    monkeypatch.delenv("MEFOR_PFX_PASSWORD", raising=False)
+    _ca_key, ca_cert = _make_cert("ca.example.org")
+    key, cert = _make_cert("leaf.example.org")
+    pfx_path = tmp_path / "b.pfx"
+    pfx_path.write_bytes(_make_pfx(key, cert, cas=[ca_cert] if with_ca else None))
+    return main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(out), "--json"])
+
+
+@pytest.mark.parametrize(
+    ("existing", "refusal", "with_ca"),
+    [
+        pytest.param("cert.pem", "overwrite an existing certificate file", True, id="cert"),
+        pytest.param("ca-chain.pem", "overwrite an existing CA chain file", True, id="ca-chain"),
+        # A bundle with no CA writes no ca-chain.pem, but an earlier one would sit beside a key it
+        # does not chain, so it is refused too, saying why.
+        pytest.param(
+            "ca-chain.pem", "import beside an existing CA chain file", False, id="stale-ca-chain"
+        ),
+        pytest.param("key.pem", "overwrite an existing key file", True, id="key"),
+    ],
+)
+def test_import_refuses_to_overwrite_an_existing_file(
+    existing: str,
+    refusal: str,
+    with_ca: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cert.pem and ca-chain.pem were written with `write_bytes`, so one with no key.pem beside it
+    was replaced without a word. Each is refused now, as the key is, and the refusal writes nothing.
+
+    Mutation: drop the existence check and the exclusive create. Red: the operator's file is gone."""
+    out = tmp_path / "o"
+    out.mkdir()
+    (out / existing).write_bytes(b"THE-OPERATORS-FILE\n")
+
+    assert _import_into(tmp_path, monkeypatch, out, with_ca=with_ca) == 2
+    assert f"refusing to {refusal}" in json.loads(capsys.readouterr().out)["error"]
+    assert (out / existing).read_bytes() == b"THE-OPERATORS-FILE\n"
+    assert sorted(p.name for p in out.iterdir()) == [existing]
+
+
+@pytest.mark.parametrize("dies", ["cert.pem", "ca-chain.pem"])
+def test_a_failed_import_write_leaves_no_file(
+    dies: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The key is written first. A public write that then failed left the key behind, with a
+    traceback, and the next import refused because the key existed. Now the run removes every file
+    it wrote and says so in its own failure line.
+
+    Mutation: drop the cleanup. Red: key.pem is still there."""
+    _cert_open_dies_midway(monkeypatch, dies)
+    out = tmp_path / "o"
+
+    assert _import_into(tmp_path, monkeypatch, out) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "No space left on device" in error
+    wrote = [out / "key.pem", out / "cert.pem"] + (
+        [out / "ca-chain.pem"] if dies != "cert.pem" else []
+    )
+    assert f"removed {', '.join(map(str, wrote))}, which this run wrote" in error
+    assert list(out.iterdir()) == []
+
+
 # --- cert inventory ---------------------------------------------------------
 
 
@@ -821,12 +896,81 @@ def test_self_signed_refuses_to_overwrite_an_existing_cert(
     assert not (out / "key.pem").exists()
 
 
-def _cert_open_dies_midway(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_self_signed_refuses_beside_an_existing_ca_chain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ca-chain.pem an earlier `cert import` left would sit beside a placeholder key it does not
+    chain. `cert import` refuses that case, so `cert self-signed` refuses it too, and writes nothing
+    (vault BACKLOG #3514).
+
+    Mutation: drop the ca-chain.pem check. Red: rc 0, and a key.pem beside the stale chain."""
+    out = tmp_path / "o"
+    out.mkdir()
+    (out / "ca-chain.pem").write_bytes(b"AN-EARLIER-CHAIN\n")
+
+    rc = main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
+    assert rc == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("refusing to mint beside an existing CA chain file"), error
+    assert "A self-signed certificate has no CA chain" in error
+    assert sorted(p.name for p in out.iterdir()) == ["ca-chain.pem"]
+
+
+def _dangling_link(out: Path, name: str, target: Path) -> None:
+    out.mkdir()
+    try:
+        (out / name).symlink_to(target)
+    except OSError as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+
+
+@pytest.mark.parametrize(
+    ("name", "refusal"),
+    [
+        ("cert.pem", "refusing to overwrite an existing certificate file"),
+        ("key.pem", "refusing to overwrite an existing key file"),
+        ("ca-chain.pem", "refusing to mint beside an existing CA chain file"),
+    ],
+)
+def test_self_signed_refuses_a_dangling_link_before_it_mints(
+    name: str, refusal: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A name that is a link to nothing is taken, not free. ``exists()`` follows the link and read
+    it as free; on Windows the exclusive create then followed it and wrote the cert outside
+    --out-dir (vault BACKLOG #3514). Now each is refused before the mint, and nothing is written.
+
+    Mutation: test the names with ``exists()``. Red: cert.pem and ca-chain.pem go to rc 0, and on
+    Windows the cert lands at the link's target."""
+    out, target = tmp_path / "o", tmp_path / "elsewhere.pem"
+    _dangling_link(out, name, target)
+
+    rc = main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
+    assert rc == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith(refusal), error
+    assert sorted(p.name for p in out.iterdir()) == [name]
+    assert not target.exists()
+
+
+def test_import_names_a_dangling_ca_chain_link_as_an_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bundle that carries a CA, into a directory whose ca-chain.pem is a link to nothing, is
+    refused as an overwrite. It was refused saying the bundle carries no CA, which was untrue."""
+    out = tmp_path / "o"
+    _dangling_link(out, "ca-chain.pem", tmp_path / "elsewhere.pem")
+
+    assert _import_into(tmp_path, monkeypatch, out) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("refusing to overwrite an existing CA chain file"), error
+
+
+def _cert_open_dies_midway(monkeypatch: pytest.MonkeyPatch, name: str = "cert.pem") -> None:
     real_open = Path.open
 
     def _open(self: Path, *a: Any, **k: Any) -> Any:
         handle = real_open(self, *a, **k)
-        return _HandleThatDiesMidWrite(handle) if self.name == "cert.pem" else handle
+        return _HandleThatDiesMidWrite(handle) if self.name == name else handle
 
     monkeypatch.setattr(Path, "open", _open)
 
@@ -922,7 +1066,8 @@ def test_a_key_the_cleanup_cannot_remove_is_named(
     assert rc == 2
     error = json.loads(capsys.readouterr().out)["error"]
     assert f"could not remove {out / 'key.pem'}" in error
-    assert "remove it before running again" in error
+    # Both the key and the truncated cert are left, so the line says "them" (vault BACKLOG #3514).
+    assert "so remove them before running again" in error
 
 
 @pytest.mark.parametrize(

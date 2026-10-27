@@ -200,10 +200,14 @@ are **byte-identical**. This reuses `config/tls_policy.py`, mirroring the #200/A
   production→REFUSE; else non-prod-PHI→WARN. It carries **no global-escape arm** — the only relaxations are
   the on-box carve-out, a proven terminator, an operator attestation, or a synthetic instance.
 - **Thin guard** `RevocationHopGuard.capture(...).enforce_construction()` — snapshots the active
-  `HopPosture` (`current_hop_posture`, stamped by `build_check_registry`'s `active_hop_posture` scope) and
-  folds the blanket `MEFOR_TLS_REVOCATION_ATTESTED` env into the per-connection attestation. No-op when the
-  posture is unstamped (a live serve build after the pre-flight / a direct test), identical to the #200
-  `InsecureHopGuard` — the build-check gate is the authority.
+  `HopPosture` (`current_hop_posture`, stamped by `build_check_registry`'s `active_hop_posture` scope,
+  and by the runner around its live builds when `serve` starts the graph) and reads the blanket
+  `MEFOR_TLS_REVOCATION_ATTESTED` env into a field of its own. No-op when the posture is unstamped (a
+  direct test build, or an embedding that stamps none), identical to the #200 `InsecureHopGuard`.
+  *(Until 2026-10-26 this said the guard folds the env into the per-connection attestation, which
+  BACKLOG #299 undid, and that it no-ops in "a live serve build after the pre-flight", with the
+  build-check gate as the authority there. `serve` runs no such pre-flight, and its live builds are
+  stamped, so a first `serve` start refuses the hop at its own build. Vault BACKLOG #3514.)*
 - **Attestation** — a new per-connection `tls_revocation_attested` flag (Destination), OR the existing
   blanket `MEFOR_TLS_REVOCATION_ATTESTED` env (the same opt-out the listener got). It is **distinct** from
   the #200 `tls_hop_attested` (which attests a *cleartext / verify-off* hop is secure by other means).

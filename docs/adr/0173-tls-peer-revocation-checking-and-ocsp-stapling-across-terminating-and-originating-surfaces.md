@@ -602,10 +602,13 @@ at `tls_policy.py:963-973` has no global audited-opt-out arm (`:958-960`), so th
 loopback, a proven terminator, an attestation, or a non-PHI posture.
 
 **One caveat, stated so nobody reads more coverage into it than exists:**
-`RevocationHopGuard.enforce_construction` **no-ops when the posture is unstamped** (`tls_policy.py:1044-1046`)
-— a live serve build after the pre-flight, or a direct test or embedding. The `build_check` gate is
-the authority there, by design. A configuration that names no environment and declares no data class
-lands on the not-PHI ALLOW arm and gets nothing.
+`RevocationHopGuard.enforce_construction` **no-ops when the posture is unstamped** — a direct test
+build, or an embedding that stamps none. `build_check` (`messagefoundry check`, dry-run, reload)
+stamps the posture, and so does the runner around its live builds when `serve` starts the graph, so
+neither path is unstamped. *(Until 2026-10-26 this caveat named "a live serve build after the
+pre-flight" as unstamped, with the `build_check` gate as the authority there; `serve` runs no such
+pre-flight. It also said a configuration naming no environment and no data class lands on a not-PHI
+ALLOW arm; BACKLOG #1279 removed that arm. Vault BACKLOG #3514.)*
 
 ### 4.2 Accepted with no risk to accept
 

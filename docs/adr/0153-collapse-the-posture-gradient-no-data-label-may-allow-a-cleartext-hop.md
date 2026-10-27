@@ -130,6 +130,10 @@ this decision, for three reasons found while sizing it:
   runs, so no posture, attestation or acceptance flag can suppress it — including on the loopback binds
   arm 1 exempts, because that path never consults `is_loopback_hop_host`. Measured: 14 of 14 inbound MLLP
   listeners across the repo's six loadable config dirs hard-fail. `DICOM()` carries the identical trap.
+  *(Since 2026-10-26 that message reads `<family> <name>: tls=true requires tls_cert_file (the server
+  identity)`, the name in Python's repr quoting, as `MLLP listener 'IB_ACME_ADT': ...`, or the
+  family alone when a direct build passes no name. The refusal is unchanged, and the line cited
+  above has moved. Vault BACKLOG #3514.)*
 * **It would disarm a working control.** The four inbound exposed-gates early-return when
   `source.settings.get("tls")` is truthy (`pipeline/wiring_runner.py:6137`, `:6173`, `:6208`, `:6249`). With
   the default flipped that branch always fires, replacing the actionable "binds non-loopback host without
