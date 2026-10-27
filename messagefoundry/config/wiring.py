@@ -35,6 +35,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import inspect
+import io
 import ipaddress
 import logging
 import math
@@ -7935,6 +7936,15 @@ class _HelperImporter:
         # it, and docs/DANGEROUS-FUNCTIONALITY.md section 2 names this site.
         exec(code, module.__dict__)  # noqa: S102  # nosec B102
 
+    def source_of(self, filename: str) -> bytes | None:
+        """The snapshot bytes a module compiled under ``filename`` ran, or ``None`` for a file
+        this load did not compile. A diagnostic reads its line from these rather than from the
+        directory, which may hold other bytes by now and which a sandbox worker never reads."""
+        path = Path(filename)
+        if path.parent != self._dir:
+            return None
+        return self._snapshot.files.get(path.name)
+
     def preload(self, path: Path) -> None:
         """Load every helper a function body in ``path`` imports -- and, in turn, every helper those
         helpers' bodies import -- so an in-body import works after the load. Called once ``path`` has
@@ -7978,7 +7988,9 @@ class _HelperImporter:
                 # load. Names only, never the exception text (CLAUDE.md section 9).
                 self._failed[name] = (
                     _textless_import_error(exc),
-                    _failure_detail(self._dir.resolve(), f"{name}.py", exc),
+                    _failure_detail(
+                        self._dir.resolve(), self._files[name], exc, source_of=self.source_of
+                    ),
                 )
                 _logger.warning(
                     "config helper %s failed to load (%s) and is left to the ImportError guard in %s",
@@ -9067,7 +9079,9 @@ _CONFIG_MODULE_SUFFIX_LEN: Final = 13
 _WITHHELD: Final = "its message is withheld: it can carry a value the module held"
 
 
-def _module_failure(path: Path, exc: BaseException) -> str:
+def _module_failure(
+    path: Path, exc: BaseException, source_of: Callable[[str], bytes | None] | None = None
+) -> str:
     """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
     file and line it was raised from, and for an import or name error the identifier, but never the
     exception's text (vault BACKLOG #3249).
@@ -9078,11 +9092,18 @@ def _module_failure(path: Path, exc: BaseException) -> str:
     credential scrub only replaces a LABELLED value, so it is a backstop, not a boundary."""
     return (
         f"error loading config module {path.name}: "
-        f"{_failure_detail(path.parent.resolve(), path.name, exc)} ({_WITHHELD})"
+        f"{_failure_detail(path.parent.resolve(), path.name, exc, source_of=source_of)} "
+        f"({_WITHHELD})"
     )
 
 
-def _failure_detail(config_dir: Path, own_file: str, exc: BaseException) -> str:
+def _failure_detail(
+    config_dir: Path,
+    own_file: str,
+    exc: BaseException,
+    *,
+    source_of: Callable[[str], bytes | None] | None = None,
+) -> str:
     """``exc``'s TYPE, the config-directory file and line it was raised from (the file only when it
     is not ``own_file``), and for an import or name error each identifier the source line spells.
 
@@ -9112,7 +9133,8 @@ def _failure_detail(config_dir: Path, own_file: str, exc: BaseException) -> str:
     detail += f" at line {line}"
     if isinstance(exc, _NAMED_EXCEPTIONS):
         # `from x import y` puts the module in `name` and the symbol in `name_from`.
-        names_on_line = _dotted_names_on_line(source_file, line)
+        source = source_of(source_file) if source_of is not None else None
+        names_on_line = _dotted_names_on_line(source_file, line, source)
         idents = [
             ident
             for ident in map(_source_name, (exc.name, getattr(exc, "name_from", None)))
@@ -9123,32 +9145,45 @@ def _failure_detail(config_dir: Path, own_file: str, exc: BaseException) -> str:
     return detail
 
 
-def _dotted_names_on_line(source_file: str, line: int) -> list[str]:
+def _dotted_names_on_line(source_file: str, line: int, source: bytes | None = None) -> list[str]:
     """Every dotted name (``a``, ``a.b.c``) written in code in the statement that starts on, or spans,
     ``line`` of ``source_file`` -- a parenthesized import over several lines is one statement --
     never a string literal's or a comment's content.
 
-    The file is read afresh, never through :mod:`linecache`: that cache holds whatever version of the
-    file was read first, so after an edit and a reload a stale line could vouch for a run-time value.
-    It is tokenized from the top, so a line inside a multi-line string is read as the string it is.
-    ``[]`` -- nothing vouched for -- when the file cannot be read or tokenized."""
-    runs: list[list[str]] = [[]]
+    ``source`` is the bytes that ran, from the load's snapshot, so the line read is the line that
+    raised even when the file has been edited since, and a sandbox worker reads no file (vault
+    BACKLOG #2596). Without it the file is read afresh, never through :mod:`linecache`: that cache
+    holds whatever version of the file was read first, so after an edit and a reload a stale line
+    could vouch for a run-time value. It is tokenized from the top, so a line inside a multi-line
+    string is read as the string it is. ``[]`` -- nothing vouched for -- when the source cannot be
+    read or tokenized."""
     try:
-        with tokenize.open(source_file) as f:
-            for tok in tokenize.generate_tokens(f.readline):
-                if tok.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
-                    # A logical line ended: keep it only if it spans `line`, else start afresh.
-                    if tok.start[0] >= line:
-                        break
-                    runs = [[]]
-                elif tok.type == tokenize.NAME or (tok.type == tokenize.OP and tok.string == "."):
-                    runs[-1].append(tok.string)
-                elif runs[-1]:
-                    runs.append([])
+        if source is not None:
+            # tokenize.tokenize reads a PEP 263 coding line and a BOM from the bytes, as compile did.
+            runs = _name_runs(tokenize.tokenize(io.BytesIO(source).readline), line)
+        else:
+            with tokenize.open(source_file) as f:
+                runs = _name_runs(tokenize.generate_tokens(f.readline), line)
     except (OSError, SyntaxError, UnicodeDecodeError, tokenize.TokenError):
         return []
     # "a b" is two runs of names, never one name, so a run is split where two names abut.
     return [name for run in runs for name in " ".join(run).replace(" . ", ".").split()]
+
+
+def _name_runs(tokens: Iterable[tokenize.TokenInfo], line: int) -> list[list[str]]:
+    """The runs of names and dots in the logical line of ``tokens`` that spans ``line``."""
+    runs: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+            # A logical line ended: keep it only if it spans `line`, else start afresh.
+            if tok.start[0] >= line:
+                break
+            runs = [[]]
+        elif tok.type == tokenize.NAME or (tok.type == tokenize.OP and tok.string == "."):
+            runs[-1].append(tok.string)
+        elif runs[-1]:
+            runs.append([])
+    return runs
 
 
 def _spelled(ident: str, names: list[str]) -> bool:
@@ -9227,7 +9262,7 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
                 raise
             raise WiringError(f"error loading config module {path.name}: {exc}") from exc
         try:
-            withheld = WiringError(_module_failure(path, exc))
+            withheld = WiringError(_module_failure(path, exc, helpers.source_of))
         except Exception:  # noqa: BLE001 - a fault building the detail must not escape with `exc`
             # chained as its context; the type alone is still a withheld diagnostic.
             withheld = WiringError(

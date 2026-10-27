@@ -23,6 +23,7 @@ import importlib.util
 import marshal
 import os
 import subprocess
+import tokenize
 from pathlib import Path, PurePath
 from types import CodeType
 
@@ -306,6 +307,21 @@ def test_a_session_that_cannot_read_its_snapshot_starts_no_worker(
         assert session._proc is None
     finally:
         session.close()
+
+
+def test_a_load_failure_reads_its_line_from_the_bytes_that_ran(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The diagnostic names an identifier only when the line spells it, and that line comes from
+    the snapshot: the file may hold other bytes by now, and a worker reads no file."""
+    (tmp_path / "graph.py").write_text("X = undefined_marker_name\n", encoding="utf-8")
+
+    def no_file(*_args: object, **_kwargs: object) -> object:
+        raise OSError("the directory was read")
+
+    monkeypatch.setattr(tokenize, "open", no_file)
+    with pytest.raises(WiringError, match="naming 'undefined_marker_name'"):
+        load_config(tmp_path)
 
 
 # --- the points the row folds in -------------------------------------------------------------------
