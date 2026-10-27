@@ -704,7 +704,7 @@ def test_a_path_nssm_expands_is_refused_with_percent_before_anything_acts() -> N
 
 def test_building_the_install_root_is_opt_in_and_never_editable() -> None:
     """Only -EngineWheel builds, it builds only the default root, its companions are refused
-    without it, and every input is read before the first act. Nothing installs editable."""
+    without it, and the build's own inputs are read before it acts. Nothing installs editable."""
     text = _text()
     assert "$BuildsInstall = [bool]$EngineWheel" in text
     assert 'throw ("-EngineWheel builds the default install root' in text
@@ -739,7 +739,7 @@ _BUILD_STUB = """
   function Invoke-EngineBuildStep {
     param($What, $Exe, $Arguments)
     $log.Add("run $Exe | $($Arguments -join ' | ')")
-    $log.Add("env PIP_CONFIG_FILE=$env:PIP_CONFIG_FILE PIP_INDEX_URL=$env:PIP_INDEX_URL")
+    $log.Add("env PIP_CONFIG_FILE=$env:PIP_CONFIG_FILE PIP_INDEX_URL=$env:PIP_INDEX_URL TEMP=$env:TEMP")
     if ($Arguments -contains 'venv') {
       $h = if ($venvHome) { $venvHome } else { Split-Path -Parent $Exe }
       Set-Content -LiteralPath (Join-Path $Arguments[-1] 'pyvenv.cfg') -Value "home = $h"
@@ -747,6 +747,8 @@ _BUILD_STUB = """
     if ($failAt -and $What -like "*$failAt*") { throw "$What failed (exit 1)" }
   }
   $env:PIP_INDEX_URL = 'https://index.invalid/simple'
+  $env:PIP_CONFIG_FILE = 'C:\\corp\\pip.ini'
+  $before = "$env:PIP_CONFIG_FILE|$env:PIP_INDEX_URL|$env:TEMP"
 """
 
 
@@ -798,7 +800,7 @@ def _build_call(
         f"  $res.root = Test-Path -LiteralPath {_psq(str(root))}\n"
         f"  $res.held = @(Get-ChildItem -LiteralPath {_psq(str(root))} -Force "
         "-ErrorAction SilentlyContinue).Count\n"
-        '  $res.after = "$env:PIP_CONFIG_FILE|$env:PIP_INDEX_URL"\n'
+        '  $res.restored = ("$env:PIP_CONFIG_FILE|$env:PIP_INDEX_URL|$env:TEMP" -eq $before)\n'
         "  $res | ConvertTo-Json -Compress\n"
     )
 
@@ -812,9 +814,9 @@ def test_the_build_sets_the_access_list_before_pip_and_pins_what_pip_installs(
     tmp_path: Path,
 ) -> None:
     """The clean build is the control for the refusals below. Each folder it makes gets its access
-    list before the first native step; the lock goes in with --require-hashes and the wheel with
-    --no-deps, both from the copies in the root, with pip reading no configuration, and the
-    operator's PIP_ variables come back after."""
+    list before the first native step; the lock goes in with --require-hashes and binary wheels
+    only and the wheel with --no-deps, both from the copies in the root, with pip reading no
+    configuration and a temp folder in the root, and the operator's variables come back after."""
     wheel, lock = _wheel(tmp_path / "release")
     (tmp_path / "pf").mkdir()
     root = tmp_path / "pf" / "MessageFoundry" / "engine"
@@ -826,23 +828,25 @@ def test_the_build_sets_the_access_list_before_pip_and_pins_what_pip_installs(
     assert [log[i] for i in acls] == [f"acl {root.parent}", f"acl {root}"], log
     assert max(acls) < min(runs), log
     assert len(runs) == 5, log
-    for i in runs:
-        assert log[i + 1] == "env PIP_CONFIG_FILE=nul PIP_INDEX_URL=", log
+    # Every pip step; the owner reset runs after the variables are back.
+    for i in runs[:-1]:
+        assert log[i + 1] == f"env PIP_CONFIG_FILE=nul PIP_INDEX_URL= TEMP={root / 'buildtemp'}"
     venv, deps, engine, check, owner = (log[i] for i in runs)
     stage = root / "wheelhouse"
     assert venv == f"run C:\\Python314\\python.exe | -I | -m | venv | {root}"
     python = root / "Scripts" / "python.exe"
     assert deps.startswith(f"run {python} | -I | -m | pip | install | --isolated"), deps
-    assert deps.endswith(f"| --require-hashes | -r | {stage / 'requirements.lock'}"), deps
+    lock_args = f"| --require-hashes | --only-binary | :all: | -r | {stage / 'requirements.lock'}"
+    assert deps.endswith(lock_args), deps
     assert "--no-deps" not in deps and str(lock) not in deps
     assert engine.startswith(f"run {python} | -I | -m | pip | install | --isolated"), engine
     assert engine.endswith(f"| --no-deps | {stage / wheel.name}"), engine
     assert "--require-hashes" not in engine and str(wheel) not in engine
     assert check.startswith(f"run {python} | -I | -m | pip | check"), check
     assert owner == f"run icacls | {root} | /setowner | *S-1-5-32-544 | /T | /C | /Q"
-    # The root holds the venv's pyvenv.cfg and no wheelhouse.
+    # The root holds the venv's pyvenv.cfg, and no wheelhouse or temp folder.
     assert got["root"] is True and got["held"] == 1, got
-    assert got["after"] == "|https://index.invalid/simple", got
+    assert got["restored"] is True, got
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
@@ -861,6 +865,8 @@ def test_the_build_refuses_a_copy_that_misses_its_pin(which: str, tmp_path: Path
     assert _sha(target) in got["error"] and _wrong(_sha(target)) in got["error"]
     assert not _runs(got), got
     assert got["root"] is False
+    # Refused before any variable was changed, so the operator's are as they were.
+    assert got["restored"] is True, got
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
@@ -879,24 +885,24 @@ def test_the_build_refuses_a_root_others_can_write_before_pip_runs(tmp_path: Pat
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
-def test_an_existing_empty_root_gets_the_access_list_and_is_emptied_on_a_failure(
-    tmp_path: Path,
-) -> None:
-    """A root that already existed, empty, gets the administrator-only list before pip, as a new
-    one does, and a failed step leaves it empty rather than half-built. A venv whose home is not
-    the base interpreter's folder is refused before pip runs."""
+def test_an_existing_root_is_refused_and_a_failed_build_leaves_no_root(tmp_path: Path) -> None:
+    """A root that already exists, even empty, is not built into. A step that fails, and a venv
+    whose home is not the base interpreter's folder, each leave no root and put the operator's
+    variables back."""
     wheel, lock = _wheel(tmp_path / "release")
+    (tmp_path / "pf").mkdir()
     root = tmp_path / "pf" / "engine"
-    root.mkdir(parents=True)
     failed = _build(tmp_path, _build_call(root, wheel, lock, setup="  $failAt = 'engine wheel'\n"))
     assert "installing the engine wheel failed" in failed["error"], failed
-    assert [str(x) for x in failed["log"] if str(x).startswith("acl ")] == [f"acl {root}"]
-    assert failed["root"] is True and failed["held"] == 0, failed
-    assert failed["after"] == "|https://index.invalid/simple", failed
+    assert failed["root"] is False and failed["restored"] is True, failed
     other = _build(tmp_path, _build_call(root, wheel, lock, setup="  $venvHome = 'C:\\Shim'\n"))
     assert "names home 'C:\\Shim', not 'C:\\Python314'" in other["error"], other
     assert len(_runs(other)) == 1, other
-    assert other["held"] == 0, other
+    assert other["root"] is False and other["restored"] is True, other
+    root.mkdir()
+    existing = _build(tmp_path, _build_call(root, wheel, lock))
+    assert "already exists" in existing["error"], existing
+    assert existing["log"] == [] and existing["root"] is True, existing
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
@@ -919,9 +925,7 @@ def test_get_engine_build_problem_reads_every_input_before_anything_acts(tmp_pat
     old = interpreter("old", dll="python312.dll")
     venv = interpreter("venv/Scripts")
     (tmp_path / "venv" / "pyvenv.cfg").write_text("home = C:\\Python314\n", encoding="utf-8")
-    held = tmp_path / "held"
-    held.mkdir()
-    (held / "pyvenv.cfg").write_text("", encoding="utf-8")
+    (Path(python).parent / "Lib").mkdir()
     empty = tmp_path / "empty"
     empty.mkdir()
 
@@ -943,7 +947,6 @@ def test_get_engine_build_problem_reads_every_input_before_anything_acts(tmp_pat
         "clean": call(),
         "clean_lower": call(s=wsha.lower(), ls=lsha.lower()),
         "empty_root": call(root=empty),
-        "held_root": call(root=held),
         "bad_sha": call(s="abc"),
         "bad_lock_sha": call(ls=""),
         "mismatch": call(s=_wrong(wsha)),
@@ -959,14 +962,17 @@ def test_get_engine_build_problem_reads_every_input_before_anything_acts(tmp_pat
     body = (
         "  $res = [ordered]@{}\n"
         + "".join(f"  $res[{_psq(k)}] = [string]({v})\n" for k, v in cases.items())
-        # Planted last, so only this case sees it: a holder on the DLL alone.
+        # Planted last, each alone: a holder on the DLL, then on the standard library's folder.
         + f"  $broadFor[{_psq(str(Path(python).parent / 'python314.dll'))}] = 'BUILTIN\\Users'\n"
-        + f"  $res['broad_python'] = [string]({call()})\n"
+        + f"  $res['broad_dll'] = [string]({call()})\n"
+        + "  $broadFor.Clear()\n"
+        + f"  $broadFor[{_psq(str(Path(python).parent / 'Lib'))}] = 'BUILTIN\\Users'\n"
+        + f"  $res['broad_lib'] = [string]({call()})\n"
         + "  $res | ConvertTo-Json -Compress\n"
     )
     got = _build(tmp_path, body)
-    assert got["clean"] == "" and got["clean_lower"] == "" and got["empty_root"] == "", got
-    assert "already holds files" in got["held_root"]
+    assert got["clean"] == "" and got["clean_lower"] == "", got
+    assert "already exists" in got["empty_root"]
     assert "-EngineWheelSha256 must be a SHA-256" in got["bad_sha"]
     assert "-RequirementsLockSha256 must be a SHA-256" in got["bad_lock_sha"]
     assert "not the pinned" in got["mismatch"] and str(wheel) in got["mismatch"]
@@ -978,8 +984,9 @@ def test_get_engine_build_problem_reads_every_input_before_anything_acts(tmp_pat
     assert "launcher or a shim" in got["shim"]
     assert "is Python 3.12" in got["old"]
     assert "virtual environment's interpreter" in got["venv"]
-    assert "not administrator-only" in got["broad_python"]
-    assert "python314.dll" in got["broad_python"]
+    for case, held in (("broad_dll", "python314.dll"), ("broad_lib", "Lib")):
+        assert "not administrator-only" in got[case], got[case]
+        assert f"BUILTIN\\Users on '{Path(python).parent / held}'" in got[case], got[case]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="runs a native program")

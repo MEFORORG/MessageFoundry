@@ -1442,11 +1442,15 @@ function Get-EngineBuildProblem {
 
       $BasePython must be a CPython 3.14 or later interpreter itself. A virtual environment's
       python.exe, a launcher such as py.exe and a package manager's shim each start another
-      interpreter, which this would not read, so a python3<minor>.dll must sit beside it. It and
-      that DLL are then read as the engine install is: anyone but administrators able to write
-      either, or a folder above them, is refused. This script runs it elevated, and the built
-      venv's python.exe starts it at every service start. NOT READ: the files of that install one
-      by one, such as its standard library; the folder holding them is read.
+      interpreter, which this would not read, so a python3<minor>.dll must sit beside it. It, that
+      DLL and its Lib and DLLs folders are then read as the engine install is: anyone but
+      administrators able to write one of them, or a folder above them, is refused. This script
+      runs it elevated, and the built venv's python.exe starts it at every service start. NOT READ:
+      the files inside Lib and DLLs one by one, and any folder below them.
+
+      The root must not exist yet. A folder that already exists carries an access list this
+      script did not set, and an explicit inheritable entry on it, such as CREATOR OWNER, would
+      reach every file pip writes.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -1477,7 +1481,10 @@ function Get-EngineBuildProblem {
         return "no Python was found to make the virtual environment from. Pass -BasePython"
     }
     $baseDir = Split-Path -Parent $BasePython
-    foreach ($cfg in @((Join-Path $baseDir "pyvenv.cfg"), (Join-Path (Split-Path -Parent $baseDir) "pyvenv.cfg"))) {
+    # A drive root has no folder above it.
+    $cfgs = @($baseDir, (Split-Path -Parent $baseDir)) | Where-Object { $_ } |
+        ForEach-Object { Join-Path $_ "pyvenv.cfg" }
+    foreach ($cfg in $cfgs) {
         if (Test-Path -LiteralPath $cfg) {
             return ("'$BasePython' is a virtual environment's interpreter. Pass -BasePython with " +
                 "the python.exe of a Python installed for all users")
@@ -1494,28 +1501,16 @@ function Get-EngineBuildProblem {
     $dll = $dlls[-1]
     $minor = [int]($dll.Name -replace '^python3(\d+)\.dll$', '$1')
     if ($minor -lt 14) { return "'$BasePython' is Python 3.$minor, and the engine needs 3.14 or later" }
-    $holders = Get-NssmHomeProblem -File @($BasePython, $dll.FullName)
+    $read = @($BasePython, $dll.FullName) + @(@("Lib", "DLLs") | ForEach-Object { Join-Path $baseDir $_ } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Container })
+    $holders = Get-NssmHomeProblem -File $read
     if ($holders) {
         return ("the Python '$BasePython' is not administrator-only: $holders. Pass -BasePython " +
             "with a Python installed for all users")
     }
     if (Test-Path -LiteralPath $InstallRoot) {
-        try {
-            $item = Get-Item -LiteralPath $InstallRoot -Force -ErrorAction Stop
-            $held = @(Get-ChildItem -LiteralPath $InstallRoot -Force -ErrorAction Stop)
-        } catch {
-            return "'$InstallRoot' could not be read ($($_.Exception.Message))"
-        }
-        # A junction would have the build write wherever it points, which the access-list reading
-        # does not follow.
-        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            return "'$InstallRoot' is not an ordinary folder"
-        }
-        if ($held) {
-            return ("'$InstallRoot' already holds files. Leave -EngineWheel out to use the install " +
-                "as it is, update it as docs/SERVICE.md 'Update to a new build' shows, or stop the " +
-                "service, delete the folder and re-run")
-        }
+        return ("'$InstallRoot' already exists, and the build makes it. Leave -EngineWheel out to " +
+            "use the install there as it is, or stop the service, delete the folder and re-run")
     }
     return ""
 }
@@ -1545,26 +1540,26 @@ function Build-EngineInstall {
       Build the default install root with -EngineWheel (vault BACKLOG #2626): a virtual environment
       only administrators can write, holding the dependencies the pinned requirements.lock names by
       hash and the pinned engine wheel, never editable. Get-EngineBuildProblem has cleared the
-      inputs. In this order, so pip only ever writes where only administrators can:
+      inputs, including that the root does not exist yet. In this order:
 
         1. Make the root and any missing folder above it administrator-only (New-AdminOnlyFolder).
-           A root that already existed, empty, gets the same access list, so no inheritable entry
-           such as CREATOR OWNER reaches the files pip writes. A folder above it keeps its own.
+           A folder above it that already existed keeps its own access list.
         2. Refuse unless Get-NssmHomeProblem reads the root and every folder above it as
            administrator-only.
         3. Copy the wheel and the lock into a folder in the root, and refuse unless each copy has
            its pinned SHA-256. pip reads the copies, which only an administrator can change.
-        4. Make the venv, and refuse unless its pyvenv.cfg names $BasePython's folder as home.
-        5. Install the lock with --require-hashes, the wheel with --no-deps, then run pip check.
-           pip reads no configuration file or PIP_ variable meanwhile: PIP_CONFIG_FILE is the null
-           device, as ensurepip sets it, and the other PIP_ variables are removed for the build and
-           put back after it. NOT CLOSED: a source distribution the lock pins is built, which runs
-           its own build code as administrator.
-        6. Make Administrators the owner of everything in the root, as step 1 does for the root.
+        4. Point TEMP and TMP at a folder in the root, so the files pip downloads and unpacks sit
+           where only administrators can write too, not in the operator's own temp folder.
+        5. Make the venv, and refuse unless its pyvenv.cfg names $BasePython's folder as home.
+        6. Install the lock with --require-hashes and --only-binary :all:, so no source
+           distribution is built, then the wheel with --no-deps, then run pip check. pip reads no
+           configuration file or PIP_ variable meanwhile: PIP_CONFIG_FILE is the null device, as
+           ensurepip sets it, and the operator's PIP_ variables, TEMP and TMP are put back after.
+        7. Make Administrators the owner of everything in the root.
 
-      Unless every step completes, Ctrl+C included, the root is deleted when this call made it and
-      emptied when it was empty on entry, so a re-run does not meet a half-built one.
-      Get-EngineInstallProblem then reads what was built.
+      Unless every step completes, Ctrl+C included, the root is deleted, so a re-run does not meet
+      a half-built one; a delete that fails is named in a warning. Get-EngineInstallProblem then
+      reads what was built.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -1574,17 +1569,16 @@ function Build-EngineInstall {
         [Parameter(Mandatory)][string]$LockSha256,
         [Parameter(Mandatory)][string]$BasePython
     )
-    $stage = Join-Path $InstallRoot "wheelhouse"
-    $existed = Test-Path -LiteralPath $InstallRoot
-    if ($existed -and @(Get-ChildItem -LiteralPath $InstallRoot -Force).Count) {
-        throw "'$InstallRoot' already holds files, so it is not built over. Nothing was installed."
+    if (Test-Path -LiteralPath $InstallRoot) {
+        throw "'$InstallRoot' already exists, so it is not built over. Nothing was installed."
     }
-    $savedPip = @{}
+    $stage = Join-Path $InstallRoot "wheelhouse"
+    $buildTemp = Join-Path $InstallRoot "buildtemp"
+    $saved = @{}
     $built = $false
     # finally, not catch: Ctrl+C stops the pipeline without running a catch block.
     try {
         New-AdminOnlyFolder -Path $InstallRoot | Out-Null
-        if ($existed) { Set-AdminOnlyAcl -Path $InstallRoot }
         $holders = Get-NssmHomeProblem -File (Join-Path $InstallRoot "pyvenv.cfg")
         if ($holders) {
             throw ("'$InstallRoot' is not administrator-only: $holders. Nothing was installed. Fix " +
@@ -1600,13 +1594,16 @@ function Build-EngineInstall {
             $problem = Get-FilePinProblem -Path $copy[0] -Expected $copy[1]
             if ($problem) { throw "Refusing the $($copy[2]): $problem. Nothing was installed." }
         }
-        foreach ($name in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'PIP_*' } |
-                ForEach-Object { $_.Name })) {
-            $savedPip[$name] = [Environment]::GetEnvironmentVariable($name)
-            [Environment]::SetEnvironmentVariable($name, $null)
-        }
+        New-Item -ItemType Directory -Path $buildTemp | Out-Null
+        # Saved together and before any is changed, so the finally below puts back exactly these.
+        $names = @(@(Get-ChildItem Env: | Where-Object { $_.Name -like 'PIP_*' } |
+                ForEach-Object { $_.Name }) + @("PIP_CONFIG_FILE", "TEMP", "TMP") | Select-Object -Unique)
+        foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
+        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $null) }
         # os.devnull on Windows. pip then loads no configuration file at all.
         [Environment]::SetEnvironmentVariable("PIP_CONFIG_FILE", "nul")
+        [Environment]::SetEnvironmentVariable("TEMP", $buildTemp)
+        [Environment]::SetEnvironmentVariable("TMP", $buildTemp)
         Invoke-EngineBuildStep -What "making the virtual environment" -Exe $BasePython `
             -Arguments @("-I", "-m", "venv", $InstallRoot)
         $cfg = Join-Path $InstallRoot "pyvenv.cfg"
@@ -1620,26 +1617,25 @@ function Build-EngineInstall {
         $pipOptions = @("--isolated", "--no-input", "--disable-pip-version-check", "--no-cache-dir")
         $pip = @("-I", "-m", "pip", "install") + $pipOptions
         Invoke-EngineBuildStep -What "installing the dependencies requirements.lock pins" `
-            -Exe $venvPython -Arguments ($pip + @("--require-hashes", "-r", $stagedLock))
+            -Exe $venvPython -Arguments ($pip + @("--require-hashes", "--only-binary", ":all:", "-r", $stagedLock))
         Invoke-EngineBuildStep -What "installing the engine wheel" -Exe $venvPython `
             -Arguments ($pip + @("--no-deps", $stagedWheel))
         # --no-deps skipped the wheel's own requirements, so a lock from another release is caught
         # here rather than at the service's first start.
         Invoke-EngineBuildStep -What "checking the installed dependencies" -Exe $venvPython `
             -Arguments (@("-I", "-m", "pip", "check") + $pipOptions)
-        Remove-Item -LiteralPath $stage -Recurse -Force
+        foreach ($name in @("TEMP", "TMP")) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
+        Remove-Item -LiteralPath $stage, $buildTemp -Recurse -Force
         Invoke-EngineBuildStep -What "making Administrators the owner of '$InstallRoot'" -Exe "icacls" `
             -Arguments @($InstallRoot, "/setowner", "*S-1-5-32-544", "/T", "/C", "/Q")
         $built = $true
     } finally {
-        [Environment]::SetEnvironmentVariable("PIP_CONFIG_FILE", $null)
-        foreach ($name in $savedPip.Keys) { [Environment]::SetEnvironmentVariable($name, $savedPip[$name]) }
+        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
         if (-not $built -and (Test-Path -LiteralPath $InstallRoot)) {
-            if ($existed) {
-                Get-ChildItem -LiteralPath $InstallRoot -Force |
-                    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-            } else {
-                Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $InstallRoot) {
+                Write-Warning ("The unfinished install '$InstallRoot' could not be deleted. Delete it " +
+                    "before building again: -EngineWheel refuses a root that exists.")
             }
         }
     }
@@ -1931,8 +1927,10 @@ if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Le
     throw "Service settings file not found at: $ServiceConfig"
 }
 
-# The first act of an install that builds its root (vault BACKLOG #2626), once every input above
-# has been read. The check below then reads the built root as it reads any install.
+# The first act of an install that builds its root (vault BACKLOG #2626), once the inputs above
+# have been read. NOT YET READ here: -NssmPath and -NssmDir, which Resolve-Nssm reads below, so a
+# refusal there leaves the built root for a re-run without -EngineWheel. The check below then
+# reads the built root as it reads any install.
 if ($BuildsInstall) {
     Build-EngineInstall -InstallRoot $DefaultInstallRoot -Wheel $EngineWheel -WheelSha256 $EngineWheelSha256 `
         -RequirementsLock $RequirementsLock -LockSha256 $RequirementsLockSha256 -BasePython $BasePython

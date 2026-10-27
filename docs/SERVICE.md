@@ -74,15 +74,15 @@ change, and the service would run their next edit.
 Without it, the installer builds nothing and checks the root that is there; it never falls back to
 an editable install. It makes the root administrator-only before pip runs, and refuses, installing
 nothing, when the copy of the wheel or the lock pip would read misses its pin. It installs the lock
-with `--require-hashes` and the wheel with `--no-deps`, with pip reading no configuration file or
-`PIP_` variable. At least one route still runs code the pins do not name: a source distribution
-the lock pins is built, running its build code as administrator. `Build-EngineInstall` in the
-script is the source of record for the steps and their order.
+with `--require-hashes` and binary wheels only, and the engine wheel with `--no-deps`, with pip
+reading no configuration file or `PIP_` variable. So pip needs `pypi.org` for the dependencies:
+it reads no mirror or proxy a `pip.ini` names. `Build-EngineInstall` in the script is the source
+of record for the steps and their order.
 
-It refuses to build into a root that already holds files, so it never upgrades in place, and a
-re-run after a later step failed needs `-EngineWheel` left out; see
-[Update to a new build](#update-to-a-new-build-restart-vs-reinstall). An unfinished build deletes a
-root it made. `-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython`
+It refuses to build into a root that already exists, so it never upgrades in place; see
+[Update to a new build](#update-to-a-new-build-restart-vs-reinstall). An unfinished build deletes
+the root. The build runs before NSSM is fetched, so when a later step fails, such as the NSSM
+download, re-run with `-EngineWheel` left out to use the root it built. `-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython`
 defaults to the first `python` on `PATH`; `Get-EngineBuildProblem` in the script lists what it
 refuses there, at least a launcher, a shim, a venv's interpreter, a Python older than 3.14 and
 one anyone but administrators can write. The installer installs the engine wheel only. Install
