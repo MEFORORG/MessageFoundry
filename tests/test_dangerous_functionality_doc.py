@@ -668,7 +668,7 @@ def _bound_phrase(seconds: float) -> str:
 
 _OPENSSL_NAME_RE = re.compile(r"`(OPENSSL_[A-Z_]+)`")
 _CIPHER_PARAGRAPH_LEAD = "**The host cipher read gives PowerShell script text.**"
-_OPENSSL_ITEM_LEAD = "The `openssl` start in `verify/cipher_policy.py`"
+_OPENSSL_ITEM_LEAD = "The two `openssl` starts in `verify/cipher_policy.py`"
 
 
 def _cipher_probe_drift(
@@ -766,7 +766,8 @@ def test_cipher_probe_text_drift_is_reported() -> None:
     moved = _replace_once(moved, tray, f"Probes are {stated}.\n\n{tray}")
     assert _cipher_probe_drift(moved, seconds, names)
     last = names[-1]
-    stray = _replace_once(text, f" and `{last}`", "")
+    stray, count = _loose(f"and `{last}`").subn("", text)
+    assert count == 1
     stray = _replace_once(stray, "- The sandbox worker,", f"- The sandbox worker (`{last}`),")
     assert _cipher_probe_drift(stray, seconds, names)
 
