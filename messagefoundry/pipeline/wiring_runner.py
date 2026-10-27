@@ -8089,8 +8089,9 @@ class RegistryRunner:
         A failure is caught, never raised: a re-pend that raises inside an except arm would kill the
         worker with the rows still in flight, which is strictly worse than the retry. It is logged at
         WARNING on the worker's ``faults`` backoff (BACKLOG #1844), one line per 1st, 2nd, 4th ...
-        failure and a line when the write lands; a caller without one gets a backoff of its own. The
-        line carries counts and the exception, never a row's content.
+        failure; that run closes, with a line, on the worker's quiet rule rather than when the write
+        lands. A caller without one gets a backoff of its own, which logs a line when the write lands.
+        Each line carries counts and the exception, never a row's content.
         """
         if not ids:
             return False
