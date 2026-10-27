@@ -669,7 +669,6 @@ def _bound_phrase(seconds: float) -> str:
 _OPENSSL_NAME_RE = re.compile(r"`(OPENSSL_[A-Z_]+)`")
 _CIPHER_PARAGRAPH_LEAD = "**The host cipher read gives PowerShell script text.**"
 _OPENSSL_ITEM_LEAD = "The `openssl` start in `verify/cipher_policy.py`"
-_BLANK_LINE = "\n\n"
 
 
 def _cipher_probe_drift(
@@ -680,7 +679,7 @@ def _cipher_probe_drift(
     in that start's environment-list item (vault BACKLOG #3804 items 3 and 5). Each is read from its
     own place, so a match elsewhere in the section cannot stand in for it (#4083 finding 7)."""
     section = _section(text, 4)
-    paragraph = section.partition(_CIPHER_PARAGRAPH_LEAD)[2].partition(_BLANK_LINE)[0]
+    paragraph = section.partition(_CIPHER_PARAGRAPH_LEAD)[2].partition("\n\n")[0]
     items = [item for item in _env_list_items(text) if item.startswith(_OPENSSL_ITEM_LEAD)]
     if not paragraph or len(items) != 1:
         return [
@@ -763,7 +762,7 @@ def test_cipher_probe_text_drift_is_reported() -> None:
     moved, count = _loose(stated).subn("limited", text)
     assert count == 1
     tray = "**The tray opens files"
-    moved = _replace_once(moved, tray, f"Probes are {stated}.{_BLANK_LINE}{tray}")
+    moved = _replace_once(moved, tray, f"Probes are {stated}.\n\n{tray}")
     assert _cipher_probe_drift(moved, seconds, names)
     last = names[-1]
     stray = _replace_once(text, f" and `{last}`", "")
