@@ -141,17 +141,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Wheels only (vault BACKLOG #3861): pip, the auditor's dry-runs included, builds no pinned sdist
-    # in this job. uv reads no PIP_* variable, so `uv lock --check` may still build one to re-resolve.
+    # in this job. uv reads no PIP_* variable, so it takes its own switch, for `uv lock --check` and
+    # the exports. Measured 2026-10-26 with uv 0.12.0 and an empty cache: this lock checks and exports
+    # under it, and a lock needing an sdist-only pin fails "building from source is disabled".
     env:
       PIP_ONLY_BINARY: ":all:"
+      UV_NO_BUILD: "1"
     # HARD-FAILING: the lockfile audit is clean. A newly-disclosed CVE in a pinned dep will now turn CI
     # red (the intended forcing function) — bump the lockfile, or append `--ignore-vuln <ID>` to
     # that lock's audit line to accept a triaged advisory.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Store no job token from the checkout, where code a dependency install or audit runs
-          # could read it (vault BACKLOG #3861).
+          # Store no job token in the checkout's .git/config, where code a dependency install or
+          # audit runs could read it from disk (vault BACKLOG #3861). That removes the copy on disk
+          # only. It does not keep the token from that code: on a GitHub-hosted runner any step can
+          # read it from the runner process's memory. What bounds the token is the workflow's
+          # `permissions:` block, read-only contents.
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -379,7 +385,8 @@ jobs:
       - name: Install pip-audit (hash-pinned, from the CI toolchain lock)
         # Same install as the pip-audit job above: no new tool, no new pin, no second vulnerability
         # database, nothing that can drift out of step with an operator-facing command.
-        run: python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r ci/locks/ci-scanners.lock
       - name: Audit the latest released line's pinned core runtime
         env:
           GH_TOKEN: ${{ github.token }}
@@ -438,6 +445,8 @@ jobs:
             fi
             # Every pin, whatever its marker: the pip-audit job's comment on the same script says why.
             # GH_TOKEN is for `gh` above; pip and pip-audit have no use for it (vault BACKLOG #3861).
+            # The unset keeps it out of their environment only, not out of their reach: the
+            # pip-audit job's checkout comment says why.
             env -u GH_TOKEN python scripts/security/audit_all_platforms.py "core-$tag.lock"
             echo "$tag: CLEAN -- $pinned pinned requirements of the CORE RUNTIME closure, no known advisory"
             examined=$((examined + 1))
@@ -1616,13 +1625,15 @@ jobs:
     # an audit verdict). So the steady state this is sized against is pip-audit at 79 seconds plus
     # that worst case plus a full-history secret scan.
     timeout-minutes: 20
-    # Wheels only for pip here: see the pip-audit job's `env:` (vault BACKLOG #3861).
+    # Wheels only for pip and uv here: see the pip-audit job's `env:` (vault BACKLOG #3861).
     env:
       PIP_ONLY_BINARY: ":all:"
+      UV_NO_BUILD: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # No stored job token: see the pip-audit job's checkout (vault BACKLOG #3861).
+          # No job token on disk: see the pip-audit job's checkout, and what it does not stop
+          # (vault BACKLOG #3861).
           persist-credentials: false
           # `fetch-depth: 0` IS THE GITLEAKS REQUIREMENT AND IT NOW GOVERNS THE WHOLE JOB. The scan
           # walks every ancestor of HEAD, which a shallow clone has not fetched, so dropping this

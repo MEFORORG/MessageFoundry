@@ -2513,10 +2513,13 @@ def test_a_binary_option_value_is_not_an_install_target() -> None:
     assert _install_targets("pip install --no-binary :none: requests==2.0") == ["requests==2.0"]
 
 
-#: The security.yml jobs that audit a dependency lock, which vault BACKLOG #3861 closed. Not every job
-#: that installs a lock: at least sbom, sbom-windows, bandit and repo-scan install one without either
-#: control, and are not pinned here.
+#: The security.yml jobs that audit a dependency lock, the ones vault BACKLOG #3861 names (that row
+#: stays PARTIAL). Not every job that installs a lock: at least sbom, bandit and repo-scan install one
+#: with neither control, and sbom-windows with the checkout control only. None of those is pinned here.
 _LOCK_AUDIT_JOBS = ("pip-audit", "released-line-audit", "dependency-and-secret-scan")
+
+#: The lock-audit jobs that run uv, which reads no ``PIP_*`` variable and so takes its own switch.
+_UV_LOCK_AUDIT_JOBS = ("pip-audit", "dependency-and-secret-scan")
 
 
 @pytest.mark.parametrize("job", _LOCK_AUDIT_JOBS)
@@ -2534,6 +2537,19 @@ def test_a_lock_audit_job_takes_wheels_only_and_keeps_no_checkout_token(job: str
     assert checkouts, f"{job} has no checkout step"
     for step in checkouts:
         assert (step.get("with") or {}).get("persist-credentials") is False, job
+
+
+@pytest.mark.parametrize("job", _UV_LOCK_AUDIT_JOBS)
+def test_a_lock_audit_job_that_runs_uv_takes_no_build_too(job: str) -> None:
+    """``uv lock --check`` and ``uv export`` ignore ``PIP_ONLY_BINARY``; ``UV_NO_BUILD`` at job level
+    keeps them from building an sdist (vault BACKLOG #4083 finding 5). Removing it fails here."""
+    pytest.importorskip("yaml")
+    from tests._workflow_contexts import jobs_of
+
+    jobs = jobs_of("security.yml")
+    runs = "\n".join(str(s.get("run", "")) for s in jobs[job]["steps"])
+    assert re.search(r"^\s*uv (?:lock|export)\b", runs, re.M), f"{job} runs no uv; update the list"
+    assert (jobs[job].get("env") or {}).get("UV_NO_BUILD") == "1", job
 
 
 def test_the_released_line_auditor_runs_without_the_gh_token() -> None:
