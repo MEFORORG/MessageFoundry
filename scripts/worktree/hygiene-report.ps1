@@ -650,9 +650,9 @@ foreach ($c in $report.clones) {
     $md.Add("")
     $md.Add("### e. Seat locks whose session is gone ($($c.staleSeatLocks.Count))")
     $md.Add("")
-    if ($c.staleSeatLocks.Count -eq 0) { $md.Add("None. A seat lock reads ``<seat> <session id>``; only those whose session reads DEAD, STALE or has no registry record are listed.") }
+    if ($c.staleSeatLocks.Count -eq 0) { $md.Add("None. Rule: scripts/worktree/worktree-audit.ps1, Get-SeatLockReading.") }
     else {
-        $md.Add("A seat locks its worktree on arrival and unlocks it on a clean exit. These sessions did not, so every reclaimer, the Desktop GC included, keeps the tree. ``No registry record`` cannot tell an exited session from one that never registered, so check before unlocking:")
+        $md.Add("These seats did not unlock at exit, so every reclaimer keeps the tree. ``NO RECORD`` cannot tell an exited session from one that never registered, so check before unlocking:")
         $md.Add("")
         foreach ($s in $c.staleSeatLocks) { $md.Add("- ``$($s.path)``: ``$($s.reason)``, $($s.state) ($($s.detail))") }
         $md.Add("")

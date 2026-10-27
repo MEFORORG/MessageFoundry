@@ -18,7 +18,8 @@
     SessionStart wrote, or the input's `cwd`. It reads the pin and never writes one.
 
     IT NEVER FAILS AND NEVER SPEAKS. It exits 0 on every path and prints nothing, because a session
-    that is ending has no turn left to read a line.
+    that is ending has no turn left to read a line. A failed unlock leaves the lock, which
+    hygiene-report.ps1 then lists like any other left behind.
 #>
 [CmdletBinding()]
 param()
@@ -31,6 +32,9 @@ try {
     $raw = Read-CcxHookInput
     $s = Resolve-CcxHookSession -Text $raw -ReadOnly
     if (-not $s.SessionId) { exit 0 }
+    # /clear and /resume end a session id while the process, and its seat, go on in the same tree.
+    # The lock stays; seat.ps1 -Record takes it over under the new id at the next Stop.
+    if ($s.Payload -and $s.Payload.PSObject.Properties['reason'] -and [string]$s.Payload.reason -in @('clear', 'resume')) { exit 0 }
     $dir = if ($s.Dir) { $s.Dir } else { (Get-Location).ProviderPath }
     $root = if ($s.Root) { $s.Root } else { Get-CcxWorktreeRoot $dir }
     if (-not $root) { exit 0 }

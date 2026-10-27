@@ -6,8 +6,10 @@
 
 .DESCRIPTION
     Dot-source this; it defines functions and does nothing on its own. seat.ps1 calls
-    Set-SeatWorktreeLock on -Declare and on the SessionStart -Prompt path, and Remove-SeatWorktreeLock
-    on -Close. The SessionEnd hook scripts/hooks/seat-unlock.ps1 calls Remove-SeatWorktreeLock too.
+    Set-SeatWorktreeLock on the SessionStart -Prompt path, on -Declare, and on every Stop (-Record),
+    so a lock lost to a /clear, a shared-root outage or a co-tenant's exit is put back by the next
+    turn. Only the SessionEnd hook scripts/hooks/seat-unlock.ps1 calls Remove-SeatWorktreeLock: a
+    seat that ran -Close is often still open, and an early unlock re-opens it to the GC.
     Why a lock at all, and the reason format, are in worktree-audit.ps1's header.
 
     NEITHER FUNCTION THROWS. Each returns an Action and a Detail, because both run inside hooks that
@@ -16,6 +18,8 @@
     WHAT EACH WILL NOT DO, and why:
       * Lock or unlock the PRIMARY checkout. Git refuses `worktree lock` on the main working tree, and
         no GC removes it anyway.
+      * Lock for a session with no session id. Its lock could never be matched at exit or placed by
+        a reader, so it would be permanent and unreported.
       * Run in a Claude Code cloud session. The VM's clone has no Desktop GC to fend off, and the
         refusal elsewhere in this repository is that such a session writes nothing for others.
       * Replace another holder's lock. Claude Code locks an `isolation: worktree` agent's tree while it
@@ -64,12 +68,20 @@ function Set-SeatWorktreeLock {
         Lock $Worktree for this seat. Idempotent. Actions: locked, relabelled, taken-over, kept-own,
         kept-foreign, skipped-primary, skipped-cloud, failed.
     #>
-    param([string]$Worktree, [string]$Seat, [string]$SessionKey, [string[]]$ConfigRoot)
+    param(
+        [string]$Worktree, [string]$Seat, [string]$SessionKey, [string[]]$ConfigRoot,
+        # Keep this session's existing lock as it reads, for a caller that does not know the seat.
+        [switch]$KeepLabel
+    )
     if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
         return [pscustomobject]@{ Action = 'skipped-cloud'; Detail = 'a cloud session has no Desktop worktree GC to fend off' }
     }
+    # A lock this session's exit could not match, and no reader could place, is a permanent lock that
+    # nothing reports. So a session with no session id (a hand run with none set) places none.
+    if (-not (Test-SeatLockSessionKey $SessionKey)) {
+        return [pscustomobject]@{ Action = 'skipped-no-session-id'; Detail = "'$SessionKey' is not a session id, so nothing could release or report this lock" }
+    }
     $reason = Format-SeatLockReason -Seat $Seat -SessionKey $SessionKey
-    $mineKey = $reason.Split(' ')[1]
     $st = Get-WorktreeLockState $Worktree
     if ($st.Error) { return [pscustomobject]@{ Action = 'failed'; Detail = $st.Error } }
     if (-not $st.Linked) { return [pscustomobject]@{ Action = 'skipped-primary'; Detail = 'the primary checkout cannot be locked, and no GC removes it' } }
@@ -78,21 +90,27 @@ function Set-SeatWorktreeLock {
         if ($st.Reason -ceq $reason) { return [pscustomobject]@{ Action = 'kept-own'; Detail = $reason } }
         $held = ConvertFrom-SeatLockReason $st.Reason
         $action = ''
-        # `nosid` is no identity, so two sessions without one never relabel each other's lock.
-        if ($held -and $mineKey -ne 'nosid' -and $held.SessionKey -ceq $mineKey) { $action = 'relabelled' }
+        if ($held -and $held.SessionKey -ceq $SessionKey) {
+            if ($KeepLabel) { return [pscustomobject]@{ Action = 'kept-own'; Detail = $st.Reason } }
+            $action = 'relabelled'
+        }
         elseif ($held -and (Get-SeatLockReading -SessionKey $held.SessionKey -ConfigRoot $ConfigRoot).Gone) { $action = 'taken-over' }
         if (-not $action) {
             return [pscustomobject]@{ Action = 'kept-foreign'; Detail = "already locked by another holder: $($st.Reason)" }
         }
+        # In place, so the tree is never unlocked in between. Git writes the reason and a newline.
+        $f = Join-Path $st.AdminDir 'locked'
+        $tmp = "$f.$([guid]::NewGuid().ToString('n')).tmp"
         try {
-            # In place, so the tree is never unlocked in between. Git writes the reason and a newline.
-            $f = Join-Path $st.AdminDir 'locked'
-            $tmp = "$f.$([guid]::NewGuid().ToString('n')).tmp"
             [System.IO.File]::WriteAllText($tmp, "$reason`n", [System.Text.UTF8Encoding]::new($false))
             [System.IO.File]::Move($tmp, $f, $true)
             return [pscustomobject]@{ Action = $action; Detail = "$reason (was: $($st.Reason))" }
         }
-        catch { return [pscustomobject]@{ Action = 'failed'; Detail = "could not rewrite the lock: $($_.Exception.Message)" } }
+        catch {
+            # No residue in git's admin directory.
+            try { [System.IO.File]::Delete($tmp) } catch { }
+            return [pscustomobject]@{ Action = 'failed'; Detail = "could not rewrite the lock: $($_.Exception.Message)" }
+        }
     }
 
     $msg = & git -C $Worktree worktree lock --reason $reason $Worktree 2>&1
@@ -123,9 +141,7 @@ function Remove-SeatWorktreeLock {
     if (-not $st.Linked) { return [pscustomobject]@{ Action = 'skipped-primary'; Detail = 'the primary checkout carries no seat lock' } }
     if (-not $st.Locked) { return [pscustomobject]@{ Action = 'not-locked'; Detail = '' } }
     $held = ConvertFrom-SeatLockReason $st.Reason
-    $key = ConvertTo-SeatLockToken $SessionKey
-    # `nosid` is no identity: two sessions with no id would each own the other's lock.
-    if (-not $held -or -not $key -or $key -eq 'nosid' -or $held.SessionKey -cne $key) {
+    if (-not $held -or -not (Test-SeatLockSessionKey $SessionKey) -or $held.SessionKey -cne $SessionKey) {
         return [pscustomobject]@{ Action = 'kept-foreign'; Detail = "locked by another holder: $($st.Reason)" }
     }
     $msg = & git -C $Worktree worktree unlock $Worktree 2>&1

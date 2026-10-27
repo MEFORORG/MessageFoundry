@@ -2,11 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A declared seat's worktree carries git's ``locked`` file, and a clean exit removes only its own.
 
-BACKLOG #2524. A Claude Desktop instance's worktree GC runs ``git worktree remove --force`` on another
-instance's quiet, clean worktree, and on Windows that empties and deregisters a folder a live session
-still holds. The GC keeps a tree whose admin directory holds a ``locked`` file. So ``seat.ps1`` locks
-the seat's worktree on arrival (``-Prompt``, the SessionStart path, and ``-Declare``), and ``-Close``
-and the SessionEnd hook ``seat-unlock.ps1`` unlock it.
+BACKLOG #2524; why a lock at all is scripts/worktree/worktree-audit.ps1's header. ``seat.ps1`` locks
+the seat's worktree on ``-Prompt`` (SessionStart), ``-Declare`` and ``-Record`` (every Stop), and only
+the SessionEnd hook ``seat-unlock.ps1`` unlocks it.
 
 The properties pinned here each fail silently:
 
@@ -147,8 +145,12 @@ def declare(w: Path, home: Path, sid: str = SID) -> subprocess.CompletedProcess[
     return proc
 
 
-def unlock_hook(w: Path, home: Path, sid: str) -> subprocess.CompletedProcess[str]:
-    payload = json.dumps({"session_id": sid, "cwd": str(w), "hook_event_name": "SessionEnd"})
+def unlock_hook(
+    w: Path, home: Path, sid: str, reason: str = "prompt_input_exit"
+) -> subprocess.CompletedProcess[str]:
+    payload = json.dumps(
+        {"session_id": sid, "cwd": str(w), "hook_event_name": "SessionEnd", "reason": reason}
+    )
     return subprocess.run(
         [
             "pwsh",
@@ -202,8 +204,8 @@ def test_another_holders_lock_is_kept(wt: Path, home: Path, repo: Path) -> None:
     assert "worktree lock: kept-foreign" in proc.stdout
     assert lock_text(wt) == claude
     # And a clean exit leaves it too.
-    proc = seat(wt, home, "-Close", "-SessionId", SID)
-    assert "worktree lock: kept-foreign" in proc.stdout
+    proc = unlock_hook(wt, home, SID)
+    assert proc.returncode == 0, proc.stderr
     assert lock_text(wt) == claude
 
 
@@ -224,20 +226,45 @@ def test_a_live_seats_lock_is_kept_and_a_dead_ones_is_taken_over(
         sleeper.kill()
         sleeper.wait()
 
-    # The same seat with no registry record: gone, so the arriving seat takes the lock over.
+    # No record, but a registry file caught mid-write might be that seat's: still not gone.
+    (sessions / "1.json").write_text("{", encoding="utf-8")
+    proc = declare(wt, home)
+    assert "worktree lock: kept-foreign" in proc.stdout, proc.stdout
+
+    # The same seat with no registry record at all: gone, so the arriving seat takes it over.
     (sessions / "1.json").unlink()
     proc = declare(wt, home)
     assert "worktree lock: taken-over" in proc.stdout, proc.stdout
     assert lock_text(wt) == f"builder {SID}"
 
 
-def test_close_unlocks_only_its_own_session(wt: Path, home: Path) -> None:
+def test_close_keeps_the_lock_and_the_next_stop_restores_a_lost_one(wt: Path, home: Path) -> None:
+    """A closed seat is often still open, so -Close must not unlock. And a lock lost while the
+    session runs (a co-tenant's exit, a /clear) is put back by the next Stop's -Record."""
     declare(wt, home)
-    proc = seat(wt, home, "-Close", "-SessionId", OTHER_SID)
-    assert "worktree lock: kept-foreign" in proc.stdout
-    assert lock_text(wt) == f"builder {SID}"
     proc = seat(wt, home, "-Close", "-SessionId", SID)
-    assert "worktree lock: unlocked" in proc.stdout
+    assert proc.returncode == 0, proc.stderr
+    assert lock_text(wt) == f"builder {SID}"
+    git(wt, "worktree", "unlock", str(wt))
+    proc = seat(wt, home, "-Record", "-SessionId", SID)
+    assert proc.returncode == 0, proc.stderr
+    assert lock_text(wt) == f"builder {SID}"
+
+
+def test_the_sessionend_hook_skips_a_clear_and_a_resume(wt: Path, home: Path) -> None:
+    declare(wt, home)
+    for reason in ("clear", "resume"):
+        proc = unlock_hook(wt, home, SID, reason=reason)
+        assert proc.returncode == 0, proc.stderr
+        assert lock_text(wt) == f"builder {SID}", f"reason={reason} ended no seat"
+    proc = unlock_hook(wt, home, SID, reason="prompt_input_exit")
+    assert lock_text(wt) is None, "control: a real exit unlocks"
+
+
+def test_a_session_with_no_session_id_places_no_lock(wt: Path, home: Path) -> None:
+    """Its lock could never be matched at exit or placed by the report, so it would be permanent."""
+    proc = seat(wt, home, "-Declare", "-Seat", "builder", "-Goal", "g", "-SessionId", "sess-abc")
+    assert "worktree lock: skipped-no-session-id" in proc.stdout
     assert lock_text(wt) is None
 
 

@@ -746,16 +746,19 @@ whose admin directory holds a `locked` file, and so do `prune-merged.ps1`, `clai
 and `hygiene-report.ps1`'s removal list.
 
 So `seat.ps1` runs `git worktree lock --reason "<seat> <session id>"` on the session's worktree. It
-does so on the SessionStart `-Prompt` path, with the seat `undeclared`, and again on `-Declare`,
-which relabels the same session's lock in place. `seat.ps1 -Close` and the SessionEnd hook
-[`seat-unlock.ps1`](../scripts/hooks/seat-unlock.ps1) unlock it. They remove only a seat lock that
-names their own session id. The rules are in
-[`seat-lock.ps1`](../scripts/worktree/seat-lock.ps1):
+does so on the SessionStart `-Prompt` path, on `-Declare`, and on every Stop (`-Record`). The seat
+is whatever the record holds, or `undeclared`, and a later call relabels the same session's lock in
+place. Only the SessionEnd hook [`seat-unlock.ps1`](../scripts/hooks/seat-unlock.ps1) unlocks it,
+and only a seat lock that names its own session id. It skips a `/clear` or `/resume`, after which
+the next Stop takes the lock over under the new id. `-Close` does not unlock, because a closed seat
+is often still open. The rules are in [`seat-lock.ps1`](../scripts/worktree/seat-lock.ps1):
 
 - Another holder's lock is kept. Claude Code locks an `isolation: worktree` agent's tree while it
   runs, and that reason reads `claude agent <name> (pid <n>)`.
-- A seat lock whose session reads DEAD or STALE, or has no registry record, is taken over by the
-  seat that arrives there. It is rewritten in place, so the tree is never unlocked in between.
+- A seat lock whose session reads DEAD or STALE, or has no registry record while every registry
+  file parses, is taken over by the seat that arrives there. It is rewritten in place, so the tree
+  is never unlocked in between.
+- A session with no session id places no lock, since nothing could release or report it.
 - The primary checkout is skipped, because git refuses to lock it. A cloud session is skipped too.
 
 A session that dies without unlocking leaves its tree locked, and every reclaimer then keeps it.

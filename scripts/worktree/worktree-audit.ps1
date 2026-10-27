@@ -23,13 +23,17 @@
     and it is told apart from other holders' locks by its SHAPE: Claude Code's own lock on an
     `isolation: worktree` agent reads `claude agent <name> (pid <n>)`, and a hand-written lock is
     usually prose. The session token must be a session id as seat.ps1 keys it (a UUID, optionally
-    `codex-` prefixed) or the literal `nosid`, so a two-word hand lock such as `manual hold` is never
-    read as a seat lock and offered for unlocking.
+    `codex-` prefixed), so a two-word hand lock such as `manual hold` is never read as a seat lock and
+    offered for unlocking. A session with no such id is never locked (seat-lock.ps1), because nothing
+    could ever tell its lock apart from another's, release it, or report it.
 #>
 
-# A session id as seat.ps1's Get-SessionKey keys it: a UUID, `codex-` prefixed for a Codex seat, or
-# the literal it falls back to when no id is known.
-$script:SeatLockSessionPattern = '(?:codex-)?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}|nosid'
+# A session id as seat.ps1's Get-SessionKey keys it: a UUID, `codex-` prefixed for a Codex seat.
+$script:SeatLockSessionPattern = '(?:codex-)?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
+
+function Test-SeatLockSessionKey([string]$SessionKey) {
+    return ([string]$SessionKey) -match "\A(?:$script:SeatLockSessionPattern)\z"
+}
 
 function ConvertTo-SeatLockToken([string]$Text) {
     # One token, so the reason stays two. A seat label is one word in the roster; anything else is
@@ -42,9 +46,7 @@ function Format-SeatLockReason {
     param([string]$Seat, [string]$SessionKey)
     $s = ConvertTo-SeatLockToken $Seat
     if (-not $s) { $s = 'undeclared' }
-    $k = ConvertTo-SeatLockToken $SessionKey
-    if (-not $k) { $k = 'nosid' }
-    return "$s $k"
+    return "$s $(ConvertTo-SeatLockToken $SessionKey)"
 }
 
 function ConvertFrom-SeatLockReason {
@@ -73,20 +75,29 @@ function Get-SeatLockReading {
     .DESCRIPTION
         Gone is DEAD, STALE, or no registry record. A session that exits cleanly drops its record, so a
         miss cannot tell an exited session from one that never registered; Detail says which reading
-        it was. LIVE, UNVERIFIED and UNREADABLE are never gone. `nosid` names no session, and a Codex
-        session is not in Claude's registry, so neither can be fenced and neither reads gone. The
-        caller must have dot-sourced session-registry.ps1.
+        it was. LIVE, UNVERIFIED and UNREADABLE are never gone. A Codex session is not in Claude's
+        registry, so it cannot be fenced and never reads gone. The caller must have dot-sourced
+        session-registry.ps1.
+
+        A MISS IS GONE ONLY WHEN EVERY REGISTRY FILE PARSED. A file caught mid-write parses to nothing
+        and the lookup skips it, and that file may be the very session asked about; seat.ps1's
+        -ClearHandoff refuses on the same ground. -Unreadable takes that count from a caller that
+        already read the registry, so a report over many locks reads it once.
     #>
-    param([string]$SessionKey, [string[]]$ConfigRoot)
-    if ($SessionKey -eq 'nosid') {
-        return [pscustomobject]@{ State = 'NO SESSION ID'; Detail = 'the lock names no session, so nothing can say whether its seat is alive'; Gone = $false }
-    }
+    param([string]$SessionKey, [string[]]$ConfigRoot, [Nullable[int]]$Unreadable)
     if ($SessionKey.StartsWith('codex-')) {
         return [pscustomobject]@{ State = 'CODEX'; Detail = "Claude's session registry cannot fence a Codex seat"; Gone = $false }
     }
     try { $l = Get-SessionLiveness -SessionId $SessionKey -ConfigRoot $ConfigRoot }
     catch { return [pscustomobject]@{ State = 'UNREADABLE'; Detail = "the liveness lookup failed: $($_.Exception.Message)"; Gone = $false } }
     if ((-not $l.Found) -and $l.State -eq 'UNKNOWN') {
+        if ($null -eq $Unreadable) {
+            try { $Unreadable = @(Get-SessionRecords -ConfigRoot $ConfigRoot -IncludeUnreadable | Where-Object { $_.Unreadable }).Count }
+            catch { $Unreadable = 1 }
+        }
+        if ($Unreadable -gt 0) {
+            return [pscustomobject]@{ State = 'UNREADABLE'; Detail = "no registry record, but $Unreadable registry file(s) could not be read, and one may be this session's"; Gone = $false }
+        }
         return [pscustomobject]@{ State = 'NO RECORD'; Detail = 'no registry record: the session exited, or never registered'; Gone = $true }
     }
     return [pscustomobject]@{ State = $l.State; Detail = $l.Detail; Gone = ($l.State -in @('DEAD', 'STALE')) }
@@ -103,16 +114,21 @@ function Get-StaleSeatLocks {
 
         Gone is Get-SeatLockReading's rule. A LIVE, UNVERIFIED or UNREADABLE session is never listed:
         this feeds a report that proposes an unlock, and an unlock under a live seat re-opens the tree
-        to the GC. A `nosid` lock is listed too, because nothing will ever release it on its own; a
-        Codex lock is not, because nothing here can tell that it is gone.
+        to the GC. A Codex lock is never listed, because nothing here can tell that it is gone.
     #>
     param([object[]]$Worktrees, [string[]]$ConfigRoot)
     $out = [System.Collections.Generic.List[object]]::new()
-    foreach ($w in @($Worktrees | Where-Object { $_ -and $_.Locked })) {
-        $p = ConvertFrom-SeatLockReason $w.LockReason
-        if (-not $p) { continue }
-        $r = Get-SeatLockReading -SessionKey $p.SessionKey -ConfigRoot $ConfigRoot
-        if (-not ($r.Gone -or $r.State -eq 'NO SESSION ID')) { continue }
+    $seatLocks = @(foreach ($w in @($Worktrees | Where-Object { $_ -and $_.Locked })) {
+            $p = ConvertFrom-SeatLockReason $w.LockReason
+            if ($p) { [pscustomobject]@{ W = $w; P = $p } }
+        })
+    if ($seatLocks.Count -eq 0) { return @() }
+    $unreadable = 1
+    try { $unreadable = @(Get-SessionRecords -ConfigRoot $ConfigRoot -IncludeUnreadable | Where-Object { $_.Unreadable }).Count } catch { }
+    foreach ($x in $seatLocks) {
+        $w = $x.W; $p = $x.P
+        $r = Get-SeatLockReading -SessionKey $p.SessionKey -ConfigRoot $ConfigRoot -Unreadable $unreadable
+        if (-not $r.Gone) { continue }
         $out.Add([pscustomobject]@{ Path = $w.Path; Reason = $w.LockReason; Seat = $p.Seat; SessionKey = $p.SessionKey; State = $r.State; Detail = $r.Detail })
     }
     return @($out)

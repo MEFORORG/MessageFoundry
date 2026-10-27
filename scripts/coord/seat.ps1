@@ -845,6 +845,35 @@ function Invoke-ClearHandoff {
     return 0
 }
 
+function Invoke-SeatWorktreeLock {
+    <#
+    .SYNOPSIS
+        Lock this seat's worktree (BACKLOG #2524). Returns the line a CLI verb prints. Never throws.
+
+    .DESCRIPTION
+        Why, and the rules, are scripts/worktree/worktree-audit.ps1's and seat-lock.ps1's headers.
+        It runs on -Prompt (SessionStart), -Declare and -Record (every Stop), and also when the shared
+        registry is down: the lock is local git state, so an outage must not leave a session unlocked.
+        A copy of this script with no seat-lock.ps1 beside it (a test sandbox that copies seat.ps1
+        alone) says so and records nothing: the lock is not this record's to fail.
+    #>
+    param([string]$Wt, [string]$Seat, [string]$SessionKey, [switch]$KeepLabel)
+    $lib = Join-Path (Split-Path -Parent $PSScriptRoot) 'worktree\seat-lock.ps1'
+    if (-not (Test-Path -LiteralPath $lib -PathType Leaf)) {
+        return 'worktree lock: not attempted (scripts/worktree/seat-lock.ps1 is missing beside this script)'
+    }
+    try {
+        . $lib
+        $lock = Set-SeatWorktreeLock -Worktree $Wt -Seat $Seat -SessionKey $SessionKey -KeepLabel:$KeepLabel
+        if ($lock.Action -eq 'failed') { Write-WriterError -Stage 'worktree-lock' -Message $lock.Detail }
+        return "worktree lock: $($lock.Action)$(if ($lock.Detail) { " ($($lock.Detail))" })"
+    }
+    catch {
+        Write-WriterError -Stage 'worktree-lock' -Message $_.Exception.Message
+        return "worktree lock: failed ($($_.Exception.Message))"
+    }
+}
+
 # ---------------------------------------------------------------------------------------------
 # Main. Everything is wrapped: rule 2 says this exits 0 whatever happens.
 # ---------------------------------------------------------------------------------------------
@@ -875,6 +904,9 @@ try {
         # REFUSES, naming the cause. Neither falls back to the local root: a local fallback would
         # put this seat in a registry the other PC never reads, while reporting success.
         if ($PSCmdlet.ParameterSetName -in 'Record', 'Prompt') {
+            # The lock is local; it does not wait on the share. No seat is known here, so an existing
+            # lock of this session's keeps its label.
+            $null = Invoke-SeatWorktreeLock -Wt $wt -SessionKey (Get-SessionKey -Payload $payload -Override $SessionId).Key -KeepLabel
             [System.Console]::Error.WriteLine("seat.ps1: the shared seat registry did not resolve, so nothing was recorded: $($seatsRes.Error)")
             exit 0
         }
@@ -1103,6 +1135,14 @@ try {
     $priorClears = Prior 'handoffClears' $null
     if ($null -ne $priorClears) { $rec['handoffClears'] = @($priorClears) }
 
+    # The worktree lock (BACKLOG #2524), BEFORE the record write, so a failed write cannot leave the
+    # session unlocked. -Close does not unlock: only the SessionEnd hook does (seat-lock.ps1 says why).
+    # The line is printed AFTER `wrote <path>`, which callers parse as stdout's first line.
+    $lockLine = ''
+    if ($Declare -or $Prompt -or $Record) {
+        $lockLine = Invoke-SeatWorktreeLock -Wt $wt -Seat ([string]$rec.seat) -SessionKey $sk.Key
+    }
+
     Write-RecordAtomic -Path $recPath -Object $rec
     # ------------------------------------------------------------ the role-card marker
     # A DECLARATION ALSO WRITES `.claude/seat.local.txt`, BECAUSE NOTHING ELSE DOES AND THE CARD
@@ -1147,35 +1187,6 @@ try {
                     "($($_.Exception.Message)). No role card will be injected here until it exists.")
             }
             catch { }
-        }
-    }
-
-    # ------------------------------------------------------------ the worktree lock (BACKLOG #2524)
-    # ARRIVAL LOCKS THE WORKTREE, A CLEAN EXIT UNLOCKS IT. A Claude Desktop instance's worktree GC
-    # empties and deregisters another instance's quiet, clean worktree with its session still inside,
-    # and it keeps any tree that carries a `locked` file. -Prompt is the SessionStart path, so every
-    # session is covered before it declares; -Declare relabels the lock with the declared seat; -Close
-    # releases it. The rules (another holder's lock is kept, the primary and a cloud VM are skipped)
-    # are scripts/worktree/seat-lock.ps1's. Rule 2 above: a failure here is recorded, never thrown.
-    # A copy of this script with no seat-lock.ps1 beside it (a test sandbox that copies seat.ps1
-    # alone) says so on the CLI paths and records nothing: the lock is not this record's to fail.
-    # The line is printed AFTER `wrote <path>`, which callers parse as stdout's first line.
-    $lockLine = ''
-    $lockLib = Join-Path (Split-Path -Parent $PSScriptRoot) 'worktree\seat-lock.ps1'
-    if (($Declare -or $Prompt -or $Close) -and -not (Test-Path -LiteralPath $lockLib -PathType Leaf)) {
-        $lockLine = 'worktree lock: not attempted (scripts/worktree/seat-lock.ps1 is missing beside this script)'
-    }
-    elseif ($Declare -or $Prompt -or $Close) {
-        try {
-            . $lockLib
-            $lock = if ($Close) { Remove-SeatWorktreeLock -Worktree $wt -SessionKey $sk.Key }
-                    else { Set-SeatWorktreeLock -Worktree $wt -Seat ([string]$rec.seat) -SessionKey $sk.Key }
-            if ($lock.Action -eq 'failed') { Write-WriterError -Stage 'worktree-lock' -Message $lock.Detail }
-            $lockLine = "worktree lock: $($lock.Action)$(if ($lock.Detail) { " ($($lock.Detail))" })"
-        }
-        catch {
-            Write-WriterError -Stage 'worktree-lock' -Message $_.Exception.Message
-            $lockLine = "worktree lock: failed ($($_.Exception.Message))"
         }
     }
 
