@@ -12,8 +12,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   re-pend of it can fail too. A worker, or a pooled lane serializer, whose re-pend fails now
   retries it on a capped backoff while it holds the lane, claiming nothing newer until the row is
   pending again, so per-lane order holds. A per-lane worker that dies holding a row has the rows on
-  its own lane re-pended before its replacement claims anything; clustered, that step stands down,
-  as the unconditional startup reset does. A stop during the retry leaves the row in flight for the
+  its own lane re-pended before its replacement claims anything, and a replacement for a worker
+  that keeps dying waits a doubling backoff, up to 30 s; clustered, that step stands down, as the
+  unconditional startup reset does. A stop during the retry leaves the row in flight for the
   next start, as before. While the store stays down the row stays in flight, and the in-flight
   watch added in 0.5.0 still pages it. (`BACKLOG #1611`)
 

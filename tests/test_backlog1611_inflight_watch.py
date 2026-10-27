@@ -652,7 +652,7 @@ class _Killed(BaseException):
     its claimed row in flight, and the supervisor respawns it."""
 
 
-@pytest.mark.parametrize("variant", ["shipped", "control"])
+@pytest.mark.parametrize("variant", ["shipped", "recovery-fails-once", "control"])
 async def test_a_worker_killed_holding_a_row_has_it_recovered_by_its_replacement(
     store: MessageStore,
     tmp_path: Path,
@@ -664,11 +664,15 @@ async def test_a_worker_killed_holding_a_row_has_it_recovered_by_its_replacement
     respawns it, and the replacement re-pends its own lane before its first claim, so A routes
     first, then B, with no restart and no reload.
 
-    The ``control`` variant spawns the replacement with no recovery: A stays in flight and B, which
-    arrived meanwhile, overtakes it."""
+    ``recovery-fails-once``: the replacement's reset raises once. It claims nothing until the
+    retry lands, so the order still holds. The ``control`` variant spawns the replacement with no
+    recovery: A stays in flight and B, which arrived meanwhile, overtakes it."""
     _fast_backoffs(monkeypatch)
+    calls: dict[str, int] = {}
     if variant == "control":
         monkeypatch.setattr(wiring_runner, "_left_a_lane", lambda prev: False)
+    elif variant == "recovery-fails-once":
+        _fail_once(monkeypatch, store, "reset_stale_inflight", calls)
     second: list[str] = []
     kills: list[str] = []
 
@@ -703,6 +707,8 @@ async def test_a_worker_killed_holding_a_row_has_it_recovered_by_its_replacement
             assert handed_off == [a, second[0]]
             assert await _ingress_inflight(store) == 0
             assert "re-pended 1 row(s) a finished worker left in flight" in caplog.text
+            if variant == "recovery-fails-once":
+                assert calls["reset_stale_inflight"] == 2
         finally:
             await runner.stop()
 
@@ -877,3 +883,57 @@ async def test_a_stop_during_the_retry_exits_promptly_and_leaves_the_row_in_flig
     finally:
         if not stopped:
             await runner.stop()
+
+
+async def test_the_respawn_recovery_is_scoped_to_its_stage_and_lane_and_reached_by_every_kind(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The OUTBOUND arm scopes on ``destination_name`` and the inbound arms on ``channel_id``, each
+    at its own stage. A spawn over a FINISHED worker of each kind recovers that kind's stage and
+    lane only; rows on another destination, or another stage of the same inbound, stay in flight.
+    A spawn with no predecessor recovers nothing (the startup reset covered it)."""
+    runner = RegistryRunner(
+        _two_inbound_registry(tmp_path), store, egress=EgressSettings(deny_by_default=False)
+    )
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=1.0)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB2", "p")], now=1.0)
+    await store.claim_next_fifo("OB", now=2.0)
+    await store.claim_next_fifo("OB2", now=2.0)
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
+    await store.claim_next_fifo("IB", now=2.0, stage=Stage.INGRESS.value)
+    out, ingress = Stage.OUTBOUND.value, Stage.INGRESS.value
+    assert await runner._recover_respawned_lane(Stage.OUTBOUND, "OB") == 1
+    assert await store.inflight_by_lane(stage=out) == {"OB2": (1, 2.0)}
+    assert await store.inflight_by_lane(stage=ingress) == {"IB": (1, 2.0)}
+
+    async def idle(name: str) -> None:
+        return None
+
+    finished = asyncio.ensure_future(idle("x"))
+    await finished
+    for attr in ("_router_worker", "_transform_worker", "_response_worker"):
+        monkeypatch.setattr(runner, attr, idle)
+    runner._transform_workers["IB"] = finished  # a returned transform worker: ROUTED, not INGRESS
+    runner._spawn_inbound_worker("transform", "IB")
+    await runner._transform_workers["IB"]
+    assert await store.inflight_by_lane(stage=ingress) == {"IB": (1, 2.0)}
+    runner._spawn_inbound_worker("router", "IB")  # no predecessor: nothing recovered
+    await runner._router_workers["IB"]
+    assert await store.inflight_by_lane(stage=ingress) == {"IB": (1, 2.0)}
+    runner._router_workers["IB"] = finished  # a returned router worker: INGRESS on IB
+    runner._spawn_inbound_worker("router", "IB")
+    await runner._router_workers["IB"]
+    assert await store.inflight_by_lane(stage=ingress) == {}
+    assert await store.inflight_by_lane(stage=out) == {"OB2": (1, 2.0)}
+
+
+def test_a_worker_that_keeps_dying_is_respawned_on_a_doubling_backoff(tmp_path: Path) -> None:
+    """Recovery puts the row a worker died holding back at the head, so a row that kills its worker
+    every time would otherwise loop with no pause. The first death waits nothing; each death after
+    it doubles the wait, up to the cap; another lane keeps its own count."""
+    runner = RegistryRunner(_registry(tmp_path), None, egress=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]
+    delays = [runner._respawn_delay(Stage.INGRESS, "IB") for _ in range(9)]
+    assert delays[:4] == [0.0, 0.5, 1.0, 2.0]
+    assert delays[-1] == stage_dispatcher._RESPAWN_BACKOFF_CAP_SECONDS
+    assert runner._respawn_delay(Stage.INGRESS, "IB2") == 0.0
+    assert runner._respawn_delay(Stage.ROUTED, "IB") == 0.0

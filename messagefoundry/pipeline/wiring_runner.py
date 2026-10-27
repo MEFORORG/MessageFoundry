@@ -190,6 +190,9 @@ from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.pipeline.stage_dispatcher import (
     _REPEND_RETRY_CAP_SECONDS,
+    _RESPAWN_BACKOFF_BASE_SECONDS,
+    _RESPAWN_BACKOFF_CAP_SECONDS,
+    _RESPAWN_STABLE_SECONDS,
     LaneItemResult,
     LaneResultKind,
     StageDispatcher,
@@ -468,6 +471,11 @@ def _left_a_lane(prev: asyncio.Task[None] | None) -> bool:
     the next start by design (ADR 0066). A live one is never recovered over: its rows may be
     mid-send, and every caller spawns only over a missing or finished worker anyway."""
     return prev is not None and prev.done() and not prev.cancelled()
+
+
+def _died(prev: asyncio.Task[None]) -> bool:
+    """Whether a finished worker (:func:`_left_a_lane`) raised rather than returned."""
+    return prev.exception() is not None
 
 
 # A per-lane worker's run of faults closes on the first healthy pass or empty claim at least this
@@ -1465,6 +1473,9 @@ class RegistryRunner:
         # One delivery worker per outbound connection, addressable by name so a reload can
         # gracefully stop/swap a single connection's worker without touching its siblings.
         self._workers: dict[str, asyncio.Task[None]] = {}
+        # BACKLOG #1611: per (stage, lane), consecutive per-lane worker deaths and when the latest
+        # replacement started, for the respawn backoff in _recover_then_run.
+        self._worker_deaths: dict[tuple[str, str], tuple[int, float]] = {}
         # --- outbound operator PAUSE (connection controls) ---------------------------------------
         # Operator-paused outbounds: delivery halted, queued rows RETAINED PENDING (never dropped/
         # reordered). The RELOAD-SURVIVING source of truth — outbound_running() reads it, a reload
@@ -6085,8 +6096,8 @@ class RegistryRunner:
             return
         prev = self._workers.get(name)
         task = asyncio.create_task(
-            self._recover_then_run(Stage.OUTBOUND, name, self._delivery_worker)
-            if _left_a_lane(prev)
+            self._recover_then_run(Stage.OUTBOUND, name, self._delivery_worker, died=_died(prev))
+            if prev is not None and _left_a_lane(prev)
             else self._delivery_worker(name)
         )
         task.add_done_callback(functools.partial(self._on_worker_done, name))
@@ -6177,8 +6188,8 @@ class RegistryRunner:
         worker = self._inbound_worker_coro(kind)
         prev = workers.get(name)
         task = asyncio.create_task(
-            self._recover_then_run(_INBOUND_WORKER_STAGE[kind], name, worker)
-            if _left_a_lane(prev)
+            self._recover_then_run(_INBOUND_WORKER_STAGE[kind], name, worker, died=_died(prev))
+            if prev is not None and _left_a_lane(prev)
             else worker(name)
         )
         task.add_done_callback(functools.partial(self._on_inbound_worker_done, kind, name))
@@ -6997,12 +7008,63 @@ class RegistryRunner:
         return recovered
 
     async def _recover_then_run(
-        self, stage: Stage, name: str, worker: Callable[[str], Awaitable[None]]
+        self, stage: Stage, name: str, worker: Callable[[str], Awaitable[None]], *, died: bool
     ) -> None:
-        """A replacement per-lane worker's body: recover the lane, then run the worker. The
-        recovery is awaited first, so nothing on the lane is claimed before it (BACKLOG #1611)."""
-        await self._recover_respawned_lane(stage, name)
+        """A replacement per-lane worker's body: recover the lane, then run the worker
+        (BACKLOG #1611). Nothing on the lane is claimed until the recovery has LANDED: a failed
+        reset is retried on a capped backoff, as the workers retry a failed re-pend, because a
+        replacement that claimed past a row still in flight would deliver its successor first.
+        A stop ends the wait and leaves the rows INFLIGHT for the next start.
+
+        ``died`` is True when the predecessor raised. The replacement then waits a backoff that
+        doubles with consecutive deaths on this lane (from :data:`_RESPAWN_BACKOFF_BASE_SECONDS`
+        to :data:`_RESPAWN_BACKOFF_CAP_SECONDS`, the pooled claimer's figures), and the first
+        death after :data:`_RESPAWN_STABLE_SECONDS` of clean running waits nothing. Recovery puts
+        the row a worker died holding back at the head of its lane, so a row that kills its
+        worker every time would otherwise respawn, re-claim and die with no pause at all."""
+        if died and await self._stop_or_sleep(self._respawn_delay(stage, name)):
+            return
+        run = FailureRun()
+        while True:
+            try:
+                await self._recover_respawned_lane(stage, name)
+            except Exception as exc:  # noqa: BLE001 — retried before any claim; see the docstring
+                run = run.record(
+                    log,
+                    exc,
+                    "%s lane %r: recovery of rows a finished worker left in flight failed; the "
+                    "replacement claims nothing until it lands, and retries",
+                    stage.value,
+                    name,
+                    level=logging.WARNING,
+                )
+                delay = _capped_backoff(
+                    _WORKER_ERROR_BACKOFF_SECONDS, run.count - 1, _REPEND_RETRY_CAP_SECONDS
+                )
+                if await self._stop_or_sleep(delay):
+                    return
+                continue
+            run.clear(log, "%s lane %r: recovery", stage.value, name, level=logging.WARNING)
+            break
         await worker(name)
+
+    def _respawn_delay(self, stage: Stage, name: str) -> float:
+        """The wait before a dead per-lane worker's replacement recovers and claims; see
+        :meth:`_recover_then_run`. Counts the death, and stamps the replacement's start."""
+        key = (stage.value, name)
+        now = time.monotonic()
+        deaths, started = self._worker_deaths.get(key, (0, 0.0))
+        if now - started >= _RESPAWN_STABLE_SECONDS:
+            deaths = 0  # the last replacement ran cleanly for the stable window: a fresh fault
+        delay = (
+            0.0
+            if deaths == 0
+            else _capped_backoff(
+                _RESPAWN_BACKOFF_BASE_SECONDS, deaths - 1, _RESPAWN_BACKOFF_CAP_SECONDS
+            )
+        )
+        self._worker_deaths[key] = (deaths + 1, now + delay)
+        return delay
 
     async def _recover_respawned_lane(self, stage: Stage, name: str) -> int:
         """Re-pend what a FINISHED per-lane worker left INFLIGHT on its own lane, before its
@@ -7022,9 +7084,12 @@ class RegistryRunner:
         ownership-scoped ``reset_stale_inflight`` the reload backstop
         (:meth:`_recover_stopped_worker_residue`) uses, scoped to this one stage and lane.
 
-        The claim's ``attempts`` increment stands, as under the startup reset. That is by design:
-        ADR 0057 G6 needs it, so a row that kills its worker on every pass still dead-letters at
-        ``max_attempts`` instead of crash-looping forever.
+        The claim's ``attempts`` increment stands, as under the startup reset, and that is by
+        design (ADR 0057 G6): a row whose worker died holding it counts the attempt. That bounds the
+        loop only where a claim path enforces ``max_attempts``, which not every lane does, so the
+        respawn backoff in :meth:`_recover_then_run` is what paces a row that kills its worker
+        every time. A STOPPED worker's tail, recovered here when its own release failed, is
+        charged the same +1, as under the reload backstop.
 
         CLUSTERED, IT STANDS DOWN, exactly where ``Engine.start()`` skips its unconditional reset
         (``reclaims_inflight()``). An ex-leader may still hold a row on this lane mid-send, and
@@ -7034,8 +7099,8 @@ class RegistryRunner:
         this node's own: a worker exists only for a lane this shard owns (ADR 0073), and the scope
         is that lane alone, so a sibling shard's rows are out of reach.
 
-        Best effort: a failure logs and leaves the rows for the next start, and the in-flight watch
-        (:meth:`_check_inflight_strands`) still pages them on claim age."""
+        A store failure RAISES: :meth:`_recover_then_run` retries it before any claim, and the
+        in-flight watch (:meth:`_check_inflight_strands`) pages the rows meanwhile."""
         if self._coordinator.reclaims_inflight() or not self._coordinator.is_leader():
             return 0
         lane = frozenset({name})
@@ -7044,17 +7109,7 @@ class RegistryRunner:
             if stage is Stage.OUTBOUND
             else OwnedLanes(channels=lane, destinations=frozenset())
         )
-        try:
-            recovered = await self.store.reset_stale_inflight(stage=stage.value, owned=owned)
-        except Exception:  # noqa: BLE001 — best effort; see the docstring
-            log.warning(
-                "%s lane %r: recovery of rows a finished worker left in flight failed; they stay "
-                "INFLIGHT for the next start, and the in-flight watch pages them",
-                stage.value,
-                name,
-                exc_info=True,
-            )
-            return 0
+        recovered = await self.store.reset_stale_inflight(stage=stage.value, owned=owned)
         if recovered:
             log.warning(
                 "%s lane %r: re-pended %d row(s) a finished worker left in flight, before its "
@@ -8144,8 +8199,8 @@ class RegistryRunner:
         """Re-pend the rows a per-lane worker was holding when its loop faulted, retrying until the
         write lands (BACKLOG #1611 steps 1 and 2) — the per-lane analogue of the pooled T17 head
         re-pend in :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
-        Returns True when the runner was stopped while the rows were still held, so the caller
-        returns rather than claiming again.
+        Returns True when the caller must return rather than claim again: the runner was stopped,
+        or this node lost leadership, while the rows were still held.
 
         The claim is its own committed transaction, so a fault in the handoff that follows leaves the
         claimed row INFLIGHT. Every claim path selects ``status='pending'``, so a worker that went on
@@ -8161,8 +8216,9 @@ class RegistryRunner:
 
         A runner stop ends the retry and leaves the rows INFLIGHT for ``reset_stale_inflight`` at
         the next start, as a cancelled worker's are; the backoff is :meth:`_stop_or_sleep`, and the
-        task stays cancellable. A node that is no longer the leader stops retrying too: the rows
-        then belong to the successor's promotion recovery.
+        task stays cancellable. A node that is no longer the leader stops retrying too, and its
+        worker returns, as the delivery worker's own leadership check does: the rows then belong
+        to the successor's promotion recovery.
 
         Dates the rows into the future by the same backoff the caller is about to sleep, exactly as
         T17 does and for the same reason: a plain release leaves them past-due, so the sweep re-readies
@@ -8214,7 +8270,7 @@ class RegistryRunner:
                     )
                 return False
             if not self._coordinator.is_leader():
-                return False  # the successor's promotion recovery owns them now
+                return True  # the successor's promotion recovery owns them; this worker returns
             delay = _capped_backoff(
                 _WORKER_ERROR_BACKOFF_SECONDS, failures - 1, _REPEND_RETRY_CAP_SECONDS
             )
@@ -8409,7 +8465,7 @@ class RegistryRunner:
                 faults.failed(exc, "delivery worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 if await self._repend_claimed_on_fault("delivery", name, claimed, faults=faults):
-                    return  # stopped while holding them: they stay INFLIGHT for the next start
+                    return  # stopped or demoted while holding them; see the helper
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9253,7 +9309,7 @@ class RegistryRunner:
                 faults.failed(exc, "router worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 if await self._repend_claimed_on_fault("router", name, claimed, faults=faults):
-                    return  # stopped while holding them: they stay INFLIGHT for the next start
+                    return  # stopped or demoted while holding them; see the helper
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9601,7 +9657,7 @@ class RegistryRunner:
                 faults.failed(exc, "response worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 if await self._repend_claimed_on_fault("response", name, claimed, faults=faults):
-                    return  # stopped while holding them: they stay INFLIGHT for the next start
+                    return  # stopped or demoted while holding them; see the helper
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9728,7 +9784,7 @@ class RegistryRunner:
                 )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 if await self._repend_claimed_on_fault("transform", name, claimed, faults=faults):
-                    return  # stopped while holding them: they stay INFLIGHT for the next start
+                    return  # stopped or demoted while holding them; see the helper
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
