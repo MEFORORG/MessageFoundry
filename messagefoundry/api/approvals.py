@@ -2045,8 +2045,8 @@ class ApprovalGate:
 
         A pending request that fails its integrity seal is rejected too (BACKLOG #3638; owner
         ruling 2026-10-26), by :meth:`_reject_seal_failed`, since nothing else would ever close
-        it once ``[approvals].expiry_hours`` is 0. The read reports it first, throttled, as every
-        read of a failing request does, so a reject that then answers 409 still leaves a report."""
+        it once ``[approvals].expiry_hours`` is 0. The read reports it first, throttled per request
+        (:meth:`_approval_seal_failed`), so a reject that then answers 409 still leaves a report."""
         try:
             row = await self._require_pending(approval_id)
         except _SealRefusal as refusal:
@@ -2314,10 +2314,10 @@ class ApprovalGate:
         A row that moved, was settled or changed since the read answers 409 and reports nothing
         more: the gate's read reported it, throttled, before this write. A store fault answers
         503, logs and pages ``audit_write_failed`` for ``approval.rejected`` as any decision's
-        fault does (:meth:`_store_fault`), and still reports the seal failure, throttled. That
-        runs inside the shielded unit too, so a cancelled caller cannot skip the page. A defect in
-        the call (:data:`_READ_DEFECTS`) is raised as it is, so a bug is not answered as an
-        outage to retry."""
+        fault does (:meth:`_store_fault`). The gate's read has reported the seal failure already,
+        throttled, so the report here, inside the shielded unit, adds one only once that interval
+        has passed. A defect in the call (:data:`_READ_DEFECTS`) is raised as it is, so a bug is
+        not answered as an outage to retry."""
         reason = (
             f"an {APPROVAL_KIND} request failed its integrity check and was rejected"
             f" (approval {scrub_log_argument(approval_id)})"

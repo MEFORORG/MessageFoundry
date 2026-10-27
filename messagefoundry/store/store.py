@@ -3872,7 +3872,9 @@ def held_approval_tombstone(sealer: RowSealer | None, found: ByName) -> tuple[st
     seal (:func:`approval_tombstone`) holds under the key it names, the active one or a retired one
     this process holds, or ``None``. ``rotate-key``'s re-seal moves such a row to the active key
     rather than count it refused (BACKLOG #3638): a tombstone fails its approval seal by design.
-    A tombstone whose columns changed outside the store fails here too, and stays refused."""
+    The check covers what the tombstone covers, the id, status, approver and decision time; a
+    change to one of those outside the store fails here, and the row stays refused. A change to
+    any other column, which the tombstone never vouched for, does not."""
     if sealer is None:
         return None
     try:
