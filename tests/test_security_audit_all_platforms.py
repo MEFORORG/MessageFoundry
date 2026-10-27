@@ -199,6 +199,49 @@ def test_a_pip_option_line_is_refused(line: str, tmp_path: Path) -> None:
     assert not ran
 
 
+def _seen_by(tmp_path: Path, argv: list[str]) -> tuple[int, list[tuple[list[str], str]]]:
+    """Run ``main`` on ``LOCK`` with ``argv`` before the lock path; each command and its -r file."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    seen: list[tuple[list[str], str]] = []
+
+    def run(cmd: list[str]) -> int:
+        seen.append((cmd, Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8")))
+        return 0
+
+    return main([*argv, str(src)], run=run), seen
+
+
+def test_a_private_pin_the_adopter_names_is_left_out_of_the_audit_alone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3786 finding 1: ``--strict`` fails a pin no index can look up, such as a
+    private package, and ``--ignore-vuln`` cannot clear that. Naming the package leaves it out of
+    the audit, by its canonical name, and nothing else: every other pin is still looked up under
+    ``--strict``, and the install check still covers the private one."""
+    status, [(_, checked), (audit, audited)] = _seen_by(tmp_path, ["--skip-private", "IDNA"])
+    assert status == 0
+    assert checked == LOCK
+    assert audited == STRIPPED.replace("idna==3.20 \\\n    --hash=sha256:cccc\n", "")
+    assert "--strict" in audit
+    assert "not audited, named by --skip-private: idna==3.20" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "names",
+    [["not-in-the-lock"], ["colorama", "idna", "uvloop"]],
+    ids=["unpinned-name", "every-pin"],
+)
+def test_a_skip_private_that_matches_nothing_or_everything_is_refused(
+    tmp_path: Path, names: list[str]
+) -> None:
+    """A stale name would read as an opt-out that still does something; skipping every pin would
+    read as a clean audit of nothing."""
+    argv = [arg for name in names for arg in ("--skip-private", name)]
+    status, seen = _seen_by(tmp_path, argv)
+    assert (status, seen) == (2, [])
+
+
 def test_a_failed_install_check_stops_before_the_audit(tmp_path: Path) -> None:
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
