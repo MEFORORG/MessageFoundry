@@ -3096,8 +3096,11 @@ class SqlServerStore:
         # against this and re-reads only the sets that differ. Seeded at open (_load_reference_cache)
         # and on every write_reference_snapshot.
         self._reference_versions: dict[str, str] = {}
-        # Serializes audit-chain appends in-process (the store is the single audit writer per engine
-        # process; active-passive = one active node) — see record_audit.
+        # A near gate only: it orders the appends in THIS process that take it (record_audit and
+        # its siblings; _append_operator_audit does not). The chain's lock is `_AUDIT_APPEND_LOCK`,
+        # taken by every append in every engine-shard process (why: record_audit). That premise is
+        # tested in tests/test_control_premises.py (offline: the applock precedes the head read)
+        # and the gated tests/test_sqlserver_audit_applock.py (live: it holds across processes).
         self._audit_lock = asyncio.Lock()
         # H1 fencing token: the held leader epoch + the leader_lease row to validate it against, pushed
         # by the engine on promotion via set_leader_epoch() (the store NEVER imports the coordinator —
