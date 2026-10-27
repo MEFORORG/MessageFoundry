@@ -11,6 +11,10 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
 * :func:`broad_access_problem` answers, before a key file is used, whether a known broad group
   can read it or change it.
 
+Beside them, :func:`unlink_generated` removes a key or certificate file the engine wrote, riding out
+the brief Windows hold another process puts on such a file (:func:`ride_out_a_held_file`). It sits
+here so the `cert` commands, which write through this module, need not import the API TLS module.
+
 ``store._secure_file`` is the other mechanism, and it is for files that hold no key: it tightens a
 file that already exists and only logs when it cannot. A file that holds a key must never have that
 as its only protection.
@@ -50,6 +54,8 @@ if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinPathSecurity
 
 __all__ = [
+    "WINERROR_ACCESS_DENIED",
+    "WINERROR_SHARING_VIOLATION",
     "RestrictedFileError",
     "broad_access_problem",
     "ride_out_a_held_file",

@@ -6144,11 +6144,10 @@ def _cert_import(args: argparse.Namespace) -> int:
     # Refuse before writing any file (vault BACKLOG #3514). cert.pem and ca-chain.pem were replaced
     # without a word, as `cert self-signed` replaced cert.pem (#3073). An earlier ca-chain.pem is
     # refused even when this bundle carries no CA, or it would sit beside a key it does not chain.
+    # The second check reaches an existing ca-chain.pem only when the bundle has no CA to write.
     refusal = _refusal_for_existing(
         [(path, kind) for path, _pem, kind in public] + [(key_path, "key")]
-    )
-    if refusal is None:  # reached with a ca-chain.pem only when the bundle has no CA to write
-        refusal = _refuse_a_stale_ca_chain(ca_path, "import", "This bundle carries no CA certs")
+    ) or _refuse_a_stale_ca_chain(ca_path, "import", "This bundle carries no CA certs")
     if refusal is not None:
         return _cert_fail(refusal, as_json=args.json)
 
