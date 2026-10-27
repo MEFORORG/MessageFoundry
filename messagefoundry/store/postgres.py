@@ -8525,7 +8525,7 @@ class PostgresStore:
         """One row of :meth:`reseal_approval_records`, read under its lock: re-sealed as a request,
         or, when it fails that seal, as a tombstone that holds (BACKLOG #3638). Raises
         :class:`RowSealError` when neither holds, before any statement runs, so the transaction
-        rolls back clean; store.py's twin states the contract."""
+        rolls back clean; store.py's twin states the rest of the contract."""
         try:
             current = ApprovalRow.from_mapping(found)
             return await self._write_approval(conn, current, current=current)
@@ -8533,9 +8533,9 @@ class PostgresStore:
             tombstone = held_approval_tombstone(self._row_sealer, found)
             if tombstone is None:
                 raise
-            return await self._reseal_tombstone(
-                conn, str(found["id"]), *tombstone, seal_read=found["seal"]
-            )
+        return await self._reseal_tombstone(
+            conn, str(found["id"]), *tombstone, seal_read=found["seal"]
+        )
 
     async def _reseal_tombstone(
         self, conn: Any, approval_id: str, approver: str, decided_at: float, *, seal_read: object

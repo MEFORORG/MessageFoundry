@@ -30,12 +30,14 @@ from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.row_seal import RowSealError
+from messagefoundry.store.row_seal import RowSealer, RowSealError
 from messagefoundry.store.store import (
     APPROVAL_SEAL_EXCLUDED,
     ApprovalRow,
     MessageStore,
     approval_seal_ok,
+    approval_tombstone,
+    held_approval_tombstone,
 )
 from tests._approval_seal_contract import (
     _Hooked,
@@ -220,6 +222,45 @@ async def test_rotation_moves_a_tombstone_to_the_active_key(tmp_path: Path) -> N
     # The sound request and the tombstone are re-sealed; the forged tombstone and the changed
     # rejected row are refused, on this pass and on the next, which has nothing else to do.
     assert first == (2, 2) and second == (0, 2)
+
+
+def test_a_tombstone_holds_only_as_rejected_under_a_held_key() -> None:
+    """BACKLOG #3638: what :func:`held_approval_tombstone` accepts. The control is the tombstone as
+    written, under the active key and under a retired one the sealer holds; each change after it is
+    one a writer outside the store could make, or one no honest write leaves."""
+    old, new, gone = generate_key(), generate_key(), generate_key()
+    writer = RowSealer.for_cipher(make_cipher(old, write_v2=True))
+    reader = RowSealer.for_cipher(make_cipher(new, [old], write_v2=True))
+    stranger = RowSealer.for_cipher(make_cipher(gone, write_v2=True))
+    assert writer is not None and reader is not None and stranger is not None
+    row = {
+        "id": "a" * 32,
+        "status": "rejected",
+        "approver": "ap",
+        "decided_at": 5.0,
+        "seal": approval_tombstone(writer, "a" * 32, approver="ap", decided_at=5.0),
+    }
+    assert held_approval_tombstone(writer, row) == ("ap", 5.0)  # control, the active key
+    assert held_approval_tombstone(reader, row) == ("ap", 5.0)  # control, a retired held key
+    assert held_approval_tombstone(stranger, row) is None  # a key this process does not hold
+    assert held_approval_tombstone(None, row) is None
+    for column, value in (
+        ("status", "pending"),
+        ("status", "approved"),
+        ("approver", "someone-else"),
+        ("approver", None),
+        ("decided_at", 6.0),
+        ("decided_at", True),
+        ("decided_at", "5.0"),
+        ("id", "b" * 32),
+        ("seal", b"not-text"),
+    ):
+        assert held_approval_tombstone(reader, {**row, column: value}) is None, (column, value)
+    missing = {k: v for k, v in row.items() if k != "approver"}
+    assert held_approval_tombstone(reader, missing) is None
+    # A row sealed as a request is not a tombstone, whatever its status.
+    sealed = {**row, "seal": writer.seal("approval", (("id", "a" * 32),))}
+    assert held_approval_tombstone(reader, sealed) is None
 
 
 async def test_a_request_written_before_the_seal_is_named_at_open_and_refused(

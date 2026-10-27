@@ -2748,14 +2748,16 @@ request when `[approvals].expiry_hours` is 0, so the reject is what closes it:
   holding only the id and `seal_failed` commit in one transaction. The first keeps the
   `approver`, `decided_at` and seal the tombstone overwrote, as read, under `prior`. The
   `integrity_drift` alert is raised after the commit, because an alert sink cannot join a
-  transaction.
+  transaction. The reject's read has already reported the failure, throttled, as every read of a
+  failing request does, so a reject whose write then moves nothing still leaves a report.
+- `rotate-key`'s re-seal pass checks a row that fails its approval seal as a tombstone, under the
+  key the tombstone names. One that holds gets a tombstone under the active key and is counted
+  re-sealed. One that fails, like any other failing row, is left as it is, counted and logged.
 - A seal also fails for a row sealed under a store key this engine does not hold, so a flag is not
   proof of tampering. The page says so.
 
 At least these limits remain:
 
-- `rotate-key`'s re-seal pass counts a tombstone sealed under the old key as a row that failed,
-  and logs it at WARNING on every later rotation. The tombstone acts on nothing;
 - a row no honest write leaves can be listed flagged and still not be rejectable: one whose id the
   routes refuse (not 32 lowercase hex), or, on SQL Server, one whose status matches `pending` only
   under the column's case-insensitive collation. Its reject answers 422 or 409;

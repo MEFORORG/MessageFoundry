@@ -13094,9 +13094,9 @@ class SqlServerStore:
             tombstone = held_approval_tombstone(self._row_sealer, found)
             if tombstone is None:
                 raise
-            return await self._reseal_tombstone(
-                cur, str(found["id"]), *tombstone, seal_read=found["seal"]
-            )
+        return await self._reseal_tombstone(
+            cur, str(found["id"]), *tombstone, seal_read=found["seal"]
+        )
 
     async def _reseal_tombstone(
         self, cur: Any, approval_id: str, approver: str, decided_at: float, *, seal_read: object

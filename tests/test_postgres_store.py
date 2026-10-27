@@ -5430,7 +5430,7 @@ async def test_approval_seal_contract(store) -> None:
 async def test_rotation_moves_an_approval_tombstone_to_the_active_key(store) -> None:
     """BACKLOG #3638: the re-seal pass moves a rejected request's tombstone to the active key and
     still refuses one changed outside the store, the same contract the SQLite suite runs. The table
-    is shared across tests, so only the per-row checks are pinned here."""
+    is shared across tests, so its refused counts are not pinned here."""
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
     from tests._approval_seal_contract import assert_tombstone_reseal_contract
@@ -5448,8 +5448,9 @@ async def test_rotation_moves_an_approval_tombstone_to_the_active_key(store) -> 
 
         return raw
 
-    first, _ = await assert_tombstone_reseal_contract(open_store, raw_for)
-    assert first[0] >= 2  # at least the sound request and the tombstone
+    first, second = await assert_tombstone_reseal_contract(open_store, raw_for)
+    # Only the contract's rows verify under its two keys: the sound request and the tombstone.
+    assert first[0] == 2 and second[0] == 0
 
 
 async def test_a_role_delete_racing_a_grant_leaves_no_dangling_role_row(store) -> None:

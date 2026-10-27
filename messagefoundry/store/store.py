@@ -15060,19 +15060,27 @@ class MessageStore:
                 if found is None:
                     continue
                 try:
-                    current = ApprovalRow.from_mapping(found)
-                    wrote = await self._write_approval(current, current=current)
+                    wrote = await self._reseal_approval(found)
                 except RowSealError:
-                    tombstone = held_approval_tombstone(sealer, found)
-                    if tombstone is None:
-                        refused += 1
-                        continue
-                    wrote = await self._reseal_tombstone(
-                        approval_id, *tombstone, seal_read=found["seal"]
-                    )
+                    refused += 1
+                    continue
                 await self._commit()
                 resealed += wrote
         return resealed, refused
+
+    async def _reseal_approval(self, found: aiosqlite.Row) -> bool:
+        """One row of :meth:`reseal_approval_records`, read in its write: re-sealed as a request,
+        or, when it fails that seal, as a tombstone that holds (BACKLOG #3638). Raises
+        :class:`RowSealError` when neither holds, before any statement runs. The tombstone write
+        runs outside the ``except``, so a database fault in it is not chained to the seal miss."""
+        try:
+            current = ApprovalRow.from_mapping(found)
+            return await self._write_approval(current, current=current)
+        except RowSealError:
+            tombstone = held_approval_tombstone(self._row_sealer, found)
+            if tombstone is None:
+                raise
+        return await self._reseal_tombstone(str(found["id"]), *tombstone, seal_read=found["seal"])
 
     async def _reseal_tombstone(
         self, approval_id: str, approver: str, decided_at: float, *, seal_read: object

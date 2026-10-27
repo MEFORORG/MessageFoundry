@@ -487,8 +487,9 @@ async def assert_tombstone_reseal_contract(
 
     ``open_store(key, retired)`` opens a store on one database under ``key``, holding ``retired``;
     ``raw_for(store)`` is the raw runner for it. Returns ``(re-sealed, refused)`` for the re-seal
-    pass and for a second pass after it, which a caller with a database of its own pins; the server legs share their table with other
-    tests, whose rows count too, so the per-row checks here are the contract."""
+    pass and for a second pass after it. Only this contract's rows verify under the two keys it
+    makes, so the re-sealed counts are exact on any database; the refused counts are exact only on
+    a database of the caller's own, since a shared server table holds other tests' rows."""
     from messagefoundry.store.crypto import generate_key
 
     old, new = generate_key(), generate_key()
