@@ -7770,11 +7770,12 @@ class _SnapshotLoader(importlib.abc.InspectLoader):
     module before (vault BACKLOG #2596). The module still executes through the import system's own
     ``exec_module``; only where the bytes come from changed. It has no bytecode methods, so it never
     reads or writes a ``__pycache__`` file, and it reads nothing from the directory: a sandbox
-    worker that was sent the snapshot runs the same bytes. ``get_source`` serves the same bytes, so
-    :mod:`inspect` and a traceback can show a line without reading the file.
+    worker that was sent the snapshot runs the same bytes.
 
-    No ``get_data``: ``pkgutil.get_data`` and :mod:`importlib.resources` find no resources beside a
-    config module, since the snapshot holds only the files a load reads."""
+    No source and no ``get_data``. :mod:`inspect` and a traceback read the file on disk, which may
+    hold other bytes than the ones that ran, as before this loader. ``pkgutil.get_data`` and
+    :mod:`importlib.resources` find no resources beside a config module, since the snapshot holds
+    only the files a load reads."""
 
     def __init__(self, source: bytes, filename: str) -> None:
         self._source = source
@@ -7783,14 +7784,18 @@ class _SnapshotLoader(importlib.abc.InspectLoader):
     def is_package(self, fullname: str) -> bool:
         return False
 
-    def get_source(self, fullname: str) -> str:
-        return importlib.util.decode_source(self._source)
+    def get_source(self, fullname: str) -> None:
+        # No source: linecache would cache what this returned, for a file missing at that moment,
+        # with no time to check it against, so a later load of the same path would show these lines.
+        # linecache and inspect read the file, as they did when a config module had no loader.
+        return None
 
     def get_code(self, fullname: str) -> CodeType:
-        # Compiled from the bytes, not from get_source's text, so a PEP 263 coding line and a BOM are
-        # read from the bytes, as the source loader reads them. The file name is the path an author
-        # edits, which a traceback and a load diagnostic name.
-        return self.source_to_code(self._source, self._filename)
+        # compile() here, not InspectLoader.source_to_code, so a compile failure's innermost frame is
+        # this package's, as _exec_module expects. Compiled from the bytes, so a PEP 263 coding line
+        # and a BOM are read from them, as the source loader reads them. The file name is the path
+        # an author edits, which a traceback and a load diagnostic name.
+        return compile(self._source, self._filename, "exec", dont_inherit=True)
 
 
 class _HelperImporter:
@@ -7950,8 +7955,8 @@ class _HelperImporter:
         the file an author edits, and its loader is a :class:`_SnapshotLoader` over this load's
         snapshot, so it never finds a cache file. ``importlib.reload`` still refuses it: no finder
         on ``sys.meta_path`` knows its mangled name, so nothing runs it again from disk."""
-        # What importlib.util.spec_from_loader builds for a loader with no get_filename, without
-        # its Optional return.
+        # Built by hand with has_location, as spec_from_file_location builds one, so the module
+        # gets a __file__; spec_from_loader would leave it without one.
         loader = _SnapshotLoader(self._snapshot.files[path.name], str(path))
         spec = importlib.machinery.ModuleSpec(mod_name, loader, origin=str(path))
         spec.has_location = True  # sets __file__ from the origin
