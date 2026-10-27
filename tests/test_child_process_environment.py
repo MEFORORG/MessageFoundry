@@ -382,14 +382,20 @@ def test_the_operator_page_names_each_library_secret_a_setting_refuses() -> None
     words an operator reads. Hold them to the code's list."""
     repository = Path(__file__).resolve().parents[1]
     page = (repository / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
-    rows = [line for line in page.splitlines() if line.startswith("| `pass_environment` |")]
-    assert len(rows) == 2
+    rows: dict[str, str] = {}
+    section = ""
+    for line in page.splitlines():
+        if line.startswith("### "):
+            section = line.split("`")[1] if "`" in line else line
+        elif line.startswith("| `pass_environment` |"):
+            rows[section] = line
+    assert {"[sandbox]", "[dr]"} <= set(rows)
     assert childenv.ENGINE_SECRETS_OUTSIDE_THE_PREFIX == _LIBRARY_FALLBACK_SECRETS
     missing = [
-        (index, name)
-        for index, row in enumerate(rows)
+        (section, name)
+        for section in ("[sandbox]", "[dr]")
         for name in sorted(_LIBRARY_FALLBACK_SECRETS)
-        if f"`{name}`" not in row
+        if f"`{name}`" not in rows[section]
     ]
     assert missing == []
 
@@ -429,6 +435,63 @@ def test_a_windows_hook_gets_the_machine_layout_names_a_tool_does_not() -> None:
     assert childenv.system_tool_environment(parent) == {"PATH": "x"}
 
 
+def test_the_hook_builder_refuses_an_engine_name_from_a_one_shot_iterable() -> None:
+    """The refusal reads the same pass over the names that lets them in, so an iterator cannot
+    slip one past it."""
+    with pytest.raises(ValueError, match="engine's own variable"):
+        childenv.hook_environment(_parent_environment(), extra_names=iter(("VAULT_TOKEN",)))  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_a_listed_name_that_is_not_set_is_logged_by_name(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The hook's output is discarded, so this is the one place the cause of a failed hook can
+    show. The control is the same name set, which logs nothing."""
+    monkeypatch.delenv(_PASSED, raising=False)
+    with caplog.at_level("WARNING", logger=dr.log.name):
+        assert await dr._run_command("exit 0", pass_environment=(_PASSED,)) is True
+    assert [r.getMessage() for r in caplog.records if _PASSED in r.getMessage()] != []
+    caplog.clear()
+    monkeypatch.setenv(_PASSED, _MARKER)
+    with caplog.at_level("WARNING", logger=dr.log.name):
+        assert await dr._run_command("exit 0", pass_environment=(_PASSED,)) is True
+    assert [r for r in caplog.records if _PASSED in r.getMessage()] == []
+    assert _MARKER not in caplog.text
+
+
+def test_only_the_dependency_auditor_calls_the_deny_list() -> None:
+    """``non_engine_environment`` lets a secret under any other name cross, so the spawn guard's
+    trust in it is pinned to its one caller. The control plants a second caller."""
+    sources = _package_sources()
+    target = "messagefoundry.childenv.non_engine_environment"
+
+    def refers(source: str) -> bool:
+        # Any reference, called or not, through any import alias: the spawn guard resolves
+        # aliases, so this must too.
+        tree = ast.parse(source)
+        aliases = _aliases(tree)
+        return any(
+            _dotted(node, aliases) == target
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name | ast.Attribute)
+        )
+
+    def callers(tree: Mapping[str, str]) -> set[str]:
+        return {module for module, source in tree.items() if refers(source)}
+
+    assert callers(sources) == {"security/audit_all_platforms.py"}
+    planted = {
+        **sources,
+        "pipeline/a.py": "from messagefoundry.childenv import non_engine_environment as e\n"
+        "env = e()\n",
+        "pipeline/b.py": "from messagefoundry import childenv\n"
+        "env = childenv.non_engine_environment()\n",
+    }
+    expected = {"security/audit_all_platforms.py", "pipeline/a.py", "pipeline/b.py"}
+    assert callers(planted) == expected
+
+
 def test_the_non_engine_environment_drops_the_engine_namespace_and_nothing_else() -> None:
     """The dependency auditor's deny-list (``security/audit_all_platforms.py``)."""
     parent = _parent_environment()
@@ -464,6 +527,35 @@ def test_dr_pass_environment_is_refused_at_load(tmp_path: Path) -> None:
     environ = {"MEFOR_DR_PASS_ENVIRONMENT": f"{_PASSED},PGPASSWORD"}
     with pytest.raises(ValidationError, match="dr.pass_environment"):
         settings.load_settings(config_path=path, environ=environ)
+    # The control for the environment layer: the same variable with an ordinary name loads.
+    environ = {"MEFOR_DR_PASS_ENVIRONMENT": f"{_PASSED},OTHER_NAME"}
+    loaded = settings.load_settings(config_path=path, environ=environ)
+    assert loaded.dr.pass_environment == (_PASSED, "OTHER_NAME")
+
+
+def test_the_coordinator_warns_at_start_about_an_unset_listed_name(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Before the disaster, not only when a hook runs. No hook configured is the control."""
+    monkeypatch.delenv(_PASSED, raising=False)
+
+    def build(takeover_hook: str = "") -> None:
+        dr.DrCoordinator(
+            cast(Any, None),
+            settings.DrSettings(
+                enabled=True, pass_environment=(_PASSED,), takeover_hook=takeover_hook
+            ),
+            store_settings=None,
+            activate_profile=_never_awaited,
+            deactivate_profile=_never_awaited,
+        )
+
+    with caplog.at_level("WARNING", logger=dr.log.name):
+        build()
+    assert _PASSED not in caplog.text
+    with caplog.at_level("WARNING", logger=dr.log.name):
+        build(takeover_hook="exit 0")
+    assert _PASSED in caplog.text
 
 
 def test_an_engine_shard_keeps_every_variable() -> None:

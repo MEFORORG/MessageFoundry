@@ -17,11 +17,11 @@ process start whose environment does not come from one of them.
   fully trust (the sandbox worker). It carries what the platform and the interpreter need to start,
   and the extra names its caller adds. A variable nobody listed does not cross.
 * :func:`hook_environment` is an **allowlist** too, for a shell command an operator configured (the
-  DR hook): the platform's start-up names, on Windows the few machine-layout names a shell script
-  expects (:data:`_WINDOWS_SHELL_NAMES`), and the names the operator listed in
-  ``[dr].pass_environment``. A variable nobody listed does not cross, so no secret reaches the hook
-  by default, whatever name it is kept under. Settings load refuses the engine's own names in that
-  setting.
+  DR hook): the platform's start-up names, on Windows the few
+  machine-layout names a shell script expects (:data:`_WINDOWS_SHELL_NAMES`), and the names the
+  operator listed in ``[dr].pass_environment``. A variable nobody listed does not cross, so no
+  secret is in the hook's own environment by default, whatever name it is kept under. Settings
+  load refuses the engine's own names in that setting.
 * :func:`non_engine_environment` is **everything except the engine's own namespace**: the whole
   ``MEFOR_*`` prefix, and the few names outside it in :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`.
   It is a deny-list, so **a secret kept under any other name still crosses**: a
@@ -29,7 +29,7 @@ process start whose environment does not come from one of them.
   module does not know. Only for a fixed tool the engine's own code names, run on a build or CI
   runner rather than by the service, that reads settings the engine cannot list in advance: the
   dependency auditor's ``pip`` and ``pip-audit``, which read their index, proxy and certificate
-  settings from the environment.
+  settings from the environment. ``tests/test_child_process_environment.py`` fails another caller.
 * :func:`engine_environment` is the **whole** environment, for a Python child started through the
   bootstrap that runs the engine's own trusted code: an engine shard, which opens the store and
   builds connections and so needs the secrets, and other such children, the tray's relaunch among
@@ -407,12 +407,14 @@ def hook_environment(
     docstring describes; ``extra_names`` is ``[dr].pass_environment``.
 
     No interpreter variable crosses unless listed: the hook is a shell command, not this
-    interpreter's child. An extra in the engine's own namespace raises :class:`ValueError`.
-    Settings load refuses one first, so this is the last check, not the first."""
+    interpreter's child. ``LD_LIBRARY_PATH`` does, with the other POSIX start-up names, so a hook
+    that starts an interpreter needing it still starts. An extra in the engine's own namespace
+    raises :class:`ValueError`. Settings load refuses one first, so this is the last check, not
+    the first."""
     extras = _extra_keys(extra_names)
-    for name in extra_names:
-        if not outside_engine_namespace(name):
-            raise ValueError(f"extra_names may not name the engine's own variable {name!r}")
+    for key in extras:
+        if not outside_engine_namespace(key):
+            raise ValueError(f"extra_names may not name the engine's own variable {key!r}")
     names = _platform_names() | extras
     if sys.platform == "win32":
         names |= _WINDOWS_SHELL_NAMES

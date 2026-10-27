@@ -480,3 +480,16 @@ def test_pass_environment_refuses_what_is_not_a_variable_name(
     with pytest.raises(ValidationError) as refused:
         section(pass_environment=(name,))
     assert key in str(refused.value)
+
+
+@_PASS_ENVIRONMENT_SECTIONS
+def test_pass_environment_never_echoes_a_value_typed_by_mistake(
+    section: Any, key: str, receiver: str
+) -> None:
+    """``NAME=value`` in the list would carry the value into the load error, which serve prints."""
+    with pytest.raises(ValidationError) as refused:
+        section(pass_environment=("OK_NAME", "SITE_FLAG=canary-value"))
+    text = str(refused.value)
+    assert "entry 2" in text  # the control: this is the refusal for that entry
+    assert "canary-value" not in text
+    assert "SITE_FLAG" not in text

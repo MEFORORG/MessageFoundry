@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket
 import time
 from collections.abc import Awaitable, Callable, Collection, Mapping
@@ -228,6 +229,9 @@ class DrCoordinator:
     ) -> None:
         self._store = store
         self._settings = settings
+        if settings.takeover_hook or settings.release_hook:
+            # At start too, not only when a hook runs, which on a DR box is during the disaster.
+            _warn_unset_pass_environment(settings.pass_environment)
         # The instance posture, for the Vault hop the cold-seed verify can dial (vault BACKLOG
         # #2983). The engine passes its own. `None` counts as enforcing on that hop.
         self._hop_posture = hop_posture
@@ -1371,22 +1375,31 @@ class DrCoordinator:
             log.warning("DR: %s alert failed", event, exc_info=True)
 
 
+def _warn_unset_pass_environment(names: Collection[str]) -> None:
+    """Log, by name only, each ``[dr].pass_environment`` name the engine's environment lacks."""
+    unset = [name for name in names if name not in os.environ]
+    if unset:
+        log.warning("DR: [dr].pass_environment names a variable that is not set: %s", unset)
+
+
 async def _run_command(
     command: str,
     *,
     stop_kills: bool = True,
     on_start: Callable[[], None] | None = None,
-    pass_environment: Collection[str] = (),
+    pass_environment: Collection[str],
 ) -> bool:
     """Run an operator-supplied shell command OFF the event loop and return whether it exited 0. Uses the
     asyncio subprocess API (never blocks the loop). The command is operator-configured (``[dr]``), not
     request-derived, so it is run via the shell exactly as the operator wrote it (parity with the way the
     backup destination / other operator-configured paths are trusted).
 
-    Its environment is :func:`messagefoundry.childenv.hook_environment`: an allowlist of the
-    platform's start-up names and the ``pass_environment`` names, ``[dr].pass_environment``, and
-    nothing else (vault BACKLOG #2587). ``on_start`` is called once the
-    hook's process has been let run, and never for one that was not (vault BACKLOG #3094).
+    Its environment is the allowlist :func:`messagefoundry.childenv.hook_environment` builds, with
+    ``pass_environment`` (``[dr].pass_environment``) as its extras (vault BACKLOG #2587). It is
+    required, so a caller cannot run a hook without the operator's names by forgetting it. A listed
+    name the engine's environment does not hold is logged, by name only, since the hook's output
+    is discarded and an aborted activation would otherwise not point at it. ``on_start`` is called
+    once the hook's process has been let run, and never for one that was not (vault BACKLOG #3094).
 
     **Stopping it stops the whole hook, when** ``stop_kills`` (vault BACKLOG #2622). The caller
     bounds this with ``wait_for``, which stops it by cancelling it. Cancelling only the wait would
@@ -1399,6 +1412,7 @@ async def _run_command(
     processes, such as a service wrapper's tree kill or a signal to the engine's process group,
     can still end it. A hook that finishes on its own is left alone either way, including
     anything it left running."""
+    _warn_unset_pass_environment(pass_environment)
     spawn = asyncio.ensure_future(
         asyncio.create_subprocess_shell(
             command,

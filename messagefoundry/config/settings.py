@@ -1493,7 +1493,8 @@ def uvicorn_trusted_hosts(entries: Sequence[str]) -> list[str]:
 
 
 def _split_address_list(v: object) -> object:
-    """Split the env form of a list of addresses or origins on COMMAS, never ``os.pathsep``.
+    """Split the env form of a list (addresses, origins, or the ``pass_environment`` variable names)
+    on COMMAS, never ``os.pathsep``.
     ``os.pathsep`` is ':' on POSIX, which also separates IPv6 groups and an origin's port, so it
     would shred both on the Linux leg (BACKLOG #3042). A list from the file passes through."""
     if isinstance(v, str):
@@ -2323,7 +2324,7 @@ class PipelineSettings(_Section):
     snapshot_on_send: bool = Field(default=True)
 
 
-def _pass_environment_refusal(names: tuple[str, ...], key: str, receiver: str) -> tuple[str, ...]:
+def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -> tuple[str, ...]:
     """``names``, or a :class:`ValueError` for the first one that may not be handed to ``receiver``.
 
     For the two ``pass_environment`` settings: ``[sandbox]``'s, read by the sandbox worker, and
@@ -2332,10 +2333,14 @@ def _pass_environment_refusal(names: tuple[str, ...], key: str, receiver: str) -
     ``MEFOR_*`` variable at all, and no secret a library reads on the engine's behalf
     (:func:`messagefoundry.childenv.outside_engine_namespace`, reused so the two cannot drift).
     Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
-    added. The text never echoes a value, only the name the operator typed."""
-    for name in names:
+    added. The text never echoes a value: an entry that is not a name is cited by its position,
+    since ``NAME=value`` typed by mistake would carry the value (vault BACKLOG #2600)."""
+    for position, name in enumerate(names, start=1):
         if not (name.isascii() and name.isidentifier()):
-            raise ValueError(f"{key}: {name!r} is not an environment variable name")
+            raise ValueError(
+                f"{key}: entry {position} is not an environment variable name; "
+                "list names only, never NAME=value"
+            )
         if not outside_engine_namespace(name):
             raise ValueError(
                 f"{key}: {name} is one of the engine's own variables; "
@@ -2411,7 +2416,7 @@ class SandboxSettings(_Section):
     # (messagefoundry/childenv.py). The worker loads the config again under that allowlist, so a
     # config that reads another variable needs it named here, or its worker is refused when the
     # graph it builds differs from the engine's. Names only, and never a MEFOR_* name or another
-    # of the engine's own: see _pass_environment_refusal.
+    # of the engine's own: see _checked_pass_environment.
     pass_environment: tuple[str, ...] = ()
 
     @field_validator("pass_environment", mode="before")
@@ -2422,7 +2427,7 @@ class SandboxSettings(_Section):
     @field_validator("pass_environment")
     @classmethod
     def _pass_environment_names(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        return _pass_environment_refusal(v, "sandbox.pass_environment", "a worker")
+        return _checked_pass_environment(v, "sandbox.pass_environment", "a worker")
 
 
 class DiagnosticsSettings(_Section):
@@ -6686,10 +6691,10 @@ class DrSettings(_Section):
     # latest anchor differs → activation refuses closed). "" (the default) = OFF: the #102 gate is
     # byte-unchanged and SQLite is a no-op. A URL is rejected (local/UNC only, like seed_archive).
     restore_token: str = ""
-    # Environment variable NAMES the takeover and release hooks are given, beyond the platform's
-    # start-up names (messagefoundry/childenv.py, hook_environment): a cloud profile, a proxy, a
-    # credential the hook's own tool reads. Nothing else crosses. Names only, and never a MEFOR_*
-    # name or another of the engine's own: see _pass_environment_refusal.
+    # Environment variable NAMES the takeover and release hooks are given, beyond the allowlist
+    # messagefoundry/childenv.py hook_environment builds: a cloud profile, a proxy, a credential
+    # the hook's own tool reads. Names only, and never a MEFOR_* name or another of the engine's
+    # own: see _checked_pass_environment.
     pass_environment: tuple[str, ...] = ()
 
     @field_validator("pass_environment", mode="before")
@@ -6700,7 +6705,7 @@ class DrSettings(_Section):
     @field_validator("pass_environment")
     @classmethod
     def _pass_environment_names(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        return _pass_environment_refusal(v, "dr.pass_environment", "a hook")
+        return _checked_pass_environment(v, "dr.pass_environment", "a hook")
 
     @field_validator("takeover_hook", "release_hook")
     @classmethod

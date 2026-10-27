@@ -9,11 +9,11 @@ All notable changes to MessageFoundry are documented here. The format follows
 ### Changed
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
-  other name reached it. It now gets the platform's start-up names, on Windows the names that say
-  where programs are installed, and the names a new `[dr].pass_environment` setting lists. A hook
-  that reads a cloud profile, a proxy or a credential of its own needs that name listed there.
-  The setting refuses the engine's own names, as `[sandbox].pass_environment` does. See the `[dr]`
-  section of [CONFIGURATION.md](docs/CONFIGURATION.md). (`BACKLOG #2587`)
+  other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or
+  its name is listed in the new `[dr].pass_environment`, so a hook that reads a cloud profile, a
+  proxy or a credential of its own needs that name listed. The `pass_environment` row of the
+  `[dr]` section of [CONFIGURATION.md](docs/CONFIGURATION.md) says what crosses and what the
+  setting refuses. (`BACKLOG #2587`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

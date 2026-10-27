@@ -362,10 +362,9 @@ and the builders, and a test checks that each module named calls each builder na
   reads, and the names `[sandbox].pass_environment` lists. No other inherited variable crosses. On
   Linux with `[sandbox].mem_mb` set, the engine also sets `MALLOC_ARENA_MAX=2` where the operator
   passed none.
-- The disaster-recovery hook, in `pipeline/dr.py`, gets an allowlist (`hook_environment`): the
-  platform's start-up names, on Windows the names that say where programs are installed, and the
-  names `[dr].pass_environment` lists. No other inherited variable crosses, so no secret reaches
-  it unless an operator lists its name.
+- The disaster-recovery hook, in `pipeline/dr.py`, gets an allowlist (`hook_environment`), which
+  the `[dr]` `pass_environment` row of CONFIGURATION.md describes. No secret is in the hook's own
+  environment unless an operator lists its name; the hook still runs as the engine's account.
 - The engine shards and the config-loading child, in `pipeline/supervisor.py`, and the tray's
   branded relaunch, in `tray/branding.py`, get the whole environment, secrets included, less any
   empty or relative `PYTHONPATH` entry (`engine_environment`).
