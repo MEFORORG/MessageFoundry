@@ -464,6 +464,33 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(invocations.length, 2);
   });
 
+  test("a caFile that is not a regular file is refused, not read", async () => {
+    // A directory here; /dev/zero or a FIFO on POSIX. fstat reports size 0 for those, so a reader
+    // that trusts the size reads to an EOF that never comes.
+    const dir = path.join(ws, "pki");
+    fs.mkdirSync(dir, { recursive: true });
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile: dir }];
+
+    assert.strictEqual(await trust.refreshEngineTrust(), false);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
+    assert.ok(
+      logged.some((line) => line.includes("could not read") && line.includes(`not pinning ${REMOTE}`)),
+      `the refusal was silent: ${JSON.stringify(logged)}`,
+    );
+  });
+
+  test("a loopback engineUrl claimed by a REFUSED caFile never spawns the CLI on failure", async () => {
+    // The claim keeps the serviceConfig certificate off that host, so a CLI refresh can never anchor
+    // it; spawning one a minute would be a loop with no possible success.
+    stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile: "relative/ca.pem" }];
+    await trust.refreshEngineTrust();
+    const spawned = invocations.length;
+
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), false);
+    await settle();
+    assert.strictEqual(invocations.length, spawned);
+  });
+
   test("a loopback target that is not engineUrl's host never spawns the CLI", async () => {
     // The CLI anchors only engineUrl's host:port, so for this target a spawn could never succeed and
     // would repeat once a minute for the life of the window.

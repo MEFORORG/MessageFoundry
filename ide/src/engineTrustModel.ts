@@ -273,7 +273,7 @@ export function schemeMismatch(facts: ApiTlsFacts | undefined, url: string): str
 
 /**
  * One engine a `messagefoundry.environments` entry names, as the pin pass reads it: the entry's own
- * `url`, or one of its shards' (BACKLOG #1695, residual a).
+ * `url`, or one of its engine shards' (BACKLOG #1695, residual a).
  *
  * `caFile` is `unknown` because it arrives from a settings file nothing has type-checked.
  */
@@ -290,8 +290,9 @@ export interface PinnableEnvironment extends PinTarget {
 /**
  * Every engine the configured environments name, each with the `caFile` that applies to it.
  *
- * A shard takes its own `caFile` when it sets one and its environment's otherwise: the shards of one
- * environment are instances of one deployment, which normally share an issuing CA. When they do not
+ * An engine shard takes its own `caFile` when it sets one and its environment's otherwise: the
+ * engine shards of one environment are instances of one deployment, which normally share an issuing
+ * CA. When they do not
  * (each serving its own self-signed leaf), the inherited file fails verification and the request
  * says so; it never widens what is trusted.
  */
@@ -327,7 +328,9 @@ type PathFlavour = Pick<typeof path, "sep" | "isAbsolute" | "normalize">;
 export function isFullyQualifiedPath(file: string, flavour: PathFlavour = path): boolean {
   if (flavour.sep === "\\") {
     // `[^\\/.?]` after the two separators refuses the device namespaces `\\.\` and `\\?\`. A device
-    // such as `\\.\pipe\x` is not a file, and a read of it can block the extension host unbounded.
+    // such as `\\.\pipe\x` is not a file. This is a first screen only: a named pipe reached by a UNC
+    // host name (`\\localhost\pipe\x`) passes it, and the shell's reader refuses any descriptor that
+    // is not a regular file, though on Windows the open itself may already have blocked.
     return /^[A-Za-z]:[\\/]/.test(file) || /^[\\/]{2}[^\\/.?]/.test(file);
   }
   return flavour.isAbsolute(file);
@@ -355,7 +358,7 @@ export function isFullyQualifiedPath(file: string, flavour: PathFlavour = path):
  *   * a URL that does not parse, or is not `https:` — plain http has no handshake to anchor;
  *   * a second, DIFFERENT file for a `host:port` an earlier entry already pinned. Anchors are filed by
  *     `host:port` ({@link engineHostKey}), so two files cannot both apply; the first one stays, and
- *     the same file named twice (a shard repeating its environment's URL) is not a conflict.
+ *     the same file named twice (an engine shard repeating its environment's URL) is not a conflict.
  */
 export function trustPinsFor(
   targets: readonly PinTarget[],

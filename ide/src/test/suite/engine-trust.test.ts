@@ -519,17 +519,22 @@ suite("a request that fails verification follows a changed anchor once (BACKLOG 
     return req;
   }
 
+  // Saved and restored, not just cleared: in the Extension Host leg activation has installed the
+  // production handler, and this suite must hand it back for the suites after it.
+  let savedHandler: ReturnType<typeof setTrustFailureHandler>;
+
   setup(() => {
     calls = [];
     clearEngineTrustAnchors();
     setEngineTrustAnchor(TARGET, OLD);
+    savedHandler = setTrustFailureHandler(undefined);
     realRequest = httpsModule.request;
     httpsModule.request = failingRequest as unknown as typeof httpsTypes.request;
   });
 
   teardown(() => {
     httpsModule.request = realRequest;
-    setTrustFailureHandler(undefined);
+    setTrustFailureHandler(savedHandler);
     clearEngineTrustAnchors();
   });
 
@@ -549,16 +554,22 @@ suite("a request that fails verification follows a changed anchor once (BACKLOG 
     assert.deepStrictEqual(seen, [OLD], "the handler is told which anchor the failed request used");
   });
 
-  test("a POST is retried the same way", async () => {
+  test("a POST is NOT retried, but the anchor is still followed for the next request", async () => {
+    // Whether Node can flush a POST before its JS-side verification fails is unmeasured, and a
+    // reload or a dual-control approval sent twice is costly. So: report, follow, do not resend.
+    let told = 0;
     setTrustFailureHandler(async (url) => {
+      told++;
       setEngineTrustAnchor(url, NEW);
       return true;
     });
-    await assert.rejects(postJson(TARGET, "/config/reload", {}));
+    await assert.rejects(postJson(TARGET, "/config/reload", {}), /cannot verify/);
     assert.deepStrictEqual(
       calls.map((c) => c.ca),
-      [OLD, NEW],
+      [OLD],
     );
+    assert.strictEqual(told, 1, "the handler was not told, so the next request would fail too");
+    assert.strictEqual(tlsOptions(new URL(TARGET)).ca, NEW);
   });
 
   test("a handler that changed nothing gets no retry — the control", async () => {

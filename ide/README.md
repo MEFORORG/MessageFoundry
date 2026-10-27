@@ -198,8 +198,8 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   { "name": "PROD", "url": … }]`; an entry may also list `shards` (engine instances), in which case
   promote asks which instance. When set, *Stage → Promote* asks which to target; each engine
   resolves its own environment values. **Machine-scoped**, same reason as `engineUrl`. An entry or
-  a shard may also set `caFile`, a full path to a PEM to trust for that engine — see *Trusting the
-  engine's certificate* below.
+  an engine shard may also set `caFile`, a full path to a PEM to trust for that engine — see
+  *Trusting the engine's certificate* below.
 - `messagefoundry.messageSetsDir` (default `samples/messages`) — default folder for the Test Bench's
   *Load Message Set* dialog.
 - `messagefoundry.sourceControl.autoPrompt` (default `true`) — offer to set up version control +
@@ -237,7 +237,7 @@ that engine has run at least once (it mints its certificate on the first run, no
 
 **Remote engines, and any engine you want to pin.** `messagefoundry.serviceConfig` describes the
 engine on this machine only, so it is used only for a loopback `engineUrl`. For any other engine,
-set `caFile` on its `messagefoundry.environments` entry (or on one shard):
+set `caFile` on its `messagefoundry.environments` entry (or on one engine shard):
 
 ```json
 "messagefoundry.environments": [
@@ -253,15 +253,16 @@ set `caFile` on its `messagefoundry.environments` entry (or on one shard):
   relative or root-relative path is refused, so a workspace can never choose the file. A `caFile`
   that is refused or unreadable leaves that engine with no anchor at all; it never falls back to the
   certificate `messagefoundry.serviceConfig` names. The setting is machine-scoped, so a checked-in
-  `.vscode/settings.json` cannot add or change a pin. A shard without its own `caFile` uses its
-  environment's.
+  `.vscode/settings.json` cannot add or change a pin. An engine shard without its own `caFile` uses
+  its environment's.
 - A refused or unreadable `caFile` is named in the **MessageFoundry Engine** log, and so is an https
   target that has no anchor at all.
 
 **A renewed certificate is followed.** The engine renews its generated certificate at startup, into
 the same file. When a request fails verification, the extension re-reads the file its anchor came
 from (or a `caFile` it could not read earlier) and, if the certificate changed, retries that request
-once against the new one. For the loopback `messagefoundry.engineUrl` with no anchor yet (the engine
+once against the new one; that retry is made for a GET only, so a POST that failed is not sent
+twice, and the next request uses the new certificate. For the loopback `messagefoundry.engineUrl` with no anchor yet (the engine
 was started after the window opened), it asks the engine again in the background, at most once a
 minute; that request still fails, and the status bar picks the certificate up when the answer
 arrives. Verification stays on for the retry.

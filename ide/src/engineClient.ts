@@ -196,29 +196,39 @@ export type TrustFailureHandler = (url: string, usedCa: string | undefined) => P
 let trustFailureHandler: TrustFailureHandler | undefined;
 
 /**
- * Install (or, with `undefined`, remove) the handler {@link withRenewalRetry} consults.
+ * Install (or, with `undefined`, remove) the handler {@link withRenewalRetry} consults, and return
+ * the one it replaces so a caller (a test) can put it back.
  *
  * A hook rather than an import because `engineTrust.ts` already imports this module, and re-reading
  * a certificate is file and subprocess work that does not belong in the HTTP client.
  */
-export function setTrustFailureHandler(handler: TrustFailureHandler | undefined): void {
+export function setTrustFailureHandler(
+  handler: TrustFailureHandler | undefined,
+): TrustFailureHandler | undefined {
+  const previous = trustFailureHandler;
   trustFailureHandler = handler;
+  return previous;
 }
 
 /**
- * Run `attempt`, and run it ONCE more if it failed verification and the trust handler registered a
- * new anchor for that engine (BACKLOG #1695, residual c).
+ * Run `attempt`. If it failed verification, tell the trust handler, and when `retry` is set and the
+ * handler registered a new anchor for that engine, run it ONCE more (BACKLOG #1695, residual c).
  *
  * The engine renews its generated certificate at startup, into the same file. The anchor this client
  * holds was read earlier, so after an engine restart every request failed verification until the
  * window was reloaded or a setting changed. The engine's own Python client follows a renewal the
  * same way: re-read the pin on the first verification failure, retry only if it changed.
  *
- * Retrying a POST is safe on this path and only this one: a trust failure ends the TLS handshake,
- * and Node writes the request only after the handshake succeeds, so the engine never saw the first
- * attempt. Verification is never relaxed for the retry; it simply runs against the new anchor.
+ * ONLY A GET RETRIES. Whether Node can flush a request's bytes before its JS-side verification
+ * destroys the socket has not been measured, and a POST here can be a reload or a dual-control
+ * approval, where a duplicate is costly. A POST still reports the failure, so the anchor is
+ * followed and the NEXT request succeeds. Verification is never relaxed for the retry.
  */
-async function withRenewalRetry<T>(baseUrl: string, attempt: () => Promise<T>): Promise<T> {
+async function withRenewalRetry<T>(
+  baseUrl: string,
+  attempt: () => Promise<T>,
+  retry: boolean,
+): Promise<T> {
   const usedCa = anchorFor(baseUrl);
   try {
     return await attempt();
@@ -233,7 +243,7 @@ async function withRenewalRetry<T>(baseUrl: string, attempt: () => Promise<T>): 
     } catch {
       // Best-effort: the request's own trust error is the useful outcome to report.
     }
-    if (!followed) {
+    if (!followed || !retry) {
       throw err;
     }
     return attempt();
@@ -314,7 +324,7 @@ export function postJson<T>(
   timeoutMs?: number,
 ): Promise<T> {
   const attempt = (): Promise<PostReply> => postReply(baseUrl, route, body, token, timeoutMs);
-  return withRenewalRetry(baseUrl, attempt).then((reply) => {
+  return withRenewalRetry(baseUrl, attempt, false).then((reply) => {
     const outcome = classifyApprovable<T>(reply.status, reply.body);
     if (outcome.kind === "held") {
       throw new HeldError(outcome.hold.approvalId);
@@ -400,7 +410,7 @@ export function postApprovable<T>(
   body: unknown,
   token?: string,
 ): Promise<Approvable<T>> {
-  return withRenewalRetry(baseUrl, () => postReply(baseUrl, route, body, token)).then((reply) =>
+  return withRenewalRetry(baseUrl, () => postReply(baseUrl, route, body, token), false).then((reply) =>
     classifyApprovable<T>(reply.status, reply.body),
   );
 }
@@ -490,7 +500,7 @@ export function getJson<T>(
   token?: string,
   timeoutMs: number = GET_TIMEOUT_MS,
 ): Promise<T> {
-  return withRenewalRetry(baseUrl, () => getOnce<T>(baseUrl, route, token, timeoutMs));
+  return withRenewalRetry(baseUrl, () => getOnce<T>(baseUrl, route, token, timeoutMs), true);
 }
 
 /** One GET attempt; {@link getJson} adds the renewal retry. */
