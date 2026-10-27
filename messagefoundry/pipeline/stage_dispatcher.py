@@ -1304,8 +1304,9 @@ class StageDispatcher:
         # BACKLOG #1611: both writes are retried until they land, while this serializer still HOLDS
         # the lane (PROCESSING, slot reserved), so no claim takes a later row past a stranded one. A
         # stop ends the retry and leaves the rows INFLIGHT for reset_stale_inflight at the next start,
-        # as a cancelled serializer's are; the in-flight watch pages them meanwhile. Each write is
-        # still sent once on a stop, so a stop during the head's retry still tries the tail release.
+        # as a cancelled serializer's are; the in-flight watch pages them meanwhile. A stop during
+        # the head's retry still sends the tail release once, but only while this node leads: that
+        # write is no longer at fault time, and after a hold a successor may hold those rows.
         #
         # Losing leadership pauses the retry and does not end it; _land_while_holding says why.
         head_ok = tail_ok = True
@@ -1329,12 +1330,24 @@ class StageDispatcher:
             )
             outcome = replace(outcome, park_until=dated)
         if tail_ids:
-            tail_ok = await self._land_while_holding(
-                lane,
-                f"release_claimed of {len(tail_ids)} row(s)",
-                functools.partial(self._store.release_claimed, tail_ids),
-            )
+            if head_ok or self._is_leader():
+                tail_ok = await self._land_while_holding(
+                    lane,
+                    f"release_claimed of {len(tail_ids)} row(s)",
+                    functools.partial(self._store.release_claimed, tail_ids),
+                )
+            else:
+                tail_ok = False
         if not (head_ok and tail_ok):
+            # No terminal transition, so the dispatcher's quiesce reads this lane as drained; say
+            # here that its rows did not come back. Counts only, never content.
+            log.warning(
+                "StageDispatcher %s lane %s: stopped while holding %d claimed row(s) whose re-pend "
+                "had not landed; they stay in flight for the next start or a successor's recovery",
+                self._stage.value,
+                lane,
+                (0 if head_ok else 1) + (0 if tail_ok else len(tail_ids)),
+            )
             return
         # --- synchronous terminal transition (NO await below) -------------------------------------
         # S_lane (ARM 1): read the episode clock ONCE, here, before the outcome branch — re-reading it
@@ -1465,7 +1478,9 @@ class StageDispatcher:
         The caller still holds the lane, so nothing claims a later row past the ones being re-pended,
         and no clock or ownership guess is needed: the serializer is the lane's only consumer and
         knows which rows it holds. A failure is logged at WARNING on a backoff (1st, 2nd, 4th ...)
-        with a line when the write lands; counts and the exception only, never a row's content."""
+        with a line when the write lands; counts and the exception only, never a row's content. At
+        ``infra_fault_stop_after`` consecutive failures it raises one ``lane_stuck`` alert, since a
+        held lane never reaches the ADR 0070 streak that would otherwise page it."""
         run = FailureRun()
         warned = False
         while True:
@@ -1482,6 +1497,16 @@ class StageDispatcher:
                     what,
                     level=logging.WARNING,
                 )
+                if run.count == self._infra_fault_stop_after:
+                    # A held lane never reaches _apply_retry, so the ADR 0070 fix B streak cannot
+                    # page it; page once per hold at the same count instead.
+                    self._alert_sink.lane_stuck(
+                        lane,
+                        detail=(
+                            f"{self._stage.value} lane held: {what} failed "
+                            f"{run.count} consecutive times; retrying"
+                        ),
+                    )
             else:
                 if run.count:
                     run.clear(

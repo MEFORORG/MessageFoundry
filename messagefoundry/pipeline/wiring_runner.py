@@ -30,7 +30,15 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -6107,11 +6115,8 @@ class RegistryRunner:
                 self.registry.shard_id,
             )
             return
-        prev = self._workers.get(name)
         task = asyncio.create_task(
-            self._recover_then_run(Stage.OUTBOUND, name, self._delivery_worker, died=_died(prev))
-            if prev is not None and _left_a_lane(prev)
-            else self._delivery_worker(name)
+            self._worker_body(Stage.OUTBOUND, name, self._delivery_worker, self._workers.get(name))
         )
         task.add_done_callback(functools.partial(self._on_worker_done, name))
         self._workers[name] = task
@@ -6198,12 +6203,13 @@ class RegistryRunner:
     def _spawn_inbound_worker(self, kind: str, name: str) -> None:
         """Start the ``kind`` (router/transform) worker for one inbound connection."""
         workers = self._inbound_worker_dict(kind)
-        worker = self._inbound_worker_coro(kind)
-        prev = workers.get(name)
         task = asyncio.create_task(
-            self._recover_then_run(_INBOUND_WORKER_STAGE[kind], name, worker, died=_died(prev))
-            if prev is not None and _left_a_lane(prev)
-            else worker(name)
+            self._worker_body(
+                _INBOUND_WORKER_STAGE[kind],
+                name,
+                self._inbound_worker_coro(kind),
+                workers.get(name),
+            )
         )
         task.add_done_callback(functools.partial(self._on_inbound_worker_done, kind, name))
         workers[name] = task
@@ -7021,6 +7027,20 @@ class RegistryRunner:
             log.info("reload: re-pended %d row(s) a stopped worker left in flight", recovered)
         return recovered
 
+    def _worker_body(
+        self,
+        stage: Stage,
+        name: str,
+        worker: Callable[[str], Coroutine[Any, Any, None]],
+        prev: asyncio.Task[None] | None,
+    ) -> Coroutine[Any, Any, None]:
+        """The coroutine a per-lane worker task runs: the bare ``worker`` for a first spawn or
+        over a cancelled one, else :meth:`_recover_then_run` over the finished ``prev``
+        (:func:`_left_a_lane`)."""
+        if prev is None or not _left_a_lane(prev):
+            return worker(name)
+        return self._recover_then_run(stage, name, worker, died=_died(prev))
+
     async def _recover_then_run(
         self, stage: Stage, name: str, worker: Callable[[str], Awaitable[None]], *, died: bool
     ) -> None:
@@ -7040,16 +7060,18 @@ class RegistryRunner:
         **What ends that loop is the ADR 0057 G6 attempts ceiling.** No ingress, routed or response
         claim enforces ``max_attempts``, and a delivery's ``mark_failed`` never runs for a worker
         killed mid-send, but each claim's ``attempts`` increment stands through the reset. So the
-        replacement of a worker that DIED checks the head of its first non-empty claim against the
-        ceiling (:meth:`_dead_letter_head_after_death`) and dead-letters it once its attempts reach a finite
-        cap. Where the cap is not finite (``max_attempts=None``), nothing dead-letters it: the
-        loop goes on, paced only by this backoff, and each death still logs its traceback."""
+        replacement of a worker that DIED, where the reset re-pended a row, checks the head of its
+        first non-empty claim against the ceiling (:meth:`_dead_letter_head_after_death`, which
+        names the lanes it judges) and dead-letters it once its attempts reach a finite cap. Where
+        the cap is not finite (``max_attempts=None``), or the lane is one it does not judge,
+        nothing dead-letters it: the loop goes on, paced only by this backoff, and each death
+        still logs its traceback."""
         if died and await self._stop_or_sleep(self._respawn_delay(stage, name)):
             return
         run = FailureRun()
         while True:
             try:
-                await self._recover_respawned_lane(stage, name)
+                recovered = await self._recover_respawned_lane(stage, name)
             except Exception as exc:  # noqa: BLE001 — retried before any claim; see the docstring
                 run = run.record(
                     log,
@@ -7068,7 +7090,11 @@ class RegistryRunner:
                 continue
             run.clear(log, "%s lane %r: recovery", stage.value, name, level=logging.WARNING)
             break
-        if not died:
+        if died:
+            self._mark_replacement_running(stage, name)
+        if not (died and recovered):
+            # Nothing re-pended (clustered stand-down, a follower, or a death holding no row): the
+            # next head is not a row the dead worker held, so it is not judged.
             await worker(name)
             return
         # Armed for the replacement's life: its first non-empty claim consumes it, and a worker
@@ -7097,6 +7123,14 @@ class RegistryRunner:
         )
         self._worker_deaths[key] = (deaths + 1, now + delay)
         return delay
+
+    def _mark_replacement_running(self, stage: Stage, name: str) -> None:
+        """Restart the stable window of :meth:`_respawn_delay` when the replacement's recovery has
+        landed and it starts claiming, so a recovery that retried for longer than the window is not
+        counted as clean running."""
+        key = (stage.value, name)
+        deaths, _ = self._worker_deaths.get(key, (0, 0.0))
+        self._worker_deaths[key] = (deaths, time.monotonic())
 
     async def _recover_respawned_lane(self, stage: Stage, name: str) -> int:
         """Re-pend what a FINISHED per-lane worker left INFLIGHT on its own lane, before its
@@ -9473,25 +9507,42 @@ class RegistryRunner:
         claim is not judged: the caller reads :attr:`_ceiling_armed` first, so a lane with no death
         pays nothing for this.
 
-        It is what ends the respawn loop :meth:`_recover_then_run` describes. Respawn recovery
-        re-pends the row a worker died holding at the head of its lane, so that head is the row to
-        judge, and only that one: a batch claim charges every row it takes, so rows behind the
-        poison climb with it, and judging them would dead-letter rows that never killed anything.
-        An unordered outbound lane claims in its own order, so there the row may not be the head,
-        and the respawn backoff alone paces it. The cap is the one the lane's own failures meet:
-        the outbound's resolved retry policy for a delivery lane, and ``[delivery]``
+        It is what ends the respawn loop :meth:`_recover_then_run` describes. A worker works its
+        claimed rows oldest first, one at a time, and those it finished are no longer in flight, so
+        the oldest row the reset re-pended, the head of the replacement's first claim, is the row
+        it died on. That head is the row to judge, and only that one: a batch claim charges every
+        row it takes, so rows behind the poison climb with it, and judging them would dead-letter
+        rows that never killed anything.
+
+        **Lanes where the head need not be that row are not judged**, and there the respawn backoff
+        alone paces the loop: at least an unordered outbound lane, which claims in its own order;
+        a batching outbound, whose send holds the head and its coalesced rows together; a routed
+        lane under transform concurrency above 1, which works a message's siblings together; and a
+        lane whose connection a reload removed, which keeps its row as its worker's
+        missing-connection path does. The cap is the one the lane's own failures meet: the
+        outbound's resolved retry policy for a delivery lane, and ``[delivery]``
         ``retry_max_attempts`` for the inbound stages, as the router and transform workers'
-        internal-error policy takes it. A lane whose connection a reload removed keeps its row, as
-        its worker's missing-connection path does."""
+        internal-error policy takes it."""
         key = (stage.value, name)
         if key not in self._ceiling_armed:
             return False
         self._ceiling_armed.discard(key)
+        cap: int | None
         if stage is Stage.OUTBOUND:
             policy = self._retry.get(name)
-            cap = None if policy is None else policy.max_attempts
+            judged = (
+                policy is not None
+                and name in self.registry.outbound
+                and name not in self._batch
+                and self._lane_ordering(name) is OrderingMode.FIFO
+            )
+            cap = policy.max_attempts if judged and policy is not None else None
+        elif name not in self.registry.inbound or (
+            stage is Stage.ROUTED and self._transform_concurrency > 1
+        ):
+            cap = None
         else:
-            cap = self._delivery_defaults.max_attempts if name in self.registry.inbound else None
+            cap = self._delivery_defaults.max_attempts
         if cap is None or not _g6_exhausted(head, cap):
             return False
         await self._dead_letter_exhausted(stage, name, head, cap)

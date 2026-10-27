@@ -37,8 +37,10 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import (
+    BatchConfig,
     BuildupThreshold,
     ConnectorType,
+    OrderingMode,
     RetryPolicy,
     StallThreshold,
 )
@@ -1231,8 +1233,59 @@ async def test_the_ceiling_judges_only_the_first_head_after_a_death_with_each_la
     runner._ceiling_armed.add((Stage.OUTBOUND.value, "OB"))
     assert await judge(Stage.OUTBOUND, "OB", dataclasses.replace(head, attempts=5)) is True
 
+    at_cap = dataclasses.replace(head, attempts=5)
+    # Lanes whose head need not be the row the worker died on are not judged.
+    runner._ordering["OB"] = OrderingMode.UNORDERED
+    runner._ceiling_armed.add((Stage.OUTBOUND.value, "OB"))
+    assert await judge(Stage.OUTBOUND, "OB", at_cap) is False
+    runner._ordering["OB"] = OrderingMode.FIFO
+    runner._batch["OB"] = BatchConfig(max_count=3, max_wait_ms=1)
+    runner._ceiling_armed.add((Stage.OUTBOUND.value, "OB"))
+    assert await judge(Stage.OUTBOUND, "OB", at_cap) is False
+    del runner._batch["OB"]
+    runner._transform_concurrency = 2
+    runner._ceiling_armed.add((Stage.ROUTED.value, "IB"))
+    assert await judge(Stage.ROUTED, "IB", items[1]) is False
     runner._ceiling_armed.add((Stage.ROUTED.value, "GONE"))
     assert await judge(Stage.ROUTED, "GONE", items[1]) is False  # a removed inbound keeps it
+    assert await _ingress_status(store, items[1].message_id) == "inflight"
+
+
+@pytest.mark.parametrize(
+    ("died", "recovered", "armed"), [(True, 1, True), (True, 0, False), (False, 1, False)]
+)
+async def test_only_a_death_whose_reset_re_pended_a_row_arms_the_ceiling(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    died: bool,
+    recovered: int,
+    armed: bool,
+) -> None:
+    """The ceiling judges the row the dead worker held. Where the reset re-pended nothing (the
+    clustered stand-down, a follower, a death holding no row), the next head is some other row, so
+    nothing is armed; a worker that returned is not armed either. The arming ends with the worker,
+    and the replacement's start opens a fresh stable window for the respawn backoff."""
+    runner = RegistryRunner(
+        _registry(tmp_path), store, egress=EgressSettings(deny_by_default=False)
+    )
+
+    async def reset(stage: Stage, name: str) -> int:
+        return recovered
+
+    monkeypatch.setattr(runner, "_recover_respawned_lane", reset)
+    seen: list[bool] = []
+
+    async def worker(name: str) -> None:
+        seen.append((Stage.INGRESS.value, name) in runner._ceiling_armed)
+
+    runner._worker_deaths[(Stage.INGRESS.value, "IB")] = (1, time.monotonic() - 3600.0)
+    await runner._recover_then_run(Stage.INGRESS, "IB", worker, died=died)
+    assert seen == [armed]
+    assert runner._ceiling_armed == set()
+    if died:
+        deaths, started = runner._worker_deaths[(Stage.INGRESS.value, "IB")]
+        assert time.monotonic() - started < 5.0  # stamped when the replacement started claiming
 
 
 async def test_a_stop_already_set_is_read_before_a_zero_delay(
@@ -1280,13 +1333,18 @@ def _lane_run(
     return dispatcher, applied
 
 
+@pytest.mark.parametrize("leader", [True, False])
 async def test_a_stop_during_the_head_retry_still_sends_the_tail_release_once(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    leader: bool,
 ) -> None:
-    """The head's re-pend keeps failing and a stop lands during its backoff. Each write is sent at
-    least once, so the tail release is still tried, and lands: the tail is pending again for the
-    next start, the head stays in flight for its reset. Before, the stop returned first and the
-    tail stayed in flight too."""
+    """The head's re-pend keeps failing and a stop lands during its backoff. On the leader the
+    tail release is still sent once, and lands: the tail is pending again for the next start, the
+    head stays in flight for its reset. Before, the stop returned first and the tail stayed in
+    flight too. Not the leader, the late write is not sent, since a successor may hold the rows.
+    Either way a WARNING names the rows left in flight, which quiesce cannot see."""
     await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
     await store.enqueue_ingress(channel_id="IB", raw=RAW_B, now=1.0)
     head, tail = await store.claim_next_fifo_batch(
@@ -1308,12 +1366,41 @@ async def test_a_stop_during_the_head_retry_still_sends_the_tail_release_once(
         dispatcher._stop.set()
 
     monkeypatch.setattr(dispatcher, "_sleep_or_stop", stop_now)
-    await dispatcher._run_lane("IB", [head, tail])
+    monkeypatch.setattr(dispatcher, "_is_leader", lambda: leader)
+    with caplog.at_level(logging.WARNING):
+        await dispatcher._run_lane("IB", [head, tail])
     assert calls["reschedule_claimed"] == 1
-    assert released == [[tail.id]]
-    assert await _ingress_status(store, tail.message_id) == "pending"
+    assert released == ([[tail.id]] if leader else [])
+    expected_tail = "pending" if leader else "inflight"
+    assert await _ingress_status(store, tail.message_id) == expected_tail
     assert await _ingress_status(store, head.message_id) == "inflight"
     assert applied == []  # stopped: no terminal transition
+    held = 1 if leader else 2
+    assert f"stopped while holding {held} claimed row(s)" in caplog.text
+
+
+async def test_a_held_lane_pages_lane_stuck_once_at_the_infra_fault_bound(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held lane never reaches ``_apply_retry``, so the ADR 0070 streak cannot page it. The hold
+    raises one ``lane_stuck`` at ``infra_fault_stop_after`` consecutive failures, not one per
+    failure after it."""
+    _fast_backoffs(monkeypatch)
+    sink = _RecordingSink()
+    stuck: list[str] = []
+    monkeypatch.setattr(sink, "lane_stuck", lambda name, *, detail: stuck.append(detail))
+    dispatcher = _bare_dispatcher(store, alert_sink=sink, infra_fault_stop_after=3)
+    failures = 0
+
+    async def failing() -> None:
+        nonlocal failures
+        failures += 1
+        if failures <= 5:
+            raise RuntimeError("simulated store outage")
+
+    assert await dispatcher._land_while_holding("IB", "release_claimed", failing) is True
+    assert failures == 6
+    assert len(stuck) == 1 and "failed 3 consecutive times" in stuck[0]
 
 
 async def test_a_head_retry_that_overruns_its_date_parks_the_lane_until_the_date_written(
