@@ -995,6 +995,12 @@ _CROSSINGS_LOGGED: set[tuple[str, str]] = set()
 _CROSSINGS_LOCK = threading.Lock()
 
 
+def _crossing_logged(connector: str, kind: str) -> bool:
+    """Whether :func:`_first_crossing` has already marked this crossing. Asked before every
+    send, so it takes no lock; a False answer is settled under the lock."""
+    return (connector, kind) in _CROSSINGS_LOGGED
+
+
 def _first_crossing(connector: str, kind: str) -> bool:
     """Whether this is the first ``kind`` of crossing on the ``connector`` hop in this process.
 
@@ -1008,10 +1014,9 @@ def _first_crossing(connector: str, kind: str) -> bool:
     **The hop is named by its connector label.** The key provider and the Transit cipher share
     one label, one Vault address and one settings pair, so they share one line. A process that
     crosses the same hop both ways, attested and warned, logs each once."""
-    key = (connector, kind)
-    # Asked before every send, so the common answer takes no lock.
-    if key in _CROSSINGS_LOGGED:
+    if _crossing_logged(connector, kind):
         return False
+    key = (connector, kind)
     with _CROSSINGS_LOCK:
         if key in _CROSSINGS_LOGGED:
             return False
@@ -1035,7 +1040,7 @@ def _disclose_ambient_proxy(connector: str, proxy: str | None) -> None:
     if not proxy:
         return
     kind = f"ambient proxy {hashlib.sha256(proxy.encode('utf-8', 'surrogatepass')).hexdigest()}"
-    if (connector, kind) in _CROSSINGS_LOGGED:
+    if _crossing_logged(connector, kind):
         return
     label = _dialled_proxy_label(proxy)
     if _first_crossing(connector, kind):
