@@ -144,9 +144,13 @@ VIP follow failover **passively**, with no engine VIP code.
     by the `monitoring:read` permission (`Depends(require(Permission.MONITORING_READ))` in
     [`api/app.py`](../messagefoundry/api/app.py)), so an unauthenticated LB health probe gets `401/403` on
     **every** node (the leader included) and the LB would mark all backends unhealthy and black-hole MLLP.
-    To use it, the LB must **inject a static bearer token / session header** into the probe (mint a
-    least-privilege `monitoring:read` token; rotate it) — and **many L4 LBs cannot send auth headers at
-    all**. If your LB cannot authenticate the probe, use the **TCP-connect-to-2575** default above (it needs
+    To use it, the probe must carry a bearer token. The engine has **no static or long-lived API token
+    and no route that mints one**: the only bearer is the session token a sign-in returns, and that
+    session ends at its absolute or idle limit ([SECURITY.md](SECURITY.md#sessions)). So something
+    beside the LB must sign in as a dedicated least-privilege account holding `monitoring:read` (the
+    built-in `viewer` role carries it) and hand the LB a fresh token before each session ends; under
+    the shipped `[auth].require_mfa` that account also owes a second factor at each sign-in. **Many L4
+    LBs cannot send auth headers at all**. If your LB cannot authenticate the probe, use the **TCP-connect-to-2575** default above (it needs
     no auth and works on any L4 LB); there is **no** tokenless primary-only HTTP endpoint to point an
     unauthenticated L7 check at. The `/health` liveness endpoint *is* tokenless, but it is 200 on every node
     and so cannot select the primary.
