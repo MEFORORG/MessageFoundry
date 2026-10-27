@@ -23,13 +23,16 @@ exactly like ``load_config`` itself.
 
 from __future__ import annotations
 
-import errno
 import hashlib
-import os
-import stat
 from collections.abc import Mapping
 from pathlib import Path
 
+from messagefoundry.config.snapshot import (
+    ConfigDirMissing,
+    ConfigSnapshot,
+    is_missing_directory,
+    read_config_snapshot,
+)
 from messagefoundry.credential import constant_time_equal
 
 __all__ = [
@@ -41,13 +44,18 @@ __all__ = [
     "fingerprint_matches",
     "digest_coverage",
     "is_missing_directory",
+    "snapshot_fingerprint",
 ]
 
 # Version the scheme so a future change to *what* is hashed (or *how*) is itself detectable in the
 # trail — a fingerprint produced by v1 can never collide with one produced by a later revision.
 # v2: a dot-named ``*.py`` is no longer hashed, because the loader no longer runs one (vault BACKLOG
 # #2781).
-_SCHEME = b"mefor-cfg-fp:v2\n"
+# v3: the digest folds the one snapshot a load runs (:mod:`messagefoundry.config.snapshot`, vault
+# BACKLOG #2596). A code-set table is matched by its suffix in lower case, as the loader matches it,
+# so ``codesets/x.CSV`` is hashed on POSIX too; and a path that resolves to a file another path
+# already names is hashed under both names, so a link added beside a module changes the digest.
+_SCHEME = b"mefor-cfg-fp:v3\n"
 
 #: The scheme tag :func:`config_fingerprint_detail` records beside each digest. Two digests are
 #: comparable only under one scheme: a start compares its own digest with the store's last recorded
@@ -63,140 +71,22 @@ FINGERPRINT_SCHEME = _SCHEME.decode("ascii").strip()
 #: failed reload steps.
 UNREADABLE_FILES_KEY = "unreadable_files"
 
-# Every file ``load_config`` consumes that defines the running graph's behaviour, transport config,
-# or reference data. Globs are relative to the config dir. The config modules themselves are not a
-# glob here: they come from ``config.wiring.config_py_files``, the one rule the loader and ADR 0036's
-# guard also use. It covers ``_``-prefixed helpers -- the loader skips them as *top-level modules*,
-# but a sibling can import them, so they are just as much "what runs" -- and skips a dot-named
-# ``.IB_OLD.py`` or AppleDouble ``._X.py``, which the loader never runs. The globs below are
-# unchanged: the code-set loader reads a dot-named table file, so hashing one is still right.
-_FINGERPRINT_GLOBS: tuple[str, ...] = (
-    "connections.toml",
-    "codesets/*.csv",
-    "codesets/*.toml",
-    "environments/*.toml",
-)
+# What is hashed is what :func:`~messagefoundry.config.snapshot.read_config_snapshot` reads: every
+# config module (``config.snapshot.config_py_files``, the one rule the loader and ADR 0036's guard
+# also use, ``_``-prefixed helpers included and a dot-named ``.IB_OLD.py`` or AppleDouble ``._X.py``
+# skipped), ``connections.toml``, each ``codesets/`` table, and each ``environments/*.toml`` under
+# the config directory. The last is covered and never loaded; the value file a serve start reads
+# sits under ``[environments].base_dir``, and is not hashed here. ``__pycache__`` is never read:
+# the loader compiles the source itself.
 
 
-class ConfigDirMissing(FileNotFoundError):
-    """The directory a strict :func:`config_fingerprint` was asked for is not a directory. Its own
-    type, so a caller can tell it from a covered file that vanished, which is a plain
-    ``FileNotFoundError``."""
-
-
-#: The Windows errors that refuse a path's name itself: ERROR_INVALID_NAME (123), ERROR_BAD_PATHNAME
-#: (161) and ERROR_FILENAME_EXCED_RANGE (206). Python maps the first to EINVAL, not ENOENT.
-_INVALID_NAME_WINERRORS: frozenset[int] = frozenset({123, 161, 206})
-
-
-def is_missing_directory(exc: OSError) -> bool:
-    """Whether ``exc``, raised resolving or listing a directory, says no directory can be opened by
-    that path: nothing by that name, a file rather than a directory, a name or whole path too long
-    for the filesystem (ENAMETOOLONG, or Windows error 206), or a name Windows refuses, such as
-    ``sub?``. ``Path.is_dir`` answers ``False`` for all of them, so a caller that lists the
-    directory instead reports them as missing too (vault BACKLOG #2596). Any other error, such as
-    access denied, is not a missing directory."""
-    return (
-        isinstance(exc, (FileNotFoundError, NotADirectoryError))
-        or exc.errno == errno.ENAMETOOLONG
-        or getattr(exc, "winerror", None) in _INVALID_NAME_WINERRORS
-    )
-
-
-def _iter_entries(base: Path, *, strict: bool, unreadable: set[str]) -> list[tuple[str, bytes]]:
-    """Return ``(posix-relpath, sha256(content))`` for every fingerprinted file, sorted.
+def _entries(snapshot: ConfigSnapshot) -> list[tuple[str, bytes]]:
+    """``(posix-relpath, sha256(content))`` for every file in ``snapshot``, sorted.
 
     Sorting by relpath makes the fold order-independent (filesystem enumeration order can vary);
     keying on the *relative* path (not absolute) makes the digest location-independent, so two
-    byte-identical bundles at different paths fingerprint identically. A file that cannot be stat'ed
-    or read, and a folder a glob reads that cannot be listed, raises when ``strict`` (see
-    :func:`config_fingerprint`); otherwise it is left out and added to ``unreadable``, so a caller
-    can tell a digest of the whole bundle from one of part of it (vault BACKLOG #2944).
-    """
-    # Lazy: wiring is the loader, and this module stays importable without pulling it in at import time.
-    from messagefoundry.config.wiring import config_py_files
-
-    try:
-        # Not strict, every folder that cannot be listed is collected, not just the first, so two
-        # digests that report the same coverage do cover the same files.
-        _require_listable(base, unlistable=None if strict else unreadable)
-    except ConfigDirMissing:
-        if strict:
-            raise
-        # Not strict: a missing directory digests as an empty bundle, as it always has.
-    seen: set[Path] = set()
-    entries: list[tuple[str, bytes]] = []
-    globbed = (path for pattern in _FINGERPRINT_GLOBS for path in base.glob(pattern))
-    for path in [*config_py_files(base), *globbed]:
-        rel = path.relative_to(base).as_posix()
-        try:
-            # A stat that fails for any reason but absence is an unreadable file, not a missing
-            # one: Path.is_file would answer False and the file would drop out unremarked.
-            if not _is_file(path):
-                continue
-            resolved = path.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            data = path.read_bytes()
-        except FileNotFoundError:
-            if strict:
-                raise
-            continue  # removed since the listing: gone, as _is_file judges a gone path
-        except OSError:
-            if strict:
-                raise
-            unreadable.add(rel)
-            continue
-        entries.append((rel, hashlib.sha256(data).digest()))
-    entries.sort()
-    return entries
-
-
-def _require_listable(base: Path, *, unlistable: set[str] | None = None) -> None:
-    """Raise unless ``base`` and each folder a glob reads in it can be listed. With ``unlistable``,
-    a folder that cannot be listed is added to it, by its path relative to ``base`` (``.`` for
-    ``base``), instead of raising; a missing ``base`` still raises.
-
-    ``glob`` swallows a listing error, so a missing or unlistable directory would digest as an empty
-    bundle, and an unlistable ``codesets`` folder as a bundle without it. A missing ``base`` raises
-    :class:`ConfigDirMissing`, and so does one whose name no directory can have
-    (:func:`is_missing_directory`); any other fault raises its own ``OSError``. A sub-folder that
-    is missing by the same rule is fine: there is nothing in it to leave out."""
-    missing = False
-    try:
-        with os.scandir(base):
-            pass
-    except OSError as exc:
-        if not is_missing_directory(exc):
-            if unlistable is None:
-                raise
-            unlistable.add(".")  # nothing under it can be listed either
-            return
-        missing = True
-    if missing:
-        # Raised after the handler, so the error it replaces does not ride __context__.
-        raise ConfigDirMissing(errno.ENOENT, "config directory not found", str(base))
-    for folder in sorted({Path(pattern).parent for pattern in _FINGERPRINT_GLOBS} - {Path(".")}):
-        try:
-            with os.scandir(base / folder):
-                pass
-        except OSError as exc:
-            # The same rule as base: a folder no path can open holds nothing the loader reads.
-            if not is_missing_directory(exc):
-                if unlistable is None:
-                    raise
-                unlistable.add(folder.as_posix())
-
-
-def _is_file(path: Path) -> bool:
-    """Whether ``path`` is a regular file, following links. ``Path.is_file`` answers ``False`` for a
-    path it cannot stat, so this stats it instead and raises that error. A path that is gone (a
-    dangling link, or a file removed since the listing) is not a file."""
-    try:
-        return stat.S_ISREG(path.stat().st_mode)
-    except FileNotFoundError:
-        return False
+    byte-identical bundles at different paths fingerprint identically."""
+    return sorted((rel, hashlib.sha256(data).digest()) for rel, data in snapshot.files.items())
 
 
 def _fold(entries: list[tuple[str, bytes]]) -> str:
@@ -212,6 +102,17 @@ def _fold(entries: list[tuple[str, bytes]]) -> str:
     return h.hexdigest()
 
 
+def snapshot_fingerprint(snapshot: ConfigSnapshot) -> str:
+    """The content digest of ``snapshot``: the bytes one load read, and so the bytes it ran.
+
+    A digest that gates a load, such as the one a dual-control release checks, is taken from the
+    snapshot that load then runs, so nothing can change between the check and the run (vault
+    BACKLOG #2596). Its files left out as unreadable, if any, are not covered: a caller that gates
+    on it checks :attr:`~messagefoundry.config.snapshot.ConfigSnapshot.unreadable` first, or reads
+    the snapshot strictly."""
+    return _fold(_entries(snapshot))
+
+
 def config_fingerprint(directory: str | Path, *, strict: bool = False) -> str:
     """Return a stable SHA-256 hex digest over the content of a config bundle's loaded files.
 
@@ -221,16 +122,22 @@ def config_fingerprint(directory: str | Path, *, strict: bool = False) -> str:
     the approval never covered, so ``strict`` raises instead: :class:`ConfigDirMissing` when
     ``directory`` is not a directory, and the ``OSError`` when a folder it reads cannot be listed or
     a file it covers cannot be stat'ed or read."""
-    return _fold(_iter_entries(Path(directory), strict=strict, unreadable=set()))
+    return snapshot_fingerprint(read_config_snapshot(directory, strict=strict))
 
 
-def config_fingerprint_detail(directory: str | Path) -> dict[str, object]:
+def config_fingerprint_detail(
+    directory: str | Path, *, snapshot: ConfigSnapshot | None = None
+) -> dict[str, object]:
     """Return the fingerprint plus the file count and a best-effort git HEAD, for an audit detail.
 
     ``git_head`` is included only when ``directory`` resolves inside a git work tree whose commit can
     be read purely from files; it is advisory provenance, not the integrity anchor (the content
     ``fingerprint`` is). Keys: ``fingerprint`` (str), ``scheme`` (str, :data:`FINGERPRINT_SCHEME`),
     ``files`` (int), and optionally ``git_head``.
+
+    With ``snapshot``, the digest is of that snapshot, the bytes a load read and ran, and the
+    directory is read for the git HEAD alone (vault BACKLOG #2596). Without it, the directory is
+    read now.
 
     It stays best-effort: a file it cannot read is left out of the digest. But it says so, under
     :data:`UNREADABLE_FILES_KEY` (the files and folders left out), present only when one was. Two
@@ -240,15 +147,16 @@ def config_fingerprint_detail(directory: str | Path) -> dict[str, object]:
     dual-control approval binds is :func:`config_fingerprint` with ``strict``, which raises instead.
     """
     base = Path(directory)
-    unreadable: set[str] = set()
-    entries = _iter_entries(base, strict=False, unreadable=unreadable)
+    if snapshot is None:
+        snapshot = read_config_snapshot(base, strict=False)
+    entries = _entries(snapshot)
     detail: dict[str, object] = {
         "fingerprint": _fold(entries),
         "scheme": FINGERPRINT_SCHEME,
         "files": len(entries),
     }
-    if unreadable:
-        detail[UNREADABLE_FILES_KEY] = sorted(unreadable)
+    if snapshot.unreadable:
+        detail[UNREADABLE_FILES_KEY] = list(snapshot.unreadable)
     head = _git_head(base)
     if head is not None:
         detail["git_head"] = head

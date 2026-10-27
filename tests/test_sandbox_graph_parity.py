@@ -22,7 +22,7 @@ from pydantic import ValidationError
 from messagefoundry.config import settings, wiring
 from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import Registry, WiringError, config_code_digest, load_config
+from messagefoundry.config.wiring import Registry, config_code_digest, load_config
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.dryrun import transform_one
 from messagefoundry.pipeline.sandbox import (
@@ -155,48 +155,56 @@ def test_a_config_module_edited_on_disk_refuses_the_worker_though_every_name_mat
     assert str(deliveries[0].payload) == "EDITED=1"
 
 
-def test_a_module_rewritten_while_the_load_runs_refuses_the_load(
+def test_a_module_rewritten_while_the_load_runs_does_not_change_what_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The digest is read before the modules run. A rewrite in between would let a worker pass the
-    comparison with code its digest does not describe, so the load is refused. The control is
-    the same load with nothing rewritten."""
+    """Vault BACKLOG #2596 step 1. The load reads the directory once and runs those bytes, so a
+    rewrite while it runs changes neither the code that runs nor the digest that describes it.
+    Before, the digest was read first and each module read again to run it, and a rewrite in
+    between was refused after it had run. The control loads the rewritten file afresh."""
     monkeypatch.delenv(_VARIABLE, raising=False)
-    (tmp_path / "graph.py").write_text(_GRAPH, encoding="utf-8")
-    assert load_config(tmp_path).code_digest is not None
+    graph = tmp_path / "graph.py"
+    graph.write_text(_GRAPH, encoding="utf-8")
     real = wiring._exec_module
 
     def rewrite_then_run(path: Path, helpers: Any) -> None:
-        path.write_text(_GRAPH + "\n# edited\n", encoding="utf-8")
+        path.write_text(_GRAPH.replace('"COUNT="', '"EDITED="'), encoding="utf-8")
         real(path, helpers)
 
     monkeypatch.setattr(wiring, "_exec_module", rewrite_then_run)
-    with pytest.raises(WiringError, match="changed on disk while they were loading"):
-        load_config(tmp_path)
+    registry = load_config(tmp_path)
+    monkeypatch.setattr(wiring, "_exec_module", real)
+    deliveries, _, _, _ = transform_one(registry, "h_0", RAW)
+    assert str(deliveries[0].payload) == "COUNT=1"
+    assert registry.config_snapshot is not None
+    assert registry.code_digest == config_code_digest(registry.config_snapshot)
+    assert registry.code_digest != config_code_digest(tmp_path)  # the disk moved on
+    edited = load_config(tmp_path)
+    assert str(transform_one(edited, "h_0", RAW)[0][0].payload) == "EDITED=1"
 
 
-def test_a_module_unreadable_after_the_load_is_not_called_an_edit(
+def test_a_load_reads_each_config_file_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """One read per file, for the module, a helper it imports, a code set and connections.toml:
+    every later use is of those bytes (vault BACKLOG #2596)."""
     monkeypatch.delenv(_VARIABLE, raising=False)
-    (tmp_path / "graph.py").write_text(_GRAPH, encoding="utf-8")
-    real = wiring._exec_module
+    (tmp_path / "graph.py").write_text("import _shared\n" + _GRAPH, encoding="utf-8")
+    (tmp_path / "_shared.py").write_text("X = 1\n", encoding="utf-8")
+    (tmp_path / "codesets").mkdir()
+    (tmp_path / "codesets" / "diets.csv").write_text("k,v\na,b\n", encoding="utf-8")
+    (tmp_path / "connections.toml").write_text("", encoding="utf-8")
     real_read = Path.read_bytes
-    ran: list[bool] = []
+    reads: list[str] = []
 
-    def refuse_after_the_load(self: Path) -> bytes:
-        if ran and self.name == "graph.py":
-            raise PermissionError("held open")
+    def counting(self: Path) -> bytes:
+        reads.append(self.name)
         return real_read(self)
 
-    def run(path: Path, helpers: Any) -> None:
-        real(path, helpers)
-        ran.append(True)
-
-    monkeypatch.setattr(wiring, "_exec_module", run)
-    monkeypatch.setattr(Path, "read_bytes", refuse_after_the_load)
-    with pytest.raises(WiringError, match="could not be read again"):
-        load_config(tmp_path)
+    monkeypatch.setattr(Path, "read_bytes", counting)
+    registry = load_config(tmp_path)
+    assert "h_0" in registry.handlers
+    assert sorted(reads) == ["_shared.py", "connections.toml", "diets.csv", "graph.py"]
 
 
 def test_an_unreadable_module_leaves_no_digest_and_says_so(

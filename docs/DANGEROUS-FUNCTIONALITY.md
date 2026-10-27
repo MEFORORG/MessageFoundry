@@ -96,8 +96,10 @@ break that Handler rather than protect it.
 
 ## 2. The config loader imports by file path
 
-`config/wiring.py` builds an import spec from a path and executes the module. Two sites do this: the
-loader's own finder, and the direct module load.
+`config/wiring.py` reads the config directory once, compiles each module from those bytes, and
+executes it. Two sites do this: the loader's helper importer, and the direct module load. Neither
+reads a `__pycache__` file, and a sandbox worker runs the bytes the engine read, not the directory
+(vault BACKLOG #2596).
 
 **What it means.** Every `.py` file in your config directory that does not start with `_` gets
 imported at startup, and its top-level code runs. A file you dropped there to look at later is not

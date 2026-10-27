@@ -46,6 +46,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
     UpdateCheckSettings,
 )
+from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.config.tls_policy import HopPosture, TrustAnchorPolicy
 from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
@@ -54,6 +55,7 @@ from messagefoundry.config.wiring import (
     WiringError,
     connector_secret_env_values,
     load_config,
+    read_trusted_snapshot,
 )
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline.alerts import (
@@ -2978,18 +2980,25 @@ class Engine:
         A DR activation does not reload it: it re-applies the running graph."""
         return self.last_reload_dir or self.config_dir
 
-    async def fingerprint_bundle(self, path: Path) -> tuple[dict[str, object] | None, str | None]:
+    async def fingerprint_bundle(
+        self, path: Path, snapshot: ConfigSnapshot | None = None
+    ) -> tuple[dict[str, object] | None, str | None]:
         """The ADR 0041 D1 content fingerprint of ``path``, or ``(None, reason)`` when it cannot be read.
+
+        With ``snapshot``, the digest is of that snapshot, the bytes a load read and ran, and
+        ``path`` is read only for the advisory VCS head (vault BACKLOG #2596).
 
         The one best-effort rule for every load: the start, an applied reload and a dry run all call
         it, so a bundle one of them tolerates cannot make another refuse (vault BACKLOG #2597).
         OSError is an unreadable file; ValueError is a VCS head that is not UTF-8
         (UnicodeDecodeError). Anything else, such as an ImportError of the fingerprint module, still
         raises. The reason is a :func:`safe_exc` rendering, logged here at WARNING."""
+        if snapshot is not None:
+            return await asyncio.to_thread(self.fingerprint_bundle_blocking, path, snapshot)
         return await asyncio.to_thread(self.fingerprint_bundle_blocking, path)
 
     def fingerprint_bundle_blocking(
-        self, path: Path
+        self, path: Path, snapshot: ConfigSnapshot | None = None
     ) -> tuple[dict[str, object] | None, str | None]:
         """:meth:`fingerprint_bundle` for a caller already on a worker thread, under the same rule.
 
@@ -3000,6 +3009,8 @@ class Engine:
         try:
             # A direct call, so the crypto inventory scanner, which follows a call it can see,
             # keeps the hash on its record.
+            if snapshot is not None:
+                return config_fingerprint_detail(path, snapshot=snapshot), None
             return config_fingerprint_detail(path), None
         except (OSError, ValueError) as exc:
             reason = safe_exc(exc)
@@ -3049,6 +3060,31 @@ class Engine:
             # unreadable bundle. A file that vanished from a present one is the latter.
             raise
         except (OSError, ValueError) as exc:
+            # The path can come from a client's config_dir, so it is scrubbed for CodeQL
+            # py/log-injection as the reload refusal logs scrub theirs.
+            log.warning(
+                "config content digest failed for %s: %s",
+                scrub_log_argument(str(path)),
+                safe_exc(exc),
+            )
+            return None
+
+    async def _reload_snapshot(self, path: Path) -> ConfigSnapshot | None:
+        """The one read of ``path`` a reload runs, after the load's trust check, read strictly so
+        its digest covers every file the fingerprint names (vault BACKLOG #2596). ``None`` when a
+        file or folder cannot be read, logged at WARNING as :meth:`_content_digest` logs it. A
+        missing directory raises :class:`ConfigDirMissing`, and a refused source ``WiringError``."""
+        return await asyncio.to_thread(self._reload_snapshot_blocking, path)
+
+    @staticmethod
+    def _reload_snapshot_blocking(path: Path) -> ConfigSnapshot | None:
+        from messagefoundry.config.fingerprint import ConfigDirMissing
+
+        try:
+            return read_trusted_snapshot(path, strict=True)
+        except ConfigDirMissing:
+            raise
+        except OSError as exc:
             # The path can come from a client's config_dir, so it is scrubbed for CodeQL
             # py/log-injection as the reload refusal logs scrub theirs.
             log.warning(
@@ -3212,19 +3248,21 @@ class Engine:
         single-node (``is_clustered()`` False) never bumps. The initiator advances its OWN applied
         version right after bumping, so its convergence loop sees no change and does not re-reload.
 
+        **The directory is read once** (vault BACKLOG #2596, step 1): :meth:`_reload_snapshot`
+        reads it, after the load's trust check, into a snapshot; ``load_config`` compiles and
+        parses those bytes and nothing else, so no ``__pycache__`` file runs; and the audit digest
+        is the digest of the same snapshot. An edit on disk after that read changes nothing this
+        reload runs or records.
+
         ``approval`` binds the reload to the digest a dual-control approval named (vault BACKLOG
-        #2596, step 3; :meth:`reload_target_digest` took it at request time). The bundle's digest is
-        checked against it before ``load_config`` runs any config module. After a load that
-        succeeds it is checked again, before any check that can refuse the graph as invalid: the
-        fail-closed digest, then the digest the audit row records when one was taken. After a load
-        that fails, the fail-closed digest is checked once more, so an edit that breaks the graph
-        is refused as an edit. A miss raises :class:`ConfigDigestMismatch`, or
-        :class:`ConfigDigestUnavailable` when no digest can be taken now, with nothing swapped. The
-        digest fails closed (:meth:`_content_digest`): a file or folder it cannot read gives
-        :class:`ConfigDigestUnavailable`, and a directory gone since the resolve, when a digest
-        lists it, gives :class:`ConfigDirMissing`. ``None`` binds nothing: an ungated reload, a
-        convergence reload and a dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint` hashes
-        and no more.
+        #2596, step 3; :meth:`reload_target_digest` took it at request time). The snapshot's digest
+        is checked against it before ``load_config`` runs any config module, and the load then runs
+        that snapshot, so the bytes checked are the bytes that run. A miss raises
+        :class:`ConfigDigestMismatch`, or :class:`ConfigDigestUnavailable` when a file or folder
+        cannot be read, with nothing swapped; a directory gone since the resolve gives
+        :class:`ConfigDirMissing`. ``None`` binds nothing: an ungated reload, a convergence reload
+        and a dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint`
+        hashes and no more.
 
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``ConfigDirMissing``
         (missing dir; a ``FileNotFoundError`` subclass, which the callers map to not_found),
@@ -3251,12 +3289,23 @@ class Engine:
             # route used to, before anything is read or swapped (BACKLOG #2034).
             restart_required = await self.preflight_settings()
         path = await self._existing_reload_target(config_dir)
+        # The one read of the directory this reload runs (vault BACKLOG #2596): load_config
+        # compiles and parses these bytes and nothing else, the audit digest is theirs, and an
+        # approval is checked against them before any of them runs. None when a file cannot be
+        # read, which is logged; an ungated reload then lets load_config read and refuse it.
+        snapshot = await self._reload_snapshot(path)
         if approval is not None:
             # Before load_config, which runs every config module's top-level code, so bytes
-            # changed since the request are refused before they run (vault BACKLOG #2596). This
-            # samples the files: an edit landing between here and the load still runs its module
-            # code, and the check after the load then refuses it.
-            _require_approved(await self._content_digest(path), approval)
+            # changed since the request are refused before they run. An edit after this read
+            # changes nothing: the load runs this snapshot.
+            from messagefoundry.config.fingerprint import snapshot_fingerprint
+
+            digest = (
+                await asyncio.to_thread(snapshot_fingerprint, snapshot)
+                if snapshot is not None
+                else None
+            )
+            _require_approved(digest, approval)
         # The values this reload resolves env() against. A real reload applies them only at the
         # swap, so a refusal leaves the running graph's values as they were (vault BACKLOG #2596).
         env_values = self._env_values
@@ -3307,31 +3356,14 @@ class Engine:
                     "could not re-read this environment's values for the reload, so the live graph "
                     f"is unchanged: {refusal}"
                 )
-        load_error: WiringError | None = None
-        try:
-            # Off the event loop: load_config executes user config modules (arbitrary, potentially
-            # heavy imports), which would otherwise stall every listener mid-reload (review low-3).
-            registry = await asyncio.to_thread(load_config, path)  # WiringError on a bad config
-        except WiringError as exc:
-            if approval is None:
-                raise
-            load_error = exc
-        if load_error is not None and approval is not None:
-            # An edit after the first check can also break the load. Name the edit, so a tamper is
-            # audited as one and not as a bad config (vault BACKLOG #2596). Checked AFTER the
-            # handler, so a digest refusal does not carry the load error on __context__, where a
-            # TOMLDecodeError would keep a whole value file (BACKLOG #2307).
-            try:
-                _require_approved(await self._content_digest(path), approval)
-            except (ConfigDigestMismatch, ConfigDigestUnavailable, FileNotFoundError):
-                # The refusal names the digest or the missing directory, so the load error would
-                # otherwise go unlogged.
-                log.warning(
-                    "a released config reload also failed to load: %s",
-                    scrub_log_argument(safe_exc(load_error)),
-                )
-                raise
-            raise load_error
+        # Off the event loop: load_config executes user config modules (arbitrary, potentially
+        # heavy imports), which would otherwise stall every listener mid-reload (review low-3).
+        # WiringError on a bad config. With a snapshot, a released reload's load failure is a
+        # failure of the approved bytes themselves, so it is a bad config and not an edit.
+        if snapshot is not None:
+            registry = await asyncio.to_thread(load_config, path, snapshot=snapshot)
+        else:
+            registry = await asyncio.to_thread(load_config, path)
         fingerprint: dict[str, object] | None = None
         if not dry_run:
             # ADR 0041 D1 (config provenance, item C): fingerprint the bundle right after the load
@@ -3343,19 +3375,14 @@ class Engine:
             # the swap. Still best-effort: an unreadable bundle leaves provenance unknown rather
             # than refusing an otherwise-applicable config, and is recorded as a step failure so the
             # caller is not told the reload was clean when GET /config/provenance reports nothing.
-            fingerprint, fingerprint_failure = await self.fingerprint_bundle(path)
+            # The digest of the snapshot the load ran (vault BACKLOG #2596), so a released
+            # reload's row names the approved digest by construction, and the row names the bytes
+            # that ran rather than a later read of the directory.
+            fingerprint, fingerprint_failure = await self.fingerprint_bundle(
+                path, registry.config_snapshot
+            )
             if fingerprint_failure is not None:
                 failures.append(ReloadStepFailure("config_fingerprint", fingerprint_failure))
-        if approval is not None:
-            # Again, on the digest the audit row records, so a released reload's row names the
-            # approved digest. Before every check that can refuse the graph as invalid, so a tamper
-            # is audited as one and those checks read only approved bytes. An edit that lands and
-            # is reverted inside the load is not seen. The fail-closed digest first: the recorded
-            # one skips a file it cannot read, so on its own it could match with a file unbound.
-            _require_approved(await self._content_digest(path), approval)
-            taken = fingerprint.get("fingerprint") if fingerprint is not None else None
-            if isinstance(taken, str):
-                _require_approved(taken, approval)
         # Before the shard filter, so a guard judges the WHOLE graph: an engine-shard process then
         # reaches the same verdict as its siblings, over one shared config (BACKLOG #1182).
         self.guard_registry(registry)

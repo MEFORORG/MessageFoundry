@@ -57,7 +57,8 @@ from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
     CodeSet,
     CodeSetError,
-    load_code_sets,
+    code_sets_from_files,
+    is_code_set_name,
 )
 from messagefoundry.config.code_sets import (
     activated as _code_sets_activated,
@@ -89,6 +90,7 @@ from messagefoundry.config.models import (
     require_hop_reason,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
+from messagefoundry.config.snapshot import ConfigSnapshot, config_py_files, read_config_snapshot
 from messagefoundry.connection_names import (
     CONNECTION_NAME_PATTERN,
     fhir_lookup_record_name,
@@ -5404,9 +5406,13 @@ class Registry:
     source_dir: Path | None = None
     # A digest of the config modules' bytes as this load read them
     # (:func:`config_code_digest`), or
-    # None for a graph built in code or a module that could not be read. A sandbox worker loads the
-    # directory again, and the engine refuses one whose digest differs (vault BACKLOG #2724).
+    # None for a graph built in code or a module that could not be read. The engine refuses a
+    # sandbox worker whose digest differs (vault BACKLOG #2724).
     code_digest: str | None = None
+    # The one read of the directory this graph was loaded from, whose bytes it ran (vault BACKLOG
+    # #2596), or None for a graph built in code. Its fingerprint is the reload's audit digest, and a
+    # sandbox worker is sent it, so a worker runs these bytes and never reads the directory.
+    config_snapshot: ConfigSnapshot | None = field(default=None, repr=False, compare=False)
 
     def inbound_names(self) -> frozenset[str]:
         """Every inbound connection NAME in the deployment — the pinned unfiltered set when this is one
@@ -7532,49 +7538,42 @@ def handler(
 _CODE_DIGEST_SCHEME: Final = b"mefor-config-code:v1\n"
 
 
-def config_code_digest(directory: Path) -> str | None:
-    """A SHA-256 over every config module a load of ``directory`` may run, ``_`` helpers included:
-    each file's name and the digest of its bytes, in :func:`config_py_files` order (vault BACKLOG
-    #2724).
+def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
+    """A SHA-256 over every config module a load may run, ``_`` helpers included: each file's name
+    and the digest of its bytes, in name order (vault BACKLOG #2724).
 
+    ``source`` is the :class:`~messagefoundry.config.snapshot.ConfigSnapshot` a load ran, so the
+    digest describes the bytes that ran (vault BACKLOG #2596), or a directory, which is read now.
     The loader records it on the graph, and a sandbox worker's load records its own; the engine
     refuses a worker whose digest differs. Python modules only: ``connections.toml`` changes the
     graph's names, which are compared anyway, and the worker serves the code sets the engine hands
-    it, not its own read. None when a module cannot be read, which is logged.
+    it. None when a module cannot be read, which is logged.
 
     Kept here rather than built on :mod:`messagefoundry.config.fingerprint`: importing that module
     would give every importer of the loader its comparison and hash operations in the crypto
     inventory (``scripts/security/crypto_inventory_check.py``)."""
+    if isinstance(source, ConfigSnapshot):
+        snapshot = source
+    else:
+        try:
+            snapshot = read_config_snapshot(source, strict=True)
+        except OSError as exc:
+            _logger.warning(
+                "config module digest unavailable for %s, so a sandbox worker's config code is "
+                "not compared with this load's: %s",
+                scrub_log_argument(str(source)),
+                scrub_log_argument(str(exc)),
+            )
+            return None
+    if any(rel == "." or rel.lower().endswith(".py") for rel in snapshot.unreadable):
+        return None  # a module it could not read is not described by the rest
     digest = hashlib.sha256(_CODE_DIGEST_SCHEME)
-    try:
-        for path in config_py_files(directory):
-            if not path.is_file():
-                continue
-            digest.update(path.name.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(hashlib.sha256(path.read_bytes()).digest())
-            digest.update(b"\0")
-    except OSError as exc:
-        _logger.warning(
-            "config module digest unavailable for %s, so a sandbox worker's config code is not "
-            "compared with this load's: %s",
-            scrub_log_argument(str(directory)),
-            scrub_log_argument(str(exc)),
-        )
-        return None
+    for name in snapshot.modules:
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(snapshot.files[name]).digest())
+        digest.update(b"\0")
     return digest.hexdigest()
-
-
-def config_py_files(directory: Path) -> list[Path]:
-    """Every ``*.py`` in ``directory`` the loader may run or import, sorted: dot-named files excluded.
-
-    ``Path.glob("*.py")`` matches ``.IB_OLD.py`` (an editor or manual backup) and ``._IB_ACME_ADT.py``
-    (a macOS AppleDouble file left by an SMB copy) too, because pathlib has no hidden-file rule. Neither
-    is config, so the loader, both config-source trust checks and the fingerprint skip a dot-named
-    module the same way (vault BACKLOG #2781). The ``_``-helper skip is the loader's own rule on top of
-    this, not part of it: a helper is still run when a sibling imports it, so the trust check and the
-    fingerprint keep it."""
-    return sorted(p for p in directory.glob("*.py") if not p.name.startswith("."))
 
 
 #: How every config-source refusal of a load begins.
@@ -7593,10 +7592,12 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
     with each table the loader reads from it. Both config-source trust checks walk this list (vault
     BACKLOG #2626 step 3, #2596 step 4).
 
-    **The cache folder is the reason for the list.** The loader uses Python's ordinary source loader,
-    which runs a matching ``.pyc`` in place of the ``.py`` and never compares the two. The checks
-    used to read the ``.py`` alone, so a cache file nobody vetted could run under a source that
-    passed (vault BACKLOG #2596).
+    **The cache folder is on the list although no load reads it.** The loader compiles each module
+    from the bytes of its snapshot (:func:`load_config`), so a ``.pyc`` there never runs in place of
+    its ``.py``. It once did: Python's ordinary source loader prefers a matching cache file and never
+    compares the two, and the checks then read the ``.py`` alone (vault BACKLOG #2596). The folder
+    stays vetted because a writer of it is a writer inside the config directory, and because tools
+    other than the loader (``python -m``, an editor's run button) still read it.
 
     **Not on the list:** the value file and the settings file, which sit outside the config
     directory and are checked at ``serve`` start (:func:`assert_trusted_start_paths`), and the
@@ -7615,12 +7616,10 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
     codesets = directory / CODESETS_DIR_NAME
     if codesets.is_dir():
         paths.append(codesets)
-        # The loader's own rule (code_sets.load_code_sets): a file whose suffix, in lower case, is
-        # .csv or .toml. Matched the same way here, so a table spelled .CSV is vetted on POSIX too.
+        # The loader's own rule (code_sets.is_code_set_name), so a table spelled .CSV is vetted on
+        # POSIX too.
         paths.extend(
-            p
-            for p in sorted(codesets.iterdir())
-            if p.is_file() and p.suffix.lower() in (".csv", ".toml")
+            p for p in sorted(codesets.iterdir()) if p.is_file() and is_code_set_name(p.name)
         )
     return paths
 
@@ -7789,10 +7788,15 @@ class _HelperImporter:
     builtins are a copy taken when the load starts, so a name added to :mod:`builtins` later is not
     seen by config code; a live view would cost a Python-level lookup on every builtin name a
     Handler reads, on the per-message path. :func:`_assert_safe_config_source` vets every ``*.py``
-    (including ``_*``), so a helper sits inside the same trust boundary as its importers."""
+    (including ``_*``), so a helper sits inside the same trust boundary as its importers.
 
-    def __init__(self, directory: Path) -> None:
-        self._dir = directory
+    Every helper is compiled from the load's :class:`~messagefoundry.config.snapshot.ConfigSnapshot`,
+    never read from the directory, so a helper runs the bytes the load hashed, and a ``__pycache__``
+    file is never consulted (vault BACKLOG #2596)."""
+
+    def __init__(self, snapshot: ConfigSnapshot) -> None:
+        self._snapshot = snapshot
+        self._dir = snapshot.directory
         self._modules: dict[str, ModuleType] = {}
         self._open = True
         # Helper files whose body imports are not yet loaded, drained by preload().
@@ -7805,9 +7809,10 @@ class _HelperImporter:
         self._failed: dict[str, tuple[ImportError, str]] = {}
         # The helper stems present when the load starts: the only names this importer serves, so an
         # ordinary ``import json`` in a Handler body costs one set lookup before the real import.
-        self._stems = frozenset(
-            p.stem for p in config_py_files(directory) if _is_helper_name(p.stem)
-        )
+        self._files = {
+            Path(name).stem: name for name in snapshot.modules if _is_helper_name(Path(name).stem)
+        }
+        self._stems = frozenset(self._files)
         self.builtins: dict[str, Any] = {**vars(builtins), "__import__": self._import}
 
     def close(self) -> None:
@@ -7887,21 +7892,16 @@ class _HelperImporter:
                 ) from failed
         return builtins.__import__(name, globals, locals, fromlist, level)
 
-    def _load(self, name: str) -> ModuleType | None:
-        path = self._dir / f"{name}.py"
-        if not path.is_file():
-            return None  # gone since the load started: resolved the normal way
+    def _load(self, name: str) -> ModuleType:
+        path = self._dir / self._files[name]
         _refuse_shadowing_helper(name, path)
         mod_name = _config_module_name(path)
-        spec = importlib.util.spec_from_file_location(mod_name, path)
-        if spec is None or spec.loader is None:
-            raise WiringError(f"cannot load config helper: {path}")
-        module = self.new_module(spec)
+        module = self.new_module(mod_name, path)
         # Cached before it runs, as Python's own import does, so a helper cycle sees the partial module.
         self._modules[name] = module
         self.register(mod_name, module)
         try:
-            spec.loader.exec_module(module)
+            self.run(module, path)
         except BaseException:
             del self._modules[name]
             self.unregister(mod_name, module)
@@ -7909,11 +7909,31 @@ class _HelperImporter:
         self._pending.append(path)
         return module
 
-    def new_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType:
-        """A module for ``spec`` whose own ``import`` statements resolve helpers through this load."""
+    def new_module(self, mod_name: str, path: Path) -> ModuleType:
+        """A module named ``mod_name`` for the config file at ``path``, whose own ``import``
+        statements resolve helpers through this load.
+
+        Its spec names ``path`` as its origin, so ``__file__``, a traceback and a diagnostic name
+        the file an author edits, and has no loader: nothing can run the module again from disk
+        (``importlib.reload`` refuses it) or find a cache file for it."""
+        spec = importlib.machinery.ModuleSpec(mod_name, None, origin=str(path))
+        spec.has_location = True  # sets __file__ from the origin
         module = importlib.util.module_from_spec(spec)
+        module.__dict__["__cached__"] = None  # no cache file is ever read for it
         module.__dict__["__builtins__"] = self.builtins
         return module
+
+    def run(self, module: ModuleType, path: Path) -> None:
+        """Compile the snapshot's bytes for ``path`` and run them as ``module``'s body.
+
+        Compiled here, from the bytes the load hashed, rather than by Python's source loader, which
+        would run a matching ``__pycache__`` file in place of the source and never compare the two
+        (vault BACKLOG #2596). ``compile`` reads a PEP 263 coding line and a BOM from the bytes, as
+        the source loader does."""
+        code = compile(self._snapshot.files[path.name], str(path), "exec", dont_inherit=True)
+        # Config modules are code by design; the directory's trust check (ADR 0036) is what holds
+        # it, and docs/DANGEROUS-FUNCTIONALITY.md section 2 names this site.
+        exec(code, module.__dict__)  # noqa: S102  # nosec B102
 
     def preload(self, path: Path) -> None:
         """Load every helper a function body in ``path`` imports -- and, in turn, every helper those
@@ -7926,10 +7946,8 @@ class _HelperImporter:
     def _preload_one(self, current: Path) -> None:
         if not self._stems:
             return
-        try:
-            source = current.read_bytes()
-        except OSError:
-            return  # it already ran; the file going away now is not this pass's to report
+        # The bytes that ran, from the snapshot: the directory is never read again.
+        source = self._snapshot.files[current.name]
         for name, caught in _body_helper_imports(source, self._stems):
             if name in self._modules:
                 continue
@@ -7976,16 +7994,16 @@ _load_lock = threading.Lock()
 
 
 @contextmanager
-def _loading(directory: Path, registry: Registry) -> Iterator[_HelperImporter]:
+def _loading(snapshot: ConfigSnapshot, registry: Registry) -> Iterator[_HelperImporter]:
     """Hold the load lock, publish ``registry`` as the active declaration target **and its code sets
     as the active set** (so a module-top-level ``code_set(...)`` resolves), and yield the load's
-    :class:`_HelperImporter`, closed on exit so it serves only what this load imported. A load that
-    raises inside this block gets back, in ``sys.modules``, whatever each of its names held before, so
-    a live graph loaded earlier from the same files keeps its modules. (A failure after the block --
-    graph validation, the connections.toml merge -- leaves this load's entries, as it leaves its config
-    modules'.)"""
+    :class:`_HelperImporter` over ``snapshot``, closed on exit so it serves only what this load
+    imported. A load that raises inside this block gets back, in ``sys.modules``, whatever each of
+    its names held before, so a live graph loaded earlier from the same files keeps its modules. (A
+    failure after the block -- graph validation, the connections.toml merge -- leaves this load's
+    entries, as it leaves its config modules'.)"""
     global _active
-    helpers = _HelperImporter(directory)
+    helpers = _HelperImporter(snapshot)
     with _load_lock:
         _active = registry
         # Code sets are published BEFORE the modules run so a top-level capture resolves; the registry
@@ -8001,18 +8019,16 @@ def _loading(directory: Path, registry: Registry) -> Iterator[_HelperImporter]:
             helpers.close()
 
 
-def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry:
-    """Load every ``*.py`` config module in ``directory`` (sorted; ``_*`` skipped) into a Registry.
+def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> ConfigSnapshot:
+    """Read the config directory a load runs, after its trust check: the one read of it.
 
-    Config modules are **executed** in-process with the engine's full privilege, so the source
-    location is part of the trust boundary: :func:`_assert_safe_config_source` refuses a
-    group/world-writable directory before any code runs. Blocking: an async caller (engine reload)
-    should run this via ``asyncio.to_thread`` so heavy user-config imports don't stall listeners.
-
-    ``allow_empty`` is passed straight to :meth:`Registry.validate` and suppresses the empty-graph
-    refusal only. It exists for ``messagefoundry check --allow-empty-config`` (BACKLOG #1648) and
-    is deliberately NOT reachable from ``serve``: a running engine must never start on a graph that
-    would receive and send nothing."""
+    Refuses a missing directory (:class:`~messagefoundry.config.fingerprint.ConfigDirMissing`), a
+    source :func:`_assert_safe_config_source` refuses, and a file the load needs but cannot read
+    (``WiringError``). A file only the fingerprint covers (``environments/*.toml``) that cannot be
+    read is left out and named in :attr:`ConfigSnapshot.unreadable`, as the observational
+    fingerprint names it. With ``strict``, any file or folder it cannot read raises its
+    ``OSError`` instead, so the snapshot's digest covers every file the fingerprint names: the
+    digest a dual-control release checks. Blocking."""
     directory = Path(directory)
     # Fail loudly on a missing/typo'd dir: Path.glob() on a nonexistent dir yields nothing, so the
     # engine would otherwise start with an empty graph — a silently dead interface (review M-24).
@@ -8023,56 +8039,97 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
 
         raise ConfigDirMissing(f"config directory not found: {directory}")
     _assert_safe_config_source(directory)
+    snapshot = read_config_snapshot(directory, strict=strict)
+    _require_loadable(snapshot)
+    return snapshot
+
+
+def _require_loadable(snapshot: ConfigSnapshot) -> None:
+    """Refuse a snapshot missing a file a load would read: it cannot run bytes it does not have."""
+    missing = snapshot.unreadable_loaded
+    if missing:
+        raise WiringError(
+            f"refusing to load config from {snapshot.directory}: could not read "
+            f"{', '.join(missing)}; see the engine log and docs/SERVICE.md for required permissions"
+        )
+
+
+def load_config(
+    directory: str | Path, *, allow_empty: bool = False, snapshot: ConfigSnapshot | None = None
+) -> Registry:
+    """Load every ``*.py`` config module in ``directory`` (sorted; ``_*`` skipped) into a Registry.
+
+    Config modules are **executed** in-process with the engine's full privilege, so the source
+    location is part of the trust boundary: :func:`_assert_safe_config_source` refuses a
+    group/world-writable directory before any code runs. Blocking: an async caller (engine reload)
+    should run this via ``asyncio.to_thread`` so heavy user-config imports don't stall listeners.
+
+    **One read, then the bytes it read** (vault BACKLOG #2596). The directory is read once, into a
+    :class:`~messagefoundry.config.snapshot.ConfigSnapshot` (:func:`read_trusted_snapshot`), and
+    everything the load runs or parses comes from it: each module and helper is compiled from its
+    bytes by the loader itself, so a ``__pycache__`` file is never consulted, and the code sets and
+    ``connections.toml`` are parsed from it. The graph carries the snapshot
+    (:attr:`Registry.config_snapshot`), so its fingerprint and a sandbox worker use the same bytes.
+    ``snapshot`` is one the caller already read with :func:`read_trusted_snapshot`, such as the one a
+    dual-control release checked against its approval; the directory is then not read again.
+
+    ``allow_empty`` is passed straight to :meth:`Registry.validate` and suppresses the empty-graph
+    refusal only. It exists for ``messagefoundry check --allow-empty-config`` (BACKLOG #1648) and
+    is deliberately NOT reachable from ``serve``: a running engine must never start on a graph that
+    would receive and send nothing."""
+    directory = Path(directory)
+    if snapshot is None:
+        snapshot = read_trusted_snapshot(directory)
     # Resolved, so a worker that spawns later loads this target even if a link in the path moves.
-    # The digest is read just before the modules run (vault BACKLOG #2724).
-    registry = Registry(source_dir=directory.resolve(), code_digest=config_code_digest(directory))
+    return load_snapshot(snapshot, allow_empty=allow_empty, source_dir=directory.resolve())
+
+
+def load_snapshot(
+    snapshot: ConfigSnapshot, *, allow_empty: bool = False, source_dir: Path | None = None
+) -> Registry:
+    """Load the graph ``snapshot`` holds, reading nothing from disk.
+
+    :func:`load_config` once the directory is read and checked. A ``[sandbox].mode=subprocess``
+    worker calls it with the snapshot its engine sent, so a worker, a respawned one included, runs
+    the bytes the engine loaded and never reads the directory (vault BACKLOG #2596). The trust
+    check belongs to whoever read the snapshot; this function runs what it is given.
+    ``source_dir`` is recorded as :attr:`Registry.source_dir`, the snapshot's directory when
+    omitted."""
+    _require_loadable(snapshot)
+    directory = snapshot.directory
+    registry = Registry(
+        source_dir=source_dir if source_dir is not None else directory,
+        code_digest=config_code_digest(snapshot),
+        config_snapshot=snapshot,
+    )
     # Load the bundle's reference tables (codesets/ relative to the config dir) BEFORE importing the
     # config modules, so a module-top-level code_set(...) capture resolves. A bad/duplicate table is a
     # WiringError here (fail loud), like a bad env value; a missing codesets/ dir is fine (no tables).
     try:
-        registry.code_sets = load_code_sets(directory / CODESETS_DIR_NAME)
+        registry.code_sets = code_sets_from_files(
+            snapshot.code_set_files, directory / CODESETS_DIR_NAME
+        )
     except CodeSetError as exc:
         raise WiringError(str(exc)) from exc
-    with _loading(directory, registry) as helpers:
-        for path in config_py_files(directory):
-            if not path.name.startswith("_"):
-                _exec_module(path, helpers)
-        if registry.code_digest is not None:
-            # Inside the block, so a refusal discards this load's modules like any failed load.
-            _require_unchanged_code(directory, registry.code_digest)
+    with _loading(snapshot, registry) as helpers:
+        for name in snapshot.modules:
+            if not name.startswith("_"):
+                _exec_module(directory / name, helpers)
     # Connections may also be authored as data (ADR 0007): merge connections.toml into the SAME
     # registry the code-first inbound()/outbound() calls populated, before validating the whole graph.
     # Imported lazily to avoid a wiring<->connections_file import cycle. A name in both surfaces is a
     # duplicate WiringError via add_inbound/add_outbound (no silent precedence).
     from messagefoundry.config.connections_file import (
         connections_file_path,
-        load_connections_file,
+        load_connections_data,
     )
 
-    # The live file, or the candidate a `connections_edit` write is validating before it replaces the
-    # live one (vault BACKLOG #2782).
-    conn_file = connections_file_path(directory)
-    if conn_file.is_file():
-        load_connections_file(conn_file, registry)
+    if snapshot.connections is not None:
+        # Named as the live file, or the candidate a `connections_edit` write is validating before
+        # it replaces the live one (vault BACKLOG #2782); the bytes are the snapshot's.
+        load_connections_data(snapshot.connections, connections_file_path(directory), registry)
     registry.validate(allow_empty=allow_empty)
     return registry
-
-
-def _require_unchanged_code(directory: Path, before: str) -> None:
-    """Refuse a load whose config modules changed on disk while it ran (vault BACKLOG #2724).
-
-    The digest was read before the modules ran. A module rewritten in between ran bytes the digest
-    does not describe, and a sandbox worker would then pass the comparison with edited code."""
-    after = config_code_digest(directory)
-    if after is None:
-        raise WiringError(
-            f"config modules in {directory} could not be read again after the load, so what ran "
-            "cannot be shown to match what was read; load again"
-        )
-    if after != before:  # both are public digests of public bytes; nothing to time
-        raise WiringError(
-            f"config modules in {directory} changed on disk while they were loading; load again"
-        )
 
 
 # Group-write (0o020) | world-write (0o002): a writable bit for anyone but the owner.
@@ -9133,22 +9190,25 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
     # Register the module in sys.modules under its path-derived name so intra-config imports and
     # anything relying on sys.modules[__name__] resolve correctly; remove it again on failure.
     mod_name = _config_module_name(path)
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise WiringError(f"cannot load config module: {path}")
-    module = helpers.new_module(spec)
+    module = helpers.new_module(mod_name, path)
     helpers.register(mod_name, module)
     withheld: WiringError | None = None
     cause: ImportError | None = None
     try:
-        spec.loader.exec_module(module)
+        helpers.run(module, path)
         # The helpers its function bodies import, loaded now that it has run (vault BACKLOG #2783).
         helpers.preload(path)
     except Exception as exc:
         helpers.unregister(mod_name, module)
         # An import or name error is judged by its identifier, not its frame: a failed import ends
-        # in this package's own helper finder whoever wrote the import.
-        if _raised_by_the_engine(exc) and not isinstance(exc, _NAMED_EXCEPTIONS):
+        # in this package's own helper finder whoever wrote the import. A SyntaxError is the
+        # author's source failing to compile; the loader compiles it, so its innermost frame is
+        # this package's, and it is judged as the author's failure it is.
+        if (
+            _raised_by_the_engine(exc)
+            and not isinstance(exc, _NAMED_EXCEPTIONS)
+            and not isinstance(exc, SyntaxError)
+        ):
             # The engine's own wording -- a factory or registry refusal naming a connection or a
             # setting -- which is the diagnostic an author needs, so it keeps its text, as before.
             # That relies on engine raise sites not quoting a value. At least a few wrap another
@@ -9197,23 +9257,32 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
         _assert_safe_config_source(directory)
     except WiringError as exc:
         return [Diagnostic(message=str(exc), file=str(directory))]
+    # One read, as load_config's, so the modules, tables and connections it reports on are one
+    # set of bytes (vault BACKLOG #2596). A file it needs but cannot read is a diagnostic.
+    snapshot = read_config_snapshot(directory, strict=False)
     registry = Registry()
-    diagnostics: list[Diagnostic] = []
+    diagnostics: list[Diagnostic] = [
+        Diagnostic(message=f"could not read {rel}", file=str(directory / rel))
+        for rel in snapshot.unreadable_loaded
+    ]
     # Tracked separately from `diagnostics` on purpose — see the empty-graph note at the end of this
     # function. Only a source that could have DECLARED a connection counts: a module or
     # connections.toml. A bad code-set table is a diagnostic that explains nothing about emptiness.
-    declaring_source_failed = False
+    declaring_source_failed = any(
+        not rel.startswith(CODESETS_DIR_NAME) for rel in snapshot.unreadable_loaded
+    )
     # Load reference tables first (so a module-top-level code_set(...) resolves during import). A
     # bad/duplicate table is recorded as a diagnostic, not raised, so the editor sees every problem.
     codesets_dir = directory / CODESETS_DIR_NAME
     try:
-        registry.code_sets = load_code_sets(codesets_dir)
+        registry.code_sets = code_sets_from_files(snapshot.code_set_files, codesets_dir)
     except CodeSetError as exc:
         diagnostics.append(Diagnostic(message=str(exc), file=str(codesets_dir)))
-    with _loading(directory, registry) as helpers:
-        for path in config_py_files(directory):
-            if path.name.startswith("_"):
+    with _loading(snapshot, registry) as helpers:
+        for name in snapshot.modules:
+            if name.startswith("_"):
                 continue
+            path = snapshot.directory / name
             try:
                 _exec_module(path, helpers)
             except WiringError as exc:
@@ -9229,15 +9298,15 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     from messagefoundry.config.connections_file import (
         CONNECTIONS_FILE_NAME,
         connections_file_path,
-        load_connections_file,
+        load_connections_data,
     )
 
     # The candidate a `connections_edit` write is validating, when this runs inside one (vault
     # BACKLOG #2782), as `load_config` does.
     conn_file = connections_file_path(directory)
-    if conn_file.is_file():
+    if snapshot.connections is not None:
         try:
-            load_connections_file(conn_file, registry)
+            load_connections_data(snapshot.connections, conn_file, registry)
         except WiringError as exc:
             # Scrubbed like the arm below, and for the SAME reason: a WiringError out of the TOML
             # loader is a project-authored TEMPLATE wrapped around somebody else's exception text.
