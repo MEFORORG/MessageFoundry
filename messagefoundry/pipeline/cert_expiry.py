@@ -227,9 +227,11 @@ def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
     ``kind="cert"`` :class:`MonitoredCert`. Today that is the SQL Server ``[store].ssl_root_cert``
     pin, labelled ``"store.ssl_root_cert"`` in the dotted style of :func:`crls_from_settings`.
 
-    Vault BACKLOG #2223: the store sends that pin with ``Encrypt=strict``, where a pin match stands in
-    for the driver's own expiry check. The store refuses an expired pin at connect, so watching it here
-    is what warns before that refusal. A PostgreSQL ``ssl_root_cert`` is a CA bundle the driver
+    Vault BACKLOG #2223: the store sends that pin with ``Encrypt=strict``, where Microsoft documents
+    that the driver does not check a pin match's expiry; the ``ssl_root_cert`` row of
+    ``docs/CONFIGURATION.md`` says more. The store refuses an expired pin only at store open, and a
+    store opened before the pin expired keeps connecting after it, so watching it here is what warns
+    ahead of that. A PostgreSQL ``ssl_root_cert`` is a CA bundle the driver
     validates itself, so it is not listed."""
     store, pin = settings.store, settings.store.ssl_root_cert
     # Only where the store sends it: an escaped weakened posture sends no pin.

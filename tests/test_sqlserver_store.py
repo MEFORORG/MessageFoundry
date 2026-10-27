@@ -1952,8 +1952,10 @@ async def test_purge_search_presets_ss(store) -> None:
 async def test_search_preset_retention_keys_on_last_used_ss(store) -> None:
     """#306 parity on SQL Server: a RECALLED-but-unedited preset survives; NULL `last_used_at` still ages.
 
-    T-SQL has no portable GREATEST (2022+ only, floor is 2016 SP1), so the greatest-of-two is spelled
-    as `updated_at < cutoff AND (last_used_at IS NULL OR last_used_at < cutoff)`. This pins BOTH arms:
+    T-SQL has GREATEST only from 2022, so the greatest-of-two is spelled as
+    `updated_at < cutoff AND (last_used_at IS NULL OR last_used_at < cutoff)`. The pair keeps the
+    query valid on pre-2022 T-SQL, as the store's 2016 SP1 guards (`sqlserver._claim_proc_ddl`,
+    ADR 0114) also do; docs/SYSTEM-REQUIREMENTS.md states what is supported. This pins BOTH arms:
     the recall arm and the NULL (pre-column migration) arm. Cleans up after itself (see above).
     """
     try:
