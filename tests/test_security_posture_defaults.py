@@ -52,7 +52,6 @@ from messagefoundry.config.settings import (
     security_loosenings,
     uvicorn_trusted_hosts,
 )
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline import Engine
 
 
@@ -1941,9 +1940,6 @@ def test_the_authenticator_refuses_a_plain_bind_at_every_dial() -> None:
     for enforcing in (True, False):
         with pytest.raises(LdapError, match="refused, with no escape"):
             LdapAuthenticator(auth, enforcing=enforcing)
-    # No posture releases it: a known non-enforcing posture refuses too.
-    with pytest.raises(LdapError, match="refused, with no escape"):
-        LdapAuthenticator(auth, enforcing=False, posture=HopPosture(enforcing=False))
     # A bare host that starts with "ldaps" is still a plain bind.
     with pytest.raises(LdapError, match="refused, with no escape"):
         LdapAuthenticator(

@@ -4255,9 +4255,8 @@ def _serve(args: argparse.Namespace) -> int:
     # Gated on a CONFIGURED transport: with no email_smtp_host/email_from there is no hop to protect,
     # and the #188 gate above already owns the "no channel at all" case.
     #
-    # A LOGIN NEVER REACHES THIS GATE (vault BACKLOG #3533 item 3). AlertsSettings refuses
-    # email_username beside either shape at load, at every posture, so the acknowledgment below
-    # covers alert bodies and notice email on a hop with no login, and never the SMTP AUTH password.
+    # A login never reaches this gate: it cannot load beside either shape
+    # (AlertsSettings._refuse_a_login_over_an_unauthenticated_hop, vault BACKLOG #3533).
     if settings.alerts.email_smtp_host and settings.alerts.email_from:
         if not settings.alerts.email_use_tls:
             hop_desc = "[alerts].email_use_tls=false (the SMTP hop is CLEARTEXT)"

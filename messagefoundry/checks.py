@@ -2451,9 +2451,7 @@ def _check_alert_smtp_tls(
             detail="no [alerts] SMTP transport configured — no hop to report",
         )
     acked = settings.security.allow_unverified_alert_smtp_tls
-    # A login never reaches here on such a hop: AlertsSettings refuses email_username beside it at
-    # load (vault BACKLOG #3533 item 3), so the load above already failed, and the acknowledgment
-    # this names covers a hop with no login.
+    # A login cannot load beside such a hop (AlertsSettings._refuse_a_login_over_an_unauthenticated_hop).
     ack_note = (
         " — acknowledged by [security].allow_unverified_alert_smtp_tls (no login)"
         if acked

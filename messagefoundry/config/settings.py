@@ -5478,8 +5478,7 @@ class AlertsSettings(_Section):
     # hop was encrypted but unauthenticated. FALSE is an audited loosening: it is named by
     # security_loosenings() and REFUSED at the serve gate on an enforcing PHI instance unless
     # [security].allow_unverified_alert_smtp_tls is also set. Only meaningful when email_use_tls=true.
-    # Beside email_username it is refused at load, at every posture, and that switch does not cover
-    # it (vault BACKLOG #3533 item 3; _refuse_a_login_over_an_unauthenticated_hop).
+    # Beside email_username: _refuse_a_login_over_an_unauthenticated_hop (vault BACKLOG #3533).
     email_tls_verify: bool = True
     # PEM bundle of trust anchors for that hop. None (the default) = the [tls] internal-CA policy if one
     # is configured, else the OS trust store. A path, not a secret — same status as [tls].internal_ca_file.
@@ -6919,9 +6918,8 @@ class SecuritySettings(_Section):
     # posture fails closed instead; this switch is unchanged by that.) So the refusal is keyed on this explicit
     # switch at the serve gate instead, in the shape of allow_unencrypted_phi_under_strict_enforcement.
     # Default FALSE and byte-identical when unset. Setting it TRUE is a LOOSENING: security_loosenings()
-    # names it, so the opt-out is never silent. It covers a hop with NO login only: beside
-    # [alerts].email_username the unauthenticated hop is refused at load, with no escape (vault BACKLOG
-    # #3533 item 3; AlertsSettings._refuse_a_login_over_an_unauthenticated_hop).
+    # names it, so the opt-out is never silent. It covers a hop with no login only
+    # (AlertsSettings._refuse_a_login_over_an_unauthenticated_hop, vault BACKLOG #3533).
     allow_unverified_alert_smtp_tls: bool = False
 
     # ── Store principal privileges (ASVS 13.2.2, ADR 0199) ───────────
@@ -9633,8 +9631,8 @@ def security_loosenings(
     # on the switch alone would leave the actual weakening invisible — which is the failure mode this
     # registry exists to prevent. Reported at every call site (unlike cleartext_accepted, this is
     # settings-scoped, so `security show` and a graphless GET /security/posture see it completely).
-    # Neither names a login: beside [alerts].email_username both shapes are refused at load (vault
-    # BACKLOG #3533 item 3), so a loaded config reaches these only with no login.
+    # Neither names a login, which cannot load beside either shape
+    # (AlertsSettings._refuse_a_login_over_an_unauthenticated_hop).
     if alerts.email_smtp_host and alerts.email_from:
         if not alerts.email_use_tls:
             out.append(

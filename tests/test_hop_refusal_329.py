@@ -97,17 +97,15 @@ def _ldaps_verifyoff() -> AuthSettings:
     )
 
 
-@pytest.mark.parametrize(
-    "posture", [PROD_PHI, STAGING_PHI, None], ids=["enforcing", "warn", "no-posture"]
-)
+@pytest.mark.parametrize("enforcing", [True, False], ids=["enforcing", "warn"])
 def test_ldaps_verifyoff_is_refused_in_every_posture_even_with_escape(
-    posture: HopPosture | None, monkeypatch: pytest.MonkeyPatch
+    enforcing: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Vault BACKLOG #3230: every LDAPS bind carries the service-account password, so ad_tls_verify=false
     # is refused outright. Until then the escape released it at warn (#329); now no posture does.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     with pytest.raises(LdapError, match="ad_tls_verify=false") as info:
-        LdapAuthenticator(_ldaps_verifyoff(), posture=posture)
+        LdapAuthenticator(_ldaps_verifyoff(), enforcing=enforcing)
     message = str(info.value)
     assert "with no escape" in message
     assert "ad_tls_ca_cert_file" in message  # names the lever that does cross: a pinned CA
@@ -124,7 +122,7 @@ def test_ldaps_verifyoff_refuses_before_the_bind_secret_is_fetched() -> None:
 
     s = _ldaps_verifyoff().model_copy(update={"ad_bind_password_secret": "kv/ad#pw"})
     with pytest.raises(LdapError, match="ad_tls_verify=false"):
-        LdapAuthenticator(s, secret_provider=_NeverCalled(), posture=STAGING_PHI)  # type: ignore[arg-type]
+        LdapAuthenticator(s, secret_provider=_NeverCalled(), enforcing=False)  # type: ignore[arg-type]
 
 
 def test_ldaps_verifying_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -140,7 +138,7 @@ def test_ldaps_verifying_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch)
         ad_bind_password="synthetic-bind-secret",
         ad_tls_verify=True,
     )
-    LdapAuthenticator(s, posture=PROD_PHI)  # no raise: verifying LDAPS is unaffected by the change
+    LdapAuthenticator(s)  # no raise: verifying LDAPS is unaffected by the change
 
 
 # --- Cell (3): webhook alert sink cleartext http (OUT-OF-GATE, explicit posture) ----------------

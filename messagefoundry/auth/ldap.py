@@ -45,7 +45,6 @@ from messagefoundry.config.settings import (
     is_ldaps_address,
     split_kerberos_spn,
 )
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.redaction import safe_name
 
 if TYPE_CHECKING:
@@ -1509,24 +1508,17 @@ class LdapAuthenticator:
         settings: AuthSettings,
         *,
         secret_provider: SecretProvider | None = None,
-        posture: HopPosture | None = None,
         enforcing: bool = True,
     ) -> None:
         if not settings.ad_server or not settings.ad_user_search_base:
             raise LdapError("AD is enabled but ad_server / ad_user_search_base are not configured")
-        # One definition of "is this bind LDAPS", read by the plain-bind refusal and the verify-off
-        # refusal below, the suite assertion, and _server(). It is the settings module's own test, so
-        # this and AuthSettings agree: a bare host that merely starts with "ldaps" is plain (#2354).
-        self._ldaps = is_ldaps_address(str(settings.ad_server))
         # A plain bind sends both passwords in cleartext, so it is refused, with no escape and in every
-        # posture, as verify-off LDAPS is below (vault BACKLOG #3533 item 1). Until then the removed
-        # ad_allow_insecure_ldap opt-in released it at [security].enforcement = warn (#2354).
-        # AuthSettings refuses it at load while ad_enabled; this repeats the refusal for a caller that
-        # hands over an AuthSettings built some other way. It runs before the bind secret is
-        # resolved, so a refused build never fetches the password. `posture` no longer decides
-        # anything here; it stays a keyword because its callers still pass it.
-        del posture
-        if not self._ldaps:
+        # posture, as verify-off LDAPS is below (vault BACKLOG #3533 item 1). AuthSettings refuses it
+        # at load while ad_enabled; this repeats the refusal for a caller that hands over an
+        # AuthSettings built some other way. The scheme test is the settings module's own, so the two
+        # agree: a bare host that merely starts with "ldaps" is plain (#2354). It runs before the bind
+        # secret is resolved, so a refused build never fetches the password.
+        if not is_ldaps_address(str(settings.ad_server)):
             raise LdapError(
                 "ad_server is not an ldaps:// address; a plain ldap:// bind would send the AD "
                 "service-account and user passwords in cleartext, so it is refused, with no escape. "
@@ -1539,7 +1531,7 @@ class LdapAuthenticator:
         # docs/SECURITY-LOOSENING.md). Until then MEFOR_ALLOW_INSECURE_TLS released it at
         # [security].enforcement = warn (#329). Like the plain-bind refusal above, it runs before the
         # bind secret is resolved, so a refused build never fetches the password.
-        if self._ldaps and not settings.ad_tls_verify:
+        if not settings.ad_tls_verify:
             raise LdapError(
                 "ad_tls_verify=false would send the AD service-account and user passwords to an "
                 "LDAPS peer whose certificate is not verified; refused, with no escape. Leave "
@@ -1565,12 +1557,11 @@ class LdapAuthenticator:
         # file swapped after this check is never trusted. ldap3 used to get the path, and read the
         # file again on every bind. `enforcing` is the [security].enforcement dial, as for the OIDC
         # anchor: a pin mismatch always refuses, and an anchor others can replace refuses at enforce.
-        # Only an LDAPS bind loads a CA; a plain ldap:// bind builds no Tls at all. So rotating the AD
-        # CA now takes a restart, as the OIDC anchor already did: a reload re-checks and audits the
+        # Rotating the AD CA takes a restart, as the OIDC anchor already did: a reload re-checks and audits the
         # file, but no reload rebuilds this authenticator.
         self._ca_certs_data: str | None = None
         spec = ad_anchor_spec(settings)
-        if self._ldaps and spec is not None:
+        if spec is not None:
             self._ca_certs_data = verified_anchor_cadata(spec, enforcing=enforcing)
         # BACKLOG #1317, #2494. The engine builds this hop's TLS context (ASVS 12.1.2): narrowed to the
         # approved suites at TLS 1.2 and, where the interpreter allows it, TLS 1.3, then asserted.
@@ -1581,15 +1572,13 @@ class LdapAuthenticator:
         # The CA goes in as the bytes checked above, never a path (BACKLOG #2034); None loads the OS
         # trust store, as ldap3 did. The accepted risk of owner ruling 2026-09-27 stands: an older
         # domain controller that offers none of the approved suites fails to bind.
-        self._tls: NarrowedTls | None = None
-        if self._ldaps:
-            from messagefoundry.auth.ldap_tls import NarrowedTls  # lazy: it imports ldap3
+        from messagefoundry.auth.ldap_tls import NarrowedTls  # lazy: it imports ldap3
 
-            self._tls = NarrowedTls(
-                validate=ssl.CERT_REQUIRED,  # ad_tls_verify=false is refused above
-                ca_certs_data=self._ca_certs_data,
-                connector=_LDAPS_CONNECTOR,
-            )
+        self._tls: NarrowedTls = NarrowedTls(
+            validate=ssl.CERT_REQUIRED,  # ad_tls_verify=false is refused above
+            ca_certs_data=self._ca_certs_data,
+            connector=_LDAPS_CONNECTOR,
+        )
 
     def _server(self) -> Any:
         import ldap3

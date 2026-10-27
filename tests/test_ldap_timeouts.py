@@ -84,8 +84,9 @@ def _over_plain_loopback(settings: AuthSettings) -> LdapAuthenticator:
     assert server.startswith("ldaps://127.0.0.1:"), server
     authenticator = LdapAuthenticator(settings)
     plain = settings.model_copy(update={"ad_server": "ldap://" + server.removeprefix("ldaps://")})
+    # Two private attributes: _server() reads the address from `_s` and the Tls from `_tls`.
     authenticator._s = plain
-    authenticator._tls = None
+    authenticator._tls = None  # type: ignore[assignment]
     return authenticator
 
 
