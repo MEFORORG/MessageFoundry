@@ -1948,13 +1948,12 @@ issuer. The engine applies a replaced file only when all three of these hold:
    engine refuses one. A `-----BEGIN X509 CRL-----` marker inside a comment line refuses the file
    too, on purpose: the engine cannot tell that text from a CRL the file is meant to hold. Take
    the marker text out of the comment. The file carries no certificate the hop does not already
-   trust. On a hop that already holds a CRL, a start also makes a private copy of the file in the
-   engine's temporary directory. If it cannot make or read that copy, it refuses and names the
-   setting and the file. That refusal is about the temporary directory, not the CRL.
+   trust.
 2. Each CRL's signature verifies against a CA certificate in the hop's own trust store. OpenSSL checks
    that signature only during a handshake, so without this rule a badly signed CRL would be applied
-   and then fail every handshake it judges. The reload cannot see an intermediate CA that the peer sends in its handshake,
-   and may not see a CA in a CA directory or the system store. A restart applies such a file. Where
+   and then fail every handshake it judges. The reload cannot see an intermediate CA that the peer
+   sends in its handshake, and may not see a CA in a CA directory or the system store. A restart
+   applies such a file. Where
    the hop has its own CA file, adding the issuing intermediate to it lets later reloads verify the
    CRL without a restart. The engine checks again every pass, because a CA directory adds a CA only
    when a handshake first needs it.
@@ -1963,12 +1962,21 @@ issuer. The engine applies a replaced file only when all three of these hold:
    same scope, signing key and critical extensions.
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
-what to do. It also raises the `crl_reload_refused` alert described further down. A file failing rule 1 would also stop the engine starting, so fix the file. A file whose
-CRL fails its signature check under rule 2 is held back too. On the signature, a start refuses it
-only where the engine proves the signature bad, so fix that file. Short of that proof the signature
-does not stop a start: unless another rule refuses the file, a start loads it with a warning, and
-each handshake then decides. The next paragraphs say what counts as proof, and name cases that
-load.
+what to do. It also raises the `crl_reload_refused` alert described further down. A file failing
+rule 1 would also stop the engine starting, so fix the file. A file whose CRL fails its signature
+check under rule 2 is held back too. On the signature, a start refuses it only where the engine
+proves the signature bad, so fix that file. Short of that proof the signature does not stop a
+start: unless another rule refuses the file, a start loads it with a warning, and each handshake
+then decides. The next paragraphs say what counts as proof, and name cases that load.
+
+**The private copy is about the temporary directory, not the CRL.** The reload loads a private copy
+of the file, made in the engine's temporary directory. When it cannot make that copy, it refuses with
+`retry` and tries again every pass, so do not fix the file. A start makes the same copy on a hop
+that already holds a CRL, such as one whose CA file carries a CRL. If it cannot make or read the
+copy, it refuses, and names the setting and the file. So before you restart on a `retry` whose ERROR
+line says the reload could not stage the file, check that the engine's account can write to its
+temporary directory, and that there is room there.
+
 A file failing only rule 3 needs a restart to apply. Examples are a rollback to an older CRL,
 a file that drops an issuer, and a CRL signed under a new key. When the hops holding one file need
 different things, the ERROR names the strongest: fix the file, then restart, then wait. When it names
@@ -1978,8 +1986,9 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
 the file in one case only, where it has proof. Three things all hold then. A listed CA has the
 CRL's issuer name, compared as OpenSSL compares it for the case of ASCII letters and exactly
-otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its key identifier. The engine
-ran the signature check with that key, and the check failed. Where several listed CAs share that
+otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its
+key identifier. The engine ran the signature check with that key, and the check failed. Where
+several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
 authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
 `CRL signature failure`, an error that does not name the file. The refusal names the setting, the
@@ -1987,9 +1996,12 @@ file and the CRL. Give the setting the CRL that CA signed. No setting turns this
 an expired CRL.
 
 The check reads only the file a CRL setting names. A CRL can also reach a hop through its CA file
-alone, on at least the hops that the paragraph on a CRL inside a CA file, further down, names. It
-is in use there, and the engine does not check its signature, at a start or at a reload. OpenSSL
-still checks it at each handshake it judges.
+alone, on at least the hops that the paragraph on a CRL inside a CA file, further down, names. The
+PostgreSQL store is another: it loads `[store].ssl_root_cert` whole, CRL blocks included, and once
+`[store].ssl_crl_file` turns revocation checking on, those CRLs are checked too. Such a CRL is in
+use, and neither a start nor a reload checks its signature. The expiry scan may judge one, but only
+for its alert, and it refuses nothing; the paragraph on a CRL inside a CA file says what it
+checks. OpenSSL still checks the signature at each handshake it judges.
 
 Each CRL in the file is judged on its own, as for an expired CRL. So a badly signed copy refuses
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
@@ -2016,7 +2028,9 @@ three cases warn:
   Two measured examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature
   over SHA-1 that the CA did make.
 
-If the check itself fails, the engine logs an ERROR that says so, and loads the file.
+If the check itself fails, the engine logs an ERROR that says so, and loads the file. A CRL it
+proved badly signed before the failure still refuses the file, and the CRLs after the failure are
+not judged (vault BACKLOG #3506).
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
 engine process logs the WARNING once while the file keeps the same bytes. It keeps that record for
@@ -2077,7 +2091,7 @@ transport it is a WARNING in the log, beside the reload's ERROR.
 | `remedy_class` | a short token for what to do next; see the next table |
 | `stale_contexts` | how many running TLS contexts still held the old copy at the last reload pass that reported the refusal. A reminder carries that latest count, so it can differ from the count the alert was first raised with |
 | `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
-| `start_refuses` | `true`, and present only then. The remedy names a restart, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then |
+| `start_refuses` | `true`, and present only then. The remedy could lead you to restart, by naming a restart or by saying a start can load the file, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then |
 
 This event carries no CRL contents. The reason for the refusal quotes CRL issuer names and dates, so
 it is left out of this event. It is in the engine log, in the `crl_reload` ERROR line. Read that
@@ -2124,7 +2138,14 @@ follows a fix. A resolve made by hand in the alert list does not end it.
 
 **Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
 the event carries no `start_refuses`. With any other class a start can refuse the file too, and
-then the engine does not come up.
+then the engine does not come up. Two of those cases need more:
+
+- A `retry` whose ERROR line says the reload could not stage the file. A start can need the same
+  private copy and refuse too, so fix the temporary directory first (*The private copy is about
+  the temporary directory*, above).
+- `not_provable` is not in that list, although its remedy names a restart. A restart applies the
+  file only where the hop already trusts the certificate the file carries. Otherwise a start
+  refuses it, so give the setting a bare CRL.
 
 **The alert resolves itself.** Its inverse, `crl_reload_applied`, pages nobody and cannot be a
 rule's `event_type`. The engine raises it once the refusal no longer stands on that process:
