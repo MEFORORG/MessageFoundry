@@ -151,9 +151,12 @@ _PROBE_EVENT: Final = "messagefoundry.remotedebug.probe"
 
 #: The injecting process chooses the script's name, so the logged copy is bounded: the hook keeps
 #: this many characters of it. :func:`_ascii` then spells each one in up to ten characters, and
-#: the spelling is logged whole, so it can be read back. A line can then reach about 1,400
-#: characters. A collector that cuts at the 1,024 bytes RFC 3164 allows drops the end of the name,
-#: never the refusal or the event name, which come first (vault BACKLOG #3673, finding 1).
+#: the spelling is logged whole, so it can be read back. A text line can then reach about 1,400
+#: characters, and the forwarder's JSON line about 1,600 bytes. A collector that cuts at the
+#: 1,024 bytes RFC 3164 allows cuts into the name. On a text line the refusal and the event name
+#: come first and survive; a JSON line is left unterminated, and a parser may drop all of it.
+#: Kept as a known limit, since a cut after escaping would let the injecting process choose how
+#: little of the name survives (vault BACKLOG #3673, finding 1).
 _FILE_NAME_LIMIT: Final = 120
 
 #: Refusals waiting for the reporter thread. Past this the refusal is still counted and still
@@ -274,10 +277,13 @@ def _after_fork_in_child() -> None:
     only the thread that called it. Without this a refusal in the child is counted and never
     logged, because the inherited flag stops every later call from starting a reporter. The lock
     is new because a thread that no longer exists may have held it at the fork. The queue is new
-    because the parent's reporter logs what was queued before the fork."""
-    global _install_lock, _reports, _reporter_started
+    because the parent's reporter logs what was queued before the fork. The count starts again
+    because it is this process's, and the child's refusal watch would otherwise report the
+    parent's refusals as its own."""
+    global _install_lock, _refused, _reports, _reporter_started
     _install_lock = threading.Lock()
     _reports = queue.SimpleQueue()
+    _refused = 0
     if _reporter_started:
         _reporter_started = False
         with _install_lock:
@@ -361,8 +367,8 @@ def install_remote_debug_guard() -> None:
     per call made while the probe stays cut off, and nothing else bounds them. ``serve`` and
     ``supervise`` make at least two calls, at import and then first in ``_serve`` or
     ``_supervise``; other subcommands make the import's call. Each
-    :func:`messagefoundry.api.create_app` call makes one more, so ``serve`` makes three. Under
-    ``python -m``, a later import of the command-line module runs the import-time call again, as
+    :func:`messagefoundry.api.create_app` call makes one more, so ``serve`` makes at least
+    three. Under ``python -m``, a later import of the command-line module runs the import-time call again, as
     ``api/tls.py`` does when it writes a key. A stacked copy changes no count: the first copy
     raises on ``cpython.remote_debugger_script``, and the interpreter stops at the first hook
     that raises, so a later copy never sees the event. Each copy does run on every other audited

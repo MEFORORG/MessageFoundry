@@ -4408,8 +4408,8 @@ def create_app(
         store_privilege = getattr(request.app.state, "store_privilege", None)
         # Vault BACKLOG #2700 / #2701: read off THIS process, which is the engine. Each is read
         # once here, so the loosening list and the `interpreter` block below report one reading.
-        # An app built without `serve` never installed the remote-debugging hook, and the reading
-        # then says so. The start-up reading is the one `serve` took as it started, kept for the
+        # create_app installed the remote-debugging hook (vault BACKLOG #3673), so a reading that
+        # says it is missing points at another audit hook in the process. The start-up reading is the one `serve` took as it started, kept for the
         # life of the process. An app built without `serve` takes it here, once, and that first
         # reading reads files, so the call is kept off the event loop.
         remote_debug = remote_debug_posture()

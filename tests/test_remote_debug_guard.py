@@ -841,12 +841,14 @@ def test_a_forked_child_starts_its_own_reporter(monkeypatch: pytest.MonkeyPatch)
     # Restored afterwards: the handler rebinds both, and this process's reporter reads the queue.
     monkeypatch.setattr(remotedebug, "_install_lock", remotedebug._install_lock)
     monkeypatch.setattr(remotedebug, "_reports", remotedebug._reports)
+    monkeypatch.setattr(remotedebug, "_refused", 5)  # the parent's count, inherited
     inherited_lock, inherited_queue = remotedebug._install_lock, remotedebug._reports
     monkeypatch.setattr(remotedebug, "_reporter_started", True)  # as the parent left it
     remotedebug._after_fork_in_child()
     assert installs.reporters == 1 and remotedebug._reporter_started is True
     assert remotedebug._install_lock is not inherited_lock
     assert remotedebug._reports is not inherited_queue
+    assert remotedebug._refused == 0
     # CONTROL: a parent that had no reporter, because it had no hook, gives the child none.
     monkeypatch.setattr(remotedebug, "_reporter_started", False)
     remotedebug._after_fork_in_child()
@@ -1305,16 +1307,18 @@ def test_building_the_api_installs_the_guard_without_the_command_line(tmp_path: 
     assert reading["before"] is False and reading["imported_only"] is False
     assert reading["after"] is True and reading["cli_loaded"] is False
     assert len(cast("list[object]", reading["loaded_at_install"])) == 1
+    # The whole install, not only the hook: a refusal is logged and kept off standard error.
+    assert reading["reporter"] is True and reading["quiet"] is True
 
 
 def test_the_guard_module_imports_neither_logging_nor_dataclasses() -> None:
     """Vault BACKLOG #3673, defect 4: each import ahead of the install widens the window in which
     an injected script runs, and these two were most of it. Read in a fresh interpreter. The
-    control is the same reading after ``logging`` is imported, which must see it."""
+    control is the same reading after ``logging`` is imported, through the same expression."""
     code = (
         "import sys, messagefoundry.remotedebug; "
-        "print(sorted({'logging', 'dataclasses', 'inspect'} & set(sys.modules))); "
-        "import logging; print('logging' in sys.modules)"
+        "seen = lambda: sorted({'logging', 'dataclasses', 'inspect'} & set(sys.modules)); "
+        "print(seen()); import logging; print('logging' in seen())"
     )
     proc = subprocess.run(
         [sys.executable, "-c", code], env=_child_env(), capture_output=True, text=True, timeout=50
