@@ -364,13 +364,13 @@ class InsecureHopGuard:
 
     Built once at connector construction via :meth:`capture`, which snapshots the active hop posture
     (:func:`~messagefoundry.config.tls_policy.current_hop_posture`). :meth:`enforce_construction` is the
-    ENFORCED gate — it fires inside ``build_check`` (``messagefoundry check`` / dry-run / reload / the
-    serve pre-flight), where the derived posture IS stamped, and refuses a production-PHI cleartext hop
-    there. :meth:`assert_send` is the zero-I/O send-time backstop at the byte crossing. Both **no-op when
-    the posture is unstamped** (``None`` — a live serve build after the pre-flight, or a direct
-    test/embedding): the enforced gate has already validated the config, so fail-closing here would
-    wrongly refuse a legitimate non-prod cleartext lane that ``build_check`` allowed (and would break
-    every live serve of such a lane, since the live-build sites are deliberately not re-gated)."""
+    ENFORCED gate. It fires wherever the derived posture is stamped, and refuses an enforcing cleartext
+    hop there: inside ``build_check`` (``messagefoundry check`` / dry-run / reload), and in the runner's
+    live builds when ``serve`` starts the graph, which stamp the same posture (there a refusal fails
+    that connection alone, ADR 0031). ``serve`` runs no ``build_check`` pre-flight of its own; the live
+    build is the check (vault BACKLOG #3514). :meth:`assert_send` is the zero-I/O send-time backstop at
+    the byte crossing. Both **no-op when the posture is unstamped** (``None``, such as a direct test
+    build or an embedding that stamps none): with no posture there is no dial to key the decision on."""
 
     host: str
     port: int
@@ -437,8 +437,7 @@ class InsecureHopGuard:
         """The ENFORCED construction gate: raise
         :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` on an unattested, unaccepted
         enforcing cleartext hop, loud-log (+ audit the attestation / the acceptance) on a warned hop,
-        allow the rest. No-op when the posture is unstamped (``None``) — the build_check gate is the
-        authority; see the class docstring."""
+        allow the rest. No-op when the posture is unstamped (``None``); see the class docstring."""
         posture = self.posture
         if posture is None:
             return
