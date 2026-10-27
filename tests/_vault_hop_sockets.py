@@ -4,13 +4,17 @@
 port with nothing listening on it.
 
 Shared by the cleartext-hop tests and the ambient proxy disclosure tests (vault BACKLOG #4028), so
-neither test module imports the other.
+neither test module imports the other. Each imports the ``listener`` fixture from here, so it
+has one definition.
 """
 
 from __future__ import annotations
 
 import socket
 import threading
+from collections.abc import Iterator
+
+import pytest
 
 
 class _Listener:
@@ -43,6 +47,15 @@ class _Listener:
         self._stop.set()
         self._thread.join(timeout=5)
         self._sock.close()
+
+
+@pytest.fixture
+def listener() -> Iterator[_Listener]:
+    lst = _Listener()
+    try:
+        yield lst
+    finally:
+        lst.close()
 
 
 def _closed_port() -> int:
