@@ -34,12 +34,14 @@
 # rebuild. The pin also freezes the base's Debian packages: a fix reaches the image only when that
 # digest moves, and a build from an older checkout keeps that checkout's digest.
 #
-# CA STORES, INSPECTED 2026-10-26 (BACKLOG #3905, GHSA-6q48-6c7w-9gw2). The image holds three CA
-# bundles no lock controls: Debian's ca-certificates in /etc/ssl/certs, and the certifi pip vendors,
-# in the system pip and in the pip `python -m venv` copies into /opt/venv. The previous digest
-# carried "emSign ECC Root CA - G3" in all three; this one carries it in none (ca-certificates
-# 20250419~deb12u2, pip 26.2.2). Nothing re-inspects a later digest:
-# tests/test_container_build_pins.py refuses only the known-bad one.
+# CA STORES, INSPECTED 2026-10-26 FOR linux/amd64 ONLY (BACKLOG #3905, GHSA-6q48-6c7w-9gw2). The
+# base holds at least three CA bundles no lock controls: Debian's ca-certificates in /etc/ssl/certs,
+# the certifi the system pip vendors, and the same inside the ensurepip pip wheel, which is where
+# the pip that `python -m venv` puts in /opt/venv comes from. The previous digest carried
+# "emSign ECC Root CA - G3" in all three; this one carries it in none (ca-certificates
+# 20250419~deb12u2, pip 26.2.2). The certifi installed into /opt/venv is the locked one in
+# docker/locks/. Nothing re-inspects a later digest or another platform:
+# tests/test_container_build_pins.py refuses only the known-bad digests.
 FROM python:3.14-slim-bookworm@sha256:9974e24551f9e7ca172cf284d85b8ab3e031d22d945f7026ede7a8279118c9f1 AS python-base
 
 # ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------

@@ -11,8 +11,9 @@
 #
 # WHY THIS FILE EXISTS. `--ignore-unfixed` filters on "does UPSTREAM have a fix", not "can WE apply
 # it". Both entries below are pip's VENDORED copies: pip 26.2.1 pins msgpack==1.1.2 and
-# setuptools==70.3.0 in pip/_vendor/vendor.txt and publishes them in pip/_vendor/bom.cdx.json, which
-# Trivy ingests. Neither package is in docker/locks/requirements-core.lock, neither appears in the
+# setuptools==70.3.0 in pip/_vendor/vendor.txt (pip 26.2.2, which the base digest moved to for
+# BACKLOG #3905, pins the same two, read from its wheel on 2026-10-27) and publishes them in
+# pip/_vendor/bom.cdx.json, which Trivy ingests. Neither package is in docker/locks/requirements-core.lock, neither appears in the
 # image's /opt/venv site-packages, nothing in the engine imports them, and the image entrypoint is
 # `tini -- messagefoundry`, which never runs pip.
 #

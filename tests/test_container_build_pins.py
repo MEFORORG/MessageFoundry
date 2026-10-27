@@ -8,14 +8,16 @@ Dockerfile header says why the fix looks the way it does; this module keeps it f
 back, since no CI job reads the Dockerfile for pins (``trivy config`` in security.yml ends in
 ``|| true``).
 
-Three invariants:
+Four invariants:
 
 * every REGISTRY image the build pulls, by ``FROM`` or ``COPY --from``, is named by tag AND digest,
   written literally, because Dependabot's ``docker`` entry cannot follow an ARG-interpolated tag
   and has nothing to move without a tag;
 * every ``pip install`` is either hash-checked or installs only the locally built engine wheel with
   ``--no-deps``;
-* the build frontend comes from ``ci/locks/release-tools.lock``, the lock CI and the release use.
+* the build frontend comes from ``ci/locks/release-tools.lock``, the lock CI and the release use;
+* no base is a digest inspected and found to carry a CA root an advisory removed. That test carries
+  its own control, since :data:`_PRE_FIX` has no digest.
 
 :data:`_PRE_FIX` is the positive control. Each predicate is asserted to FIRE on it before the real
 file is checked, because a predicate that fires on nothing looks the same as a clean file.
@@ -176,11 +178,14 @@ def test_every_registry_base_is_pinned_by_a_literal_digest() -> None:
 
 
 #: Base digests inspected and found to carry a CA root an advisory removed; a revert is refused.
-_DISTRUSTED_ROOT_DIGESTS = {
-    # "emSign ECC Root CA - G3" in Debian ca-certificates and both pip-vendored certifi copies
-    # (GHSA-6q48-6c7w-9gw2, BACKLOG #3905).
-    "sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83",
-}
+_DISTRUSTED_ROOT_DIGESTS = frozenset(
+    {
+        # "emSign ECC Root CA - G3" in Debian ca-certificates and both pip-vendored certifi copies
+        # (GHSA-6q48-6c7w-9gw2, BACKLOG #3905): the multi-arch index, then its linux/amd64 manifest.
+        "sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83",
+        "sha256:a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf",
+    }
+)
 
 
 def _known_bad_bases(text: str) -> list[str]:
@@ -188,9 +193,10 @@ def _known_bad_bases(text: str) -> list[str]:
 
 
 def test_no_base_is_a_digest_known_to_carry_a_distrusted_root() -> None:
-    bad = next(iter(_DISTRUSTED_ROOT_DIGESTS))
-    # Positive control: the predicate fires on the pre-fix FROM line.
-    assert _known_bad_bases(f"FROM python:3.14-slim-bookworm@{bad} AS python-base\n")
+    # Positive control, per entry: a malformed entry could never match a parsed reference.
+    for bad in _DISTRUSTED_ROOT_DIGESTS:
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", bad), bad
+        assert _known_bad_bases(f"FROM python:3.14-slim-bookworm@{bad} AS python-base\n"), bad
     text = _DOCKERFILE.read_text(encoding="utf-8")
     found = _known_bad_bases(text)
     assert not found, f"{found} carries a CA root an advisory removed; see the Dockerfile header"
