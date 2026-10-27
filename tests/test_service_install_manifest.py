@@ -1032,6 +1032,10 @@ _PATH_PARAMS = [
     "ServiceConfig",
     "ProjectRoot",
     "DbPath",
+    # -EngineWheel's inputs (vault BACKLOG #2626), read before the build acts.
+    "EngineWheel",
+    "RequirementsLock",
+    "BasePython",
 ]
 
 

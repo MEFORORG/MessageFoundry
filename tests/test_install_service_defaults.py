@@ -13,6 +13,7 @@ behaviour runs the script's own helper functions, extracted by AST, through ``pw
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -695,3 +697,223 @@ def test_a_path_nssm_expands_is_refused_with_percent_before_anything_acts() -> N
     assert text.index("$NssmDir = Resolve-AbsolutePath $NssmDir") < check
     assert text.index("$PythonExe = Get-EngineInterpreter") < check
     assert check < text.index("$NssmPath = Resolve-Nssm")
+
+
+# --- -EngineWheel builds the default root (vault BACKLOG #2626 step 1) -------------------------------
+
+
+def test_building_the_install_root_is_opt_in_and_never_editable() -> None:
+    """Only -EngineWheel builds, it builds only the default root, its companions are refused
+    without it, and every input is read before the first act. Nothing installs editable."""
+    text = _text()
+    assert "$BuildsInstall = [bool]$EngineWheel" in text
+    assert 'throw ("-EngineWheel builds the default install root' in text
+    assert (
+        "-EngineWheelSha256, -RequirementsLock and -BasePython go only with -EngineWheel." in text
+    )
+    preflight = text.index(
+        "$buildProblem = Get-EngineBuildProblem -InstallRoot $DefaultInstallRoot"
+    )
+    lock_check = text.index("$configLockProblem = Get-LockPathProblem -Path $Config")
+    settings = text.index('throw "Service settings file not found at: $ServiceConfig"')
+    build = text.index("    Build-EngineInstall -InstallRoot $DefaultInstallRoot")
+    check = text.index("$installProblem = Get-EngineInstallProblem")
+    nssm = text.index("$NssmPath = Resolve-Nssm")
+    # Every refusal that reads an input sits before the build, and the build before the check.
+    assert preflight < lock_check < settings < build < check < nssm
+    for editable in ("pip install -e", "--editable", '"-e"'):
+        assert editable not in text
+
+
+# Stubs for what Build-EngineInstall acts through, defined after the lifted functions so they
+# win. $log records the order of the access-list and native steps.
+_BUILD_STUB = """
+  $log = [System.Collections.Generic.List[string]]::new()
+  function Set-AdminOnlyAcl { param($Path) $log.Add("acl $Path") }
+  function Invoke-EngineBuildStep {
+    param($What, $Exe, $Arguments) $log.Add("run $Exe | $($Arguments -join ' | ')")
+  }
+"""
+
+
+def _build(tmp_path: Path, body: str) -> dict[str, Any]:
+    assert _SCRIPT is not None
+    script = _extract(
+        _SCRIPT,
+        [
+            "Get-FilePinProblem",
+            "New-AdminOnlyFolder",
+            "Get-NssmHomeProblem",
+            "Get-EngineBuildProblem",
+            "Build-EngineInstall",
+        ],
+        "",
+    )
+    script = script[: script.rindex("}")] + _BROAD_STUB + _BUILD_STUB + body + "}"
+    result: dict[str, Any] = json.loads(_ok(script, tmp_path).strip().splitlines()[-1])
+    return result
+
+
+def _wheel(folder: Path) -> tuple[Path, Path, str]:
+    folder.mkdir(parents=True)
+    wheel = folder / "messagefoundry-0.5.2-py3-none-any.whl"
+    wheel.write_bytes(b"the engine wheel")
+    lock = folder / "requirements.lock"
+    lock.write_text("aiosqlite==0.22.1 --hash=sha256:00\n", encoding="utf-8")
+    return wheel, lock, hashlib.sha256(wheel.read_bytes()).hexdigest().upper()
+
+
+def _build_call(root: Path, wheel: Path, lock: Path, sha: str) -> str:
+    return (
+        "  $res = [ordered]@{ error = '' }\n"
+        f"  try {{ Build-EngineInstall -InstallRoot {_psq(str(root))} -Wheel {_psq(str(wheel))} "
+        f"-WheelSha256 {_psq(sha)} -RequirementsLock {_psq(str(lock))} "
+        "-BasePython 'C:\\Python314\\python.exe' }\n"
+        "  catch { $res.error = $_.Exception.Message }\n"
+        "  $res.log = @($log)\n"
+        f"  $res.root = Test-Path -LiteralPath {_psq(str(root))}\n"
+        f"  $res.stage = Test-Path -LiteralPath {_psq(str(root / 'wheelhouse'))}\n"
+        "  $res | ConvertTo-Json -Compress\n"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
+def test_the_build_sets_the_access_list_before_pip_and_pins_what_pip_installs(
+    tmp_path: Path,
+) -> None:
+    """The clean build is the control for the refusals below. Each folder it makes gets its access
+    list before the first native step; the lock goes in with --require-hashes and the wheel with
+    --no-deps, both from the copies in the root rather than the operator's files."""
+    wheel, lock, sha = _wheel(tmp_path / "release")
+    (tmp_path / "pf").mkdir()
+    root = tmp_path / "pf" / "MessageFoundry" / "engine"
+    got = _build(tmp_path, _build_call(root, wheel, lock, sha))
+    assert got["error"] == "", got
+    log = [str(x) for x in got["log"]]
+    acls = [i for i, line in enumerate(log) if line.startswith("acl ")]
+    runs = [i for i, line in enumerate(log) if line.startswith("run ")]
+    assert [log[i] for i in acls] == [f"acl {root.parent}", f"acl {root}"], log
+    assert max(acls) < min(runs), log
+    assert len(runs) == 4, log
+    venv, deps, engine, owner = (log[i] for i in runs)
+    stage = root / "wheelhouse"
+    assert venv == f"run C:\\Python314\\python.exe | -I | -m | venv | {root}"
+    python = root / "Scripts" / "python.exe"
+    assert deps.startswith(f"run {python} | -I | -m | pip | install"), deps
+    assert deps.endswith(f"| --require-hashes | -r | {stage / 'requirements.lock'}"), deps
+    assert "--no-deps" not in deps and str(wheel) not in deps
+    assert engine.startswith(f"run {python} | -I | -m | pip | install"), engine
+    assert engine.endswith(f"| --no-deps | {stage / wheel.name}"), engine
+    assert "--require-hashes" not in engine and str(wheel) not in engine
+    assert owner == f"run icacls | {root} | /setowner | *S-1-5-32-544 | /T | /C | /Q"
+    assert got["root"] is True and got["stage"] is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
+def test_the_build_refuses_a_wheel_whose_copy_misses_the_pin(tmp_path: Path) -> None:
+    """The copy pip would read is hashed. A mismatch runs no native step and removes the root the
+    call made. The clean build above, with the right pin, is the control."""
+    wheel, lock, sha = _wheel(tmp_path / "release")
+    (tmp_path / "pf").mkdir()
+    root = tmp_path / "pf" / "engine"
+    wrong = ("0" if sha[0] != "0" else "1") + sha[1:]
+    got = _build(tmp_path, _build_call(root, wheel, lock, wrong))
+    assert "Refusing the engine wheel" in got["error"], got
+    assert sha in got["error"] and wrong in got["error"]
+    assert not [x for x in got["log"] if str(x).startswith("run ")], got
+    assert got["root"] is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
+def test_the_build_refuses_a_root_others_can_write_before_pip_runs(tmp_path: Path) -> None:
+    """A broad holder on the folder above the root, which already existed and so kept its own
+    access list, stops the build before any native step. The clean build is the control."""
+    wheel, lock, sha = _wheel(tmp_path / "release")
+    (tmp_path / "pf").mkdir()
+    root = tmp_path / "pf" / "engine"
+    planted = f"  $broadFor[{_psq(str(tmp_path / 'pf'))}] = 'BUILTIN\\Users'\n"
+    got = _build(tmp_path, planted + _build_call(root, wheel, lock, sha))
+    assert "is not administrator-only" in got["error"], got
+    assert "BUILTIN\\Users" in got["error"]
+    assert [str(x) for x in got["log"]] == [f"acl {root}"], got
+    assert got["root"] is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
+def test_get_engine_build_problem_reads_every_input_before_anything_acts(tmp_path: Path) -> None:
+    wheel, lock, sha = _wheel(tmp_path / "release")
+    console = tmp_path / "release" / "messagefoundry_webconsole-0.5.0-py3-none-any.whl"
+    console.write_bytes(b"the engine wheel")
+    python = tmp_path / "py" / "python.exe"
+    python.parent.mkdir()
+    python.write_bytes(b"")
+    held = tmp_path / "held"
+    held.mkdir()
+    (held / "pyvenv.cfg").write_text("", encoding="utf-8")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    def call(
+        root: Path = tmp_path / "missing",
+        w: Path = wheel,
+        s: str = sha,
+        lk: Path = lock,
+        py: str = str(python),
+    ) -> str:
+        return (
+            f"Get-EngineBuildProblem -InstallRoot {_psq(str(root))} -Wheel {_psq(str(w))} "
+            f"-WheelSha256 {_psq(s)} -RequirementsLock {_psq(str(lk))} -BasePython {_psq(py)}"
+        )
+
+    cases = {
+        "clean": call(),
+        "clean_lower": call(s=sha.lower()),
+        "empty_root": call(root=empty),
+        "held_root": call(root=held),
+        "bad_sha": call(s="abc"),
+        "mismatch": call(s="0" * 64),
+        "no_wheel": call(w=tmp_path / "release" / "messagefoundry-9.9.9-py3-none-any.whl"),
+        "console": call(w=console),
+        "no_lock": call(lk=tmp_path / "release" / "nope.lock"),
+        "no_python": call(py=""),
+    }
+    body = (
+        "  $res = [ordered]@{}\n"
+        + "".join(f"  $res[{_psq(k)}] = [string]({v})\n" for k, v in cases.items())
+        # Planted last, so only this case sees it.
+        + f"  $broadFor[{_psq(str(python.parent))}] = 'BUILTIN\\Users'\n"
+        + f"  $res['broad_python'] = [string]({call()})\n"
+        + "  $res | ConvertTo-Json -Compress\n"
+    )
+    got = _build(tmp_path, body)
+    assert got["clean"] == "" and got["clean_lower"] == "" and got["empty_root"] == "", got
+    assert "already holds files" in got["held_root"]
+    assert "64 hex characters" in got["bad_sha"]
+    assert "not the pinned" in got["mismatch"]
+    assert "does not exist" in got["no_wheel"]
+    assert "is not an engine wheel" in got["console"]
+    assert "-RequirementsLock" in got["no_lock"]
+    assert "-BasePython" in got["no_python"]
+    assert "not administrator-only" in got["broad_python"]
+    assert "BUILTIN\\Users" in got["broad_python"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs a native program")
+def test_a_build_step_that_exits_non_zero_is_a_failure(tmp_path: Path) -> None:
+    """The exit code of each native step is read, and a zero one is the control."""
+    assert _SCRIPT is not None
+    body = (
+        "  $res = [ordered]@{ ok = ''; bad = '' }\n"
+        "  try { Invoke-EngineBuildStep -What 'step one' -Exe 'cmd.exe' "
+        "-Arguments @('/c', 'exit 0') } catch { $res.ok = $_.Exception.Message }\n"
+        "  try { Invoke-EngineBuildStep -What 'step two' -Exe 'cmd.exe' "
+        "-Arguments @('/c', 'exit 3') } catch { $res.bad = $_.Exception.Message }\n"
+        "  $res | ConvertTo-Json -Compress\n"
+    )
+    script = _extract(
+        _SCRIPT,
+        ["Test-LegacyNativeArgumentPassing", "ConvertTo-NativeArgument", "Invoke-EngineBuildStep"],
+        body,
+    )
+    got = json.loads(_ok(script, tmp_path).strip().splitlines()[-1])
+    assert got == {"ok": "", "bad": "step two failed (exit 3)"}

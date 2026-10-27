@@ -23,9 +23,10 @@ venv interpreter) and the per-connection firewall openings the service needs.
 
 1. **The engine, installed where only administrators can write.** The installer's default is
    `C:\Program Files\MessageFoundry\engine`, built from the engine wheel and never editable.
+   The installer builds it when you pass the wheel, as
    [Install the engine where only administrators can write](#install-the-engine-where-only-administrators-can-write)
-   builds it. The installer checks that folder and does not build it. It refuses any other
-   install, such as a checkout's venv, that anyone but administrators can write.
+   shows, and refuses any install, such as a checkout's venv, that anyone but administrators can
+   write.
 2. **NSSM** — provisioned automatically. `install-service.ps1` keeps the `nssm.exe` the service
    runs in `-NssmDir`, `C:\Program Files\MessageFoundry\nssm` by default. It refuses a folder that
    anyone but administrators can write to or owns, because it runs that file as administrator. It
@@ -55,32 +56,32 @@ change. So the installer's default engine is a virtual environment under Program
 the engine wheel (vault BACKLOG #2626). An editable install in a checkout is code its developers can
 change, and the service would run their next edit.
 
-1. Get the engine wheel. Take a release wheel and verify it as
-   [INSTALL-GUIDE.md](INSTALL-GUIDE.md) shows, or build one from a checkout as yourself, not
-   elevated: `python -m pip wheel --no-deps -w dist .`
-2. In an elevated PowerShell, in the folder that holds the wheel and the release's
-   `requirements.lock`, build the install:
+1. Get the engine wheel and the release's `requirements.lock` into one folder. Take a release
+   wheel and verify it as [INSTALL-GUIDE.md](INSTALL-GUIDE.md) shows, or build one from a checkout
+   as yourself, not elevated: `python -m pip wheel --no-deps -w dist .`
+2. Take the wheel's SHA-256 in the session that verified it:
+   `(Get-FileHash -Algorithm SHA256 <wheel>).Hash`. `requirements.lock` pins every dependency by
+   hash but not the engine wheel, so this value is the pin on the engine itself.
+3. Pass both to the installer, elevated, with the options [Install](#install) names:
    ```powershell
-   $Root = "$env:ProgramFiles\MessageFoundry\engine"
-   python -m venv $Root
-   & "$Root\Scripts\python.exe" -m pip install --require-hashes -r requirements.lock
-   & "$Root\Scripts\python.exe" -m pip install --no-deps (Get-Item .\messagefoundry-*.whl).FullName
+   .\scripts\service\install-service.ps1 -EngineWheel D:\release\messagefoundry-0.5.2-py3-none-any.whl `
+       -EngineWheelSha256 <hash> -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml
    ```
-   `requirements.lock` is the SHA-256-pinned export checked in sync and audited in CI (DEP-1).
-   Install the web console wheel the same way if the service serves `/ui`.
-3. Make the folder and the folder above it administrator-only, owner included:
-   ```powershell
-   $Parent = Split-Path -Parent $Root
-   foreach ($Folder in $Parent, $Root) {
-       icacls $Folder /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" `
-           "*S-1-5-32-545:(OI)(CI)RX" "*S-1-5-11:(OI)(CI)RX"
-   }
-   icacls $Parent /setowner "*S-1-5-32-544"
-   icacls $Root /setowner "*S-1-5-32-544" /T /C
-   ```
-   A new folder under Program Files can be owned by the administrator who made it, with full
-   control through `CREATOR OWNER`. That administrator's own account then counts as another
-   account that can write it.
+
+**With `-EngineWheel`, the installer builds the root before it checks it** (vault BACKLOG #2626).
+Without it, the installer builds nothing and checks the root that is there; it never falls back to
+an editable install. It makes the root administrator-only before pip runs, installs the lock with
+`--require-hashes` and the wheel with `--no-deps`, and refuses, installing nothing, when the copy
+of the wheel pip would read misses `-EngineWheelSha256`. `Build-EngineInstall` in the script is
+the source of record for the steps and their order.
+
+It refuses to build into a root that already holds files, so it never upgrades in place; see
+[Update to a new build](#update-to-a-new-build-restart-vs-reinstall). A failed build deletes a root
+it made. `-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython`
+defaults to the first `python` on `PATH`, and the installer refuses one that anyone but
+administrators can write, because it runs that interpreter elevated and the venv's `python.exe`
+starts it at every service start. Install the web console wheel into the built root by hand if
+the service serves `/ui`: the installer installs the engine wheel only.
 
 **The installer refuses an engine install anyone but administrators can write** (vault BACKLOG
 #2626). That holds for the default root and for one you pass with `-AppExe` or `-PythonExe`. It

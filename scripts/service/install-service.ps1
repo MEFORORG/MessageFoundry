@@ -29,15 +29,30 @@ param(
     # INSTALL the service runs from. The service does not run it: it runs the Python interpreter of
     # that install directly, so the interpreter options below reach it (vault BACKLOG #2701).
     # Defaults to the admin-only install root, "$env:ProgramFiles\MessageFoundry\engine", which the
-    # installer checks and does not build (vault BACKLOG #2626). docs/SERVICE.md "Install the engine
-    # where only administrators can write" builds it from the wheel. A passed one is checked the
-    # same way, so a checkout's venv, which its developers can write, is refused.
+    # installer builds with -EngineWheel and checks either way (vault BACKLOG #2626). A passed one
+    # is checked the same way, so a checkout's venv, which its developers can write, is refused.
     [string]$AppExe,
     # The interpreter the service runs. Defaults to the python.exe of the install -AppExe is in:
     # beside it for a virtual environment, one folder up for a system-wide install. Pass it when
     # neither is right. It must be able to import messagefoundry in isolated mode, which leaves
     # out the user's own site directory, so a `pip install --user` copy will not do.
     [string]$PythonExe,
+    # Build the default install root from this engine wheel before checking it (vault BACKLOG
+    # #2626). Off unless passed: the installer cannot choose a wheel, or the hash it must have, by
+    # itself, and it never falls back to an editable checkout. Needs -EngineWheelSha256. Refused
+    # with -AppExe or -PythonExe, and when the root already holds anything. Build-EngineInstall
+    # lists the steps.
+    [string]$EngineWheel,
+    # The SHA-256 the -EngineWheel file must have, from the release you verified. requirements.lock
+    # pins the dependencies and not the engine wheel, so this is the pin on the engine itself.
+    [string]$EngineWheelSha256,
+    # The hash-locked dependency list -EngineWheel installs with --require-hashes. Defaults to
+    # requirements.lock in the wheel's folder.
+    [string]$RequirementsLock,
+    # The Python -EngineWheel makes the virtual environment from. The venv's python.exe starts it,
+    # so the service runs it too. Defaults to the first python on PATH. Refused when anyone but
+    # administrators can write it.
+    [string]$BasePython,
     # The config directory the service loads. Required: it used to default to the checkout's
     # samples\config, a demo graph in a folder its developers can write (vault BACKLOG #2626).
     [string]$Config,
@@ -440,6 +455,25 @@ function Set-AdminOnlyAcl {
     & icacls $Path /setowner "*S-1-5-32-544" | Out-Null
 }
 
+function New-AdminOnlyFolder {
+    <#
+      Create $Path and any missing folder above it, and give each folder this call creates an
+      administrator-only access list and owner (Set-AdminOnlyAcl). Returns the folders it created,
+      outermost first. A folder that already existed is left as it is: its permissions are the
+      operator's choice, and each caller reads them with Get-NssmHomeProblem afterwards.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $missing = @()
+    $probe = $Path
+    while ($probe -and -not (Test-Path -LiteralPath $probe)) {
+        $missing = @($probe) + $missing
+        $probe = Split-Path -Parent $probe
+    }
+    New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    foreach ($dir in $missing) { Set-AdminOnlyAcl -Path $dir }
+    return $missing
+}
+
 function Get-NssmHomeProblem {
     <#
       Who, other than administrators, could replace $File: through the file itself, its folder, or
@@ -502,16 +536,7 @@ function Resolve-Nssm {
     #>
     param([string]$Provided, [Parameter(Mandatory)][string]$NssmDir)
 
-    # Every folder this call creates gets an administrator-only ACL. A folder that already existed is
-    # left as it is: its permissions are the operator's choice, and the check below reads them.
-    $missing = @()
-    $probe = $NssmDir
-    while ($probe -and -not (Test-Path -LiteralPath $probe)) {
-        $missing = @($probe) + $missing
-        $probe = Split-Path -Parent $probe
-    }
-    New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
-    foreach ($dir in $missing) { Set-AdminOnlyAcl -Path $dir }
+    New-AdminOnlyFolder -Path $NssmDir | Out-Null
     $target = Join-Path $NssmDir "nssm.exe"
     $refuse = {
         param($holders)
@@ -1296,10 +1321,10 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
 # The default install root (vault BACKLOG #2626). Under Program Files, so a new folder there inherits
 # an access list only administrators can write; the installer checks that below rather than assume
-# it. The installer does not build the root: docs/SERVICE.md "Install the engine where only
-# administrators can write" installs the hash-locked dependencies and the engine wheel into it, never
-# editable. A passed -AppExe or -PythonExe gets the same check (Get-EngineInstallProblem), so a
-# service can no longer run from a checkout its developers can write.
+# it. With -EngineWheel the installer builds the root first (Build-EngineInstall), from the
+# hash-locked dependencies and the pinned engine wheel, never editable. A passed -AppExe or
+# -PythonExe gets the same check (Get-EngineInstallProblem), so a service can no longer run from a
+# checkout its developers can write.
 $DefaultInstallRoot = Join-Path $env:ProgramFiles "MessageFoundry\engine"
 $UsesDefaultInstall = -not ($AppExe -or $PythonExe)
 
@@ -1403,6 +1428,149 @@ function Get-EngineInstallProblem {
     $files = @(@($PythonExe, $package, $cache, $AppExe, (Join-Path $InstallRoot "pyvenv.cfg")) |
         Where-Object { $_ -and (Test-Path -LiteralPath $_) })
     return (Get-NssmHomeProblem -File $files)
+}
+
+function Get-EngineBuildProblem {
+    <#
+      Why Build-EngineInstall must not build $InstallRoot, or "" when it may (vault BACKLOG #2626).
+      Read before anything acts. It hashes the operator's wheel where it lies, which anyone who can
+      write that folder can change later, so Build-EngineInstall hashes the copy it installs again.
+
+      $BasePython is read as the engine install is: anyone but administrators able to write it, or
+      a folder above it, is refused. This script runs it elevated, and the built venv's python.exe
+      starts it whenever the service starts.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$Wheel,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$WheelSha256,
+        [Parameter(Mandatory)][string]$RequirementsLock,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$BasePython
+    )
+    if ($WheelSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        return "-EngineWheelSha256 must be the wheel's SHA-256 as 64 hex characters, not '$WheelSha256'"
+    }
+    if (-not (Test-Path -LiteralPath $Wheel -PathType Leaf)) { return "the engine wheel '$Wheel' does not exist" }
+    # The engine's own distribution. messagefoundry_webconsole and the toolkit are others.
+    if ((Split-Path -Leaf $Wheel) -notmatch '^messagefoundry-[0-9][^-]*-.+\.whl$') {
+        return "'$Wheel' is not an engine wheel, whose name starts messagefoundry-<version>-"
+    }
+    $pin = Get-FilePinProblem -Path $Wheel -Expected $WheelSha256
+    if ($pin) { return $pin }
+    if (-not (Test-Path -LiteralPath $RequirementsLock -PathType Leaf)) {
+        return "the dependency lock '$RequirementsLock' does not exist. Pass -RequirementsLock"
+    }
+    if (-not $BasePython -or -not (Test-Path -LiteralPath $BasePython -PathType Leaf)) {
+        return "no Python was found to make the virtual environment from. Pass -BasePython"
+    }
+    $holders = Get-NssmHomeProblem -File $BasePython
+    if ($holders) {
+        return ("the Python '$BasePython' is not administrator-only: $holders. Pass -BasePython " +
+            "with a Python installed for all users")
+    }
+    if (Test-Path -LiteralPath $InstallRoot) {
+        try {
+            $item = Get-Item -LiteralPath $InstallRoot -Force -ErrorAction Stop
+            $held = @(Get-ChildItem -LiteralPath $InstallRoot -Force -ErrorAction Stop)
+        } catch {
+            return "'$InstallRoot' could not be read ($($_.Exception.Message))"
+        }
+        # A junction would have the build write wherever it points, which the access-list reading
+        # does not follow.
+        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            return "'$InstallRoot' is not an ordinary folder"
+        }
+        if ($held) {
+            return ("'$InstallRoot' already holds files. Leave -EngineWheel out to use the install " +
+                "as it is, update it as docs/SERVICE.md 'Update to a new build' shows, or stop the " +
+                "service, delete the folder and re-run")
+        }
+    }
+    return ""
+}
+
+function Invoke-EngineBuildStep {
+    <#
+      Run one native step of Build-EngineInstall, and throw naming the step when it fails. Each
+      argument is escaped for this host, and $LASTEXITCODE is cleared first, as in Invoke-Nssm,
+      which says why. The program's output goes to the console, not to the caller.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$What,
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+    $legacy = Test-LegacyNativeArgumentPassing
+    $sent = @($Arguments | ForEach-Object { ConvertTo-NativeArgument "$_" -Legacy:$legacy })
+    $global:LASTEXITCODE = $null
+    & $Exe @sent | Out-Host
+    $exit = $LASTEXITCODE
+    if ($null -eq $exit) { throw "$What failed (no exit code: '$Exe' did not run)" }
+    if ($exit -ne 0) { throw "$What failed (exit $exit)" }
+}
+
+function Build-EngineInstall {
+    <#
+      Build the default install root with -EngineWheel (vault BACKLOG #2626): a virtual environment
+      only administrators can write, holding the dependencies requirements.lock pins by hash and the
+      engine wheel the operator pins by SHA-256, never editable. Get-EngineBuildProblem has cleared
+      the inputs. In this order, so pip only ever writes where only administrators can:
+
+        1. Make the root and any missing folder above it administrator-only (New-AdminOnlyFolder).
+           A folder that already existed keeps its own access list.
+        2. Refuse unless Get-NssmHomeProblem reads the root and every folder above it as
+           administrator-only.
+        3. Copy the wheel and the lock into a folder in the root, and refuse unless the wheel's copy
+           has the pinned SHA-256. pip reads the copy, which only an administrator can change.
+        4. Make the venv, install the lock with --require-hashes, then the wheel with --no-deps, so
+           pip installs nothing the lock or the pin does not name.
+        5. Make Administrators the owner of everything in the root, as step 1 does for the root.
+
+      On a failure the root is deleted when this call made it, so a re-run does not meet a half-built
+      one; otherwise only the copies are. Get-EngineInstallProblem then reads what was built.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$Wheel,
+        [Parameter(Mandatory)][string]$WheelSha256,
+        [Parameter(Mandatory)][string]$RequirementsLock,
+        [Parameter(Mandatory)][string]$BasePython
+    )
+    $stage = Join-Path $InstallRoot "wheelhouse"
+    $missing = @(New-AdminOnlyFolder -Path $InstallRoot)
+    try {
+        $holders = Get-NssmHomeProblem -File (Join-Path $InstallRoot "pyvenv.cfg")
+        if ($holders) {
+            throw ("'$InstallRoot' is not administrator-only: $holders. Nothing was installed. Fix " +
+                "its permissions or a folder above it, and re-run.")
+        }
+        New-Item -ItemType Directory -Path $stage | Out-Null
+        $stagedWheel = Join-Path $stage (Split-Path -Leaf $Wheel)
+        $stagedLock = Join-Path $stage "requirements.lock"
+        Copy-Item -LiteralPath $Wheel -Destination $stagedWheel
+        Copy-Item -LiteralPath $RequirementsLock -Destination $stagedLock
+        $pin = Get-FilePinProblem -Path $stagedWheel -Expected $WheelSha256
+        if ($pin) { throw "Refusing the engine wheel: $pin. Nothing was installed." }
+        Invoke-EngineBuildStep -What "making the virtual environment" -Exe $BasePython `
+            -Arguments @("-I", "-m", "venv", $InstallRoot)
+        $venvPython = Join-Path $InstallRoot "Scripts\python.exe"
+        $pip = @("-I", "-m", "pip", "install", "--no-input", "--disable-pip-version-check")
+        Invoke-EngineBuildStep -What "installing the dependencies requirements.lock pins" `
+            -Exe $venvPython -Arguments ($pip + @("--require-hashes", "-r", $stagedLock))
+        Invoke-EngineBuildStep -What "installing the engine wheel" -Exe $venvPython `
+            -Arguments ($pip + @("--no-deps", $stagedWheel))
+        Remove-Item -LiteralPath $stage -Recurse -Force
+        Invoke-EngineBuildStep -What "making Administrators the owner of '$InstallRoot'" -Exe "icacls" `
+            -Arguments @($InstallRoot, "/setowner", "*S-1-5-32-544", "/T", "/C", "/Q")
+    } catch {
+        if ($missing -contains $InstallRoot) {
+            Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+        } elseif (Test-Path -LiteralPath $stage) {
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+    Write-Host "Engine installed to $InstallRoot from $(Split-Path -Leaf $Wheel)"
 }
 
 function Assert-NoNssmExpansion {
@@ -1563,29 +1731,56 @@ function Resolve-AbsolutePath {
 }
 
 $DataDir = Resolve-AbsolutePath $DataDir
+# -EngineWheel builds the default root further down (vault BACKLOG #2626). Its inputs are read here,
+# before anything acts, and its companions are refused without it rather than silently ignored.
+$BuildsInstall = [bool]$EngineWheel
+if ($BuildsInstall) {
+    if (-not $UsesDefaultInstall) {
+        throw ("-EngineWheel builds the default install root '$DefaultInstallRoot', so it cannot be " +
+            "combined with -AppExe or -PythonExe.")
+    }
+    $EngineWheel = Resolve-AbsolutePath $EngineWheel
+    if ($RequirementsLock) { $RequirementsLock = Resolve-AbsolutePath $RequirementsLock }
+    else { $RequirementsLock = Join-Path (Split-Path -Parent $EngineWheel) "requirements.lock" }
+    if ($BasePython) { $BasePython = Resolve-AbsolutePath $BasePython }
+    else {
+        $onPath = Get-Command python -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        $BasePython = if ($onPath) { $onPath.Source } else { "" }
+    }
+    $buildProblem = Get-EngineBuildProblem -InstallRoot $DefaultInstallRoot -Wheel $EngineWheel `
+        -WheelSha256 $EngineWheelSha256 -RequirementsLock $RequirementsLock -BasePython $BasePython
+    if ($buildProblem) { throw "Not building the engine install '$DefaultInstallRoot': $buildProblem." }
+} elseif ($EngineWheelSha256 -or $RequirementsLock -or $BasePython) {
+    throw "-EngineWheelSha256, -RequirementsLock and -BasePython go only with -EngineWheel."
+}
 # With -PythonExe alone there is no launcher to name, and nothing below reads one.
 if ($UsesDefaultInstall) { $AppExe = Join-Path $DefaultInstallRoot "Scripts\messagefoundry.exe" }
 elseif ($AppExe) { $AppExe = Resolve-AbsolutePath $AppExe }
 # The interpreter the service runs (vault BACKLOG #2701). Named here, with the other paths, so it
 # is absolute before anything consumes it. Empty when none is found; refused below.
 if ($PythonExe) { $PythonExe = Resolve-AbsolutePath $PythonExe }
+elseif ($BuildsInstall) { $PythonExe = Join-Path $DefaultInstallRoot "Scripts\python.exe" }
 else { $PythonExe = Get-EngineInterpreter -AppExe $AppExe }
-# The launcher only names the install, so it is required only while it is what finds the
-# interpreter. With -PythonExe the service's program is already named.
-if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path -LiteralPath $AppExe)) {
-    throw ("Engine executable not found at: $AppExe`nBuild the install root from the engine wheel " +
-        "(docs/SERVICE.md 'Install the engine where only administrators can write'), or pass " +
-        "-AppExe, or name the interpreter with -PythonExe.")
-}
-# NOT CHECKED: that this interpreter can import the engine. Finding out would mean running the
-# install's code from this elevated prompt. A wrong -PythonExe shows as ModuleNotFoundError in the
-# service's error log at its first start.
-if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
-    throw ("The Python interpreter the service runs was not found" +
-        $(if ($PythonExe) { " at: $PythonExe" } else { " beside '$AppExe' or one folder up" }) +
-        ".`nThe service runs the interpreter directly, in isolated mode, and not the " +
-        "messagefoundry.exe launcher. Pass -PythonExe with the python.exe of the install the " +
-        "engine is in (docs/SERVICE.md 'The service launch').")
+# A root still to be built has neither file yet; both are checked once it is built, below.
+if (-not $BuildsInstall) {
+    # The launcher only names the install, so it is required only while it is what finds the
+    # interpreter. With -PythonExe the service's program is already named.
+    if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path -LiteralPath $AppExe)) {
+        throw ("Engine executable not found at: $AppExe`nBuild the install root with -EngineWheel " +
+            "(docs/SERVICE.md 'Install the engine where only administrators can write'), or pass " +
+            "-AppExe, or name the interpreter with -PythonExe.")
+    }
+    # NOT CHECKED: that this interpreter can import the engine. Finding out would mean running the
+    # install's code from this elevated prompt. A wrong -PythonExe shows as ModuleNotFoundError in
+    # the service's error log at its first start.
+    if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
+        throw ("The Python interpreter the service runs was not found" +
+            $(if ($PythonExe) { " at: $PythonExe" } else { " beside '$AppExe' or one folder up" }) +
+            ".`nThe service runs the interpreter directly, in isolated mode, and not the " +
+            "messagefoundry.exe launcher. Pass -PythonExe with the python.exe of the install the " +
+            "engine is in (docs/SERVICE.md 'The service launch').")
+    }
 }
 # No default (vault BACKLOG #2626). It used to be the checkout's samples\config: a demo graph, in a
 # folder its developers can write, run as the service account.
@@ -1657,22 +1852,35 @@ if ($LockConfigDir) {
     }
 }
 
+if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Leaf)) {
+    throw "Service settings file not found at: $ServiceConfig"
+}
+
+# The first act of an install that builds its root (vault BACKLOG #2626), once every input above
+# has been read. The check below then reads the built root as it reads any install.
+if ($BuildsInstall) {
+    Build-EngineInstall -InstallRoot $DefaultInstallRoot -Wheel $EngineWheel -WheelSha256 $EngineWheelSha256 `
+        -RequirementsLock $RequirementsLock -BasePython $BasePython
+    foreach ($built in @($PythonExe, $AppExe)) {
+        if (-not (Test-Path -LiteralPath $built -PathType Leaf)) {
+            throw "The build of '$DefaultInstallRoot' left no '$built'."
+        }
+    }
+}
+
 # Every install is checked, the default root and a passed -AppExe or -PythonExe alike, before
-# anything acts (vault BACKLOG #2626). A checkout's venv, which its developers can write, is refused.
+# anything else acts (vault BACKLOG #2626). A checkout's venv, which its developers can write, is
+# refused.
 $installProblem = Get-EngineInstallProblem -InstallRoot $AppDirectory -PythonExe $PythonExe -AppExe $AppExe
 if ($installProblem) {
     throw ("The engine install '$AppDirectory' is not administrator-only: $installProblem. Build " +
-        "it from the engine wheel and set its access list and owner as docs/SERVICE.md 'Install " +
-        "the engine where only administrators can write' shows.")
+        "the default root with -EngineWheel, as docs/SERVICE.md 'Install the engine where only " +
+        "administrators can write' shows.")
 }
 
 # AFTER the normalization: Resolve-Nssm copies nssm.exe into -NssmDir, and the service is registered
 # with that path, so a relative one would be resolved against a different directory later.
 $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
-
-if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Leaf)) {
-    throw "Service settings file not found at: $ServiceConfig"
-}
 
 $LogDir   = Join-Path $DataDir "logs"
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
