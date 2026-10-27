@@ -7,7 +7,13 @@ import * as http from "node:http";
 import * as https from "node:https";
 
 import { serveCommandLine } from "./engineControlModel";
-import { engineHostKey, isRecord, isTlsTrustError, trustRemedy } from "./engineTrustModel";
+import {
+  CAFILE_UNREAD_CODE,
+  engineHostKey,
+  isRecord,
+  isTlsTrustError,
+  trustRemedy,
+} from "./engineTrustModel";
 
 /**
  * What a step-up refusal asked for (403 + `X-Step-Up-Required`). `action` is the
@@ -175,8 +181,9 @@ export const TLS_CIPHERS = TLS_12_SUITES.concat(TLS_13_SUITES).join(":");
  * Module-level because a trust anchor is a property of a SERVER, not of one request: every caller
  * in this extension reaching a given engine needs the same one, and threading a `ca` argument
  * through `postJson`/`getJson` and their eight call sites would let one of them be forgotten.
- * Populated by `engineTrust.ts` from what the engine itself reports; empty until then, which is
- * exactly the previous behaviour (Node's default CA set alone).
+ * Populated by `engineTrust.ts` from what the engine itself reports and from `caFile` pins. A host
+ * with no anchor verifies against Node's default CA set alone, unless a `caFile` pins it: then the
+ * request is refused until the file is read ({@link pinRefusal}).
  */
 const trustAnchors = new Map<string, string>();
 
@@ -200,18 +207,59 @@ export function clearEngineTrustAnchors(): void {
 }
 
 /**
- * Capture the registered anchors and return a function that puts exactly that set back. For a test
- * that registers its own anchors: in the Extension Host leg `engineTrust.ts` keeps its own record of
- * what it registered, and clearing the client's set behind its back would leave the two out of step.
+ * Every `host:port` an accepted https `caFile` pin names in the settings as they are NOW, whether or
+ * not its file has been read. Such a host must never be verified against Node's default roots: a
+ * request to one with no anchor registered is refused before it is sent ({@link pinRefusal}).
+ *
+ * Kept apart from {@link trustAnchors} because the two change at different times. This set follows the
+ * setting the moment it changes (`engineTrust.ts` publishes it synchronously, at activation and on
+ * every settings change), while an anchor arrives only once its file is read, which on a slow share
+ * may take a whole refresh or longer. Only `engineTrust.ts` writes either.
+ */
+let pinnedHosts: ReadonlySet<string> = new Set();
+
+/** Replace the set of pinned `host:port` keys (see {@link pinnedHosts}). */
+export function setPinnedEngineHosts(keys: Iterable<string>): void {
+  pinnedHosts = new Set(keys);
+}
+
+/**
+ * Capture the registered anchors and the pinned hosts, and return a function that puts exactly that
+ * state back. For a test that registers its own: in the Extension Host leg `engineTrust.ts` keeps its
+ * own record of what it registered, and clearing the client's state behind its back would leave the
+ * two out of step.
  */
 export function snapshotEngineTrustAnchors(): () => void {
   const saved = new Map(trustAnchors);
+  const savedPins = pinnedHosts;
   return () => {
     trustAnchors.clear();
     for (const [key, pem] of saved) {
       trustAnchors.set(key, pem);
     }
+    pinnedHosts = savedPins;
   };
+}
+
+/**
+ * The error a request to `url` fails with WITHOUT being sent, or `undefined` when it may be sent.
+ *
+ * Refused: an https URL whose `host:port` a `caFile` pins and that has no anchor registered. With no
+ * `ca`, Node verifies against its default roots, so a publicly signed certificate for that host would
+ * pass, which is what pinning it excludes. The code is a trust failure ({@link CAFILE_UNREAD_CODE}),
+ * so {@link withRenewalRetry} hands it to the failure handler, which reads the file; a GET then runs
+ * once more with the anchor. Every other URL is unaffected: an unpinned host keeps the default roots,
+ * and the loopback engine keeps the certificate `messagefoundry.serviceConfig` names.
+ */
+export function pinRefusal(url: URL): NetworkError | undefined {
+  if (url.protocol !== "https:") {
+    return undefined;
+  }
+  const key = engineHostKey(url.href);
+  if (key === undefined || !pinnedHosts.has(key) || trustAnchors.has(key)) {
+    return undefined;
+  }
+  return new NetworkError(trustRemedy(CAFILE_UNREAD_CODE, url.origin) ?? "", CAFILE_UNREAD_CODE);
 }
 
 /** The anchor registered for `url`'s engine, if any. The ONE lookup: {@link tlsOptions} and
@@ -484,6 +532,11 @@ function postReply(
       reject(new Error(`invalid engine URL: ${baseUrl}`));
       return;
     }
+    const refused = pinRefusal(url);
+    if (refused !== undefined) {
+      reject(refused);
+      return;
+    }
     const payload = Buffer.from(JSON.stringify(body), "utf8");
     const headers: Record<string, string | number> = {
       "Content-Type": "application/json",
@@ -564,6 +617,11 @@ function getOnce<T>(
       url = new URL(baseUrl.replace(/\/+$/, "") + route);
     } catch {
       reject(new Error(`invalid engine URL: ${baseUrl}`));
+      return;
+    }
+    const refused = pinRefusal(url);
+    if (refused !== undefined) {
+      reject(refused);
       return;
     }
     const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};

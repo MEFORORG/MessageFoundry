@@ -207,9 +207,18 @@ export const TLS_TRUST_CODES: readonly string[] = [
   "CERT_UNTRUSTED",
 ];
 
-/** True when `code` is one of {@link TLS_TRUST_CODES}. */
+/**
+ * Our own code for a request refused BEFORE it was sent: its `host:port` is pinned by an https
+ * `caFile`, and no certificate from that file is registered yet (BACKLOG #1695). Sending it would
+ * verify against Node's default roots, which a pin exists to exclude. Not in {@link TLS_TRUST_CODES},
+ * whose remedy is a different one, but a trust failure all the same ({@link isTlsTrustError}), so the
+ * failure handler reads the file and the next request carries it.
+ */
+export const CAFILE_UNREAD_CODE = "MF_CAFILE_UNREAD";
+
+/** True when `code` is one of {@link TLS_TRUST_CODES}, or {@link CAFILE_UNREAD_CODE}. */
 export function isTlsTrustError(code: string | undefined): boolean {
-  return code !== undefined && TLS_TRUST_CODES.includes(code);
+  return code !== undefined && (code === CAFILE_UNREAD_CODE || TLS_TRUST_CODES.includes(code));
 }
 
 /**
@@ -232,6 +241,14 @@ export function isTlsTrustError(code: string | undefined): boolean {
 export function trustRemedy(code: string | undefined, url: string): string | undefined {
   if (!isTlsTrustError(code)) {
     return undefined;
+  }
+  if (code === CAFILE_UNREAD_CODE) {
+    return (
+      `not sent to ${url}: its caFile in \`messagefoundry.environments\` has not been read yet, or ` +
+      `could not be read as a PEM certificate, and a pinned engine is never verified against the ` +
+      `default CAs. Check that the file exists and is readable from this machine; each refused request ` +
+      `reads it again, and the MessageFoundry Engine log names what went wrong.`
+    );
   }
   const head = `cannot verify the TLS certificate ${url} presented (${code}).`;
   return isLocalEngine(url)

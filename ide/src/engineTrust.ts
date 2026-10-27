@@ -11,6 +11,7 @@ import { engineUrl, environments, isExecGated, runJson, serviceConfig, workspace
 import {
   clearEngineTrustAnchors,
   setEngineTrustAnchor,
+  setPinnedEngineHosts,
   setTrustFailureHandler,
 } from "./engineClient";
 import { engineLog } from "./engineLog";
@@ -207,10 +208,12 @@ function trustState(): string {
  * the local engine's certificate as its CLI reports it.
  *
  * **Fail-soft throughout, and never looser for it.** Nothing here throws. A target this refresh
- * cannot anchor and never anchored is verified against Node's default roots with verification on;
- * the request then fails with a trust error carrying the remedy (`trustRemedy`). A target that WAS
- * anchored keeps its anchor through any failure that proves nothing (see {@link Outcome}), because
- * dropping it would put that target back on the default roots, which trusts more than the anchor did.
+ * cannot anchor and never anchored is verified against Node's default roots with verification on,
+ * unless a usable `caFile` pins it: then engineClient refuses its requests until the file is read
+ * ({@link publishPinnedHosts}). Either way a failing request carries the remedy (`trustRemedy`). A
+ * target that WAS anchored keeps its anchor through any failure that proves nothing (see
+ * {@link Outcome}), because dropping it would put an unpinned target back on the default roots, which
+ * trusts more than the anchor did, and refuse every request to a pinned one.
  *
  * Resolves to true when what the client TRUSTS changed, compared as host keys and PEM contents, so
  * the caller can re-probe rather than leave a stale verdict on screen. Dropping an anchor counts,
@@ -302,6 +305,7 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   const outcomes = new Map<string, Outcome>();
   const targets = pinTargetsOf(environments());
   const pins = trustPinsFor(targets);
+  publishPinnedHosts(pins);
   const claimed = claimedBy(pins);
   // This refresh asks the CLI after any failure noted so far, so it covers that failure.
   lateFailure = undefined;
@@ -336,10 +340,11 @@ async function refreshOnce(followUp: boolean): Promise<boolean> {
   }
   // Swap only now, after the subprocess has answered. Clearing first and then awaiting left EVERY
   // engine unanchored for as long as `cert inventory` ran.
+  const files = pinFilesOf(pins);
   claimedKeys = claimed;
-  pinFiles = pinFilesOf(pins);
+  pinFiles = files;
   commit(outcomes);
-  warnAboutUnanchoredTargets(targets);
+  warnAboutUnanchoredTargets(targets, files);
   return trustState() !== before;
 }
 
@@ -384,6 +389,24 @@ function claimedBy(pins: readonly TrustPin[]): Set<string> {
 /** The usable `caFile` for each host key. */
 function pinFilesOf(pins: readonly TrustPin[]): Map<string, string> {
   return new Map(pins.flatMap((pin) => (pin.kind === "pin" ? [[pin.key, pin.file] as const] : [])));
+}
+
+/** The pins `messagefoundry.environments` names now. */
+function configuredPins(): TrustPin[] {
+  return trustPinsFor(pinTargetsOf(environments()));
+}
+
+/**
+ * Tell engineClient which hosts a usable `caFile` pins, so a request to one with no anchor yet is
+ * refused rather than verified against the default roots (`pinRefusal` there).
+ *
+ * The keys are those of {@link pinFilesOf}, so a refused pin (an http:// url, a relative path) marks
+ * nothing: it has no file that could ever anchor the host. Called SYNCHRONOUSLY from the settings, at
+ * activation, on every settings change and at the start of every refresh, never after a file read,
+ * so no read on a slow share can leave a pinned host on the default roots meanwhile.
+ */
+function publishPinnedHosts(pins: readonly TrustPin[]): void {
+  setPinnedEngineHosts(pinFilesOf(pins).keys());
 }
 
 /**
@@ -792,7 +815,7 @@ export async function followCertificateChange(
   // after the read, so a setting changed meanwhile is seen.
   const fileFor = (): string | undefined =>
     registered.get(key)?.file ??
-    (pinFiles ?? pinFilesOf(trustPinsFor(pinTargetsOf(environments())))).get(key);
+    (pinFiles ?? pinFilesOf(configuredPins())).get(key);
   const file = fileFor();
   // A read already running when this request failed may predate the rotation. Only when it returns
   // the certificate that just failed is the file read again; anything else answers this request.
@@ -847,6 +870,7 @@ export function setEngineTrustLimitsForTest(next: Partial<Limits>): void {
 /** Drop every anchor and reset the failure-refresh state. For the shell test only. */
 export function forgetEngineTrust(): void {
   clearEngineTrustAnchors();
+  setPinnedEngineHosts([]);
   registered.clear();
   claimedKeys = new Set();
   pinFiles = undefined;
@@ -869,11 +893,23 @@ export function forgetEngineTrust(): void {
  * `messagefoundry.serviceConfig` is verified against the default roots only, which is right for a
  * publicly trusted chain and fails for anything else.
  */
-function warnAboutUnanchoredTargets(targets: readonly PinTarget[]): void {
-  const unanchored = targets.filter((t) => {
+function warnAboutUnanchoredTargets(
+  targets: readonly PinTarget[],
+  pinned: ReadonlyMap<string, string>,
+): void {
+  const missing = targets.filter((t) => {
     const key = engineHostKey(t.url);
     return key !== undefined && isHttpsUrl(t.url) && !registered.has(key);
   });
+  const unread = missing.filter((t) => pinned.has(engineHostKey(t.url) ?? ""));
+  const unanchored = missing.filter((t) => !unread.includes(t));
+  if (unread.length > 0) {
+    engineLog().warn(
+      `messagefoundry.environments pins ${unread.length} https target(s) whose caFile has not been ` +
+        `read (${unread.map((t) => t.url).join(", ")}); requests to them are refused until it is, ` +
+        `and never verified against the default roots.`,
+    );
+  }
   if (unanchored.length === 0) {
     return;
   }
@@ -895,6 +931,9 @@ function warnAboutUnanchoredTargets(targets: readonly PinTarget[]): void {
 export function registerEngineTrust(context: vscode.ExtensionContext): void {
   deactivated = false;
   setTrustFailureHandler(followCertificateChange);
+  // Before the first refresh is queued: its file reads may take seconds, and a pinned host must not
+  // be reachable on the default roots meanwhile.
+  publishPinnedHosts(configuredPins());
   context.subscriptions.push({
     dispose: () => {
       setTrustFailureHandler(undefined);
@@ -909,6 +948,7 @@ export function registerEngineTrust(context: vscode.ExtensionContext): void {
         e.affectsConfiguration("messagefoundry.environments") ||
         e.affectsConfiguration("messagefoundry.serviceConfig")
       ) {
+        publishPinnedHosts(configuredPins()); // now, not when the queued refresh starts
         void refreshEngineTrustThenRecheck();
       }
     }),

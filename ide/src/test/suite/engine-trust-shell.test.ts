@@ -18,8 +18,11 @@
 // a node-side test cannot have are stubbed: the `vscode` module and the CLI subprocess.
 import * as assert from "assert";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+
+import { CAFILE_UNREAD_CODE } from "../../engineTrustModel";
 
 /** What the stubbed `vscode.workspace.getConfiguration("messagefoundry")` answers. */
 interface StubConfig {
@@ -38,6 +41,9 @@ let invocations: { args: string[]; cwd: string | undefined }[];
 let logged: string[];
 /** Called with each logged line, so a test can act at a known point inside a running refresh. */
 let onLog: ((line: string) => void) | undefined;
+type ConfigListener = (e: { affectsConfiguration(section: string): boolean }) => void;
+/** The settings-change listener `registerEngineTrust` subscribed last, so a test can fire it. */
+let configListener: ConfigListener | undefined;
 
 function log(line: string): void {
   logged.push(line);
@@ -54,7 +60,10 @@ const vscodeStub = {
       get: (key: string, fallback: unknown): unknown =>
         key in stubConfig ? (stubConfig as unknown as Record<string, unknown>)[key] : fallback,
     }),
-    onDidChangeConfiguration: () => ({ dispose: (): void => {} }),
+    onDidChangeConfiguration: (listener: ConfigListener) => {
+      configListener = listener;
+      return { dispose: (): void => {} };
+    },
   },
   window: {
     createOutputChannel: () => ({
@@ -1268,5 +1277,179 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
     assert.strictEqual(await trust.followCertificateChange(REMOTE, undefined), true);
     assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+  });
+
+  // ---- round 5: a caFile-pinned host never falls back to the default roots ----
+
+  /**
+   * A loopback TCP listener that counts connections and drops each one, so a test can tell a request
+   * refused before it was sent (no connection) from one sent and failed. It is not TLS, so a request
+   * that IS sent fails its handshake; that failure is the control's evidence, not a defect.
+   */
+  async function countingListener(): Promise<{ url: string; connections: () => number }> {
+    let count = 0;
+    const server = net.createServer((socket) => {
+      count++;
+      socket.destroy();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    held.push(() => server.close());
+    return {
+      url: `https://127.0.0.1:${(server.address() as net.AddressInfo).port}`,
+      connections: () => count,
+    };
+  }
+
+  /** Install the production failure handler for one test; teardown puts the old one back. */
+  function withFollowHandler(): void {
+    const previous = engineClient.setTrustFailureHandler(trust.followCertificateChange);
+    held.push(() => engineClient.setTrustFailureHandler(previous));
+  }
+
+  test("a pinned host with no anchor is refused before it is sent, not verified against the default roots", async () => {
+    const target = await countingListener();
+    const caFile = path.join(ws, "pki", "late-ca.pem");
+    stubConfig.environments = [{ name: "PROD", url: target.url, caFile }];
+    withFollowHandler();
+    await trust.refreshEngineTrust();
+
+    await assert.rejects(
+      () => engineClient.getJson(target.url, "/health", undefined, 2000),
+      (e: unknown) =>
+        e instanceof engineClient.NetworkError &&
+        e.code === CAFILE_UNREAD_CODE &&
+        e.message.includes("messagefoundry.environments"),
+    );
+    await assert.rejects(
+      () => engineClient.postJson(target.url, "/config/reload", {}, undefined, 2000),
+      (e: unknown) => e instanceof engineClient.NetworkError && e.code === CAFILE_UNREAD_CODE,
+    );
+    assert.strictEqual(target.connections(), 0, "a request to a pinned host was sent with no anchor");
+  });
+
+  test("an unpinned remote still goes out on the default roots, and loopback is unchanged: the controls", async () => {
+    const target = await countingListener();
+    stubConfig.environments = [{ name: "PROD", url: target.url }];
+    stubInventory = plantedEngine();
+    await trust.refreshEngineTrust();
+
+    await assert.rejects(
+      () => engineClient.getJson(target.url, "/health", undefined, 2000),
+      (e: unknown) => e instanceof engineClient.NetworkError && e.code !== CAFILE_UNREAD_CODE,
+    );
+    assert.strictEqual(target.connections(), 1, "an unpinned host must be sent as before");
+    assert.strictEqual(engineClient.tlsOptions(new URL(target.url)).ca, undefined);
+    assert.strictEqual(engineClient.pinRefusal(new URL(REMOTE)), undefined);
+    // The loopback engine keeps the certificate serviceConfig names, and is not refused.
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+    assert.strictEqual(engineClient.pinRefusal(new URL(LOOPBACK)), undefined);
+  });
+
+  test("the refusal is a trust failure: the follow reads the caFile and the retry goes out with it", async () => {
+    const target = await countingListener();
+    const caFile = path.join(ws, "pki", "late-ca.pem");
+    stubConfig.environments = [{ name: "PROD", url: target.url, caFile }];
+    withFollowHandler();
+    await trust.refreshEngineTrust();
+    plantCert(path.join("pki", "late-ca.pem")); // the share mounted after the refresh
+
+    await assert.rejects(
+      () => engineClient.getJson(target.url, "/health", undefined, 2000),
+      // Sent, with the anchor; it fails only because the listener is not TLS.
+      (e: unknown) => e instanceof engineClient.NetworkError && e.code !== CAFILE_UNREAD_CODE,
+    );
+    assert.strictEqual(target.connections(), 1, "the follow never read the caFile, so nothing was retried");
+    assert.strictEqual(engineClient.tlsOptions(new URL(target.url)).ca, PEM);
+    assert.strictEqual(engineClient.pinRefusal(new URL(target.url)), undefined);
+  });
+
+  test("a pin is in force from the setting, before any file read or CLI answer", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    let duringCli: unknown = "not observed";
+    childProcess.execFile = cliThatFirst(() => {
+      duringCli = engineClient.pinRefusal(new URL(REMOTE))?.code;
+    });
+
+    await trust.refreshEngineTrust();
+
+    assert.strictEqual(
+      duringCli,
+      CAFILE_UNREAD_CODE,
+      "a pinned host was open to the default roots while the refresh ran",
+    );
+    assert.strictEqual(engineClient.pinRefusal(new URL(REMOTE)), undefined, "the read landed");
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+  });
+
+  test("activation publishes the pins synchronously, before its first refresh has read anything", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    const subscriptions: { dispose(): unknown }[] = [];
+    held.push(() => subscriptions.forEach((d) => d.dispose()));
+
+    trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
+
+    assert.strictEqual(engineClient.pinRefusal(new URL(REMOTE))?.code, CAFILE_UNREAD_CODE);
+    await settle();
+    assert.strictEqual(engineClient.pinRefusal(new URL(REMOTE)), undefined);
+  });
+
+  test("a pin added in the settings is in force at once, before the refresh it starts reads it", async () => {
+    const subscriptions: { dispose(): unknown }[] = [];
+    held.push(() => subscriptions.forEach((d) => d.dispose()));
+    configListener = undefined;
+    trust.registerEngineTrust({ subscriptions } as unknown as import("vscode").ExtensionContext);
+    await settle();
+    const listener = configListener as ConfigListener | undefined;
+    assert.ok(listener !== undefined, "no settings listener was subscribed");
+    assert.strictEqual(engineClient.pinRefusal(new URL(REMOTE)), undefined);
+
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    listener({ affectsConfiguration: (s) => s === "messagefoundry.environments" });
+
+    assert.strictEqual(engineClient.pinRefusal(new URL(REMOTE))?.code, CAFILE_UNREAD_CODE);
+    await settle();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+  });
+
+  test("removing the pin returns the host to the default roots", async () => {
+    const DR = "https://dr.example.com:8765";
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [
+      { name: "PROD", url: REMOTE, caFile },
+      { name: "DR", url: DR, caFile: path.join(ws, "pki", "missing.pem") },
+    ];
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+    assert.strictEqual(engineClient.pinRefusal(new URL(DR))?.code, CAFILE_UNREAD_CODE);
+
+    stubConfig.environments = [
+      { name: "PROD", url: REMOTE },
+      { name: "DR", url: DR },
+    ];
+    await trust.refreshEngineTrust();
+
+    for (const url of [REMOTE, DR]) {
+      assert.strictEqual(engineClient.tlsOptions(new URL(url)).ca, undefined, url);
+      assert.strictEqual(engineClient.pinRefusal(new URL(url)), undefined, url);
+    }
+  });
+
+  test("a refused caFile (http://, relative) does not mark its host as pinned", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [
+      { name: "PROD", url: REMOTE, caFile: "pki/prod-ca.pem" },
+      { name: "PLAIN", url: "http://plain.example.com:8765", caFile },
+    ];
+    await trust.refreshEngineTrust();
+
+    assert.strictEqual(engineClient.pinRefusal(new URL(REMOTE)), undefined);
+    assert.strictEqual(engineClient.pinRefusal(new URL("https://plain.example.com:8765")), undefined);
+    // The control: an https entry with a full path does pin the host, read or not.
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile: path.join(ws, "pki", "missing.pem") }];
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.pinRefusal(new URL(REMOTE))?.code, CAFILE_UNREAD_CODE);
   });
 });

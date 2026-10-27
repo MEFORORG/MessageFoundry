@@ -32,6 +32,7 @@ import {
 } from "../../engineClient";
 import { describeNetworkCode } from "../../engineStatusModel";
 import {
+  CAFILE_UNREAD_CODE,
   TLS_TRUST_CODES,
   engineHostKey,
   isFullyQualifiedPath,
@@ -256,6 +257,19 @@ suite("a trust failure is not an absent engine (BACKLOG #1695)", () => {
       /nothing is listening/,
     );
     assert.match(describeNetworkCode("CERT_HAS_EXPIRED", "https://127.0.0.1:8765"), /expired/);
+  });
+
+  test("a request refused for an unread caFile is a trust failure that names the setting", () => {
+    // A trust failure, so the failure handler reads the file and the request is not called absent.
+    assert.ok(isTlsTrustError(CAFILE_UNREAD_CODE));
+    for (const url of ["https://prod-host:8765", "https://127.0.0.1:8765"]) {
+      const text = describeNetworkCode(CAFILE_UNREAD_CODE, url);
+      assert.strictEqual(text, trustRemedy(CAFILE_UNREAD_CODE, url));
+      assert.match(text, /caFile in `messagefoundry\.environments`/);
+      assert.match(text, /never verified against the default CAs/);
+      // Not the serviceConfig remedy: a pinned host never takes that certificate.
+      assert.ok(!/serviceConfig/.test(text), text);
+    }
   });
 });
 

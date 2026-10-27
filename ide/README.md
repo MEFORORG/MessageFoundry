@@ -257,6 +257,14 @@ set `caFile` on its `messagefoundry.environments` entry (or on one engine shard)
   the same `host:port` is anchored as if it were absent. The setting is machine-scoped, so a checked-in
   `.vscode/settings.json` cannot add or change a pin. An engine shard without its own `caFile` uses
   its environment's.
+- **A `caFile`-pinned host never falls back to the default CAs.** From the moment the setting names
+  a usable `caFile` (a full path on an https entry), a request to that `host:port` is sent only with
+  a certificate read from that file. Until the file has been read, or while it cannot be read as a
+  PEM certificate, the request is refused before it is sent, with an error naming the `caFile` in
+  `messagefoundry.environments`. That refusal reads the file again, so a GET that was refused only
+  because the file had not been read yet is retried once with it. A `caFile` that is refused (a
+  relative path, or an `http://` entry) pins nothing, so that host verifies against the default
+  roots as if no `caFile` were set. Remove the `caFile` to put a host back on the default roots.
 - A refused or unreadable `caFile` is named in the **MessageFoundry Engine** log, and so is an https
   target that has no anchor at all.
 
