@@ -8046,6 +8046,11 @@ class RegistryRunner:
 
     # --- delivery path -------------------------------------------------------
 
+    def _repend_fence(self) -> RependFence:
+        """The lease a worker claims under, read before its claim (BACKLOG #1611), so a lease
+        change during the pass, not only during the re-pend, fences the retries."""
+        return RependFence.capture(self._coordinator.is_leader, self._coordinator.current_epoch)
+
     async def _repend_claimed_on_fault(
         self,
         worker: str,
@@ -8053,6 +8058,7 @@ class RegistryRunner:
         ids: Sequence[str],
         *,
         faults: _WorkerFaultLog | None = None,
+        fence: RependFence | None = None,
         abandon: Callable[[], bool] | None = None,
         give_up_after: int | None = None,
     ) -> HoldResult:
@@ -8081,7 +8087,8 @@ class RegistryRunner:
           next start, as a cancelled worker's are; the backoff is :meth:`_stop_or_sleep`, and the
           task stays cancellable.
         * Leadership and the lease's epoch gate the retries, not the first write, through the
-          :class:`~messagefoundry.pipeline.stage_dispatcher.RependFence`, which says why. Not the
+          :class:`~messagefoundry.pipeline.stage_dispatcher.RependFence`, which says why; each
+          caller passes the one it read before its claim (:meth:`_repend_fence`). Not the
           leader, the worker keeps holding the lane, so a stop returns ``STOPPED`` and a flap under
           the same lease resumes the retry; leading under another lease returns ``SUPERSEDED``.
         * ``abandon``, read at the base interval through each backoff, returns ``ABANDONED``. The
@@ -8113,8 +8120,8 @@ class RegistryRunner:
         if not ids:
             return HoldResult.LANDED
         rows = list(ids)
-        # Read before the first write, which can hang across a flap.
-        fence = RependFence.capture(self._coordinator.is_leader, self._coordinator.current_epoch)
+        if fence is None:  # read before the first write, which can hang across a flap
+            fence = self._repend_fence()
         # Without a worker's `faults` (#1844), this call logs on its own backoff and closes it.
         own = FailureRun()
         failures = 0
@@ -8220,6 +8227,7 @@ class RegistryRunner:
         claimed: list[str] = []
         faults = _WorkerFaultLog("delivery", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
+            fence = self._repend_fence()  # #1611: the lease this pass claims under
             # #122 (ADR 0189) THE CLAIM GATE, per_lane half: the application log is unwritable and this
             # process has fail-closed, so this lane must not deliver no matter which door started it.
             # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state
@@ -8358,6 +8366,7 @@ class RegistryRunner:
                     name,
                     claimed,
                     faults=faults,
+                    fence=fence,
                     abandon=lambda: not self._lane_may_deliver(name),
                 )
                 if held is HoldResult.STOPPED:
@@ -8831,6 +8840,7 @@ class RegistryRunner:
         guard appends the extras' ids to it, and the worker's arm re-pends head and extras in ONE
         write. Two writes for one failed pass would record twice on the worker's backoff, doubling
         its count and pinning the extras' line to positions the schedule never emits."""
+        fence = self._repend_fence()  # #1611: before the extras are claimed
         members: list[OutboxItem] = [head]
         try:
             return await self._deliver_coalesced_batch(name, cfg, members)
@@ -8856,6 +8866,7 @@ class RegistryRunner:
                     "batch delivery",
                     name,
                     extras,
+                    fence=fence,
                     abandon=lambda: not self._lane_may_deliver(name),
                     give_up_after=(
                         self._infra_fault_stop_after if self._infra_fault_policy == "stop" else None
@@ -9180,6 +9191,7 @@ class RegistryRunner:
         claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("router", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
+            fence = self._repend_fence()  # #1611: the lease this pass claims under
             # #122 (ADR 0162): the application log is unwritable and this process has fail-closed.
             # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state a
             # STOP-policy halt leaves, re-armed by restarting this inbound.
@@ -9229,7 +9241,9 @@ class RegistryRunner:
                 # back off, and keep going (mirrors the delivery worker). #1844: with a backoff.
                 faults.failed(exc, "router worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                held = await self._repend_claimed_on_fault("router", name, claimed, faults=faults)
+                held = await self._repend_claimed_on_fault(
+                    "router", name, claimed, faults=faults, fence=fence
+                )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
@@ -9556,6 +9570,7 @@ class RegistryRunner:
         claimed: list[str] = []  # #1611: the row this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("response", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
+            fence = self._repend_fence()  # #1611: the lease this pass claims under
             if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
                 return
             try:
@@ -9578,7 +9593,9 @@ class RegistryRunner:
                 # log, back off, keep going (mirrors the router/delivery workers). #1844: with a backoff.
                 faults.failed(exc, "response worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                held = await self._repend_claimed_on_fault("response", name, claimed, faults=faults)
+                held = await self._repend_claimed_on_fault(
+                    "response", name, claimed, faults=faults, fence=fence
+                )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
@@ -9656,6 +9673,7 @@ class RegistryRunner:
         claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("transform", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
+            fence = self._repend_fence()  # #1611: the lease this pass claims under
             if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
                 return
             try:
@@ -9707,7 +9725,7 @@ class RegistryRunner:
                 )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 held = await self._repend_claimed_on_fault(
-                    "transform", name, claimed, faults=faults
+                    "transform", name, claimed, faults=faults, fence=fence
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start

@@ -114,15 +114,15 @@ class HoldResult(Enum):
 @dataclass(frozen=True)
 class RependFence:
     """The leadership a held re-pend's RETRIES are gated on (BACKLOG #1611). The first write is
-    always sent (ADR 0157 C1); a retry only while this node leads under the lease it held at the
-    fault. :meth:`capture` reads that lease before the first write, since a hung first write can
-    span a flap.
+    always sent (ADR 0157 C1); a retry only while this node leads under the lease it claimed the
+    rows under. Callers :meth:`capture` that lease before the claim's work runs, so a flap during
+    that work, or during a hung first write, is seen.
 
     The epoch bumps only when the lease changes owner, so a node that regains the lease after
     another node led holds a newer one, and that node may have claimed these rows meanwhile:
     ``reschedule_claimed`` is fenced only by ``status='inflight'``, so a retry would re-pend the
     successor's claim, a duplicate send. :meth:`superseded` reads that. A node that was not the
-    leader at the fault cannot tell who led since, so it never retries after regaining the lease.
+    leader at the capture cannot tell who led since, so it never retries after regaining the lease.
     A ``None`` epoch while leading, a single node, keeps no fence: there is no second writer.
 
     What is left is the window between the check and the write, a flap inside one store round
@@ -1388,6 +1388,9 @@ class StageDispatcher:
         ``release_claimed``'d (attempts restored, FIFO-neutral) on a park/stop/exception. The final
         state mutation runs synchronously after the (async) tail release so it is atomic on the loop
         (no double-dispatch window)."""
+        # BACKLOG #1611: the lease these rows were claimed under, read before the body runs, so a
+        # lease change during the body or the first re-pend still fences the retries.
+        fence = RependFence.capture(self._is_leader, self._current_epoch)
         outcome, tail_ids, head_reschedule = await self._drain_lane(lane, items)
         # Fix A (ADR 0070): re-pend the T17 head with a DURABLE backoff BEFORE the tail release.
         # This is NOT release_claimed: it dates the head into the future so it reads not-due (collapsing
@@ -1401,10 +1404,9 @@ class StageDispatcher:
         # bound) sends no further retry and runs the terminal transition below, as before step 2
         # after one failed write; the rows stay in flight and the in-flight watch pages them.
         #
-        # When the head's hold did not land, the tail release is sent once, as before step 2, but
-        # only while this node leads under the lease it held at the fault: the write is no longer
-        # at fault time, and a successor may hold those rows. _land_while_holding says the rest.
-        fence = RependFence.capture(self._is_leader, self._current_epoch)
+        # After a head re-pend, the tail's first write is fenced too, since it is no longer at
+        # fault time and a successor may hold those rows; when the head's hold did not land, that
+        # write is sent once, as before step 2. _land_while_holding says the rest.
         head = tail = HoldResult.LANDED
         if head_reschedule is not None:
             head_id, when = head_reschedule
@@ -1428,10 +1430,10 @@ class StageDispatcher:
         if tail_ids:
             release = functools.partial(self._store.release_claimed, tail_ids)
             what = f"release_claimed of {len(tail_ids)} row(s)"
-            if head is HoldResult.LANDED:
-                tail = await self._land_while_holding(lane, what, release, fence)
-            elif not fence.may_write():
+            if head_reschedule is not None and not fence.may_write():
                 tail = HoldResult.SUPERSEDED
+            elif head is HoldResult.LANDED:
+                tail = await self._land_while_holding(lane, what, release, fence)
             else:
                 tail = await self._write_once(lane, what, release, head)
         unlanded = (head is not HoldResult.LANDED) + (
@@ -1458,9 +1460,11 @@ class StageDispatcher:
                 unlanded,
                 (head if head is not HoldResult.LANDED else tail).name.lower(),
             )
-        if HoldResult.EXHAUSTED in (head, tail) and outcome.kind is LaneResultKind.RETRY:
-            # The stop policy's bound: _land_while_holding added the hold's failures to the streak,
-            # and _apply_retry STOPs only a zero-progress infra fault, which a failing re-pend is.
+        # The stop policy's bound on a hold: _apply_retry STOPs a lane only for a zero-progress infra
+        # fault at the bound, which a re-pend failing that often is. The streak is raised to the
+        # bound in the RETRY branch below, not here, so a pause that wins skips it untouched.
+        exhausted = HoldResult.EXHAUSTED in (head, tail) and outcome.kind is LaneResultKind.RETRY
+        if exhausted:
             outcome = replace(outcome, is_infra_fault=True, made_progress=False)
         # --- synchronous terminal transition (NO await below) -------------------------------------
         # S_lane (ARM 1): read the episode clock ONCE, here, before the outcome branch — re-reading it
@@ -1509,6 +1513,9 @@ class StageDispatcher:
         elif outcome.kind is LaneResultKind.RETRY:  # T15
             # S_lane DROP: a RETRY head was re-pended, not delivered — no completed service. Occupancy.
             self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=0, service=False)
+            if exhausted:
+                # _apply_retry adds this fault, which reaches infra_fault_stop_after.
+                st.infra_error_streak = max(st.infra_error_streak, self._infra_fault_stop_after - 1)
             self._apply_retry(lane, st, outcome)
         else:  # T16 STOP (content-policy STOP — the InternalErrorPolicy path, untouched by ADR 0070)
             # S_lane DROP: a STOPped lane rendered no completed service either. Occupancy.
@@ -1660,9 +1667,9 @@ class StageDispatcher:
         not held until the store heals. :meth:`_hold_abandoned` says which lanes can be paused.
 
         **At ``infra_fault_stop_after`` consecutive failures the policy decides.** Under ``stop``
-        the hold ends (``EXHAUSTED``) and adds its failures to the lane's ``infra_error_streak``, so
-        :meth:`_apply_retry` STOPs the lane with ``connection_stopped``, as a persistent T17 fault
-        does. Under ``retry_forever`` the hold goes on and raises one ``lane_stuck``
+        the hold ends (``EXHAUSTED``) and :meth:`_run_lane` raises the lane's ``infra_error_streak``
+        to the bound, so :meth:`_apply_retry` STOPs the lane with ``connection_stopped``, as a
+        persistent T17 fault does; a pending pause wins over that, as it does over a T17 STOP. Under ``retry_forever`` the hold goes on and raises one ``lane_stuck``
         (:meth:`_page_held_lane`)."""
         run = FailureRun()
         while True:
@@ -1681,9 +1688,6 @@ class StageDispatcher:
                 )
                 if run.count >= self._infra_fault_stop_after:
                     if self._infra_fault_policy == "stop":
-                        st = self._states.get(lane)
-                        if st is not None:
-                            st.infra_error_streak += run.count
                         return HoldResult.EXHAUSTED
                     if run.count == self._infra_fault_stop_after:
                         self._page_held_lane(lane, what, run.count)
@@ -1705,7 +1709,11 @@ class StageDispatcher:
                 poll=_LANE_ERROR_BACKOFF_SECONDS,
                 sleep=self._slept_into_stop,
                 fence=fence,
-                abandon=functools.partial(self._hold_abandoned, lane),
+                abandon=(
+                    functools.partial(self._hold_abandoned, lane)
+                    if self._stage is Stage.OUTBOUND
+                    else None  # never paused, so its backoff is one sleep, not 1 s polls
+                ),
                 not_leader=functools.partial(
                     log.warning,
                     "StageDispatcher %s lane %s: %s failed %d time(s) and this node is not the "
