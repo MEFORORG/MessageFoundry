@@ -630,7 +630,7 @@ class _CrlAkid:
     """A CRL's own Authority Key Identifier, read once per CRL for :func:`_akid_fit` (vault
     BACKLOG #3506). ``serial`` is the serial the CRL carries, ``issuers`` the directory names it
     carries in :func:`_issuer_name_key` form, and ``der`` its value. ``der`` is the bytes the CRL
-    carries wherever :func:`_crl_akid_span` finds them, and ``cryptography``'s encoding of the
+    carries wherever :func:`_crl_akid_spans` finds them, and ``cryptography``'s encoding of the
     value only where it does not."""
 
     key_identifier: bytes | None
@@ -651,10 +651,11 @@ class _CrlExtensions:
 
 def _crl_extensions(crl: x509.CertificateRevocationList) -> _CrlExtensions:
     """``crl``'s extensions, read without ``cryptography``'s warning about a serial number that is
-    not positive (vault BACKLOG #3506). **It encodes the CRL's DER again**, which on a long CRL
-    costs more than its parse: measured 2026-10-27 on Windows, CPython 3.14, ``cryptography``
+    not positive (vault BACKLOG #3506). **It encodes the CRL's DER again**, which costs more than
+    the parse on a long CRL: measured 2026-10-27 on Windows, CPython 3.14, ``cryptography``
     50.0.2, about 28 ms for a 2.9 MB CRL of 100,000 entries, against about 16 ms to parse it.
-    :func:`_signature_state` reads it only for a CRL some listed CA is named for.
+    :func:`judge_every_crl` pays that for every CRL, beside the encode its fingerprint takes.
+    :func:`_signature_state` pays it only for a CRL some listed CA is named for.
 
     A CRL's Authority Key Identifier can carry its CA's serial, and a CRL from a root with serial
     0 can carry 0 there. ``cryptography`` warns when it reads that extension, and where warnings
@@ -669,13 +670,10 @@ def _crl_extensions(crl: x509.CertificateRevocationList) -> _CrlExtensions:
     the block by name: a duplicate extension, and at least a general name ``cryptography`` does
     not support and, where warnings are errors, any other deprecation it warns of."""
     der = crl.public_bytes(serialization.Encoding.DER)
-    found = _crl_akid_span(der)
-    serials = [] if found is None else _not_positive_spans(der, found)
+    found = _crl_akid_spans(der)
+    copy = der if found is None else _positive_copy(der, found[1])
     try:
-        if serials:
-            extensions = x509.load_der_x509_crl(_positive_copy(der, serials)).extensions
-        else:
-            extensions = crl.extensions
+        extensions = crl.extensions if copy == der else x509.load_der_x509_crl(copy).extensions
         akid = extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
     except x509.ExtensionNotFound:
         return _CrlExtensions(extensions, None)
@@ -684,21 +682,25 @@ def _crl_extensions(crl: x509.CertificateRevocationList) -> _CrlExtensions:
     except (x509.UnsupportedGeneralNameType, CryptographyDeprecationWarning) as exc:
         raise ValueError(f"its extensions do not read ({type(exc).__name__}: {exc})") from exc
     serial = akid.authority_cert_serial_number
-    if serials:
-        serial = int.from_bytes(der[slice(*serials[0])], "big", signed=True)
+    raw = akid.public_bytes()
+    if found is not None:
+        value, serials = found
+        raw = der[slice(*value)]
+        if copy != der:  # the parsed serial is the copy's
+            serial = int.from_bytes(der[slice(*serials[0])], "big", signed=True)
     issuers = frozenset(
         _issuer_name_key(name.value)
         for name in akid.authority_cert_issuer or ()
         if isinstance(name, x509.DirectoryName)
     )
-    raw = akid.public_bytes() if found is None else der[slice(*found)]
     return _CrlExtensions(extensions, _CrlAkid(akid.key_identifier, serial, issuers, raw))
 
 
-def _crl_akid_span(der: bytes) -> tuple[int, int] | None:
+def _crl_akid_spans(der: bytes) -> tuple[tuple[int, int], list[tuple[int, int]]] | None:
     """Where the CRL ``der``'s own Authority Key Identifier sits, as the content span of its
-    ``extnValue``. ``None`` when it carries none, carries more than one, or the bytes do not have
-    that shape; the parse then judges them. A TBSCertList's extensions are under tag ``[0]``."""
+    ``extnValue``, and the content spans of the serials it carries. ``None`` when it carries
+    none, carries more than one, or the bytes do not have that shape; the parse then judges
+    them. A TBSCertList's extensions are under tag ``[0]``."""
     try:
         fields = _tbs_fields(der)
         if fields is None:
@@ -709,18 +711,11 @@ def _crl_akid_span(der: bytes) -> tuple[int, int] | None:
             if field.tag == 0xA0
             for value in _akid_values(der, field.start, field.end)
         ]
+        if len(values) != 1:
+            return None
+        return values[0], _akid_serials(der, values[0])
     except MalformedDer:
         return None
-    return values[0] if len(values) == 1 else None
-
-
-def _not_positive_spans(der: bytes, value: tuple[int, int]) -> list[tuple[int, int]]:
-    """The serials in the Authority Key Identifier at ``value`` that :func:`_not_positive`
-    holds, as content spans; none when the bytes do not have that shape."""
-    try:
-        return [span for span in _akid_serials(der, value) if _not_positive(der[slice(*span)])]
-    except MalformedDer:
-        return []
 
 
 #: The 26 ASCII capitals to their lower case, and no other character.

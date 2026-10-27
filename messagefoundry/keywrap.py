@@ -200,9 +200,10 @@ def _children(buf: bytes, tlv: _Tlv) -> list[_Tlv]:
 
 
 #: The DER reader under public names, for :mod:`messagefoundry.pki`'s read of the serial
-#: numbers in a CA and in a CRL's authority key identifier (vault BACKLOG #3506). One reader, so the two modules cannot drift apart on what they
-#: accept. It reads definite lengths and single-byte tags, and does not insist that a long-form
-#: length is minimal, so it accepts some BER that is not DER.
+#: numbers in a CA and in a CRL's authority key identifier (vault BACKLOG #3506). One reader, so
+#: the two modules cannot drift apart on what they accept. It reads definite lengths and
+#: single-byte tags, and does not insist that a long-form length is minimal, so it accepts some
+#: BER that is not DER.
 MalformedDer = _Malformed
 DerTlv = _Tlv
 read_der_tlv = _read_tlv

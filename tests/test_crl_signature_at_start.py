@@ -23,7 +23,6 @@ All material is synthetic and minted here. No PHI.
 
 from __future__ import annotations
 
-import base64
 import datetime
 import ssl
 import warnings
@@ -1054,9 +1053,9 @@ def _crl_naming_serial(
     assert der.count(akid_serial) == 1
     der = der.replace(akid_serial, akid_serial[:-1] + bytes([serial]))
     if x400:
-        span = pki_module._crl_akid_span(der)
-        assert span is not None
-        akid_tlv = read_der_tlv(der, *span)
+        found = pki_module._crl_akid_spans(der)
+        assert found is not None
+        akid_tlv = read_der_tlv(der, *found[0])
         (names,) = [part for part in der_children(der, akid_tlv) if part.tag == 0xA1]
         assert der[names.start] == 0xA4  # directoryName, [4]
         der = der[: names.start] + b"\xa3" + der[names.start + 1 :]  # x400Address, [3]
@@ -1072,13 +1071,8 @@ def _crl_naming_serial(
         + signature
     )
     whole = b"\x30" + _der_length(len(body)) + body
-    return _pem_from_der(whole)
-
-
-def _pem_from_der(der: bytes) -> bytes:
-    """``der`` as a PEM CRL, without parsing it."""
-    text = base64.encodebytes(der).decode("ascii")
-    return f"-----BEGIN X509 CRL-----\n{text}-----END X509 CRL-----\n".encode("ascii")
+    # The parse reads no extension, so this neither warns nor raises for what was edited.
+    return x509.load_der_x509_crl(whole).public_bytes(_PEM)
 
 
 _NOT_POSITIVE = pytest.mark.parametrize("serial", [0x00, 0x80], ids=["zero", "negative"])
@@ -1119,19 +1113,18 @@ def test_a_crl_key_identifier_serial_is_kept_as_the_crl_carries_it(serial: int) 
     naming serial 1 do not score alike."""
     key = ec.generate_private_key(ec.SECP256R1())
     now = _NOW.timestamp()
+    pem = _crl_naming_serial(key, key, serial)
     with warnings.catch_warnings():
         warnings.simplefilter("error", CryptographyDeprecationWarning)
-        ((_, odd),) = pki_module.judge_every_crl(_crl_naming_serial(key, key, serial), now=now)
+        ((_, odd),) = pki_module.judge_every_crl(pem, now=now)
     ((_, one),) = pki_module.judge_every_crl(_crl_naming_serial(key, key, 0x01), now=now)
     assert odd.selection[1] is not None and one.selection[1] is not None
     assert odd.selection[1] != one.selection[1]
     # The bytes differ in the serial alone, and the CRL's own carries ``serial``.
     carried = bytes([0x82, 0x01, serial])
     assert odd.selection[1].replace(carried, b"\x82\x01\x01") == one.selection[1]
-    # The fingerprint is still the CRL's own.
-    pem = _crl_naming_serial(key, key, 0x01)
-    ((_, block),) = pki_module.judge_every_crl(pem, now=now)
-    assert block.fingerprint == x509.load_pem_x509_crl(pem).fingerprint(hashes.SHA256())
+    # The fingerprint is the CRL's own, not the rewritten copy's.
+    assert odd.fingerprint == x509.load_pem_x509_crl(pem).fingerprint(hashes.SHA256())
 
 
 def test_a_crl_whose_extensions_do_not_read_is_refused_by_name(tmp_path: Path) -> None:
@@ -1139,7 +1132,7 @@ def test_a_crl_whose_extensions_do_not_read_is_refused_by_name(tmp_path: Path) -
     raised out of the start as itself, naming neither the setting nor the file. One such is a
     general name of a type it does not support, which OpenSSL loads. It refuses by name now."""
     key = ec.generate_private_key(ec.SECP256R1())
-    ca_file = tmp_path / "zero-serial-ca.pem"
+    ca_file = tmp_path / "ca.pem"  # serial 1: this test is not about the serial
     ca_file.write_text(ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key, 0x01)), "ascii")
     crl = tmp_path / "crl.pem"
     unread = _crl_naming_serial(key, key, 0x01, x400=True)
