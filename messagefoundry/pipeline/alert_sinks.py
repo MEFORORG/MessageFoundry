@@ -557,9 +557,20 @@ def send_plain_email(
     msg = EmailMessage()
     msg["Subject"] = subject
     envelope.address(msg)
-    msg.set_content(body)  # plain-text part is always kept (never HTML-only)
-    if html_body is not None:
-        msg.add_alternative(html_body, subtype="html")
+    # set_content() and add_alternative() encode with a bare str.encode(). A body holding a lone
+    # surrogate raises UnicodeEncodeError, whose text names the character and whose `.object` is the
+    # whole body, and the notifier logs a failed send with exc_info. Keep only the type name, and
+    # raise outside the handler so neither chain link holds that error (vault BACKLOG #3011; the
+    # same shape as the Email destination's body arm).
+    failure = ""
+    try:
+        msg.set_content(body)  # plain-text part is always kept (never HTML-only)
+        if html_body is not None:
+            msg.add_alternative(html_body, subtype="html")
+    except UnicodeError as exc:
+        failure = type(exc).__name__
+    if failure:
+        raise ValueError(f"{ALERTS_SMTP_CELL}: the alert body could not be encoded ({failure})")
     with smtplib.SMTP(host, port, timeout=timeout) as smtp:
         if use_tls:
             # context= is REQUIRED (#323): starttls()'s own default verifies NOTHING.
@@ -577,7 +588,9 @@ def send_plain_email(
                 channel_encrypted=use_tls,
                 cell=ALERTS_SMTP_CELL,
             )
-        envelope.send(smtp, msg)
+        # A partial RCPT refusal raises a NegativeAckError that names the cell and two counts, never
+        # an address, so the notifier's exc_info log line is safe to write (vault BACKLOG #2924).
+        envelope.send(smtp, msg, cell=ALERTS_SMTP_CELL)
 
 
 class EmailTransport:

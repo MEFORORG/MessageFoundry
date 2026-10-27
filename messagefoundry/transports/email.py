@@ -12,6 +12,9 @@ plain-text SMTP message to a configured server and maps the outcome onto the eng
 - **a body that cannot be encoded for the configured ``encoding``** maps to the permanent, content-free
   :class:`~messagefoundry.transports.base.NegativeAckError` that
   :func:`~messagefoundry.transports.base.encode_wire_body` raises (dead-lettered, never retried).
+- **a relay that refuses some recipients and accepts the rest** maps to a permanent
+  ``partial-refusal`` :class:`~messagefoundry.transports.base.NegativeAckError` naming two counts
+  and no address (:meth:`CheckedEnvelope.send`; dead-lettered, never retried).
 
 Standard library only (``smtplib`` + ``email.message``) — no new dependency (ADR 0029 §"What this
 must not break"; CLAUDE.md §7). The synchronous SMTP core is **lifted** from
@@ -269,9 +272,37 @@ class CheckedEnvelope:
         msg["From"] = list(self.from_header)
         msg["To"] = list(self.to_header)
 
-    def send(self, smtp: smtplib.SMTP, msg: EmailMessage) -> None:
-        """Submit ``msg`` with ``MAIL FROM`` and ``RCPT TO`` taken from the checked addresses."""
-        smtp.send_message(msg, from_addr=self.sender, to_addrs=list(self.recipients))
+    def send(self, smtp: smtplib.SMTP, msg: EmailMessage, *, cell: str = "SMTP") -> None:
+        """Submit ``msg`` with ``MAIL FROM`` and ``RCPT TO`` taken from the checked addresses.
+
+        ``smtplib`` raises only when the relay refuses EVERY recipient. When it refuses some, the
+        send succeeds and ``send_message`` returns the refused ones in a dict, so a message one of
+        two recipients never got would read as delivered. A non-empty dict is therefore a failed
+        delivery: a permanent :class:`~messagefoundry.transports.base.NegativeAckError` with code
+        ``partial-refusal``, which the delivery worker dead-letters at once (vault BACKLOG #2924).
+        Permanent because the relay already accepted the message for the other recipients, so a
+        retry would send them a duplicate every attempt; a replay of the dead-lettered row is the
+        operator's choice and re-sends to every recipient. Neither fault flag is set: one mailbox
+        refused is not a fault in the connection, and a config fault would stop the lane.
+
+        The text is ``cell`` and two counts. It holds no address, and none of the relay's reply
+        codes or texts, because a reply text can echo the address. The dict is dropped before the
+        raise, and the raise is in no ``except`` block, so neither the chain nor this frame's locals
+        carry it."""
+        refused = smtp.send_message(msg, from_addr=self.sender, to_addrs=list(self.recipients))
+        if not refused:
+            return
+        # smtplib keys the dict by each to_addrs entry as given, so this counts refused RCPT lines,
+        # a listed-twice address included. The `or` keeps a non-empty dict from reading as zero.
+        refused_count = sum(1 for address in self.recipients if address in refused) or len(refused)
+        del refused
+        raise NegativeAckError(
+            f"{cell}: {refused_count} of {len(self.recipients)} recipients refused",
+            code="partial-refusal",
+            permanent=True,
+            credential_fault=False,
+            config_fault=False,
+        )
 
 
 def checked_envelope(cell: str, sender: str, recipients: Any) -> CheckedEnvelope:
@@ -641,7 +672,9 @@ class EmailDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="EMAIL outbound",
                     )
-                self._envelope.send(smtp, msg)
+                # A partial RCPT refusal raises NegativeAckError, which no arm below catches, so it
+                # reaches the delivery worker as the permanent refusal it is (vault BACKLOG #2924).
+                self._envelope.send(smtp, msg, cell=f"Email {self.host}:{self.port}")
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
             # which escapes the arms below and lands in the delivery worker's catch-all --

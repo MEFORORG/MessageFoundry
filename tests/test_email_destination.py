@@ -764,6 +764,9 @@ class _WireCapture:
         self.rcpt_lines: list[bytes] = []
         self.data: list[bytes] = []
         self.connections = 0
+        #: Lower-cased mailboxes whose ``RCPT`` gets ``550`` rather than ``250``. One of two refused
+        #: is the partial refusal smtplib reports only through its return value (vault BACKLOG #2924).
+        self.refuse_rcpt: frozenset[bytes] = frozenset()
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
@@ -783,6 +786,12 @@ class _WireCapture:
                         self.mail_lines.append(line)
                     if verb == b"RCPT":
                         self.rcpt_lines.append(line)
+                        mailbox = line.partition(b"<")[2].partition(b">")[0].lower()
+                        if mailbox in self.refuse_rcpt:
+                            # The reply echoes the mailbox, as many relays do, so a test can show
+                            # the refusal text does not carry it on.
+                            conn.sendall(b"550 <" + mailbox + b"> no such mailbox\r\n")
+                            continue
                     if verb == b"DATA":
                         conn.sendall(b"354 go\r\n")
                         for body in reader:
@@ -845,6 +854,59 @@ async def test_the_rcpt_line_on_the_wire_names_exactly_the_checked_address(
     # The To: header is built from the same checked list, so the display name does not reach it.
     [to_line] = [line for line in wire.data if line.lower().startswith(b"to:")]
     assert to_line.rstrip(b"\r\n") == b"To: a@hospital.example, b.c+d@HOSPITAL.example"
+
+
+# --- a partial RCPT refusal is a failed delivery (vault BACKLOG #2924) -------
+#
+# smtplib raises only when the relay refuses every recipient. With one of two refused it sends the
+# message to the other and returns the refusal in a dict, which the envelope used to drop.
+
+#: The mailbox the capture listener refuses. Its RCPT reply echoes it, as many relays do.
+_PARTIAL_REFUSED = "b@hospital.example"
+_PARTIAL_RECIPIENTS = ["a@hospital.example", _PARTIAL_REFUSED]
+
+
+def assert_partial_refusal(exc: NegativeAckError, cell: str, wire: _WireCapture) -> None:
+    """The refusal is permanent, no connection fault, and names ``cell`` and two counts. No address
+    reaches its text, any rendering of it, its chain, or a dict in a frame its traceback holds."""
+    assert exc.code == "partial-refusal"
+    assert exc.permanent is True
+    assert exc.credential_fault is False
+    assert exc.config_fault is False
+    assert str(exc) == f"{cell}: 1 of 2 recipients refused"
+    rendered = " | ".join(
+        [str(exc), repr(exc), safe_exc(exc), "".join(traceback.format_exception(exc))]
+    ).lower()
+    for address in _PARTIAL_RECIPIENTS:
+        assert address not in rendered
+    assert exc.__cause__ is None and exc.__context__ is None
+    tb = exc.__traceback__
+    while tb is not None:
+        for value in tb.tb_frame.f_locals.values():
+            assert not (isinstance(value, dict) and _PARTIAL_REFUSED in value), (
+                "a frame the traceback holds still carries the refused-recipients dict"
+            )
+        tb = tb.tb_next
+    # The relay accepted the other recipient and took the message, which is why it is not retried.
+    assert len(wire.rcpt_lines) == 2
+    assert wire.data
+
+
+async def test_a_partial_rcpt_refusal_fails_the_email_delivery(wire: _WireCapture) -> None:
+    wire.refuse_rcpt = frozenset({_PARTIAL_REFUSED.encode()})
+    dest = _wire_dest(wire.port, _PARTIAL_RECIPIENTS)
+    check_egress_allowed(dest, _wire_egress(wire.port))
+    with pytest.raises(NegativeAckError) as caught:
+        await EmailDestination(dest).send("PID|1|synthetic")
+    assert_partial_refusal(caught.value, f"Email 127.0.0.1:{wire.port}", wire)
+
+
+async def test_every_recipient_accepted_is_still_a_delivery(wire: _WireCapture) -> None:
+    # The control: the same listener with no refusal, so the test above fails for the refusal alone.
+    dest = _wire_dest(wire.port, _PARTIAL_RECIPIENTS)
+    check_egress_allowed(dest, _wire_egress(wire.port))
+    assert await EmailDestination(dest).send("PID|1|synthetic") is None
+    assert len(wire.rcpt_lines) == 2
 
 
 def _quote() -> str:

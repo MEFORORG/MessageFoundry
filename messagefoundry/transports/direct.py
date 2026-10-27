@@ -809,7 +809,9 @@ class DirectDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="DIRECT outbound",
                     )
-                self._envelope.send(smtp, msg)
+                # A partial RCPT refusal raises NegativeAckError, which no arm below catches, so it
+                # reaches the delivery worker as the permanent refusal it is (vault BACKLOG #2924).
+                self._envelope.send(smtp, msg, cell=f"Direct {self.host}:{self.port}")
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
             # which escapes the arms below and lands in the delivery worker's catch-all --
