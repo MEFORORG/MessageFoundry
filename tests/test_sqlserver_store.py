@@ -5918,13 +5918,74 @@ async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> No
     the round count; the shared module is what keeps this leg and the Postgres one asking the same
     question rather than two hand-synced copies drifting apart.
 
-    THIS BACKEND'S NUMBER IS UNMEASURED. The 30 rounds were measured against Postgres, whose lock is
-    a different mechanism under a different snapshot rule. What this leg establishes on a real SQL
-    Server, nobody has yet read -- the gated ``sqlserver-store`` CI job carries its first result.
+    This backend's own lock-removed result is recorded in that module too; read it there rather
+    than here. The negative control below re-measures it whenever the gated ``sqlserver-store`` job
+    runs, and that job's log carries the printed line.
     """
     from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
 
     await assert_concurrent_finalize_reaches_processed(store)
+
+
+async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
+    store, monkeypatch, capsys
+) -> None:
+    """NEGATIVE CONTROL for the test above: with ONLY the finalize applock removed, the race shows.
+
+    WHY THIS EXISTS (BACKLOG #1610). A race test that passes proves nothing unless it can also fail:
+    the benign interleaving can win every round over a store carrying no lock at all. The Postgres
+    arm was shown to fail with its lock removed, and two CI jobs showed the same here (recorded in
+    ``tests/_finalize_race_contract``). A recorded sample is not a standing proof, so this control
+    re-runs the proof instead of relying on the record. This test is a STANDING
+    expected-red-under-patch control: it removes the lock on every run and
+    asserts the race is observable, so a change that made the test above blind (a pool of one, a
+    serialised ``mark_done``, a round body that stopped racing) turns THIS test red instead of
+    leaving the positive test green for the wrong reason.
+
+    ONLY the finalize lock is removed. ``SqlServerStore._applock`` also takes at least the schema
+    and audit-append locks, so it is wrapped, not replaced: a resource starting
+    ``mefor:finalize:`` is skipped and counted, everything else runs. Every ``mark_done`` must skip
+    at least once, so a renamed resource string, or a finalize that stopped going through
+    ``_applock`` (the batched and sync twins issue ``sp_getapplock`` directly), fails this loudly
+    rather than passing it with the lock still in place.
+
+    The per-round failure rate is printed outside pytest's capture, so the ``sqlserver-store`` job
+    log carries it on a pass as well as a failure. That line is this backend's measurement.
+    """
+    from tests._finalize_race_contract import FINALIZE_RACE_ROUNDS, count_round_statuses
+
+    real_applock = store._applock
+    skipped = 0
+
+    async def _applock_without_finalize(cur: Any, resource: str) -> None:
+        nonlocal skipped
+        if resource.startswith("mefor:finalize:"):
+            skipped += 1
+            return
+        await real_applock(cur, resource)
+
+    monkeypatch.setattr(store, "_applock", _applock_without_finalize)
+
+    statuses = await count_round_statuses(store, rounds=FINALIZE_RACE_ROUNDS)
+    missed = FINALIZE_RACE_ROUNDS - statuses[MessageStatus.PROCESSED.value]
+    with capsys.disabled():
+        print(
+            f"\n[#1610 control] finalize applock removed: {missed} of {FINALIZE_RACE_ROUNDS} rounds "
+            f"not PROCESSED ({missed / FINALIZE_RACE_ROUNDS:.2f} per round); statuses "
+            f"{dict(statuses)}; {skipped} finalize applock calls skipped"
+        )
+
+    assert skipped >= 2 * FINALIZE_RACE_ROUNDS, (
+        f"{skipped} finalize applock calls skipped for {2 * FINALIZE_RACE_ROUNDS} mark_done calls, "
+        "so some finalize still took its lock -- the resource was renamed, or mark_done stopped "
+        "finalizing through _applock; this control did not remove the lock it claims to"
+    )
+    assert missed > 0, (
+        f"all {FINALIZE_RACE_ROUNDS} rounds reached PROCESSED with the finalize applock removed, so "
+        "the positive test above cannot fail on this backend. Causes include at least: a per-round "
+        "race rate low enough for 30 rounds to miss, a round body that no longer races, a pool that "
+        "serialises the two mark_done calls, or a new serialisation inside mark_done"
+    )
 
 
 async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> None:
