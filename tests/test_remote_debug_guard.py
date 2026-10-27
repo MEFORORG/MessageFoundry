@@ -862,7 +862,7 @@ import sys
 import time
 import warnings
 
-log, out = sys.argv[1:3]
+out, log = sys.argv[1:3]
 logging.basicConfig(filename=log, level=logging.WARNING)
 from messagefoundry import remotedebug
 
@@ -894,18 +894,7 @@ pathlib.Path(out).write_text(f"logged={logged}", encoding="utf-8")
 def test_a_refusal_in_a_forked_child_is_logged(tmp_path: Path) -> None:
     """Against a real interpreter and a real fork. Before the fix the child counted the refusal
     and logged nothing, because no reporter ran there."""
-    script = tmp_path / "fork_probe.py"
-    script.write_text(_FORK_PROBE, encoding="utf-8")
-    out = tmp_path / "fork.txt"
-    proc = subprocess.run(
-        [sys.executable, str(script), str(tmp_path / "engine.log"), str(out)],
-        env=_child_env(),
-        capture_output=True,
-        text=True,
-        timeout=50,
-    )
-    assert proc.returncode == 0 and out.exists(), proc.stderr[-2000:]
-    reading = out.read_text(encoding="utf-8")
+    reading = _run_probe(tmp_path, _FORK_PROBE, tmp_path / "fork.txt", str(tmp_path / "engine.log"))
     if reading == "unguarded":
         pytest.skip("the child interpreter does not accept injected scripts, or its hook is out")
     assert reading == "logged=True"
@@ -1228,22 +1217,28 @@ finally:
 _GUARD_NEEDS = {"messagefoundry", "messagefoundry.controlchars", "messagefoundry.remotedebug"}
 
 
-def _install_probe(tmp_path: Path, mode: str) -> dict[str, object]:
-    script = tmp_path / "install_probe.py"
-    script.write_text(_INSTALL_PROBE, encoding="utf-8")
-    out = tmp_path / f"{mode}.json"
+def _run_probe(tmp_path: Path, source: str, out: Path, *args: str) -> str:
+    """Run ``source`` in a fresh interpreter that accepts injected scripts, with ``out`` and
+    ``args`` as its arguments, and return what it wrote to ``out``."""
+    script = tmp_path / "probe.py"
+    script.write_text(source, encoding="utf-8")
     try:
         proc = subprocess.run(
-            [sys.executable, str(script), str(out), mode],
+            [sys.executable, str(script), str(out), *args],
             env=_child_env(),
             capture_output=True,
             text=True,
             timeout=50,  # under the suite's per-test watchdog, so a hung probe is reported here
         )
     except subprocess.TimeoutExpired as exc:
-        pytest.fail(f"the install probe did not finish: {exc.stderr!r}")
+        pytest.fail(f"the probe did not finish: {exc.stderr!r}")
     assert proc.returncode == 0 and out.exists(), proc.stderr[-2000:]
-    reading: dict[str, object] = json.loads(out.read_text(encoding="utf-8"))
+    return out.read_text(encoding="utf-8")
+
+
+def _install_probe(tmp_path: Path, mode: str) -> dict[str, object]:
+    raw = _run_probe(tmp_path, _INSTALL_PROBE, tmp_path / f"{mode}.json", mode)
+    reading: dict[str, object] = json.loads(raw)
     if reading["enabled"] is not True:
         # An interpreter built without the interface. Nothing was measured, in either direction.
         pytest.skip("the child interpreter does not accept injected scripts")

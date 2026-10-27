@@ -3800,7 +3800,9 @@ def create_app(
     configured_log_level: str | None = None,
 ) -> FastAPI:
     # Vault BACKLOG #3673, defect 3: an application that builds the API without the command line
-    # gets the remote-debugging hook here, first, rather than late or never.
+    # gets the remote-debugging hook here, rather than late or never. It goes in after the API's
+    # imports, so a script injected while they load still runs. Installing at import would put a
+    # permanent audit hook in every process that imports the package, which this does not.
     # messagefoundry/remotedebug.py says what the hook does and when a repeat call adds a copy.
     install_remote_debug_guard()
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
