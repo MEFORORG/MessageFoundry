@@ -24,12 +24,16 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
-from messagefoundry.config.settings import RetentionSettings
+from messagefoundry.config.settings import EgressSettings, RetentionSettings
+from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline.retention import RetentionRunner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
+from messagefoundry.transports import file as file_transport
 from messagefoundry.transports.base import (
+    ArchiveGuard,
     ProcessedArchive,
-    archive_dir_key,
+    build_archive_guard,
     guarded_source_dirs,
 )
 from messagefoundry.transports.file import FileSource
@@ -60,7 +64,14 @@ def _never() -> bool:
 
 
 def _prune(src: FileSource, protected: frozenset[Path] = frozenset()) -> int:
-    return src._prune_processed(_CUTOFF, frozenset(archive_dir_key(p) for p in protected), _never)
+    return src._prune_processed(_CUTOFF, build_archive_guard(protected), _never)
+
+
+@pytest.fixture(autouse=True)
+def _mtime_keyed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX keys the sweep on the later of mtime and ctime, and a test cannot make an old ctime, so
+    these tests age a file by its mtime alone. The ctime test undoes this."""
+    monkeypatch.setattr(file_transport, "_archived_at", lambda st: st.st_mtime)
 
 
 def test_the_window_is_auto_bounded_at_the_body_window() -> None:
@@ -238,7 +249,8 @@ async def test_a_stopping_source_stops_its_sweep(tmp_path: Path) -> None:
     src._stop.set()
 
     assert (
-        await src.prune_processed_archive(_CUTOFF, protected=frozenset(), deadline_hit=_never) == 0
+        await src.prune_processed_archive(_CUTOFF, protected=ArchiveGuard(), deadline_hit=_never)
+        == 0
     )
     assert old.exists()
 
@@ -253,6 +265,55 @@ def test_the_file_source_declares_its_guarded_directories(tmp_path: Path) -> Non
     assert guarded_source_dirs(config) == (inbox, inbox / "bad")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX keys on ctime; Windows stamps by handle")
+def test_posix_ages_a_copy_from_its_ctime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A copy whose old mtime the stamp could not replace still ages from its archive: the move set
+    its ctime, which nobody can set back.
+
+    Mutation: make `_archived_at` return `st.st_mtime`. Red."""
+    monkeypatch.undo()
+    src = _source(tmp_path / "in")
+    copy = _aged(src.processed_dir / "kept-mtime.hl7", 90)  # ctime is now
+
+    assert _prune(src) == 0
+    assert copy.exists()
+
+
+def test_an_aliased_protected_directory_is_refused_once_opened(tmp_path: Path) -> None:
+    """The guard names B's watch directory by another path that the path compare cannot join (here a
+    link). The opened archive is recognised by identity.
+
+    Mutation: drop the `_opened_id(dest) in guard.ids` check. Red."""
+    real = tmp_path / "shared"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(real, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"cannot create a symbolic link here: {exc}")
+    a = _source(tmp_path / "a", processed_subdir=str(real))
+    a_copy = _aged(real / "done.hl7", 90)
+    guard = ArchiveGuard(keys=frozenset({"unrelated"}), ids=build_archive_guard({alias}).ids)
+
+    assert a._prune_processed(_CUTOFF, guard, _never) == 0
+    assert a_copy.exists()
+
+
+def test_the_registry_runner_guards_an_unbound_file_inbound(tmp_path: Path) -> None:
+    """`archive_guard_dirs` reads the configuration, so an inbound that never started is named."""
+    inbox = tmp_path / "stopped"
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "IB_STOPPED", ConnectionSpec(ConnectorType.FILE, {"directory": str(inbox)}), router="r"
+        )
+    )
+    runner = RegistryRunner(reg, None, egress=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]
+
+    assert runner.processed_archives() == ()
+    assert runner.archive_guard_dirs() == (inbox, inbox / ".error")
+
+
 def test_a_missing_archive_directory_is_not_an_error(tmp_path: Path) -> None:
     assert _prune(_source(tmp_path / "in")) == 0
 
@@ -262,7 +323,7 @@ def test_the_deadline_stops_the_sweep_between_files(tmp_path: Path) -> None:
     for i in range(3):
         _aged(src.processed_dir / f"old-{i}.hl7", 90)
 
-    assert src._prune_processed(_CUTOFF, frozenset(), lambda: True) == 0
+    assert src._prune_processed(_CUTOFF, ArchiveGuard(), lambda: True) == 0
     assert len(list(src.processed_dir.iterdir())) == 3
 
 

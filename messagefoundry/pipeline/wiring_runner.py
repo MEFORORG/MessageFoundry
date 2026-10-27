@@ -227,6 +227,7 @@ from messagefoundry.transports.base import (
     ReplyBodyDropped,
     SyncReplyResolver,
     check_file_key,
+    declares_guarded_dirs,
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
@@ -3059,6 +3060,8 @@ class RegistryRunner:
         deletes nothing, because a guard that silently drops a directory fails open."""
         dirs: list[Path] = []
         for ic in self.registry.inbound.values():
+            if not declares_guarded_dirs(ic.spec.type):
+                continue  # a fault in an inbound with no directories cannot hide one
             try:
                 settings = resolve_env_settings(
                     ic.spec.settings, self._env_values, connection=inbound_record_name(ic.name)
@@ -3066,7 +3069,7 @@ class RegistryRunner:
                 dirs.extend(
                     guarded_source_dirs(Source(type=ic.spec.type, name=ic.name, settings=settings))
                 )
-            except (WiringError, ValueError) as exc:
+            except (WiringError, ValueError, TypeError, KeyError) as exc:
                 log.warning(
                     "inbound connection %r: its directories could not be resolved for the "
                     "[retention].processed_archive_days guard (%s)",

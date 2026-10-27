@@ -30,7 +30,7 @@ import operator
 import os
 import re
 import ssl
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -60,7 +60,10 @@ __all__ = [
     "SyncReplyResolver",
     "ProcessedFileLedger",
     "ProcessedArchive",
+    "ArchiveGuard",
     "archive_dir_key",
+    "build_archive_guard",
+    "declares_guarded_dirs",
     "guarded_source_dirs",
     "FILE_KEY_SCHEME",
     "FILE_KEY_SCHEMES",
@@ -637,27 +640,48 @@ class ProcessedArchive(Protocol):
     the local File source's ``.processed`` (owner ruling A2 of 2026-10-08, BACKLOG #1188).
 
     The retention runner reads these from the live graph each pass and never imports a transport. It
-    hands every archive, as ``protected``, the :func:`archive_dir_key` of each watch and ``.error``
+    hands every archive, as ``protected``, an :class:`ArchiveGuard` over each watch and ``.error``
     directory any registry inbound names, bound or not (:func:`guarded_source_dirs`), so one whose
     archive directory is, or holds, any of those deletes nothing: a misconfigured ``processed_subdir``
     must never let an age sweep reach undelivered drops or the ``.error`` copies, whose deletion nobody
-    has ruled on (#3335)."""
+    has ruled on (#3335). ``archiving`` says whether this source writes the archive at all; one that
+    does not is protected but never swept."""
 
     directory: Path
     processed_dir: Path
     error_dir: Path
 
+    @property
+    def archiving(self) -> bool: ...
+
     async def prune_processed_archive(
         self,
         older_than: float,
         *,
-        protected: frozenset[str],
+        protected: ArchiveGuard,
         deadline_hit: Callable[[], bool],
     ) -> int:
         """Delete archived files whose archive time is before ``older_than`` (epoch seconds), and
-        return how many went. A file it cannot remove is skipped and tried again next pass; an
-        ``OSError`` that escapes (a failed alternate credential, say) the caller contains."""
+        return how many went. A file it cannot remove is skipped and tried again next pass. Only an
+        ``OSError`` may escape, and the caller contains it."""
         ...
+
+
+@dataclass(frozen=True)
+class ArchiveGuard:
+    """What an archive sweep must not reach (BACKLOG #1188).
+
+    ``keys`` holds each guarded directory's :func:`archive_dir_key`, for the check before the archive
+    directory is opened. ``ids`` holds the ``(st_dev, st_ino)`` of each guarded directory and of every
+    directory above one, for the check once it is open: an archive directory that is, or holds, a
+    guarded one under another name (a UNC path and the local path of one share, a bind mount, a DFS
+    link, a lexical ``x/..``) is recognised by what was actually opened."""
+
+    keys: frozenset[str] = frozenset()
+    ids: frozenset[tuple[int, int]] = frozenset()
+
+    def __or__(self, other: ArchiveGuard) -> ArchiveGuard:
+        return ArchiveGuard(self.keys | other.keys, self.ids | other.ids)
 
 
 def archive_dir_key(path: Path) -> str:
@@ -666,6 +690,37 @@ def archive_dir_key(path: Path) -> str:
     case then reads them as one, which can only make the sweep refuse more, never reach further.
     Blocking (``realpath``), and it can raise ``OSError`` on an unreachable share."""
     return os.path.normcase(os.path.realpath(path)).casefold()
+
+
+def build_archive_guard(dirs: Iterable[Path]) -> ArchiveGuard:
+    """The :class:`ArchiveGuard` over ``dirs``. Blocking (``realpath``, ``stat``).
+
+    A directory that cannot be resolved, a share this identity cannot reach say, is compared by its
+    absolute path instead, so one unreachable directory does not switch the whole sweep off. One that
+    cannot be stat'ed adds no identity, and nor does an identity of inode 0, which some file systems
+    report for every directory and which would otherwise match them all."""
+    keys: set[str] = set()
+    ids: set[tuple[int, int]] = set()
+    for path in dirs:
+        try:
+            here = Path(os.path.realpath(path))
+        except (OSError, ValueError):
+            here = Path(os.path.abspath(path))
+        keys.add(os.path.normcase(str(here)).casefold())
+        for candidate in (here, *here.parents):
+            try:
+                st = os.stat(candidate)
+            except (OSError, ValueError):
+                continue
+            if st.st_ino:
+                ids.add((st.st_dev, st.st_ino))
+    return ArchiveGuard(frozenset(keys), frozenset(ids))
+
+
+def declares_guarded_dirs(kind: ConnectorType) -> bool:
+    """Whether the inbound connector registered for ``kind`` declares directories no archive sweep
+    may reach (:func:`guarded_source_dirs`)."""
+    return callable(getattr(_SOURCES.get(kind), "guarded_dirs", None))
 
 
 def guarded_source_dirs(config: Source) -> tuple[Path, ...]:
