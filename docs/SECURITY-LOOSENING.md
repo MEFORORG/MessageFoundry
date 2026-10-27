@@ -1776,8 +1776,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
     caller who can restart the engine adds a read at each start and stop.
   - **No file name.** The injecting process chooses the script's name, so neither the row nor
     the alert carries it. The engine's log output can still hold the name. Usually it is in the
-    refusal's WARNING line, bounded and escaped. In the case below where the guard reads as
-    missing, the interpreter writes the full path to standard error instead. Some refusals have
+    refusal's WARNING line, bounded and escaped. Where another audit hook refuses the script
+    ahead of the guard, as a point below says, the interpreter writes the full path to standard
+    error instead. Some refusals have
     no line with the name at all. At least these do: one past the backlog of 64, one still
     waiting to be logged when the process exits, and every one where the thread that writes the
     lines could not start.
@@ -1854,20 +1855,41 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `pythonw -m messagefoundry.tray`, has the interface on. That process hands over to the branded
   relaunch. Where branding is unavailable, or the branded child exits at once, it runs the whole
   tray itself with the interface on.
-- **`remote_debug_unguarded`: the interface is on, and the hook is not installed.** A process the
-  operating system lets attach could run Python inside the engine, with the store key, the
-  connection secrets and the messages in flight. An application that builds the API without
-  `serve` reports this, until something in it imports the command-line module, which installs
-  the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
-  in at least two cases. Both need an audit hook that something else added to the process first.
-  In one, that hook refused the engine's, so the engine's hook is missing and an injected script
-  runs. In the other, that hook raises on the event the engine uses to ask whether its own hook
-  is there. The engine's hook is then in place and refuses a script, but the entry still reads
-  as unguarded. A refusal in that state writes no WARNING, and the entry shows no count of
-  refusals. The interpreter reports each one on standard error, with the script's full path.
-  The refusal is still counted, so under `serve` the `remote_debug_refused` audit row and alert
-  still come. In the first case nothing is refused, so there is no row and no alert. The entry cannot tell the two cases apart, so read
-  it as the first, and look for what else in the process adds an audit hook.
+- **`remote_debug_unguarded`: the interface is on, and the hook did not answer.** Read it as the
+  hook not installed: a process the operating system lets attach could run Python inside the
+  engine, with the store key, the connection secrets and the messages in flight. An application
+  that builds the API without `serve` reports this, until something in it imports the
+  command-line module, which installs the hook. `messagefoundry/api/tls.py` does that when it
+  writes a key. `serve` would report it in at least two cases. Both need an audit hook that
+  something else added to the process first. In one, that hook refused the engine's, so the
+  engine's hook is missing and an injected script runs. Nothing is refused, so there is no
+  WARNING, no row and no alert. In the other, that hook raises on the event the engine uses to
+  ask whether its own hook is there. The engine's hook is then usually in place and refuses a
+  script, but the entry still reads as unguarded. Where that hook also refused the engine's, as
+  in the first case, the engine's hook is missing and nothing is refused, and the engine cannot
+  tell that from its hook being in. A refusal in the second case is logged as a WARNING and
+  counted like any other, so under `serve` the `remote_debug_refused` audit row and alert come
+  too (vault BACKLOG #3463). Once a refusal is counted, the entry as `GET /security/posture`
+  reads it carries the count, which the first case cannot produce. The serve-time warning is
+  read once, at start, so it carries a count only for a refusal before then. A count says
+  the hook was in at some point, not that it still is, so read the entry as missing either way.
+  In either case a later install call adds the hook again. So a hook the other one refused at
+  import still goes in if that hook stops refusing by the time `serve` or `supervise` makes its
+  own call. In the first case nothing stacks, because the interpreter dropped the hook. In the
+  second a copy can stack, one per install call, and nothing else bounds them. `serve` and
+  `supervise` make at least two calls, at import and then as each starts. Under `python -m`, the
+  `api/tls.py` import above runs the import-time call again, and an application makes one per
+  call it adds. A stacked copy changes no count: the first copy refuses the script, and the
+  interpreter asks no hook after one that raised. Each copy does run on every other audited
+  event, so the hook's per-event cost is paid once per copy. Without a count,
+  the entry cannot tell the cases apart, so read it as the first, and look for what else in the
+  process adds an audit hook.
+- **An audit hook added earlier can refuse a script ahead of the engine's, in any state.** Where
+  it raises on the interpreter's injection event, it refuses the script itself and the engine's
+  hook is never asked, whichever entry the engine reports. The script does not run, but there is
+  no WARNING, no count, no row and no alert, and the interpreter writes the script's full path on
+  standard error. The engine leaves that line, as it is the other hook's and the only record of
+  the refusal.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
   It logs the line a second time once its off-box log forwarder is installed, so the collector's

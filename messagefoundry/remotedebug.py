@@ -128,7 +128,7 @@ REMOTE_DEBUG_ACCEPTANCE_LOOSENING: Final = (
 #: argument is the script's path.
 REMOTE_SCRIPT_EVENT: Final = "cpython.remote_debugger_script"
 
-#: Raised by :func:`_guard_answers` to ask whether the hook is in the interpreter's hook list.
+#: Raised by :func:`_probe` to ask whether the hook is in the interpreter's hook list.
 #: The interpreter has no call that lists audit hooks, and it drops a new hook without an error
 #: when one already installed objects, so asking is the only way to know.
 _PROBE_EVENT: Final = "messagefoundry.remotedebug.probe"
@@ -262,21 +262,35 @@ def _without_own_refusals(
     return hook
 
 
-def _guard_answers() -> bool:
+def _probe() -> bool | None:
+    """Ask the hook whether it is in the interpreter's hook list.
+
+    True: it answered. False: the probe passed every hook and none answered, so it is not in the
+    list. None: a hook raised before the probe reached this one, so the list cannot be read (vault
+    BACKLOG #3463). The interpreter calls hooks in the order they were added and stops at the
+    first that raises, so only an earlier hook can cut the probe off."""
     answer: list[bool] = []
     # never-raise: another audit hook may raise on an event it does not know. That must not stop
-    # `serve` at its first statement or fail the posture route. The reading is then whatever this
-    # hook managed to say, and a hook that could not answer is reported as not installed.
-    with contextlib.suppress(Exception):
+    # `serve` at its first statement or fail the posture route.
+    try:
         sys.audit(_PROBE_EVENT, answer)
+    except Exception:
+        return True if answer else None
     return bool(answer)
 
 
-def install_remote_debug_guard() -> None:
-    """Add the hook to this process, once, when the interpreter accepts injected scripts.
+def _guard_answers() -> bool:
+    """Whether the hook answered. A probe another hook cut off reads as not installed."""
+    return _probe() is True
 
-    Call it as early in the process as possible: a script injected before the call runs. A second
-    call finds the hook answering and adds nothing, and an audit hook cannot be removed.
+
+def install_remote_debug_guard() -> None:
+    """Add the hook to this process when the interpreter accepts injected scripts and the hook
+    does not answer a probe. Behind a hook that cuts the probe off, every call adds a copy.
+
+    Call it as early in the process as possible: a script injected before the call runs. A later
+    call adds nothing once the hook answers, and an audit hook cannot be removed. Each call starts
+    the reporter thread if no earlier call managed to.
 
     A hook that another hook refused, and a reporter thread the interpreter could not start, do
     not raise here. The command line makes this call at import, ahead of everything that could
@@ -286,13 +300,49 @@ def install_remote_debug_guard() -> None:
     Nothing is added where ``sys.is_remote_debug_enabled()`` is False, which is every child started
     through :func:`messagefoundry.childenv.python_child_argv`. The event cannot fire there.
 
-    The hook may still be missing afterwards: the interpreter drops a new hook without an error
-    when one already installed raises on ``sys.addaudithook``. :func:`remote_debug_posture` reports
-    which it is.
+    The probe after the add reads one of three ways (vault BACKLOG #3463), and the install acts on
+    what each one proves:
+
+    - It answered: the hook is in. Later calls find it answering and add nothing.
+    - It passed every hook unanswered (False): the hook is not in the list, for example because
+      an audit hook added earlier raised on ``sys.addaudithook`` and the interpreter dropped the
+      new hook without an error. The quiet wrapper this call put on ``sys.unraisablehook`` comes
+      off, this call starts no reporter, and the next call tries again. Nothing can stack, because
+      the hook is not in the list. A wrapper and a reporter an earlier cut-off call left stay.
+    - An earlier hook raised on the probe event and cut it off (None). The hook may be in behind
+      it, refusing, or that hook may also have refused the add. The quiet wrapper and the reporter
+      stay, so a refusal is logged and its full path is kept off standard error. The posture reads
+      the hook as missing.
+
+    Any call whose first probe does not read True adds the hook, whatever an earlier call read.
+    That keeps the retry for an earlier hook that cuts the probe off and refused the add at
+    import, but no longer refuses it by the time ``serve`` or ``supervise`` makes its own call.
+    The cost is a copy that may stack where the first add did go in behind a cut-off probe: one
+    per call made while the probe stays cut off, and nothing else bounds them. ``serve`` and
+    ``supervise`` make at least two calls, at import and then first in ``_serve`` or
+    ``_supervise``; other subcommands make the import's call. Under
+    ``python -m``, a later import of the command-line module runs the import-time call again, as
+    ``api/tls.py`` does when it writes a key. A stacked copy changes no count: the first copy
+    raises on ``cpython.remote_debugger_script``, and the interpreter stops at the first hook
+    that raises, so a later copy never sees the event. Each copy does run on every other audited
+    event, so the per-event cost the module docstring measures is paid once per copy, and each
+    call that adds also wraps ``sys.unraisablehook`` once more.
+
+    Where ``sys.addaudithook`` raised instead of returning, the hook is not in, so the quiet
+    wrapper is put back and the next call tries again. Nothing is logged there: the command line
+    makes this call before logging is configured, and the posture reports the missing hook.
+
+    One refusal is out of reach in any state. An audit hook added earlier that raises on
+    ``cpython.remote_debugger_script`` refuses the script before the interpreter calls this
+    module's hook. The script does not run, but this module's count, WARNING and audit row never
+    hear of it. The interpreter's report on standard error, with the script's full path, is then
+    the only trace of the refusal. It carries the other hook's exception, so the quiet wrapper
+    passes it on rather than hide the one record that exists.
     """
     if not sys.is_remote_debug_enabled():
         return
     with _install_lock:
+        # A cut-off probe adds too: the docstring says why, and what can stack.
         if not _guard_answers():
             # Quiet first, so no refusal is ever reported with its full path.
             previous = sys.unraisablehook
@@ -300,10 +350,17 @@ def install_remote_debug_guard() -> None:
             # never-raise: a hook already installed may object to this one. The documented
             # contract is that the interpreter swallows a RuntimeError from it and passes on any
             # other exception. Measured on CPython 3.14.6 it swallows a ValueError too, so this
-            # holds the line for an interpreter that does what the documentation says.
-            with contextlib.suppress(Exception):
+            # holds the line for an interpreter that does what the documentation says. A
+            # BaseException such as KeyboardInterrupt still leaves, with the wrapper put back.
+            try:
                 sys.addaudithook(_guard)
-            if not _guard_answers():
+            except BaseException as exc:
+                if sys.unraisablehook is quiet:
+                    sys.unraisablehook = previous
+                if isinstance(exc, Exception):
+                    return
+                raise
+            if _probe() is False:
                 # Dropped: there is nothing to report for, and nothing to quiet.
                 if sys.unraisablehook is quiet:
                     sys.unraisablehook = previous
@@ -351,15 +408,27 @@ def remote_debug_loosening(posture: RemoteDebugPosture) -> tuple[str, str] | Non
     if not posture.interpreter_enabled:
         return None
     if not posture.guard_installed:
+        # A count here says the hook was in at some point, which a hook that never went in cannot
+        # produce. It does not say the hook is in now: a process that can write this one's memory
+        # can remove it. So the entry still says to read it as missing.
+        seen = (
+            f" The hook has refused {posture.refused_scripts} since this process started. That "
+            "says it was in at some point, not that it still is."
+            if posture.refused_scripts
+            else ""
+        )
         return (
             "remote_debug_unguarded",
             "the interpreter's remote debugging (PEP 768) is enabled in this process and the "
-            "engine's refusal hook is NOT installed. A process the operating system lets attach "
-            "to this one, which on Windows includes one running as the same account, could run "
-            "Python inside it with sys.remote_exec, with everything it holds (the store key, "
-            "connection secrets, messages in flight). The `messagefoundry` command line installs "
-            "the hook as it starts. Start the interpreter with -X disable-remote-debug to turn "
-            "the interface off",
+            "engine's refusal hook did NOT answer. Either it is NOT installed (nothing installed "
+            "it, or an audit hook added earlier refused it), or an audit hook added earlier stops "
+            "it from answering. Read it as not installed: a process the operating system lets "
+            "attach to this one, which on Windows includes one running as the same account, "
+            "could run Python inside it with sys.remote_exec, with everything it holds (the store "
+            f"key, connection secrets, messages in flight).{seen} The `messagefoundry` command "
+            "line installs the hook as it starts. Look for what else in the process adds an "
+            "audit hook. Start the interpreter with -X disable-remote-debug to turn the "
+            "interface off",
         )
     refused = (
         f" It has refused {posture.refused_scripts} since this process started."
