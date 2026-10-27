@@ -26,6 +26,7 @@ tests/test_adr0071_crossing_count.py
 tests/test_adr_index_coverage.py
 tests/test_afk_decision_log.py
 tests/test_afk_digest.py
+tests/test_afk_gate.py
 tests/test_afk_kill_switch.py
 tests/test_afk_tripwire.py
 tests/test_ai_provenance_claims.py
@@ -110,6 +111,7 @@ tests/test_coord_cloud_refusal.py
 tests/test_coord_handoff_clear.py
 tests/test_coord_handoff_pointer.py
 tests/test_coord_handoff_report.py
+tests/test_coord_lane_no_ceiling.py
 tests/test_coord_lane_statement.py
 tests/test_coord_lock.py
 tests/test_coord_migrate.py
@@ -243,6 +245,7 @@ tests/test_worktree_install_daily_prune.py
 tests/test_worktree_new_cleanup_advice.py
 tests/test_worktree_new_no_track.py
 tests/test_worktree_prune_merged.py
+tests/test_worktree_remove_discard.py
 tests/test_worktree_remove_path.py
 tests/test_worktree_remove_in_use.py
 tests/test_worktree_remove.py

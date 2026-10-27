@@ -45,6 +45,7 @@ __all__ = [
     "CertFacts",
     "CrlBlock",
     "CrlFacts",
+    "CrlIssuerKey",
     "CrlSignature",
     "crl_signature_refusal",
     "judge_crl_signatures",
@@ -296,9 +297,14 @@ class CrlBlock:
     does not handle. Among equal scores it takes the latest ``thisUpdate``. So ``selection`` holds
     the scope, the key identifier and the critical extension OIDs, and two CRLs score alike only when
     those match. ``fingerprint`` is the SHA-256 of the CRL's DER, so an unchanged CRL is recognised
-    however its PEM is wrapped."""
+    however its PEM is wrapped.
+
+    ``issuer`` is the name as text, for a message. ``issuer_key`` is the name as
+    :func:`_crl_issuer_key` gives it, and every grouping by issuer uses it, never the text (vault
+    BACKLOG #3755). It has no default, so no block can group by a key nobody computed."""
 
     issuer: str
+    issuer_key: CrlIssuerKey
     this_update: datetime.datetime
     next_update: datetime.datetime
     fingerprint: bytes
@@ -362,6 +368,7 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
                     _crl_facts(crl, nxt, now),
                     CrlBlock(
                         issuer=crl.issuer.rfc4514_string(),
+                        issuer_key=_crl_issuer_key(crl.issuer),
                         this_update=crl.last_update_utc,
                         next_update=nxt,
                         fingerprint=crl.fingerprint(hashes.SHA256()),
@@ -504,6 +511,70 @@ def _attribute_key(attribute: x509.NameAttribute[str | bytes]) -> tuple[str, boo
     value = attribute.value
     folded = value.translate(_ASCII_FOLD) if isinstance(value, str) else value
     return attribute.oid.dotted_string, isinstance(value, bytes), folded
+
+
+#: One issuer name as :func:`_crl_issuer_key` gives it: per RDN, in order, the sorted attributes,
+#: each its OID, a string tag (0 for text) and its value.
+CrlIssuerKey = tuple[tuple[tuple[str, int, str | bytes], ...], ...]
+
+#: The ASN.1 tags of the string types OpenSSL compares as text (``ASN1_MASK_CANON`` in its
+#: source): UTF8String, PrintableString, T61String, IA5String, VisibleString, UniversalString
+#: and BMPString.
+_OPENSSL_TEXT_TAGS = frozenset({12, 19, 20, 22, 26, 28, 30})
+
+#: The text types OpenSSL reads one byte to a character, as Latin-1: PrintableString,
+#: T61String, IA5String and VisibleString. ``cryptography`` decodes their bytes as UTF-8.
+_OPENSSL_LATIN1_TAGS = frozenset({19, 20, 22, 26})
+
+
+def _crl_issuer_key(name: x509.Name) -> CrlIssuerKey:
+    """``name`` as :class:`CrlBlock` groups CRLs by issuer (vault BACKLOG #3755).
+
+    OpenSSL compares names by a canonical form, and this follows it in at least three ways. A
+    value in a text type has its ASCII letter case folded, and its text type is dropped. A value
+    in a one-byte text type, such as a T61String, is read as Latin-1, as OpenSSL reads it.
+    A value in any other type keeps its type and is compared exactly, because OpenSSL does not
+    fold it. So ``CN=Partner CA`` and ``CN=PARTNER CA`` are one issuer. A case change outside
+    ASCII, or in a NumericString, is another issuer.
+
+    Grouped by the exact text before, a replacement CRL whose issuer differed only in ASCII case
+    was refused as superseding nothing. Grouped looser than OpenSSL, a reload records a file as
+    applied while the hop goes on checking the CRL it held. Folding case in a NumericString did
+    that, and so did taking ``cryptography``'s UTF-8 reading of a T61String.
+
+    **Where this still differs from OpenSSL, at least.** White space is compared exactly, as
+    :func:`_issuer_name_key` records. Two names OpenSSL takes for one issuer then group apart.
+    That gap is safe: a reload asks for a restart, and a start can refuse a future CRL beside a
+    current one.
+
+    **It reads a private attribute.** The string type comes from ``cryptography``'s
+    ``NameAttribute._type``. If a release drops it, every CRL is refused. A start and a reload
+    name that cause. The expiry monitor's check of a CA file says only that it cannot judge the
+    CRL. Comparing the exact text instead would reopen the T61String gap with no sign.
+
+    **Latin-1 here covers UTF-8 bytes only.** A one-byte text type whose bytes are not valid
+    UTF-8 already fails ``cryptography``'s parse, so the file is refused."""
+    return tuple(tuple(sorted(map(_crl_attribute_key, rdn))) for rdn in name.rdns)
+
+
+def _crl_attribute_key(attribute: x509.NameAttribute[str | bytes]) -> tuple[str, int, str | bytes]:
+    """One attribute as :func:`_crl_issuer_key` compares it. One tag holds one value type, so a
+    ``bytes`` value is never ordered against a ``str`` one."""
+    kind = getattr(attribute, "_type", None)
+    tag = getattr(kind, "value", kind)
+    if not isinstance(tag, int):
+        raise ValueError(
+            "the installed cryptography package no longer exposes the string type of an issuer "
+            "name, so the engine cannot group CRLs by issuer as OpenSSL does. This is an engine "
+            "defect, not a fault in the file"
+        )
+    value = attribute.value
+    if tag in _OPENSSL_TEXT_TAGS and isinstance(value, str):
+        if tag in _OPENSSL_LATIN1_TAGS:
+            # Never ``encode("latin-1")``: it raises above U+00FF, so it would refuse a valid CRL.
+            value = value.encode("utf-8").decode("latin-1")
+        return attribute.oid.dotted_string, 0, value.translate(_ASCII_FOLD)
+    return attribute.oid.dotted_string, tag, value
 
 
 def _signature_state(

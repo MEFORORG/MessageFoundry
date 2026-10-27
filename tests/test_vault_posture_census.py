@@ -77,6 +77,9 @@ _LINKS: dict[str, int | None] = {
     "mount_strict_reply_adapter": None,
     "StrictReplyAdapter": None,
     "_refuse_an_unrevoked_vault_hop": None,
+    # the proxy leg's guard, and the decision both guards share (vault BACKLOG #3561)
+    "_refuse_an_unrevoked_proxy_leg": None,
+    "_crossed_unrevoked": None,
     # check-privileges
     "probe_vault": None,
     "store_vault_client": None,
@@ -368,8 +371,29 @@ _CENSUS: list[Row] = sorted(
             "StrictReplyAdapter",
             "posture",
         ),
+        # The proxy leg's guard (vault BACKLOG #3561): the adapter binds its posture into the
+        # guard it hands its pool classes, and both guards decide through one shared function.
+        (
+            "transports/strict_requests.py",
+            "StrictReplyAdapter.__init__",
+            "_refuse_an_unrevoked_proxy_leg",
+            "posture",
+        ),
+        (
+            "transports/strict_requests.py",
+            "_refuse_an_unrevoked_proxy_leg",
+            "_crossed_unrevoked",
+            "posture",
+        ),
+        (
+            "transports/strict_requests.py",
+            "_refuse_an_unrevoked_vault_hop",
+            "_crossed_unrevoked",
+            "posture",
+        ),
         ("verify/checks.py", "check_lockable_accounts._census", "open_store", "-"),
-        # Strict on purpose; `_client_credential_row`'s docstring says why.
+        # Strict on purpose; `_client_credential_row`'s docstring says why. The posture it
+        # derives in `_serve_crossing` only classifies a refusal and reaches no link.
         ("verify/federation.py", "_client_credential_row", "resolve_secret_provider", "-"),
         ("verify/smoke.py", "check_smoke_disposition._poll", "open_store", "-"),
         ("verify/smoke.py", "check_store_connectivity._open_close", "open_store", "-"),
@@ -461,6 +485,8 @@ _DERIVATIONS = sorted(
         ("api/app.py", "create_managed_app.lifespan", _SERVE_DIAL),
         ("checks.py", "_check_build", "settings.security.enforcement"),
         ("verify/federation.py", "_revocation_row", "settings.security.enforcement"),
+        # Classifies the client-credential row's refusal; the read itself stays strict (#3619).
+        ("verify/federation.py", "_serve_crossing", "settings.security.enforcement"),
     ]
 )
 #: How a derivation may spell the dial: the loaded settings' own field, or a local read from it.

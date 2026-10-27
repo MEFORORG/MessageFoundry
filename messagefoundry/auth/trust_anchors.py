@@ -121,11 +121,46 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     ``restart_required``. The internal CA is checked under ``augment`` or ``pinned`` even when every
     hop is loopback or names its own ``tls_ca_file``, and so never reads it.
 
-    At least four readers come before or outside this check. At start, ``serve`` builds the log
-    forwarder, and the API lifespan starts the alert notifier, before the lifespan runs this
-    preflight, so an alert sent during startup, or the forwarder's first records, use a CA not yet
-    checked. ``supervise`` builds its own forwarder and runs no preflight. The offline security
-    notifier of the recovery commands builds an SMTP hop with no check.
+    **The hops built before this preflight take the checks first** (BACKLOG #3470), through
+    :func:`anchor_refusal`, which writes no audit row. At least four are covered:
+
+    * ``serve`` checks ``[logging].forward_tls_ca_file`` before it builds the log forwarder. A
+      refusal builds no forwarder and logs a WARNING that forwarding is off. ``serve`` hands the
+      refusal to the API lifespan, which refuses the start once this preflight has run. It has
+      its rows when the file can be read, and is marked ``unaudited`` if this preflight passed.
+      At least these run first: the API TLS pair is minted or renewed, the store is created and
+      migrated, and the startup attestation runs and may alert. Their log records reach stdout
+      and the log file but no collector. No listener binds, since uvicorn binds after the
+      lifespan.
+    * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
+      before any engine shard spawns. Its process has no audited preflight, so no row is written.
+    * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
+      notifier with an email transport. It checks only a CA this preflight is given. A refusal
+      builds no email transport, and no alert is suppressed for it. A rule that sent only by
+      email uses the other transports instead. With none there is no notifier, and the logging
+      sink logs each alert, so an email page becomes a log line. This preflight then refuses the
+      start, with its rows when the file can be read. If it passes instead, the file changed or a
+      read failed once. The first refusal is raised then, marked ``unaudited``: no row records
+      it.
+    * The offline security notifier of the recovery commands checks the same CA. A refusal drops
+      the notice with a WARNING and never refuses the recovery.
+
+    Under ``warn`` an exposed or unjudged CA warns and goes on. A file that cannot be read still
+    refuses, at either setting. The forwarder's check prints its warning scrubbed to stderr, since
+    no log handler is installed yet. ``supervise`` logs it again once its forwarder is up, and in
+    ``serve`` this preflight logs it again.
+
+    **Accepted:** these checks keep the check-then-load gap above, since each hop still loads the
+    file by path after its check. A reload adds no second check; this preflight is the reload's.
+
+    **Declined** (BACKLOG #3470). The internal CA check stays for an instance whose hops never
+    read the file, as the paragraph above says. This preflight runs before any graph is loaded,
+    so it cannot tell. A reload can also add a hop that reads the CA. It errs toward refusing.
+    And each spec builder restates its hop's enable conditions rather than sharing one predicate
+    with the hop's builder. One predicate would run
+    through the alert sinks, the security notifier and the forwarder builder. That is a refactor
+    of three modules for a drift no finding has shown. The read and unread tests pin each
+    builder's conditions, not their agreement with the hop.
 11. **The SQL Server store pin** (vault BACKLOG #3714). ``[store].ssl_root_cert`` on SQL Server is
     sent as the ODBC ``ServerCertificate`` pin, under ``Encrypt=strict``, so it is the store hop's
     only trust anchor. :func:`collect_anchor_specs` adds it under the label
@@ -216,8 +251,11 @@ class TrustAnchorError(Exception):
     construction and at reload so the engine refuses a tampered/exposed anchor rather than silently
     trusting it.
 
-    ``unaudited`` is True when the preflight refused the anchor while the store refused one of its
-    ``auth.trust_anchor`` rows (BACKLOG #3091), so the refusal may have no row behind it."""
+    ``unaudited`` is True in two cases where the refusal may have no row behind it. One is when the
+    preflight refused the anchor while the store refused one of its ``auth.trust_anchor`` rows
+    (BACKLOG #3091). The other is when a check before the store opened refused an anchor that the
+    preflight then passed (BACKLOG #3470, module item 10). False does not prove a row exists: a
+    file that cannot be read is refused before any row is written."""
 
     unaudited: bool = False
 
@@ -1105,16 +1143,24 @@ _REFUSED = "[security].enforcement=enforce refuses it"
 _WARNED = "[security].enforcement=warn, using it anyway"
 
 
-def _silent(*_args: object) -> None:
-    """A stand-in for ``log.warning`` that says nothing; see ``quiet`` below."""
+def _log_warning(text: str) -> None:
+    """The default ``warn`` of :func:`_enforce_verdict`: this module's logger, at WARNING."""
+    log.warning("%s", text)
+
+
+def _silent(_text: str) -> None:
+    """A ``warn`` for :func:`_enforce_verdict` that says nothing: for a check whose caller already
+    logged the same warning (:data:`_WARNED_AT_OPEN`). Every refusal is still raised."""
 
 
 def _enforce_verdict(
-    spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: bool, quiet: bool = False
+    spec: AnchorSpec,
+    verdict: AnchorVerdict,
+    *,
+    enforcing: bool,
+    warn: Callable[[str], None] = _log_warning,
 ) -> None:
     """Apply the owner fork to a verdict. Raises :class:`TrustAnchorError` on a fatal violation.
-    With ``quiet`` it logs none of its warnings and still raises every refusal: for a check whose
-    caller already logged the same warning (:data:`_WARNED_AT_OPEN`).
 
     * A pin mismatch always refuses.
     * A group/world-writable DACL, or a path another principal can replace the anchor through,
@@ -1124,34 +1170,37 @@ def _enforce_verdict(
       #1142, slice 3). **A configured pin that matches is the escape**: it warns and loads, at either
       dial, because the bytes it matched are the bytes the context loads. Not for an anchor whose
       consumer reads the file again (``loads_verified_bytes`` False, the outbound CAs, vault
-      BACKLOG #2371): there the pin matched bytes the consumer does not load."""
-    warn = _silent if quiet else log.warning
+      BACKLOG #2371): there the pin matched bytes the consumer does not load.
+
+    ``warn`` takes each warning's text in place of this module's logger. A caller that runs
+    before logging is configured passes it, so it can scrub the text and log it again later.
+    :func:`_silent` logs none of them."""
     if verdict.pin_ok is False:
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
         if enforcing:
             raise TrustAnchorError(f"{_acl_message(spec)}\n{_REFUSED}")
-        warn("%s\n%s", _acl_message(spec), _WARNED)
+        warn(f"{_acl_message(spec)}\n{_WARNED}")
     if verdict.path_ok is False:
         if enforcing:
             raise TrustAnchorError(f"{_path_message(spec, verdict)}\n{_REFUSED}")
-        warn("%s\n%s", _path_message(spec, verdict), _WARNED)
+        warn(f"{_path_message(spec, verdict)}\n{_WARNED}")
     if verdict.acl_ok is not None and verdict.path_ok is not None:
         return
     # BACKLOG #1142, slice 3. Slice 2 made the checked bytes the loaded bytes, which is what lets a
     # pin stand in for a read the file system would not give.
     unknown = _indeterminate_message(spec, verdict)
     if verdict.pin_ok is True and spec.loads_verified_bytes:
+        pin = spec.pin_setting or "the configured SHA-256 pin"
         warn(
-            "%s\n%s matches the bytes read, and those are the bytes loaded, so it is loaded anyway",
-            unknown,
-            spec.pin_setting or "the configured SHA-256 pin",
+            f"{unknown}\n{pin} matches the bytes read, and those are the bytes loaded, so it is "
+            "loaded anyway"
         )
         return
     fix = _indeterminate_fix(spec, verdict)
     if enforcing:
         raise TrustAnchorError(f"{unknown}\n{fix}\n{_REFUSED}")
-    warn("%s\n%s\n%s", unknown, fix, _WARNED)
+    warn(f"{unknown}\n{fix}\n{_WARNED}")
 
 
 def _warned_state(verdict: AnchorVerdict) -> tuple[object, ...] | None:
@@ -1192,6 +1241,25 @@ def enforced_anchor(
 def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
     """:func:`enforced_anchor`, returning only the fingerprint."""
     return enforced_anchor(spec, enforcing=enforcing).fingerprint
+
+
+def anchor_refusal(
+    spec: AnchorSpec, *, enforcing: bool, warn: Callable[[str], None] = _log_warning
+) -> TrustAnchorError | None:
+    """:func:`enforce_anchor`, returning its refusal rather than raising it, or ``None`` when the
+    anchor passes. A file that cannot be read is a refusal that names its setting, as it is in the
+    audited preflight. It writes no audit row: it serves a hop built before the store is open
+    (BACKLOG #3470), and the audited preflight still runs once the store is. ``warn`` is
+    :func:`_enforce_verdict`'s."""
+    try:
+        _enforce_verdict(spec, evaluate_anchor(spec), enforcing=enforcing, warn=warn)
+    except TrustAnchorError as exc:
+        return exc
+    except (OSError, ValueError) as exc:
+        refusal = _unreadable_anchor(spec, exc)
+        refusal.__cause__ = exc
+        return refusal
+    return None
 
 
 def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
@@ -1589,11 +1657,7 @@ def alerts_email_anchor_spec(alerts: AlertsSettings, auth: AuthSettings) -> Anch
     and ``email_tls_verify`` on: ``email_tls_verify=false`` loads it into a context that verifies
     nothing. The hop loads it with ``cafile=``, so the spec carries ``loads_verified_bytes=False``
     and no pin."""
-    if not (alerts.email_tls_ca_file and alerts.email_use_tls and alerts.email_tls_verify):
-        return None
-    if not (alerts.email_smtp_host and alerts.email_from):
-        return None
-    if not (alerts.email_to or auth.notify_security_events):
+    if not (alerts.email_tls_ca_file and _smtp_hop_verifies(alerts, auth)):
         return None
     return AnchorSpec(
         "alerts_email_ca",
@@ -1601,6 +1665,36 @@ def alerts_email_anchor_spec(alerts: AlertsSettings, auth: AuthSettings) -> Anch
         alerts.email_tls_ca_file,
         loads_verified_bytes=False,
     )
+
+
+def _smtp_hop_verifies(alerts: AlertsSettings, auth: AuthSettings) -> bool:
+    """Whether a sender is built on the ``[alerts]`` SMTP hop and verifies its relay: the sender
+    conditions of :func:`alerts_email_anchor_spec`."""
+    return bool(
+        alerts.email_use_tls
+        and alerts.email_tls_verify
+        and alerts.email_smtp_host
+        and alerts.email_from
+        and (alerts.email_to or auth.notify_security_events)
+    )
+
+
+def smtp_hop_anchor_spec(
+    alerts: AlertsSettings, auth: AuthSettings, tls: TlsSettings
+) -> AnchorSpec | None:
+    """The settings CA an ``[alerts]`` SMTP hop verifies its relay with, for a check before the
+    hop is built (BACKLOG #3470), or ``None`` when it reads none. That is
+    ``[alerts].email_tls_ca_file`` when it is set. With none set, a relay off this host falls back
+    to the internal CA (:func:`internal_ca_anchor_spec`), as
+    :func:`~messagefoundry.config.tls_policy.resolve_trust_anchor` chooses."""
+    if alerts.email_tls_ca_file:
+        return alerts_email_anchor_spec(alerts, auth)
+    from messagefoundry.config.tls_policy import is_loopback_hop_host
+
+    host = alerts.email_smtp_host
+    if host and not is_loopback_hop_host(host) and _smtp_hop_verifies(alerts, auth):
+        return internal_ca_anchor_spec(tls)
+    return None
 
 
 def log_forward_anchor_spec(log_settings: LoggingSettings) -> AnchorSpec | None:
@@ -1933,7 +2027,9 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     warned = _WARNED_AT_OPEN.pop((spec.label, spec.path), None)
     quiet = warned is not None and warned == _warned_state(verdict)
     try:
-        _enforce_verdict(spec, verdict, enforcing=enforcing, quiet=quiet)
+        _enforce_verdict(
+            spec, verdict, enforcing=enforcing, warn=_silent if quiet else _log_warning
+        )
         if shape_error is not None:
             raise shape_error
     except TrustAnchorError as refusal:

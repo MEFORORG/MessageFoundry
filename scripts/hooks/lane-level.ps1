@@ -2,17 +2,30 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
-    Stop hook. In a builder session it nags that lane for its own free-slot count. In the dispatcher
-    session it reports those counts and speaks whenever it cannot prove both lanes are full.
+    Stop hook. In a builder session it nags that lane for its own level. In the dispatcher session
+    it reports each lane's stated counts, and it never calls a lane full.
 
 .DESCRIPTION
-    THE STRUCTURAL PROPERTY, AND EVERYTHING ELSE IS DETAIL: every input is either a lane's own
-    assertion of fullness, or an invalidator of one. NOTHING TURNS "UNKNOWN" INTO "FULL". A missing
-    file, an unreadable file, a stale number, a superseded number, a roster shortfall -- all of them
-    SPEAK. Silence is reachable only through a lane's own fresh statement.
+    THERE IS NO ITEM CEILING. The owner ruling of 2026-10-26 is stated once, in the header of
+    scripts/coord/lane.ps1. This hook used to call a lane AT CAPACITY when it stated no free items,
+    against a four-item ceiling, and went quiet when both lanes said so. Now no count it reads
+    becomes a verdict that a lane is full or that briefing should stop, and it adds no usage
+    throttle of its own. The one count-driven word left is IDLE, for a lane with nothing in flight.
 
-    THAT IS WHY IT SURVIVES A DISPATCHER WITH NO DISCIPLINE: THE DISPATCHER WRITES NOTHING THIS HOOK
-    READS. It never reads mail, receipts, dispatch traffic, or claim counts to derive occupancy.
+    AN OLDER lane.ps1 MEANS SOMETHING ELSE BY FREE. Its free count includes the empty slots under
+    the retired ceiling, so read as held items it overstates them. The current lane.ps1 writes
+    `capacity` as null on every statement and keeps whatever it finds on -Asked, which writes no
+    counts; the older one writes a number there on every statement. So a record whose `capacity` is
+    a number has a level an older lane.ps1 stated. This hook shows that level's in-flight count,
+    withholds its free count, labels it OLD-WRITER and asks the lane to restate with the current
+    script. The number is read as a marker of who stated the counts, never as a cap. A record whose
+    `capacity` is null or absent is read as stated.
+
+    EVERY NUMBER IS A LANE'S OWN QUOTE. A missing file, an unreadable file, a stale number, a
+    superseded number, a roster shortfall -- each is said aloud, never turned into a count.
+
+    THE DISPATCHER WRITES NOTHING THIS HOOK READS. It never reads mail, receipts, dispatch traffic,
+    or claim counts to derive occupancy.
 
     The failure it replaces, measured 2026-08-23: a lane held NINE claims while reporting ONE active
     item and THREE free slots. A claim-counting gauge would have reported both lanes full for the
@@ -39,7 +52,6 @@ $ErrorActionPreference = 'Stop'
 $EXPECTED_LANES = 2
 $STALE_TURNS = 6
 $STALE_MIN = 30
-$SERIAL_MIN_INFLIGHT = 2
 $LANE_PROMPT_TURNS = 3
 $LANE_PROMPT_MIN = 15
 $SEAT_DIR_FLOOR = 5
@@ -64,8 +76,22 @@ function Read-Json([string]$Path) {
 }
 
 function Get-AgeMin($utc) {
+    # ConvertFrom-Json hands back statedUtc as a [datetime] with Kind=Utc. [datetime]::Parse on that
+    # stringifies it with no zone, re-reads it as local, and adds the offset again, so a stamp 45
+    # minutes old read as hours in the future and the STALE and re-prompt checks never fired.
+    # lane.ps1 documents the same trap at its statedUtc guard; this mirrors its fix.
     if (-not $utc) { return $null }
-    try { return [math]::Round(([datetime]::UtcNow - ([datetime]::Parse($utc)).ToUniversalTime()).TotalMinutes, 0) }
+    try {
+        $at = if ($utc -is [datetime]) {
+            if ($utc.Kind -eq 'Local') { $utc.ToUniversalTime() }
+            else { [datetime]::SpecifyKind($utc, [System.DateTimeKind]::Utc) }
+        } else {
+            [datetime]::Parse([string]$utc, [cultureinfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor
+                [System.Globalization.DateTimeStyles]::AssumeUniversal)
+        }
+        return [math]::Round(([datetime]::UtcNow - $at).TotalMinutes, 0)
+    }
     catch { return $null }
 }
 
@@ -79,18 +105,25 @@ function Test-Has($rec, [string]$name) {
     return ($rec.PSObject.Properties.Name -contains $name)
 }
 
+function Test-OldWriter($rec) {
+    # See the header: a number in `capacity` marks a record an older lane.ps1 wrote. Only whether it
+    # is null is read, never its value.
+    return ($null -ne $rec) -and ($rec -isnot [string]) -and (Test-Has $rec 'capacity') -and
+           ($null -ne $rec.capacity)
+}
+
 function Get-LaneVerdict($rec, [string]$boxKey) {
-    # One occupancy word and one confidence word, or a single non-answer word. `greenable` is the ONLY
-    # thing the caller may use to stay quiet, and it is set in exactly one place.
+    # One state word and one confidence word, or a single non-answer word. A readable level is IDLE
+    # when nothing is in flight and STATED otherwise, whatever its numbers: no count makes a lane
+    # full. A level an older lane.ps1 wrote is OLD-WRITER and carries no free count (see the header).
     $o = [ordered]@{ box = $boxKey; occ = ''; conf = ''; free = $null; inflight = $null
-                     cap = 4; ageMin = $null; turns = $null; note = ''; greenable = $false }
+                     ageMin = $null; turns = $null; note = '' }
 
     if ($null -eq $rec) { $o.occ = 'NO-RECORD'; return [pscustomobject]$o }
     if ($rec -is [string] -and $rec -eq 'UNREADABLE') { $o.occ = 'UNREADABLE'; return [pscustomobject]$o }
 
     $free = if (Test-Has $rec 'statedFree') { $rec.statedFree } else { $null }
     $inf = if (Test-Has $rec 'statedInFlight') { $rec.statedInFlight } else { $null }
-    if ((Test-Has $rec 'capacity') -and $rec.capacity) { $o.cap = [int]$rec.capacity }
     if (Test-Has $rec 'statedNote') { $o.note = [string]$rec.statedNote }
     if (Test-Has $rec 'turnsSinceStated') { $o.turns = [int]$rec.turnsSinceStated }
     $statedUtc = if (Test-Has $rec 'statedUtc') { $rec.statedUtc } else { $null }
@@ -101,19 +134,13 @@ function Get-LaneVerdict($rec, [string]$boxKey) {
         $o.occ = if ($pc -gt 0) { 'NEVER-STATED' } else { 'NO-RECORD' }
         return [pscustomobject]$o
     }
-    if ($null -eq $free) { $o.occ = 'UNREADABLE'; return [pscustomobject]$o }
+    if ($null -eq $free -or $null -eq $inf) { $o.occ = 'UNREADABLE'; return [pscustomobject]$o }
 
-    $o.free = [int]$free
-    if ($null -ne $inf) { $o.inflight = [int]$inf }
-
-    if ($o.free -gt 0) {
-        $o.occ = 'OPEN'
-    } elseif ($null -eq $o.inflight) {
-        $o.occ = 'UNREADABLE'; return [pscustomobject]$o
-    } elseif ($o.inflight -lt $SERIAL_MIN_INFLIGHT) {
-        $o.occ = 'SERIAL'
-    } else {
-        $o.occ = 'AT-CAPACITY'
+    $o.inflight = [int]$inf
+    if (Test-OldWriter $rec) { $o.occ = 'OLD-WRITER' }
+    else {
+        $o.free = [int]$free
+        $o.occ = if ($o.inflight -eq 0) { 'IDLE' } else { 'STATED' }
     }
 
     $tipMoved = (Test-Has $rec 'tipNow') -and (Test-Has $rec 'tipAtStated') -and
@@ -126,52 +153,64 @@ function Get-LaneVerdict($rec, [string]$boxKey) {
             ($null -ne $o.ageMin -and $o.ageMin -gt $STALE_MIN)) { $o.conf = 'STALE' }
     else { $o.conf = 'FRESH' }
 
-    $o.greenable = ($o.occ -eq 'AT-CAPACITY' -and $o.conf -eq 'FRESH')
     return [pscustomobject]$o
 }
 
 $BLIND = @'
-  CANNOT SEE: whether the number is right, whether an item concluded since it was typed, whether a hold
-  makes those slots undispatchable, or anything about a lane that writes no record. Every number above
-  is a QUOTE from that lane, never a measurement, and never derived from claims. OPEN clears when the
-  LANE RESTATES, not when you dispatch -- if you dispatched and OPEN persists, that lane has not taken
-  a turn yet.
+  CANNOT SEE: whether the number is right, whether an item concluded since it was typed, whether a
+  Steward hold is in force, or anything about a lane that writes no record. Every number above is a
+  QUOTE from that lane, never a measurement, and never derived from claims. A number changes when the
+  LANE RESTATES, not when you dispatch. There is no item ceiling, so no count above is a reason to
+  stop briefing; a hold is, and this hook does not read holds.
 '@
 
 if ($SelfTest) {
     $fail = @()
-    function New-Rec($f, $i, $t1, $t2, $turns) {
+    # The current lane.ps1 writes capacity as null; pass 4 for a record an older one wrote.
+    function New-Rec($f, $i, $t1, $t2, $turns, $cap = $null) {
         [pscustomobject]@{
             statedFree = $f; statedInFlight = $i
             statedUtc = ([datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
             tipAtStated = $t1; tipNow = $t2; claimHashAtStated = 'a'; claimHashNow = 'a'
-            turnsSinceStated = $turns; capacity = 4; statedNote = ''; promptCount = 1 }
+            turnsSinceStated = $turns; capacity = $cap; statedNote = ''; promptCount = 1 }
     }
 
     $v = Get-LaneVerdict (New-Rec 3 1 'x' 'x' 0) 'b1'
-    if ($v.occ -ne 'OPEN') { $fail += "3 free must be OPEN, got $($v.occ)" }
-    if ($v.greenable) { $fail += 'an OPEN lane must never be greenable' }
+    if ($v.occ -ne 'STATED' -or $v.free -ne 3 -or $v.inflight -ne 1) { $fail += "3 free / 1 in flight must be STATED 3/1, got $($v.occ) $($v.free)/$($v.inflight)" }
 
-    $v = Get-LaneVerdict (New-Rec 0 3 'x' 'x' 0) 'b2'
-    if (-not $v.greenable) { $fail += "0 free / 3 in flight fresh must be greenable, got $($v.occ)/$($v.conf)" }
+    # The retired ceiling's own case: an old record naming capacity 4, with 0 free and 4 in flight.
+    $v = Get-LaneVerdict (New-Rec 0 4 'x' 'x' 0 4) 'b2'
+    if ($v.occ -ne 'OLD-WRITER' -or $v.conf -ne 'FRESH') { $fail += "0 free / 4 in flight on capacity 4 must be OLD-WRITER FRESH, never full, got $($v.occ)/$($v.conf)" }
+    if ($v.PSObject.Properties.Name -contains 'cap') { $fail += 'a verdict must carry no capacity' }
+
+    # An older lane.ps1's free count includes empty slots, so it is withheld rather than shown as held.
+    $v = Get-LaneVerdict (New-Rec 2 2 'x' 'x' 0 4) 'b9'
+    if ($v.occ -ne 'OLD-WRITER' -or $null -ne $v.free -or $v.inflight -ne 2) { $fail += "capacity 4, 2 free / 2 in flight must be OLD-WRITER with no free count and 2 in flight, got $($v.occ) $($v.free)/$($v.inflight)" }
+
+    # The control: the same counts with capacity null are the current writer's, so 2 is held items.
+    $v = Get-LaneVerdict (New-Rec 2 2 'x' 'x' 0) 'b10'
+    if ($v.occ -ne 'STATED' -or $v.free -ne 2 -or $v.inflight -ne 2) { $fail += "capacity null, 2 free / 2 in flight must be STATED 2/2, got $($v.occ) $($v.free)/$($v.inflight)" }
 
     $v = Get-LaneVerdict $null 'b3'
-    if ($v.occ -ne 'NO-RECORD' -or $v.greenable) { $fail += 'a missing record must be NO-RECORD and never greenable' }
+    if ($v.occ -ne 'NO-RECORD') { $fail += 'a missing record must be NO-RECORD' }
 
     $v = Get-LaneVerdict 'UNREADABLE' 'b4'
-    if ($v.occ -ne 'UNREADABLE' -or $v.greenable) { $fail += 'an unreadable record must never be greenable' }
+    if ($v.occ -ne 'UNREADABLE') { $fail += 'an unreadable record must be UNREADABLE' }
 
     $v = Get-LaneVerdict (New-Rec 0 3 'aaa' 'bbb' 0) 'b5'
-    if ($v.conf -ne 'SUPERSEDED' -or $v.greenable) { $fail += "a moved tip must be SUPERSEDED, got $($v.conf)" }
+    if ($v.conf -ne 'SUPERSEDED') { $fail += "a moved tip must be SUPERSEDED, got $($v.conf)" }
 
     $v = Get-LaneVerdict (New-Rec 0 3 'x' 'x' 99) 'b6'
-    if ($v.conf -ne 'STALE' -or $v.greenable) { $fail += "99 turns must be STALE, got $($v.conf)" }
+    if ($v.conf -ne 'STALE') { $fail += "99 turns must be STALE, got $($v.conf)" }
 
-    $v = Get-LaneVerdict (New-Rec 0 1 'x' 'x' 0) 'b7'
-    if ($v.occ -ne 'SERIAL' -or $v.greenable) { $fail += "0 free / 1 in flight must be SERIAL, got $($v.occ)" }
+    $v = Get-LaneVerdict (New-Rec 2 $null 'x' 'x' 0) 'b7'
+    if ($v.occ -ne 'UNREADABLE') { $fail += "a level with no in-flight count must be UNREADABLE, got $($v.occ)" }
+
+    $v = Get-LaneVerdict (New-Rec 0 0 'x' 'x' 0) 'b8'
+    if ($v.occ -ne 'IDLE') { $fail += "0 in flight must be IDLE, got $($v.occ)" }
 
     if ($fail.Count) { $fail | ForEach-Object { Write-Host "FAIL: $_" }; exit 1 }
-    Write-Host 'lane-level self-test: 7 assertions pass, 6 of them asserting a state that must NOT be greenable.'
+    Write-Host 'lane-level self-test: 10 cases pass, and none of them can read a lane as full.'
     exit 0
 }
 
@@ -244,6 +283,21 @@ $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
 
 if ($leaf -match '^builder') {
     $rec = Read-LaneFor $cwd (Get-CoordHost)
+    # BOTH NAGS NAME THE lane.ps1 BESIDE THIS HOOK. The copy in this worktree may be the older one,
+    # and a restatement through it writes a level the OLD-WRITER nag below then asks about again.
+    $current = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\lane.ps1'
+    $stated = (Test-OldWriter $rec) -and (Test-Has $rec 'statedUtc') -and $rec.statedUtc
+    if ($stated) {
+        # Asked every turn until it restates, however fresh the level: its free count is not held
+        # items. A record with no stated level holds no count, so the unstated nag below covers it.
+        Say '[lane] Your lane level was written by an OLDER lane.ps1, whose free count includes empty'
+        Say '  slots under the retired ceiling, so it is not shown as held items. Restate it with the'
+        Say '  current script, from this worktree:'
+        Say "  pwsh -NoProfile -File `"$current`" -Free <n> -InFlight <n> -Note `"<what is moving>`""
+        Say '  FREE MEANS ITEMS YOU HOLD AND ARE NOT WORKING: built-and-awaiting-land, blocked, parked.'
+        Say '  There is no item ceiling, so count no empty slots.'
+        Emit
+    }
     $need = ($null -eq $rec) -or ($rec -is [string])
     if (-not $need) {
         $t = if (Test-Has $rec 'turnsSinceStated') { [int]$rec.turnsSinceStated } else { 99 }
@@ -252,9 +306,10 @@ if ($leaf -match '^builder') {
     }
     if ($need) {
         Say '[lane] Your lane level is unstated or stale. State it now, it takes five seconds:'
-        Say '  pwsh -NoProfile -File scripts\coord\lane.ps1 -Free <n> -InFlight <n> -Note "<what is moving>"'
+        Say "  pwsh -NoProfile -File `"$current`" -Free <n> -InFlight <n> -Note `"<what is moving>`""
         Say '  FREE MEANS BY WORK, NOT BY CLAIMS. Built-and-awaiting-land is FREE. Blocked is FREE.'
-        Say '  Parked on a condition is FREE. Nobody else can write this number for you.'
+        Say '  Parked on a condition is FREE. There is no item ceiling, so count no empty slots.'
+        Say '  Nobody else can write this number for you.'
     }
     Emit
 }
@@ -316,7 +371,8 @@ foreach ($c in $cands) {
     # so a lane silent for hours is one nobody is dispatching to. Measured today the live lanes sat at
     # 0.1h and 0.2h and the next candidate at 10.2h -- a real gap, not a threshold fitted to noise.
     # If this ever DROPS a live lane, `discovered` falls below `expected` and the ROSTER DRIFT block
-    # fires. Narrowing can therefore cost noise; it can never manufacture a green.
+    # fires. Narrowing can therefore cost noise; while the expected count is right, it cannot hide
+    # a lane silently.
     if (((([datetime]::UtcNow) - $c.at).TotalHours) -gt 6) { continue }
     $lanes += $c
 }
@@ -327,7 +383,7 @@ foreach ($c in $cands) {
 #
 # THE ASYMMETRY IS THE WHOLE POINT: a lane is dropped ONLY when the call is Evaluable AND says dead.
 # When Evaluable is false the lane is KEPT and marked LIVENESS-UNKNOWN, which speaks. An unevaluated
-# fence is not a passed fence, so doubt can shrink the noise but can never manufacture a green.
+# fence is not a passed fence, so doubt can shrink the noise but can never hide a lane silently.
 $live = @()
 $unknown = @()
 try {
@@ -352,21 +408,11 @@ $verdicts = @()
 foreach ($l in $lanes) { $verdicts += Get-LaneVerdict (Read-LaneFor $l.worktree $l.host) $l.box }
 
 $discovered = $verdicts.Count
-$notGreen = @($verdicts | Where-Object { -not $_.greenable }).Count
 $unknownLive = @($verdicts | Where-Object { $unknownBoxes -contains $_.box }).Count
-# A lane whose liveness could not be evaluated blocks green even if it states itself full: the
-# statement may be from a session that is gone.
-$green = ($discovered -eq $EXPECTED_LANES) -and ($discovered -gt 0) -and ($notGreen -eq 0) -and ($unknownLive -eq 0)
 
-if ($green) {
-    $bits = ($verdicts | ForEach-Object {
-        "$($_.box) $($_.free) free / $($_.inflight) in flight of $($_.cap) (stated $(Format-Age $_.ageMin) ago)" }) -join ' | '
-    Say "[lane] BOTH LANES AT CAPACITY BY THEIR OWN STATEMENT: $bits. Quoted, not measured."
-    Emit
-}
-
-$below = @($verdicts | Where-Object { $_.occ -ne 'AT-CAPACITY' }).Count
-Say "[lane] $below of $discovered LANES BELOW CAPACITY BY THEIR OWN STATEMENT."
+# NO VERDICT OF FULLNESS, AND NO SILENCE BOUGHT BY ONE. There is no item ceiling (see the header), so
+# the counts are reported as quoted and the hook speaks on every dispatcher turn.
+Say "[lane] $discovered LANES, EACH NUMBER BY ITS OWN STATEMENT."
 foreach ($v in ($verdicts | Sort-Object box)) {
     $lbl = ("$($v.occ) $($v.conf)").Trim()
     $pad = '{0,-28} {1,-20}' -f $v.box, $lbl
@@ -374,24 +420,28 @@ foreach ($v in ($verdicts | Sort-Object box)) {
         'NO-RECORD' {
             Say "  $pad never wrote a level, and its own hook never prompted it"
             Say ('  {0,-28} {1,-20} either. That points at the HOOK, not the lane. Nothing is' -f '', '')
-            Say ('  {0,-28} {1,-20} known here: not zero, and not full.' -f '', '') }
+            Say ('  {0,-28} {1,-20} known here, not even zero.' -f '', '') }
         'NEVER-STATED' {
             Say "  $pad prompted on its own turns and never answered. The hook runs"
             Say ('  {0,-28} {1,-20} there; the number is not coming. Ask the lane directly.' -f '', '') }
         'UNREADABLE' {
-            Say "  $pad its level file did not parse. NO verdict for this lane, and"
+            Say "  $pad its level file did not parse, or lacks a count. NO verdict, and"
             Say ('  {0,-28} {1,-20} this is NOT a pass.' -f '', '') }
-        'SERIAL' {
-            Say "  $pad $($v.free) free / $($v.inflight) in flight of $($v.cap), stated $(Format-Age $v.ageMin) ago."
-            Say ('  {0,-28} {1,-20} OCCUPANCY CANNOT SEE A SERIAL LANE -- it reads as full.' -f '', '') }
+        'OLD-WRITER' {
+            $n = if ($v.note) { " Note: `"$($v.note)`"" } else { '' }
+            Say "  $pad $($v.inflight) in flight, stated $(Format-Age $v.ageMin) and $($v.turns) lane-turns ago.$n"
+            Say ('  {0,-28} {1,-20} WRITTEN BY AN OLDER lane.ps1: its free count includes empty' -f '', '')
+            Say ('  {0,-28} {1,-20} slots, so it is not shown as held items. Ask the lane to' -f '', '')
+            Say ('  {0,-28} {1,-20} restate with a current lane.ps1; its own worktree may hold' -f '', '')
+            Say ('  {0,-28} {1,-20} the older copy. Its own hook asks only in a builder* worktree.' -f '', '') }
         default {
             $n = if ($v.note) { " Note: `"$($v.note)`"" } else { '' }
-            Say "  $pad $($v.free) free / $($v.inflight) in flight of $($v.cap), stated $(Format-Age $v.ageMin) and $($v.turns) lane-turns ago.$n" }
+            Say "  $pad $($v.inflight) in flight, $($v.free) free by work, stated $(Format-Age $v.ageMin) and $($v.turns) lane-turns ago.$n" }
     }
     if ($v.conf -eq 'SUPERSEDED') {
         Say ('  {0,-28} {1,-20} that lane has committed or changed claims since it stated' -f '', '')
         Say ('  {0,-28} {1,-20} that number, so the number is NOT current. Ask it.' -f '', '') }
-    if ($v.conf -eq 'STALE') { Say ('  {0,-28} {1,-20} STALE IS NOT FULL.' -f '', '') }
+    if ($v.conf -eq 'STALE') { Say ('  {0,-28} {1,-20} STALE: the number may no longer hold. Ask it.' -f '', '') }
     if ($unknownBoxes -contains $v.box) {
         Say ('  {0,-28} {1,-20} LIVENESS-UNKNOWN: too few activity signals could be read, so I' -f '', '')
         Say ('  {0,-28} {1,-20} cannot say this lane is alive. An unevaluated fence is not a' -f '', '')

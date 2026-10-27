@@ -36,8 +36,9 @@ used for one handshake, and never returned to a caller.
 on the proxy being reachable. That is a real tension for an interface engine and it is deliberate: an
 unreachable-means-warn rule is defeated by start ordering (start the engine first and the check never
 runs), so warn-on-unreachable is not a gate at all. The blast radius is bounded to the posture the
-requirement is about — a declared upstream terminator on a PHI instance under ``enforce`` — and every
-other posture is byte-identical. A regression detected *later*, at runtime, must NOT kill the engine
+requirement is about — a reverse proxy in front of a PHI instance under ``enforce``, either a declared
+upstream terminator or, since vault BACKLOG #3538, a proxy named in ``trusted_proxies`` alone — and
+every other posture is byte-identical. A regression detected *later*, at runtime, must NOT kill the engine
 and the hospital's feed with it; that path belongs to an AlertSink event.
 """
 

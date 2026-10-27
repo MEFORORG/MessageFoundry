@@ -53,6 +53,7 @@ from messagefoundry.auth.notifications import (
 )
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
+    _UNANSWERED_OUTCOMES,
     AUTHORITY_SEAL_FAILED_ACTION,
     AuthService,
     DirectoryObjectIdMissing,
@@ -2152,6 +2153,216 @@ async def test_a_deleted_search_base_aborts_alerts_and_never_revokes(
         plan = await service.reconcile_directory_sessions()
         assert plan.aborted is None and plan.misconfigured == ()
         assert service.directory_reconcile_misconfigured is None
+    finally:
+        await store.close()
+
+
+# --- an unanswered account blocks the clears across passes (BACKLOG #3844) -------------------------
+
+_UnansweredKind = Literal["referred", "faulted", "misconfigured"]
+_UNANSWERED_KINDS: tuple[_UnansweredKind, ...] = get_args(_UnansweredKind)
+
+
+def test_the_unanswered_outcomes_are_the_unjudged_ones_less_unavailable() -> None:
+    """BACKLOG #3844. ``service._UNANSWERED_OUTCOMES`` is written out by hand beside
+    ``reconcile._UNJUDGED``. An unjudged outcome added there and not here would not be carried.
+
+    RED when: the two sets drift apart."""
+    expected = reconcile._UNJUDGED - {reconcile.ProbeOutcome.UNAVAILABLE}
+    assert expected == _UNANSWERED_OUTCOMES
+
+
+def _leave_unanswered(ldap: _FakeLdap, name: str, kind: _UnansweredKind) -> None:
+    """Make every probe of ``name`` go unanswered, as a referral, a fault or a refusal."""
+    if kind == "referred":
+        ldap.referring.add(name)
+    elif kind == "faulted":
+        ldap.broken[name] = KeyError("userAccountControl")  # a malformed entry
+    else:
+        ldap.broken[name] = _no_such_base()
+
+
+async def _sampled_pass(
+    service: AuthService, ids: dict[str, str], sample: set[str]
+) -> reconcile.ReconcilePlan:
+    """One pass whose probe sample is exactly ``sample``, on a budget of ``len(sample)``: those
+    accounts read as never probed, so they sort first, and every other one as probed last."""
+    assert len(sample) == service._settings.ad_session_recheck_max_users, "the sample is the budget"
+    later = time.monotonic() + 1e6
+    for name, user_id in ids.items():
+        if name in sample:
+            service._reconcile_last_probed.pop(user_id, None)
+        else:
+            service._reconcile_last_probed[user_id] = later
+    return await service.reconcile_directory_sessions()
+
+
+async def _watched_estate(
+    store: MessageStore, names: tuple[str, ...]
+) -> tuple[AuthService, _FakeLdap, dict[str, str]]:
+    """Every account in ``names`` signed in and read PRESENT once, two per pass, on a process whose
+    own passes held, tripped and saw a referral before, with nothing left unconfirmed or referred.
+    Set directly, as ``_marked`` in ``tests/test_ad_user_account_control.py`` does, so the clear
+    predicate is the only thing left to decide. The pass that completes the record is the
+    control: it marks both clears."""
+    ldap = _FakeLdap({n: _principal(n) for n in names})
+    service = AuthService(store, _ad_settings(ad_session_recheck_max_users=2), ldap=ldap)  # type: ignore[arg-type]
+    await service.initialize()
+    for name in names:
+        assert await _signed_in_ad_user(service, store, name) is not None
+    ids = {n: (await store.get_user_by_username(n)).id for n in names}  # type: ignore[union-attr]
+    service._reconcile_hold_standing = "held"
+    service._reconcile_breaker_standing = "tripped"
+    service._reconcile_referral_standing = "referred"
+    first = await _sampled_pass(service, ids, {names[0], names[1]})
+    assert (first.breaker_clear, first.hold_clear) == (False, False)  # one account unread yet
+    control = await _sampled_pass(service, ids, {names[0], names[2]})
+    assert (control.breaker_clear, control.hold_clear) == (True, True), "the control did not clear"
+    return service, ldap, ids
+
+
+@pytest.mark.parametrize("kind", _UNANSWERED_KINDS)
+async def test_an_unanswered_account_a_later_sample_misses_still_blocks_both_clears(
+    kind: _UnansweredKind,
+) -> None:
+    """BACKLOG #3844, the two-pass case. ``cdoe`` reads PRESENT, then its probe is referred,
+    faults or is refused for its configuration, beside a clean ``alice``: that pass marks no clear.
+    The next sample misses ``cdoe``, whose older PRESENT is still on record. It must mark neither
+    the breaker's clear nor the hold's: that answer predates the probe that went unanswered. The
+    positive control: once a pass reads ``cdoe`` PRESENT again, both clear.
+
+    The referral's own clear does not read the carried set (``_mark_reconcile_clears`` says why):
+    after a fault or a refusal the missed pass marks it, and after a referral ``cdoe`` is still
+    marked on the referral's own record, so it does not.
+
+    RED when: only THIS pass's referred, faulted or refused accounts stop a clear, so the second
+    pass reads the older answer as current and marks both, or a fault or a refusal holds the
+    referral's clear."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap, ids = await _watched_estate(store, ("alice", "bwong", "cdoe"))
+
+        _leave_unanswered(ldap, "cdoe", kind)
+        unanswered = await _sampled_pass(service, ids, {"alice", "cdoe"})
+        assert unanswered.aborted is None
+        assert getattr(unanswered, kind) == (ids["cdoe"],)
+        assert (unanswered.breaker_clear, unanswered.hold_clear) == (False, False)
+
+        missed = await _sampled_pass(service, ids, {"alice", "bwong"})
+        assert missed.aborted is None and getattr(missed, kind) == ()
+        assert service._reconcile_outcomes[ids["cdoe"]] is reconcile.ProbeOutcome.PRESENT
+        assert (missed.breaker_clear, missed.hold_clear) == (False, False), (
+            f"a sample that missed the {kind} account read its older answer as current"
+        )
+        assert missed.referral_clear is (kind != "referred")
+
+        ldap.referring.clear()
+        ldap.broken.clear()  # the cause is gone
+        answered = await _sampled_pass(service, ids, {"alice", "cdoe"})
+        assert (answered.breaker_clear, answered.hold_clear) == (True, True)
+        assert answered.referral_clear
+        assert service._reconcile_unanswered == set()
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("kind", _UNANSWERED_KINDS)
+async def test_an_unanswered_account_is_marked_by_a_pass_that_raises_after_its_probes(
+    kind: _UnansweredKind,
+) -> None:
+    """BACKLOG #3844. A pass stamps each probed account to the back of the rotation as it probes.
+    One that raises after its probes, on a store read for instance, must still have marked
+    ``cdoe`` unanswered, or a next sample that misses ``cdoe``, as the stamp makes likely, reads
+    its older answer as current. The helper picks that sample by hand; the mark is the subject.
+
+    RED when: the mark is written only once the pass has planned, after the stamp."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap, ids = await _watched_estate(store, ("alice", "bwong", "cdoe"))
+        _leave_unanswered(ldap, "cdoe", kind)
+
+        async def _refused(name: str) -> Any:
+            raise RuntimeError("synthetic: store read refused")
+
+        healthy = service._ad_map
+        service._ad_map = _refused  # type: ignore[method-assign]
+        try:
+            with pytest.raises(RuntimeError, match="store read refused"):
+                await _sampled_pass(service, ids, {"alice", "cdoe"})
+        finally:
+            service._ad_map = healthy  # type: ignore[method-assign]
+        assert service._reconcile_unanswered == {ids["cdoe"]}
+
+        missed = await _sampled_pass(service, ids, {"alice", "bwong"})
+        assert (missed.breaker_clear, missed.hold_clear) == (False, False)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("kind", _UNANSWERED_KINDS)
+async def test_any_later_answer_ends_an_unanswered_account_and_an_unreachable_probe_does_not(
+    kind: _UnansweredKind,
+) -> None:
+    """BACKLOG #3844. What ends an account's part is a later answer on record, any answer, because
+    the test asks only whether the record postdates the probe that went unanswered; the other
+    tests then judge it. So an ABSENT read ends it, and its strike, not the set, then keeps the
+    breaker's clear. A probe that could not reach the directory recorded nothing, so it does not.
+
+    RED when: only PRESENT ends a part, or an unavailable probe ends one."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap, ids = await _watched_estate(store, ("alice", "bwong", "cdoe"))
+        _leave_unanswered(ldap, "cdoe", kind)
+        await _sampled_pass(service, ids, {"alice", "cdoe"})
+
+        ldap.referring.clear()
+        ldap.broken.clear()
+        ldap.unreachable.add("cdoe")
+        unreachable = await _sampled_pass(service, ids, {"alice", "cdoe"})
+        assert unreachable.unavailable == 1
+        assert service._reconcile_unanswered == {ids["cdoe"]}
+        assert (unreachable.breaker_clear, unreachable.hold_clear) == (False, False)
+
+        ldap.unreachable.clear()
+        del ldap.present["cdoe"]  # answered, as gone from the directory
+        absent = await _sampled_pass(service, ids, {"alice", "cdoe"})
+        assert absent.outcomes[ids["cdoe"]] is reconcile.ProbeOutcome.ABSENT
+        assert service._reconcile_unanswered == set()
+        # The hold reads a fresh answer that is not undetermined; the breaker reads a strike.
+        assert (absent.breaker_clear, absent.hold_clear) == (False, True)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("kind", _UNANSWERED_KINDS)
+async def test_an_unanswered_account_that_signs_out_takes_its_part_with_it(
+    kind: _UnansweredKind,
+) -> None:
+    """BACKLOG #3844. The carried set holds accounts still signed in. Once ``cdoe`` signs out
+    unanswered, a clear rests only on the accounts that remain, each with a fresh answer on
+    record, and this rule forfeits nothing: an unjudged probe left the outcome record and the
+    trip's marks as they were, and those are what forfeit on leaving
+    (``_forfeit_clears_on_attrition``). The referral's own record still does: a referred account
+    that leaves before it reads PRESENT forfeits the referral's clear.
+
+    RED when: an unanswered account's leaving forfeits a clear or blocks one, or the set keeps an
+    account that holds no session, so it grows without bound under churn."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap, ids = await _watched_estate(store, ("alice", "bwong", "cdoe"))
+        _leave_unanswered(ldap, "cdoe", kind)
+        await _sampled_pass(service, ids, {"alice", "cdoe"})
+        assert service._reconcile_unanswered == {ids["cdoe"]}
+
+        await store.revoke_user_sessions(ids["cdoe"])  # signs out, still unanswered
+        del ids["cdoe"]
+        after = await _sampled_pass(service, ids, {"alice", "bwong"})
+        assert service._reconcile_unanswered == set()
+        assert (after.breaker_clear, after.hold_clear) == (True, True)
+        assert service._reconcile_breaker_standing == "tripped"
+        assert service._reconcile_hold_standing == "settled"
+        forfeited = service._reconcile_referral_standing == "forfeit"
+        assert forfeited is (kind == "referred")
     finally:
         await store.close()
 

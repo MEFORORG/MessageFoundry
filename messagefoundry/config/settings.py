@@ -1729,6 +1729,19 @@ class ApiSettings(_Section):
         return self.proxy_tls_min_version is not None
 
     @property
+    def browser_tls_ends_at_proxy(self) -> bool:
+        """Whether the browser's TLS ends at a reverse proxy in front of the engine, so the engine
+        cannot see the floor that proxy negotiates (vault BACKLOG #3538). Two shapes count: a
+        declared terminator, and a proxy named in ``trusted_proxies`` that re-encrypts to an
+        operator ``tls_cert_file``. The validator makes a terminator imply ``trusted_proxies``, so
+        this reads that list alone. It assumes browsers come through a listed proxy, as the
+        exposure rules already do (vault BACKLOG #2251). Where browsers reach the engine directly
+        and the proxy fronts other clients only, the probe dials the engine before it listens and
+        the start refuses. ``serve`` reads this for the ASVS 12.1.1 probe and the
+        ``proxy_tls_min_version`` attestation."""
+        return bool(self.trusted_proxies)
+
+    @property
     def serves_plaintext_upstream_hop(self) -> bool:
         """Whether the engine serves the proxy-to-engine hop in PLAINTEXT (BACKLOG #1179): a declared
         upstream terminator and no operator certificate, in :func:`api_tls_source`'s order. The one
@@ -6194,9 +6207,10 @@ class SecretRotationSettings(_Section):
     engine persists a non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and
     watches the DEK off it, so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
     **override**, not a prerequisite. The connector/AD/SMTP/Vault/OIDC credentials the engine holds are
-    tracked too — each is fingerprinted with a DEK-derived keyed MAC into store meta and its clock reset
-    when the fingerprint changes (rotation auto-detected). The broader ``SecretProvider`` generalization
-    (a pluggable secret backend) remains a design-only follow-on (ADR 0019 §5)."""
+    tracked too — each is fingerprinted with a keyed MAC sealed as a store-cipher cell (BACKLOG #3472)
+    and its clock reset when the secret no longer matches it (rotation auto-detected). The broader
+    ``SecretProvider`` generalization (a pluggable secret backend) remains a design-only follow-on
+    (ADR 0019 §5)."""
 
     warn_days: int = (
         14  # alert this many days before a secret is due for rotation (0 = reminder off)

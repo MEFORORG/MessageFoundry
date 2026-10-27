@@ -484,7 +484,11 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    - **In-process TLS** also needs `MEFOR_TLS_REVOCATION_ATTESTED=1` — your attestation that the PKI
      behind the cert enforces revocation, because the engine performs no OCSP/CRL
      ([ADR 0078](adr/0078-certificate-revocation-posture.md)). The alternative is to terminate at a
-     revocation-checking proxy instead (which is branch B).
+     revocation-checking proxy instead (which is branch B). If you name a proxy that re-encrypts to
+     your certificate in `[api].trusted_proxies`, you also need `[api].proxy_tls_min_version` and
+     `[security].web_console_public_address`, which the startup TLS-floor probe dials. The
+     `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md#api) says when each one refuses
+     (vault BACKLOG #3538).
    - **The terminator branch** also needs `[api].proxy_intra_service_auth`
      (`mtls` / `network` / `shared_secret`) **and** `[api].proxy_tls_min_version` (`1.2` / `1.3`) — the
      engine can verify neither the proxy→engine internal hop nor the proxy's negotiated TLS floor, so it
@@ -724,7 +728,8 @@ Each bullet below releases a hop with no credential, unless it says otherwise.
 With `MEFOR_ALLOW_INSECURE_TLS` set, these otherwise-refused settings become permitted (each logs a
 loud warning):
 
-- REST/SOAP/FHIR/DICOMweb `verify_tls = false`. *(Clamped.)*
+- REST/SOAP/FHIR/DICOMweb `verify_tls = false`. *(Clamped. A static header off the verify-off
+  allowlist refuses the hop in every case, as a credential does.)*
 - MLLP outbound `tls_verify = false`; FTPS `tls_verify = false`. *(Clamped.)*
 - DATABASE destination / store: `Encrypt=false` or `TrustServerCertificate=true` (SQL Server),
   `[store].trust_server_certificate=true` / `[store].encrypt=false`. *(Clamped. These carry the
@@ -734,11 +739,11 @@ loud warning):
 - Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Clamped, read directly
   rather than through the authority. CORRECTED 2026-10-13: this read *Not clamped*.)*
 - The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
-  forwarder and the API PHI-read serve hop, plus the webhook alert sink and the AI-broker endpoint.
-  *(All clamped — the webhook sink and the AI broker since #329. The AI broker hop carries
-  `[ai].api_key`, and a webhook URL can carry a path secret; the credential rule does not reach
-  either yet. LDAPS was on this list until vault BACKLOG #3230 made `ad_tls_verify = false` a
-  refusal with no escape.)*
+  forwarder and the API PHI-read serve hop, plus the webhook alert sink.
+  *(All clamped — the webhook sink since #329. A webhook URL can carry a path secret, and the
+  credential rule does not reach it yet. LDAPS was on this list until vault BACKLOG #3230 made
+  `ad_tls_verify = false` a refusal with no escape. The AI-broker endpoint was on it until vault
+  BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`.)*
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
@@ -750,7 +755,7 @@ the opposite claim, "secure by other means", and ALLOWs the hop. It is reported 
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
 enforce`, and for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP and anonymous FTPS cells and, since #329,
-the SFTP host key, the webhook sink and the AI broker — the clamp additionally requires the
+the SFTP host key and the webhook sink — the clamp additionally requires the
 instance to be PHI, which is also the default. Either way, on the shipped posture those cells are inert;
 no bullet above is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.
 
