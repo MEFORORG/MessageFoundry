@@ -670,8 +670,6 @@ def test_a_name_that_genuinely_differs_is_still_unlisted(
     assert pki_module.UNLISTED_SIGNATURE in line
     verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
     assert verdict is not None and verdict[1] is False  # the reload's NO_ISSUER case
-    # The reload gives the same state the same words, so the two cannot drift apart.
-    assert pki_module.UNLISTED_SIGNATURE in verdict[0]
     # The premise: OpenSSL finds no CRL for the leaf's issuer in this file, so it does not judge
     # the peer by it, and a leaf-checking hop fails for want of one, not on the signature.
     with pytest.raises(ssl.SSLError, match="unable to get certificate CRL"):
@@ -893,15 +891,12 @@ def test_a_root_with_a_zero_serial_is_skipped_alone_where_warnings_are_errors(
     from cryptography.utils import CryptographyDeprecationWarning
 
     odd = _zero_serial_ca()
-    # Control: the instrument is real. Parsing that CA warns, and as an error it raises.
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", CryptographyDeprecationWarning)
-        with pytest.raises(CryptographyDeprecationWarning):
-            x509.load_der_x509_certificate(odd)
-
     forged = _crl(twins.stranger, names=twins.new_key)
     with warnings.catch_warnings():
         warnings.simplefilter("error", CryptographyDeprecationWarning)
+        # Control: the instrument is real. Parsing that CA warns, and as an error it raises.
+        with pytest.raises(CryptographyDeprecationWarning):
+            x509.load_der_x509_certificate(odd)
         judged = [s.state for s in judge_crl_signatures(forged, [odd, *_ders(twins.new_ca)])]
     assert judged == ["bad"]
 

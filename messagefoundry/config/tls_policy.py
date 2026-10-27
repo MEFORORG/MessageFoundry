@@ -615,7 +615,6 @@ def _check_crl_signatures(
 
     fingerprint = crl_fingerprint(pem)
     judged: list[CrlSignature] = []
-    failed: Exception | None = None
     try:
         # One verdict at a time, so a failure part way keeps the verdicts already reached.
         for signature in judge_crl_signatures(pem, anchors):
@@ -623,21 +622,20 @@ def _check_crl_signatures(
     except Exception as exc:
         # Not a verdict on the file, and not proof: the judgment itself failed. Broad on purpose.
         # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
-        # that with exception types of its own. The handshake still checks every signature.
-        failed = exc
-    bad = next((s for s in judged if s.state == "bad"), None)
-    if failed is not None and bad is None:
-        if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(failed).__name__)):
-            logger.error(
-                "%s: the engine could not check the signatures of the CRL(s) in this file at "
-                "start (%s). That is not a verdict on the file. It is loaded and revocation "
-                "checking is on, and OpenSSL checks each signature at the handshake",
-                label,
-                type(failed).__name__,
-                exc_info=failed,  # outside the except clause, so the exception itself
-            )
-        return
-    if bad is not None:
+        # that with exception types of its own. The handshake still checks every signature. A
+        # proof already reached still refuses, below.
+        if not any(signature.state == "bad" for signature in judged):
+            if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(exc).__name__)):
+                logger.error(
+                    "%s: the engine could not check the signatures of the CRL(s) in this file at "
+                    "start (%s). That is not a verdict on the file. It is loaded and revocation "
+                    "checking is on, and OpenSSL checks each signature at the handshake",
+                    label,
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+            return
+    if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
         raise ValueError(
             f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "
             "key does not verify the CRL's signature. A handshake OpenSSL judges by this CRL "

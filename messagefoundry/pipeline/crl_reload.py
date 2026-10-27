@@ -222,7 +222,7 @@ _RANK = {remedy: rank for rank, remedy in enumerate(_PRECEDENCE)}
 #: The remedies that can send the operator to a restart, which fails while the file is not in
 #: effect. :data:`BAD_SIGNATURE` names no restart, but it says a start can load the file, which is
 #: false until then, so it takes the same caveat (vault BACKLOG #3506).
-_SAYS_RESTART = frozenset({RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE, BAD_SIGNATURE})
+_LEADS_TO_A_START = frozenset({RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE, BAD_SIGNATURE})
 #: A short token per remedy, for the ``crl_reload_refused`` alert (vault BACKLOG #2904). The alert
 #: carries this and the remedy sentence, never the refusal's reason, which quotes CRL issuer
 #: names and dates. ``docs/CONFIGURATION.md`` lists the tokens under ``[cert_monitor]``.
@@ -284,7 +284,7 @@ class ReloadOutcome:
     refusal: ReloadRefusal | None
     #: Contexts still on the copy they held when this pass ended. 0 when ``refusal`` is ``None``.
     stale: int = 0
-    #: True when the remedy can send the operator to a restart (:data:`_SAYS_RESTART`) and a
+    #: True when the remedy can send the operator to a restart (:data:`_LEADS_TO_A_START`) and a
     #: start would refuse the file too, until one of its CRLs takes effect. The reason says so
     #: with the time; an alert carries only this flag.
     start_refuses: bool = False
@@ -746,7 +746,7 @@ def _reload_path(
         refusals.error = exc
     if (
         refusals.strongest is not None
-        and refusals.strongest[1] in _SAYS_RESTART
+        and refusals.strongest[1] in _LEADS_TO_A_START
         and (unmet := crl_not_in_effect(blocks, now=now)) is not None
     ):
         # For the alert, which carries no reason. The reopen below is what lets this flag live
