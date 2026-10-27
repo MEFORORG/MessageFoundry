@@ -386,7 +386,9 @@ def harden_crl_check(
         )
 
     pem = path.read_bytes()
-    facts, blocks = judge_crl_bytes(pem, label=label, now=time.time())
+    facts, blocks = judge_crl_bytes(
+        pem, label=label, now=time.time(), refuse_unread_extensions=True
+    )
 
     before = ctx.cert_store_stats()
     certs_before = before["x509"]  # a missing key raises: fail closed
@@ -710,7 +712,12 @@ def crl_label(crl_file: str, setting: str | None) -> str:
 
 
 def judge_crl_bytes(
-    pem: bytes, *, label: str, now: float, require_in_effect: bool = True
+    pem: bytes,
+    *,
+    label: str,
+    now: float,
+    require_in_effect: bool = True,
+    refuse_unread_extensions: bool = False,
 ) -> tuple[CrlFacts, tuple[CrlBlock, ...]]:
     """Refuse CRL bytes no context may load. Return the facts of the soonest-expiring block, and
     every block, which a context that records its copy needs (BACKLOG #299).
@@ -724,6 +731,8 @@ def judge_crl_bytes(
     ones. So does an issuer whose every CRL takes effect later (:class:`CrlNotInEffect`), unless
     ``require_in_effect`` is False: the reload asks :func:`crl_not_in_effect` itself, because a file
     to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``.
+    ``refuse_unread_extensions`` goes to :func:`~messagefoundry.pki.judge_every_crl`, which says
+    what it does and who passes it.
 
     No signature is checked here, because this has no CA list. A start checks it in
     :func:`_check_crl_signatures`, and the reload in
@@ -731,7 +740,7 @@ def judge_crl_bytes(
     from messagefoundry.pki import judge_every_crl, soonest_crl
 
     try:
-        judged = judge_every_crl(pem, now=now)
+        judged = judge_every_crl(pem, now=now, refuse_unread_extensions=refuse_unread_extensions)
     except ValueError as exc:
         raise ValueError(f"{label}: {exc}") from exc
     facts = soonest_crl([every for every, _ in judged])

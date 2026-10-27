@@ -24,6 +24,7 @@ All material is synthetic and minted here. No PHI.
 from __future__ import annotations
 
 import datetime
+import logging
 import ssl
 import warnings
 import weakref
@@ -46,8 +47,10 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
 )
 from messagefoundry.keywrap import der_children, read_der_tlv
-from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE
+from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE, FIX, reload_replaced_crls
 from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
+from tests.test_crl_held_copy_alert import _bundle_scan
+from tests.test_crl_held_copy_alert import _hop as _bundle_hop
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
 from tests.test_trust_anchor_byte_binding import _handshake
 
@@ -1145,6 +1148,54 @@ def test_a_crl_whose_extensions_do_not_read_is_refused_by_name(tmp_path: Path) -
     # Control: the same CRL with its name tagged as a directory name loads.
     crl.write_bytes(_crl_naming_serial(key, key, 0x01))
     assert _hop(ca_file, crl).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_the_ca_file_scan_reports_a_crl_whose_extensions_do_not_read_as_before(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Lander's hold on vault BACKLOG #3506. The refusal by name above is for a start and the
+    reload. It must not change what the expiry scan reports for a CA file holding such a CRL,
+    which nothing at start checks, so a restart loads it. At fc2ee122f the scan reported it as
+    a CRL the engine cannot judge, to be replaced before a restart. What the scan reports is held
+    to what it reported before #3506, measured at origin/main 93f6438c7: no held-copy account and
+    no remedy, and one ERROR that it could not judge the held copies, with ``cryptography``'s own
+    error. That ERROR drops the held copy's date from the alert, before #3506 as now."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    ca_pem = ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key, 0x01)).encode("ascii")
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(ca_pem + _crl(key, names=key, name=_ZERO_NAME))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(_crl(key, names=key, name=_ZERO_NAME, age=2 * _DAY))
+    hop = _bundle_hop(bundle, crl)  # holds the CA file's CRL, and checks revocation
+    bundle.write_bytes(ca_pem + _crl_naming_serial(key, key, 0x01, x400=True))
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.cert_expiry"):
+        sink, mine = _bundle_scan(bundle)
+
+    # One alert, dated by the file, which lapses within the scan's 30 days, and nothing more.
+    assert [sink.crl_notes[i] for i in mine] == [(False, "", ())]
+    # A held copy's path can be case-folded (loaded_crls.crl_path_key).
+    records = [r for r in caplog.records if str(bundle).lower() in r.getMessage().lower()]
+    assert [r.levelno for r in records] == [logging.ERROR]
+    assert "could not judge the copies" in records[0].getMessage()
+    assert records[0].exc_info is not None
+    assert isinstance(records[0].exc_info[1], x509.UnsupportedGeneralNameType)
+
+    # Control: the scan reached the CA file's check. The same CRL with its name tagged as a
+    # directory name is one the engine judges, so a restart applies it.
+    bundle.write_bytes(ca_pem + _crl_naming_serial(key, key, 0x01))
+    sink, mine = _bundle_scan(bundle)
+    assert [sink.crl_notes[i][1].startswith("Restart the engine") for i in mine] == [True]
+
+    # The reload still refuses such a CRL in a CRL setting as one to fix, by name.
+    crl.write_bytes(_crl_naming_serial(key, key, 0x01, x400=True))
+    outcomes = reload_replaced_crls()
+    (outcome,) = [o for o in outcomes if Path(o.path).exists() and Path(o.path).samefile(crl)]
+    assert outcome.refusal is not None and outcome.refusal.remedy == FIX
+    assert "CRL block 1 of 1 cannot be judged: its extensions do not read" in (
+        outcome.refusal.reason
+    )
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
 def test_a_long_issuer_name_is_quoted_with_a_bound(twins: _Twins) -> None:

@@ -313,9 +313,17 @@ class CrlBlock:
     selection: tuple[bytes | None, bytes | None, frozenset[str]] = (None, None, frozenset())
 
 
-def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]]:
+def judge_every_crl(
+    pem: bytes, *, now: float, refuse_unread_extensions: bool = False
+) -> list[tuple[CrlFacts, CrlBlock]]:
     """The facts and the :class:`CrlBlock` of EVERY CRL in ``pem``, in file order, refusing any block
     it cannot judge. One parse per block.
+
+    **Extensions ``cryptography`` cannot read raise as it raised them, unless
+    ``refuse_unread_extensions``** (:data:`_UNREAD_EXTENSIONS`; vault BACKLOG #3506). With it, such
+    a block refuses by name, as a ``ValueError``, like any other block that cannot be judged. A
+    start and the running-hop reload pass it. The expiry scan's check of a CRL in a CA file does
+    not, so what it reports for such a CRL is what it reported before #3506.
 
     The strict sibling of :func:`read_soonest_crl_facts`, for a context load (``harden_crl_check``)
     and the running-hop reload (BACKLOG #299). The monitor skips a block it cannot judge so one bad
@@ -357,7 +365,14 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
         where = f"CRL block {index} of {len(blocks)}"
         try:
             crl, nxt = _parse_first_crl(block)
-            extensions = _crl_extensions(crl)
+            try:
+                extensions = _crl_extensions(crl)
+            except _UNREAD_EXTENSIONS as exc:
+                if not refuse_unread_extensions:
+                    raise
+                raise ValueError(
+                    f"its extensions do not read ({type(exc).__name__}: {exc})"
+                ) from exc
             if _is_delta_crl(extensions):
                 raise ValueError(
                     "it is a delta CRL, and the engine turns on no delta CRL support, so OpenSSL "
@@ -500,6 +515,12 @@ _UNREADABLE_CA = (
     x509.UnsupportedGeneralNameType,
     CryptographyDeprecationWarning,
 )
+
+#: What ``cryptography`` raises, at least, for CRL extensions it cannot read, beside a duplicate
+#: extension, which :func:`_crl_extensions` refuses itself: a general name it does not support,
+#: such as an x400Address, and, where warnings are errors, a deprecation it warns of. Neither is a
+#: ``ValueError``. :func:`judge_every_crl` says who refuses these by name (vault BACKLOG #3506).
+_UNREAD_EXTENSIONS = (x509.UnsupportedGeneralNameType, CryptographyDeprecationWarning)
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
 _NameKey = tuple[tuple[tuple[str, bool, str | bytes], ...], ...]
@@ -666,9 +687,10 @@ def _crl_extensions(crl: x509.CertificateRevocationList) -> _CrlExtensions:
     real bytes, and the AKID's serial and encoding are taken from them too. A serial that is not
     minimally encoded is left for the parse to refuse.
 
-    **Raises ``ValueError`` for extensions it cannot read**, so :func:`judge_every_crl` refuses
-    the block by name: a duplicate extension, and at least a general name ``cryptography`` does
-    not support and, where warnings are errors, any other deprecation it warns of."""
+    **Raises ``ValueError`` for a duplicate extension**, so :func:`judge_every_crl` refuses the
+    block by name. Other extensions ``cryptography`` cannot read raise as it raised them
+    (:data:`_UNREAD_EXTENSIONS`), and :func:`judge_every_crl` says which callers refuse those by
+    name."""
     der = crl.public_bytes(serialization.Encoding.DER)
     found = _crl_akid_spans(der)
     copy = der if found is None else _positive_copy(der, found[1])
@@ -679,8 +701,6 @@ def _crl_extensions(crl: x509.CertificateRevocationList) -> _CrlExtensions:
         return _CrlExtensions(extensions, None)
     except x509.DuplicateExtension as exc:
         raise ValueError(f"the CRL carries a duplicate extension: {exc}") from exc
-    except (x509.UnsupportedGeneralNameType, CryptographyDeprecationWarning) as exc:
-        raise ValueError(f"its extensions do not read ({type(exc).__name__}: {exc})") from exc
     serial = akid.authority_cert_serial_number
     raw = akid.public_bytes()
     if found is not None:

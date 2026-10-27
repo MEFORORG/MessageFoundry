@@ -701,7 +701,9 @@ def _reload_path(
     try:
         # A CRL not in effect yet is judged here, not refused there: a context at the cap, a held
         # CRL nothing supersedes, or a file to fix each outranks a wait, and must be reported.
-        facts, blocks = judge_crl_bytes(pem, label=label, now=now, require_in_effect=False)
+        facts, blocks = judge_crl_bytes(
+            pem, label=label, now=now, require_in_effect=False, refuse_unread_extensions=True
+        )
         verdicts: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         timing: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         # Every stale context, with the verdict that holds it back, if any. Each still gets the
