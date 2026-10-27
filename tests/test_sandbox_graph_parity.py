@@ -112,7 +112,9 @@ def test_a_worker_whose_graph_differs_from_the_engines_is_refused(
     assert "IB_PARITY" in text
     assert "allowlist" in text
     assert "[sandbox].pass_environment" in text
-    assert "reload" in text
+    # A worker runs the snapshot it is sent (vault BACKLOG #2596), so a reload is no remedy for a
+    # graph that differs by name, and the refusal does not send the operator after one.
+    assert "reload" not in text
     # What differs, and on which side: the engine has two handlers the worker never built.
     assert "handlers (engine only: h_1, h_2)" in text
 

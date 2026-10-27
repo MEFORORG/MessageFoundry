@@ -108,7 +108,6 @@ from messagefoundry.config.settings import (
     security_enforcement_env_names,
 )
 from messagefoundry.config.snapshot import ConfigSnapshot
-from messagefoundry.config.wiring import WiringError
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline._sandbox_codec import GraphShape, SandboxCodecError, SandboxError
@@ -231,8 +230,8 @@ def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
     ``bindings`` is compared over the inbounds the ENGINE holds. An engine shard holds only its
     own, while its worker loads the whole config, so the worker's other bindings are not a
     difference. ``code_digest`` is compared whenever the engine has one: a config module whose
-    bytes changed on disk since the engine loaded it differs there even when every name is the
-    same (vault BACKLOG #2724). A worker of the same build with no digest could not read its own
+    bytes differ from the ones the engine loaded differs there even when every name is the same
+    (vault BACKLOG #2724; since #2596 a worker runs the engine's snapshot, so this is a backstop). A worker of the same build with no digest could not read its own
     modules, so that is a difference too, never a pass."""
     found: list[str] = []
     sets = {
@@ -668,6 +667,18 @@ class SandboxSession:
             raise SandboxWorkerRefused(
                 self._refused[1], first=False, content_only=self._refused[2], graph=engine_graph
             )
+        # The boot frame is built BEFORE the child exists, so a snapshot that cannot be read (a
+        # session given none reads its directory here) or a frame that cannot be encoded leaves no
+        # live child, job handle or drain thread behind.
+        try:
+            boot = codec.encode_boot(
+                snapshot=self._config_snapshot(),
+                forbidden=self.policy.forbidden_modules,
+                mem_mb=self.policy.mem_mb,
+                code_sets=self._code_sets,
+            )
+        except (OSError, ValueError, SandboxError) as exc:  # WiringError is a ValueError
+            raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
         # this generation's reads.
         self._responses = queue.Queue()
@@ -753,16 +764,8 @@ class SandboxSession:
         # not on what the parent's threads are doing.
         self._job = _assign_kill_on_close_job(proc)
         try:
-            _write_frame(
-                proc.stdin,
-                codec.encode_boot(
-                    snapshot=self._config_snapshot(),
-                    forbidden=self.policy.forbidden_modules,
-                    mem_mb=self.policy.mem_mb,
-                    code_sets=self._code_sets,
-                ),
-            )
-        except (OSError, SandboxError, WiringError) as exc:
+            _write_frame(proc.stdin, boot)
+        except (OSError, SandboxError) as exc:
             self._kill(proc)
             raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
         try:
@@ -789,20 +792,22 @@ class SandboxSession:
                 # FAIL CLOSED. A worker that loaded a different graph would answer for this inbound
                 # from that graph, and nothing in its answers would say so.
                 self._kill(proc)
-                # Only an edit on disk when the worker read its modules: a worker that could not
-                # read them reports no digest, and that is not an edit.
+                # Module bytes alone differ only when the worker read its modules: a worker that
+                # could not read them reports no digest, and that is not the same bytes.
                 content_only = worker_graph.code_digest is not None and all(
                     d.startswith(_CONTENT_DIFFERS) for d in differing
                 )
+                # A worker runs the snapshot it is sent and never reads the directory (vault
+                # BACKLOG #2596), so an edit on disk is not a cause any more, and a reload is no
+                # remedy for a graph that differs by name.
                 causes = (
-                    "The config files changed on disk since the engine loaded them: reload the "
+                    "The worker ran other config module bytes than the engine loaded: reload the "
                     "config."
                     if content_only
-                    else "Most often the config files changed on disk since the engine loaded "
-                    "them: reload the config. Or config code reads an environment variable the "
-                    "worker is not given, because the worker loads the config again under an "
-                    "allowlisted environment: name each such variable in "
-                    "[sandbox].pass_environment and restart."
+                    else "Config code most likely reads an environment variable the worker is "
+                    "not given, because the worker runs the config again under an allowlisted "
+                    "environment: name each such variable in [sandbox].pass_environment and "
+                    "restart."
                 )
                 # Short before the differences: a dead-lettered message keeps about the first 200
                 # characters of this, behind its stage prefix and the exception's type name.

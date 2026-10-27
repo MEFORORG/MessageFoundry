@@ -180,15 +180,17 @@ def sandbox_worker_refused_detail(*, content_only: bool) -> str:
     BACKLOG #2724). Fixed words that name the cause and the remedy: never a message body, and not
     the refusal itself, which the runner logs whole in a WARNING line. The alert instance's reason
     column keeps only about the first 200 characters, so the cause and the remedy lead."""
+    # A worker runs the engine's config snapshot and never reads the directory (vault BACKLOG
+    # #2596), so an edit on disk is not a cause, and a reload does not cure a graph that differs
+    # by name.
     if content_only:
         cause = (
-            "A config file changed on disk since the engine loaded it, with no reload. Reload the "
-            "config."
+            "The worker ran other config module bytes than the engine loaded. Reload the config."
         )
     else:
         cause = (
-            "Most often a config file changed on disk with no reload: reload the config. Or config "
-            "reads a variable the worker lacks: add it to [sandbox].pass_environment and restart."
+            "Config most likely reads a variable the worker lacks: add it to "
+            "[sandbox].pass_environment and restart."
         )
     return (
         f"{cause} Until then every message on this inbound fails at routing or transform: "

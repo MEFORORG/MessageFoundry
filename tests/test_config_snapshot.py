@@ -22,6 +22,7 @@ import importlib.machinery
 import importlib.util
 import marshal
 import os
+import subprocess
 from pathlib import Path, PurePath
 from types import CodeType
 
@@ -280,6 +281,31 @@ def test_a_worker_sent_the_engines_tables_is_not_sent_their_files(tmp_path: Path
     )
     assert "codesets/diets.csv" in unpublished.snapshot.files
     assert load_snapshot(unpublished.snapshot).code_sets["diets"]["a"] == "b"
+
+
+def test_a_session_that_cannot_read_its_snapshot_starts_no_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session given no snapshot reads its directory before the child is started, so a read
+    that fails leaves no child, job handle or drain thread behind."""
+
+    def no_child(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a worker was started")
+
+    monkeypatch.setattr(subprocess, "Popen", no_child)
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
+        inbound="IB_SNAP",
+        config_dir=tmp_path / "missing",
+        env=None,
+        graph=None,
+    )
+    try:
+        with pytest.raises(SandboxError, match="failed to bootstrap"):
+            session._spawn()
+        assert session._proc is None
+    finally:
+        session.close()
 
 
 # --- the points the row folds in -------------------------------------------------------------------
