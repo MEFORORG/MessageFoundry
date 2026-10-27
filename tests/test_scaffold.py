@@ -431,6 +431,8 @@ def test_the_scaffolded_audit_job_runs_on_windows_on_its_own(
     assert audit["runs-on"] == "windows-latest"
     assert audit["defaults"] == {"run": {"shell": "bash"}}
     assert "needs" not in audit and "if" not in audit
+    # Wheels only for every pip in the job, so no sdist's build code runs (vault BACKLOG #4083).
+    assert audit["env"] == {"PIP_ONLY_BINARY": ":all:"}
     assert 0 < audit["timeout-minutes"] < 360
     # Static, so these hold where no bash can run the steps below.
     runs = {s["name"]: s["run"] for s in audit["steps"] if "run" in s}

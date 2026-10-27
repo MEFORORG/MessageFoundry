@@ -1172,7 +1172,7 @@ does apply the pin, the exact match replaces the standard checks, the trust chai
 `Encrypt=strict` (vault BACKLOG #2223).** With `[store].ssl_root_cert` set on the secure posture,
 `connection_string` now sends `ServerCertificate=` together with `Encrypt=strict`, in place of
 `Encrypt=yes`, and both stay inside the last-wins tail (*code*). The reason: on the Driver 18.7 build
-tested, the `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
+tested on Windows, the `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
 `Encrypt=yes`; no other `Encrypt` value was tested. Microsoft's page, quoted above, documents the
 keyword for strict encryption (*documentation*). The decision rests on a private test record, vault
 BACKLOG #3009, and its contents are not repeated here. Four consequences follow, and they are
@@ -1201,6 +1201,8 @@ it is skipped in CI and the Linux reading is not yet taken.
 The paragraph above is kept as written. Its first sentence, *"`connection_string` emits
 `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`"*, describes the code before this
 amendment.
+*(Corrected 2026-10-27: the amendment's reason read "on the Driver 18.7 build tested", without
+"on Windows". The measurement was taken on Windows only. Vault BACKLOG #3714 item 10.)*
 
 **The counts, after this note.** The counts paragraph above covers the table above, and this note
 leaves it as written. *(Corrected 2026-10-11: that paragraph has since been edited once, for
