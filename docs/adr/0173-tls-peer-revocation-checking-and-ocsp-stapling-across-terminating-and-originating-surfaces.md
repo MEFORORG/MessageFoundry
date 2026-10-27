@@ -1183,12 +1183,12 @@ decisions too:
 The live Linux test of the pin, `test_server_certificate_pin_is_enforced_under_strict_encryption`,
 runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. No CI job sets it, so
 it is skipped in CI and the Linux reading is not yet taken.
-*(Corrected 2026-10-27: the reason above read "on the Driver 18.7 build tested", without "on
-Windows". The measurement was taken on Windows only. Vault BACKLOG #3714 item 10.)*
 
 The paragraph above is kept as written. Its first sentence, *"`connection_string` emits
 `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`"*, describes the code before this
 amendment.
+*(Corrected 2026-10-27: the amendment's reason read "on the Driver 18.7 build tested", without
+"on Windows". The measurement was taken on Windows only. Vault BACKLOG #3714 item 10.)*
 
 **The counts, after this note.** The counts paragraph above covers the table above, and this note
 leaves it as written. *(Corrected 2026-10-11: that paragraph has since been edited once, for
