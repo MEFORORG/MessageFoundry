@@ -251,8 +251,8 @@ set `caFile` on its `messagefoundry.environments` entry (or on one engine shard)
   the same engine, and it wins over the certificate `messagefoundry.serviceConfig` names.
 - It must be a full path (a drive-letter or UNC path on Windows, an absolute path elsewhere); a
   relative or root-relative path is refused, so a workspace can never choose the file. A `caFile`
-  that is refused or unreadable leaves that engine with no anchor at all; it never falls back to the
-  certificate `messagefoundry.serviceConfig` names. The exception is a `caFile` on an `http://`
+  that is refused, or that has never been read, leaves that engine with no anchor at all; it never
+  falls back to the certificate `messagefoundry.serviceConfig` names. The exception is a `caFile` on an `http://`
   entry, which has no certificate to pin: it is refused and claims nothing, so an https engine on
   the same `host:port` is anchored as if it were absent. The setting is machine-scoped, so a checked-in
   `.vscode/settings.json` cannot add or change a pin. An engine shard without its own `caFile` uses
@@ -274,10 +274,30 @@ after the window opened. If no https `caFile` covers that `host:port`, a failure
 again in the background. This happens at most once a minute. A failure that arrives while the
 engine is already being asked waits for that answer. If the answer does not fix it, the engine is
 asked once more. The failed request is not retried; the status bar picks the certificate up when
-the answer arrives. The engine gets 35 seconds to answer, and each certificate file gets 10 seconds
-to read. Past that, the extension goes on with what it has, so a hung interpreter or share cannot
-stop later setting changes from taking effect. While an earlier run of the engine's command is still
-alive, no second one starts. Verification stays on throughout.
+the answer arrives.
+
+**A failure that proves nothing keeps the anchor you had.** Each time the extension re-learns its
+anchors, it ends each engine one of three ways. A certificate it read replaces the anchor. An engine
+that no setting or engine answer names any more loses its anchor: you removed or broke its `caFile`,
+moved `messagefoundry.engineUrl`, or the engine reported no certificate. Anything else keeps the
+anchor in force: a file that could not be read or was read too slowly, or an engine command that
+failed, did not answer, or was not started. So does a renewal a failing request followed meanwhile.
+A kept `caFile` anchor is always one read from the file the setting names now, and a kept engine
+certificate is kept only while `engineUrl` still names that engine and no `caFile` claims it.
+Dropping it instead would put that engine back on the default roots, which trust more than the
+anchor did. So deleting
+or emptying a `caFile` does not by itself stop the extension trusting the certificate it last read
+from it; change or remove the setting to do that. The log names each anchor it keeps.
+
+**Every wait is bounded.** The engine gets 35 seconds to answer. All the certificate files of one
+pass then get 10 seconds together, and a file not read by then counts as a failure that proves
+nothing. At most two certificate reads run at once, and a file whose read is still running is not
+opened again, so files on an unreachable share hold at most two of the threads the editor's
+extensions share. While an earlier run of the engine's command is still alive, no second one starts,
+and a failing request does not ask the engine again. When that run finally exits, if a settings
+change asked to re-learn the anchors meanwhile, the extension does so once more, so the change takes
+effect.
+Verification stays on throughout.
 
 **The OS trust store.** Unmeasured. VS Code's `http.systemCertificates` (on by default) is meant to
 add the OS store to an extension's https requests. Reading the `@vscode/proxy-agent` 0.45.0 that VS

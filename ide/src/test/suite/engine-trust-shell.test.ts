@@ -134,6 +134,13 @@ if (NODE_SIDE) {
   realExecFile = childProcess.execFile;
 }
 
+/** `fs.promises`, whose `open` the round-4 tests intercept to hold a certificate read open. */
+const fsPromises = (require("node:fs") as { promises: { open: (...a: unknown[]) => Promise<unknown> } })
+  .promises;
+const realOpen = fsPromises.open;
+/** When set and it returns a promise, that promise stands in for opening the (normalized) file. */
+let openHook: ((file: string) => Promise<unknown> | undefined) | undefined;
+
 const shellSuite = NODE_SIDE ? suite : suite.skip;
 
 shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)", () => {
@@ -144,6 +151,8 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
   const UNANCHORED = "with no trust anchor";
 
   let ws: string;
+  /** Releases for reads and CLI runs a round-4 test holds open; teardown calls any left. */
+  const held: (() => void)[] = [];
 
   /** The stubbed CLI: records the call and answers at once with {@link stubInventory}. */
   const answeringCli = ((
@@ -180,13 +189,21 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     onLog = undefined;
     trust.forgetEngineTrust();
     childProcess.execFile = answeringCli;
+    openHook = undefined;
+    fsPromises.open = (file: unknown, ...rest: unknown[]): Promise<unknown> =>
+      openHook?.(path.normalize(String(file))) ?? realOpen(file, ...rest);
   });
 
   teardown(async () => {
     onLog = undefined;
+    openHook = undefined;
+    for (const release of held.splice(0)) {
+      release();
+    }
     childProcess.execFile = answeringCli;
     await trust.engineTrustSettled(); // nothing from this test may run into the next one
     childProcess.execFile = realExecFile;
+    fsPromises.open = realOpen;
     trust.forgetEngineTrust();
     fs.rmSync(ws, { recursive: true, force: true });
     // The modules loaded above keep reading this stub. Leaving it pointing at the directory just
@@ -843,5 +860,298 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
     assert.strictEqual(invocations.length, 2);
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  // ---- round 4: one merge rule per host key. A refresh ends each key in exactly one of three
+  // ways: a certificate it read (fresh), no source naming it any more (dropped), or an answer that
+  // proves nothing (kept, as registered at commit time). ----
+
+  /** Let queued callbacks run, so a refresh queued from one is counted before {@link settle}. */
+  async function ticks(): Promise<void> {
+    for (let i = 0; i < 10; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /** Hold every read of `files` open until teardown; returns how many opens each one saw, and the
+   *  most that were held at once. */
+  function holdReads(files: readonly string[]): { opens: Map<string, number>; most: () => number } {
+    const wanted = new Set(files.map((f) => path.normalize(f)));
+    const opens = new Map<string, number>();
+    let running = 0;
+    let most = 0;
+    openHook = (file) => {
+      if (!wanted.has(file)) {
+        return undefined;
+      }
+      opens.set(file, (opens.get(file) ?? 0) + 1);
+      most = Math.max(most, ++running);
+      return new Promise((_resolve, reject) => {
+        held.push(() => {
+          running--;
+          reject(new Error("EHOSTDOWN"));
+        });
+      });
+    };
+    return { opens, most: () => most };
+  }
+
+  /** A CLI that does not answer until the returned function is called; it then fails. */
+  function hungCli(): () => void {
+    let answer: (() => void) | undefined;
+    childProcess.execFile = ((
+      _file: string,
+      args: string[],
+      options: { cwd?: string },
+      done: (err: Error, stdout: string, stderr: string) => void,
+    ) => {
+      invocations.push({ args, cwd: options.cwd });
+      answer = () => done(Object.assign(new Error("killed"), { killed: true }), "", "");
+      held.push(answer);
+      return undefined;
+    }) as unknown as typeof childProcess.execFile;
+    return () => answer?.();
+  }
+
+  test("pin, fresh: a caFile read again replaces the anchor", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    fs.writeFileSync(caFile, RENEWED);
+
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, RENEWED);
+  });
+
+  test("pin, dropped: a caFile removed from the setting takes its anchor with it", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+
+    stubConfig.environments = [{ name: "PROD", url: REMOTE }];
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
+  });
+
+  test("pin, kept: a caFile read slower than the refresh allows keeps the anchor read before", async () => {
+    // Dropping it would put a pinned host back on the default roots, which trust more than the pin.
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    trust.setEngineTrustLimitsForTest({ refreshReadMs: 50 });
+    holdReads([caFile]);
+
+    assert.strictEqual(await trust.refreshEngineTrust(), false);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+    assert.ok(
+      logged.some((line) => line.includes(`keeping the certificate read earlier from ${caFile}`)),
+      `the keep was silent: ${JSON.stringify(logged)}`,
+    );
+  });
+
+  test("pin, kept: an unreadable caFile keeps its earlier read, but never another file's", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+    fs.rmSync(caFile); // a share that dropped, or a rotation caught mid-write
+
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
+
+    // The control: the user pointed the pin at a different file, so the old read no longer applies.
+    const other = path.join(ws, "pki", "new.pem");
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile: other }];
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, undefined);
+  });
+
+  test("CLI, fresh: a certificate the CLI now names elsewhere replaces the anchor", async () => {
+    stubInventory = plantedEngine();
+    await trust.refreshEngineTrust();
+    const moved = path.join(ws, "state2", "api-cert.pem");
+    fs.mkdirSync(path.dirname(moved), { recursive: true });
+    fs.writeFileSync(moved, RENEWED);
+    stubInventory = inventoryFor(moved, "generated");
+
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
+  });
+
+  test("CLI, dropped: a CLI that answers with no certificate drops the loopback anchor", async () => {
+    stubInventory = plantedEngine();
+    await trust.refreshEngineTrust();
+    stubInventory = NO_CERT_YET;
+
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+  });
+
+  test("CLI, kept: a CLI that does not answer in time keeps the loopback anchor", async () => {
+    stubInventory = plantedEngine();
+    await trust.refreshEngineTrust();
+    trust.setEngineTrustLimitsForTest({ cliAnswerMs: 50 });
+    hungCli();
+
+    assert.strictEqual(await trust.refreshEngineTrust(), false);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("CLI, kept: only the CLI's own anchor — a removed loopback pin is not kept by a silent CLI", async () => {
+    const caFile = plantCert(path.join("pki", "local-ca.pem"));
+    stubConfig.environments = [{ name: "LOCAL", url: LOOPBACK, caFile }];
+    await trust.refreshEngineTrust();
+    stubConfig.environments = [];
+    trust.setEngineTrustLimitsForTest({ cliAnswerMs: 50 });
+    hungCli();
+
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+  });
+
+  test("CLI, kept: a CLI that fails keeps the loopback anchor", async () => {
+    stubInventory = plantedEngine();
+    await trust.refreshEngineTrust();
+    childProcess.execFile = ((
+      _file: string,
+      args: string[],
+      options: { cwd?: string },
+      done: (err: Error, stdout: string, stderr: string) => void,
+    ) => {
+      invocations.push({ args, cwd: options.cwd });
+      done(Object.assign(new Error("exit 2"), { code: 2 }), "", "");
+      return undefined;
+    }) as unknown as typeof childProcess.execFile;
+
+    assert.strictEqual(await trust.refreshEngineTrust(), false);
+    assert.strictEqual(invocations.length, 2, "the failing CLI never ran");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("CLI, kept: a certificate read that does not finish keeps the loopback anchor", async () => {
+    const cert = plantCert(path.join("state", "api-cert.pem"));
+    stubInventory = inventoryFor(cert, "generated");
+    await trust.refreshEngineTrust();
+    trust.setEngineTrustLimitsForTest({ refreshReadMs: 50 });
+    holdReads([cert]);
+
+    assert.strictEqual(await trust.refreshEngineTrust(), false);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("CLI, kept: a skipped CLI keeps the anchor, and the child's exit applies a setting changed meanwhile", async () => {
+    stubInventory = plantedEngine();
+    await trust.refreshEngineTrust();
+    trust.setEngineTrustLimitsForTest({ cliAnswerMs: 50 });
+    const exit = hungCli();
+    await trust.refreshEngineTrust(); // gives up on the child, which stays alive
+
+    // The user points serviceConfig at another TOML while that child is still alive.
+    const moved = path.join(ws, "other", "api-cert.pem");
+    fs.mkdirSync(path.dirname(moved), { recursive: true });
+    fs.writeFileSync(moved, RENEWED);
+    stubConfig.serviceConfig = "other.toml";
+    stubInventory = inventoryFor(moved, "generated");
+    await trust.refreshEngineTrust();
+    assert.strictEqual(invocations.length, 2, "a second CLI started beside the live one");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM, "the skip dropped the anchor");
+
+    childProcess.execFile = answeringCli;
+    exit();
+    await ticks();
+    await settle();
+
+    assert.strictEqual(invocations.length, 3, "the child's exit queued no refresh");
+    assert.ok(invocations[2].args.includes("other.toml"), JSON.stringify(invocations[2].args));
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
+  });
+
+  test("a failure while an earlier CLI child is alive starts no refresh", async () => {
+    stubInventory = plantedEngine();
+    await trust.refreshEngineTrust();
+    trust.setEngineTrustLimitsForTest({ cliAnswerMs: 50 });
+    hungCli();
+    await trust.refreshEngineTrust();
+    const before = logged.length;
+
+    assert.strictEqual(await trust.followCertificateChange(LOOPBACK, PEM), false);
+    await ticks();
+    await settle();
+
+    const skipped = logged.slice(before).filter((line) => line.includes("has not exited"));
+    assert.deepStrictEqual(skipped, [], "a refresh started only to skip the CLI");
+  });
+
+  test("certificate reads are bounded: at most two run at once, abandoned ones included", async () => {
+    const files = [0, 1, 2, 3].map((i) => plantCert(path.join("pki", `ca-${i}.pem`)));
+    stubConfig.environments = files.map((caFile, i) => ({
+      name: `E${i}`,
+      url: `https://h${i}.example.com:8765`,
+      caFile,
+    }));
+    trust.setEngineTrustLimitsForTest({ refreshReadMs: 50 });
+    const reads = holdReads(files);
+
+    await trust.refreshEngineTrust();
+    await trust.refreshEngineTrust(); // the first refresh's reads are still running
+    assert.strictEqual(reads.most(), 2, `not capped at two: ${JSON.stringify([...reads.opens])}`);
+  });
+
+  test("a file still being read is not opened again by a later refresh", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    trust.setEngineTrustLimitsForTest({ refreshReadMs: 50 });
+    const reads = holdReads([caFile]);
+
+    await trust.refreshEngineTrust();
+    await trust.refreshEngineTrust();
+    assert.strictEqual(reads.opens.get(path.normalize(caFile)), 1);
+  });
+
+  test("a read that started before the refresh asked is not what the refresh registers", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+    await trust.refreshEngineTrust();
+
+    // A request's re-read opens the file while it still holds PEM, and finishes only after the
+    // refresh has joined it; meanwhile the file is rotated.
+    let stale: (() => void) | undefined;
+    openHook = (file) => {
+      if (file !== path.normalize(caFile) || stale !== undefined) {
+        return undefined;
+      }
+      const bytes = Buffer.from(PEM);
+      let served = false;
+      const handle = {
+        stat: async () => ({ isFile: () => true, size: bytes.length }),
+        read: async (buffer: Buffer, offset: number) => {
+          const bytesRead = served ? 0 : bytes.copy(buffer, offset);
+          served = true;
+          return { bytesRead };
+        },
+        close: async () => undefined,
+      };
+      return new Promise((resolve) => {
+        stale = () => resolve(handle);
+      });
+    };
+    childProcess.execFile = cliThatFirst(() => {
+      void trust.followCertificateChange(REMOTE, PEM);
+      fs.writeFileSync(caFile, RENEWED);
+      setTimeout(() => stale?.(), 20);
+    });
+
+    await trust.refreshEngineTrust();
+    await settle();
+
+    assert.ok(stale !== undefined, "the request's read never started, so this test proves nothing");
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, RENEWED);
+  });
+
+  test("before the first refresh commits, a failure reads the configured caFile", async () => {
+    const caFile = plantCert(path.join("pki", "prod-ca.pem"));
+    stubConfig.environments = [{ name: "PROD", url: REMOTE, caFile }];
+
+    assert.strictEqual(await trust.followCertificateChange(REMOTE, undefined), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(REMOTE)).ca, PEM);
   });
 });
