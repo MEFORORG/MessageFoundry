@@ -1199,7 +1199,7 @@ def test_a_wait_never_outranks_a_context_at_the_cap(pki: _Pki) -> None:
     assert outcome.refusal.remedy == RESTART and "reloads" in outcome.refusal.reason
     assert not outcome.refusal.sticky  # the other hop's wait is still retried
     # And it does not send the operator into a start that refuses the same file.
-    assert "a start until then refuses this file too" in outcome.refusal.reason
+    assert "a start refuses this file too at least until then" in outcome.refusal.reason
     assert _accepts(capped, pki.server()) and _accepts(fresh, pki.server())
 
 

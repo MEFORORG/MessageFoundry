@@ -35,6 +35,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from pydantic import ValidationError
 
 from messagefoundry.config import loaded_crls
@@ -48,9 +51,14 @@ from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AlertRule, Egress
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.pipeline import crl_reload
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, crl_reload_refused_detail
+from messagefoundry.pipeline.alerts import (
+    AlertSink,
+    LoggingAlertSink,
+    crl_reload_refused_detail,
+)
 from messagefoundry.pipeline.crl_reload import (
     ALERT_PATH_MAX_LENGTH,
+    BAD_SIGNATURE,
     FIX,
     RESTART,
     WAIT,
@@ -292,7 +300,9 @@ async def test_a_restart_that_a_start_would_refuse_too_says_so(pki: _Pki) -> Non
     (outcome,) = _pass(runner, max_reloads=1)
 
     assert outcome.refusal is not None and outcome.refusal.remedy == RESTART
-    assert "a start until then refuses this file too" in outcome.refusal.reason  # the control
+    assert (
+        "a start refuses this file too at least until then" in outcome.refusal.reason
+    )  # the control
     assert outcome.start_refuses
     (payload,) = sink.refused()
     assert payload["remedy_class"] == "restart" and payload["start_refuses"] is True
@@ -302,6 +312,76 @@ async def test_a_restart_that_a_start_would_refuse_too_says_so(pki: _Pki) -> Non
     # The warning comes before the remedy that names a restart: the reason column is cut short.
     assert detail.index("do not restart before then") < detail.index(RESTART)
     assert capped.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_refuses_it_too(
+    pki: _Pki,
+) -> None:
+    """Vault BACKLOG #3506, the Manager's item 1. The ``bad_signature`` remedy says a start can
+    load the file, which is false while it is not in effect, so the refusal carries the same
+    caveat a restart remedy does. Before, it carried none."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+    forged = pki.crl_pem(
+        issued=-_DAY, lasts=90 * _DAY, signer=ec.generate_private_key(ec.SECP256R1())
+    )
+    pki.crl.write_bytes(forged)  # not in effect, and badly signed
+
+    (outcome,) = _pass(runner)
+
+    assert outcome.refusal is not None and outcome.refusal.remedy == BAD_SIGNATURE
+    assert "Restart the engine" not in BAD_SIGNATURE  # the remedy itself is unchanged
+    assert "a start refuses this file too at least until then" in outcome.refusal.reason
+    assert outcome.start_refuses
+    (payload,) = sink.refused()
+    assert payload["remedy_class"] == "bad_signature" and payload["start_refuses"] is True
+    # The detail a notifier builds from what the alert carried.
+    detail = crl_reload_refused_detail(
+        remedy_class=payload["remedy_class"],
+        stale_contexts=payload["stale_contexts"],
+        remedy=payload["remedy"],
+        start_refuses=payload["start_refuses"],
+    )
+    # Review finding F3: the time is no promise. A start refuses a proven bad signature after it
+    # too, and the reload cannot tell proven from unproven, so the text says "at least", inside
+    # the first 200 characters the alert list keeps. The remedy that follows says when.
+    assert "at least until its CRL takes effect, so do not restart before then." in detail[:200]
+    assert detail.index("at least until") < detail.index(BAD_SIGNATURE)
+    # The old wording, which read the time as the moment a start loads the file, is gone.
+    assert "too until its CRL takes effect" not in detail
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+    # Control: the same forgery in effect carries no such caveat.
+    pki.crl.write_bytes(
+        pki.crl_pem(issued=_DAY, lasts=90 * _DAY, signer=ec.generate_private_key(ec.SECP256R1()))
+    )
+    (in_effect,) = _pass(runner)
+    assert in_effect.refusal is not None and in_effect.refusal.remedy == BAD_SIGNATURE
+    assert not in_effect.start_refuses
+    assert "at least until then" not in in_effect.refusal.reason
+
+
+async def test_the_caveat_quotes_a_long_issuer_name_with_a_bound(pki: _Pki) -> None:
+    """Vault BACKLOG #3506: the caveat quotes the issuer of the CRL not yet in effect the way the
+    signature check quotes one, cut to a bound, since a name has no length bound of its own."""
+    hop = pki.outbound_hop()
+    runner = _runner(_Sink())
+    long_name = x509.Name(
+        [x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, f"unit-{n:03}") for n in range(80)]
+    )
+    assert len(long_name.rfc4514_string()) > 600  # the premise
+    pki.crl.write_bytes(pki.crl_pem(issued=-_DAY, lasts=90 * _DAY, issuer=long_name))
+
+    (outcome,) = _pass(runner)
+
+    assert outcome.refusal is not None and outcome.start_refuses
+    reason = outcome.refusal.reason
+    assert "is not in effect" in reason and "(cut: the name is" in reason
+    caveat = reason[reason.index("since its CRL from issuer") :]
+    assert len(caveat) < 300
+    assert long_name.rfc4514_string() not in reason[reason.index("Not before") :]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF  # keeps the hop alive to here
 
 
 def test_every_remedy_has_its_own_class_token() -> None:

@@ -1411,6 +1411,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # Vault BACKLOG #2223: load_pinned_server_certificate counts the certificates in a SQL
             # Server pin file, so a bundle is refused at load. Public certificates only.
             "key_cert:cryptography.x509.load_pem_x509_certificates",
+            # Vault BACKLOG #3506: _crl_extensions parses a copy of a CRL whose authority key
+            # identifier carries a serial that is not positive, to read its extensions without
+            # cryptography's warning. Public material; no signature is checked on the copy.
+            "key_cert:cryptography.x509.load_der_x509_crl",
             "key_cert:cryptography.x509.load_pem_x509_crl",
             "key_cert:cryptography.x509.random_serial_number",
             "key_cert:via messagefoundry.keywrap",

@@ -386,7 +386,9 @@ def harden_crl_check(
         )
 
     pem = path.read_bytes()
-    facts, blocks = judge_crl_bytes(pem, label=label, now=time.time())
+    facts, blocks = judge_crl_bytes(
+        pem, label=label, now=time.time(), refuse_unread_extensions=True
+    )
 
     before = ctx.cert_store_stats()
     certs_before = before["x509"]  # a missing key raises: fail closed
@@ -559,16 +561,10 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
 
 
 #: Why a start could not confirm a CRL's signature, by :class:`~messagefoundry.pki.CrlSignature`
-#: state, in the words of the one warning :func:`_check_crl_signatures` logs. ``unlisted`` says
-#: what the engine did, not what the CA list holds: a listed CA whose name differs from the
-#: issuer's only in white space reads ``unlisted`` too, and OpenSSL can still use that CA
-#: (:func:`~messagefoundry.pki._issuer_name_key` says why).
+#: state, in the words of the one warning :func:`_check_crl_signatures` logs. ``unlisted`` is not
+#: here: its words are :data:`~messagefoundry.pki.UNLISTED_SIGNATURE`, which the reload's refusal
+#: uses too, so the two cannot drift apart (vault BACKLOG #3506).
 _UNCONFIRMED_SIGNATURE = {
-    "unlisted": (
-        "the engine matched it to no CA certificate this hop lists (it compares the issuer name "
-        "with the case of ASCII letters folded, as OpenSSL does, and white space exactly, and "
-        "then the CRL's authority key identifier, where it carries one)"
-    ),
     "unproven": (
         "a listed CA has that name, ASCII letter case aside, and its key does not "
         "verify the CRL, but the CRL does not "
@@ -600,8 +596,11 @@ def _check_crl_signatures(
     logged. That function is asked only when there is a line to log. So it holds the last file
     version that logged one, and an earlier version is logged again only when it returns after
     another that logged one. A judgment that fails for any other reason is logged at ERROR,
-    once, and the file loads: this is a diagnosis, and a defect in it must not stop a start. That
-    failure discards the whole judgment, a proven bad CRL in the same file included.
+    once, and the file loads: this is a diagnosis, and a defect in it must not stop a start. The
+    verdicts reached before that failure still count (vault BACKLOG #3506): a CRL already proven
+    bad refuses the file, and the others it could not confirm warn. The CRLs after it are not
+    judged, so a proof there is missed, and none is judged when the failure comes before the
+    first verdict.
 
     **Each CRL is judged on its own, as the expired-CRL refusal judges them.** So a badly signed
     copy refuses the file even beside a newer, good CRL from the same issuer, which OpenSSL
@@ -615,25 +614,30 @@ def _check_crl_signatures(
     There is no setting that turns this off and none that widens it, as for the expired-CRL
     refusal in :func:`judge_crl_bytes`."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
-    from messagefoundry.pki import judge_crl_signatures
+    from messagefoundry.pki import UNLISTED_SIGNATURE, CrlSignature, judge_crl_signatures
 
     fingerprint = crl_fingerprint(pem)
+    judged: list[CrlSignature] = []
     try:
-        judged = list(judge_crl_signatures(pem, anchors))
+        # One verdict at a time, so a failure part way keeps the verdicts already reached.
+        for signature in judge_crl_signatures(pem, anchors):
+            judged.append(signature)
     except Exception as exc:
         # Not a verdict on the file, and not proof: the judgment itself failed. Broad on purpose.
         # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
-        # that with exception types of its own. The handshake still checks every signature.
+        # that with exception types of its own. The handshake still checks every signature. The
+        # verdicts already reached are used below: a proof refuses, and the unconfirmed warn.
         if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(exc).__name__)):
             logger.error(
                 "%s: the engine could not check the signatures of the CRL(s) in this file at "
-                "start (%s). That is not a verdict on the file. It is loaded and revocation "
+                "start (%s), after judging %d of them. That is not a verdict on the rest. Unless "
+                "a CRL it judged is proven badly signed, the file is loaded and revocation "
                 "checking is on, and OpenSSL checks each signature at the handshake",
                 label,
                 type(exc).__name__,
+                len(judged),
                 exc_info=True,
             )
-        return
     if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
         raise ValueError(
             f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "
@@ -645,15 +649,16 @@ def _check_crl_signatures(
     finding = tuple(signature.state for signature in judged)
     if not unconfirmed or not first_unconfirmed_signature(crl_file, fingerprint, finding):
         return
+    words = {**_UNCONFIRMED_SIGNATURE, "unlisted": UNLISTED_SIGNATURE}
     shown = "; ".join(
-        f"{signature.where}: {_UNCONFIRMED_SIGNATURE[signature.state]}"
+        f"{signature.where}: {words[signature.state]}"
         for signature in unconfirmed[:_UNCONFIRMED_SHOWN]
     )
     if (more := len(unconfirmed) - _UNCONFIRMED_SHOWN) > 0:
         shown = f"{shown}; and {more} more"
     logger.warning(
         "%s: the engine could not confirm at start that a CA this hop lists signed %d of the %d "
-        "CRL(s) in this file. %s. The file is loaded and revocation checking is on. OpenSSL "
+        "CRL(s) it judged in this file. %s. The file is loaded and revocation checking is on. OpenSSL "
         "checks each signature at the handshake. If peers are then refused with 'CRL signature "
         "failure' or 'unable to get certificate CRL', check this file first",
         label,
@@ -707,7 +712,12 @@ def crl_label(crl_file: str, setting: str | None) -> str:
 
 
 def judge_crl_bytes(
-    pem: bytes, *, label: str, now: float, require_in_effect: bool = True
+    pem: bytes,
+    *,
+    label: str,
+    now: float,
+    require_in_effect: bool = True,
+    refuse_unread_extensions: bool = False,
 ) -> tuple[CrlFacts, tuple[CrlBlock, ...]]:
     """Refuse CRL bytes no context may load. Return the facts of the soonest-expiring block, and
     every block, which a context that records its copy needs (BACKLOG #299).
@@ -720,7 +730,10 @@ def judge_crl_bytes(
     load. An expired CRL refuses, because past ``nextUpdate`` it fails every peer, not only revoked
     ones. So does an issuer whose every CRL takes effect later (:class:`CrlNotInEffect`), unless
     ``require_in_effect`` is False: the reload asks :func:`crl_not_in_effect` itself, because a file
-    to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``.
+    to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``, except for a CRL
+    whose extensions ``cryptography`` cannot read: without ``refuse_unread_extensions`` its own
+    error, which is no ``ValueError``, raises as it is. That flag goes to
+    :func:`~messagefoundry.pki.judge_every_crl`, which says who passes it.
 
     No signature is checked here, because this has no CA list. A start checks it in
     :func:`_check_crl_signatures`, and the reload in
@@ -728,7 +741,7 @@ def judge_crl_bytes(
     from messagefoundry.pki import judge_every_crl, soonest_crl
 
     try:
-        judged = judge_every_crl(pem, now=now)
+        judged = judge_every_crl(pem, now=now, refuse_unread_extensions=refuse_unread_extensions)
     except ValueError as exc:
         raise ValueError(f"{label}: {exc}") from exc
     facts = soonest_crl([every for every, _ in judged])

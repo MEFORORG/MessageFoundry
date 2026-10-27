@@ -31,11 +31,16 @@ from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.serialization import pkcs12
+from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.keywrap import (
+    DerTlv,
+    MalformedDer,
     Pkcs12EncryptedPart,
+    der_children,
     pkcs12_encrypted_parts,
+    read_der_tlv,
     refuse_weak_pkcs12,
     refuse_weak_pkcs12_contents,
 )
@@ -46,9 +51,11 @@ __all__ = [
     "CrlFacts",
     "CrlIssuerKey",
     "CrlSignature",
+    "UNLISTED_SIGNATURE",
     "crl_signature_refusal",
     "judge_crl_signatures",
     "judge_every_crl",
+    "quoted_issuer",
     "read_crl_facts",
     "read_soonest_crl_facts",
     "crl_pem_blocks",
@@ -306,9 +313,20 @@ class CrlBlock:
     selection: tuple[bytes | None, bytes | None, frozenset[str]] = (None, None, frozenset())
 
 
-def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]]:
+def judge_every_crl(
+    pem: bytes, *, now: float, refuse_unread_extensions: bool = False
+) -> list[tuple[CrlFacts, CrlBlock]]:
     """The facts and the :class:`CrlBlock` of EVERY CRL in ``pem``, in file order, refusing any block
     it cannot judge. One parse per block.
+
+    **Extensions ``cryptography`` cannot read raise as it raised them, unless
+    ``refuse_unread_extensions``** (:data:`_UNREAD_EXTENSIONS`; vault BACKLOG #3506). With it, such
+    a block refuses by name, as a ``ValueError``, like any other block that cannot be judged. A
+    start and the running-hop reload pass it. The expiry scan's check of a CRL in a CA file does
+    not, so what it reports for such a CRL is what it reported before #3506: a hold on engine PR
+    2566 (vault row #4532) found that that check reported it, by the ``ValueError``, as one to
+    replace before a restart, a report it had not made before. ``docs/CONFIGURATION.md``, under
+    ``[cert_monitor]``, says what it reports.
 
     The strict sibling of :func:`read_soonest_crl_facts`, for a context load (``harden_crl_check``)
     and the running-hop reload (BACKLOG #299). The monitor skips a block it cannot judge so one bad
@@ -350,7 +368,15 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
         where = f"CRL block {index} of {len(blocks)}"
         try:
             crl, nxt = _parse_first_crl(block)
-            if _is_delta_crl(crl):
+            try:
+                extensions = _crl_extensions(crl)
+            except _UNREAD_EXTENSIONS as exc:
+                if not refuse_unread_extensions:
+                    raise
+                raise ValueError(
+                    f"its extensions do not read ({type(exc).__name__}: {exc})"
+                ) from exc
+            if _is_delta_crl(extensions):
                 raise ValueError(
                     "it is a delta CRL, and the engine turns on no delta CRL support, so OpenSSL "
                     "loses revocations under either delta rule. Before openssl/openssl PR 31044 it "
@@ -367,7 +393,7 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
                         this_update=crl.last_update_utc,
                         next_update=nxt,
                         fingerprint=crl.fingerprint(hashes.SHA256()),
-                        selection=_selection(crl),
+                        selection=_selection(extensions),
                     ),
                 )
             )
@@ -377,20 +403,19 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
 
 
 def _selection(
-    crl: x509.CertificateRevocationList,
+    read: _CrlExtensions,
 ) -> tuple[bytes | None, bytes | None, frozenset[str]]:
     """What OpenSSL scores a CRL on besides time and issuer; :class:`CrlBlock` says why."""
     scope: bytes | None = None
-    key_id: bytes | None = None
     critical: set[str] = set()
-    for ext in crl.extensions:
+    for ext in read.extensions:
         if ext.critical:
             critical.add(ext.oid.dotted_string)
         if isinstance(ext.value, x509.IssuingDistributionPoint):
             scope = ext.value.public_bytes()
-        elif isinstance(ext.value, x509.AuthorityKeyIdentifier):
-            # The whole AKID: OpenSSL matches its issuer and serial to the CA too, when present.
-            key_id = ext.value.public_bytes()
+    # The whole AKID: OpenSSL matches its issuer and serial to the CA too, when present. Its
+    # bytes as the CRL carries them, since ``read.extensions`` can hold a rewritten serial.
+    key_id = None if read.akid is None else read.akid.der
     return scope, key_id, frozenset(critical)
 
 
@@ -443,27 +468,273 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
     that OpenSSL loads. Before vault BACKLOG #2905 such a CA raised out of the reload's check,
     which then retried every pass. ``pem`` must be bytes :func:`judge_every_crl` accepted; a
     block that does not parse raises ``ValueError``."""
-    cas: list[tuple[_NameKey, x509.Certificate]] = []
+    cas: list[_ListedCa] = []
     for der in ca_ders:
         try:
-            ca = x509.load_der_x509_certificate(der)
-            cas.append((_issuer_name_key(ca.subject), ca))
+            cas.append(_listed_ca(der))
         except _UNREADABLE_CA:
             continue
     blocks = list(_crl_blocks(pem))
     for index, block in enumerate(blocks, start=1):
         crl = x509.load_pem_x509_crl(block)
-        where = f"CRL block {index} of {len(blocks)} (issuer {crl.issuer.rfc4514_string()!r})"
-        yield CrlSignature(where, _signature_state(crl, cas))
+        issuer = quoted_issuer(crl.issuer.rfc4514_string())
+        yield CrlSignature(
+            f"CRL block {index} of {len(blocks)} (issuer {issuer})", _signature_state(crl, cas)
+        )
 
+
+#: The most characters of a CRL's quoted issuer name the signature check and the running-hop
+#: reload put in a message (vault BACKLOG #3506). A name has no length bound of its own, and each
+#: message that quotes it goes to the log or an exception.
+_ISSUER_SHOWN = 200
+
+
+def quoted_issuer(issuer: str) -> str:
+    """``issuer`` quoted with ``repr``, whole, or cut so the quoted form holds at most
+    :data:`_ISSUER_SHOWN` characters, escapes included. The note on how long the name is stays
+    outside the quotes."""
+    quoted = repr(issuer)
+    if len(quoted) <= _ISSUER_SHOWN:
+        return quoted
+    # Cut the name, not its quoted form, so the quotes close and no escape is split.
+    kept = _ISSUER_SHOWN
+    while len(quoted := repr(issuer[:kept])) > _ISSUER_SHOWN:
+        kept -= 1
+    return f"{quoted}... (cut: the name is {len(issuer)} characters)"
+
+
+#: What ``cryptography`` raises, at least, for CRL extensions it cannot read, beside a duplicate
+#: extension, which :func:`_crl_extensions` refuses itself: a general name it does not support,
+#: such as an x400Address, and, where warnings are errors, a deprecation it warns of. Neither is a
+#: ``ValueError``. :func:`judge_every_crl` says who refuses these by name (vault BACKLOG #3506).
+_UNREAD_EXTENSIONS = (x509.UnsupportedGeneralNameType, CryptographyDeprecationWarning)
 
 #: What ``cryptography`` raises for a CA certificate it cannot read, at least. A CA that raises
 #: one is skipped by :func:`judge_crl_signatures`, alone. ``InvalidVersion`` comes from the
 #: parse, and ``UnsupportedGeneralNameType`` from reading extensions; neither is a ``ValueError``.
-_UNREADABLE_CA = (ValueError, x509.InvalidVersion, x509.UnsupportedGeneralNameType)
+#: ``CryptographyDeprecationWarning`` is raised only where warnings are errors. A CA whose serial
+#: number is not positive no longer raises it, because :func:`_listed_ca` reads that CA without
+#: the warning, and nor does a CRL whose Authority Key Identifier carries such a serial
+#: (:func:`_crl_extensions`). It stays here for any other deprecation the parse warns of, so such
+#: a CA is skipped alone rather than ending the whole judgment (vault BACKLOG #3506).
+#: :func:`_signature_state` reads a CRL whose own extensions raise one of these as ``unlisted``.
+_UNREADABLE_CA = (ValueError, x509.InvalidVersion, *_UNREAD_EXTENSIONS)
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
 _NameKey = tuple[tuple[tuple[str, bool, str | bytes], ...], ...]
+
+
+@dataclass(frozen=True)
+class _ListedCa:
+    """One CA from a hop's list, as :func:`_signature_state` reads it. ``serial`` is the serial
+    number the certificate carries. ``cert`` can be a copy with its serial numbers rewritten
+    (:func:`_listed_ca` says when), so it is read for its names, extensions and key only, never
+    for its serial, its fingerprint or as the CA's identity."""
+
+    name: _NameKey
+    cert: x509.Certificate
+    serial: int
+
+
+def _listed_ca(der: bytes) -> _ListedCa:
+    """The CA certificate ``der``, read for :func:`judge_crl_signatures` (vault BACKLOG #3506).
+
+    **A serial number that is not positive is read without ``cryptography``'s warning.** At
+    least some system roots carry serial 0, and some of those name it again in their own
+    Authority Key Identifier. ``cryptography`` warns when it parses such a CA, when it reads the
+    serial, and when it reads that extension, and where warnings are errors the warning is raised
+    instead. That CA was then skipped, so a forged CRL naming its key read ``unlisted`` and loaded
+    with a warning. Silencing the warning needs a change to the process's warning filters, and a
+    start and a reload can run this on two threads at once. So instead the first byte of each
+    such serial is rewritten to ``0x01`` in a copy of the bytes, which keeps the length and makes
+    the number positive, and the copy is parsed. The real serial is kept in
+    :attr:`_ListedCa.serial` for the Authority Key Identifier match. The copy's own signature is
+    then wrong, which nothing here reads: the check uses the subject, the issuer, the Subject Key
+    Identifier and the public key, and those bytes are unchanged. A serial that is not minimally
+    encoded is left as it is, so the parse refuses it as before. ``cryptography`` says it will
+    refuse such a serial outright in a later release; this reads the CA all the same."""
+    spans = _der_serial_spans(der)
+    if spans is None:  # not that shape: the parse judges it, and reads its serial
+        ca = x509.load_der_x509_certificate(der)
+        return _ListedCa(_issuer_name_key(ca.subject), ca, ca.serial_number)
+    serial = int.from_bytes(der[slice(*spans[0])], "big", signed=True)
+    ca = x509.load_der_x509_certificate(_positive_copy(der, spans))
+    return _ListedCa(_issuer_name_key(ca.subject), ca, serial)
+
+
+def _positive_copy(der: bytes, spans: list[tuple[int, int]]) -> bytes:
+    """``der`` with the first byte of each INTEGER in ``spans`` that :func:`_not_positive` holds
+    set to ``0x01``: the same length, and a positive number. The one rewrite rule the CA side
+    (:func:`_listed_ca`) and the CRL side (:func:`_crl_extensions`) share."""
+    for start, end in spans:
+        if _not_positive(der[start:end]):
+            der = der[:start] + b"\x01" + der[start + 1 :]
+    return der
+
+
+def _not_positive(content: bytes) -> bool:
+    """Whether the INTEGER content ``content`` is zero, or negative and minimally encoded. A
+    non-minimal one is left for the parse to refuse."""
+    return content == b"\x00" or (
+        content[0] >= 0x80 and not (content[0] == 0xFF and len(content) > 1 and content[1] >= 0x80)
+    )
+
+
+#: The Authority Key Identifier's OID, ``id-ce-authorityKeyIdentifier``, as the content of its
+#: DER encoding.
+_AKID_OID = bytes.fromhex("551d23")
+
+
+def _der_serial_spans(der: bytes) -> list[tuple[int, int]] | None:
+    """Where the serial numbers sit in the certificate ``der``, as content spans: its own first,
+    then any its own Authority Key Identifier carries. ``None`` when the bytes do not have that
+    shape; the parse then judges them. A TBSCertificate starts with an optional explicit
+    version, tag ``[0]``, and then the serial, an INTEGER. Its extensions are under tag ``[3]``,
+    and an Authority Key Identifier carries a serial under tag ``[2]``."""
+    try:
+        fields = _tbs_fields(der)
+        if fields and fields[0].tag == 0xA0:
+            fields = fields[1:]
+        if not fields:
+            return None
+        serial = fields[0]
+        if serial.tag != 0x02 or serial.start == serial.end:
+            return None
+        spans = [(serial.start, serial.end)]
+        for field in fields:
+            if field.tag == 0xA3:
+                for value in _akid_values(der, field.start, field.end):
+                    spans += _akid_serials(der, value)
+    except MalformedDer:
+        return None
+    return spans
+
+
+def _tbs_fields(der: bytes) -> list[DerTlv] | None:
+    """The fields of the signed part of the certificate or CRL ``der``: a SEQUENCE whose first
+    element, the TBSCertificate or TBSCertList, is a SEQUENCE. ``None`` when the bytes do not
+    have that shape. Raises :class:`MalformedDer` when they do not parse as DER."""
+    outer = read_der_tlv(der, 0, len(der))
+    tbs = read_der_tlv(der, outer.start, outer.end)
+    if (outer.tag, tbs.tag) != (0x30, 0x30):
+        return None
+    return der_children(der, tbs)
+
+
+def _akid_values(der: bytes, start: int, end: int) -> list[tuple[int, int]]:
+    """Where each Authority Key Identifier sits in the explicitly tagged extensions whose content
+    is ``der[start:end]``, a certificate's ``[3]`` or a CRL's ``[0]``, as the content span of its
+    ``extnValue``. Raises :class:`MalformedDer` when the bytes do not have that shape."""
+    found: list[tuple[int, int]] = []
+    for extension in der_children(der, read_der_tlv(der, start, end)):
+        parts = der_children(der, extension)
+        if len(parts) >= 2 and der[parts[0].start : parts[0].end] == _AKID_OID:
+            found.append((parts[-1].start, parts[-1].end))
+    return found
+
+
+def _akid_serials(der: bytes, value: tuple[int, int]) -> list[tuple[int, int]]:
+    """The content spans of the serial, tag ``[2]``, in the Authority Key Identifier whose
+    ``extnValue`` content is ``value``. Raises :class:`MalformedDer` when the bytes do not parse."""
+    akid = read_der_tlv(der, *value)
+    return [
+        (part.start, part.end)
+        for part in der_children(der, akid)
+        if part.tag == 0x82 and part.start < part.end
+    ]
+
+
+@dataclass(frozen=True)
+class _CrlAkid:
+    """A CRL's own Authority Key Identifier, read once per CRL for :func:`_akid_fit` (vault
+    BACKLOG #3506). ``serial`` is the serial the CRL carries, ``issuers`` the directory names it
+    carries in :func:`_issuer_name_key` form, and ``der`` its value. ``der`` is the bytes the CRL
+    carries wherever :func:`_crl_akid_spans` finds them, and ``cryptography``'s encoding of the
+    value only where it does not."""
+
+    key_identifier: bytes | None
+    serial: int | None
+    issuers: frozenset[_NameKey]
+    der: bytes
+
+
+@dataclass(frozen=True)
+class _CrlExtensions:
+    """A CRL's extensions, as :func:`_crl_extensions` reads them. ``extensions`` can come from a
+    copy with its Authority Key Identifier's serial rewritten, so the AKID is read from ``akid``,
+    never from ``extensions``. ``akid`` is ``None`` when the CRL carries none."""
+
+    extensions: x509.Extensions
+    akid: _CrlAkid | None
+
+
+def _crl_extensions(crl: x509.CertificateRevocationList) -> _CrlExtensions:
+    """``crl``'s extensions, read without ``cryptography``'s warning about a serial number that is
+    not positive (vault BACKLOG #3506). **It encodes the CRL's DER again**, which costs more than
+    the parse on a long CRL: measured 2026-10-27 on Windows, CPython 3.14, ``cryptography``
+    50.0.2, about 28 ms for a 2.9 MB CRL of 100,000 entries, against about 16 ms to parse it.
+    :func:`judge_every_crl` pays that for every CRL, beside the encode its fingerprint takes.
+    :func:`_signature_state` pays it only for a CRL some listed CA is named for.
+
+    A CRL's Authority Key Identifier can carry its CA's serial, and a CRL from a root with serial
+    0 can carry 0 there. ``cryptography`` warns when it reads that extension, and where warnings
+    are errors the warning is raised instead: a start then failed with that raw warning, and the
+    signature check read such a CRL as ``unlisted``. So the serial is rewritten in a copy of the
+    DER (:func:`_positive_copy`), as :func:`_listed_ca` does for a CA, and the copy's extensions
+    are read. The CRL itself is left as it is, so its signature and fingerprint are read from the
+    real bytes, and the AKID's serial and encoding are taken from them too. A serial that is not
+    minimally encoded is left for the parse to refuse.
+
+    **Raises ``ValueError`` for a duplicate extension**, so :func:`judge_every_crl` refuses the
+    block by name. Other extensions ``cryptography`` cannot read raise as it raised them
+    (:data:`_UNREAD_EXTENSIONS`), and :func:`judge_every_crl` says which callers refuse those by
+    name."""
+    der = crl.public_bytes(serialization.Encoding.DER)
+    found = _crl_akid_spans(der)
+    copy = der if found is None else _positive_copy(der, found[1])
+    try:
+        extensions = crl.extensions if copy == der else x509.load_der_x509_crl(copy).extensions
+        akid = extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
+    except x509.ExtensionNotFound:
+        return _CrlExtensions(extensions, None)
+    except x509.DuplicateExtension as exc:
+        raise ValueError(f"the CRL carries a duplicate extension: {exc}") from exc
+    serial = akid.authority_cert_serial_number
+    raw = akid.public_bytes()
+    if found is not None:
+        value, serials = found
+        raw = der[slice(*value)]
+        if copy != der:  # the parsed serial is the copy's
+            serial = int.from_bytes(der[slice(*serials[0])], "big", signed=True)
+    issuers = frozenset(
+        _issuer_name_key(name.value)
+        for name in akid.authority_cert_issuer or ()
+        if isinstance(name, x509.DirectoryName)
+    )
+    return _CrlExtensions(extensions, _CrlAkid(akid.key_identifier, serial, issuers, raw))
+
+
+def _crl_akid_spans(der: bytes) -> tuple[tuple[int, int], list[tuple[int, int]]] | None:
+    """Where the CRL ``der``'s own Authority Key Identifier sits, as the content span of its
+    ``extnValue``, and the content spans of the serials it carries. ``None`` when it carries
+    none, carries more than one, or the bytes do not have that shape; the parse then judges
+    them. A TBSCertList's extensions are under tag ``[0]``."""
+    try:
+        fields = _tbs_fields(der)
+        if fields is None:
+            return None
+        values = [
+            value
+            for field in fields
+            if field.tag == 0xA0
+            for value in _akid_values(der, field.start, field.end)
+        ]
+        if len(values) != 1:
+            return None
+        return values[0], _akid_serials(der, values[0])
+    except MalformedDer:
+        return None
+
 
 #: The 26 ASCII capitals to their lower case, and no other character.
 _ASCII_FOLD = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
@@ -573,25 +844,30 @@ def _crl_attribute_key(attribute: x509.NameAttribute[str | bytes]) -> tuple[str,
 
 
 def _signature_state(
-    crl: x509.CertificateRevocationList, cas: list[tuple[_NameKey, x509.Certificate]]
+    crl: x509.CertificateRevocationList, cas: list[_ListedCa]
 ) -> CrlSignatureState:
     """Which :class:`CrlSignature` state ``cas`` gives ``crl``."""
     issuer = _issuer_name_key(crl.issuer)
+    named_cas = [ca for ca in cas if ca.name == issuer]
+    if not named_cas:
+        return "unlisted"  # the usual case for an intermediate's CRL: its extensions go unread
+    try:
+        akid = _crl_extensions(crl).akid  # once per CRL, not once per CA
+    except _UNREADABLE_CA:
+        return "unlisted"  # its extensions do not read: no CA is shown to fit
     fitting = False
     named = False  # the CRL names some fitting CA's key
     unchecked = False
-    for subject, ca in cas:
-        if subject != issuer:
-            continue
+    for ca in named_cas:
         try:
-            names_key = _akid_fit(crl, ca)
+            names_key = _akid_fit(akid, ca)
         except _UNREADABLE_CA:
-            continue  # its extensions or its issuer name do not read: not shown to fit
+            continue  # the CA's extensions or its issuer name do not read: not shown to fit
         if names_key is None:
             continue
         fitting = True
         named = named or names_key
-        answer = _verifies(crl, ca)
+        answer = _verifies(crl, ca.cert)
         if answer:
             return "verified"
         unchecked = unchecked or answer is None
@@ -600,6 +876,17 @@ def _signature_state(
     if unchecked:
         return "uncheckable"
     return "bad" if named else "unproven"
+
+
+#: Why a CRL reads :class:`CrlSignature` state ``unlisted``, for a start's warning and a reload's
+#: refusal alike. It says what the engine did, not what the CA list holds: a listed CA whose name
+#: differs from the issuer's only in white space reads ``unlisted`` too, and OpenSSL can still use
+#: that CA (:func:`_issuer_name_key` says why).
+UNLISTED_SIGNATURE = (
+    "the engine matched it to no CA certificate this hop lists (it compares the issuer name "
+    "with the case of ASCII letters folded, as OpenSSL does, and white space exactly, and then "
+    "the CRL's authority key identifier, where it carries one)"
+)
 
 
 def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bool] | None:
@@ -625,15 +912,8 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     unlisted: str | None = None
     for signature in judge_crl_signatures(pem, ca_ders):
         if signature.state == "unlisted":
-            # Go on: a block that is known to be badly signed is the stronger finding. The words
-            # are the start warning's (``tls_policy._UNCONFIRMED_SIGNATURE``); a test holds the
-            # two together.
-            unlisted = unlisted or (
-                f"{signature.where}: the engine matched it to no CA certificate this hop lists "
-                "(it compares the issuer name with the case of ASCII letters folded, as OpenSSL "
-                "does, and white space exactly, and then the CRL's authority key identifier, "
-                "where it carries one)"
-            )
+            # Go on: a block that is known to be badly signed is the stronger finding.
+            unlisted = unlisted or f"{signature.where}: {UNLISTED_SIGNATURE}"
         elif signature.state != "verified":
             return (
                 f"{signature.where}: the engine could not confirm its signature with the key "
@@ -645,19 +925,18 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     return None if unlisted is None else (unlisted, False)
 
 
-def _akid_fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
-    """How ``ca`` fits ``crl``'s Authority Key Identifier, the way OpenSSL's ``X509_check_akid``
-    matches one: each part the AKID carries must match the CA. ``None`` when it does not fit.
+def _akid_fit(akid: _CrlAkid | None, listed: _ListedCa) -> bool | None:
+    """How the CA ``listed`` fits a CRL's Authority Key Identifier ``akid``, the way OpenSSL's
+    ``X509_check_akid`` matches one: each part the AKID carries must match the CA. ``None`` when
+    it does not fit.
 
     When it fits, the answer is whether the CRL **names the CA's key**: the AKID carries a key
-    identifier, the CA carries a Subject Key Identifier, and the two are equal. A CRL with no key
-    identifier fits, and so does a CA with no Subject Key Identifier, but neither names the key."""
-    try:
-        akid = crl.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
-    except x509.ExtensionNotFound:
+    identifier, the CA carries a Subject Key Identifier, and the two are equal. A CRL with no
+    AKID or no key identifier fits, and so does a CA with no Subject Key Identifier, but none of
+    those names the key."""
+    if akid is None:
         return False
-    except x509.DuplicateExtension:
-        return None
+    ca = listed.cert
     names_key = False
     if akid.key_identifier is not None:
         try:
@@ -670,18 +949,12 @@ def _akid_fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
             if ski != akid.key_identifier:
                 return None
             names_key = True
-    serial = akid.authority_cert_serial_number
-    if serial is not None and serial != ca.serial_number:
+    if akid.serial is not None and akid.serial != listed.serial:
         return None
-    names = [
-        name.value
-        for name in akid.authority_cert_issuer or ()
-        if isinstance(name, x509.DirectoryName)
-    ]
     # By the name test the issuer match uses, since OpenSSL compares this name by the same
     # canonical form. OpenSSL reads only the first directory name here; any one counts here,
     # as it did before vault BACKLOG #3543.
-    fits = not names or _issuer_name_key(ca.issuer) in {_issuer_name_key(n) for n in names}
+    fits = not akid.issuers or _issuer_name_key(ca.issuer) in akid.issuers
     return names_key if fits else None
 
 
@@ -749,15 +1022,10 @@ def _verify_with(key: object, crl: x509.CertificateRevocationList) -> None:
         )
 
 
-def _is_delta_crl(crl: x509.CertificateRevocationList) -> bool:
-    """Whether ``crl`` carries a Delta CRL Indicator (RFC 5280 section 5.2.4)."""
-    try:
-        crl.extensions.get_extension_for_class(x509.DeltaCRLIndicator)
-    except x509.ExtensionNotFound:
-        return False
-    except x509.DuplicateExtension as exc:
-        raise ValueError(f"the CRL carries a duplicate extension: {exc}") from exc
-    return True
+def _is_delta_crl(read: _CrlExtensions) -> bool:
+    """Whether the CRL ``read`` came from carries a Delta CRL Indicator (RFC 5280 section 5.2.4).
+    A duplicate extension already refused in :func:`_crl_extensions`."""
+    return any(isinstance(ext.value, x509.DeltaCRLIndicator) for ext in read.extensions)
 
 
 def soonest_crl(facts: list[CrlFacts]) -> CrlFacts:
