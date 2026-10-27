@@ -579,7 +579,9 @@ def _one_shot_repend(monkeypatch: pytest.MonkeyPatch) -> None:
         self: RegistryRunner, worker: str, name: str, ids: Any, **_k: Any
     ) -> HoldResult:
         with contextlib.suppress(Exception):
-            await self.store.reschedule_claimed(list(ids), time.time())
+            await self.store.reschedule_claimed(
+                list(ids), time.time() + wiring_runner._WORKER_ERROR_BACKOFF_SECONDS
+            )
         return HoldResult.LANDED
 
     async def once_pooled(self: Any, lane: str, what: str, write: Any, fence: Any) -> HoldResult:
@@ -1443,3 +1445,113 @@ async def test_the_stop_policy_bounds_a_held_lane_and_retry_forever_pages_it(
         assert sink.stopped == [] and own_stops == []
         assert len(sink.stuck) == 1 and "failed 3 consecutive times" in sink.stuck[0]
         assert await _ingress_status(store, head.message_id) == "pending"
+
+
+@pytest.mark.parametrize("variant", ["shipped", "control-unfenced-tail"])
+async def test_the_tail_release_after_a_landed_head_is_fenced(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """The head's re-pend hangs while another node takes the lease, then commits. The tail
+    release that follows is no longer at fault time, and the successor may hold those rows, so it
+    is not sent. The control lets it through, the duplicate-send path."""
+    _fast_backoffs(monkeypatch)
+    if variant == "control-unfenced-tail":
+        monkeypatch.setattr(RependFence, "may_write", lambda self: True)
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
+    await store.enqueue_ingress(channel_id="IB", raw=RAW_B, now=1.0)
+    head, tail = await store.claim_next_fifo_batch(
+        "IB", stage=Stage.INGRESS.value, limit=2, now=2.0
+    )
+    lease = _EpochLease()
+    real_reschedule = store.reschedule_claimed
+
+    async def slow_write(ids: list[str], when: float) -> Any:
+        lease.epoch = 8  # another node took the lease while the write hung; it then commits
+        return await real_reschedule(ids, when)
+
+    monkeypatch.setattr(store, "reschedule_claimed", slow_write)
+    released: list[list[str]] = []
+
+    async def recording_release(ids: list[str]) -> Any:
+        released.append(list(ids))
+
+    monkeypatch.setattr(store, "release_claimed", recording_release)
+    dispatcher, applied = _lane_run(store, monkeypatch, head.id, [tail.id], time.time() + 60.0)
+    monkeypatch.setattr(dispatcher, "_is_leader", lease.is_leader)
+    monkeypatch.setattr(dispatcher, "_current_epoch", lease.current_epoch)
+    await asyncio.wait_for(dispatcher._run_lane("IB", [head, tail]), timeout=5.0)
+    assert len(applied) == 1
+    assert released == ([[tail.id]] if variant == "control-unfenced-tail" else [])
+
+
+async def test_a_lease_change_during_the_body_fences_the_retry(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pooled fence is read before the body runs, not at the fault: a lease change while the
+    body ran, then a failed first re-pend, sends no retry."""
+    _fast_backoffs(monkeypatch)
+    head_id = await _claimed_ingress_row(store)
+    lease = _EpochLease()
+    calls: dict[str, int] = {}
+    _fail_while(monkeypatch, store, "reschedule_claimed", calls)
+    dispatcher, applied = _lane_run(store, monkeypatch, head_id, [], time.time() + 60.0)
+    monkeypatch.setattr(dispatcher, "_is_leader", lease.is_leader)
+    monkeypatch.setattr(dispatcher, "_current_epoch", lease.current_epoch)
+    drained = dispatcher._drain_lane
+
+    async def body_spans_a_flap(lane: str, items: Any) -> Any:
+        lease.epoch = 8
+        return await drained(lane, items)
+
+    monkeypatch.setattr(dispatcher, "_drain_lane", body_spans_a_flap)
+    await asyncio.wait_for(dispatcher._run_lane("IB", []), timeout=5.0)
+    assert calls["reschedule_claimed"] == 1
+    assert len(applied) == 1
+
+
+async def test_a_pause_that_wins_over_the_stop_bound_leaves_the_streak_alone(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``stop`` the hold reaches its bound just as an operator pause lands. The lane goes
+    PAUSED, not STOPPED, and its infra-fault streak is untouched, so after a resume the next single
+    T17 fault does not STOP it at once."""
+    _fast_backoffs(monkeypatch)
+    head_id = await _claimed_ingress_row(store)
+    sink = _StopSink()
+    paused: list[str] = []
+    dispatcher = stage_dispatcher.StageDispatcher(
+        Stage.OUTBOUND,
+        store,
+        process_item=None,  # type: ignore[arg-type]  # the drain is stubbed
+        lane_provider=set,
+        per_lane_limit=1,
+        alert_sink=sink,
+        infra_fault_policy="stop",
+        infra_fault_stop_after=3,
+        on_lane_paused=paused.append,
+    )
+    st = stage_dispatcher._LaneState(phase=stage_dispatcher._LanePhase.PROCESSING)
+    dispatcher._states["OB"] = st
+    outcome = stage_dispatcher._LaneOutcome(
+        stage_dispatcher.LaneResultKind.RETRY, time.time() + 60.0, is_infra_fault=True
+    )
+
+    async def drained(lane: str, items: Any) -> Any:
+        return outcome, [], (head_id, time.time() + 60.0)
+
+    monkeypatch.setattr(dispatcher, "_drain_lane", drained)
+    writes = 0
+
+    async def failing(ids: list[str], when: float) -> Any:
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            dispatcher.pause_lane("OB")  # PROCESSING, so it is marked pending
+        raise RuntimeError("simulated store outage in reschedule_claimed")
+
+    monkeypatch.setattr(store, "reschedule_claimed", failing)
+    await asyncio.wait_for(dispatcher._run_lane("OB", []), timeout=5.0)
+    assert writes == 3
+    assert st.phase is stage_dispatcher._LanePhase.PAUSED and paused == ["OB"]
+    assert sink.stopped == []
+    assert st.infra_error_streak == 0
