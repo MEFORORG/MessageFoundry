@@ -543,18 +543,16 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     **An encryption header name after the first BEGIN refuses, before that load** (BACKLOG
     #2270), whether or not it sits inside a block. A
     ``Proc-Type: 4,ENCRYPTED`` header sends OpenSSL to its password callback, and ``cadata=`` sets
-    none, so OpenSSL falls back to its default one, which reads the terminal. The POSIX terminal run
-    was done later, off-version (BACKLOG #3090, 2026-10-12): on CPython 3.12.3 / OpenSSL 3.0.13 on
-    Linux with a pseudo-terminal, the same ``cadata=`` load wrote ``Enter PEM pass phrase:`` and was
-    still waiting at 5 seconds, while ``cafile=`` refused at once with ``PEM lib``.
-    ``tests/test_encrypted_pem_cafile_pin.py`` holds that table and pins it on each CI platform.
-    What was measured first, on Windows, on
-    CPython 3.14.6 / OpenSSL 3.5.7 in a child process with stdin on the null device: the
+    none, so OpenSSL falls back to its default one, which reads the terminal. Measured on Windows,
+    on CPython 3.14.6 / OpenSSL 3.5.7 in a child process with stdin on the null device: the
     ``cadata=`` load of a certificate block carrying ``Proc-Type: 4,ENCRYPTED`` and ``DEK-Info:``
     did not return within 20 seconds and was killed, while ``cafile=`` on the same bytes refused at
-    once with ``PEM lib``. So a start or a reload could hang on this file. A CA certificate never
-    carries an RFC 1421 encryption header, so ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any
-    case, anywhere after the first BEGIN of the text the load would get, and OpenSSL is never
+    once with ``PEM lib``. So a start or a reload could hang on this file. A later run under a POSIX
+    pseudo-terminal (BACKLOG #3090) saw the same ``cadata=`` load write the password prompt and
+    wait. ``tests/test_encrypted_pem_cafile_pin.py`` holds that run's table, with its versions, and
+    pins it on each CI platform. A CA certificate never carries an RFC 1421 encryption header, so
+    ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any case, anywhere after the first BEGIN of the
+    text the load would get, and OpenSSL is never
     handed that text (:func:`has_encryption_header`). That is wider than the hang: a private-key
     block encrypted in that legacy header format beside a certificate loads through ``cadata=``,
     and refuses here, and so does the header name in a comment between two blocks or after the

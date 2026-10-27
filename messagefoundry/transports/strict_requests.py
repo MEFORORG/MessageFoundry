@@ -310,34 +310,31 @@ def _narrowed_pool_classes(
 
             **The refusal is a** :class:`VaultHopRefused`, **like the proxy leg's CA load
             refusal in** :meth:`_narrow_the_proxy_leg`. urllib3 does not catch that type, so it
-            reaches the caller as it is, and :func:`vault_failure_text` keeps its text. The base
-            ``InsecureHopRefused`` would reach the caller too, but that function would give only
-            its type name;
-            :class:`VaultHopRefused` says why. A urllib3 ``SSLError`` raised here would not reach
-            the caller as it is. Measured with urllib3 2.8.0, one raised before the proxy has
-            connected comes out of requests as a ``ProxyError``. The providers would then report a
-            type name only.
+            reaches the caller as it is, and :func:`vault_failure_text` keeps its text. A urllib3
+            ``SSLError`` raised here would not reach the caller as it is. Measured with urllib3
+            2.8.0, one raised before the proxy has connected comes out of requests as a
+            ``ProxyError``. The providers would then report a type name only.
 
             **A CA file is not checked, because the load itself refuses it.** That holds for the
             encryption header only: a CA file holding a private key loads, and nothing here
             refuses it (BACKLOG #3745 covers the CA text alone). ``ca_certs`` is a
             path. Measured, a path load of an encrypted ``CERTIFICATE`` or ``X509 CRL`` block raised
-            ``PEM lib`` at once and wrote no prompt. A check here would also open the file twice.
-            ``tests/test_encrypted_pem_cafile_pin.py`` holds both measurements, with the versions
+            ``PEM lib`` at once, and no prompt was seen. A check here would also open the file
+            twice. ``tests/test_encrypted_pem_cafile_pin.py`` holds both measurements, with the versions
             and terminal conditions, and pins them on each platform CI runs.
 
             **A CA directory is not refused, because it was not seen to wait.** ``ca_cert_dir``
             reaches OpenSSL as ``capath``. OpenSSL reads a directory's files when it verifies a
             peer, not when the directory is named, so a check of the text handed to the load,
             like the one above, does not cover one. So it was measured, for Python's ``ssl`` only,
-            with a real handshake (2026-10-12), on CPython 3.14.6 / OpenSSL 3.5.7 on
-            Windows and, off-version, on CPython 3.12.3 / OpenSSL 3.0.13 on Linux. A directory
-            file holding an encrypted ``CERTIFICATE`` or ``X509 CRL`` block, under the name
-            OpenSSL looks up, wrote no prompt and never waited, in every terminal condition
-            tried, a pseudo-terminal among them. The handshake refused the peer at once with a
-            verification error, so the hop fails closed. ``tests/test_encrypted_pem_capath_pin.py``
-            holds that table and its controls, and pins it on each platform CI runs. A directory
-            does reach both loads today. With neither ``MEFOR_STORE_VAULT_CA_FILE`` nor
+            with a real handshake on Windows and Linux. A directory file holding an encrypted
+            ``CERTIFICATE`` or ``X509 CRL`` block, under the name OpenSSL looks up, never waited,
+            in every terminal condition tried, a pseudo-terminal among them. The handshake refused
+            the peer at once with a verification error, so the hop fails closed. No prompt was
+            seen either; on Windows a console prompt is not visible to the caller, and
+            ``tests/test_encrypted_pem_capath_pin.py`` says what that reading rests on there. That
+            file holds the table, with its versions and controls, and pins it on each platform CI
+            runs. A directory does reach both loads today. With neither ``MEFOR_STORE_VAULT_CA_FILE`` nor
             ``MEFOR_SECRETS_VAULT_CA_FILE`` set, hvac and requests choose the CA. At least two
             routes can name a directory: hvac's ``VAULT_CAPATH``, used when ``VAULT_CACERT`` is not
             set, and requests' ``REQUESTS_CA_BUNDLE`` or ``CURL_CA_BUNDLE``. requests passes a
@@ -762,9 +759,9 @@ def vault_failure_text(exc: BaseException) -> str:
     A refusal from this hop keeps its own text: a :class:`VaultHopRefused` from the hop checks, or
     an :class:`~messagefoundry.transports.bounded_read.EgressReplyError` from the reply reader.
     Both are built here and in ``bounded_read`` from the hop's fixed connector label and fixed
-    reason text. They name no part of the address, the proxy URL, the token or the reply. Any
-    other failure gives only its type name, as before, because its text can echo ciphertext, a
-    request body or a URL.
+    reason text. They name no part of the address, the proxy URL, the token or the reply, and
+    :class:`VaultHopRefused` lists what else its text never names. Any other failure gives only
+    its type name, as before, because its text can echo ciphertext, a request body or a URL.
 
     **A bare** ``InsecureHopRefused`` **gives only its type name too (vault BACKLOG #3247).**
     :class:`VaultHopRefused` says why.

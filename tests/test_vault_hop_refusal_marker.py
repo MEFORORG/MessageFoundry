@@ -19,6 +19,7 @@ Synthetic data only: the host, key names and wrapped key are made up.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from typing import Any
 
@@ -140,15 +141,22 @@ def _is_fixed_text(call: ast.Call, constants: frozenset[str]) -> bool:
 
 
 def test_every_marked_refusal_is_built_from_fixed_text() -> None:
-    """The marker means the text names no address, proxy URL, token or reply. This holds each
-    site to a shape that cannot interpolate one. It does not read a listed helper's own text."""
-    tree = parse_source(_HOME.read_text(encoding="utf-8"))
+    """The marker means the text names nothing the ``VaultHopRefused`` docstring says it never
+    names. This holds each site to a shape that cannot interpolate a caller's value. It does not
+    read a listed helper's own text."""
+    source = _HOME.read_text(encoding="utf-8")
+    tree = parse_source(source)
     constants = _string_constants(tree)
     sites = call_sites(tree, _MARKER)
-    # 15 marked refusals when this floor was last set (BACKLOG #3458, #3745). A scan that sees few
-    # of them, or none, leaves the rest unchecked. Lower the floor only if refusals were really
-    # merged or removed, and raise it when one is added.
-    assert len(sites) >= 15, f"the scan saw only {len(sites)} marked refusal(s) in {_HOME.name}"
+    # A scan that sees few of the refusals, or none, leaves the rest unchecked. So the AST scan
+    # must see every call the source text spells, and a hand-kept floor cannot lag (BACKLOG
+    # #3489: one sat at 6, then 15, while the module grew). The fixed floor only stops a module
+    # that lost all of them passing on zero against zero.
+    spelled = len(re.findall(rf"(?<![\w.]){_MARKER}\(", source)) - len(
+        re.findall(rf"^class {_MARKER}\(", source, re.MULTILINE)
+    )
+    assert len(sites) == spelled, f"the scan saw {len(sites)} of {spelled} marked refusal(s)"
+    assert len(sites) >= 10, f"the scan saw only {len(sites)} marked refusal(s) in {_HOME.name}"
     loose = [site.lineno for site in sites if not _is_fixed_text(site, constants)]
     assert loose == [], f"a marked refusal interpolates something at lines {loose}"
     # The constants the sites use today are found, so the lookup is not passing on an empty set.
