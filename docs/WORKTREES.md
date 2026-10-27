@@ -753,18 +753,31 @@ the same settings file, so the unlock is always wired where the lock was made. `
 relabels a lock this session already holds, and never creates one. Nothing locks on a Stop. The
 seat is whatever the record holds, or `undeclared`. Only the SessionEnd hook
 [`seat-unlock.ps1`](../scripts/hooks/seat-unlock.ps1) unlocks it, and only a seat lock that names
-its own session id. It skips a `/clear` or `/resume`. The SessionStart that follows (`source`
-`clear`, `resume` or `compact`) hands any seat lock in the tree over to the new id, so the new id's
-exit releases it. `-Close` does not unlock, because a closed seat is often still open. The rules are
-in [`seat-lock.ps1`](../scripts/worktree/seat-lock.ps1):
+its own session id. It skips a `/clear` or `/resume`, whose session carries on under a new id.
+`-Close` does not unlock, because a closed seat is often still open. The rules are in
+[`seat-lock.ps1`](../scripts/worktree/seat-lock.ps1)'s header, and this list only summarises them:
 
 - Another holder's lock is kept. Claude Code locks an `isolation: worktree` agent's tree while it
   runs, and that reason reads `claude agent <name> (pid <n>)`.
 - A seat lock whose session reads DEAD or STALE is taken over by the seat that arrives there. It is
   rewritten in place, so the tree is never unlocked in between. A lock with no registry record is
   reported but not taken over, because a live seat this reader cannot see reads the same way.
+- The SessionStart after a `/clear`, `/resume` or `/compact` hands a seat lock in the tree over to
+  the new id, so the new id's exit releases it. It does so only when the occupancy fence can look
+  and finds no other live session in the tree; otherwise the lock is kept.
 - A session with no session id places no lock, since nothing could release or report it.
 - The primary checkout is skipped, because git refuses to lock it. A cloud session is skipped too.
+
+**The handover is not guaranteed under the Desktop app.** There a hook starts in the primary
+checkout, and after a `/clear` or `/compact` it writes no pin (rule 5 in
+[`_hookinput.ps1`](../scripts/hooks/_hookinput.ps1)), so it cannot place the session's own linked
+worktree, and [`seat-declare-prompt.ps1`](../scripts/hooks/seat-declare-prompt.ps1) then skips
+`seat.ps1` altogether. The lock keeps the old id, the new id's exit does not release it, and it is
+stranded once the process ends. `hygiene-report.ps1` section e is where it surfaces.
+
+**A lock has one holder.** When two live seats share a tree, the first one's lock stands for both,
+so once that seat exits and unlocks, the other is unprotected. One session per worktree is the fleet
+rule ([`CLAUDE.md`](../CLAUDE.md) section 5), and this lock does not cover a breach of it.
 
 A session that dies without unlocking leaves its tree locked, and every reclaimer then keeps it.
 `hygiene-report.ps1` lists those locks in section e, with a `git worktree unlock` command for each
@@ -794,7 +807,10 @@ pwsh -NoProfile -File scripts\worktree\find-emptied-worktrees.ps1
 
 It only reads, and it skips the Desktop's own `.ccd-trash~*` tombstones. A session still in an
 emptied folder can re-add the worktree at the same path, on the same branch, from the primary
-checkout, then re-declare its seat, which locks it again. `git worktree add` refuses a folder that
+checkout. Re-declaring the seat does not lock it again, because `-Declare` only relabels a lock that
+exists: the tree stays unlocked until a SessionStart from a startup or `/resume` runs there, or until
+you run `git worktree lock --reason "<seat> <session id>"` on it, which the session's own exit then
+releases. `git worktree add` refuses a folder that
 is not empty, so a folder that still holds files (the entry count says how many) needs them moved
 aside first. Copy out anything a session wrote there before you do.
 

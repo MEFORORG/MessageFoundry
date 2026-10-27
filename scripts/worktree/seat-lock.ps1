@@ -28,8 +28,9 @@
       * Replace another holder's lock. Claude Code locks an `isolation: worktree` agent's tree while it
         is live (docs/SESSION-DRIFT-CONTROLS.md), and a person may lock one by hand. Those are kept, and
         the caller is told. The exceptions are SEAT locks only: one whose session reads DEAD or STALE
-        is taken over by a seat arriving in that tree, and any one is handed over to the new id on a
-        SessionStart from /clear, /resume or /compact. Either way the new holder's exit clears it.
+        is taken over by a seat arriving in that tree, and one is handed over to the new id on a
+        SessionStart from /clear, /resume or /compact when no other live session is in the tree.
+        Either way the new holder's exit clears it.
         The takeover rewrites the `locked` file in place rather than unlocking and re-locking, so
         there is no moment in which the tree is unlocked.
       * Remove a lock this session did not place. Unlock removes only a seat lock naming this session
@@ -66,6 +67,62 @@ function Get-WorktreeLockState {
     return $out
 }
 
+function Get-SeatLockSelfPids {
+    # This hook's own process and its ancestors, one of which is the Claude process whose registry
+    # record (<pid>.json) carries this session. The same walk as presence.ps1's Get-SelfPids, which
+    # cannot be dot-sourced because that script runs on load. A failed read returns $PID alone, so
+    # this session's own record then reads as a peer and the handover is refused: the safe side.
+    $ppid = @{}
+    try {
+        Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId -EA Stop |
+            ForEach-Object { $ppid[[int]$_.ProcessId] = [int]$_.ParentProcessId }
+    }
+    catch { return @($PID) }
+    $chain = @()
+    $cur = $PID
+    for ($i = 0; $i -lt 12 -and $cur -gt 0; $i++) {
+        $chain += $cur
+        $parent = $ppid[$cur]
+        if (-not $parent -or $parent -le 0 -or $chain -contains $parent) { break }
+        $cur = $parent
+    }
+    return $chain
+}
+
+function Get-SeatLockHandoverVeto {
+    <#
+    .SYNOPSIS
+        '' when no OTHER live session occupies $Worktree, else why a handover must not happen.
+
+    .DESCRIPTION
+        The occupancy fence hygiene-report.ps1 reads (occupancy.ps1): a session is in the tree when
+        its registry record's cwd places it there and its state is a veto state (LIVE, UNVERIFIED,
+        UNREADABLE). This session is excluded by its new id, and by pid, since the old id's record is
+        the same Claude process. An unavailable fence vetoes: a peer it cannot see is not ruled out.
+    #>
+    param([string]$Worktree, [string]$SessionKey, [string[]]$ConfigRoot)
+    # occupancy.ps1 reads fields a record may lack. Under seat.ps1's StrictMode Latest that throws,
+    # and the catch below would then veto every handover. Same reason as Get-SeatLockReading.
+    Set-StrictMode -Off
+    try {
+        $occ =Get-WorktreeOccupancy -Repo $Worktree -ConfigRoot $ConfigRoot
+        if (-not $occ.Available) { return "the liveness fence could not look ($($occ.Detail))" }
+        $norm = ConvertTo-Norm $Worktree
+        $root = ''
+        foreach ($w in $occ.Worktrees) {
+            $k = ConvertTo-Norm $w.Path
+            if (($norm -eq $k -or $norm.StartsWith("$k/")) -and $k.Length -gt $root.Length) { $root = $k }
+        }
+        if (-not $root) { return "the liveness fence does not list $Worktree" }
+        $self = @(Get-SeatLockSelfPids)
+        $peers = @(Get-WorktreeOccupants -Occupancy $occ -Path $root |
+                Where-Object { $_.SessionId -cne $SessionKey -and $self -notcontains $_.Pid })
+        if ($peers.Count -gt 0) { return "another session is in this tree: $(($peers | ForEach-Object { "$($_.Short) $($_.State)" }) -join ', ')" }
+        return ''
+    }
+    catch { return "the liveness fence failed: $($_.Exception.Message)" }
+}
+
 function Set-SeatWorktreeLock {
     <#
     .SYNOPSIS
@@ -78,8 +135,10 @@ function Set-SeatWorktreeLock {
           arrive    SessionStart from a startup. Creates the lock; takes over a DEAD or STALE seat's.
           handover  SessionStart from /clear, /resume or /compact. The process and its seat carry on
                     in this tree under a new id, and the old id's lock reads LIVE or NO RECORD, so
-                    neither a takeover nor any exit would ever release it. So ANY seat lock here is
-                    rewritten to this id. Another holder's lock is still kept.
+                    neither a takeover nor any exit would ever release it. So a seat lock here is
+                    rewritten to this id, but only when Get-SeatLockHandoverVeto finds no OTHER live
+                    session in the tree and the fence could look; otherwise it is kept. Another
+                    holder's lock is always kept.
           relabel   -Declare. Rewrites only a lock this session already holds, and NEVER creates one:
                     the SessionStart that created it and the SessionEnd that releases it come from
                     the same settings file, while a -Declare can run where that file wires no
@@ -119,7 +178,13 @@ function Set-SeatWorktreeLock {
             if ($KeepLabel) { return [pscustomobject]@{ Action = 'kept-own'; Detail = $st.Reason } }
             $action = 'relabelled'
         }
-        elseif ($held -and $Mode -eq 'handover') { $action = 'handed-over' }
+        elseif ($held -and $Mode -eq 'handover') {
+            # Only this process's own old id may be handed over. In a shared tree the lock may be a
+            # live peer's, and rewriting it would let this session's exit unlock the tree under it.
+            $veto = Get-SeatLockHandoverVeto -Worktree $Worktree -SessionKey $SessionKey -ConfigRoot $ConfigRoot
+            if ($veto) { return [pscustomobject]@{ Action = 'kept-foreign'; Detail = "not handed over, $($veto): $($st.Reason)" } }
+            $action = 'handed-over'
+        }
         elseif ($held -and (Get-SeatLockReading -SessionKey $held.SessionKey -ConfigRoot $ConfigRoot).State -in @('DEAD', 'STALE')) {
             # A positive dead signal only. NO RECORD is gone enough to REPORT, but a live seat this
             # reader cannot see (a config root outside USERPROFILE) also reads that way, and taking

@@ -222,22 +222,51 @@ def test_a_declaration_never_creates_a_lock(wt: Path, home: Path) -> None:
     assert lock_text(wt) is None
 
 
+def placed_record(home: Path, name: str, sid: str, pid: int, cwd: Path) -> None:
+    """A registry record the occupancy fence places in cwd. No startedAt, so a running pid reads
+    UNVERIFIED, which is a veto state: the fence treats it as possibly live."""
+    sessions = home / ".claude" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    record = {"pid": pid, "sessionId": sid, "cwd": str(cwd)}
+    (sessions / f"{name}.json").write_text(json.dumps(record), encoding="utf-8")
+
+
 @pytest.mark.parametrize("source", ["clear", "resume"])
 def test_a_clear_or_resume_hands_the_lock_to_the_new_id(wt: Path, home: Path, source: str) -> None:
     """The old id's lock reads LIVE (the same process carries on), so neither a takeover nor any
-    exit would release it. The SessionStart that follows hands it to the new id."""
+    exit would release it. The SessionStart that follows hands it to the new id when no other
+    session is in the tree. The old id's record carries this test's pid, an ancestor of the hook,
+    as a real record carries the Claude process that runs the hook."""
     declare(wt, home)
-    sleeper = live_record(home, SID)
+    placed_record(home, "self", SID, os.getpid(), wt)
+    unlock_hook(wt, home, SID, reason=source)
+    assert lock_text(wt) == f"builder {SID}", "the old id's end must not unlock"
+    arrive(wt, home, OTHER_SID, source=source)
+    assert lock_text(wt) == f"builder {OTHER_SID}", "the seat label is kept across the handover"
+    unlock_hook(wt, home, OTHER_SID)
+    assert lock_text(wt) is None, "the new id's clean exit releases it"
+
+
+def test_a_clear_beside_a_live_peer_in_the_tree_keeps_its_lock(wt: Path, home: Path) -> None:
+    """Two sessions in one tree: the peer holds the lock and is live. A /clear in the other must
+    not take it, or the newcomer's exit would unlock the tree under the peer."""
+    declare(wt, home)
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(240)"])
     try:
-        unlock_hook(wt, home, SID, reason=source)
-        assert lock_text(wt) == f"builder {SID}", "the old id's end must not unlock"
-        arrive(wt, home, OTHER_SID, source=source)
-        assert lock_text(wt) == f"builder {OTHER_SID}", "the seat label is kept across the handover"
+        placed_record(home, "peer", SID, sleeper.pid, wt)
+        arrive(wt, home, OTHER_SID, source="clear")
+        assert lock_text(wt) == f"builder {SID}"
     finally:
         sleeper.kill()
         sleeper.wait()
-    unlock_hook(wt, home, OTHER_SID)
-    assert lock_text(wt) is None, "the new id's clean exit releases it"
+
+
+def test_a_clear_keeps_the_lock_when_the_fence_cannot_look(wt: Path, home: Path) -> None:
+    """No session registry at all: a live peer cannot be ruled out, so nothing is handed over."""
+    declare(wt, home)
+    assert not (home / ".claude" / "sessions").exists()
+    arrive(wt, home, OTHER_SID, source="clear")
+    assert lock_text(wt) == f"builder {SID}"
 
 
 def test_a_startup_beside_a_live_seat_lock_keeps_it(wt: Path, home: Path) -> None:

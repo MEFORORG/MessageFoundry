@@ -16,7 +16,8 @@
 
     READ-ONLY. It runs `git worktree list` and reads files. It deletes, moves and re-registers
     nothing. To recover a folder a session is still in, re-add the worktree at the same path on the
-    same branch, then lock it (docs/WORKTREES.md).
+    same branch, then lock it by hand: re-declaring the seat does not, since -Declare only relabels
+    an existing lock (docs/WORKTREES.md).
 
 .PARAMETER RepoRoot
     Any checkout of the repository. Defaults to this script's own.

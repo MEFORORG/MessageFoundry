@@ -5,8 +5,9 @@
     A SessionEnd hook: release the worktree lock this session placed on arrival (BACKLOG #2524).
 
 .DESCRIPTION
-    seat.ps1 locks a seat's worktree at SessionStart and on -Declare, with the reason
-    `<seat> <session id>`; scripts/worktree/worktree-audit.ps1 says why. This hook is the clean-exit
+    seat.ps1 locks a seat's worktree at SessionStart, with the reason `<seat> <session id>`;
+    -Declare only relabels that lock and never creates one. scripts/worktree/worktree-audit.ps1 says
+    why, and seat-lock.ps1 holds the rules. This hook is the clean-exit
     half. It unlocks only a seat lock that names THIS session's id, so Claude Code's own lock on an
     agent worktree, a hand-placed lock, and another live seat's lock all stay.
 

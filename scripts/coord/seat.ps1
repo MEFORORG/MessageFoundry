@@ -115,7 +115,8 @@ param(
     [Parameter(ParameterSetName = 'Prompt')][string]$DerivedSeat,
     # The SessionStart hook input's `source`: startup, resume, clear or compact. On the last three the
     # process and its seat carry on in the same tree under a (possibly) new session id, so the seat
-    # lock is handed over to that id (BACKLOG #2524; scripts/worktree/seat-lock.ps1).
+    # lock is handed over to that id when no other live session is in the tree (BACKLOG #2524;
+    # scripts/worktree/seat-lock.ps1).
     [Parameter(ParameterSetName = 'Prompt')][string]$Source,
     # Only for tests and for -Declare from a different cwd. Normally derived.
     [string]$Worktree,
