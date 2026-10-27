@@ -60,7 +60,7 @@ FINALIZE_RACE_ROUNDS = 30
 _RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
 
-async def _race_one_round(store: Any, round_no: int) -> str:
+async def _race_one_round(store: Any, round_no: int) -> Any:
     """Enqueue one two-destination message, complete both legs concurrently, return its status."""
     # Flat timestamps, as every neighbouring test uses: an earlier round's rows are DONE, so no
     # `now` can make them claimable again, and `mark_done` spends `now` only on updated_at and
@@ -68,10 +68,10 @@ async def _race_one_round(store: Any, round_no: int) -> str:
     mid = await store.enqueue_message(
         channel_id="IB", raw=_RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], now=100.0
     )
-    # Claim per DESTINATION rather than one limit=N sweep. SQL Server's claim opens with
-    # SET LOCK_TIMEOUT 0 and may fail-close a batch to empty (see _claim_until in that suite),
-    # which would flake a bare `len(items) == 2` for a reason that has nothing to do with the
-    # finalizer -- and a flake here reads as the very defect this contract is pinning.
+    # Claim per DESTINATION rather than one limit=N sweep. SQL Server's claim_ready reads
+    # WITH (READPAST, UPDLOCK, ROWLOCK), so a row another transaction holds is skipped rather than
+    # waited on, which could short a sweep and flake a bare `len(items) == 2` for a reason that has
+    # nothing to do with the finalizer -- and a flake here reads as the very defect being pinned.
     items = []
     for dest in ("OB1", "OB2"):
         claimed = await store.claim_ready(now=200.0, destination_name=dest)
@@ -82,7 +82,8 @@ async def _race_one_round(store: Any, round_no: int) -> str:
 
     msg = await store.get_message(mid)
     assert msg is not None, f"round {round_no}: message {mid} vanished"
-    return str(msg["status"])
+    # Returned uncoerced: str() of a (str, Enum) member is its NAME, never its value.
+    return msg["status"]
 
 
 async def assert_concurrent_finalize_reaches_processed(

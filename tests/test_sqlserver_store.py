@@ -5919,8 +5919,8 @@ async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> No
     question rather than two hand-synced copies drifting apart.
 
     THIS BACKEND'S NUMBER IS UNMEASURED. The 30 rounds were measured against Postgres, whose lock is
-    a different mechanism under a different snapshot rule. What this leg establishes on a real SQL
-    Server, nobody has yet read -- the gated ``sqlserver-store`` CI job carries its first result.
+    a different mechanism under a different snapshot rule. The negative control below prints this
+    backend's per-round rate with the lock removed; the ``sqlserver-store`` CI job log carries it.
     """
     from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
 
@@ -5934,19 +5934,18 @@ async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
 
     WHY THIS EXISTS (BACKLOG #1610). A race test that passes proves nothing unless it can also fail:
     the benign interleaving can win every round over a store carrying no lock at all. The Postgres
-    arm was shown to fail with its lock removed; this leg never was, so its green said nothing. This
+    arm was shown to fail with its lock removed; the test above has no such proof in the tree. This
     test is a STANDING expected-red-under-patch control: it removes the lock on every run and
     asserts the race is observable, so a change that made the test above blind (a pool of one, a
     serialised ``mark_done``, a round body that stopped racing) turns THIS test red instead of
-    leaving the positive test green for the wrong reason. Measured once before, on engine
-    2ffcf3347 against a live SQL Server 2022: with the finalize applock a no-op, 79 of 80 fan-out
-    messages never finalised.
+    leaving the positive test green for the wrong reason.
 
-    ONLY the finalize lock is removed. ``SqlServerStore._applock`` also takes the schema, audit
-    append, resend, quota and admin-guard locks, so it is wrapped, not replaced: a resource
-    starting ``mefor:finalize:`` is skipped and counted, everything else runs. The count must be
-    above zero, so a renamed resource string fails this loudly rather than passing it with the lock
-    still in place.
+    ONLY the finalize lock is removed. ``SqlServerStore._applock`` also takes at least the schema
+    and audit-append locks, so it is wrapped, not replaced: a resource starting
+    ``mefor:finalize:`` is skipped and counted, everything else runs. Every ``mark_done`` must skip
+    at least once, so a renamed resource string, or a finalize that stopped going through
+    ``_applock`` (the batched and sync twins issue ``sp_getapplock`` directly), fails this loudly
+    rather than passing it with the lock still in place.
 
     The per-round failure rate is printed outside pytest's capture, so the ``sqlserver-store`` job
     log carries it on a pass as well as a failure. That line is this backend's measurement.
@@ -5973,13 +5972,15 @@ async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
             f"{skipped} finalize applock calls skipped"
         )
 
-    assert skipped > 0, (
-        "no applock resource started with 'mefor:finalize:', so nothing was removed -- the resource "
-        "was renamed or mark_done stopped finalizing through _applock; this control tested nothing"
+    assert skipped >= 2 * FINALIZE_RACE_ROUNDS, (
+        f"{skipped} finalize applock calls skipped for {2 * FINALIZE_RACE_ROUNDS} mark_done calls, "
+        "so some finalize still took its lock -- the resource was renamed, or mark_done stopped "
+        "finalizing through _applock; this control did not remove the lock it claims to"
     )
     assert missed > 0, (
         f"all {FINALIZE_RACE_ROUNDS} rounds reached PROCESSED with the finalize applock removed, so "
-        "the round body no longer races and the positive test above cannot fail on this backend"
+        "the positive test above cannot fail on this backend: the round body no longer races, the "
+        "pool serialises the two mark_done calls, or mark_done gained another serialisation"
     )
 
 
