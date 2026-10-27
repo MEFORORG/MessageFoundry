@@ -3360,10 +3360,9 @@ class Engine:
         # heavy imports), which would otherwise stall every listener mid-reload (review low-3).
         # WiringError on a bad config. With a snapshot, a released reload's load failure is a
         # failure of the approved bytes themselves, so it is a bad config and not an edit.
-        if snapshot is not None:
-            registry = await asyncio.to_thread(load_config, path, snapshot=snapshot)
-        else:
-            registry = await asyncio.to_thread(load_config, path)
+        # With no snapshot (one could not be read strictly), load_config reads its own and refuses
+        # a file it needs but cannot read.
+        registry = await asyncio.to_thread(load_config, path, snapshot=snapshot)
         fingerprint: dict[str, object] | None = None
         if not dry_run:
             # ADR 0041 D1 (config provenance, item C): fingerprint the bundle right after the load

@@ -223,7 +223,7 @@ def test_an_unreadable_module_leaves_no_digest_and_says_so(
     monkeypatch.setattr(Path, "read_bytes", refuse)
     with caplog.at_level("WARNING", logger="messagefoundry.config.wiring"):
         assert config_code_digest(tmp_path) is None
-    assert "not compared" in caplog.text and "held open" in caplog.text
+    assert "not compared" in caplog.text and "graph.py" in caplog.text
 
 
 def test_the_code_digest_covers_each_module_a_load_may_run(tmp_path: Path) -> None:

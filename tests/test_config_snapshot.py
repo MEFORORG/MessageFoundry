@@ -32,7 +32,7 @@ import pytest
 from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.snapshot import ConfigSnapshot, config_py_files, read_config_snapshot
-from messagefoundry.config.wiring import WiringError, load_config, load_snapshot
+from messagefoundry.config.wiring import WiringError, load_config, load_snapshot, validate_config
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.dryrun import transform_one
 from messagefoundry.pipeline.sandbox import (
@@ -374,3 +374,21 @@ def test_a_load_refuses_a_module_it_cannot_read(
     with pytest.raises(WiringError, match="could not read graph.py"):
         load_config(tmp_path)
     assert read_config_snapshot(tmp_path, strict=False).unreadable == ("graph.py",)
+
+
+def test_an_unreadable_module_named_like_the_tables_folder_still_declares(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``codesets_map.py`` is a module, which can declare connections, not a table in
+    ``codesets/``: its read failure explains an empty graph, so no second, derived diagnostic."""
+    (tmp_path / "codesets_map.py").write_text(_graph("V1"), encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self.name == "codesets_map.py":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    messages = [d.message for d in validate_config(tmp_path)]
+    assert messages == ["could not read codesets_map.py"]

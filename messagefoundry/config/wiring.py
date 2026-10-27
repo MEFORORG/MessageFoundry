@@ -7553,21 +7553,21 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
     Kept here rather than built on :mod:`messagefoundry.config.fingerprint`: importing that module
     would give every importer of the loader its comparison and hash operations in the crypto
     inventory (``scripts/security/crypto_inventory_check.py``)."""
-    if isinstance(source, ConfigSnapshot):
-        snapshot = source
-    else:
-        try:
-            snapshot = read_config_snapshot(source, strict=True)
-        except OSError as exc:
-            _logger.warning(
-                "config module digest unavailable for %s, so a sandbox worker's config code is "
-                "not compared with this load's: %s",
-                scrub_log_argument(str(source)),
-                scrub_log_argument(str(exc)),
-            )
-            return None
-    if any(rel == "." or rel.lower().endswith(".py") for rel in snapshot.unreadable):
-        return None  # a module it could not read is not described by the rest
+    # Not strict: only the modules are digested, so a code-set table or value file that cannot be
+    # read does not take the digest away.
+    snapshot = (
+        source if isinstance(source, ConfigSnapshot) else read_config_snapshot(source, strict=False)
+    )
+    unread = [rel for rel in snapshot.unreadable if rel == "." or rel.lower().endswith(".py")]
+    if unread:
+        # A module it could not read is not described by the rest.
+        _logger.warning(
+            "config module digest unavailable for %s, so a sandbox worker's config code is not "
+            "compared with this load's: could not read %s",
+            scrub_log_argument(str(snapshot.directory)),
+            scrub_log_argument(", ".join(unread)),
+        )
+        return None
     digest = hashlib.sha256(_CODE_DIGEST_SCHEME)
     for name in snapshot.modules:
         digest.update(name.encode("utf-8"))
@@ -9313,7 +9313,8 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     # function. Only a source that could have DECLARED a connection counts: a module or
     # connections.toml. A bad code-set table is a diagnostic that explains nothing about emptiness.
     declaring_source_failed = any(
-        not rel.startswith(CODESETS_DIR_NAME) for rel in snapshot.unreadable_loaded
+        rel != CODESETS_DIR_NAME and not rel.startswith(f"{CODESETS_DIR_NAME}/")
+        for rel in snapshot.unreadable_loaded
     )
     # Load reference tables first (so a module-top-level code_set(...) resolves during import). A
     # bad/duplicate table is recorded as a diagnostic, not raised, so the editor sees every problem.
