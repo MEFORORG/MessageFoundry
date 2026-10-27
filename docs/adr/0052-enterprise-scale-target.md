@@ -64,7 +64,7 @@ enterprise market is **in-scope and not demand-gated**.
 ## Acceptance Criteria
 
 > Capability targets; several verifying runs are future (the enterprise-hardware load run #40, a
-> connection-scale harness). The **decision** (commit the target) is Accepted now; the criteria define the
+> 1,500-connection run with the subprocess sandbox on). The **decision** (commit the target) is Accepted now; the criteria define the
 > bar, not a precondition for the commitment. `adr-analyze` will flag the unresolved `→` links until built.
 
 - **AC-1** — THE SYSTEM SHALL sustain up to 45M messages/day on a qualified enterprise configuration
@@ -72,7 +72,8 @@ enterprise market is **in-scope and not demand-gated**.
   → `harness/load/` + `docs/benchmarks/` (enterprise-hardware run pending — BACKLOG #40 / #28 / #29)
 - **AC-2** — THE SYSTEM SHALL support up to 1,500 concurrent connections without per-connection-worker
   exhaustion (fd/socket/worker-task limits).
-  → connection-scale test (to build; new BACKLOG item)
+  → `harness/load/connscale/` (the connection-scale harness, built). Not yet measured with the
+  subprocess sandbox on: the two-arm 1,500-connection run is BACKLOG #3132.
 - **AC-3** — WHERE the deployment uses a remote production database, THE SYSTEM SHALL run the full staged
   pipeline (`ingress → routed → outbound`) with the store finalizer as the single disposition authority.
   → `tests/` Postgres + SQL Server store suites
@@ -105,5 +106,6 @@ durable-write); the 45M/day storage + IOPS footprint (ADR 0051); the 1,500-conne
 ## To resolve on acceptance
 
 - [x] The market commitment — resolved by owner decision 2026-06-29.
-- [ ] Connection-scale (1,500) validation harness — does not exist; track as a new BACKLOG item.
+- [ ] Connection-scale (1,500) validation. The harness is built (`harness/load/connscale/`); the
+  1,500-connection run with the subprocess sandbox on is still open, as BACKLOG #3132.
 - [ ] Enterprise-hardware load run to measure the real single-engine ceiling vs the 45M target (#40 / #28 / #29).

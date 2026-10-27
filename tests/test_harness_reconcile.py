@@ -252,6 +252,48 @@ def test_connscale_reconcile_more_timeouts_than_sends_cannot_go_vacuous() -> Non
     assert "intake floor 5" in result.detail
 
 
+# --- connscale _reconcile: every message read must be written (BACKLOG #3132) -------------------
+#
+# Each connscale inbound routes to exactly one outbound, so after a drain `written >= read`. The three
+# checks above never compared the two: an arm whose worker refuses every message dead-letters them all,
+# writes nothing, delivers nothing, drains to an empty backlog, and passed. These pin that it fails.
+
+
+def test_connscale_reconcile_an_arm_that_refuses_every_message_reads_red() -> None:
+    # Every send ACKed and read, then every message dead-lettered before delivery. Intake passes
+    # (read == sent), delivery-to-sink passes (0 >= 0) and the backlog is empty, so before the
+    # written-vs-read term this read green.
+    c = Counters(sent=36, acked=36, sink_received=0)
+    result = connscale_reconcile(c, _BASE, _sample(read=36, written=0), unconfirmed_budget=_BUDGET)
+    assert not result.ok, result.detail
+    assert "engine_written 0 < engine_read 36" in result.detail
+    assert "36 read but never delivered" in result.detail
+
+
+def test_connscale_reconcile_one_read_message_never_written_fails() -> None:
+    # Magnitude one: a single dead-lettered message among 36 fails the step.
+    c = Counters(sent=36, acked=36, sink_received=35)
+    result = connscale_reconcile(c, _BASE, _sample(read=36, written=35), unconfirmed_budget=_BUDGET)
+    assert not result.ok, result.detail
+    assert "1 read but never delivered" in result.detail
+
+
+def test_connscale_reconcile_unconfirmed_excusal_does_not_reach_written_vs_read() -> None:
+    # Mutation pin: the shortfall equals the timeout count, so leaking the intake excusal into this
+    # term would flip the verdict to ok. `read` counts rows the engine holds, so nothing excuses one.
+    c = Counters(sent=36, acked=35, timeouts=1, sink_received=34)
+    result = connscale_reconcile(c, _BASE, _sample(read=35, written=34), unconfirmed_budget=_BUDGET)
+    assert not result.ok, result.detail
+    assert "1 read but never delivered" in result.detail
+
+
+def test_connscale_reconcile_redelivery_is_not_loss() -> None:
+    # At-least-once may write a message twice, so `written > read` is healthy and must pass.
+    c = Counters(sent=36, acked=36, sink_received=37)
+    result = connscale_reconcile(c, _BASE, _sample(read=36, written=37), unconfirmed_budget=_BUDGET)
+    assert result.ok, result.detail
+
+
 # --- connscale _reconcile: the reload probe's own stranding (BACKLOG #1292) ---------------------
 #
 # The mid-hold reload probe closes every inbound connection. What it strands is the harness's doing,

@@ -658,14 +658,16 @@ def test_ledger_requires_expect_ack() -> None:
 
 
 def _sample(read: int) -> EngineSample:
+    # `written` follows `read`: each connscale inbound delivers to one outbound, and the reconcile
+    # fails a step that read more than it wrote (BACKLOG #3132), which these tests do not exercise.
     return EngineSample(
         elapsed_s=0.0,
         pending=0,
         inflight=0,
-        done=0,
+        done=read,
         dead=0,
         read=read,
-        written=0,
+        written=read,
         out_dead=0,
         queue_depth=0,
         in_pipeline=0,
@@ -716,7 +718,8 @@ def _record_with(audit: IntakeAudit, *, read: int, sent: int) -> ConnScaleRecord
         mode="fixed_aggregate",
         count=4,
         aggregate_rate=10.0,
-        metrics_counters=Counters(sent=sent),
+        # Every message the engine read reached the sink, so only the intake terms can fail.
+        metrics_counters=Counters(sent=sent, sink_received=read),
         ack_hist=Histogram(),
         poller=poller,
         samples=[],

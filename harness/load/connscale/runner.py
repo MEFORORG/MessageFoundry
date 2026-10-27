@@ -350,8 +350,14 @@ async def run_connscale(
     # arm (comparison.ok folds those in). A single-arm run has no comparison ⇒ unchanged verdict. The
     # fusion/batching A/Bs fold ONLY their correctness gate (.ok = every B1 arm held zero-loss +
     # present) — a NO-GO/INCONCLUSIVE throughput verdict is a legitimate measurement, not a red build.
+    #
+    # A step that never started fails the run on its own (BACKLOG #3132). A comparison sees only the
+    # misses it can pair against a present arm, and a single-arm pooled profile has no comparison at
+    # all: its miss left no record, `zero_loss` graded what was left, and a run whose every step
+    # failed to start read PASS.
     result_ok = (
-        all(c.ok for c in slos)
+        not missing_detail
+        and all(c.ok for c in slos)
         and (comparison is None or comparison.ok)
         and (fuse_comparison is None or fuse_comparison.ok)
         and (batch_comparison is None or batch_comparison.ok)
@@ -1802,6 +1808,12 @@ def _reconcile(
     # `test_no_accept_acked_message_is_absent_from_the_stopped_engines_store` asserts.
     floor_short = population // 2 - read
     deliver_short = written - sink_received
+    # Every message the engine READ must be WRITTEN (BACKLOG #3132). Each connscale inbound routes to
+    # exactly one outbound, so after the drain `written >= read`; at-least-once may make it greater.
+    # Without this term a dead-lettered or refused message passed: it is read, never written, never
+    # reaches the sink, and leaves no backlog, so the intake, delivery and drain checks all hold. No
+    # excusal applies: `read` counts rows the engine holds, not sends that may never have arrived.
+    write_short = read - written
     drained = backlog == 0
     # The three reload guards. Each is a SIGNATURE, not a fraction of the offered volume, and none
     # applies to a step that offered nothing at all (`sent == 0`, e.g. a zero-rate lane).
@@ -1821,6 +1833,7 @@ def _reconcile(
         read_short <= 0
         and floor_short <= 0
         and deliver_short <= 0
+        and write_short <= 0
         and drained
         and not over_budget
         and not (not_back or no_sends or no_reply)
@@ -1843,6 +1856,11 @@ def _reconcile(
     if deliver_short > 0:
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
+        )
+    if write_short > 0:
+        parts.append(
+            f"engine_written {written} < engine_read {read} ({write_short} read but never "
+            f"delivered: dead-lettered, refused, or rejected after it was recorded)"
         )
     if not drained:
         parts.append(f"backlog {backlog} not drained")
