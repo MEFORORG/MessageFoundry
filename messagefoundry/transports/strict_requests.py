@@ -118,6 +118,7 @@ from messagefoundry.config.tls_policy import (
     revocation_hop_disposition,
     tls_revocation_attested,
 )
+from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_cert_chain_key
 from messagefoundry.transports.ambient_proxy import (
     UNREADABLE_PROXY_LABEL,
     proxy_label,
@@ -138,6 +139,7 @@ __all__ = [
     "StrictReplyAdapter",
     "VaultAttestationSection",
     "VaultHopRefused",
+    "is_unrevoked_vault_hop_refusal",
     "mount_strict_reply_adapter",
     "vault_failure_text",
 ]
@@ -270,6 +272,7 @@ def _narrowed_pool_classes(
                     "refusing to connect"
                 )
             self._refuse_encrypted_ca_text()
+            self._refuse_an_unchecked_client_key()
             self._mefor_proxy_context = self._narrow_the_proxy_leg()
             self.ssl_context = factory()
             super().connect()
@@ -342,6 +345,49 @@ def _narrowed_pool_classes(
                     "public trust material, so a private key does not belong in it; refusing to "
                     "load it (BACKLOG #3745)"
                 )
+
+        def _refuse_an_unchecked_client_key(self) -> None:
+            """Check the client key urllib3 is about to load, before it loads it (BACKLOG #3458).
+
+            hvac reads ``VAULT_CLIENT_CERT`` and ``VAULT_CLIENT_KEY`` at import and hands them to
+            requests, which sets them here as ``cert_file`` and ``key_file``. urllib3 then calls
+            ``load_cert_chain(cert_file, key_file)`` on the Vault leg. It checks for an encrypted
+            key only when ``key_file`` is set. With none, OpenSSL reads the key out of the
+            certificate file, and an encrypted one makes it ask for a passphrase. Measured on
+            Windows: it wrote the prompt and was still waiting when killed, 30 s later.
+
+            So the key goes through ``keywrap.refuse_weak_cert_chain_key`` first, the check that
+            ``keywrap.load_checked_cert_chain`` runs for the engine's other TLS key loads.
+            requests never sets ``key_password``, so any encrypted key is refused. The refusal is
+            a :class:`VaultHopRefused` with fixed text, for the reason
+            :meth:`_refuse_encrypted_ca_text` gives; the chained ``KeyWrapRefused`` would lose its
+            text at :func:`vault_failure_text`.
+
+            **The check reads the file once, and OpenSSL reads it again.** A file swapped in
+            between, or a path that only then becomes readable, is not checked. So, as
+            ``load_checked_cert_chain`` passes an empty-passphrase callback, this sets
+            ``key_password`` to ``""`` when it is ``None``. urllib3 then passes ``""`` to
+            ``load_cert_chain``. Measured on Windows: an encrypted key then failed at once with
+            ``PEM lib`` and wrote no prompt, and a plain key loaded. urllib3's own encrypted-key
+            check, which runs only with ``key_file`` set and only when ``key_password`` is
+            ``None``, is not relied on: it is a separate read too, and it looks for the word
+            ``ENCRYPTED`` in the file. ``""`` counts as no passphrase here, so a reconnect on this
+            connection is checked the same way."""
+            if not self.cert_file:
+                return
+            try:
+                refuse_weak_cert_chain_key(
+                    self.cert_file,
+                    self.key_file,
+                    cert_setting="VAULT_CLIENT_CERT",
+                    key_setting="VAULT_CLIENT_KEY",
+                    unlock_setting=None,
+                    passphrase_given=bool(self.key_password),
+                )
+            except KeyWrapRefused as exc:
+                raise VaultHopRefused(f"{connector}: {_UNCHECKED_CLIENT_KEY}") from exc
+            if self.key_password is None:
+                self.key_password = ""  # nosec B105 -- no passphrase: fail fast, never prompt
 
         def _narrow_the_proxy_leg(self) -> ssl.SSLContext | None:
             """Give the TLS leg to an https proxy its own context, or ``None`` if it has none.
@@ -752,6 +798,17 @@ _PRIVATE_KEY_CA_TEXT = (
 )
 
 
+#: What the client key refusal says (BACKLOG #3458). It names the hvac settings, never a path or
+#: the ``KeyWrapRefused`` text it replaces.
+_UNCHECKED_CLIENT_KEY = (
+    "the client key for this hop was refused before the TLS library read it. The key is in the "
+    "VAULT_CLIENT_CERT file, or in VAULT_CLIENT_KEY when that is set. It is encrypted, the file "
+    "could not be read, or the file is over 1 MiB. hvac has no passphrase to give, and an "
+    "encrypted key with none can make the TLS library wait for one. Supply the key unencrypted, "
+    "in a readable file of a few kilobytes; refusing to connect (BACKLOG #3458)"
+)
+
+
 #: What the proxy leg's CA load refusals say (BACKLOG #3090). The load raises an ``ssl.SSLError``
 #: for content it will not load, and another ``OSError`` for a file it could not open or read, so
 #: each says only what its type shows. Neither names a path or any CA text.
@@ -1145,6 +1202,34 @@ def _refuse_an_unrevoked_vault_hop(
     if attestation_section == "store":
         raise VaultHopRefused(f"{connector}: {_UNREVOKED_VAULT_HOP} {_STORE_REVOCATION_LEVER}")
     raise VaultHopRefused(f"{connector}: {_UNREVOKED_VAULT_HOP} {_SECRETS_REVOCATION_LEVER}")
+
+
+#: The text after the connector label of each revocation refusal above, by the section it names.
+_UNREVOKED_VAULT_HOP_REASONS: dict[VaultAttestationSection, str] = {
+    "store": f"{_UNREVOKED_VAULT_HOP} {_STORE_REVOCATION_LEVER}",
+    "secrets": f"{_UNREVOKED_VAULT_HOP} {_SECRETS_REVOCATION_LEVER}",
+}
+
+
+def is_unrevoked_vault_hop_refusal(
+    exc: BaseException | None, section: VaultAttestationSection
+) -> bool:
+    """Whether ``exc`` is :func:`_refuse_an_unrevoked_vault_hop`'s refusal for ``section``'s pair,
+    and no other refusal of the hop (vault BACKLOG #3619).
+
+    It takes the exact type, :class:`VaultHopRefused`, and the whole fixed text after the
+    connector label, which no connector label contains. Any other refusal of the hop answers
+    ``False``, at least of its address, its proxy, its TLS leg or its pool, and so does a
+    subclass, as :func:`vault_failure_text` reads one.
+
+    That refusal means the hop was off the box, not attested and not CRL-checked, and was judged
+    enforcing. So ``tls_policy.revocation_hop_disposition`` on those inputs, with another posture,
+    says what that posture would have done with the same hop. ``verify``'s ``_serve_crossing``
+    relies on that, so a new input to the guard's decision must reach it too."""
+    if type(exc) is not VaultHopRefused:
+        return False
+    _connector, _sep, reason = str(exc).partition(": ")
+    return reason == _UNREVOKED_VAULT_HOP_REASONS[section]
 
 
 def _prepared_vault_hop(

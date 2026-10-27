@@ -3,11 +3,12 @@
 """Strict validation treats an hl7apy ``choice`` group as "exactly one of", not "all of".
 
 hl7apy 1.3.5 validates a ``choice`` group with its ``sequence`` code path, so every alternative
-counts as required (upstream crs4/hl7apy issue 151; fix PR 152, unmerged on 2026-09-30). The
-common shape it hits is the order detail of ``ORM^O01``: ORC followed by OBR is valid HL7, and
-without the carried fix the strict tier would reject it with ``Missing required child
-ORM_O01_CHOICE.RQD`` (the group's name varies by version). The same false reject would hit
-``ORR^O02`` and every other structure with a choice group, in every hl7apy version from 2.2 on.
+counts as required (upstream crs4/hl7apy issue 151; fix PR 152, merged into hl7apy's ``develop``
+on 2026-10-26 and in no release on that date). The common shape it hits is the order detail of
+``ORM^O01``: ORC followed by OBR is valid HL7, and without the carried fix the strict tier would
+reject it with ``Missing required child ORM_O01_CHOICE.RQD`` (the group's name varies by
+version). The same false reject would hit ``ORR^O02`` and every other structure with a choice
+group, in every hl7apy version from 2.2 on.
 
 All messages here are synthetic.
 """
@@ -162,8 +163,11 @@ def test_hl7apy_still_has_the_bug_so_the_shim_is_still_on() -> None:
     hl7apy rather than its version number. The code it leaves behind is dead, and this test is
     what says so. It also pins that hl7apy rejects the probe for issue 151 and not for some
     other reason, which would keep the shim on for the wrong cause. Before deleting the shim,
-    check that the new release still accepts ``_LABELLED_CHOICE_PROBE``: PR 152 as written
-    would not, and the shim then stays on by design.
+    check that the new release still accepts ``_LABELLED_CHOICE_PROBE``: PR 152's first draft
+    would not, and the shim then stays on by design. PR 152 as merged (``develop`` at
+    ``458085c52b``, 2026-10-26) gets all three probes right, so the release that carries it
+    should turn this test red. When it does, raise the ``hl7apy`` floor in ``pyproject.toml``
+    to that release in the same change that deletes the shim.
     """
     from hl7apy.consts import VALIDATION_LEVEL
     from hl7apy.exceptions import ValidationError
@@ -176,7 +180,7 @@ def test_hl7apy_still_has_the_bug_so_the_shim_is_still_on() -> None:
     with pytest.raises(ValidationError, match="Missing required child ORM_O01_OBRRQDRQ1RXOODSODT"):
         Validator.validate(parsed(_CHOICE_PROBE))
     # The third probe arm is live: unaided hl7apy accepts it today, so only a release that
-    # starts rejecting it (PR 152 as written would) can keep the shim on through that arm.
+    # starts rejecting it (PR 152's first draft would) can keep the shim on through that arm.
     assert Validator.validate(parsed(_LABELLED_CHOICE_PROBE))
     assert _choice_fix_needed()
     # The control: the engine gets all three probes right.

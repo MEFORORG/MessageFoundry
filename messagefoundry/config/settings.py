@@ -1703,6 +1703,19 @@ class ApiSettings(_Section):
         return self.proxy_tls_min_version is not None
 
     @property
+    def browser_tls_ends_at_proxy(self) -> bool:
+        """Whether the browser's TLS ends at a reverse proxy in front of the engine, so the engine
+        cannot see the floor that proxy negotiates (vault BACKLOG #3538). Two shapes count: a
+        declared terminator, and a proxy named in ``trusted_proxies`` that re-encrypts to an
+        operator ``tls_cert_file``. The validator makes a terminator imply ``trusted_proxies``, so
+        this reads that list alone. It assumes browsers come through a listed proxy, as the
+        exposure rules already do (vault BACKLOG #2251). Where browsers reach the engine directly
+        and the proxy fronts other clients only, the probe dials the engine before it listens and
+        the start refuses. ``serve`` reads this for the ASVS 12.1.1 probe and the
+        ``proxy_tls_min_version`` attestation."""
+        return bool(self.trusted_proxies)
+
+    @property
     def serves_plaintext_upstream_hop(self) -> bool:
         """Whether the engine serves the proxy-to-engine hop in PLAINTEXT (BACKLOG #1179): a declared
         upstream terminator and no operator certificate, in :func:`api_tls_source`'s order. The one
