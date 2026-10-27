@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -22,7 +23,10 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
-from messagefoundry.config.wiring import FHIR, Rest
+from messagefoundry.config.wiring import FHIR, Registry, Rest
+from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
+from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.fhir import FhirDestination
@@ -126,7 +130,7 @@ def test_a_held_hop_refuses_the_header_at_send(
     assert sent == []
     assert exc.value.code == DYNAMIC_HEADER_REFUSED_CODE
     assert exc.value.permanent is True
-    assert exc.value.config_fault is True  # stop the lane, keep the queue
+    assert exc.value.config_fault is False  # dead-letter this message; the lane goes on
     text = str(exc.value)
     assert "connection 'OB_DYN'" in text
     count = len(_REFUSED[case])
@@ -158,3 +162,92 @@ def test_control_a_free_hop_sends_any_header(hop: str, monkeypatch: pytest.Monke
     sent = _wire(dest, monkeypatch)
     asyncio.run(dest.send(_PATIENT, metadata=_meta(_REFUSED["two headers"])))
     assert len(sent) == 1
+
+
+async def _seed_delivery(store: Any, *, channel: str, dest: str, control_id: str) -> str:
+    """Drive one message ingress to routed to outbound for ``dest``; return its message id."""
+    raw = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|{control_id}|P|2.5.1\r"
+    mid = await store.enqueue_ingress(channel_id=channel, raw=raw, now=0.0)
+    ing = await store.claim_next_fifo(channel, stage=Stage.INGRESS.value, now=0.0)
+    assert ing is not None
+    await store.route_handoff(
+        ingress_id=ing.id,
+        message_id=mid,
+        channel_id=channel,
+        handlers=[("h1", raw)],
+        disposition=MessageStatus.ROUTED,
+        now=0.0,
+    )
+    routed = await store.claim_next_fifo(channel, stage=Stage.ROUTED.value, now=0.0)
+    assert routed is not None
+    await store.transform_handoff(
+        routed_id=routed.id,
+        message_id=mid,
+        channel_id=channel,
+        deliveries=[(dest, _PATIENT)],
+        now=0.0,
+    )
+    return str(mid)
+
+
+class _StopSink(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.stopped: list[str] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        self.stopped.append(name)
+
+
+async def test_one_bad_message_dead_letters_and_the_lane_delivers_the_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-2 review finding 1 (vault BACKLOG #3533 item 6): the refusal is per message. A Handler
+    that stamps an off-allowlist header on one message dead-letters that message only. The lane is
+    not stopped, and the next message, with an allowed header, reaches the wire."""
+    store = await MessageStore.open(tmp_path / "dyn.db")
+    try:
+        bad = await _seed_delivery(store, channel="IB_DYN", dest="OB_DYN", control_id="M1")
+        good = await _seed_delivery(store, channel="IB_DYN", dest="OB_DYN", control_id="M2")
+        headers = {bad: {"X-Session": "s1"}, good: {"X-Request-ID": "r1"}}
+        sink = _StopSink()
+        runner = RegistryRunner(
+            Registry(),
+            store,
+            poll_interval=0.02,
+            alert_sink=sink,
+            egress=EgressSettings(deny_by_default=False),
+        )
+        dest = _rest("https://127.0.0.1:8443/x", verify_tls=False)
+        sent = _wire(dest, monkeypatch)
+        runner._destinations["OB_DYN"] = dest
+
+        async def metadata_for(message_id: str) -> dict[str, str]:
+            return _meta(headers[message_id])
+
+        monkeypatch.setattr(runner, "_user_metadata_for", metadata_for)
+
+        async def status_of(mid: str) -> str:
+            cur = await store._db.execute(
+                "SELECT status FROM queue WHERE message_id=? AND stage=?",
+                (mid, Stage.OUTBOUND.value),
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            return str(row[0])
+
+        first = await store.claim_next_fifo("OB_DYN", now=1.0)
+        assert first is not None and first.message_id == bad
+        outcome = await runner._process_delivery_item("OB_DYN", first)
+        assert outcome[0] is _ItemOutcome.PROCESSED  # the lane goes on
+        assert await status_of(bad) == OutboxStatus.DEAD.value
+        assert sent == []
+
+        second = await store.claim_next_fifo("OB_DYN", now=2.0)
+        assert second is not None and second.message_id == good
+        outcome = await runner._process_delivery_item("OB_DYN", second)
+        assert outcome[0] is _ItemOutcome.PROCESSED
+        assert sent == [{"X-Request-ID": "r1"}]
+        assert await status_of(good) == OutboxStatus.DONE.value
+        assert sink.stopped == []
+    finally:
+        await store.close()

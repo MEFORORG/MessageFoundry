@@ -1307,9 +1307,12 @@ def refuse_dynamic_headers_off_allowlist(
     is off :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, in any letter case, or when the redaction
     screen would mask it, so a credential-shaped value under an allowed name counts too.
 
-    The refusal is permanent and a configuration fault: a retry would stamp the same header, and a
-    Handler that stamps it usually does so on every message. It names the connection and how
-    many headers it refused, and **never a header's name or value**. At send a name is a metadata
+    The refusal is permanent, since a retry would stamp the same header, and it is not a
+    configuration fault. So the delivery worker dead-letters this one message and the lane goes on
+    to the next, as for the latin-1 refusal in :func:`outbound_headers_from_metadata`. A Handler may
+    stamp such a header on some messages only, and a configuration fault would stop the lane and keep
+    the row with its metadata, so even a fixed Handler could not clear it. It names the connection
+    and how many headers it refused, and **never a header's name or value**. At send a name is a metadata
     key suffix the Handler may derive from the message, as
     :func:`enforce_send_time_length_limits` records for its own message-derived arm, so it is
     treated as PHI. That also keeps a crafted name from faking the refusal's structure."""
@@ -1327,10 +1330,8 @@ def refuse_dynamic_headers_off_allowlist(
         "credential in them. "
         "The names are withheld, since a Handler may derive them from the message",
         code=DYNAMIC_HEADER_REFUSED_CODE,
+        # Dead-letter this message only; see the docstring for why this is no configuration fault.
         permanent=True,
-        # A Handler that stamps such a header usually stamps it on every message, so stop the lane
-        # and keep the queue (ADR 0095) rather than dead-letter each row in turn.
-        config_fault=True,
     )
 
 
