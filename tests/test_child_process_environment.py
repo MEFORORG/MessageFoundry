@@ -316,6 +316,35 @@ def test_a_system_tool_gets_the_platforms_start_up_names_and_nothing_else() -> N
     assert spelled == expected
 
 
+def test_a_system_tool_extra_name_crosses_and_no_interpreter_variable_does() -> None:
+    """``openssl`` reads its own variables and no Python one (BACKLOG #3803 item 5). A name in the
+    engine's namespace or the interpreter's is refused, since a system tool reads neither."""
+    parent = {**_parent_environment(), "OPENSSL_CONF": "/etc/x.cnf", "PYTHONUTF8": "1"}
+    env = childenv.system_tool_environment(parent, extra_names=("OPENSSL_CONF",))
+    assert env == {"PATH": "/usr/bin", "TZ": "UTC", "OPENSSL_CONF": "/etc/x.cnf"}
+    for refused in ("MEFOR_STORE_KEY", "VAULT_TOKEN", "PYTHONPATH"):
+        with pytest.raises(ValueError, match=refused):
+            childenv.system_tool_environment(parent, extra_names=(refused,))
+    with pytest.raises(TypeError):
+        childenv.system_tool_environment(parent, extra_names="OPENSSL_CONF")
+
+
+def test_a_system_tool_pin_replaces_the_inherited_value() -> None:
+    """The cipher probe's PowerShell gets a fixed ``PATH`` and ``PSModulePath`` whatever the
+    operator's shell holds (BACKLOG #3803 S1). Set through the builder, not on its result, which
+    the static guard below would refuse (vault BACKLOG #2724)."""
+    parent = {**_parent_environment(), "PSModulePath": "/srv/operator/Modules"}
+    env = childenv.system_tool_environment(parent, pinned={"PATH": "/sys", "PSModulePath": "/m"})
+    assert env == {"PATH": "/sys", "TZ": "UTC", "PSModulePath": "/m"}
+    if sys.platform == "win32":
+        # One variable whatever its spelling, as Windows reads it: the pin is the only PATH left.
+        spelled = childenv.system_tool_environment({"Path": "x"}, pinned={"PATH": "/sys"})
+        assert spelled == {"PATH": "/sys"}
+    for refused in ("MEFOR_STORE_KEY", "PGPASSWORD", "PYTHONPATH"):
+        with pytest.raises(ValueError, match=refused):
+            childenv.system_tool_environment(parent, pinned={refused: "x"})
+
+
 def test_a_variable_that_only_looks_like_the_interpreters_or_the_locales_does_not_cross() -> None:
     """The allowlist is names, not prefixes: an operator's own variable can start with the same
     letters as an interpreter or a locale variable."""
@@ -844,10 +873,11 @@ _MUST_CHOOSE = frozenset(
         ("service.py", "service_state", "subprocess.run"),
         ("service_status.py", "_query", "subprocess.run"),
         # verify's host cipher policy probes (BACKLOG #3277): PowerShell by its pinned path takes
-        # the start-up names; openssl takes worker_environment, which adds the interpreter's
-        # PYTHON* names, plus the OPENSSL_* names OpenSSL reads (OPENSSL_CONF).
+        # the start-up names, with PATH and PSModulePath pinned; openssl takes the start-up names
+        # plus the OPENSSL_* names OpenSSL reads (OPENSSL_CONF), and no PYTHON* name (#3803).
+        # Both openssl runs, the suite list and the OPENSSLDIR read, start in _openssl_lines.
         ("verify/cipher_policy.py", "_windows_enabled_suites", "subprocess.run"),
-        ("verify/cipher_policy.py", "_openssl_suites", "subprocess.run"),
+        ("verify/cipher_policy.py", "_openssl_lines", "subprocess.run"),
         # The dependency auditor's pip and pip-audit, with hook_environment: no MEFOR_* secret.
         ("security/audit_all_platforms.py", "_run", "subprocess.run"),
     }

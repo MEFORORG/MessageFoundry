@@ -726,10 +726,11 @@ def _cipher_probe_code_problems(source: str) -> list[str]:
         if not _passes(call, "timeout", "_PROBE_TIMEOUT_S")
     ]
     if not any(
-        _called_name(call) == "worker_environment" and _passes(call, "extra_names", "_OPENSSL_ENV")
+        _called_name(call) == "system_tool_environment"
+        and _passes(call, "extra_names", "_OPENSSL_ENV")
         for call in calls
     ):
-        problems.append("no worker_environment(extra_names=_OPENSSL_ENV) call")
+        problems.append("no system_tool_environment(extra_names=_OPENSSL_ENV) call")
     return problems
 
 
