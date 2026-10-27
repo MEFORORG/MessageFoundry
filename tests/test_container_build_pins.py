@@ -175,6 +175,27 @@ def test_every_registry_base_is_pinned_by_a_literal_digest() -> None:
     )
 
 
+#: Base digests inspected and found to carry a CA root an advisory removed; a revert is refused.
+_DISTRUSTED_ROOT_DIGESTS = {
+    # "emSign ECC Root CA - G3" in Debian ca-certificates and both pip-vendored certifi copies
+    # (GHSA-6q48-6c7w-9gw2, BACKLOG #3905).
+    "sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83",
+}
+
+
+def _known_bad_bases(text: str) -> list[str]:
+    return [b for b in _registry_bases(text) if b.rpartition("@")[2] in _DISTRUSTED_ROOT_DIGESTS]
+
+
+def test_no_base_is_a_digest_known_to_carry_a_distrusted_root() -> None:
+    bad = next(iter(_DISTRUSTED_ROOT_DIGESTS))
+    # Positive control: the predicate fires on the pre-fix FROM line.
+    assert _known_bad_bases(f"FROM python:3.14-slim-bookworm@{bad} AS python-base\n")
+    text = _DOCKERFILE.read_text(encoding="utf-8")
+    found = _known_bad_bases(text)
+    assert not found, f"{found} carries a CA root an advisory removed; see the Dockerfile header"
+
+
 def test_every_pip_install_is_hash_checked() -> None:
     text = _DOCKERFILE.read_text(encoding="utf-8")
     # Counted over PARSED commands, not raw text: a comment mentioning pip would satisfy a text
