@@ -616,12 +616,14 @@ def refuse_url_credentials(
 #
 # The HTTP-family cells (REST/SOAP/FHIR/DICOMweb + the FhirLookup read path) shipped three escape-only,
 # construction-only refusals — cleartext-credentials, cleartext body-egress, and verify_tls=false. #200
-# re-keys them onto the ONE authority (``tls_policy.insecure_hop_disposition``) so they decide on the
-# instance POSTURE (PHI? production?) instead of the blunt global escape, and adds a zero-I/O SEND-TIME
-# re-assertion at the byte-crossing (defense-in-depth). Decision 5 (no-loosen): these cells refused BOTH
-# staging and production PHI today, so :func:`_shipped_strict_disposition` FLOORS a non-prod PHI hop that
-# would otherwise warn-and-cross back to REFUSE — only the (clamped, non-prod) escape, a per-hop
-# attestation, on-box loopback, or a synthetic (non-PHI) instance relaxes it.
+# re-keyed them onto the ONE authority (``tls_policy.insecure_hop_disposition``) so they decide on the
+# instance POSTURE instead of the blunt global escape, and added a zero-I/O SEND-TIME re-assertion at
+# the byte-crossing (defense-in-depth). Decision 5 (no-loosen): these cells refused BOTH staging and
+# production PHI, so :func:`_shipped_strict_disposition` FLOORS a hop that would otherwise
+# warn-and-cross back to REFUSE. Two of the three have since left the posture: a credential over
+# off-box cleartext http (vault BACKLOG #3533 item 4) and a credential over verify_tls=false (vault
+# BACKLOG #3230) are refused with no escape. The posture still decides the body egress, a verify-off
+# hop with no credential, and the forward-proxy login's cleartext leg.
 
 
 def _current_hop_posture_fail_closed() -> HopPosture:
@@ -653,9 +655,11 @@ def _shipped_strict_disposition(
 
     **Two different cells share this function, and ADR 0153 governs only one of them.**
 
-    * A **cleartext** hop (``http://`` body or credential egress) is what 0153 decision 2 is about, so
-      it is keyed on ``cleartext_accepted`` and the blunt ``MEFOR_ALLOW_INSECURE_TLS`` escape no longer
-      reaches it (decision 5 — the variable "can no longer influence a cleartext-hop decision"). The
+    * A **cleartext** hop (``http://`` body egress, and the forward-proxy login's leg to its proxy)
+      is what 0153 decision 2 is about, so it is keyed on ``cleartext_accepted``. A destination's own
+      credential over off-box cleartext no longer reaches here: it is refused with no escape (vault
+      BACKLOG #3533 item 4). The blunt ``MEFOR_ALLOW_INSECURE_TLS`` escape no longer reaches this
+      cell (decision 5 — the variable "can no longer influence a cleartext-hop decision"). The
       floor is re-keyed to match: a WARN reached by the non-enforcing dial alone is still floored to
       REFUSE, exactly as before, but a declared acceptance survives it. Without that re-key decision 2
       would be inert for REST/SOAP/FHIR/DICOMweb — the largest cleartext-egress family in the product,
@@ -863,8 +867,11 @@ def cleartext_acceptance_from_settings(
     """``(cleartext_accepted, cleartext_reason, connection)`` off an ``env()``-resolved settings mapping.
 
     ADR 0153's pair is a **top-level outbound key**, but the deep settings-driven seams — the forward-proxy
-    credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers, and the ``FhirLookup``
-    read executor — receive only a settings mapping, exactly as they already do for ``tls_hop_attested``.
+    credential chain and the ``FhirLookup`` read executor — receive only a settings mapping, exactly as
+    they already do for ``tls_hop_attested``. The HTTP Digest, OAuth2 and SMART token seams read it
+    too, through :func:`hop_declarations_from_settings`, but only for its strict flag check and the
+    connection name: no declaration lets their credential cross cleartext http off this machine
+    (vault BACKLOG #3533 item 4).
     The runner mirrors the declaration into those resolved settings only when it is set, and this is
     the single reader, so those resolved keys are never re-parsed by hand at five call sites.
 
@@ -2028,7 +2035,8 @@ def proxy_auth_handler_from_settings(
     scheme (vault BACKLOG #3416). A credential that passes it may cross the cleartext proxy leg at
     send, the one exception ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
     destination's own credentials (:func:`refuse_cleartext_credential_hop`, vault BACKLOG #3533
-    item 4), this leg still honours ``tls_hop_attested`` and ``cleartext_accepted``."""
+    item 4), this leg still honours ``tls_hop_attested`` and ``cleartext_accepted``, under the
+    owner's 2026-10-05 ruling on the proxy credential (vault BACKLOG #3007)."""
     user = s.get("proxy_user")
     password = s.get("proxy_password")
     auth_type = s.get("proxy_auth_type")
@@ -2053,9 +2061,10 @@ def proxy_auth_handler_from_settings(
     # so urllib sends the credential in a CONNECT before any TLS for either destination scheme. The one
     # exception, urllib's bypass list naming the proxy's own host, is not knowable here, so it is not
     # relied on. `proxy_scheme` now only words the refusal.
-    # Not refuse_cleartext_credential_hop: vault BACKLOG #3533 item 4 took the declarations away from
-    # the destination's credentials only. This leg is still judged by them, so an attested or
-    # accepted proxy can carry its own login; ADR 0153's 2026-10-27 amendment records the split.
+    # Not refuse_cleartext_credential_hop, which no declaration lifts (vault BACKLOG #3533 item 4).
+    # The owner's 2026-10-05 ruling on the proxy credential (vault BACKLOG #3007) refuses it over
+    # cleartext unless the connection declares the cleartext acceptance with a reason, so this leg
+    # is still judged by the declarations; ADR 0153's 2026-10-27 amendment records the split.
     proxy_host = _hop_guard_host(proxy_url, cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL)
     credential = (
         "web-proxy credential"

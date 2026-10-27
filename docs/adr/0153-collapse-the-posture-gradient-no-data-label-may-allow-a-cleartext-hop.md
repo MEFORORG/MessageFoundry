@@ -281,7 +281,8 @@ ALLOW` before delegating, and passes the clamped global escape as the new arm-3 
 declaration, so refusing them would create a deviation the loosening registry cannot express. Restated,
 not inherited: the scope limit is now a written decision at the one place it applies.
 
-**SUPERSEDED 2026-10-27 by owner ruling; see *Amendment 2026-10-27* at the end. Kept as written.**
+**PARTLY SUPERSEDED 2026-10-27 by owner ruling; see *Amendment 2026-10-27* at the end. Kept as
+written. The forward-proxy credential still follows it.**
 
 **3. `cleartext_accepted` reaches the CREDENTIAL hops as well as the body hops.** The ADR is silent, and
 putting a password on the wire is a materially worse claim than putting a body on it. It is threaded
@@ -365,21 +366,28 @@ body secret, an HTTP Digest login, and the OAuth2 and SMART token requests. One 
 
 **What counts as a credential.** The old test keyed on a header named exactly `Authorization`,
 with that letter case. So a static API-key header, or `authorization` in lower case, did not count.
-The test now counts what the `verify_tls = false` refusal counts (`http_credentials_sent`): every
-auth setting, a static header the redaction screen would mask, a static header whose name is off
-the verify-off allowlist in any letter case, and a credential-looking query parameter. One
-exception: a static `Proxy-Authorization`, in any spelling, is left to the send-time proxy rule.
+The test now counts the credentials the `verify_tls = false` refusal counts (`http_credentials_sent`
+with `cleartext=True`): every auth setting, a static header the redaction screen would mask, by
+name or by value, and a credential-looking query parameter. A header a Handler stamps per message
+under `dynamic_headers` is judged the same way when the message is sent. One exception: when the
+connection names a `proxy_url`, a static `Proxy-Authorization`, in any spelling, is left to the
+send-time proxy rule.
 
 **What did not change.** `cleartext_accepted` still carries a body with no credential across, with
 the WARN and the audit record decision 2 describes. That was the case decision 2 was written for.
+A header with a neutral name and value, static or per message, still crosses with that body. The
+verify-off rule's header-name allowlist (owner ruling 2026-10-26 on item 7) is not applied to
+cleartext hops. The owner's ruling here named credentials only, so whether the allowlist should
+reach plain `http` off this machine is an open owner question, not built.
 
 **Why build note 3's argument no longer holds.** It said that refusing a credential would push an
 operator with a legacy Basic-auth peer into writing a false `tls_hop_attested`. The attestation no
 longer lifts the refusal either, so a false one gains nothing. The engine's side of the hop has to
 be `https`. A peer that cannot speak TLS is reached through a TLS-terminating proxy in front of it.
 
-**Not covered: the forward-proxy login.** The question the owner answered named the destination's
-credentials. A `proxy_user` login rides the leg to the proxy, which the engine judges as cleartext
-whatever the proxy's scheme (vault BACKLOG #3416). Applying the ruling there would refuse every
-authenticated proxy off this machine, so this build leaves that leg judged by the declarations as
-before. `docs/SECURITY-LOOSENING.md` lists it among the hops the rule does not reach yet.
+**Judged by a different owner ruling: the forward-proxy login.** A `proxy_user` login rides the
+leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
+#3416). The owner ruled on that credential on 2026-10-05 (vault BACKLOG #3007, R1): it is refused
+over cleartext unless the connection declares the cleartext acceptance with a reason. That ruling
+is the specific one for this leg, so it stays judged by the declarations as before.
+`docs/SECURITY-LOOSENING.md` says so beside the credential rule.

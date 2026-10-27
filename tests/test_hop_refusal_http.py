@@ -714,15 +714,15 @@ def test_control_a_static_proxy_authorization_beside_a_proxy_is_left_to_the_prox
     """With a ``proxy_url`` the header is the proxy's, so this rule leaves it to the send-time
     proxy rule, and the connection builds."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    ctype, factory, url = _CLEARTEXT["REST"]
-    settings = factory(
+    url = _CLEARTEXT["REST"][2]
+    settings = Rest(
         url=url, headers={"Proxy-Authorization": "Basic synthetic"}, proxy="http://127.0.0.1:3128"
     ).settings
     with active_hop_posture(_PROD):
         dest = build_destination(
             Destination(
                 name="OB",
-                type=ctype,
+                type=ConnectorType.REST,
                 settings=settings,
                 cleartext_accepted=True,
                 cleartext_reason="vendor firmware predates TLS",

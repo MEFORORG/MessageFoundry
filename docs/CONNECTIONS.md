@@ -1593,9 +1593,10 @@ sends meet the rule above. With `[security].require_nonstatic_credentials` on, `
 credential written into `proxy_url` at start instead, unless `static_credential_accepted` names
 the hop (see *Static credentials on every backend hop*). A `proxy_user` credential is checked when
 the connection is built, for a proxy written either way. It is refused there unless the proxy is
-on the box or the connection declares `cleartext_accepted` or `tls_hop_attested`. That check
-follows the posture, so under `[security].enforcement = warn` it logs a WARNING and the connection
-builds. A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
+on the box or the connection declares `cleartext_accepted` or `tls_hop_attested`, the owner's
+2026-10-05 ruling on the proxy credential (vault BACKLOG #3007). `[security].enforcement = warn`
+does not lift it: the HTTP family's no-loosen floor turns that WARN back into a refusal. A
+connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
 connection's `proxy_url` and still follows a proxy from the environment.
 
 A `proxy_user` connection to a host urllib's own bypass list names (`NO_PROXY`, or the Windows
@@ -3140,7 +3141,11 @@ An **outbound** connection whose hop has no TLS is **refused** at `messagefoundr
 reload / the serve pre-flight under the default `[security].enforcement = enforce`
 ([ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)). No data
 label relaxes that — `data_class = "synthetic"` used to allow every cleartext hop silently, and no longer
-does. There are exactly three ways such a hop crosses:
+does. An HTTP-family credential over such a hop to a host off this machine is refused whatever the
+table below says: neither `cleartext_accepted` nor `tls_hop_attested` lifts it, only a loopback host
+(vault BACKLOG #3533 item 4; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
+names the forward-proxy login as the exception). For a hop with no such credential there are exactly
+three ways it crosses:
 
 | | claim | disposition |
 |---|---|---|
@@ -3220,6 +3225,11 @@ cleartext or verify-off hop then **ALLOWs** it
 2026-09-24). That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a
 verify-off HTTP-family egress hop and a weakened database TLS hop. It does **not** reach every
 verify-off refusal: at least the MLLP, FTPS and email `tls_verify = false` refusals do not read it.
+Nor does it carry an HTTP-family credential: over cleartext `http` to a host off this machine, or
+over `verify_tls = false`, the credential is refused, attested or not (vault BACKLOG #3533 item 4,
+#3230). A forward-proxy login is the exception, as
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
+says.
 
 Set it on the declaration that owns the hop:
 
