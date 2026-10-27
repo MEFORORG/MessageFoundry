@@ -357,16 +357,18 @@ amends **build note 3** above, which stays as written so the earlier reasoning r
 
 **What changed.** An HTTP-family credential over plain `http` to a host off this machine is now
 refused with no escape. Neither declaration lifts it, nor does the posture. A loopback host still
-does, because that hop never leaves the machine. The rule covers the credentials of `Rest()`,
-`Soap()`, `FHIR()`, `DICOMweb()` and `FhirLookup()`, a SOAP WS-Security UsernameToken or body
-secret, an HTTP Digest login, and the OAuth2 and SMART token requests. One function decides it,
-`transports/rest.py` `refuse_cleartext_credential_hop`, and `refuse_cleartext_credentials` wraps it.
+does, because that hop never leaves the machine. The rule covers at least the credentials of
+`Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` and `FhirLookup()`, a SOAP WS-Security UsernameToken or
+body secret, an HTTP Digest login, and the OAuth2 and SMART token requests. One body decides it,
+`transports/rest.py` `_refuse_off_box_cleartext`, which `refuse_cleartext_credential_hop` and
+`refuse_cleartext_credentials` both call.
 
 **What counts as a credential.** The old test keyed on a header named exactly `Authorization`,
 with that letter case. So a static API-key header, or `authorization` in lower case, did not count.
 The test now counts what the `verify_tls = false` refusal counts (`http_credentials_sent`): every
 auth setting, a static header the redaction screen would mask, a static header whose name is off
-the verify-off allowlist in any letter case, and a credential-looking query parameter.
+the verify-off allowlist in any letter case, and a credential-looking query parameter. One
+exception: a static `Proxy-Authorization`, in any spelling, is left to the send-time proxy rule.
 
 **What did not change.** `cleartext_accepted` still carries a body with no credential across, with
 the WARN and the audit record decision 2 describes. That was the case decision 2 was written for.

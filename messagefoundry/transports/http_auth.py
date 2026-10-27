@@ -160,7 +160,7 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
         # The connection the refusals and the revocation record name.
         connection: str | None = None,
         # The connection that declared `revocation_attested`, named in the revocation guard's audit
-        # line. Kept apart from `connection`, the cleartext declaration's name.
+        # line. Both readers fill it from the same `connection_name` mirror as `connection`.
         revocation_connection: str | None = None,
         proxy: ProxyConfig | None = None,
         # #1176 (ADR 0139): this connection's loopback ECH sidecar, when it has one; the token POST is
@@ -251,7 +251,7 @@ def oauth2_cc_provider_from_settings(
     if not oauth2_auth_configured(s):
         return None
     # Read strictly for the flag check (vault BACKLOG #2232) and the mirrored connection name.
-    _, accepted, revocation = hop_declarations_from_settings(s, HttpAuthError)
+    _, (_, _, connection), revocation = hop_declarations_from_settings(s, HttpAuthError)
     token_url = str(s.get("oauth2_token_url") or "")
     return OAuth2ClientCredentialsProvider(
         token_url=token_url,
@@ -274,7 +274,7 @@ def oauth2_cc_provider_from_settings(
         # the connection's top-level declaration, through the reader the SMART sibling uses.
         revocation_attested=revocation[0],
         revocation_attested_reason=revocation[1],
-        connection=accepted[2],
+        connection=connection,
         revocation_connection=revocation[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
         ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)

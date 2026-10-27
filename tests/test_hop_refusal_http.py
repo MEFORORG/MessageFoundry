@@ -41,6 +41,7 @@ from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import (
     InsecureHopGuard,
     refuse_cleartext_credential_hop,
+    refuse_cleartext_credentials,
     refuse_cleartext_egress,
     refuse_verify_off,
 )
@@ -667,6 +668,32 @@ def test_a_declared_cleartext_hop_refuses_every_credential(
     assert "synthetic" not in str(exc.value)
 
 
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_a_declared_cleartext_hop_offers_removing_a_header_that_is_no_credential(
+    declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A header refused only for its name is not called a credential, and removing it is offered,
+    since that alone clears the refusal."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD), pytest.raises(InsecureHopRefused) as exc:
+        _build(_CLEARTEXT["REST"], **{declared: True}, headers={"X-Trace": "t1"})
+    message = str(exc.value)
+    assert "static header outside the header allowlist (X-Trace)" in message
+    assert "its credentials (" not in message
+    assert "Or remove the header; none of them is a credential." in message
+
+
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_control_a_soap_ws_username_without_ws_security_sends_no_token(
+    declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ws_security off no UsernameToken is stamped, so the WS-Security refusal does not fire
+    on a declared cleartext hop (review round 1 of this change)."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD):
+        assert _build(_CLEARTEXT["SOAP"], **{declared: True}, ws_username="u") is not None
+
+
 @pytest.mark.parametrize("cell", _CELLS)
 @pytest.mark.parametrize("declared", ["attested", "accepted"])
 def test_control_a_declared_cleartext_hop_with_no_credential_still_crosses(
@@ -852,9 +879,9 @@ def _cleartext_egress(scheme: str, url: str, **declared: Any) -> object:
     return refuse_cleartext_egress(scheme, url, connection=None, **declared)
 
 
-def _cleartext_credential(scheme: str, url: str, **declared: Any) -> object:
-    # No declaration reaches the credential rule (vault BACKLOG #3533 item 4), so it takes none.
-    del declared
+def _cleartext_credential(scheme: str, url: str) -> object:
+    # No declaration reaches the credential rule (vault BACKLOG #3533 item 4), so it takes none;
+    # test_the_credential_rule_takes_no_declaration pins that.
     refuse_cleartext_credential_hop(
         scheme,
         url,
@@ -891,7 +918,17 @@ def test_a_hop_with_no_host_is_refused_not_treated_as_loopback(
         fn(scheme, f"{scheme}://{authority}/x")
 
 
-@pytest.mark.parametrize("guard", list(_HOST_GUARDS))
+def test_the_credential_rule_takes_no_declaration() -> None:
+    """Vault BACKLOG #3533 item 4: neither credential refusal accepts a declaration, so none can
+    lift it. A re-added parameter fails here before any arm could quietly cross."""
+    import inspect
+
+    for fn in (refuse_cleartext_credential_hop, refuse_cleartext_credentials):
+        params = set(inspect.signature(fn).parameters)
+        assert not params & {"attested", "cleartext_accepted", "cleartext_reason"}, fn.__name__
+
+
+@pytest.mark.parametrize("guard", [g for g in _HOST_GUARDS if g != "cleartext credential"])
 def test_no_declaration_or_escape_crosses_the_no_host_refusal(
     guard: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -126,6 +126,7 @@ def test_a_held_hop_refuses_the_header_at_send(
     assert sent == []
     assert exc.value.code == DYNAMIC_HEADER_REFUSED_CODE
     assert exc.value.permanent is True
+    assert exc.value.config_fault is True  # stop the lane, keep the queue
     text = str(exc.value)
     assert "connection 'OB_DYN'" in text
     count = len(_REFUSED[case])

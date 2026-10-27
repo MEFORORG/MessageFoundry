@@ -943,6 +943,10 @@ def _hop_guard_host(url: str, *, cell: str) -> str:
 #: The cell an off-box cleartext credential refusal names (vault BACKLOG #3533 item 4).
 _CLEARTEXT_CREDENTIAL_CELL = "HTTP cleartext credentials"
 
+#: The cell the forward-proxy login's refusal names, apart from the destination's no-escape rule,
+#: because a declaration can still lift this one.
+_PROXY_CLEARTEXT_CREDENTIAL_CELL = "web-proxy cleartext credentials"
+
 
 def _off_box_cleartext_host(scheme: str, url: str) -> str | None:
     """The host ``url`` names when it is cleartext ``http`` to a host off this machine, else ``None``.
@@ -956,18 +960,22 @@ def _off_box_cleartext_host(scheme: str, url: str) -> str | None:
     return None if is_loopback_hop_host(host) else host
 
 
-def _refuse_off_box_cleartext(scheme: str, url: str, *, sends: str, connection: str | None) -> None:
+def _refuse_off_box_cleartext(
+    scheme: str, url: str, *, sends: str, connection: str | None, removal: str = ""
+) -> None:
     """Raise :class:`InsecureHopRefused` when ``url`` is cleartext ``http`` to an off-box host.
 
     The one body of the HTTP family's cleartext credential rule (vault BACKLOG #3533 item 4, owner
-    ruling 2026-10-26, amending ADR 0153 build note 3). ``sends`` names what would cross."""
+    ruling 2026-10-26, amending ADR 0153 build note 3). ``sends`` names what would cross;
+    ``removal`` is a closing sentence offering to drop headers, when that alone would clear it."""
     host = _off_box_cleartext_host(scheme, url)
     if host is None:
         return
     raise InsecureHopRefused(
         f"{hop_name_prefix(connection)}{_CLEARTEXT_CREDENTIAL_CELL}: sends {sends} over cleartext "
         f"http to {host!r}; refused, with no escape. Neither tls_hop_attested nor "
-        "cleartext_accepted lets a credential cross cleartext http off this machine. Use https"
+        "cleartext_accepted lets a credential, or a static header off the allowlist, cross "
+        f"cleartext http off this machine. Use https.{removal}"
     )
 
 
@@ -987,9 +995,9 @@ def refuse_cleartext_credential_hop(
     **Nothing lifts it but a loopback host** (vault BACKLOG #3533 item 4, owner ruling 2026-10-26).
     Not ``tls_hop_attested``, not an ADR 0153 ``cleartext_accepted`` declaration, not the posture.
     ADR 0153 build note 3 once let ``cleartext_accepted`` reach these hops with a WARN; its dated
-    amendment records why that went. The forward-proxy credential is the one cleartext credential
-    hop still judged by the declarations; see :func:`proxy_auth_handler_from_settings`. SMTP AUTH
-    over cleartext is refused outright in ``transports.email``.
+    amendment records why that went. At least the forward-proxy credential is still judged by
+    the declarations; see :func:`proxy_auth_handler_from_settings`. SMTP AUTH over cleartext is
+    refused outright in ``transports.email``.
 
     A URL that names no host raises ``ValueError`` (:func:`_hop_guard_host`, BACKLOG #1924)."""
     _refuse_off_box_cleartext(scheme, url, sends=f"a {credential}", connection=connection)
@@ -1006,19 +1014,33 @@ def refuse_cleartext_credentials(
     """Refuse to send credentials over a cleartext (``http``) hop to an off-box host (#200, #3533).
 
     ``credentials`` is what :func:`http_credentials_sent` returns for the hop with
-    ``cleartext=True``, so this rule counts
-    exactly what the ``verify_tls = false`` rule counts: every auth setting, a static header the
-    redaction screen masks or whose name is off :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, and a
-    credential-looking query parameter (vault BACKLOG #3533 item 4). An ``Authorization`` header in
-    the built ``headers``, in any case, counts as well. As for :func:`refuse_cleartext_credential_hop`,
-    only a loopback host lifts it. Shared by the REST, SOAP, FHIR and DICOMweb cells and the
-    ``FhirLookup`` read path."""
+    ``cleartext=True``. So this rule counts what the ``verify_tls = false`` rule counts, with one
+    exception: every auth setting, a static header the redaction screen masks or whose name is off
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, and a credential-looking query parameter (vault
+    BACKLOG #3533 item 4). The exception is a static ``Proxy-Authorization``, in any spelling, which
+    the send-time proxy rule judges instead. An ``Authorization`` header in the built ``headers``,
+    in any case, counts as well; the bearer re-checks pass one in, as defense in depth should the
+    inventory and the bearer providers ever disagree. As for
+    :func:`refuse_cleartext_credential_hop`, only a loopback host lifts it. Shared by the REST,
+    SOAP, FHIR and DICOMweb cells and the ``FhirLookup`` read path."""
     sent = list(credentials)
     if not sent and any(str(name).strip().lower() == "authorization" for name in headers):
         sent = ["Authorization header"]
     if not sent:
         return
-    _refuse_off_box_cleartext(scheme, url, sends=_describe_sent(sent), connection=connection)
+    unlisted = sum(1 for c in sent if c.endswith(_OFF_ALLOWLIST))
+    removal = (
+        f" Or remove the {'header' if unlisted == 1 else 'headers'}; none of them is a credential."
+        if unlisted == len(sent)
+        else ""
+    )
+    _refuse_off_box_cleartext(
+        scheme,
+        url,
+        sends=_describe_sent(sent, allowlist="header"),
+        connection=connection,
+        removal=removal,
+    )
 
 
 def refuse_cleartext_egress(
@@ -1103,10 +1125,10 @@ def _header_held(name: str, value: object) -> str | None:
     return None
 
 
-def _describe_sent(credentials: Sequence[str]) -> str:
+def _describe_sent(credentials: Sequence[str], *, allowlist: str = "verify-off") -> str:
     """What a hop would send, worded for a refusal: its credentials, then any static headers
     refused only for their names, apart (vault BACKLOG #3533). ``credentials`` is non-empty and
-    comes from :func:`http_credentials_sent`."""
+    comes from :func:`http_credentials_sent`; ``allowlist`` names the list in the text."""
     unlisted = [c.removesuffix(_OFF_ALLOWLIST) for c in credentials if c.endswith(_OFF_ALLOWLIST)]
     secrets = [c for c in credentials if not c.endswith(_OFF_ALLOWLIST)]
     noun = "header" if len(unlisted) == 1 else "headers"
@@ -1114,7 +1136,7 @@ def _describe_sent(credentials: Sequence[str]) -> str:
     if secrets:
         sends.append(f"its credentials ({', '.join(secrets)})")
     if unlisted:
-        sends.append(f"static {noun} outside the verify-off allowlist ({', '.join(unlisted)})")
+        sends.append(f"static {noun} outside the {allowlist} allowlist ({', '.join(unlisted)})")
     return " and ".join(sends)
 
 
@@ -1259,11 +1281,14 @@ DYNAMIC_HEADER_REFUSED_CODE = "dynamic-header-refused"
 
 
 def holds_headers_to_allowlist(scheme: str, url: str, *, verify_tls: bool) -> bool:
-    """Whether every header this hop sends is held to :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`.
+    """Whether this hop holds its static ``headers`` and a Handler's per-message headers to
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`.
 
     True for a ``verify_tls = false`` https hop, any host, and for plain http to a host off this
     machine (vault BACKLOG #3533 items 4, 6, 7). Those are the hops where a static header off the
-    allowlist refuses the connection at build. :func:`refuse_dynamic_headers_off_allowlist` holds
+    allowlist refuses the connection at build. Headers the connector builds itself, such as
+    ``SOAPAction``, the FHIR conditional headers, ``Content-Type`` and the JWS headers, are not
+    held to the list. :func:`refuse_dynamic_headers_off_allowlist` holds
     a Handler's per-message headers to the same list at send. Call it after the construction
     guards, which have already refused a URL that names no host."""
     if scheme == "https":
@@ -1282,7 +1307,8 @@ def refuse_dynamic_headers_off_allowlist(
     is off :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, in any letter case, or when the redaction
     screen would mask it, so a credential-shaped value under an allowed name counts too.
 
-    The refusal is permanent: a retry would stamp the same header. It names the connection and how
+    The refusal is permanent and a configuration fault: a retry would stamp the same header, and a
+    Handler that stamps it usually does so on every message. It names the connection and how
     many headers it refused, and **never a header's name or value**. At send a name is a metadata
     key suffix the Handler may derive from the message, as
     :func:`enforce_send_time_length_limits` records for its own message-derived arm, so it is
@@ -1302,6 +1328,9 @@ def refuse_dynamic_headers_off_allowlist(
         "The names are withheld, since a Handler may derive them from the message",
         code=DYNAMIC_HEADER_REFUSED_CODE,
         permanent=True,
+        # A Handler that stamps such a header usually stamps it on every message, so stop the lane
+        # and keep the queue (ADR 0095) rather than dead-letter each row in turn.
+        config_fault=True,
     )
 
 
@@ -2013,7 +2042,7 @@ def proxy_auth_handler_from_settings(
     # Not refuse_cleartext_credential_hop: vault BACKLOG #3533 item 4 took the declarations away from
     # the destination's credentials only. This leg is still judged by them, so an attested or
     # accepted proxy can carry its own login; ADR 0153's 2026-10-27 amendment records the split.
-    proxy_host = _hop_guard_host(proxy_url, cell=_CLEARTEXT_CREDENTIAL_CELL)
+    proxy_host = _hop_guard_host(proxy_url, cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL)
     credential = (
         "web-proxy credential"
         if proxy_scheme == "http"
@@ -2021,8 +2050,12 @@ def proxy_auth_handler_from_settings(
     )
     _enforce_shipped_hop(
         proxy_host,
-        cell=_CLEARTEXT_CREDENTIAL_CELL,
-        message=f"sends a {credential} over cleartext http to {proxy_host!r}",
+        cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL,
+        message=(
+            f"sends a {credential} over cleartext http to {proxy_host!r}; unlike the "
+            "destination's own credentials, this leg can be declared with tls_hop_attested or "
+            "cleartext_accepted"
+        ),
         attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,

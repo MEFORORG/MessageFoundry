@@ -672,8 +672,9 @@ class SoapDestination(DestinationConnector):
             raise ValueError("SOAP ws_addressing/ws_security require soap_version='1.2' (ADR 0015)")
         # A UsernameToken password over cleartext http is a credential on the wire, refused like the
         # header credentials: only a loopback host lets it cross, never a declaration or the escape
-        # (vault BACKLOG #3533 item 4).
-        if self.ws_username:
+        # (vault BACKLOG #3533 item 4). Only with ws_security on: without it no token is stamped,
+        # and a basic_user that ws_username falls back to is judged as HTTP Basic instead.
+        if self.ws_security and self.ws_username:
             refuse_cleartext_credential_hop(
                 scheme,
                 self.url,

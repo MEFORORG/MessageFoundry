@@ -668,7 +668,7 @@ def token_provider_from_settings(
         return None
     # Read strictly for the flag check (vault BACKLOG #2232) and the connection name the runner's
     # _dest_config mirrors into these resolved settings. Read exactly as the OAuth2 sibling does.
-    _, accepted, revocation = hop_declarations_from_settings(s, SmartAuthError)
+    _, (_, _, connection), revocation = hop_declarations_from_settings(s, SmartAuthError)
     token_url = str(s.get("smart_token_url") or "")
     return SmartBackendTokenProvider(
         token_url=token_url,
@@ -695,7 +695,7 @@ def token_provider_from_settings(
         # top-level declaration.
         revocation_attested=revocation[0],
         revocation_attested_reason=revocation[1],
-        connection=accepted[2],
+        connection=connection,
         revocation_connection=revocation[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
         ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)
