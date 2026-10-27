@@ -939,13 +939,8 @@ def test_a_worker_that_keeps_dying_is_respawned_on_a_doubling_backoff(tmp_path: 
     assert runner._respawn_delay(Stage.ROUTED, "IB") == 0.0
 
 
-# --- step 2: a node that is not the leader sends no re-pend -----------------------------------------
-#
-# The re-pend writes are unfenced by design (a fenced re-pend would turn a permitted duplicate into a
-# forbidden strand), so the retry reads leadership before every write: one sent after a successor
-# re-claimed the rows would re-pend rows the successor holds. It holds the lane meanwhile rather than
-# giving up, so a demote-then-re-promote with no teardown neither strands the lane nor lets a later
-# row overtake the held ones.
+# --- step 2: a node that is not the leader sends no re-pend RETRY -----------------------------------
+# StageDispatcher._land_while_holding's docstring says why; the first write is always sent.
 
 
 class _Lease(NullCoordinator):
@@ -981,7 +976,7 @@ def _bare_dispatcher(store: MessageStore, **kwargs: Any) -> stage_dispatcher.Sta
 _LEASE_CASES = {
     "control-kept": (True, False, None),
     "lost-during-the-write-then-stop": (True, True, "stop"),
-    "lost-before-the-first-write-then-stop": (False, False, "stop"),
+    "not-the-leader-from-the-start-then-stop": (False, False, "stop"),
     "lost-then-regained-with-no-teardown": (True, True, "regain"),
 }
 
@@ -994,10 +989,10 @@ async def test_the_pooled_repend_retry_sends_nothing_while_not_the_leader(
     case: str,
 ) -> None:
     """The serializer's first re-pend fails, the store then heals. Kept lease (the control): the
-    second write lands after one backoff. Not the leader, from the start or from the failing write
-    on: no write at all while it lasts, one WARNING, and the stop that the demotion teardown sends
-    returns False with the row in flight. Leading again with no teardown resumes the retry, which
-    lands."""
+    retry lands after one backoff. Not the leader, from the start or from the failing write on:
+    the first write is still sent (ADR 0157 C1), then no retry while it lasts, one WARNING, and the
+    stop the demotion teardown sends returns False with the row in flight. Leading again with no
+    teardown resumes the retry, which lands."""
     _fast_backoffs(monkeypatch)
     leader, lose_in_write, third_backoff = _LEASE_CASES[case]
     lease = _Lease()
@@ -1036,22 +1031,29 @@ async def test_the_pooled_repend_retry_sends_nothing_while_not_the_leader(
     elif third_backoff == "regain":
         assert (landed, writes, backoffs, held_lines) == (True, 2, 3, 1)
     else:
-        assert (landed, writes, backoffs, held_lines) == (False, 1 if leader else 0, 3, 1)
+        assert (landed, writes, backoffs, held_lines) == (False, 1, 3, 1)
     assert await _ingress_inflight(store) == (0 if landed else 1)
 
 
 @pytest.mark.parametrize(
-    "case", ["control-kept", "lost-during-the-backoff-then-stop", "lost-then-regained"]
+    "case",
+    [
+        "control-kept",
+        "lost-during-the-backoff-then-stop",
+        "not-the-leader-from-the-start-then-stop",
+        "lost-then-regained",
+    ],
 )
 async def test_the_per_lane_repend_retry_sends_nothing_while_not_the_leader(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    """The per-lane twin. The first re-pend fails and the store heals during the backoff after it.
-    Kept lease (the control): the second write lands. Lease lost during that backoff: no write is
-    sent after it, and the teardown's stop returns True, so the caller returns rather than claiming
-    past the held row. Lease regained with no teardown: the retry resumes and lands."""
+    """The per-lane twin. The first re-pend fails, on a non-leader too, and the store heals during
+    the backoff after it. Kept lease (the control): the retry lands. Not the leader after that
+    backoff: no retry is sent, and the teardown's stop returns True, so the caller returns rather
+    than claiming past the held row. Lease regained with no teardown: the retry resumes and lands."""
     _fast_backoffs(monkeypatch)
     lease = _Lease()
+    lease.held = case != "not-the-leader-from-the-start-then-stop"
     runner = RegistryRunner(
         _registry(tmp_path),
         store,
@@ -1079,7 +1081,7 @@ async def test_the_per_lane_repend_retry_sends_nothing_while_not_the_leader(
 
     monkeypatch.setattr(runner, "_stop_or_sleep", backoff)
     stopped = await runner._repend_claimed_on_fault("router", "IB", [row])
-    if case == "lost-during-the-backoff-then-stop":
+    if case.endswith("-then-stop"):
         assert (stopped, calls["reschedule_claimed"], backoffs) == (True, 1, 3)
         assert await _ingress_inflight(store) == 1
     else:

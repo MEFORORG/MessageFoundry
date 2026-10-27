@@ -1306,10 +1306,7 @@ class StageDispatcher:
         # stop ends the retry and leaves the rows INFLIGHT for reset_stale_inflight at the next start,
         # as a cancelled serializer's are; the in-flight watch pages them meanwhile.
         #
-        # Losing leadership does NOT end it: no write is sent while this node is not the leader, and
-        # the serializer keeps holding the lane until a stop (the demotion teardown) or until it
-        # leads again with no teardown (a flap), when the retry resumes. Ending it on leader loss
-        # instead would leave the lane PROCESSING with no serializer through such a flap.
+        # Losing leadership pauses the retry and does not end it; _land_while_holding says why.
         if head_reschedule is not None:
             head_id, when = head_reschedule
             # The head is dated `when`, which the RETRY outcome parks the lane until. Only a retry
@@ -1448,64 +1445,66 @@ class StageDispatcher:
         backoff (BACKLOG #1611). Returns False if the dispatcher stopped first; the rows then stay
         INFLIGHT for ``reset_stale_inflight`` at the next start.
 
-        Leadership is read before every write, the first included. The re-pend writes are unfenced
-        by design (see ``ClusterCoordinator.current_epoch``), so one sent after a successor
-        re-claimed the rows would re-pend rows it holds. While this node is not the leader no write
-        is sent, one WARNING says so, and the backoff goes on: a stop (the demotion teardown) returns
-        False with the rows in flight for the successor's recovery, and leading again with no
-        teardown (a flap) resumes the writes, so the lane is never left held by nobody.
+        The first write is always sent. A RETRY is sent only while this node is the leader, read
+        after each backoff, right before it: the writes are unfenced by design (ADR 0157 C1), and a
+        retry from a node that lost the lease could re-pend rows a successor re-claimed. Not the
+        leader, the serializer sends nothing, logs one WARNING, and keeps holding the lane, polling
+        at the base interval: a stop (the demotion teardown) returns False, and leading again with
+        no teardown (a flap) resumes the retry. Ending the retry on leader loss instead would leave
+        the lane PROCESSING with no serializer through such a flap.
 
         The caller still holds the lane, so nothing claims a later row past the ones being re-pended,
         and no clock or ownership guess is needed: the serializer is the lane's only consumer and
         knows which rows it holds. A failure is logged at WARNING on a backoff (1st, 2nd, 4th ...)
         with a line when the write lands; counts and the exception only, never a row's content."""
         run = FailureRun()
-        stood_down = False
+        warned = False
         while True:
-            if not self._is_leader():
-                if not stood_down:
-                    stood_down = True
-                    log.warning(
-                        "StageDispatcher %s lane %s: %s held, not sent, after %d failure(s): this "
-                        "node is not the leader; the rows stay in flight until it leads again or stops",
-                        self._stage.value,
-                        lane,
-                        what,
-                        run.count,
-                    )
+            try:
+                await write()
+            except Exception as exc:  # noqa: BLE001 — retried while holding the lane; see the docstring
+                run = run.record(
+                    log,
+                    exc,
+                    "StageDispatcher %s lane %s: %s failed; holding the lane and retrying, so no "
+                    "later row overtakes it",
+                    self._stage.value,
+                    lane,
+                    what,
+                    level=logging.WARNING,
+                )
             else:
-                stood_down = False
-                try:
-                    await write()
-                except Exception as exc:  # noqa: BLE001 — retried while holding the lane; see the docstring
-                    run = run.record(
+                if run.count:
+                    run.clear(
                         log,
-                        exc,
-                        "StageDispatcher %s lane %s: %s failed; holding the lane and retrying, so no "
-                        "later row overtakes it",
+                        "StageDispatcher %s lane %s: %s",
                         self._stage.value,
                         lane,
                         what,
                         level=logging.WARNING,
                     )
-                else:
-                    if run.count:
-                        run.clear(
-                            log,
-                            "StageDispatcher %s lane %s: %s",
-                            self._stage.value,
-                            lane,
-                            what,
-                            level=logging.WARNING,
-                        )
-                    return True
-            await self._sleep_or_stop(
-                _capped_backoff(
-                    _LANE_ERROR_BACKOFF_SECONDS, run.count - 1, _REPEND_RETRY_CAP_SECONDS
-                )
+                return True
+            delay = _capped_backoff(
+                _LANE_ERROR_BACKOFF_SECONDS, run.count - 1, _REPEND_RETRY_CAP_SECONDS
             )
-            if self._stop.is_set():
-                return False
+            while True:
+                await self._sleep_or_stop(delay)
+                if self._stop.is_set():
+                    return False
+                if self._is_leader():
+                    break
+                delay = _LANE_ERROR_BACKOFF_SECONDS
+                if not warned:
+                    warned = True
+                    log.warning(
+                        "StageDispatcher %s lane %s: %s failed %d time(s) and this node is not the "
+                        "leader, so no retry is sent; the lane stays held with the rows in flight, "
+                        "and the retry resumes only if this node leads again before it stops",
+                        self._stage.value,
+                        lane,
+                        what,
+                        run.count,
+                    )
 
     async def _drain_lane(
         self, lane: str, items: list[OutboxItem]
