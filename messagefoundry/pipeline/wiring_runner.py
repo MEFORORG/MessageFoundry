@@ -911,11 +911,11 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 #: settle, taking the ADR 0031 rebind-failure branch instead.
 _PENDING_STOP_SETTLE_SECONDS = 10.0
 #: How long a SHUTDOWN teardown cancelled from outside still lets its in-flight source stops run
-#: before it cuts them (BACKLOG #1620, ADR 0157 Amendment B). Short on purpose: the cancel usually
-#: comes from a caller already out of time (at least Engine.stop()'s 10.0s supervisor wait, inside
-#: NSSM's 15000 ms AppStopMethodConsole window), so the grace keeps the added delay small. It does
-#: NOT make such a shutdown fit that window. It covers a stop that ends promptly; one still in a
-#: listener's client drain is cut, as the serial loop cut its one in-flight stop.
+#: before it cuts them (BACKLOG #1620, ADR 0157 Amendment B). The grace spares a stop that ends
+#: promptly a cut and a redo, and the DICOM and Database cut hazards. The bound honours the
+#: caller's cancel: a hung stop is cut here and then hangs, visibly, in the following unbounded
+#: stop() (Engine.stop() calls registry_runner.stop() right after cancelling the supervisor), which
+#: covers the rest. It saves no shutdown time on that path, and claims none.
 _CANCELLED_STOP_GRACE_SECONDS = 2.0
 
 
@@ -5768,6 +5768,11 @@ class RegistryRunner:
         the grace or was coalesced with the first: ``cancelling()`` is compared against
         ``cancels_before``, read before the wait, so a cancel the task already carried from earlier
         does not count. The caller re-raises.
+
+        A further cancel during the final ``gather`` cannot leave a cut stop running: the task's
+        cancel is forwarded to the stops, and ``gather`` still resolves only once each has
+        finished, so this method returns only after every stop task is done. No later stop()
+        can therefore overlap one (ADR 0157 Amendment B).
         """
         current = asyncio.current_task()
         if current is not None and current.cancelling() - cancels_before > 1:
@@ -5827,9 +5832,9 @@ class RegistryRunner:
         ``reason`` (ADR 0157 C6) selects the SOURCE + DISPATCHER phases and the bound on the
         lookup-executor close wait (:meth:`_teardown_body` states it); every other phase, and
         their order, is shared. Under SHUTDOWN the executed statements are the pre-ADR-0157 ones,
-        except at least that the source stops now run concurrently and a failed one is raised only
-        after the rest of teardown has run (BACKLOG #1620); none is bounded or abandoned, except
-        that a teardown cancelled from outside cuts them after a grace (ADR 0157 Amendment B).
+        except at least that the source stops now run concurrently and a failed one is raised once
+        every stop has been joined (BACKLOG #1620); none is bounded or abandoned, except that a
+        teardown cancelled from outside cuts them after a grace (ADR 0157 Amendment B).
 
         **THE INVARIANT: ``self._running = False`` must execute on every path.**
         ``Engine._reconcile_graph``'s bring-up branch is ``is_leader() and not running``, so a teardown
@@ -5893,7 +5898,6 @@ class RegistryRunner:
             self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
         else:
             self._wake_worker_lanes()
-        failed_stops: list[tuple[str, SourceConnector, BaseException]] = []
         if demote:
             # ADR 0157 Inc 5: DEMOTE INVERTS the ADR 0066 D3 order below, deliberately. Egress is the
             # split-brain-relevant action, so its budget must start NOW rather than after the source
@@ -5909,11 +5913,11 @@ class RegistryRunner:
             # BACKLOG #1620: concurrent, so N slow inbound stops cost one, not N. Deliberately NOT
             # bounded here: every stop is joined before the dispatchers stop (the ordering below)
             # and before start() can rebind on its failed-start and residual-state teardowns (review
-            # M-8), so this phase is only as bounded as each inbound's own stop(). A failed stop no
-            # longer aborts the rest of teardown: its inbound is put back into _sources after the
-            # clears below and the first failure re-raised there, so the next stop()/start()
-            # retries it. An OUTER cancel gets a bounded grace rather than cutting every stop at
-            # once. ADR 0157 Amendment B states all three and what each connector relies on.
+            # M-8), so this phase is only as bounded as each inbound's own stop(). A failed stop
+            # ends teardown after every stop has been joined, before anything below runs: its
+            # listener may still be live, so its drain side is kept and the next stop()/start()
+            # retries it, as the serial loop left it. An OUTER cancel gets a bounded grace rather
+            # than cutting every stop at once. ADR 0157 Amendment B states all of it, per connector.
             sources = list(self._sources.items())  # snapshot BEFORE the await (ADR 0157 Inc 4)
             tasks = [
                 asyncio.create_task(source.stop(), name=f"shutdown-stop:{name}")
@@ -5931,6 +5935,8 @@ class RegistryRunner:
                         self._log_failed_source_stops(sources, tasks, cancelled_is_failure=False)
                     raise
             failed_stops = self._log_failed_source_stops(sources, tasks, cancelled_is_failure=True)
+            if failed_stops:
+                raise failed_stops[0][2]
             # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
             # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
             # _stop.set(). The shared _stop already broke their loops; d.stop() cancels each
@@ -6079,11 +6085,6 @@ class RegistryRunner:
         # ADR 0071 B5: reset the fusion degraded gauge so a start()-after-stop() begins clean (the
         # executors + pools were already torn down above; _fusion_active reset there too).
         self._fusion_pool_open_failed = False
-        if failed_stops:
-            # BACKLOG #1620: the rest of teardown ran; now restore what a failed stop used to leave,
-            # the inbound itself as residual state, and the raise, so start() never builds over it.
-            self._sources.update((name, source) for name, source, _ in failed_stops)
-            raise failed_stops[0][2]
         # NOTE: `self._running = False` is NOT here — it moved into _teardown_unsafe's `finally`
         # (ADR 0157 D7) so a raised or cancelled teardown still leaves this node re-promotable.
 

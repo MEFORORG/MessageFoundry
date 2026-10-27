@@ -3,8 +3,10 @@
 """The runner's plain (SHUTDOWN) source stop runs the stops concurrently (BACKLOG #1620).
 
 ``RegistryRunner.stop()`` used to await each ``source.stop()`` in turn, so N slow sources cost N
-times one. They now run together, every one is still joined before the dispatchers stop, and a failed stop is logged rather than aborting the rest of teardown. The failed inbound is
-then kept as residual state and its error re-raised, so the next stop() or start() retries it.
+times one. They now run together, and every one is still joined before the dispatchers stop. A
+failed stop is logged and re-raised once every stop is joined, before the dispatchers stop: its
+listener may still be live, so the drain side is kept as residual state, and the next stop() or
+start() retries it, as the serial loop left it (ADR 0157 Amendment B).
 
 The runner deliberately adds no bound of its own: cutting or abandoning a stop there would let
 start() rebind over a source still releasing its port or poll task. Each source's own stop() is
@@ -20,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Callable
 
 import pytest
 
@@ -57,6 +60,14 @@ class _Source:
             await self._body()
         except asyncio.CancelledError:
             self.events.append(f"cut:{self.name}")
+            if self.mode == "slow_cut":
+                assert self.gate is not None
+                # Cleanup that outlives the cut AND a re-cancel, as one inside a thread or a
+                # store call does. The test sets the gate in a finally, so this always ends.
+                while not self.gate.is_set():
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self.gate.wait()
+                self.events.append(f"cut_done:{self.name}")
             raise
         self.events.append(f"end:{self.name}")
 
@@ -70,6 +81,9 @@ class _Source:
         elif self.mode == "fails_once":
             if self.stop_calls == 1:
                 raise OSError("shutdown raised")
+        elif self.mode == "slow_cut":
+            if self.stop_calls == 1:
+                await asyncio.Event().wait()
         elif self.mode == "hangs":
             await asyncio.Event().wait()
         elif self.mode == "self_cancels":
@@ -112,26 +126,26 @@ async def test_slow_stops_run_concurrently_and_finish_before_the_dispatchers() -
     assert runner._sources == {} and runner._pending_source_stops == []
 
 
-async def test_a_failed_stop_is_logged_and_teardown_continues(
+async def test_a_failed_stop_keeps_the_drain_side(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """A failed stop may leave its listener live, still ACKing into the store. Teardown must not
+    clear the drain side under it. Mutation: run the rest of teardown before the raise (head
+    8bf008396). Red: the dispatchers are stopped and cleared."""
     events: list[str] = []
     runner = _runner(events, IB_OK="ok", IB_BAD="fails")
 
-    # Before #1620 the OSError escaped at once and skipped the rest of teardown. It still escapes,
-    # but only after the rest has run.
     with (
         caplog.at_level(logging.WARNING, logger=wiring_runner.log.name),
         pytest.raises(OSError, match="share went away"),
     ):
         await runner.stop()
 
-    assert "end:IB_OK" in events
-    assert events[-1] == "dispatchers"
+    assert "end:IB_OK" in events  # every stop still ran and was joined
     assert "'IB_BAD': stop() failed" in caplog.text and "OSError" in caplog.text
-    assert runner._dispatchers == {}
-    # Mutation: drop the restore. Red: the failed inbound is forgotten and never stopped again.
-    assert list(runner._sources) == ["IB_BAD"]
+    assert "dispatchers" not in events
+    assert list(runner._dispatchers) == [Stage.INGRESS]
+    assert set(runner._sources) == {"IB_OK", "IB_BAD"}
     assert runner.has_residual_state and not runner.running
 
 
@@ -162,8 +176,8 @@ async def test_a_stop_that_ends_cancelled_is_raised_as_a_runtime_error() -> None
     with pytest.raises(RuntimeError, match=r"'IB_ODD': stop\(\) ended cancelled"):
         await runner.stop()
 
-    assert events[-1] == "dispatchers"
-    assert list(runner._sources) == ["IB_ODD"]
+    assert "end:IB_OK" in events and "dispatchers" not in events
+    assert set(runner._sources) == {"IB_ODD", "IB_OK"}
 
 
 async def _started(events: list[str], *names: str) -> None:
@@ -172,6 +186,11 @@ async def _started(events: list[str], *names: str) -> None:
             await asyncio.sleep(0)
 
     await asyncio.wait_for(spin(), _RENDEZVOUS_SECONDS)  # a regression fails, never hangs
+
+
+async def _until(condition: Callable[[], bool]) -> None:
+    while not condition():
+        await asyncio.sleep(0)
 
 
 async def _yield(turns: int = 5) -> None:
@@ -310,6 +329,43 @@ async def test_a_failure_before_an_outer_cancel_is_logged_by_name(
 
     assert "'IB_BAD': stop() failed" in caplog.text and "OSError" in caplog.text
     assert set(runner._sources) == {"IB_BAD", "IB_A"}
+
+
+async def test_a_third_cancel_still_joins_the_cut_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A third cancel lands while the cut stops are being joined. gather forwards it to them but
+    still resolves only once each has finished, so stop() cannot return with one running and no
+    later stop() can overlap it. A pin, not a fix: it is green on head 8bf008396 too. Mutation:
+    drop the gather of the cut stops. Red: stop() returns while the cut
+    stop is still running."""
+    monkeypatch.setattr(wiring_runner, "_CANCELLED_STOP_GRACE_SECONDS", 60.0)
+    events: list[str] = []
+    gate = asyncio.Event()
+    runner = _runner(events, gate, IB_DICOM="slow_cut")
+    source = runner._sources["IB_DICOM"]
+
+    try:
+        first = asyncio.create_task(runner.stop())
+        await _started(events, "IB_DICOM")
+        first.cancel()
+        first.cancel()  # coalesced: cut at once
+        await asyncio.wait_for(_until(lambda: "cut:IB_DICOM" in events), _RENDEZVOUS_SECONDS)
+        first.cancel()  # lands in the join of the cut stop
+        await _yield()
+        assert not first.done()  # still joining the cut stop
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(first, _RENDEZVOUS_SECONDS)
+        assert "cut_done:IB_DICOM" in events
+    finally:
+        gate.set()  # a failure must not leave the cut stop absorbing cancels forever
+
+    await runner.stop()
+
+    assert events.index("cut_done:IB_DICOM") < events.index("end:IB_DICOM")
+    assert source.stop_calls == 2  # type: ignore[attr-defined]
+    assert runner._sources == {}
 
 
 async def test_control_healthy_stops_log_nothing(caplog: pytest.LogCaptureFixture) -> None:
