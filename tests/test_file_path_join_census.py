@@ -442,7 +442,7 @@ SITES: dict[str, Site] = {
     ),
     # --- messagefoundry/ ---
     "messagefoundry/__main__.py::_cert_import": Site(3, OPERATOR, _CERT_OUT),
-    "messagefoundry/__main__.py::_cert_self_signed": Site(2, OPERATOR, _CERT_OUT),
+    "messagefoundry/__main__.py::_cert_self_signed": Site(3, OPERATOR, _CERT_OUT),
     "messagefoundry/__main__.py::_check_env_file_present": Site(
         1,
         REVIEWED,
@@ -842,6 +842,16 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/uploads.py::_atomic_write_text": Site(
         1, INTERNAL, "A random-token temp name beside a path the store built."
+    ),
+    "messagefoundry/verify/cipher_policy.py::_openssl_default_file": Site(
+        1,
+        INTERNAL,
+        "The fixed `openssl.cnf` name under the OPENSSLDIR printed by the `openssl` on the "
+        "operator's PATH. A planted binary gains nothing new by naming the directory, since it "
+        "already runs code as the operator; a PASS from that file alone is capped at MANUAL.",
+    ),
+    "messagefoundry/verify/cipher_policy.py::_powershell_pins": Site(
+        1, INTERNAL, "The fixed `Modules` name under the system's Windows PowerShell directory."
     ),
     "messagefoundry_toolkit/adr_analyze.py::_criteria": Site(
         1,

@@ -872,12 +872,13 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     assert set(markers) <= seen, "the capture missed a marker sent through the connector's logger"
     # _poll_once catches a failed hand-off, logs it and goes on, so a _hand_off that raised once the
     # stop was set would leave the assertions below green. The connector logs no failure this poll.
+    # The message prints each logged line in full, where pytest's diff would truncate it.
     failures = [
         r.getMessage()
         for r in caplog.records
         if r.name == connector_log.name and r.getMessage() not in markers
     ]
-    assert failures == []
+    assert failures == [], "the connector logged a WARNING this poll:\n" + "\n".join(failures)
     # a.hl7 was handed over and recorded; b.hl7 met the stop before its first message.
     assert [b.decode("utf-8").split("|")[9] for b in handler.bodies] == ["CTRL1"]
     # b.hl7 was split once, after its stop ran, and the forced arm held that split's submission.
@@ -885,7 +886,9 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     # ingested, quarantined, a transient retrieve failure and the tick ceiling. One that skipped
     # b.hl7 would pass the assertion above without this one.
     assert holds_at_split == [1 if hold_loop else 0], (
-        "b.hl7 was not split once with its stop, or the forced arm did not hold that split"
+        f"holds_at_split={holds_at_split}, the running hold count at each split of b.hl7: it was "
+        "not split exactly once with its stop, or the forced arm's hold did not fire once before "
+        "that split (the hold-arm comment above says what the hold rests on)"
     )
     assert len(ledger.keys) == 1 and ledger.pruned == 1
     # Neither file was quarantined or deleted. Leave mode moves no file it finished either, so this

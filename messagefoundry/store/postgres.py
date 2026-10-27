@@ -136,7 +136,9 @@ from messagefoundry.store.crypto import (
     cipher_meta_key,
     decrypt_json_cell,
     report_sealed_surface,
-    rotation_fingerprint_key,
+    reseal_rotation_fingerprints,
+    rotation_fingerprint_cipher,
+    rotation_fingerprint_reseal_likes,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.gcm_bound import (
@@ -1046,8 +1048,9 @@ _SCHEMA: list[str] = [
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner_user_id, name)",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
-    # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
-    # the tracked-since age floor + the auto-detected last-rotation stamp. Adding this DDL moves
+    # is the DEK's one-way key-id, or for any other class a store-cipher cell sealing a keyed MAC under
+    # a random per-row key (BACKLOG #3472, ADR 0213) — never the value; the dates are the tracked-since
+    # age floor + the auto-detected last-rotation stamp. Adding this DDL moves
     # _schema_hash() automatically — the ADR 0064 bump — so the table is created at open on Postgres too,
     # engaging the engine's `isinstance(store, SecretRotationMetaStore)` reconcile on this backend.
     """CREATE TABLE IF NOT EXISTS secret_rotation_meta (
@@ -2468,11 +2471,10 @@ class PostgresStore:
     # `isinstance(store, SecretRotationMetaStore)` reconcile on the Postgres backend (mirrors
     # MessageStore's SQLite implementation).
 
-    def secret_rotation_fingerprint_key(self) -> bytes | None:
-        """The DEK-derived HMAC subkey the rotation watcher fingerprints tracked secret values with
-        (ASVS 13.3.4). Derived off THIS store's live cipher; ``None`` when keyless / DEK not in heap, in
-        which case the watcher tracks only the non-secret DEK key-id stamp. Never returns the DEK."""
-        return rotation_fingerprint_key(self._cipher)
+    def secret_rotation_cipher(self) -> AesGcmCipher | None:
+        """The cipher the rotation watcher seals each non-DEK fingerprint cell with (ASVS 13.3.4,
+        BACKLOG #3472); ``None`` when keyless or ``vault_transit``. Mirrors MessageStore's."""
+        return rotation_fingerprint_cipher(self._cipher)
 
     async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
         """Every persisted secret-rotation watch record, keyed by ``secret_key`` (non-secret dates +
@@ -2495,7 +2497,9 @@ class PostgresStore:
     ) -> None:
         """Insert or replace one NON-SECRET watch record. Idempotent via ``ON CONFLICT (secret_key) DO
         UPDATE`` (MVCC-atomic — the Postgres equivalent of SQLite's INSERT OR REPLACE), so a re-run —
-        or a second cluster node — writing an identical fingerprint/date is a no-op."""
+        or a second cluster node — writing an identical fingerprint/date is a no-op. A sealed non-DEK fingerprint draws a fresh key on every write (BACKLOG #3472), so two nodes
+        sealing one class at once each write a different cell and the last write wins; either opens
+        to the same verdict."""
         await self._pool.execute(
             "INSERT INTO secret_rotation_meta (secret_key, fingerprint, tracked_since, last_rotated)"
             " VALUES ($1,$2,$3,$4)"
@@ -3288,6 +3292,8 @@ class PostgresStore:
             value_col="reason",
             id_keyed=True,
         )
+        # BACKLOG #3472 (ADR 0213): each sealed secret-rotation fingerprint; store.py's twin says why.
+        total += await self._reseal_rotation_fingerprints_to_active(cipher, active_like)
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         # BACKLOG #2592: a rotation ends every session; store.py's reencrypt_to_active says why.
@@ -3340,6 +3346,33 @@ class PostgresStore:
             await self._charge_bound_batch()
             rotated += len(rows)
         return rotated
+
+    async def _reseal_rotation_fingerprints_to_active(
+        self, cipher: AesGcmCipher, active_like: str
+    ) -> int:
+        """Re-seal each sealed ``secret_rotation_meta.fingerprint`` under the active key (BACKLOG
+        #3472). Mirrors MessageStore._reseal_rotation_fingerprints_to_active: one read, and a cell no
+        key opens is left in place."""
+        sealed, active = rotation_fingerprint_reseal_likes(active_like)
+        rows = await self._fetchall(
+            "SELECT secret_key, fingerprint FROM secret_rotation_meta"
+            " WHERE fingerprint LIKE $1 AND fingerprint NOT LIKE $2",
+            sealed,
+            active,
+        )
+        updates = reseal_rotation_fingerprints(
+            cipher, [(r["secret_key"], r["fingerprint"]) for r in rows]
+        )
+        if updates:
+            async with self._timed_acquire() as conn, conn.transaction():
+                for new_value, skey in updates:
+                    await conn.execute(
+                        "UPDATE secret_rotation_meta SET fingerprint=$1 WHERE secret_key=$2",
+                        new_value,
+                        skey,
+                    )
+            await self._charge_bound_batch()
+        return len(updates)
 
     @staticmethod
     def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:

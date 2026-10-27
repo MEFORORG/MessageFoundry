@@ -99,6 +99,7 @@ from messagefoundry.transports.bounded_read import (
     hop_identity,
     is_never_proxied_host,
     is_proxy_credential_header_name,
+    proxy_credential_header_name_shown,
     read_2xx_reply_text,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -1057,25 +1058,45 @@ def refuse_cleartext_egress(
     )
 
 
+#: The static header names a ``verify_tls = false`` hop may still send, in lower case (vault
+#: BACKLOG #3533 item 7, owner ruling 2026-10-26). Any other static header refuses that hop, so a
+#: secret under a neutral name such as ``X-Session`` cannot cross it. The list fails closed and
+#: needs no secret recognition. Each entry is defined to hold a media type, a product token or a
+#: correlation id, never a secret: ``accept`` and ``content-type`` name media types,
+#: ``user-agent`` names the client, and ``x-request-id`` tags a request for tracing. Widen it only
+#: by a reviewed change; the value test in :func:`http_credentials_sent` still refuses a
+#: credential-shaped value under one of these names.
+VERIFY_OFF_STATIC_HEADER_ALLOWLIST = frozenset(
+    {"accept", "content-type", "user-agent", "x-request-id"}
+)
+
+#: The suffix :func:`http_credentials_sent` puts on a header refused only for its name. Such a
+#: header need not be a credential, so :func:`refuse_verify_off` strips the suffix and names the
+#: header apart from the credentials, as one outside the allowlist.
+_OFF_ALLOWLIST = " header, which is not on the verify-off header allowlist"
+
+
 def http_credentials_sent(
     ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool = False
 ) -> list[str]:
-    """The credentials an HTTP-family hop sends, by name, for :func:`refuse_verify_off` (vault
-    BACKLOG #3230). Empty when it sends none.
+    """What an HTTP-family hop sends that :func:`refuse_verify_off` refuses on a verify-off hop,
+    by name (vault BACKLOG #3230, #3533). Empty when it sends none.
 
     The settings half is :func:`~messagefoundry.config.static_credentials.http_hop_credentials`, the
     static-credential inventory's own reader, so the two agree on every auth setting. The two
     additions below are this refusal's alone; the inventory does not count them yet. A
-    static ``headers`` entry is a credential when the redaction screen
-    (``config.wiring._is_secret_header``) would mask it, so an API-key header counts too. That
-    screen leans toward a false positive, which here refuses a verify-off hop that a header name
-    such as ``X-Routing-Key`` merely resembles; on a hop that already turned verification off, that
-    is the cheaper error. A credential-looking query parameter in ``url`` counts too, by the reader
-    ``query_credential_hops`` uses. A ``Proxy-Authorization`` from the proxy settings is not one: it
-    goes to the proxy, inside the CONNECT, not across this hop.
+    static ``headers`` entry counts when the redaction screen (``config.wiring._is_secret_header``)
+    would mask it, by name or by value, or when its name is not on
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`. That over-refuses on purpose: a header whose name
+    and value are both harmless, such as ``X-Routing-Key``, refuses a verify-off hop too, and on a
+    hop that already turned verification off that is the cheaper error. A credential-looking query
+    parameter in ``url`` counts too, by the reader ``query_credential_hops`` uses. A
+    ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
+    CONNECT, not across this hop.
 
     It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
-    not seen here; docs/SECURITY-LOOSENING.md lists that among the hops the rule does not reach."""
+    not seen here, nor a secret in the path of ``url``; docs/SECURITY-LOOSENING.md lists both among
+    the hops the rule does not reach."""
     # Lazy: both import config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
     from messagefoundry.config.wiring import _is_secret_header
@@ -1083,11 +1104,12 @@ def http_credentials_sent(
     sent = http_hop_credentials(ctype, settings, lookup=lookup)
     static = settings.get("headers")
     if isinstance(static, Mapping):
-        sent += [
-            f"{name} header"
-            for name, value in static.items()
-            if _is_secret_header(str(name), value)
-        ]
+        for name, value in static.items():
+            key = str(name)
+            if _is_secret_header(key, value):
+                sent.append(f"{name} header")
+            elif key.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
+                sent.append(f"{name}{_OFF_ALLOWLIST}")
     url = settings.get("url")
     if isinstance(url, str) and (names := credential_query_params(url)):
         sent.append(f"url query parameter {', '.join(names)}")
@@ -1129,7 +1151,11 @@ def refuse_verify_off(
     0153 change that does reach here is the deleted ``not is_phi`` ALLOW arm — a tightening.
 
     **A hop that sends ``credentials`` is refused first, and nothing lifts that** (vault BACKLOG
-    #3230): not the escape, not the posture, not ``tls_hop_attested``, not a loopback host. The
+    #3230). Since vault BACKLOG #3533 the list also names each static header off
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, which need not be a credential. The refusal names
+    those headers apart from the credentials, and offers removing them only when nothing else is
+    listed, since removal cannot clear a credential. Nothing lifts it:
+    not the escape, not the posture, not ``tls_hop_attested``, not a loopback host. The
     argument is required, so no caller can skip the question; pass :func:`http_credentials_sent`.
     The rule is stated once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
     unverified peer*. It runs before the escape check, so a credentialed hop is never told to set an
@@ -1140,12 +1166,31 @@ def refuse_verify_off(
     if scheme != "https":
         return None
     if credentials:
+        unlisted = [
+            c.removesuffix(_OFF_ALLOWLIST) for c in credentials if c.endswith(_OFF_ALLOWLIST)
+        ]
+        secrets = [c for c in credentials if not c.endswith(_OFF_ALLOWLIST)]
+        noun = "header" if len(unlisted) == 1 else "headers"
+        sends = []
+        if secrets:
+            sends.append(f"its credentials ({', '.join(secrets)})")
+        if unlisted:
+            sends.append(f"static {noun} outside the verify-off allowlist ({', '.join(unlisted)})")
+        # Removing the headers clears this refusal only when nothing else is listed. Even then the
+        # engine judges the hop again as a credential-less verify-off hop, which may still refuse.
+        removal = (
+            f" Or remove the {noun}; the engine then judges the hop as a verify-off hop with no "
+            "credential, which its own posture and levers may still refuse. Moving a secret into "
+            "the url path, a query parameter with a neutral name or a dynamic header is not a "
+            "fix: this refusal cannot see a secret there."
+            if not secrets
+            else ""
+        )
         raise ValueError(
-            f"{hop_name_prefix(connection)}{connector} would send its credentials "
-            f"({', '.join(credentials)}) to a peer whose certificate it does not verify "
-            "(verify_tls=false); refused, with no escape. Leave verify_tls on (the default). For a "
-            "server whose certificate comes from a private or self-signed CA, pin that CA with "
-            "tls_ca_file."
+            f"{hop_name_prefix(connection)}{connector} would send {' and '.join(sends)} to a peer "
+            "whose certificate it does not verify (verify_tls=false); refused, with no escape. "
+            "Leave verify_tls on (the default). For a server whose certificate comes from a "
+            f"private or self-signed CA, pin that CA with tls_ca_file.{removal}"
         )
     cell = f"{connector} verify_tls=false"
     host = _hop_guard_host(url, cell=cell)
@@ -1912,14 +1957,19 @@ def _refuse_a_static_proxy_header(headers: object) -> None:
     own header from a static one. Under Digest the connection sets no header of its own, so the
     static one would cross a cleartext proxy leg on the connection's admission. Under Basic it
     would be silently replaced. Refused rather than dropped, so the operator sees the conflict.
-    Names the key, never its value. The key is read by the function the send-time rule uses, so
-    the two cannot differ on which spellings are this header."""
+    Names the key, never its value, and shows the key only as
+    :func:`~messagefoundry.transports.bounded_read.proxy_credential_header_name_shown` does,
+    because text around the plain name may be a credential typed into the key (vault BACKLOG
+    #3457).
+    The key is read by the function the send-time rule uses, so the two cannot differ on which
+    spellings are this header."""
     if not isinstance(headers, Mapping):
         return
     for key in headers:
         if is_proxy_credential_header_name(str(key)):
             raise ValueError(
-                f"headers sets {str(key)[:64]!r} and the connection also sets proxy_user and "
+                f"headers sets {proxy_credential_header_name_shown(str(key))} and the connection "
+                "also sets proxy_user and "
                 "proxy_password. Remove the static header: the proxy credential comes from "
                 "proxy_user, proxy_password and proxy_auth_type only (vault BACKLOG #3443)"
             )
