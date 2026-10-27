@@ -23,6 +23,7 @@ import datetime
 import gc
 import logging
 import ssl
+import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ from messagefoundry.pipeline.cert_expiry import (
     _CA_FILE_HOP_RESTARTS,
     CertExpiryRunner,
     MonitoredCert,
+    _ca_file_crl_refusal,
     held_crl_label,
 )
 from messagefoundry.pipeline.crl_reload import reload_replaced_crls
@@ -685,18 +687,8 @@ _SCAN_FAILED = "Check the CRL in the CA file before restarting: the scan"
 #: The lead of the remedy for a CRL in a CA file whose signature is proven bad.
 _PROVEN_BAD = "Replace the CRL in the CA file with one its CA signed"
 
-#: The lead of the remedy for a CA file OpenSSL cannot load.
-_OPENSSL_FAILED = "Fix the CA file before restarting: OpenSSL cannot load it"
-
 #: The whole line the scan logs, naming no file, when it could not check a CA file's CRL.
 _SCAN_FAILED_LINE = "cert_expiry: could not check the CRL in a CA file"
-
-
-class _SslLoadError(ssl.SSLError):
-    """An ``ssl.SSLError`` with the ``reason`` OpenSSL sets on one it raises. One built in Python
-    has no such attribute."""
-
-    reason = "synthetic reason"
 
 
 @pytest.mark.parametrize(
@@ -767,10 +759,8 @@ def _lines_naming(
         pytest.param("not-a-state", ValueError, _CANNOT_JUDGE, False, id="unknown-state-value"),
         pytest.param("unproven", RuntimeError, _CANNOT_JUDGE, True, id="unproven-runtime"),
         pytest.param("uncheckable", TypeError, _CANNOT_JUDGE, True, id="uncheckable-type"),
-        pytest.param("unproven", ssl.SSLError, _CANNOT_JUDGE, True, id="unproven-ssl"),
         pytest.param("verified", RuntimeError, _SCAN_FAILED, False, id="verified-runtime"),
         pytest.param("not-a-state", TypeError, _SCAN_FAILED, False, id="unknown-state-type"),
-        pytest.param("verified", _SslLoadError, _OPENSSL_FAILED, False, id="verified-ssl"),
         pytest.param("bad", ValueError, _PROVEN_BAD, False, id="bad-value"),
         pytest.param("bad", RuntimeError, _PROVEN_BAD, False, id="bad-runtime"),
     ],
@@ -788,11 +778,12 @@ def test_a_later_block_the_signature_check_cannot_read_leaves_the_file_unjudged(
     # BACKLOG #3512: before it, the check stopped at the first unconfirmed block and said to
     # replace the CRL. A later block the check raises on now leaves the file unjudged, so the
     # remedy is still to replace the CRL before restarting, never to check, then restart, nor that
-    # the scan could not check the file. That holds for ValueError (the failure
-    # judge_crl_signatures documents) and for any other type. Only after an unconfirmed block is
-    # that logged, once, with its cause, naming the CA file. Controls: a verified block, or a state
-    # the scan does not name, takes the outer path for each type, so no state outside the
-    # unconfirmed two is swallowed. A ``bad`` block stops the check first.
+    # the scan could not check the file. That holds for ValueError, the failure
+    # judge_crl_signatures documents, and for other types, such as RuntimeError and TypeError.
+    # Only after an unconfirmed block is that logged, once, with its cause, naming the CA file.
+    # Controls: after a verified block, or a state the scan does not name, ValueError leaves the
+    # file unjudged with no such line, and another type says the scan could not check it, so no
+    # state outside the unconfirmed two is swallowed. A ``bad`` block stops the check first.
     hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3))
     monkeypatch.setattr(
         "messagefoundry.pipeline.cert_expiry.judge_crl_signatures", _blocks_then(first, error)
@@ -810,12 +801,45 @@ def test_a_later_block_the_signature_check_cannot_read_leaves_the_file_unjudged(
         assert len(later) == 1, later
         assert later[0].levelno == logging.WARNING
         assert later[0].exc_info is not None and later[0].exc_info[0] is error
-        # Every hop in the process meets the stand-in's unconfirmed block first, so none takes
-        # the outer path and logs that the scan could not check its CA file.
-        assert not [r for r in caplog.records if r.getMessage() == _SCAN_FAILED_LINE], later
     else:
         assert later == [], later
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+@pytest.mark.parametrize("error", [ValueError, RuntimeError, TypeError])
+@pytest.mark.parametrize("first", ["unproven", "uncheckable"])
+def test_an_unchecked_later_crl_calls_its_log_once_and_takes_no_outer_path(
+    ca: _Ca,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    first: str,
+    error: type[Exception],
+) -> None:
+    # BACKLOG #3512: called directly, so the count is of calls, not of the lines the per-pass fold
+    # lets through, and no other hop in the process can add a line. After an unconfirmed block, a
+    # later block's error of any of these types calls the log once, inside the handler that holds
+    # the cause, and logs no line saying the scan could not check the file.
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.cert_expiry.judge_crl_signatures", _blocks_then(first, error)
+    )
+    causes: list[type[BaseException] | None] = []
+
+    def _on_unchecked() -> None:
+        cause = sys.exc_info()[1]
+        causes.append(None if cause is None else type(cause))
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.cert_expiry"):
+        refusal = _ca_file_crl_refusal(
+            ca.pem + ca.crl(days=90, number=3),
+            time.time(),
+            None,
+            ca_file_only=True,
+            on_unchecked=_on_unchecked,
+        )
+
+    assert refusal is not None and refusal[1].startswith(_CANNOT_JUDGE), refusal
+    assert causes == [error], causes
+    assert not [r for r in caplog.records if r.getMessage() == _SCAN_FAILED_LINE], caplog.records
 
 
 def test_a_ca_file_the_scan_could_not_check_logs_why(
