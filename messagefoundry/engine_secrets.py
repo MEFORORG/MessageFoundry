@@ -67,15 +67,10 @@ KEY_CLASS_NAMES: Final[tuple[str, ...]] = (
     "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED",
 )
 
-#: Every secret-class setting the engine reads, by its environment name. The one list:
-#: :mod:`messagefoundry.serviceenv` takes its two lists from it, and
-#: ``tests/test_service_env_secrets.py`` holds it to the settings' own lists of secrets. A
-#: connection secret an operator names through ``env()`` is not here, because its name is the
-#: operator's; the directory supplies those under :data:`VALUE_PREFIX`.
-#:
-#: Spelled out under :data:`DIRECTORY_SETTING_NAMES` and joined here, so a reader that takes the
-#: names the directory supplies takes them from an identifier with no word in it that CodeQL's
-#: clear-text-logging query reads as a secret (the reason ``serviceenv`` gives for its own names).
+#: The secret-class settings the secrets directory may supply: every one but the store key's. Part
+#: of :data:`SECRET_SETTING_NAMES`, spelled out here so a reader that takes the names the directory
+#: supplies takes them from an identifier with no word in it that CodeQL's clear-text-logging query
+#: reads as a secret (the reason ``serviceenv`` gives for its own names).
 DIRECTORY_SETTING_NAMES: Final[tuple[str, ...]] = (
     "MEFOR_STORE_PASSWORD",
     "MEFOR_AUTH_AD_BIND_PASSWORD",
@@ -88,6 +83,12 @@ DIRECTORY_SETTING_NAMES: Final[tuple[str, ...]] = (
     "MEFOR_SECRETS_VAULT_TOKEN",
     "MEFOR_AI_API_KEY",
 )
+
+#: Every secret-class setting the engine reads, by its environment name. The one list:
+#: :mod:`messagefoundry.serviceenv` takes its two lists from it, and
+#: ``tests/test_service_env_secrets.py`` holds it to the settings' own lists of secrets. A
+#: connection secret an operator names through ``env()`` is not here, because its name is the
+#: operator's; the directory supplies those under :data:`VALUE_PREFIX`.
 SECRET_SETTING_NAMES: Final[tuple[str, ...]] = (*KEY_CLASS_NAMES, *DIRECTORY_SETTING_NAMES)
 
 #: The prefix of an ``env()`` value's variable, ``MEFOR_VALUE_<KEY>``. A file in the directory with
@@ -130,13 +131,29 @@ _ALLOWED_KEYS: Final = frozenset(_name_key(name) for name in DIRECTORY_SETTING_N
 _STORE_KEY_KEYS: Final = frozenset(_name_key(name) for name in KEY_CLASS_NAMES)
 
 
-def _check(path: Path, what: str) -> None:
-    """Refuse ``path`` when a known broad group can reach it: the rule key files get."""
-    from messagefoundry.config.key_file_access import key_file_problem
+def _check(path: Path, what: str, *, directory: bool = False) -> None:
+    """Refuse ``path`` when a known broad group can reach it: the rule key files get. For the
+    directory, a broad right to delete a file inside it is refused too, since deleting a file sends
+    its setting back to the environment."""
+    from messagefoundry.restricted_file import broad_access_problem
 
-    problem = key_file_problem(str(path), what=what, remedy=_REMEDY)
+    problem = broad_access_problem(path, directory=directory)
     if problem is not None:
-        raise SecretsDirectoryError(problem)
+        raise SecretsDirectoryError(f"{what} is not restricted: {problem}. {_REMEDY}")
+
+
+#: What a refusal may print of a file name that names no setting: a variable-shaped name with the
+#: engine's prefix. Anything else may be a value someone typed as a name, so it is cited by position.
+_PRINTABLE_ENTRY = re.compile(r"MEFOR_[A-Za-z0-9_]*")
+
+
+def _cite(entry: str, position: int, total: int) -> str:
+    """``entry`` as a refusal may print it: never the part after an ``=``, which in a name written
+    like an environment line is the value, and only a name shaped like one of the engine's
+    variables. Otherwise its position in name order, which still lets an operator find it."""
+    name = entry.split("=", 1)[0]
+    shown = name if _PRINTABLE_ENTRY.fullmatch(name) else f"entry {position} of {total}"
+    return f"{shown} (with what follows its '=' left out)" if "=" in entry else shown
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +243,7 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
         raise SecretsDirectoryError(f"{what} is not a directory, or does not exist")
     # The directory first: a group that can add a file to it can supply a setting, whatever the
     # access list of the file it adds.
-    _check(path, what)
+    _check(path, what, directory=True)
     try:
         entries = sorted(os.listdir(path))
     except OSError as exc:
@@ -236,7 +253,7 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
     names: dict[str, str] = {}
     folded: dict[str, str] = {}
     refused: list[str] = []
-    for entry in entries:
+    for position, entry in enumerate(entries, start=1):
         if entry.startswith("."):
             continue  # a hidden file, such as an editor's swap file, names no setting
         key = _name_key(entry)
@@ -256,7 +273,7 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
                 )
             names[key] = entry
         else:
-            refused.append(ascii(entry))
+            refused.append(_cite(entry, position, len(entries)))
     if refused:
         raise SecretsDirectoryError(
             f"{what} holds {', '.join(refused)}, which names no setting the directory supplies. "
