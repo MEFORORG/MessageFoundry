@@ -2337,8 +2337,11 @@ that snapshot's digest against the approved one before any config module runs. T
 and runs that same snapshot, and the `config_reload` row records its digest. So the config
 modules, helpers and tables checked are the ones the loader runs, and an edit to them on disk
 during the load is neither run nor recorded. The limits below name at least one import that runs
-from disk instead. The environment values are read apart from the snapshot, as the
-limits below say. If the digest differs, nothing loads and nothing swaps. The running graph keeps
+from disk instead. Where the environment value file sits in the config directory's
+`environments/` folder, `serve` parses it from the same snapshot, so a value file edited or created
+there during the load does not apply. An engine embedded with any other value provider takes the
+digest again after that provider reads, and refuses a change made in between the same way. If the
+digest differs, nothing loads and nothing swaps. The running graph keeps
 the environment values it had. A reload applies the values it re-read only with the swap, and a
 rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
 approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
@@ -2356,7 +2359,7 @@ digest, and `approval_digest_check` set to `not_reached`, and no `current_finger
 digest was taken. A missing, unlistable or disallowed directory is refused before the check too,
 with its own reason and neither field. A refusal after the digest check passed carries neither
 field either, whether the approved bytes caused it or an input the digest does not cover, such as
-an environment value file or a connection's CA file.
+an environment value file outside the config directory or a connection's CA file.
 
 **Every start and reload refuses a config directory holding a file the load reads that the engine
 cannot read, a `_` helper no module imports included.** An unreadable file or folder under
@@ -2389,9 +2392,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   integrity seal, so a writer to the `pending_approvals` table who replaces the digest leaves a
   request the gate refuses. The seal does not stop an older sealed copy of the row being put back,
   and a keyless store checks nothing (vault BACKLOG #2592);
-- the digest covers what `config/fingerprint.py` hashes and no more. The release reads the
-  environment value file again after the digest check, wherever the file sits, so an edit to it,
-  or to a `MEFOR_VALUE_*` variable, changes the values a release applies under an unchanged digest.
+- the digest covers what `config/fingerprint.py` hashes and no more. The release reads a value
+  file outside the config directory's `environments/` folder after the digest check, and a
+  `MEFOR_VALUE_*` variable too, so an edit to either changes the values a release applies under an
+  unchanged digest. The second digest an embedded engine's other value provider gets samples the
+  files, so an edit to a value file reverted before it is not seen.
   The loader compiles each config module, and each `_` helper a config module imports with an
   `import` statement, from the snapshot. A module reached through the ordinary import system runs
   from disk, a matching `__pycache__` file included, so the bytes that run are not the bytes the
