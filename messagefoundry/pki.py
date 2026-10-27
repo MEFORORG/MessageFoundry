@@ -445,10 +445,10 @@ class CrlSignature:
       no fitting CA verifies it. The CRL names that key, and that key did not sign it. A fitting
       CA with no Subject Key Identifier that could not be checked does not lift this to
       ``uncheckable`` (vault BACKLOG #4159, the reading of #2905 item 1 decided 2026-10-26). The
-      reason: every verifying engine context sets ``VERIFY_X509_STRICT``, under which OpenSSL 3
-      refuses a chain of two or more certificates through a CA with no Subject Key Identifier,
-      so such a CA cannot make the CRL valid for that chain. Measured 2026-10-27 on CPython
-      3.14.7 with OpenSSL 3.5.7. **At least two residuals, where the start refuses a CRL a
+      reason: the verifying engine contexts set ``VERIFY_X509_STRICT``, by the decision's
+      reading of the call sites, and under it OpenSSL 3 refuses a chain of two or more
+      certificates through a CA with no Subject Key Identifier, so such a CA cannot make the CRL
+      valid for that chain. Measured 2026-10-27 on CPython 3.14.7 with OpenSSL 3.5.7. **At least two residuals, where the start refuses a CRL a
       handshake could pass.** OpenSSL skips its strict checks on a one-certificate chain: a peer
       that presents a self-signed CA with no Subject Key Identifier, listed here, passed a strict
       handshake judged by a CRL that CA signed, measured the same day. And an OpenSSL build or a

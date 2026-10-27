@@ -412,10 +412,11 @@ def test_a_ca_that_does_not_parse_is_ignored(twins: _Twins) -> None:
 # --- vault BACKLOG #4159: a CA with no Subject Key Identifier cannot rescue a proven bad CRL ------
 
 
-def _ca_without_ski(key: _CaKey) -> x509.Certificate:
+def _ca_without_ski(key: _CaKey, *, localhost: bool = False) -> x509.Certificate:
     """A self-signed CA certificate for ``key`` named :data:`_NAME` that carries no Subject Key
-    Identifier, and so no Authority Key Identifier either: nothing else here names a key."""
-    return (
+    Identifier, and so no Authority Key Identifier either: nothing else here names a key. With
+    ``localhost`` it also names ``localhost``, so a server can present it as its own."""
+    builder = (
         x509.CertificateBuilder()
         .subject_name(_NAME)
         .issuer_name(_NAME)
@@ -425,8 +426,12 @@ def _ca_without_ski(key: _CaKey) -> x509.Certificate:
         .not_valid_after(_NOW + 365 * _DAY)
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .add_extension(_ku(ca=True), critical=True)
-        .sign(key, hashes.SHA256())
     )
+    if localhost:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("localhost")]), False
+        )
+    return builder.sign(key, hashes.SHA256())
 
 
 @functools.cache
@@ -500,16 +505,17 @@ def test_a_crl_its_named_ca_proves_bad_refuses_beside_an_unchecked_ca_with_no_sk
     assert verdict is not None and verdict[1] is True
 
     # Control: OpenSSL itself fails this chain's handshake on this CRL, in either listing order.
-    # One chain shape only, a leaf under the named CA; pki.CrlSignature names the residuals.
-    with pytest.raises(ssl.SSLError, match="signature"):
+    # One chain shape only, a leaf under the named CA, with a no-SKI CA whose key is of another
+    # kind than the leaf's signature; pki.CrlSignature names the residuals.
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
         _handshake(_raw_hop(mixed, twins.crl), twins.server(sends_renewed=False))
 
 
 def test_a_strict_engine_context_refuses_a_chain_through_a_ca_with_no_ski(tmp_path: Path) -> None:
     """(a) The premise the mixed-case refusal rests on: an engine verifying context sets
-    ``VERIFY_X509_STRICT``, and under it OpenSSL refuses a chain through a CA with no Subject Key
-    Identifier, so such a CA cannot make a CRL valid at a handshake. One builder is measured here,
-    the outbound one."""
+    ``VERIFY_X509_STRICT``, and under it OpenSSL refuses a chain of two or more certificates
+    through a CA with no Subject Key Identifier, so such a CA cannot make a CRL valid for that
+    chain. One builder is measured here, the outbound one."""
     key = ec.generate_private_key(ec.SECP256R1())
     (tmp_path / "ca.pem").write_bytes(_ca_without_ski(key).public_bytes(_PEM))
     leaf, leaf_key = _leaf(_NAME, key)
@@ -530,6 +536,33 @@ def test_a_strict_engine_context_refuses_a_chain_through_a_ca_with_no_ski(tmp_pa
     # without the flag could take such a CA for a CRL's issuer.
     client.verify_flags &= ~ssl.VERIFY_X509_STRICT
     _handshake(client, server)  # raises if refused
+
+
+def test_a_one_certificate_chain_through_a_ca_with_no_ski_passes_a_strict_handshake(
+    tmp_path: Path,
+) -> None:
+    """The residual pki.CrlSignature records: OpenSSL skips its strict checks on a chain of one
+    certificate. A peer that presents a listed self-signed CA with no Subject Key Identifier as
+    its own certificate passes a strict engine handshake judged by a CRL that CA signed, so that
+    CA can make a CRL valid for that chain. If this goes red, the residual has moved: correct
+    the texts that name it (the CrlSignature docstring, CONFIGURATION.md, the changelog)."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    ca = _ca_without_ski(key, localhost=True)
+    (tmp_path / "ca.pem").write_bytes(ca.public_bytes(_PEM))
+    (tmp_path / "ca-key.pem").write_bytes(_key_pem(key))
+    (tmp_path / "crl.pem").write_bytes(_crl(key, names=key))
+    server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server.load_cert_chain(tmp_path / "ca.pem", tmp_path / "ca-key.pem")
+
+    client = _hop(tmp_path / "ca.pem", tmp_path / "crl.pem")
+    assert client.verify_flags & ssl.VERIFY_X509_STRICT
+    assert client.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    _handshake(client, server)  # raises if refused
+
+    # Control: the CRL is live for this chain. Revoking the peer's own serial refuses it.
+    (tmp_path / "crl.pem").write_bytes(_crl(key, names=key, revoke=ca.serial_number))
+    with pytest.raises(ssl.SSLError, match="revoked"):
+        _handshake(_hop(tmp_path / "ca.pem", tmp_path / "crl.pem"), server)
 
 
 def test_a_named_ca_that_cannot_be_checked_still_warns_beside_a_ca_with_no_ski(

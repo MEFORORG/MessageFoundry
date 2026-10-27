@@ -2003,16 +2003,16 @@ several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
 authority key identifier and that carries a subject key identifier, and no fitting CA may
 verify the CRL. A fitting CA with no subject key identifier that the engine cannot check does not
-stop the refusal (vault BACKLOG #4159). Every verifying context the engine builds uses strict
-verification, under which OpenSSL 3 refuses a chain of two or more certificates through such a
-CA, so it cannot make the CRL valid for that chain. At least two cases are left where the start
-refuses a CRL that a handshake could pass. OpenSSL skips its strict checks when the peer presents
-one certificate: a peer whose certificate is such a self-signed CA, listed for the hop, was
-measured to pass a strict handshake judged by a CRL that CA signed. And an OpenSSL build without
-the strict check could take such a CA for the CRL's issuer; the engine sets no OpenSSL version
-floor. A handshake that OpenSSL judges by a CRL the start refuses through a listed CA's chain
-fails with `CRL signature failure`, an error that does not name the file. The refusal names the setting, the
-file and the CRL. Give the setting the CRL that CA signed. No setting turns this check off, as for
+stop the refusal (vault BACKLOG #4159). The verifying contexts the engine builds use strict
+verification, as read from their call sites and measured for at least the outbound one. Under it
+OpenSSL 3 refuses a chain of two or more certificates through such a CA, so it cannot make the
+CRL valid for that chain. At least two cases are left where the start refuses a CRL that a
+handshake could pass. OpenSSL skips its strict checks when the peer presents one certificate: a
+peer whose certificate is such a self-signed CA, listed for the hop, was measured to pass a strict
+handshake judged by a CRL that CA signed. And an OpenSSL build without the strict check could take
+such a CA for the CRL's issuer; the engine sets no OpenSSL version floor. A handshake whose chain
+runs through the named CA, judged by such a CRL, fails with `CRL signature failure`, an error that
+does not name the file. The refusal names the setting, the file and the CRL. Give the setting the CRL that CA signed. No setting turns this check off, as for
 an expired CRL.
 
 The check reads only the file a CRL setting names. A CRL can also reach a hop through its CA file
