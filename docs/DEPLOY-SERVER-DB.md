@@ -827,7 +827,11 @@ It runs the commands of this step. It differs from them in at least the ways nam
   measured: no run planted a same-named module in a Documents folder. The PowerShell it starts
   also gets a `PSModulePath` fixed to the system modules folder, and a `PATH` fixed to the system
   folders. Given that `PSModulePath`, Windows PowerShell 5.1 leaves the Documents folder off its
-  module path (measured 2026-10-26). No command it runs is
+  module path (measured 2026-10-26). The import by path covers the folder's manifest, not every
+  module that manifest names in turn: on one Windows 11 host, read 2026-10-26, `TLS\tls.psd1`
+  names its root module, `Microsoft.WindowsAuthenticationProtocols.Commands`, by name alone, with
+  no file of that name beside it. How PowerShell resolves that name, and whether the fixed
+  `PSModulePath` bounds it, was not read. No command it runs is
   looked up by a bare name, so a program or script of that name on the `PATH`, such as a
   `Join-Path.cmd`, cannot answer either; why, and what was measured, is in the comment on
   `_SUITES_COMMAND` in `messagefoundry/verify/cipher_policy.py`.
