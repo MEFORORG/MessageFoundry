@@ -6345,15 +6345,17 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
     untrusted arm a driver that skipped the pin would still refuse the wrong pin through the chain,
     so only the trusted arm can tell a pin refusal from a chain refusal: there the chain passes, and
     ``strict_wrong`` must still be refused. ``strict_chain`` is strict with no pin, which is a chain
-    check alone. The trusted arm asserts it CONNECTED, because an arm whose chain does not pass
-    proves nothing about the pin. In the untrusted arm it is measured, and is expected REFUSED.
+    check alone. Each arm asserts it: CONNECTED in the trusted arm, because an arm whose chain does
+    not pass proves nothing about the pin, and REFUSED in the untrusted arm, so that arm is not the
+    trusted condition under the wrong name. A refusal is not asserted to be a certificate mismatch;
+    its driver message is in the warning line.
 
     MEASUREMENT, not asserted: the same two pins beside ``Encrypt=yes``, the string the store sent
-    before #2223. In the untrusted arm ``yes_right`` is the control for ``yes_wrong``: if
-    ``yes_right`` is REFUSED, the chain check refused both and ``yes_wrong`` says nothing about the
-    pin. In the trusted arm ``yes_right`` would connect through the chain. On a server that forces
-    strict encryption, though, every ``Encrypt=yes`` login is refused before the certificate matters,
-    so there both read REFUSED and say nothing about the pin. The test is skipped unless
+    before #2223. On a server that does not force strict encryption, ``yes_right`` is the control
+    for ``yes_wrong`` in the untrusted arm: if ``yes_right`` is REFUSED, the chain check refused
+    both and ``yes_wrong`` says nothing about the pin. The CI server forces strict encryption, so
+    there every ``Encrypt=yes`` login is refused before the certificate matters, in both arms, and
+    both readings say nothing about the pin. The test is skipped unless
     ``MEFOR_TEST_SQLSERVER_STRICT=1`` is set on a strict-configured server; where it runs, its
     ``BACKLOG-2223-PIN`` warning line names the arm and carries each outcome, and a refusal carries
     the driver's message."""
@@ -6376,7 +6378,7 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
     wrong.write_bytes(make_self_signed("mf-test-not-the-server", [], 30)[0])
 
     def pinned_dsn(pin: Any) -> str:
-        # CI trusts the container's self-signed certificate through the escape; the pin replaces that.
+        # Verification on, so the pin rides the secure posture and goes out with Encrypt=strict.
         return connection_string(
             base.model_copy(update={"trust_server_certificate": False, "ssl_root_cert": str(pin)})
         )
@@ -6417,12 +6419,19 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
         f"BACKLOG-2223-PIN arm={arm} " + " ".join(f"{k}={v}" for k, v in results.items()),
         stacklevel=1,
     )
+    # The right pin first: if it fails, the server or the login is at fault, and the chain
+    # assertions below would name the wrong cause.
+    assert results["strict_right"] == "CONNECTED", "the right pin was refused: the control failed"
     if trusted:
         assert results["strict_chain"] == "CONNECTED", (
-            "the trusted arm's chain check was refused, so the certificate did not reach the "
-            "driver's trust store and this arm cannot tell a pin refusal from a chain refusal"
+            "the trusted arm's strict login with no pin was refused, so this arm cannot tell a pin "
+            f"refusal from a chain refusal (driver: {results['strict_chain']})"
         )
-    assert results["strict_right"] == "CONNECTED", "the right pin was refused: the control failed"
+    else:
+        assert results["strict_chain"].startswith("REFUSED"), (
+            "the untrusted arm's strict login with no pin connected, so the certificate is already "
+            "trusted through the chain and this arm measured the trusted condition"
+        )
     assert results["strict_wrong"].startswith("REFUSED"), "a pin of another certificate connected"
 
 

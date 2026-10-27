@@ -3523,9 +3523,11 @@ jobs:
       # server, for two reasons. It starts before any step, so a certificate made in a step cannot be
       # mounted into it. And `network.forcestrict = 1` refuses every non-strict login, which every
       # suite above makes. So the leg keeps its service container and starts a SECOND container from
-      # the same digest-pinned image on 127.0.0.1:14330, after the other suites have finished.
+      # the same digest-pinned image on port 14330, after the other suites have finished.
       # 2025 only: Microsoft's mssql-conf page lists network.forcestrict as "Applies to: SQL Server
-      # 2025 (17.x) and later versions", so the 2022 leg stays exactly as it was.
+      # 2025 (17.x) and later versions", so the 2022 leg stays exactly as it was. Because the server
+      # forces strict, every Encrypt=yes login is refused before the certificate matters, so the
+      # test's yes_right and yes_wrong readings say nothing about the pin on this leg.
       - name: Start a strict-encryption SQL Server for the certificate pin test (2025 only)
         if: matrix.label == '2025'
         timeout-minutes: 5
@@ -3536,18 +3538,31 @@ jobs:
           dir="$RUNNER_TEMP/mssql-strict"
           mkdir -p "$dir/tls"
           # A throwaway test certificate: Server Authentication EKU, CN and SAN localhost, valid now.
-          openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 7 \
-            -subj "/CN=localhost" \
-            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
-            -addext "extendedKeyUsage=serverAuth" \
+          # CA:FALSE, so the trusted arm adds a leaf to the runner's store and not an issuer that
+          # could sign for any host. A config file rather than -addext, so no OpenSSL default
+          # section adds a second basicConstraints.
+          printf '%s\n' \
+            '[req]' 'distinguished_name = dn' 'x509_extensions = ext' 'prompt = no' \
+            '[dn]' 'CN = localhost' \
+            '[ext]' 'basicConstraints = critical,CA:FALSE' \
+            'subjectAltName = DNS:localhost,IP:127.0.0.1' 'extendedKeyUsage = serverAuth' \
+            > "$dir/req.cnf"
+          openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 7 -config "$dir/req.cnf" \
             -keyout "$dir/tls/mssql.key" -out "$dir/tls/mssql.pem"
-          openssl x509 -in "$dir/tls/mssql.pem" -noout -subject -dates -ext subjectAltName,extendedKeyUsage
+          openssl x509 -in "$dir/tls/mssql.pem" -noout -subject -dates \
+            -ext basicConstraints,subjectAltName,extendedKeyUsage
+          # The runner's own copy of the certificate, for the readiness login below. The mounted
+          # directory is the mssql account's alone.
+          cp "$dir/tls/mssql.pem" "$dir/server.pem"
+          # The second server's memory is capped, since the service container is still running.
           printf '%s\n' \
             '[network]' \
             'tlscert = /var/opt/mssql/tls/mssql.pem' \
             'tlskey = /var/opt/mssql/tls/mssql.key' \
             'forceencryption = 1' \
-            'forcestrict = 1' > "$dir/mssql.conf"
+            'forcestrict = 1' \
+            '[memory]' \
+            'memorylimitmb = 2048' > "$dir/mssql.conf"
           # Read the account the image runs as rather than assume it, and give it the files: Microsoft
           # requires them readable by mssql. The key is 400.
           uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
@@ -3557,21 +3572,44 @@ jobs:
           sudo chmod 400 "$dir/tls/mssql.key"
           sudo chmod 444 "$dir/tls/mssql.pem"
           sudo chmod 644 "$dir/mssql.conf"
-          docker run -d --name mssql-strict -p 127.0.0.1:14330:1433 \
+          # Published like the service container, so `localhost` reaches it over IPv4 or IPv6.
+          docker run -d --name mssql-strict -p 14330:1433 \
             -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='Str0ng_P@ssw0rd!' \
             -v "$dir/mssql.conf:/var/opt/mssql/mssql.conf" \
             -v "$dir/tls:/var/opt/mssql/tls:ro" \
             "$IMAGE"
 
-      - name: Wait for the strict SQL Server's TLS-first (TDS 8.0) handshake (2025 only)
+      - name: Wait for the strict SQL Server's TLS-first (TDS 8.0) handshake and a strict login (2025 only)
         if: matrix.label == '2025'
         timeout-minutes: 5
-        # Ready means BOTH the server's own ready line and a completed TLS-first handshake on the
-        # listener port, which is what a TDS 8.0 client opens with. Each grep reads a here-string,
-        # never a pipe, so a `grep -q` that stops reading early cannot fail the check.
+        # Ready means three things in order: the server's own ready line, a completed TLS-first
+        # handshake on the listener port (what a TDS 8.0 client opens with), and a strict login
+        # pinning the certificate the step above made. The login is here so a server still settling
+        # its first boot is reported as not ready, not as the pin test's failed control. The loop is
+        # bounded by time, well inside the step cap, so its own diagnostic always prints. Each grep
+        # reads a here-string, never a pipe, so a `grep -q` that stops reading early cannot fail it.
         run: |
+          dir="$RUNNER_TEMP/mssql-strict"
+          cat > "$dir/login-probe.py" <<'PY'
+          import sys
+
+          import pyodbc
+
+          try:
+              pyodbc.connect(
+                  "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,14330;DATABASE=master;"
+                  "UID=sa;PWD={Str0ng_P@ssw0rd!};Encrypt=strict;"
+                  "ServerCertificate={" + sys.argv[1] + "};",
+                  timeout=5,
+              ).close()
+          except pyodbc.Error as exc:
+              print(f"strict login refused: {exc.args[-1] if exc.args else type(exc).__name__}")
+              sys.exit(1)
+          PY
+          stage="the server's ready line"
           out=""
-          for i in $(seq 1 60); do
+          deadline=$((SECONDS + 180))
+          while [ "$SECONDS" -lt "$deadline" ]; do
             state="$(docker inspect -f '{{.State.Status}}' mssql-strict 2>&1 || true)"
             if [ "$state" != "running" ]; then
               docker logs --tail 80 mssql-strict 2>&1
@@ -3579,27 +3617,33 @@ jobs:
               exit 1
             fi
             logs="$(docker logs mssql-strict 2>&1)"
+            # Each probe sits inside an `if`, so the shell's -e does not end the loop on a refusal.
             if grep -q "SQL Server is now ready for client connections" <<<"$logs"; then
-              # Inside the `if`, so the shell's -e does not end the loop on a refused handshake.
-              if out="$(timeout 10 openssl s_client -connect 127.0.0.1:14330 -servername localhost -alpn tds/8.0 </dev/null 2>&1)" \
+              stage="a TLS-first (TDS 8.0) handshake on localhost:14330"
+              if out="$(timeout 5 openssl s_client -connect localhost:14330 -servername localhost -alpn tds/8.0 </dev/null 2>&1)" \
                 && grep -q "BEGIN CERTIFICATE" <<<"$out"; then
-                echo "BACKLOG-3714-STRICT-READY try=${i} $(grep -m1 -E '^(New|Protocol)' <<<"$out") $(grep -m1 'ALPN' <<<"$out")"
-                exit 0
+                handshake="$(grep -m1 -E '^(New|Protocol)' <<<"$out") $(grep -m1 'ALPN' <<<"$out")"
+                stage="a strict login pinning the generated certificate"
+                if out="$(timeout 20 python "$dir/login-probe.py" "$dir/server.pem" 2>&1)"; then
+                  echo "BACKLOG-3714-STRICT-READY after ${SECONDS}s: ${handshake}; strict login CONNECTED"
+                  exit 0
+                fi
               fi
             fi
-            echo "waiting for the strict SQL Server ($i)"; sleep 2
+            echo "waiting for the strict SQL Server: ${stage} (${SECONDS}s)"; sleep 2
           done
           echo "$out"
           docker logs --tail 80 mssql-strict 2>&1
-          echo "::error::no TLS-first (TDS 8.0) handshake on 127.0.0.1:14330 within about 120 s. The strict-mode SQL Server (network.forcestrict = 1, SQL Server 2025 only) is not serving strict encryption, so the certificate pin test cannot run."
+          echo "::error::the strict-mode SQL Server (network.forcestrict = 1, SQL Server 2025 only) was not ready within 180 s; it never passed ${stage}. The last probe's output and the server log are above. The certificate pin test cannot run."
           exit 1
 
       # The two arms run the same test with the same run body; MEFOR_TEST_SQLSERVER_PIN_TRUSTED names
       # the arm. Each step fails unless the test RAN: a skip prints no BACKLOG-2223-PIN line, and a
-      # skipped pin test reads exactly like a passing one.
+      # skipped pin test reads exactly like a passing one. The cap covers the retry wrapper's three
+      # attempts at pytest's 120 s each, so a native-crash retry reports through the wrapper.
       - name: Run the certificate pin test, certificate untrusted (2025 strict server)
         if: matrix.label == '2025'
-        timeout-minutes: 5
+        timeout-minutes: 8
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_TEST_SQLSERVER_STRICT: "1"
@@ -3638,7 +3682,7 @@ jobs:
           sudo update-ca-certificates
           # The runner's own OpenSSL must now verify the presented chain AND host name, or the
           # trusted arm below would be another untrusted arm. The test checks the driver's view too.
-          if ! out="$(timeout 10 openssl s_client -connect 127.0.0.1:14330 -servername localhost -alpn tds/8.0 \
+          if ! out="$(timeout 10 openssl s_client -connect localhost:14330 -servername localhost -alpn tds/8.0 \
             -verify_return_error -verify_hostname localhost </dev/null 2>&1)"; then
             echo "$out"
             echo "::error::the runner's OpenSSL does not trust the strict server's certificate after update-ca-certificates"
@@ -3648,7 +3692,7 @@ jobs:
 
       - name: Run the certificate pin test, certificate trusted (2025 strict server)
         if: matrix.label == '2025'
-        timeout-minutes: 5
+        timeout-minutes: 8
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_TEST_SQLSERVER_STRICT: "1"

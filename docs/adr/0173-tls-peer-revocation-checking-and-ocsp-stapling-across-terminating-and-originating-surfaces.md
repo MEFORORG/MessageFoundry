@@ -1181,8 +1181,11 @@ decisions too:
    (*code*).
 
 The live Linux test of the pin, `test_server_certificate_pin_is_enforced_under_strict_encryption`,
-runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. No CI job sets it, so
-it is skipped in CI and the Linux reading is not yet taken.
+runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. The 2025
+`sqlserver-store` CI leg sets it, against a second container that forces strict encryption, and
+runs the test with the server's certificate untrusted and then trusted (vault BACKLOG #3714). The
+Linux reading comes from that leg's two `BACKLOG-2223-PIN` lines, once a run is read. **CORRECTED 2026-10-27:** this read *"No
+CI job sets it, so it is skipped in CI and the Linux reading is not yet taken."*
 
 The paragraph above is kept as written. Its first sentence, *"`connection_string` emits
 `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`"*, describes the code before this
