@@ -430,7 +430,7 @@ def load_code_set(path: str | Path) -> CodeSet:
 def _require_supported(name: str) -> str:
     """``name``'s suffix in lower case, refused unless it is one the loader parses."""
     suffix = Path(name).suffix.lower()
-    if suffix not in (".csv", ".toml"):
+    if not is_code_set_name(name):
         raise CodeSetError(
             f"code set {name!r}: unsupported extension {suffix!r} (use .csv or .toml)"
         )

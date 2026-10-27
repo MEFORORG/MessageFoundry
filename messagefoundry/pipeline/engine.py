@@ -3078,7 +3078,7 @@ class Engine:
 
     @staticmethod
     def _reload_snapshot_blocking(path: Path) -> ConfigSnapshot | None:
-        from messagefoundry.config.fingerprint import ConfigDirMissing
+        from messagefoundry.config.snapshot import ConfigDirMissing
 
         try:
             return read_trusted_snapshot(path, strict=True)

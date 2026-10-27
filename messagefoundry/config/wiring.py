@@ -8035,7 +8035,7 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
     if not directory.is_dir():
         # ConfigDirMissing, a FileNotFoundError: a reload maps only it to not_found, so a directory
         # moved away after the reload's own check still answers as missing (BACKLOG #3157).
-        from messagefoundry.config.fingerprint import ConfigDirMissing
+        from messagefoundry.config.snapshot import ConfigDirMissing
 
         raise ConfigDirMissing(f"config directory not found: {directory}")
     _assert_safe_config_source(directory)

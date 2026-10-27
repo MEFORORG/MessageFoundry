@@ -94,6 +94,12 @@ def _covered_name(folder: str, name: str) -> bool:
     return Path(name).suffix.lower() == ".toml"
 
 
+def _covered_only(rel: str) -> bool:
+    """Whether ``rel`` (a file, or a folder that could not be listed) is one the fingerprint
+    covers and no load reads."""
+    return rel == _ENVIRONMENTS_DIR or rel.startswith(f"{_ENVIRONMENTS_DIR}/")
+
+
 def _is_module_rel(rel: str) -> bool:
     return "/" not in rel and rel.lower().endswith(".py") and not rel.startswith(".")
 
@@ -161,22 +167,14 @@ class ConfigSnapshot:
     def unreadable_loaded(self) -> tuple[str, ...]:
         """The unreadable entries a load would have read, as against those only the fingerprint
         covers. A load refuses when there is any: it cannot run bytes it does not have."""
-        return tuple(
-            rel
-            for rel in self.unreadable
-            if not rel.startswith(f"{_ENVIRONMENTS_DIR}/") and rel != _ENVIRONMENTS_DIR
-        )
+        return tuple(rel for rel in self.unreadable if not _covered_only(rel))
 
     def loaded(self) -> ConfigSnapshot:
         """This snapshot without the files only the fingerprint covers: what a sandbox worker
         needs to run the same graph, and no more."""
         return ConfigSnapshot(
             directory=self.directory,
-            files={
-                rel: data
-                for rel, data in self.files.items()
-                if not rel.startswith(f"{_ENVIRONMENTS_DIR}/")
-            },
+            files={rel: data for rel, data in self.files.items() if not _covered_only(rel)},
         )
 
 
