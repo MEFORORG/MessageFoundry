@@ -347,7 +347,7 @@ def test_connection_string_emits_server_certificate_on_secure_posture(tmp_path: 
     # The ODBC Driver 18.1+ ServerCertificate keyword pins the cert by file, brace-quoted (STORE-5).
     # Match the standalone keyword (a leading ';') so it isn't confused with TrustServerCertificate.
     assert f";ServerCertificate={{{pin}}}" in dsn
-    # The TLS keywords stay the last-wins tail, and Encrypt=yes appears nowhere in the string.
+    # The TLS keywords stay the tail, and Encrypt=yes appears nowhere in the string.
     assert dsn.rstrip(";").endswith("Encrypt=strict;TrustServerCertificate=no")
     assert "Encrypt=yes" not in dsn
     assert dsn.index(";ServerCertificate=") < dsn.index(";Encrypt=strict")

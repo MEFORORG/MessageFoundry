@@ -8,12 +8,13 @@ tail. Both now call one helper. These tests pin three things:
 * the helper's own output, shape by shape;
 * both builders' strings, byte for byte, as the code before the move built them. The expected
   strings were taken from that code;
-* that no engine module writes the ``}}`` escape or the TLS keywords itself again.
+* that no engine or harness module writes the ``}}`` escape or the TLS keywords itself again.
 """
 
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -31,7 +32,7 @@ from messagefoundry.store.sqlserver import connection_string
 from messagefoundry.transports.database import _build_dsn
 
 _WARN = HopPosture(enforcing=False)
-_ENGINE = Path(__file__).resolve().parents[1] / "messagefoundry"
+_REPO = Path(__file__).resolve().parents[1]
 
 
 # --- the helper ---------------------------------------------------------------------------------
@@ -211,49 +212,75 @@ def test_the_connector_string_is_unchanged(
     assert _build_dsn(settings, read_only=read_only, attested=True) == expected
 
 
+def test_the_harness_string_is_unchanged() -> None:
+    from harness.drivers import _database
+
+    t = _database.Target("db.example", 1433, "har}ness", "u}x", "p;w}d=1")
+    assert _database.build_dsn(t) == (
+        "DRIVER={ODBC Driver 18 for SQL Server};SERVER=db.example,1433;DATABASE={har}}ness};"
+        "APP={messagefoundry-harness};UID={u}}x};PWD={p;w}}d=1};Encrypt=yes;"
+        "TrustServerCertificate=no;"
+    )
+
+
 # --- no second copy ---------------------------------------------------------------------------------
 
 
-#: A string that STARTS with one of these is a connection-string part. Prose that names a keyword
-#: mid-sentence, such as a refusal message, is not.
-_TLS_KEYWORDS = ("Encrypt=", "ServerCertificate=", "TrustServerCertificate=")
+#: A string constant holding a TLS keyword at its start or right after a ``;`` is a connection-string
+#: part. ODBC keywords ignore case, so this does too. Prose that names a keyword mid-sentence, such
+#: as a refusal message, does not match.
+_TLS_PART = re.compile(r"(?:^|;)\s*(?:trustservercertificate|servercertificate|encrypt)\s*=", re.I)
 
 
 def _copies(path: Path) -> list[str]:
     """Where ``path`` writes the ``}}`` escape or a TLS keyword part itself.
 
-    Only a file whose text holds ``}}`` or a keyword name is parsed, which keeps the scan of the
-    whole package fast. A copy spelled with escapes or split literals would pass unseen."""
+    Only a file whose text holds ``}}`` or a keyword name is parsed, which keeps the scan fast. A
+    copy built from escapes or split literals would pass unseen."""
     text = path.read_text(encoding="utf-8")
-    if "}}" not in text and "Encrypt" not in text and "ServerCertificate" not in text:
+    lowered = text.lower()
+    if "}}" not in text and "encrypt" not in lowered and "servercertificate" not in lowered:
         return []
     found: list[str] = []
-    tree = ast.parse(text)
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "replace"
-            and [a.value for a in node.args if isinstance(a, ast.Constant)] == ["}", "}}"]
-        ):
+    for node in ast.walk(ast.parse(text)):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        if node.value == "}}":
             found.append(f"{path.name}:{node.lineno} the }}}} escape")
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and node.value.startswith(_TLS_KEYWORDS)
-        ):
+        elif _TLS_PART.search(node.value):
             found.append(f"{path.name}:{node.lineno} {node.value!r}")
     return found
 
 
-def test_the_helper_is_the_only_engine_module_that_writes_them() -> None:
+def test_the_scan_sees_each_shape_of_copy(tmp_path: Path) -> None:
+    module = tmp_path / "copy.py"
+    module.write_text(
+        'a = v.replace("}", "}}")\n'
+        'b = re.sub("}", "}}", v)\n'
+        'c = "encrypt=no"\n'
+        'd = f"APP={x};Encrypt={e}"\n'
+        'e = "TrustServerCertificate = yes"\n'
+        'f = "a pin sends Encrypt=strict"\n',  # prose: not a part
+        encoding="utf-8",
+    )
+    lines = sorted(int(hit.split()[0].split(":")[1]) for hit in _copies(module))
+    assert lines == [1, 2, 3, 4, 5]
+
+
+def test_the_helper_is_the_only_module_that_writes_them() -> None:
+    """The engine and the harness, which may import this leaf module, build no copy of their own."""
     helper = Path(odbc_dsn.__file__).resolve()
     # POSITIVE CONTROL: the scan finds the helper's own escape and keywords, so a clean verdict
     # elsewhere is not a scan that matches nothing.
     assert len(_copies(helper)) >= 4
-    paths = [p for p in sorted(_ENGINE.rglob("*.py")) if p.resolve() != helper]
-    # The walk reaches the package, at least both callers among the files it reads.
+    paths = [
+        p
+        for tree in ("messagefoundry", "harness")
+        for p in sorted((_REPO / tree).rglob("*.py"))
+        if p.resolve() != helper
+    ]
+    # The walk reaches both trees, and every caller among the files it reads.
     assert len(paths) >= 100
-    assert {"sqlserver.py", "database.py"} <= {p.name for p in paths}
+    assert {"sqlserver.py", "database.py", "_database.py"} <= {p.name for p in paths}
     others = [hit for path in paths for hit in _copies(path)]
     assert others == []

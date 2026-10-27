@@ -2843,8 +2843,8 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
         parts.append("Trusted_Connection=yes")
     elif settings.auth is SqlAuth.ENTRA:
         parts.append("Authentication=ActiveDirectoryDefault")
-    # AOAG multi-subnet fast failover (BACKLOG #100). Not a TLS keyword, so it goes before the
-    # TLS tail and cannot disturb the last-wins TLS posture.
+    # AOAG multi-subnet fast failover (BACKLOG #100). Not a TLS keyword, so it goes in the head,
+    # before the TLS tail (messagefoundry.odbc_dsn).
     if settings.multi_subnet_failover:
         parts.append("MultiSubnetFailover=Yes")
     # Pin the DB server's certificate by file WITHOUT a machine-wide trust import (#45), via the ODBC
