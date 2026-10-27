@@ -109,7 +109,7 @@ import urllib3.poolmanager
 import urllib3.util
 from urllib3.util.ssl_ import resolve_cert_reqs
 
-from messagefoundry.auth.trust_anchors import has_encryption_header
+from messagefoundry.auth.trust_anchors import has_encryption_header, has_private_key_label
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
@@ -305,7 +305,8 @@ def _narrowed_pool_classes(
             uses, ``trust_anchors.has_encryption_header``, and a flagged text is refused. ``bytes``
             are DER, which has no PEM header: measured, the same text as ``bytes`` refused at once.
             Nothing the engine ships sets ``ca_cert_data`` today, since requests and hvac never pass
-            it, so this guards a later caller.
+            it, so this guards a later caller. Text with a private-key label is refused the same
+            way, through ``trust_anchors.has_private_key_label`` (BACKLOG #3745).
 
             **The refusal is a** :class:`VaultHopRefused`, **like the proxy leg's CA load
             refusal in** :meth:`_narrow_the_proxy_leg`. urllib3 does not catch that type, so it
@@ -317,7 +318,9 @@ def _narrowed_pool_classes(
             connected comes out of requests as a ``ProxyError``. The providers would then report a
             type name only.
 
-            **A CA file is not checked, because the load itself refuses it.** ``ca_certs`` is a
+            **A CA file is not checked, because the load itself refuses it.** That holds for the
+            encryption header only: a CA file holding a private key loads, and nothing here
+            refuses it (BACKLOG #3745 covers the CA text alone). ``ca_certs`` is a
             path. Measured, a path load of an encrypted ``CERTIFICATE`` or ``X509 CRL`` block raised
             ``PEM lib`` at once and wrote no prompt. A check here would also open the file twice.
             ``tests/test_encrypted_pem_cafile_pin.py`` holds both measurements, with the versions
@@ -346,6 +349,13 @@ def _narrowed_pool_classes(
                     f"{connector}: the CA text for this hop {_ENCRYPTED_CA_TEXT}. Loading "
                     "an encrypted block can make the TLS library wait for a password; refusing to "
                     "load it (BACKLOG #3090)"
+                )
+            if isinstance(self.ca_cert_data, str) and has_private_key_label(self.ca_cert_data):
+                # BACKLOG #3745: the load would skip a key block, so it is refused here.
+                raise VaultHopRefused(
+                    f"{connector}: the CA text for this hop {_PRIVATE_KEY_CA_TEXT}. CA text is "
+                    "public trust material, so a private key does not belong in it; refusing to "
+                    "load it (BACKLOG #3745)"
                 )
 
         def _refuse_an_unchecked_client_key(self) -> None:
@@ -813,6 +823,12 @@ def _unverifiable_proxy_leg(connector: str) -> str:
 _ENCRYPTED_CA_TEXT = (
     "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
     "its PEM text, even outside a block, as in a comment"
+)
+#: The private-key refusal's twin of ``trust_anchors``'s ``PRIVATE_KEY_SCOPE`` (BACKLOG #3745),
+#: kept as a copy for the reason above and compared exactly by the same test file.
+_PRIVATE_KEY_CA_TEXT = (
+    "names a PEM label ending in PRIVATE KEY somewhere after the first -----BEGIN in its PEM text, "
+    "even outside a block, as in a comment"
 )
 
 

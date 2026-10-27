@@ -2112,8 +2112,10 @@ def _byte_order_mark_before_the_block() -> bytes:
 
 def _encrypted_key_beside_the_certificate() -> bytes:
     """Manager decision: a key block with a legacy encryption header refuses too, though cadata=
-    loads the certificate beside it, since the header is refused in a block of any label. A PKCS#8
-    ENCRYPTED PRIVATE KEY block, or a plain key block, has no such header and is not refused."""
+    loads the certificate beside it, since the header is refused in a block of any label. It is
+    refused by the header check, with that check's text, before the private-key check of BACKLOG
+    #3745 reads it; a PKCS#8 ENCRYPTED PRIVATE KEY block, or a plain key block, has no such header
+    and is refused by that later check instead (the #3745 tests below)."""
     label = b"RSA PRIVATE" + b" KEY"  # split, so the secret scanner does not read a real key
     key = b"-----BEGIN " + label + b"-----\n" + _ENCRYPTED + b"AAAA\n-----END " + label + b"-----\n"
     return _real_ca("crl-test-ca")[0] + key
@@ -2251,6 +2253,131 @@ def test_the_vault_hop_states_the_same_scope() -> None:
         and isinstance(stmt.value, ast.Constant)
     ]
     assert value == ta.ENCRYPTION_HEADER_SCOPE
+
+
+# --- BACKLOG #3745: a private-key block in a trust anchor refuses (a Manager decision) ------------
+#
+# Every label is split in the source and every body is fake, so no committed byte reads as a key.
+
+_PRIVATE = "PRIVATE" + " KEY"
+_KEY_LABELS = [_PRIVATE, "ENCRYPTED " + _PRIVATE, "RSA " + _PRIVATE, "EC " + _PRIVATE]
+_NON_ASCII = b"\xc3\xa9 "  # a UTF-8 e-acute and a space
+
+
+def _key_block(label: str) -> bytes:
+    return f"-----BEGIN {label}-----\nAAAA\n-----END {label}-----\n".encode("ascii")
+
+
+@pytest.mark.parametrize("label", _KEY_LABELS)
+@pytest.mark.parametrize("first", [False, True], ids=["after the certificate", "before it"])
+def test_a_private_key_block_in_an_anchor_refuses(
+    monkeypatch: pytest.MonkeyPatch, label: str, first: bool
+) -> None:
+    """Red with the private-key check removed from anchor_cadata: cadata= skips the key block and
+    loads the certificate beside it. The refusal names the setting and never the content."""
+    cert = _real_ca("crl-test-ca")[0]
+    data = _key_block(label) + cert if first else cert + _key_block(label)
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    with pytest.raises(TrustAnchorError) as err:
+        ta.anchor_cadata(data, spec)
+    text = str(err.value)
+    assert ta.PRIVATE_KEY_SCOPE in text and "[api].tls_client_ca_file" in text
+    assert "AAAA" not in text
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        # OpenSSL finds a BEGIN after 254 bytes of one line, so a line-start check would miss it.
+        pytest.param(
+            lambda: _real_ca("crl-test-ca")[0] + b"#" * 254 + _key_block(_PRIVATE),
+            id="BEGIN after 254 bytes",
+        ),
+        # The check errs wide, as the header check does, and the text says so.
+        pytest.param(
+            lambda: _real_ca("crl-test-ca")[0] + f"# no {_PRIVATE}----- here\n".encode(),
+            id="label in a comment after the last END",
+        ),
+        # A non-ASCII line is dropped from the cadata= text, but the check reads the bytes. Both
+        # the BEGIN and the END line are non-ASCII, so a check of the kept text finds no label.
+        pytest.param(
+            lambda: (
+                _real_ca("crl-test-ca")[0]
+                + _NON_ASCII
+                + _key_block(_PRIVATE).replace(b"-----END", _NON_ASCII + b"-----END")
+            ),
+            id="key on a non-ASCII line",
+        ),
+        pytest.param(lambda: _real_ca("crl-test-ca")[0] + _key_block(_PRIVATE.lower()), id="lower"),
+    ],
+)
+def test_a_private_key_label_refuses_in_the_shapes_a_line_check_misses(
+    monkeypatch: pytest.MonkeyPatch, shape: Any
+) -> None:
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    with pytest.raises(TrustAnchorError) as err:
+        ta.anchor_cadata(shape(), spec)
+    assert ta.PRIVATE_KEY_SCOPE in str(err.value)
+
+
+def test_a_certificate_only_anchor_still_loads() -> None:
+    """The control: two plain certificates, with a key-like word that is not a label above and
+    between them, still load."""
+    data = (
+        b"# the CA, not its PRIVATE KEY\n"
+        + _real_ca("crl-test-ca")[0]
+        + f"# the second CA; its {_PRIVATE} stays with its owner\n".encode()
+        + _real_ca("second-ca")[0]
+    )
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    assert ta.anchor_cadata(data, spec) == data.decode()
+    assert not ta.has_private_key_label(data.decode())
+    assert not ta.has_private_key_label(_key_block(_PRIVATE).decode().replace("-----BEGIN ", ""))
+
+
+async def test_a_cafile_anchor_refuses_a_key_and_still_takes_a_trusted_block(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An anchor whose hop loads cafile= (loads_verified_bytes False) skips the shape check, so a
+    TRUSTED CERTIFICATE block still passes it, but a key block refuses (BACKLOG #3745). Red with
+    the private-key check removed from _preflight_one."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+
+    def spec(body: bytes, name: str) -> AnchorSpec:
+        path = tmp_path / name
+        path.write_bytes(body)
+        return AnchorSpec(
+            "tls_internal_ca", "[tls].internal_ca_file", str(path), loads_verified_bytes=False
+        )
+
+    keyed = spec(_real_ca("crl-test-ca")[0] + _key_block("EC " + _PRIVATE), "keyed.pem")
+    with pytest.raises(TrustAnchorError) as err:
+        await run_anchor_preflight([keyed], store, enforcing=True)
+    assert ta.PRIVATE_KEY_SCOPE in str(err.value) and "[tls].internal_ca_file" in str(err.value)
+    assert "pem_refused" in {r["event"] for r in await _rows(store, "tls_internal_ca")}
+    # The control: the shape check stays off for this anchor.
+    trusted = spec(b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n", "trusted.pem")
+    await run_anchor_preflight([trusted], store, enforcing=True)
+
+
+def test_the_vault_hop_states_the_same_private_key_scope() -> None:
+    """The twin of :func:`test_the_vault_hop_states_the_same_scope` for BACKLOG #3745."""
+    import ast
+
+    import messagefoundry.transports as transports
+
+    source = (Path(transports.__file__).parent / "strict_requests.py").read_text(encoding="utf-8")
+    (value,) = [
+        stmt.value.value
+        for stmt in ast.parse(source).body
+        if isinstance(stmt, ast.Assign)
+        and any(isinstance(n, ast.Name) and n.id == "_PRIVATE_KEY_CA_TEXT" for n in stmt.targets)
+        and isinstance(stmt.value, ast.Constant)
+    ]
+    assert value == ta.PRIVATE_KEY_SCOPE
 
 
 def _ran(returncode: int, stdout: str | None, stderr: str = "") -> Any:

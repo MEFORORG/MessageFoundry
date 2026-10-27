@@ -1126,11 +1126,18 @@ def load_pinned_server_certificate(data: bytes) -> x509.Certificate:
     TLS library to a password prompt. ``cryptography``'s parser does not stop it. Measured with
     cryptography 50.0.2: a valid certificate block carrying the two RFC 1421 headers parses, and so
     does a certificate followed by an encrypted key block. So the text goes through the check
-    ``anchor_cadata`` uses first. The refusal names no part of the file."""
+    ``anchor_cadata`` uses first. The refusal names no part of the file.
+
+    **A file with a private-key label is refused too (BACKLOG #3745).** ``cryptography``'s parser
+    reads the certificate and skips a key block beside it, so a key of any label would sit in a
+    file the engine treats as public trust material. It goes through the check ``anchor_cadata``
+    uses, after the header check."""
     # Lazy: auth.trust_anchors imports far more than this module needs at import time.
     from messagefoundry.auth.trust_anchors import (
         ENCRYPTION_HEADER_SCOPE,
+        PRIVATE_KEY_SCOPE,
         has_encryption_header_bytes,
+        has_private_key_label_bytes,
     )
 
     if has_encryption_header_bytes(data):
@@ -1138,6 +1145,11 @@ def load_pinned_server_certificate(data: bytes) -> x509.Certificate:
             f"it {ENCRYPTION_HEADER_SCOPE}. The ODBC driver loads this file with its own TLS "
             "library, which can wait for a password on an encrypted block; name the server's "
             "certificate without encryption headers"
+        )
+    if has_private_key_label_bytes(data):
+        raise PinRefused(
+            f"it {PRIVATE_KEY_SCOPE}. The pin is the server's public certificate, so a private "
+            "key does not belong in it; name a file holding only that certificate"
         )
     if b"-----BEGIN" in data:
         certs = x509.load_pem_x509_certificates(data)  # ValueError when the file holds none
