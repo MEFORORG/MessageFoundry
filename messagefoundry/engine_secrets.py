@@ -270,9 +270,9 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
     """The secrets directory ``MEFOR_SECRETS_DIRECTORY`` names, checked, or ``None`` when unset.
 
     ``environ`` defaults to this process's environment. Raises :class:`SecretsDirectoryError` when
-    the directory is named and cannot be used: a relative path, a path that is not a directory, a
-    directory a known broad group can read or change, or a file in it whose name is not a setting
-    the directory supplies."""
+    the directory is named and cannot be used: at least a relative path, a path that is not a
+    directory, a link on Windows, a directory a known broad group can read or change, or a file in
+    it whose name is not a setting the directory supplies."""
     environ = os.environ if environ is None else environ
     raw = environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
     if not raw:
@@ -284,11 +284,17 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
             "on the directory the engine starts in"
         )
     what = f"the secrets directory {SECRETS_DIRECTORY_VARIABLE} names"
-    if not path.is_dir():
-        raise SecretsDirectoryError(f"{what} is not a directory, or does not exist")
+    unusable = f"{what} is not a directory, or does not exist"
+    # The order SecretsDirectory._read_file keeps, for the reason its comment gives: only probes that
+    # do not follow a link on the named path itself run before the access check, and they say first
+    # what is missing or a plain file.
+    if not os.path.lexists(path) or path.is_file(follow_symlinks=False):
+        raise SecretsDirectoryError(unusable)
     # The directory first: a group that can add a file to it can supply a setting, whatever the
     # access list of the file it adds.
     _check(path, what, directory=True)
+    if not path.is_dir():  # at least a link to something else, on POSIX
+        raise SecretsDirectoryError(unusable)
     try:
         entries = sorted(os.listdir(path))
     except OSError as exc:
