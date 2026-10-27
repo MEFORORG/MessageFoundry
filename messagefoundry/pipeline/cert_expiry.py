@@ -587,15 +587,15 @@ class _HeldCopyLog:
 
     def unchecked_later_crl(self, cert: MonitoredCert) -> None:
         """Log that a later CRL in ``cert``'s CA file did not parse for the signature check, after
-        an earlier CRL's signature was not confirmed, so the alert says the engine cannot judge the
-        file (BACKLOG #3512). Called inside the ``except``, so the line carries the cause. Folded
+        an earlier CRL's signature was not confirmed, so the scan counts the file as one the
+        engine cannot judge (BACKLOG #3512). The line is logged whether or not an alert is raised. Called inside the ``except``, so the line carries the cause. Folded
         as :meth:`warn` folds."""
         self._log_once(
             cert,
             _UNCHECKED_LATER_CRL,
             "cert_expiry: row %r: could not check the signature of a later CRL in the CA file %s, "
-            "after an earlier CRL's signature was not confirmed, so the alert says the engine "
-            "cannot judge the file.%s",
+            "after an earlier CRL's signature was not confirmed, so the scan counts the file as "
+            "one the engine cannot judge.%s",
             failure="could not log the unchecked CRL of",
             exc_info=True,
         )
@@ -651,6 +651,10 @@ def held_crl_label(path: str) -> str:
 #: either way. Named once, for the remedy that asks for a check and for the guard that catches an
 #: unread later block after one of them (BACKLOG #3512).
 _UNCONFIRMED = frozenset({"unproven", "uncheckable"})
+
+#: The states that give a CA file's CRL no remedy. A state named in neither set, such as one
+#: added to ``pki.CrlSignatureState`` later, leaves the file unjudged rather than passing it.
+_CONFIRMED = frozenset({"verified", "unlisted"})
 
 
 def _ca_file_crl_refusal(
@@ -726,8 +730,8 @@ def _ca_file_crl_refusal(
             # It is caught here only after an unconfirmed block. The unread block could be proven
             # bad, so the file is one the engine cannot judge: replace the CRL before restarting,
             # not the unconfirmed remedy's check. Any other set of states re-raises to the outer
-            # path, so a state not in _UNCONFIRMED is never swallowed (BACKLOG #3512). An error of
-            # another type is not caught here, so it says the scan could not check the file.
+            # path, which leaves the file unjudged too, so no state is swallowed (BACKLOG #3512).
+            # An error of another type is not caught here: it says the scan could not check it.
             if not states & _UNCONFIRMED:
                 raise
             on_unchecked()
@@ -773,6 +777,10 @@ def _ca_file_crl_refusal(
             if ca_file_only
             else f"{check} before restarting: {unconfirmed}",
         )
+    if states - _CONFIRMED:
+        # A state this scan does not name. Main refused every state but these two, so an
+        # unknown one is never a pass (BACKLOG #3512).
+        return unjudged
     return None
 
 

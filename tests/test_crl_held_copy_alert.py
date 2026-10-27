@@ -676,13 +676,25 @@ def test_a_ca_file_crl_from_a_renewed_ca_key_is_unconfirmed_not_failing(
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+#: The lead of the remedy for a CA file the engine cannot judge: replace the CRL first.
+_CANNOT_JUDGE = "Replace the CRL in the CA file with one the engine can judge before restarting"
+
+#: The lead of the remedy for a CA file the scan could not check, which is no verdict on it.
+_SCAN_FAILED = "Check the CRL in the CA file before restarting: the scan"
+
+#: The lead of the remedy for a CRL in a CA file whose signature is proven bad.
+_PROVEN_BAD = "Replace the CRL in the CA file with one its CA signed"
+
+
 @pytest.mark.parametrize(
     ("states", "lead"),
     [
         ({"uncheckable"}, "Check that the CRL in the CA file"),
         ({"unproven", "verified"}, "Check that the CRL in the CA file"),
-        ({"bad", "unproven"}, "Replace the CRL in the CA file with one its CA signed"),
+        ({"bad", "unproven"}, _PROVEN_BAD),
         ({"unlisted", "verified"}, "Restart the engine to apply the CA file"),
+        # A state the scan does not name is never a pass; an earlier draft returned no refusal.
+        ({"not-a-state", "verified"}, _CANNOT_JUDGE),
     ],
 )
 def test_the_ca_file_remedy_follows_the_strongest_signature_state(
@@ -706,15 +718,6 @@ def test_the_ca_file_remedy_follows_the_strongest_signature_state(
 
 #: The start of the line the scan logs when a later CRL in a CA file stops the signature check.
 _LATER_CRL_LINE = "could not check the signature of a later CRL"
-
-#: The lead of the remedy for a CA file the engine cannot judge: replace the CRL first.
-_CANNOT_JUDGE = "Replace the CRL in the CA file with one the engine can judge before restarting"
-
-#: The lead of the remedy for a CA file the scan could not check, which is no verdict on it.
-_SCAN_FAILED = "Check the CRL in the CA file before restarting: the scan"
-
-#: The lead of the remedy for a CRL in a CA file whose signature is proven bad.
-_PROVEN_BAD = "Replace the CRL in the CA file with one its CA signed"
 
 
 def _blocks_then(first: str, error: type[Exception]) -> Any:

@@ -2175,8 +2175,9 @@ not yet in effect, `detail` offers a wait too. The hop's copy of that issuer's C
 the new one takes effect. Then waiting refuses that issuer's peers in between, so replace the CRL
 instead. For a proven bad signature it says what a start says of a CRL setting: a handshake
 OpenSSL judges by that CRL fails. The engine may still be unable to confirm the signature, short
-of that proof. Then `detail` asks you to check the CRL, and claims no failure. The start's WARNING
-cases above say why (BACKLOG #3512). Where only CA files load it, `detail` then says to restart.
+of that proof. Then `detail` asks you to check the CRL, and claims no failure. If a later CRL in
+the file cannot be read for that check, `detail` says to replace the CRL before restarting
+instead. The start's WARNING cases above say why (BACKLOG #3512). Where only CA files load it, `detail` then says to restart.
 Where a CRL setting names it too, as `[store].ssl_crl_file` can, the check comes before the
 restart. A start judges that setting. A hop may still hold a stale copy through a CRL setting.
 Only then does the restart wait for the reload's verdict. So after the CA-file step, `detail` says
