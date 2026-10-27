@@ -100,6 +100,11 @@ _SENDABLE = {
     "quotation-mark": _NAME + '"',
 }
 
+#: Of those, the spellings with punctuation beside the plain name, which an error does not show.
+_PUNCTUATED = frozenset(
+    _SENDABLE[k] for k in ("semicolon", "leading-parenthesis", "quotation-mark")
+)
+
 #: Spellings ``http.client`` refuses before it opens a connection, each with what it raises.
 _UNSENDABLE: dict[str, tuple[str, type[Exception]]] = {
     "leading-space": (" " + _NAME, ValueError),
@@ -673,11 +678,16 @@ def test_a_static_proxy_header_beside_proxy_user_is_refused_at_build_in_any_spel
     """The build-time twin of the send-time rule, for a connection that sets ``proxy_user``. It
     reads the key through the same function, so a spelling one rule refuses the other refuses.
     It used ``str.strip`` of its own, which no test pinned. The error names the key in ``repr``
-    form and never the value."""
+    form and never the value, except that punctuation around the plain name may be part of a
+    credential typed into the key, so a key holding any is named as holding more text."""
     with _WireProxy() as proxy, pytest.raises(ValueError, match="#3443") as raised:
         _rest_with_static_header(name, proxy, proxy_user="u5er", proxy_password="pa55w0rd")
     text = str(raised.value)
-    assert repr(name) in text
+    if name in _PUNCTUATED:
+        assert repr(name) not in text
+        assert "not shown" in text
+    else:
+        assert repr(name) in text
     for part in ("u5er", "pa55w0rd", _VALUE):
         assert part not in text, part
     assert proxy.connections == 0
@@ -1744,18 +1754,39 @@ def test_a_plain_value_is_asked_about_once_an_open_and_only_when_it_could_be_ref
             _NAME + " " + "".join(map(chr, (0x43F, 0x430, 0x440))),
             repr(_NAME + " ") + " followed by more text, not shown",
         ),
-        (_NAME + " ==S3cret", repr(_NAME + " ==") + " followed by more text, not shown"),
+        (_NAME + " ==S3cret", repr(_NAME + " ") + " followed by more text, not shown"),
+        (_NAME + " ~~+/+/Secret", repr(_NAME + " ") + " followed by more text, not shown"),
+        (_NAME + ":~~+/+/Secret", repr(_NAME + ":") + " followed by more text, not shown"),
+        (_NAME + " +/==", repr(_NAME + " ") + " followed by more text, not shown"),
+        (_NAME + "\x00\t", repr(_NAME + "\x00\t")),
+        (_NAME + "\x00;", repr(_NAME + "\x00") + " followed by more text, not shown"),
         (
             "\u043f\u0430 " + _NAME,
             "a key holding Proxy-Authorization after other text, not shown",
         ),
-        ("\x00" * 60 + _NAME, repr("\x00" * 60 + _NAME[:4]) + ", cut at 64 characters,"),
+        ("/== " + _NAME, "a key holding Proxy-Authorization after other text, not shown"),
+        (" " * 60 + _NAME, repr(" " * 60 + _NAME[:4]) + ", cut at 64 characters,"),
     ],
-    ids=["plain", "ends", "tail", "non-ascii-tail", "padding", "letters-before", "long"],
+    ids=[
+        "plain",
+        "ends",
+        "tail",
+        "non-ascii-tail",
+        "padding",
+        "punctuation-then-letters",
+        "colon-then-punctuation",
+        "punctuation-only",
+        "controls",
+        "control-then-punctuation",
+        "letters-before",
+        "punctuation-before",
+        "long",
+    ],
 )
-def test_an_error_shows_no_letter_or_digit_around_the_plain_name(name: str, shown: str) -> None:
-    """A credential typed into the key is made of letters and digits, in any script. None of
-    them is shown, and a cut at the cap is named, so the shown key never reads as whole when
-    it is not."""
+def test_an_error_shows_nothing_but_separators_around_the_plain_name(name: str, shown: str) -> None:
+    """A credential typed into the key may hold letters and digits in any script, and
+    punctuation too: base64 holds ``+``, ``/`` and ``=``. So only whitespace, control
+    characters and colons around the plain name are shown, and a cut at the cap is named, so
+    the shown key never reads as whole when it is not."""
     assert is_proxy_credential_header_name(name)
     assert bounded_read.proxy_credential_header_name_shown(name) == shown

@@ -124,6 +124,7 @@ import http.client
 import logging
 import re
 import socket
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1082,21 +1083,31 @@ def proxy_credential_header_name_shown(name: str) -> str:
     """``name``, which :func:`is_proxy_credential_header_name` accepts, as an error may show it.
 
     Text around the plain name may be a credential typed into the name (vault BACKLOG #3457),
-    so no letter or digit outside the plain name is shown. The name is shown in ``repr`` form
-    from its start, through the plain name, up to the first letter or digit after it, and what
-    follows is named as more text. A name with a letter or digit before the plain name is not
-    shown at all. At most 64 characters are shown, and a cut there is named."""
+    and a credential may hold punctuation as well as letters and digits: base64 holds ``+``,
+    ``/`` and ``=``. So nothing outside the plain name is shown but whitespace, control
+    characters and colons, which a printable credential does not hold and which an operator
+    cannot otherwise see in the key. The name is shown in ``repr`` form from its start, through
+    the plain name, up to the first other character after it, and what follows is named as more
+    text. A name with any other character before the plain name is not shown at all. At most 64
+    characters are shown, and a cut there is named."""
     start = _NON_NAME_RUN.match(name)
     lead = start.end() if start is not None else 0
-    if any(ch.isalnum() for ch in name[:lead]):
+    if not all(map(_is_shown_separator, name[:lead])):
         return "a key holding Proxy-Authorization after other text, not shown"
     cut = lead + len(_PLAIN_NAME)
-    while cut < len(name) and not name[cut].isalnum():
+    while cut < len(name) and _is_shown_separator(name[cut]):
         cut += 1
     shown = repr(name[: min(cut, 64)])
     if cut > 64:
         shown += ", cut at 64 characters,"
     return shown if cut >= len(name) else f"{shown} followed by more text, not shown"
+
+
+def _is_shown_separator(ch: str) -> bool:
+    """Whether an error may show ``ch`` beside the plain name: a colon, or whitespace or a control
+    character (Unicode categories ``Cc``, ``Zs``, ``Zl`` and ``Zp``). No printable credential is
+    made of them (vault BACKLOG #3457)."""
+    return ch == ":" or unicodedata.category(ch) in ("Cc", "Zs", "Zl", "Zp")
 
 
 def _is_spelled_plainly(name: str | bytes) -> bool:
