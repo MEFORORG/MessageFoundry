@@ -51,7 +51,7 @@ import logging
 import os
 import re
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, NamedTuple
@@ -107,7 +107,12 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
 
-__all__ = ["DatabaseDestination", "DatabaseLookupExecutor", "DatabaseSource"]
+__all__ = [
+    "AutocommitNotConfirmed",
+    "DatabaseDestination",
+    "DatabaseLookupExecutor",
+    "DatabaseSource",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -1253,6 +1258,115 @@ def _login_timeout(s: Mapping[str, Any], label: str, *, dialect: str) -> int | N
     return None if dialect == "generic" else value
 
 
+class AutocommitNotConfirmed(RuntimeError):
+    """A connection from an autocommit pool could not be put in autocommit mode (BACKLOG #2148).
+
+    The borrow is refused, and the connection is closed and returned to its pool, so no statement
+    runs on it. The text names neither the DSN nor the connection's server."""
+
+
+async def _confirm_autocommit(conn: Any) -> None:
+    """Set autocommit on ``conn``'s driver connection, then read it back (BACKLOG #2148).
+
+    Follows ``store/sqlserver.py``'s ``_assert_autocommit``, and adds the read-back and the refusal.
+    ``autocommit=True`` at pool creation is not enough on its own: pyodbc sends
+    ``SQL_ATTR_AUTOCOMMIT`` only to turn autocommit OFF, and otherwise trusts the driver's default.
+    Setting it here sends it to the driver every time. A driver that rejects the set raises its own
+    error from the setter.
+
+    The read-back is pyodbc's own record of the mode, which a successful set has just written. So it
+    catches a set that did not take, not a driver that later leaves autocommit by itself. A
+    connection with no driver connection on ``_conn`` (aioodbc 0.5.0's attribute) is refused rather
+    than trusted, because its mode cannot be set. Both driver calls run off the event loop."""
+    raw = getattr(conn, "_conn", None)
+    if raw is None:
+        raise AutocommitNotConfirmed(
+            "DATABASE: a pooled connection exposes no driver connection, so it cannot be put in "
+            "autocommit mode; refusing to run a statement on it"
+        )
+
+    def _set_and_read() -> bool:
+        raw.autocommit = True
+        return bool(raw.autocommit)
+
+    if not await asyncio.to_thread(_set_and_read):
+        raise AutocommitNotConfirmed(
+            "DATABASE: a pooled connection did not keep autocommit mode after it was set; refusing "
+            "to run a statement on it"
+        )
+
+
+async def _discard_connection(pool: Any, conn: Any) -> None:
+    """Close ``conn`` and hand it back to ``pool``, which drops a closed connection rather than
+    reusing it. Never raises: the caller is already raising the reason the connection is discarded."""
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - the caller's refusal is the error that matters
+        logger.debug("DATABASE: closing a refused pooled connection failed: %s", safe_exc(exc))
+    try:
+        await pool.release(conn)
+    except Exception as exc:  # noqa: BLE001 - same
+        logger.debug("DATABASE: returning a refused pooled connection failed: %s", safe_exc(exc))
+
+
+class _ConfirmedAcquire:
+    """What :meth:`_AutocommitPool.acquire` returns: awaitable, like aioodbc's own acquire, and an
+    async context manager that releases on exit, so ``async with pool.acquire()`` keeps working."""
+
+    __slots__ = ("_conn", "_pool")
+
+    def __init__(self, pool: _AutocommitPool) -> None:
+        self._pool = pool
+        self._conn: Any = None
+
+    def __await__(self) -> Generator[Any, None, Any]:
+        return self._pool._acquire_confirmed().__await__()
+
+    async def __aenter__(self) -> Any:
+        self._conn = await self._pool._acquire_confirmed()
+        return self._conn
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        conn, self._conn = self._conn, None
+        await self._pool.release(conn)
+
+
+class _AutocommitPool:
+    """An aioodbc pool whose every borrowed connection has passed :func:`_confirm_autocommit`
+    (BACKLOG #2148). :func:`_make_pool` returns one for ``autocommit=True``, which covers the poll
+    source's mark pool, the ``db_lookup`` pools and the ``DatabaseRef`` sync pool. The check is in the
+    borrow, so a call site cannot skip it, and it runs on every borrow, since nothing in the pool
+    guarantees a connection kept its mode while it sat there. Everything else passes through."""
+
+    def __init__(self, pool: Any) -> None:
+        self._pool = pool
+
+    def acquire(self) -> _ConfirmedAcquire:
+        return _ConfirmedAcquire(self)
+
+    async def _acquire_confirmed(self) -> Any:
+        conn = await self._pool.acquire()
+        try:
+            await _confirm_autocommit(conn)
+        except BaseException:
+            # A cancellation lands here too, and the connection still has to go back.
+            await _discard_connection(self._pool, conn)
+            raise
+        return conn
+
+    async def release(self, conn: Any) -> None:
+        await self._pool.release(conn)
+
+    def close(self) -> None:
+        self._pool.close()
+
+    async def wait_closed(self) -> None:
+        await self._pool.wait_closed()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._pool, name)
+
+
 async def _make_pool(
     dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
 ) -> Any:
@@ -1262,13 +1376,25 @@ async def _make_pool(
 
     ``login_timeout`` is required, and callers take it from :func:`_login_timeout`, so no pool site
     can quietly go without one. aioodbc forwards ``timeout=`` to every ``pyodbc.connect`` the pool
-    makes. ``None``, for the generic dialect, passes nothing and the driver default applies."""
+    makes. ``None``, for the generic dialect, passes nothing and the driver default applies.
+
+    **An ``autocommit=True`` pool is wrapped in :class:`_AutocommitPool`** (BACKLOG #2148), so every
+    connection it hands out has autocommit set and read back first. The suspected cause is mostly
+    closed already, and the set is kept anyway. The suspicion was ODBC driver-manager pooling handing
+    back a physical connection a manual-commit pool had left in that mode, which pyodbc would not
+    correct. :func:`disable_driver_manager_pooling` (BACKLOG #2049) turns that pooling off, so each
+    ``pyodbc.connect`` opens a fresh physical connection, and a fresh ODBC connection starts in
+    autocommit. It comes back only where the driver manager pools by its own configuration
+    (unixODBC's ``Pooling = Yes`` in ``odbcinst.ini``), which the engine cannot switch off. The
+    mechanism was never reproduced, and the set holds whichever way that falls. A manual-commit pool
+    is returned unwrapped: pyodbc sets autocommit OFF itself, explicitly."""
     aioodbc = _import_aioodbc()
     disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
     options: dict[str, Any] = {"minsize": 1, "maxsize": max(1, pool_max), "autocommit": autocommit}
     if login_timeout is not None:
         options["timeout"] = login_timeout
-    return await aioodbc.create_pool(dsn=dsn, **options)
+    pool = await aioodbc.create_pool(dsn=dsn, **options)
+    return _AutocommitPool(pool) if autocommit else pool
 
 
 # WP-L3-07 (ASVS 13.1.2/13.2.6): bound a pooled-connection borrow. One delivery/poll worker per

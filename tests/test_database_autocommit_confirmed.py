@@ -1,0 +1,242 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""Every connection an autocommit DATABASE pool hands out is put in autocommit mode first (BACKLOG
+#2148).
+
+The DATABASE poll source's mark pool, the ``db_lookup`` pool and the ``DatabaseRef`` reference-sync
+pool all ask aioodbc for ``autocommit=True``. pyodbc sends ``SQL_ATTR_AUTOCOMMIT`` only to turn
+autocommit OFF and otherwise trusts the ODBC default, so a physical connection that arrives in
+manual-commit mode keeps it. A source's mark would then run inside an open transaction and roll back
+when the connection closes, and the marked rows would re-ingest.
+
+Each test drives the real ``_make_pool`` against a faked ``aioodbc`` whose connections start with
+``autocommit`` False, and records the mode each statement ran under. Synthetic data only; no driver,
+no database.
+"""
+
+from __future__ import annotations
+
+import sys
+import types
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+
+from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.transports import database
+from messagefoundry.transports.database import (
+    AutocommitNotConfirmed,
+    DatabaseLookupExecutor,
+    DatabaseSource,
+    _acquire,
+    _make_pool,
+)
+
+_SQLSERVER: dict[str, Any] = {"server": "db.example", "database": "d"}
+
+
+class _RawConnection:
+    """The pyodbc connection under an aioodbc one. ``autocommit`` starts False, the state the row
+    says a pooled physical connection could arrive in. ``sticky=False`` models a driver that accepts
+    the set and does not keep it."""
+
+    def __init__(self, *, sticky: bool = True) -> None:
+        self._autocommit = False
+        self._sticky = sticky
+        self.sets: list[bool] = []
+
+    @property
+    def autocommit(self) -> bool:
+        return self._autocommit
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        self.sets.append(value)
+        if self._sticky:
+            self._autocommit = value
+
+
+class _Cursor:
+    def __init__(self, conn: _Connection) -> None:
+        self._conn = conn
+        self.description = [("code",), ("value",)]
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        # What a statement would run under: the driver's mode at the moment it executes.
+        self._conn.executed_under.append(self._conn._conn.autocommit)
+
+    async def fetchall(self) -> list[tuple[Any, ...]]:
+        return [("A", "1")]
+
+    async def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        rows, self._conn.rows_left = self._conn.rows_left[:size], self._conn.rows_left[size:]
+        return rows
+
+    async def close(self) -> None:
+        return None
+
+
+class _Connection:
+    """An aioodbc connection: the driver connection sits on ``_conn``, as in aioodbc 0.5.0."""
+
+    def __init__(self, raw: _RawConnection) -> None:
+        self._conn = raw
+        self.closed = False
+        self.executed_under: list[bool] = []
+        self.rows_left: list[tuple[Any, ...]] = [("A", "1")]
+
+    async def cursor(self) -> _Cursor:
+        return _Cursor(self)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _Pool:
+    def __init__(self, conn: _Connection) -> None:
+        self.conn = conn
+        self.released: list[_Connection] = []
+        self.closed = False
+
+    async def acquire(self) -> _Connection:
+        return self.conn
+
+    async def release(self, conn: _Connection) -> None:
+        self.released.append(conn)
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+class _Driver:
+    """What the faked ``aioodbc.create_pool`` handed out, and with which ``autocommit``."""
+
+    def __init__(self) -> None:
+        self.pools: list[_Pool] = []
+        self.autocommit: list[bool] = []
+        self.sticky = True
+
+
+@pytest.fixture
+def driver(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Driver]:
+    seen = _Driver()
+    module = types.ModuleType("aioodbc")
+
+    async def create_pool(**kwargs: Any) -> _Pool:
+        seen.autocommit.append(kwargs["autocommit"])
+        pool = _Pool(_Connection(_RawConnection(sticky=seen.sticky)))
+        seen.pools.append(pool)
+        return pool
+
+    module.create_pool = create_pool  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "aioodbc", module)
+    monkeypatch.setitem(sys.modules, "pyodbc", None)  # the #2049 guard becomes a no-op
+    yield seen
+
+
+async def test_an_autocommit_pool_sets_autocommit_on_every_connection_it_hands_out(
+    driver: _Driver,
+) -> None:
+    """Red before the fix: the connection reached the caller with autocommit still False."""
+    pool = await _make_pool("DSN=x", 2, autocommit=True, login_timeout=5)
+    conn = await _acquire(pool, 5.0)
+    assert conn._conn.autocommit is True
+    assert conn._conn.sets == [True]
+    await pool.release(conn)
+    # A second borrow of the same physical connection is set again: nothing else in the pool
+    # guarantees the mode held while it sat there.
+    conn = await _acquire(pool, 5.0)
+    assert conn._conn.sets == [True, True]
+    await pool.release(conn)
+    assert driver.pools[0].released == [conn, conn]
+
+
+async def test_the_context_manager_form_is_confirmed_too(driver: _Driver) -> None:
+    """``async with pool.acquire()`` is how the live SQL Server tests borrow from these pools."""
+    pool = await _make_pool("DSN=x", 2, autocommit=True, login_timeout=5)
+    async with pool.acquire() as conn:
+        assert conn._conn.autocommit is True
+    assert driver.pools[0].released == [conn]
+
+
+async def test_a_connection_that_does_not_keep_autocommit_is_refused_and_discarded(
+    driver: _Driver,
+) -> None:
+    """The read-back: a set the driver does not keep refuses the borrow. The connection is closed
+    and returned, so the pool does not hand the same one to the next caller."""
+    driver.sticky = False
+    pool = await _make_pool("DSN=x", 2, autocommit=True, login_timeout=5)
+    with pytest.raises(AutocommitNotConfirmed) as info:
+        await _acquire(pool, 5.0)
+    inner = driver.pools[0]
+    assert inner.conn.closed is True
+    assert inner.released == [inner.conn]
+    assert "DSN" not in str(info.value)  # names no connection detail
+
+
+async def test_a_connection_with_no_driver_handle_is_refused(driver: _Driver) -> None:
+    """Fail closed: a connection whose mode cannot be set is not handed out as autocommit."""
+    pool = await _make_pool("DSN=x", 2, autocommit=True, login_timeout=5)
+    driver.pools[0].conn._conn = None  # type: ignore[assignment]
+    with pytest.raises(AutocommitNotConfirmed):
+        await _acquire(pool, 5.0)
+    assert driver.pools[0].released == [driver.pools[0].conn]
+
+
+async def test_a_manual_commit_pool_is_left_alone(driver: _Driver) -> None:
+    """The DATABASE destination commits itself on an ``autocommit=False`` pool, which pyodbc does
+    set explicitly. That pool is not wrapped, and its connections are not touched."""
+    pool = await _make_pool("DSN=x", 2, autocommit=False, login_timeout=5)
+    assert pool is driver.pools[0]
+    conn = await _acquire(pool, 5.0)
+    assert conn._conn.sets == []
+
+
+async def test_the_poll_source_marks_in_autocommit(driver: _Driver) -> None:
+    source = DatabaseSource(
+        Source(
+            name="IB_DB",
+            type=ConnectorType.DATABASE,
+            settings={
+                **_SQLSERVER,
+                "poll_statement": "SELECT code, value FROM q",
+                "mark_statement": "UPDATE q SET done = 1 WHERE code = :code",
+            },
+        )
+    )
+    batch = await source._select()
+    await source._mark(batch.rows[0][0])
+    assert driver.autocommit == [True]
+    assert driver.pools[0].conn.executed_under == [True, True]  # the poll, then the mark
+    await source.aclose()
+
+
+async def test_a_db_lookup_runs_in_autocommit(driver: _Driver) -> None:
+    executor = DatabaseLookupExecutor(
+        {"clarity": dict(_SQLSERVER)}, egress=EgressSettings(deny_by_default=False)
+    )
+    rows = await executor.query("clarity", "SELECT code, value FROM t", None)
+    assert rows == [{"code": "A", "value": "1"}]
+    assert driver.autocommit == [True]
+    assert driver.pools[0].conn.executed_under == [True]
+    await executor.aclose()
+
+
+async def test_a_reference_sync_runs_in_autocommit(driver: _Driver) -> None:
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    settings = {**_SQLSERVER, "statement": "SELECT code, value FROM t", "key_column": "code"}
+    rows = await _load_database_source(settings, EgressSettings(deny_by_default=False))
+    assert rows == {"A": {"value": "1"}}
+    assert driver.autocommit == [True]
+    assert driver.pools[0].conn.executed_under == [True]
+    assert driver.pools[0].closed is True
+
+
+def test_the_refusal_type_is_exported() -> None:
+    assert database.AutocommitNotConfirmed is AutocommitNotConfirmed
