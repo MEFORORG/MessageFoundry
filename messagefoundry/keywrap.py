@@ -69,12 +69,14 @@ from typing import Final
 __all__ = [
     "PBKDF2_MIN_ITERATIONS",
     "KeyWrapRefused",
+    "MalformedDer",
     "Pkcs12EncryptedPart",
     "key_wrap_refusal",
     "load_checked_cert_chain",
     "load_connection_cert_chain",
     "pkcs12_encrypted_parts",
     "pkcs12_wrap_refusal",
+    "read_der_tlv",
     "refuse_weak_cert_chain_key",
     "refuse_weak_key_file",
     "refuse_weak_key_wrap",
@@ -182,6 +184,12 @@ def _read_tlv(buf: bytes, pos: int, limit: int) -> _Tlv:
     if pos + length > limit:
         raise _Malformed
     return _Tlv(tag, pos, pos + length)
+
+
+#: The DER reader under public names, for :mod:`messagefoundry.pki`'s read of a CA's serial number
+#: (vault BACKLOG #3506). One reader, so the two modules cannot drift apart on what DER they accept.
+MalformedDer = _Malformed
+read_der_tlv = _read_tlv
 
 
 def _children(buf: bytes, tlv: _Tlv) -> list[_Tlv]:

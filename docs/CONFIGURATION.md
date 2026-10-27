@@ -2030,22 +2030,23 @@ three cases warn:
   over SHA-1 that the CA did make.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
-it judged before the failure is proved badly signed, which refuses the file. Where it loads, a CRL
-it judged and could not confirm is named in the WARNING too; one it verified is not. The CRLs after
+it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
+CRLs it judged and could not confirm are reported in the WARNING too, which names the first three
+and counts the rest; one it verified is not reported. The CRLs after
 the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
 engine process logs the WARNING once while the file keeps the same bytes, and the ERROR above
 once too. It keeps that record for one version only, the last one it logged either line for. So
 an earlier version is logged again when it returns after another version that was logged. A
-version in between that logged neither line does not reset the record: one that verified, or one
-refused with no failure in the check. A version refused after the check failed part way did log
+version in between that logged neither line does not reset the record. That includes at least one
+that verified, and one refused with no failure in the check. A version refused after the check failed part way did log
 its ERROR, so it does reset the record. A hop whose CA list
 gives a different result for the same file logs its own line, and each engine shard logs its own. A system
 root the hop has loaded counts as a listed CA, including one whose serial number is not positive,
 as at least some roots carry. So the same proof against a system root's key refuses the start too.
-A CA certificate the engine cannot read at all is the exception: it is skipped, so a CRL it issued
-reads as matched to no listed CA.
+A CA certificate the engine cannot read at all is the exception: it is skipped, as though the hop
+did not list it.
 
 The reload is stricter than a start. Under rule 2 it holds back every CRL it cannot confirm against
 a listed CA. Where the engine matches the CRL to a listed CA and cannot confirm the signature with

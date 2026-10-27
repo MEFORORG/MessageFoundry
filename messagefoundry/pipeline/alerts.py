@@ -164,9 +164,12 @@ def crl_reload_refused_detail(
         "copy they hold."
     ]
     if start_refuses:
+        # "At least" for bad_signature, inside the first 200 characters: the time is no promise
+        # there, and the sentence that says why comes after the cut.
+        until = "at least until" if remedy_class == BAD_SIGNATURE_CLASS else "until"
         parts.append(
-            "A start refuses this file too until its CRL takes effect, so do not restart before "
-            "then."
+            f"A start refuses this file too {until} its CRL takes effect, so do not restart "
+            "before then."
         )
         if remedy_class == BAD_SIGNATURE_CLASS:
             parts.append(f"{BAD_SIGNATURE_AFTER}.")

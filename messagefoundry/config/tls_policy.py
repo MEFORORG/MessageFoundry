@@ -596,8 +596,9 @@ def _check_crl_signatures(
     another that logged one. A judgment that fails for any other reason is logged at ERROR,
     once, and the file loads: this is a diagnosis, and a defect in it must not stop a start. The
     verdicts reached before that failure still count (vault BACKLOG #3506): a CRL already proven
-    bad refuses the file, and the others warn. The CRLs after it are not judged, so a proof
-    there is missed, and none is judged when the failure comes before the first verdict.
+    bad refuses the file, and the others it could not confirm warn. The CRLs after it are not
+    judged, so a proof there is missed, and none is judged when the failure comes before the
+    first verdict.
 
     **Each CRL is judged on its own, as the expired-CRL refusal judges them.** So a badly signed
     copy refuses the file even beside a newer, good CRL from the same issuer, which OpenSSL
@@ -623,7 +624,7 @@ def _check_crl_signatures(
         # Not a verdict on the file, and not proof: the judgment itself failed. Broad on purpose.
         # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
         # that with exception types of its own. The handshake still checks every signature. The
-        # verdicts already reached are used below: a proof refuses, and the rest warn.
+        # verdicts already reached are used below: a proof refuses, and the unconfirmed warn.
         if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(exc).__name__)):
             logger.error(
                 "%s: the engine could not check the signatures of the CRL(s) in this file at "

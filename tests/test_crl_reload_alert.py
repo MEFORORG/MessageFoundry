@@ -336,20 +336,23 @@ async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_ref
     assert BAD_SIGNATURE_AFTER in outcome.refusal.reason
     assert outcome.start_refuses
     (payload,) = sink.refused()
-    assert payload["remedy_class"] == "bad_signature" and payload["start_refuses"] is True
-    assert payload["remedy_class"] == BAD_SIGNATURE_CLASS
+    assert payload["remedy_class"] == BAD_SIGNATURE_CLASS and payload["start_refuses"] is True
+    # The detail a notifier builds from what the alert carried.
     detail = crl_reload_refused_detail(
-        remedy_class=BAD_SIGNATURE_CLASS, stale_contexts=1, remedy=BAD_SIGNATURE, start_refuses=True
+        remedy_class=payload["remedy_class"],
+        stale_contexts=payload["stale_contexts"],
+        remedy=payload["remedy"],
+        start_refuses=payload["start_refuses"],
     )
     assert f"do not restart before then. {BAD_SIGNATURE_AFTER}." in detail
-    assert BAD_SIGNATURE_AFTER.startswith(
-        "After then too, a start refuses the file where it proves"
-    )
+    # The alert list keeps about the first 200 characters; the hedge must be inside them.
+    assert "at least until its CRL takes effect, so do not restart before then." in detail[:200]
     # Control: a restart remedy keeps the plain caveat, with no such sentence.
     plain = crl_reload_refused_detail(
         remedy_class="restart", stale_contexts=1, remedy=RESTART, start_refuses=True
     )
-    assert "do not restart before then" in plain and "After then too" not in plain
+    assert "too until its CRL takes effect, so do not restart before then" in plain
+    assert "at least" not in plain and BAD_SIGNATURE_AFTER not in plain
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
     # Control: the same forgery in effect carries no such caveat.
@@ -360,6 +363,7 @@ async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_ref
     assert in_effect.refusal is not None and in_effect.refusal.remedy == BAD_SIGNATURE
     assert not in_effect.start_refuses
     assert "a start until then refuses" not in in_effect.refusal.reason
+    assert BAD_SIGNATURE_AFTER not in in_effect.refusal.reason
 
 
 def test_every_remedy_has_its_own_class_token() -> None:

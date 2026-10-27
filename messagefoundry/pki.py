@@ -35,10 +35,10 @@ from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.keywrap import (
+    MalformedDer,
     Pkcs12EncryptedPart,
-    _Malformed,
-    _read_tlv,
     pkcs12_encrypted_parts,
+    read_der_tlv,
     refuse_weak_pkcs12,
     refuse_weak_pkcs12_contents,
 )
@@ -527,21 +527,19 @@ def _listed_ca(der: bytes) -> _ListedCa:
     bytes are unchanged. A serial that is not minimally encoded is left as it is, so the parse
     refuses it as before. ``cryptography`` says it will refuse such a serial outright in a later
     release; this reads the CA all the same."""
-    serial: int | None = None
-    if (span := _der_serial_span(der)) is not None:
-        start, end = span
-        content = der[start:end]
-        # Zero, or negative and minimally encoded: a non-minimal one is left for the parse to refuse.
-        if content == b"\x00" or (
-            content[0] >= 0x80
-            and not (content[0] == 0xFF and len(content) > 1 and content[1] >= 0x80)
-        ):
-            serial = int.from_bytes(content, "big", signed=True)
-            der = der[:start] + b"\x01" + der[start + 1 :]
+    span = _der_serial_span(der)
+    if span is None:  # not that shape: the parse judges it, and reads its serial
+        ca = x509.load_der_x509_certificate(der)
+        return _ListedCa(_issuer_name_key(ca.subject), ca, ca.serial_number)
+    start, end = span
+    content = der[start:end]
+    # Zero, or negative and minimally encoded: a non-minimal one is left for the parse to refuse.
+    if content == b"\x00" or (
+        content[0] >= 0x80 and not (content[0] == 0xFF and len(content) > 1 and content[1] >= 0x80)
+    ):
+        der = der[:start] + b"\x01" + der[start + 1 :]
     ca = x509.load_der_x509_certificate(der)
-    return _ListedCa(
-        _issuer_name_key(ca.subject), ca, ca.serial_number if serial is None else serial
-    )
+    return _ListedCa(_issuer_name_key(ca.subject), ca, int.from_bytes(content, "big", signed=True))
 
 
 def _der_serial_span(der: bytes) -> tuple[int, int] | None:
@@ -550,12 +548,12 @@ def _der_serial_span(der: bytes) -> tuple[int, int] | None:
     first element, the TBSCertificate, is a SEQUENCE that starts with an optional explicit
     version, tag ``[0]``, and then the serial, an INTEGER."""
     try:
-        certificate = _read_tlv(der, 0, len(der))
-        tbs = _read_tlv(der, certificate.start, certificate.end)
-        element = _read_tlv(der, tbs.start, tbs.end)
+        certificate = read_der_tlv(der, 0, len(der))
+        tbs = read_der_tlv(der, certificate.start, certificate.end)
+        element = read_der_tlv(der, tbs.start, tbs.end)
         if element.tag == 0xA0:
-            element = _read_tlv(der, element.end, tbs.end)
-    except _Malformed:
+            element = read_der_tlv(der, element.end, tbs.end)
+    except MalformedDer:
         return None
     if (certificate.tag, tbs.tag, element.tag) != (
         0x30,
