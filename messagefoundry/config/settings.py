@@ -6184,9 +6184,10 @@ class SecretRotationSettings(_Section):
     engine persists a non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and
     watches the DEK off it, so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
     **override**, not a prerequisite. The connector/AD/SMTP/Vault/OIDC credentials the engine holds are
-    tracked too — each is fingerprinted with a DEK-derived keyed MAC into store meta and its clock reset
-    when the fingerprint changes (rotation auto-detected). The broader ``SecretProvider`` generalization
-    (a pluggable secret backend) remains a design-only follow-on (ADR 0019 §5)."""
+    tracked too — each is fingerprinted with a keyed MAC sealed as a store-cipher cell (BACKLOG #3472)
+    and its clock reset when the secret no longer matches it (rotation auto-detected). The broader
+    ``SecretProvider`` generalization (a pluggable secret backend) remains a design-only follow-on
+    (ADR 0019 §5)."""
 
     warn_days: int = (
         14  # alert this many days before a secret is due for rotation (0 = reminder off)

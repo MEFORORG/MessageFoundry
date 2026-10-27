@@ -1725,7 +1725,7 @@ def connector_secret_env_values(
     """The per-Connection ``env()``-sourced credential VALUES the wired graph references right now, keyed
     by their environment-value key (a NON-SECRET identifier) — the input to the ASVS-13.3.4 rotation
     watcher's ``extra_values`` (``pipeline/secret_rotation.reconcile_rotation_meta``), which fingerprints
-    each with the DEK-derived keyed MAC so a per-Connection connector credential is monitored for rotation
+    each with the sealed keyed MAC so a per-Connection connector credential is monitored for rotation
     exactly like the fixed ``MEFOR_*`` classes.
 
     A setting is included when its key is a **rotatable** credential — recognised by

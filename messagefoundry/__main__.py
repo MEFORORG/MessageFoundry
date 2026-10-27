@@ -2160,6 +2160,7 @@ def _start_logging(
     enforcing: bool,
     spool_dir: str,
     configure: Callable[[SyslogForward | None], bool],
+    deferred_ca_refusals: list[TrustAnchorError] | None = None,
 ) -> int | None:
     """Pass the off-box forwarding gates, then install this process's log handlers.
 
@@ -2168,7 +2169,10 @@ def _start_logging(
     refusal. It does not hold every gate that guards the collector: at least the static-credential
     and open-egress gates run in each caller before it, so a new one must be given to both.
     ``spool_dir`` is this process's own spool directory (:func:`_forward_spool_dir`); the spool
-    locks it.
+    locks it. The last gate checks the collector's CA as a trust anchor (BACKLOG #3470). A caller
+    that passes ``deferred_ca_refusals`` takes that refusal itself: it is appended there, and
+    logging is configured without the forwarder. ``serve`` does, so its audited preflight refuses
+    the start, with a row when it can read the file.
 
     ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
     passed (``None`` with no collector). It stays at the call site because level, format and the
@@ -2317,6 +2321,38 @@ def _start_logging(
             )
             return 2
 
+    # BACKLOG #3470: the collector's CA takes the trust-anchor checks before the forwarder loads
+    # it. In `serve` the audited preflight runs only in the API lifespan, after the forwarder has
+    # sent; `supervise` runs none. trust_anchors module item 10 says what a refusal does.
+    from messagefoundry.auth.trust_anchors import anchor_refusal, log_forward_anchor_spec
+
+    _forward_ca = log_forward_anchor_spec(settings.logging)
+    # Under `warn` the check warns rather than refuses. Its text quotes a configured path, so it is
+    # taken here and printed scrubbed, as the #2375 gate notes above are: no handler is installed
+    # yet, so a logged warning would reach bare stderr with any newline in the path intact.
+    _ca_notes: list[str] = []
+    _ca_refusal = (
+        anchor_refusal(_forward_ca, enforcing=enforcing, warn=_ca_notes.append)
+        if _forward_ca is not None
+        else None
+    )
+    for _ca_note in _ca_notes:
+        print(f"warning: {scrub_control_chars(_ca_note)}", file=sys.stderr)
+    if _ca_refusal is not None:
+        if deferred_ca_refusals is None:
+            # `supervise`: its process has no audited preflight, so it refuses here, before any
+            # engine shard spawns. Scrubbed: the refusal quotes a configured path, and a newline
+            # in it must not forge a line.
+            print(
+                f"error: {scrub_control_chars(str(_ca_refusal))}\nThe start is refused before the "
+                "log forwarder is built, so no record reached the collector.",
+                file=sys.stderr,
+            )
+            return 2
+        # `serve`: no forwarder, and the caller hands the refusal to its audited preflight.
+        deferred_ca_refusals.append(_ca_refusal)
+        log_forward = None
+
     try:
         forwarder_live = configure(log_forward)
     except OSError as exc:
@@ -2354,6 +2390,18 @@ def _start_logging(
     # handlers too. Each caller logs its #1989 static-credential lines next, for the same reason.
     for _gate_note in _gate_notes:
         logging.getLogger(__name__).warning("%s", _gate_note)
+    if deferred_ca_refusals is None:
+        # `supervise` only: its forwarder is up now, so the collector gets the record that this
+        # CA was trusted under `warn`. `serve`'s audited preflight logs the same warning again.
+        for _ca_note in _ca_notes:
+            logging.getLogger(__name__).warning("%s", _ca_note)
+    if _ca_refusal is not None:
+        logging.getLogger(__name__).warning(
+            "off-box log forwarding is off: the collector's CA was refused (%s). The start check "
+            "refuses the start once the store is open. trust_anchors module item 10 says when "
+            "that refusal has an audit row.",
+            _ca_refusal,
+        )
     if forwarder_live and log_forward is not None:
         # Only announce forwarding when configure_logging actually installed the handler. With the
         # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
@@ -2925,6 +2973,10 @@ def _serve(args: argparse.Namespace) -> int:
         if settings.logging.file is not None
         else None
     )
+    # BACKLOG #3470: a refused collector CA does not stop the start here. The forwarder is not
+    # built, and the API lifespan's audited preflight refuses the start. It writes its audit row
+    # when it can read the file.
+    _forward_ca_refusals: list[TrustAnchorError] = []
     _logging_refused = _start_logging(
         settings,
         env_name=env_name,
@@ -2937,6 +2989,7 @@ def _serve(args: argparse.Namespace) -> int:
             log_file=_log_file,
             stop_on_write_failure=settings.logging.on_write_failure is LogWriteFailurePolicy.STOP,
         ),
+        deferred_ca_refusals=_forward_ca_refusals,
     )
     if _logging_refused is not None:
         return _logging_refused
@@ -4767,6 +4820,8 @@ def _serve(args: argparse.Namespace) -> int:
             log_settings=settings.logging,
         ),
         trust_anchors_enforcing=enforcing,
+        # BACKLOG #3470: the collector CA `_start_logging` refused, for the lifespan to refuse on.
+        prestore_anchor_refusals=tuple(_forward_ca_refusals),
     )
     # log_config=None: uvicorn's loggers propagate to the handler configure_logging installed,
     # so everything shares one format/stream (and one log file under NSSM).
@@ -7594,7 +7649,8 @@ def _offline_security_notifier(
     **ANY failure to build the channel is WARNED and yields ``None`` rather than refusing.** This
     serves a recovery command, and losing the notice is the smaller harm than losing the recovery. A
     build error escaping here would also land after the store was created, leaving no administrator.
-    The audit row then records that no channel was wired.
+    The audit row then records that no channel was wired. That covers a relay CA the trust-anchor
+    checks refuse (BACKLOG #3470): the CA is never loaded, and the notice is dropped.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
     from messagefoundry.pipeline.security_notify import security_notifier_from_settings
@@ -7620,6 +7676,22 @@ def _offline_security_notifier(
             file=sys.stderr,
         )
     try:
+        # BACKLOG #3470: the relay's CA takes the trust-anchor checks `serve` gives it. A refusal
+        # drops the notice, as any other failure here does; the recovery itself goes on.
+        from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
+        from messagefoundry.config.settings import SecurityEnforcement
+        from messagefoundry.controlchars import scrub_control_chars
+
+        relay_ca = smtp_hop_anchor_spec(alerts, settings.auth, settings.tls)
+        enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+        if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
+            # The refusal's text is written for a start. This command does not stop on it.
+            print(
+                f"WARNING: {scrub_control_chars(str(refusal))}\nThis command goes on, but it "
+                "sends no security notice over that relay.",
+                file=sys.stderr,
+            )
+            return None
         return security_notifier_from_settings(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
@@ -9353,8 +9425,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     Run **offline** (engine stopped): set ``MEFOR_STORE_ENCRYPTION_KEY`` to the NEW active key and keep
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
-    rotate. After it finishes and the engine has started once, the retired key can be removed; that
-    start re-keys the secret-rotation fingerprints (BACKLOG #2242).
+    rotate. After it finishes the retired key can be removed. The store pass re-seals the
+    secret-rotation fingerprint cells too, so no engine start needs the retired key to read them
+    (BACKLOG #3472, ADR 0213).
 
     **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
     a store another connection holds, which is how a serving engine holds it; see

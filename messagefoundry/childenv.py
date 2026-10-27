@@ -8,10 +8,11 @@ connection secret arrive as ``MEFOR_*`` variables. So each spawn site names what
 through one of the builders here, and ``tests/test_child_process_environment.py`` fails a
 process start whose environment does not come from one of them.
 
-* :func:`system_tool_environment` is the platform's start-up names and **nothing else**, for a
-  fixed operating-system tool the engine runs by its absolute path, such as ``icacls`` or ``sc``
-  (vault BACKLOG #2716). Such a tool reads no engine setting, so it gets no ``MEFOR_*`` variable,
-  no interpreter variable and nothing an operator added.
+* :func:`system_tool_environment` is the platform's start-up names, for a fixed
+  operating-system tool the engine runs by its absolute path, such as ``icacls`` or ``sc``
+  (vault BACKLOG #2716), and for ``openssl``. Such a tool reads no engine setting, so it gets no
+  ``MEFOR_*`` variable and no interpreter variable. A caller may add only the tool's own
+  variables, by name, and fixed values that replace inherited ones (BACKLOG #3803).
 
 * :func:`worker_environment` is an **allowlist**, for a child that runs code the engine does not
   fully trust (the sandbox worker). It carries what the platform and the interpreter need to start,
@@ -380,24 +381,53 @@ def worker_environment(
     )
     present = {_key(name) for name in env}
     for name, value in (defaults or {}).items():
-        if not outside_engine_namespace(name):
-            raise ValueError(f"defaults may not name the engine's own variable {name!r}")
-        if _key(name) in _INTERPRETER_NAMES:
-            # The worker's import path is the inherited one, filtered above, and nothing else.
-            raise ValueError(f"defaults may not set the interpreter's variable {name!r}")
-        if _key(name) not in present:
+        # Refuses an engine or interpreter name: the worker's import path is the inherited one,
+        # filtered above, and nothing else.
+        key = _ordinary_key(name, "defaults")
+        if key not in present:
             env[name] = value
     return env
 
 
-def system_tool_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment for a fixed operating-system tool: the platform's start-up names only.
+def _ordinary_key(name: str, argument: str) -> str:
+    """``name`` as :func:`_key` compares it. A name of the engine's namespace or of the
+    interpreter is refused, since a value a builder sets for it would bypass that builder's own
+    filter. ``argument`` names the caller's argument in the refusal."""
+    if not outside_engine_namespace(name):
+        raise ValueError(f"{argument} may not name the engine's own variable {name!r}")
+    if _key(name) in _INTERPRETER_NAMES:
+        raise ValueError(f"{argument} may not name the interpreter's variable {name!r}")
+    return _key(name)
 
-    For a tool the engine runs by its absolute path, with an argument list and no shell, that
-    reads none of the engine's settings: ``icacls`` and ``sc`` (vault BACKLOG #2716). It gets what
-    the platform needs to start a process and find its temp and profile directories, and nothing
-    else. No interpreter variable crosses, because the tool is not Python."""
-    return {n: v for n, v in _source(environ).items() if _key(n) in _platform_names()}
+
+def system_tool_environment(
+    environ: Mapping[str, str] | None = None,
+    *,
+    extra_names: Collection[str] = (),
+    pinned: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The environment for a fixed operating-system tool: the platform's start-up names, plus
+    what ``extra_names`` and ``pinned`` add.
+
+    For a tool the engine runs with an argument list and no shell, that reads none of the
+    engine's settings: ``icacls`` and ``sc`` by their absolute paths (vault BACKLOG #2716), and
+    ``openssl``, which ``verify`` finds on ``PATH`` as the manual check does. It gets what the
+    platform needs to start a process and find its temp and profile directories, and nothing
+    else. No interpreter variable crosses, because the tool is not Python.
+
+    ``extra_names`` are the tool's own variables, which cross as ``environ`` holds them: the
+    ``OPENSSL_*`` names for ``openssl`` (BACKLOG #3803 item 5). ``pinned`` are fixed values that
+    replace whatever ``environ`` holds under the same name, such as the ``PATH`` and
+    ``PSModulePath`` of the cipher probe's PowerShell (BACKLOG #3803 S1). Both are set here, not on
+    the returned dict, for the reason :func:`worker_environment` gives for ``defaults``. Neither may
+    name a variable of the engine's namespace or of the interpreter."""
+    if isinstance(extra_names, str):
+        # A bare string is a collection of its characters, so no name would cross.
+        raise TypeError("extra_names takes a collection of names, not one string")
+    pins = pinned or {}
+    allowed = _platform_names() | {_ordinary_key(name, "extra_names") for name in extra_names}
+    allowed -= {_ordinary_key(name, "pinned") for name in pins}
+    return {**{n: v for n, v in _source(environ).items() if _key(n) in allowed}, **pins}
 
 
 def hook_environment(
