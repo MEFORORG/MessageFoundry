@@ -615,10 +615,13 @@ def _mllp_ssl_context(
     API listener's ``MEFOR_API_TLS_KEY_PASSWORD``); ``None`` (the default) loads an unencrypted key
     exactly as before.
 
-    ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
-    refuse_an_unread_ca_pin(
-        s, inbound=server, connector="MLLP listener" if server else "MLLP destination"
-    )
+    ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142),
+    and for the TLS refusal labels below, as the DICOM destination's do (vault BACKLOG #3514)."""
+    # Name the connection when the caller passed one, as the runner does, so an operator with several
+    # MLLP connections knows which one to fix. A direct build with no name keeps the bare family label.
+    family = "MLLP listener" if server else "MLLP destination"
+    connector = f"{family} {name!r}" if name else family
+    refuse_an_unread_ca_pin(s, inbound=server, connector=connector)
     if not s.get("tls"):
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
@@ -653,8 +656,8 @@ def _mllp_ssl_context(
         # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
         # apply_connection_tls_ciphers. Unset (the default) narrows to the approved AEAD suites
         # (BACKLOG #300, the ADR 0188 amendment); set, to the operator's validated string.
-        apply_connection_tls_ciphers(ctx, s, connector="MLLP listener")  # opt-in per-hop suite list
-        harden_cipher_suites(ctx, connector="MLLP listener")  # assert forward secrecy (ASVS 12.1.2)
+        apply_connection_tls_ciphers(ctx, s, connector=connector)  # opt-in per-hop suite list
+        harden_cipher_suites(ctx, connector=connector)  # assert forward secrecy (ASVS 12.1.2)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
         return ctx
     # Outbound (client): verify the server cert unless explicitly — and loudly — disabled. #200 (ADR
@@ -704,8 +707,8 @@ def _mllp_ssl_context(
     # See the listener above: narrow first (ADR 0188), assert second, both visible here. The pair runs
     # on the tls_verify=false path too -- a hop that skips certificate verification still negotiates a
     # suite, and an operator who narrowed this connection meant that hop as much as any other.
-    apply_connection_tls_ciphers(ctx, s, connector="MLLP destination")  # opt-in per-hop suite list
-    harden_cipher_suites(ctx, connector="MLLP destination")  # assert forward secrecy (ASVS 12.1.2)
+    apply_connection_tls_ciphers(ctx, s, connector=connector)  # opt-in per-hop suite list
+    harden_cipher_suites(ctx, connector=connector)  # assert forward secrecy (ASVS 12.1.2)
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
         # #129 (ADR 0094): granular expiry-only relaxation — honour a partner cert whose notAfter has

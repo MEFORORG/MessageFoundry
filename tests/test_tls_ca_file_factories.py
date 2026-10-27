@@ -61,11 +61,12 @@ from messagefoundry.pipeline.wiring_runner import (
     _fhir_lookup_settings,
     _source_config,
 )
-from messagefoundry.transports import dicom, rest
+from messagefoundry.transports import dicom, mllp, rest
 from messagefoundry.transports.base import build_destination, build_source
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_auth import bearer_provider_from_settings
 from messagefoundry.transports.remotefile import _ftps_ssl_context
+from tests.test_connection_tls_ciphers import _self_signed
 from tests.test_tls_trust_anchor import _ca_pem, _ca_subjects, _smart_settings, _token_opener
 
 # The four destination factories, each with the least a real config would pass. The CA is the only
@@ -460,6 +461,60 @@ def test_a_dicom_suite_refusal_names_the_connection() -> None:
     with pytest.raises(ValueError) as unnamed:
         dicom._client_ssl_context(dict(spec.settings), trust_anchor_policy=TrustAnchorPolicy())
     assert str(unnamed.value).startswith("DICOM destination: tls_ciphers rejected")
+
+
+@pytest.mark.parametrize("inbound", [False, True], ids=["destination", "listener"])
+def test_an_mllp_suite_refusal_names_the_connection(inbound: bool, tmp_path: Path) -> None:
+    """Vault BACKLOG #3514 item 1, the MLLP twin of the DICOM test above. Built the way the runner
+    builds each direction, a refused ``tls_ciphers`` names the connection to fix. The control is a
+    direct build with no name, which keeps the bare family label."""
+    cert, key = _self_signed(tmp_path)
+    egress = EgressSettings(deny_by_default=False)
+    if inbound:
+        family, name = "MLLP listener", "IB_MLLP"
+        spec = MLLP(
+            port=2575,
+            tls=True,
+            tls_cert_file=str(cert),
+            tls_key_file=str(key),
+            tls_ciphers="NULL-SHA256",
+        )
+        with pytest.raises(ValueError) as caught:
+            build_source(
+                _source_config(
+                    build_inbound_connection(name, spec, router="r"),
+                    "127.0.0.1",
+                    {},
+                    TrustAnchorPolicy(),
+                ),
+                egress=egress,
+            )
+    else:
+        family, name = "MLLP destination", "OB_MLLP"
+        spec = MLLP(
+            host="mllp.internal.example.org", port=2575, tls=True, tls_ciphers="NULL-SHA256"
+        )
+        config = _dest_config(
+            build_outbound_connection(name, spec),
+            {},
+            trust_anchor_policy=TrustAnchorPolicy(),
+            egress=egress,
+        )
+        with pytest.raises(ValueError) as caught:
+            build_destination(config, egress=egress)
+    message = str(caught.value)
+    assert message.startswith(f"{family} '{name}': tls_ciphers rejected"), message
+    with pytest.raises(ValueError) as unnamed:
+        mllp._mllp_ssl_context(dict(spec.settings), server=inbound)
+    assert str(unnamed.value).startswith(f"{family}: tls_ciphers rejected"), str(unnamed.value)
+
+
+def test_an_unread_mllp_ca_pin_refusal_names_the_connection() -> None:
+    """Vault BACKLOG #3514 item 1. The ``tls_ca_pin`` refusal shares the label, so it names the
+    connection too. A pin with no ``tls_ca_file`` is the shape nothing would check."""
+    settings = {"tls": True, "host": "mllp.internal.example.org", "tls_ca_pin": "ab" * 32}
+    with pytest.raises(ValueError, match=r"^MLLP destination 'OB_MLLP': tls_ca_pin is set"):
+        mllp._mllp_ssl_context(settings, server=False, name="OB_MLLP")
 
 
 def test_the_token_hop_reads_the_factory_ca_even_with_verify_tls_off(tmp_path: Path) -> None:
