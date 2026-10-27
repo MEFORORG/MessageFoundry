@@ -638,7 +638,8 @@ def test_soap_ws_username_cleartext_refused_whatever_the_declaration(
 #
 # Owner ruling 2026-10-26: a credential is refused across an off-box cleartext hop that
 # tls_hop_attested or cleartext_accepted would otherwise let through, and the credential test
-# counts what the verify_tls=false rule counts, header names in any case.
+# counts the credentials the verify_tls=false rule counts, header names in any case. It does not
+# take that rule's name allowlist: the ruling names credentials only.
 
 #: Each a credential the cleartext rule must count. The last three are static headers the old
 #: test, which keyed on the exact name ``Authorization``, did not see.
@@ -646,7 +647,7 @@ _ITEM4_CREDENTIALS: dict[str, dict[str, Any]] = {
     "bearer token": {"bearer_token": "synthetic-token"},
     "lower-case authorization header": {"headers": {"authorization": "Bearer synthetic-token"}},
     "api-key header": {"headers": {"X-Api-Key": "synthetic-key"}},
-    "neutral header name": {"headers": {"X-Session": "s1"}},
+    "credential value under a neutral name": {"headers": {"X-Session": "Bearer synthetic-token"}},
 }
 
 
@@ -668,19 +669,67 @@ def test_a_declared_cleartext_hop_refuses_every_credential(
     assert "synthetic" not in str(exc.value)
 
 
+@pytest.mark.parametrize("cell", _CELLS)
 @pytest.mark.parametrize("declared", ["attested", "accepted"])
-def test_a_declared_cleartext_hop_offers_removing_a_header_that_is_no_credential(
+def test_a_declared_cleartext_hop_carries_a_neutral_static_header(
+    cell: str, declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verify-off header allowlist does not apply to a declared cleartext hop: the owner's
+    ruling on item 4 refuses credentials only, so a header with a neutral name and value crosses.
+    Whether the allowlist should apply here too is an open owner question."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD):
+        dest = _build(
+            _CLEARTEXT[cell],
+            **{declared: True},
+            headers={"Prefer": "return=minimal", "X-Correlation-Id": "c1"},
+        )
+    assert dest is not None
+
+
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_a_static_proxy_authorization_with_no_proxy_is_refused_at_build(
     declared: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A header refused only for its name is not called a credential, and removing it is offered,
-    since that alone clears the refusal."""
+    """Round-2 review finding 3: with no proxy configured, a static ``Proxy-Authorization`` would
+    go to the destination, so it counts as a credential and refuses the hop at build, rather than
+    building and failing each send with a retryable error."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(_PROD), pytest.raises(InsecureHopRefused) as exc:
-        _build(_CLEARTEXT["REST"], **{declared: True}, headers={"X-Trace": "t1"})
-    message = str(exc.value)
-    assert "static header outside the header allowlist (X-Trace)" in message
-    assert "its credentials (" not in message
-    assert "Or remove the header; none of them is a credential." in message
+    with (
+        active_hop_posture(_PROD),
+        pytest.raises(
+            InsecureHopRefused, match="HTTP cleartext credentials: .*Proxy-Authorization"
+        ),
+    ):
+        _build(
+            _CLEARTEXT["REST"],
+            **{declared: True},
+            headers={"Proxy-Authorization": "Basic synthetic"},
+        )
+
+
+def test_control_a_static_proxy_authorization_beside_a_proxy_is_left_to_the_proxy_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a ``proxy_url`` the header is the proxy's, so this rule leaves it to the send-time
+    proxy rule, and the connection builds."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    ctype, factory, url = _CLEARTEXT["REST"]
+    settings = factory(
+        url=url, headers={"Proxy-Authorization": "Basic synthetic"}, proxy="http://127.0.0.1:3128"
+    ).settings
+    with active_hop_posture(_PROD):
+        dest = build_destination(
+            Destination(
+                name="OB",
+                type=ctype,
+                settings=settings,
+                cleartext_accepted=True,
+                cleartext_reason="vendor firmware predates TLS",
+            ),
+            egress=EgressSettings(deny_by_default=False, allowed_proxy=["127.0.0.1"]),
+        )
+    assert dest is not None
 
 
 @pytest.mark.parametrize("declared", ["attested", "accepted"])

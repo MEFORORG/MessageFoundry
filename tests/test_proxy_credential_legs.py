@@ -466,10 +466,10 @@ def test_control_digest_with_no_static_proxy_header_builds_and_is_admitted() -> 
         proxy_user="u5er",
         proxy_password="pa55w0rd",
         proxy_auth_type="digest",
-        headers={"X-Request-ID": "t1"},
+        headers={"X-Trace": "t1"},
     )
     assert "Proxy-Authorization" not in dest._headers
-    assert dest._headers["X-Request-ID"] == "t1"
+    assert dest._headers["X-Trace"] == "t1"
     assert _proxy_handler(dest).caller_header_admitted is True
     opened = dest._opener.handlers  # type: ignore[attr-defined]
     assert any(isinstance(h, urllib.request.ProxyDigestAuthHandler) for h in opened)

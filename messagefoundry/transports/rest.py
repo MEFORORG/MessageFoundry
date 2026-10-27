@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -960,22 +960,19 @@ def _off_box_cleartext_host(scheme: str, url: str) -> str | None:
     return None if is_loopback_hop_host(host) else host
 
 
-def _refuse_off_box_cleartext(
-    scheme: str, url: str, *, sends: str, connection: str | None, removal: str = ""
-) -> None:
+def _refuse_off_box_cleartext(scheme: str, url: str, *, sends: str, connection: str | None) -> None:
     """Raise :class:`InsecureHopRefused` when ``url`` is cleartext ``http`` to an off-box host.
 
     The one body of the HTTP family's cleartext credential rule (vault BACKLOG #3533 item 4, owner
-    ruling 2026-10-26, amending ADR 0153 build note 3). ``sends`` names what would cross;
-    ``removal`` is a closing sentence offering to drop headers, when that alone would clear it."""
+    ruling 2026-10-26, amending ADR 0153 build note 3). ``sends`` names the credentials that would
+    cross."""
     host = _off_box_cleartext_host(scheme, url)
     if host is None:
         return
     raise InsecureHopRefused(
         f"{hop_name_prefix(connection)}{_CLEARTEXT_CREDENTIAL_CELL}: sends {sends} over cleartext "
         f"http to {host!r}; refused, with no escape. Neither tls_hop_attested nor "
-        "cleartext_accepted lets a credential, or a static header off the allowlist, cross "
-        f"cleartext http off this machine. Use https.{removal}"
+        "cleartext_accepted lets a credential cross cleartext http off this machine. Use https."
     )
 
 
@@ -1014,11 +1011,14 @@ def refuse_cleartext_credentials(
     """Refuse to send credentials over a cleartext (``http``) hop to an off-box host (#200, #3533).
 
     ``credentials`` is what :func:`http_credentials_sent` returns for the hop with
-    ``cleartext=True``. So this rule counts what the ``verify_tls = false`` rule counts, with one
-    exception: every auth setting, a static header the redaction screen masks or whose name is off
-    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, and a credential-looking query parameter (vault
-    BACKLOG #3533 item 4). The exception is a static ``Proxy-Authorization``, in any spelling, which
-    the send-time proxy rule judges instead. An ``Authorization`` header in the built ``headers``,
+    ``cleartext=True``: every auth setting, a static header the redaction screen masks (by name,
+    such as ``Authorization`` or an API key in any letter case, or by a credential-shaped value),
+    and a credential-looking query parameter (vault BACKLOG #3533 item 4). It is the credential half
+    of what the ``verify_tls = false`` rule counts, without that rule's name allowlist: a static
+    header with a neutral name and value, such as ``Prefer``, still crosses a declared cleartext hop.
+    Whether the allowlist should apply here too is an open owner question. A static
+    ``Proxy-Authorization``, in any spelling, is left out when the connection names a proxy, since
+    the send-time proxy rule judges it then. An ``Authorization`` header in the built ``headers``,
     in any case, counts as well; the bearer re-checks pass one in, as defense in depth should the
     inventory and the bearer providers ever disagree. As for
     :func:`refuse_cleartext_credential_hop`, only a loopback host lifts it. Shared by the REST,
@@ -1028,19 +1028,7 @@ def refuse_cleartext_credentials(
         sent = ["Authorization header"]
     if not sent:
         return
-    unlisted = sum(1 for c in sent if c.endswith(_OFF_ALLOWLIST))
-    removal = (
-        f" Or remove the {'header' if unlisted == 1 else 'headers'}; none of them is a credential."
-        if unlisted == len(sent)
-        else ""
-    )
-    _refuse_off_box_cleartext(
-        scheme,
-        url,
-        sends=_describe_sent(sent, allowlist="header"),
-        connection=connection,
-        removal=removal,
-    )
+    _refuse_off_box_cleartext(scheme, url, sends=_describe_sent(sent), connection=connection)
 
 
 def refuse_cleartext_egress(
@@ -1108,27 +1096,30 @@ VERIFY_OFF_STATIC_HEADER_ALLOWLIST = frozenset(
 _OFF_ALLOWLIST = " header, which is not on the verify-off header allowlist"
 
 
-def _header_held(name: str, value: object) -> str | None:
-    """Why a header may not cross a hop held to :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, as the
-    suffix :func:`http_credentials_sent` puts on its name, or ``None`` when it may.
+def _header_held(name: str, value: object, *, allowlist: bool) -> str | None:
+    """Why a header may not cross the hop, as the suffix :func:`http_credentials_sent` puts on its
+    name, or ``None`` when it may.
 
     The one test the static rule at build and the per-message rule at send share (vault BACKLOG
-    #3533 items 6, 7): a header the redaction screen masks, by name or value, is a credential; any
-    other name off the allowlist, in any letter case, is refused for its name alone."""
+    #3533 items 4, 6, 7): a header the redaction screen masks, by name or value, is a credential.
+    With ``allowlist``, on a ``verify_tls = false`` hop, any other name off
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, in any letter case, is refused for its name alone.
+    An off-box cleartext hop passes ``allowlist=False``: the owner's 2026-10-26 ruling on item 4
+    refuses its credentials, and whether its neutral headers meet the list is an open question."""
     # Lazy: config.wiring is not otherwise loaded by this module.
     from messagefoundry.config.wiring import _is_secret_header
 
     if _is_secret_header(name, value):
         return " header"
-    if name.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
+    if allowlist and name.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
         return _OFF_ALLOWLIST
     return None
 
 
-def _describe_sent(credentials: Sequence[str], *, allowlist: str = "verify-off") -> str:
+def _describe_sent(credentials: Sequence[str]) -> str:
     """What a hop would send, worded for a refusal: its credentials, then any static headers
     refused only for their names, apart (vault BACKLOG #3533). ``credentials`` is non-empty and
-    comes from :func:`http_credentials_sent`; ``allowlist`` names the list in the text."""
+    comes from :func:`http_credentials_sent`."""
     unlisted = [c.removesuffix(_OFF_ALLOWLIST) for c in credentials if c.endswith(_OFF_ALLOWLIST)]
     secrets = [c for c in credentials if not c.endswith(_OFF_ALLOWLIST)]
     noun = "header" if len(unlisted) == 1 else "headers"
@@ -1136,7 +1127,7 @@ def _describe_sent(credentials: Sequence[str], *, allowlist: str = "verify-off")
     if secrets:
         sends.append(f"its credentials ({', '.join(secrets)})")
     if unlisted:
-        sends.append(f"static {noun} outside the {allowlist} allowlist ({', '.join(unlisted)})")
+        sends.append(f"static {noun} outside the verify-off allowlist ({', '.join(unlisted)})")
     return " and ".join(sends)
 
 
@@ -1163,27 +1154,32 @@ def http_credentials_sent(
     ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
     CONNECT, not across this hop.
 
-    ``cleartext=True`` leaves out a static header that
+    ``cleartext=True`` is the off-box cleartext rule's reading, which differs in two ways. It
+    counts credentials only, so a static header is not refused for its name alone (vault BACKLOG
+    #3533 item 4; whether the allowlist should apply there is an open owner question). And when
+    the connection names a ``proxy_url``, it leaves out a static header that
     :func:`~messagefoundry.transports.bounded_read.is_proxy_credential_header_name` reads as
-    ``Proxy-Authorization``, in any spelling. On a cleartext hop that header is the proxy's, and the
-    send-time proxy rule judges it: it refuses every spelling but the one it admitted for the
-    connection's own proxy login (vault BACKLOG #3416, #3457).
+    ``Proxy-Authorization``, in any spelling. That header is then the proxy's, and the send-time
+    proxy rule judges it: it refuses every spelling but the one it admitted for the connection's
+    own proxy login (vault BACKLOG #3416, #3457). With no proxy the header would go to the
+    destination, so it counts as the credential it is and refuses the hop at build.
 
     It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
-    not seen here; :func:`refuse_dynamic_headers_off_allowlist` judges those at send. Nor is a
-    secret in the path of ``url``; docs/SECURITY-LOOSENING.md lists it among the hops the rule
-    does not reach."""
+    not seen here; :func:`refuse_held_dynamic_headers` judges those at send. Nor is a secret in
+    the path of ``url``; docs/SECURITY-LOOSENING.md lists it among the hops the rule does not
+    reach."""
     # Lazy: it imports config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
 
     sent = http_hop_credentials(ctype, settings, lookup=lookup)
     static = settings.get("headers")
+    proxied = cleartext and bool(settings.get("proxy_url"))
     if isinstance(static, Mapping):
         for name, value in static.items():
             key = str(name)
-            if cleartext and is_proxy_credential_header_name(key):
+            if proxied and is_proxy_credential_header_name(key):
                 continue
-            if (held := _header_held(key, value)) is not None:
+            if (held := _header_held(key, value, allowlist=not cleartext)) is not None:
                 sent.append(f"{_display_name(key)}{held}")
     url = settings.get("url")
     if isinstance(url, str) and (names := credential_query_params(url)):
@@ -1276,36 +1272,44 @@ def refuse_verify_off(
     )
 
 
-#: ``NegativeAckError.code`` of a send refused by :func:`refuse_dynamic_headers_off_allowlist`.
+#: ``NegativeAckError.code`` of a send refused by :func:`refuse_held_dynamic_headers`.
 DYNAMIC_HEADER_REFUSED_CODE = "dynamic-header-refused"
 
+#: How :func:`refuse_held_dynamic_headers` judges a Handler's per-message headers on a hop:
+#: ``"allowlist"`` holds them to :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST` and refuses a
+#: credential in them, ``"credentials"`` refuses a credential in them only.
+DynamicHeaderRule = Literal["allowlist", "credentials"]
 
-def holds_headers_to_allowlist(scheme: str, url: str, *, verify_tls: bool) -> bool:
-    """Whether this hop holds its static ``headers`` and a Handler's per-message headers to
-    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`.
 
-    True for a ``verify_tls = false`` https hop, any host, and for plain http to a host off this
-    machine (vault BACKLOG #3533 items 4, 6, 7). Those are the hops where a static header off the
-    allowlist refuses the connection at build. Headers the connector builds itself, such as
-    ``SOAPAction``, the FHIR conditional headers, ``Content-Type`` and the JWS headers, are not
-    held to the list. :func:`refuse_dynamic_headers_off_allowlist` holds
-    a Handler's per-message headers to the same list at send. Call it after the construction
-    guards, which have already refused a URL that names no host."""
+def dynamic_header_rule(scheme: str, url: str, *, verify_tls: bool) -> DynamicHeaderRule | None:
+    """Which rule this hop holds a Handler's per-message headers to at send, or ``None``.
+
+    The same rule the hop's static ``headers`` meet at build (vault BACKLOG #3533 items 4, 6, 7).
+    ``"allowlist"`` for a ``verify_tls = false`` https hop, any host: the owner's 2026-10-26 ruling
+    on item 7. ``"credentials"`` for plain http to a host off this machine: the ruling on item 4
+    refuses a credential there, and names no allowlist. ``None`` for any other hop. Headers the
+    connector builds itself, such as ``SOAPAction``, the FHIR conditional headers,
+    ``Content-Type`` and the JWS headers, are not held. Call it after the construction guards,
+    which have already refused a URL that names no host."""
     if scheme == "https":
-        return not verify_tls
-    return _off_box_cleartext_host(scheme, url) is not None
+        return None if verify_tls else "allowlist"
+    return "credentials" if _off_box_cleartext_host(scheme, url) is not None else None
 
 
-def refuse_dynamic_headers_off_allowlist(
-    headers: Mapping[str, str], *, connector: str, connection: str | None
+def refuse_held_dynamic_headers(
+    headers: Mapping[str, str],
+    *,
+    rule: DynamicHeaderRule,
+    connector: str,
+    connection: str | None,
 ) -> None:
     """Refuse a send whose per-message headers the static rule would refuse (vault BACKLOG #3533
-    item 6, following the owner's 2026-10-26 ruling on item 7).
+    item 6, following the owner's 2026-10-26 rulings on items 4 and 7).
 
-    ``headers`` is what :func:`outbound_headers_from_metadata` built from the message. A connector
-    calls this only on a hop :func:`holds_headers_to_allowlist` names. A header counts when its name
-    is off :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, in any letter case, or when the redaction
-    screen would mask it, so a credential-shaped value under an allowed name counts too.
+    ``headers`` is what :func:`outbound_headers_from_metadata` built from the message, and ``rule``
+    is what :func:`dynamic_header_rule` returned for the hop. A header counts when the redaction
+    screen would mask it, by name or by a credential-shaped value. Under ``"allowlist"`` it also
+    counts when its name is off :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, in any letter case.
 
     The refusal is permanent, since a retry would stamp the same header, and it is not a
     configuration fault. So the delivery worker dead-letters this one message and the lane goes on
@@ -1318,16 +1322,25 @@ def refuse_dynamic_headers_off_allowlist(
     treated as PHI. That also keeps a crafted name from faking the refusal's structure."""
     if not headers:
         return
-    refused = sum(1 for name, value in headers.items() if _header_held(name, value) is not None)
+    allowlist = rule == "allowlist"
+    refused = sum(
+        1
+        for name, value in headers.items()
+        if _header_held(name, value, allowlist=allowlist) is not None
+    )
     if not refused:
         return
     noun = "header" if refused == 1 else "headers"
+    why = (
+        "Its peer is not verified (verify_tls=false), so only the allowlisted "
+        "Accept/Content-Type/User-Agent/X-Request-ID may be stamped, with no credential in them. "
+        if allowlist
+        else "It is cleartext http off this machine, so no credential may be stamped, by name or "
+        "by value; nothing lifts that but https. "
+    )
     raise NegativeAckError(
         f"{hop_name_prefix(connection)}{connector} send refused: a Handler stamped {refused} "
-        f"per-message {noun} under dynamic_headers that this hop may not carry. Its peer is not "
-        "verified (verify_tls=false) or it is cleartext http off this machine, so only the "
-        "allowlisted Accept/Content-Type/User-Agent/X-Request-ID may be stamped, with no "
-        "credential in them. "
+        f"per-message {noun} under dynamic_headers that this hop may not carry. {why}"
         "The names are withheld, since a Handler may derive them from the message",
         code=DYNAMIC_HEADER_REFUSED_CODE,
         # Dead-letter this message only; see the docstring for why this is no configuration fault.
@@ -2531,10 +2544,10 @@ class RestDestination(DestinationConnector):
                 # assertion cannot reach this hop (ASVS 12.1.2).
                 self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
-        # Vault BACKLOG #3533 item 6: on a hop whose static headers are held to the allowlist, a
-        # Handler's per-message headers are held to it too, at send.
+        # Vault BACKLOG #3533 item 6: a Handler's per-message headers meet the rule this hop's
+        # static headers meet, at send.
         self._connection_name = config.name
-        self._holds_headers = holds_headers_to_allowlist(scheme, self.url, verify_tls=verify)
+        self._header_rule = dynamic_header_rule(scheme, self.url, verify_tls=verify)
         if self._ech_sidecar is not None:
             # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar
             # owns destination TLS + ECH + cert verification), so a plain no-redirect opener carries it —
@@ -2599,9 +2612,12 @@ class RestDestination(DestinationConnector):
         # #68: build this message's dynamic headers from its user-metadata bag (pure; None → {} → byte-
         # identical). urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         dynamic_headers = outbound_headers_from_metadata(metadata)
-        if self._holds_headers:
-            refuse_dynamic_headers_off_allowlist(
-                dynamic_headers, connector="REST destination", connection=self._connection_name
+        if self._header_rule is not None:
+            refuse_held_dynamic_headers(
+                dynamic_headers,
+                rule=self._header_rule,
+                connector="REST destination",
+                connection=self._connection_name,
             )
         body, status, headers = await asyncio.to_thread(self._post, payload, dynamic_headers)
         if isinstance(body, ReplyBodyDropped):

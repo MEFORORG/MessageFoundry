@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A Handler's per-message headers meet the static header allowlist at send (vault BACKLOG #3533 item 6).
+"""A Handler's per-message headers meet the hop's static header rule at send (vault BACKLOG #3533 item 6).
 
 The owner's 2026-10-26 ruling on item 7 holds a ``verify_tls = false`` hop's static headers to
-``VERIFY_OFF_STATIC_HEADER_ALLOWLIST``. Item 4 holds plain http off this machine to the same list.
-Before item 6 the rule read settings only, so a header a Handler stamped under ``dynamic_headers``
-crossed either hop whatever its name. These tests drive the REST and FHIR ``send`` with a fake wire
-call, so a refusal is seen before any byte would cross, and a control reaches the wire.
+``VERIFY_OFF_STATIC_HEADER_ALLOWLIST``. The ruling on item 4 refuses a credential over plain http
+off this machine, with no allowlist. Before item 6 both rules read settings only, so a header a
+Handler stamped under ``dynamic_headers`` crossed either hop whatever it held. These tests drive the
+REST and FHIR ``send`` with a fake wire call, so a refusal is seen before any byte would cross, and a
+control reaches the wire.
 
 Every value here is synthetic.
 """
@@ -39,12 +40,24 @@ from messagefoundry.transports.rest import (
 _ENFORCING = HopPosture(enforcing=True)
 _PATIENT = '{"resourceType": "Patient", "id": "p1"}'
 
-#: Each per-message header set the rule must refuse: a name off the allowlist, a credential under
-#: an allowed name, and both together.
+#: Each per-message header set a verify-off hop must refuse: a name off the allowlist, a
+#: credential under an allowed name, and both together.
 _REFUSED: dict[str, dict[str, str]] = {
     "neutral name": {"X-Session": "s1"},
     "credential value under an allowed name": {"X-Request-ID": "Bearer abc.def.ghi"},
     "two headers": {"X-Session": "s1", "If-Match": 'W/"3"'},
+}
+
+#: Each per-message header set an off-box cleartext hop must refuse: a credential, by name or by
+#: value. The ruling on item 4 refuses credentials only, so a neutral name is not among them.
+_CLEARTEXT_REFUSED: dict[str, dict[str, str]] = {
+    "credential name": {"X-Api-Key": "k1"},
+    "credential value under a neutral name": {"X-Session": "Bearer abc.def.ghi"},
+    "credential value under an allowed name": {"X-Request-ID": "Bearer abc.def.ghi"},
+    "a credential beside a neutral header": {
+        "X-Auth-Token": "t9",
+        "Prefer": "return=minimal",
+    },
 }
 
 
@@ -84,8 +97,12 @@ _ACCEPTED: dict[str, Any] = {
 #: Each hop the static rule holds to the allowlist, so the dynamic rule must too.
 _HELD: dict[str, Callable[[], _Dest]] = {
     "rest verify-off loopback": lambda: _rest("https://127.0.0.1:8443/x", verify_tls=False),
-    "rest cleartext off-box": lambda: _rest("http://partner.example.test/x", **_ACCEPTED),
     "fhir verify-off loopback": lambda: _fhir("https://127.0.0.1:8443/fhir", verify_tls=False),
+}
+
+#: Each hop whose static credentials the item 4 rule refuses, so the dynamic rule must too.
+_CLEARTEXT: dict[str, Callable[[], _Dest]] = {
+    "rest cleartext off-box": lambda: _rest("http://partner.example.test/x", **_ACCEPTED),
     "fhir cleartext off-box": lambda: _fhir("http://partner.example.test/fhir", **_ACCEPTED),
 }
 
@@ -118,40 +135,67 @@ def _wire(dest: RestDestination | FhirDestination, monkeypatch: pytest.MonkeyPat
     return sent
 
 
-@pytest.mark.parametrize("hop", list(_HELD))
-@pytest.mark.parametrize("case", list(_REFUSED))
-def test_a_held_hop_refuses_the_header_at_send(
-    hop: str, case: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    dest = _HELD[hop]()
+def _assert_refused(dest: _Dest, headers: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> str:
+    """Send ``headers`` on ``dest``, assert the refusal's shape, and return its text."""
     sent = _wire(dest, monkeypatch)
     with pytest.raises(NegativeAckError) as exc:
-        asyncio.run(dest.send(_PATIENT, metadata=_meta(_REFUSED[case])))
+        asyncio.run(dest.send(_PATIENT, metadata=_meta(headers)))
     assert sent == []
     assert exc.value.code == DYNAMIC_HEADER_REFUSED_CODE
     assert exc.value.permanent is True
     assert exc.value.config_fault is False  # dead-letter this message; the lane goes on
     text = str(exc.value)
     assert "connection 'OB_DYN'" in text
-    count = len(_REFUSED[case])
-    assert f"stamped {count} per-message header" in text
-    # Neither a name nor a value: at send both are message-derived. The text lists the allowlist
-    # itself, so an allowed name is checked only by its value.
-    for name, value in _REFUSED[case].items():
+    # Neither a name nor a value: at send both are message-derived. The verify-off text lists the
+    # allowlist itself, so an allowed name is checked only by its value.
+    for name, value in headers.items():
         assert value not in text
         if name.lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
             assert name not in text
+    return text
 
 
 @pytest.mark.parametrize("hop", list(_HELD))
+@pytest.mark.parametrize("case", list(_REFUSED))
+def test_a_held_hop_refuses_the_header_at_send(
+    hop: str, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _assert_refused(_HELD[hop](), _REFUSED[case], monkeypatch)
+    assert f"stamped {len(_REFUSED[case])} per-message header" in text
+    assert "verify_tls=false" in text
+
+
+@pytest.mark.parametrize("hop", list(_CLEARTEXT))
+@pytest.mark.parametrize("case", list(_CLEARTEXT_REFUSED))
+def test_a_cleartext_hop_refuses_a_credential_header_at_send(
+    hop: str, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _assert_refused(_CLEARTEXT[hop](), _CLEARTEXT_REFUSED[case], monkeypatch)
+    # Only the credential is counted, not a neutral header beside it.
+    assert "stamped 1 per-message header " in text
+    assert "cleartext http off this machine" in text
+    assert "allowlist" not in text
+
+
+@pytest.mark.parametrize("hop", list(_HELD) + list(_CLEARTEXT))
 def test_control_a_held_hop_sends_an_allowlisted_header(
     hop: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The arm above refuses for the header, not for the hop: an allowlisted name with a plain
+    """The arms above refuse for the header, not for the hop: an allowlisted name with a plain
     value reaches the wire."""
-    dest = _HELD[hop]()
+    dest = {**_HELD, **_CLEARTEXT}[hop]()
     sent = _wire(dest, monkeypatch)
     asyncio.run(dest.send(_PATIENT, metadata=_meta({"X-Request-ID": "r1", "Accept": "a/b"})))
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("hop", list(_CLEARTEXT))
+def test_a_cleartext_hop_sends_a_neutral_header(hop: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The verify-off allowlist does not apply to an off-box cleartext hop (the ruling on item 4
+    names credentials only), so a neutral name off the list, with a plain value, still crosses."""
+    dest = _CLEARTEXT[hop]()
+    sent = _wire(dest, monkeypatch)
+    asyncio.run(dest.send(_PATIENT, metadata=_meta(_REFUSED["two headers"])))
     assert len(sent) == 1
 
 

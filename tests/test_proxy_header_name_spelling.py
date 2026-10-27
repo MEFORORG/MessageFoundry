@@ -759,15 +759,14 @@ def test_control_a_rest_send_with_a_sendable_proxy_header_is_refused_and_retried
 
 def test_control_a_rest_send_with_another_static_header_reaches_the_proxy() -> None:
     """The same connection with a header the rule does not read. The fake proxy may hang up
-    before the body is sent, so the result is not read: what reached the socket is. The header
-    is on the allowlist and holds no credential, so the cleartext hop may carry it."""
+    before the body is sent, so the result is not read: what reached the socket is. Its value is
+    no credential, since a credential cannot cross the cleartext hop (vault BACKLOG #3533 item 4)."""
     with _WireProxy() as proxy:
-        dest = _rest_with_static_header("X-Request-ID", proxy, value="t1")
+        dest = _rest_with_static_header("X-Trace", proxy, value="t1")
         with contextlib.suppress(DeliveryError):
             asyncio.run(dest.send('{"a": 1}'))
     assert len(proxy.cleartext) == 1
-    # urllib capitalizes a header name as str.capitalize() does, so the wire spelling differs.
-    assert b"X-Request-Id: t1\r\n" in proxy.cleartext[0]
+    assert b"X-Trace: t1\r\n" in proxy.cleartext[0]
 
 
 # --- a bytes name ----------------------------------------------------------------------------------
