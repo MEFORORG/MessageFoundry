@@ -372,6 +372,78 @@ def test_import_refuses_to_overwrite_existing_key(
     assert (out / "key.pem").read_bytes() == original
 
 
+# --- cert import: no silent replacement, all files or none (vault BACKLOG #3514) -------------
+
+
+def _import_into(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path) -> int:
+    """Import a fresh bundle that carries one CA, so the run writes all three files."""
+    monkeypatch.delenv("MEFOR_PFX_PASSWORD", raising=False)
+    _ca_key, ca_cert = _make_cert("ca.example.org")
+    key, cert = _make_cert("leaf.example.org")
+    pfx_path = tmp_path / "b.pfx"
+    pfx_path.write_bytes(_make_pfx(key, cert, cas=[ca_cert]))
+    return main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(out), "--json"])
+
+
+@pytest.mark.parametrize(
+    ("existing", "refusal"),
+    [
+        pytest.param("cert.pem", "an existing certificate file", id="cert"),
+        pytest.param("ca-chain.pem", "an existing CA chain file", id="ca-chain"),
+    ],
+)
+def test_import_refuses_to_overwrite_an_existing_public_file(
+    existing: str,
+    refusal: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cert.pem and ca-chain.pem were written with `write_bytes`, so one with no key.pem beside it
+    was replaced without a word. Each is refused now, as the key is, and the refusal writes nothing.
+
+    Mutation: drop the existence check and the exclusive create. Red: the operator's file is gone."""
+    out = tmp_path / "o"
+    out.mkdir()
+    (out / existing).write_bytes(b"THE-OPERATORS-FILE\n")
+
+    assert _import_into(tmp_path, monkeypatch, out) == 2
+    assert f"refusing to overwrite {refusal}" in json.loads(capsys.readouterr().out)["error"]
+    assert (out / existing).read_bytes() == b"THE-OPERATORS-FILE\n"
+    assert sorted(p.name for p in out.iterdir()) == [existing]
+
+
+@pytest.mark.parametrize("dies", ["cert.pem", "ca-chain.pem"])
+def test_a_failed_import_write_leaves_no_file(
+    dies: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The key is written first. A public write that then failed left the key behind, with a
+    traceback, and the next import refused because the key existed. Now the run removes every file
+    it wrote and says so in its own failure line.
+
+    Mutation: drop the cleanup. Red: key.pem is still there."""
+    real_open = Path.open
+
+    def _open(self: Path, *a: Any, **k: Any) -> Any:
+        handle = real_open(self, *a, **k)
+        return _HandleThatDiesMidWrite(handle) if self.name == dies else handle
+
+    monkeypatch.setattr(Path, "open", _open)
+    out = tmp_path / "o"
+
+    assert _import_into(tmp_path, monkeypatch, out) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "No space left on device" in error
+    wrote = [out / "key.pem", out / "cert.pem"] + (
+        [out / "ca-chain.pem"] if dies != "cert.pem" else []
+    )
+    assert f"removed {', '.join(map(str, wrote))}, which this run wrote" in error
+    assert list(out.iterdir()) == []
+
+
 # --- cert inventory ---------------------------------------------------------
 
 

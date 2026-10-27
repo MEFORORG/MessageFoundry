@@ -767,7 +767,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "import",
         help="import a PKCS#12/.pfx bundle into cert.pem / key.pem / ca-chain.pem. The passphrase is "
         "read ONLY from MEFOR_PFX_PASSWORD (never a CLI arg); key.pem is written owner-only (mode 0600 "
-        "on POSIX, a restrictive access list on Windows) and refuses to overwrite an existing key",
+        "on POSIX, a restrictive access list on Windows). It refuses to overwrite an existing "
+        "cert.pem, key.pem or ca-chain.pem, and removes the files it wrote if one cannot be written",
     )
     cert_import.add_argument(
         "--pfx", required=True, help="path to the PKCS#12/.pfx bundle to import"
@@ -5988,6 +5989,52 @@ def _write_private_key(path: Path, pem: bytes) -> None:
     write_restricted_file(path, pem)
 
 
+def _write_public_pems(
+    key_path: Path, files: list[tuple[Path, bytes, str]], *, as_json: bool
+) -> int | None:
+    """Write each public PEM in ``files`` to a NEW file, once this run has written ``key_path``.
+
+    ``files`` holds ``(path, pem, refusal)``, where ``refusal`` is the failure line for a ``path``
+    that already exists. Each create is exclusive, so a file that appeared after the caller's
+    existence check is still never replaced. If a write fails, every file this run wrote is
+    removed, the key included, and the failure line names any it could not remove. Returns
+    ``None`` when every file is written, else the command's exit code (BACKLOG #3073; vault
+    BACKLOG #3514 for `cert import`)."""
+    # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
+    # It rides out a brief Windows hold on a file, such as a scanner opening the new key.
+    from messagefoundry.api.tls import _unlink_generated
+
+    written = [key_path]
+    for path, pem, refusal in files:
+        try:
+            with path.open("xb") as fh:
+                written.append(path)
+                fh.write(pem)
+        except BaseException as exc:
+            # BaseException, so an interrupt between the writes still cleans up; it is re-raised.
+            # Remove only what THIS run wrote, never a file that was already there.
+            removed: list[str] = []
+            left: list[str] = []
+            for done in written:
+                try:
+                    _unlink_generated(done)
+                except FileNotFoundError:
+                    continue  # already gone, so nothing is left to remove
+                except OSError:
+                    left.append(str(done))
+                else:
+                    removed.append(str(done))
+            if not isinstance(exc, OSError):
+                raise
+            reason = refusal if isinstance(exc, FileExistsError) else f"cannot write {path}: {exc}"
+            if removed:
+                reason += f"; removed {', '.join(removed)}, which this run wrote"
+            if left:
+                reason += f"; could not remove {', '.join(left)}, so remove it before running again"
+            return _cert_fail(reason, as_json=as_json)
+    return None
+
+
 def _cert(args: argparse.Namespace) -> int:
     """`cert` command group (BACKLOG #71/#72) — dispatch to import / inventory / self-signed."""
     if args.cert_command == "import":
@@ -6005,7 +6052,9 @@ def _cert_import(args: argparse.Namespace) -> int:
     passphrase, so a bundle whose PBMAC1 MAC used one can be imported (BACKLOG #2456). It is never
     a CLI arg and never echoed. A bad password / malformed bundle is
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
-    public; key.pem is written by :func:`_write_private_key`, which refuses to overwrite."""
+    public; key.pem is written by :func:`_write_private_key`. It refuses an existing cert.pem,
+    key.pem or (when the bundle carries CAs) ca-chain.pem before it writes, and if a public file is
+    not written, the files this run wrote are removed (:func:`_write_public_pems`)."""
     import os
 
     from messagefoundry import pki
@@ -6040,30 +6089,50 @@ def _cert_import(args: argparse.Namespace) -> int:
     if key is None:
         return _cert_fail("the PKCS#12 bundle contains no private key", as_json=args.json)
 
+    cert_path = out_dir / "cert.pem"
+    key_path = out_dir / "key.pem"
+    ca_path = out_dir / "ca-chain.pem"
+    refuse_key = f"refusing to overwrite an existing key file: {key_path} (remove it first)"
+    public = [
+        (
+            cert_path,
+            pki.cert_to_pem(cert),
+            f"refusing to overwrite an existing certificate file: {cert_path} (remove it first)",
+        )
+    ]
+    wrote_ca = bool(cas)
+    if wrote_ca:
+        public.append(
+            (
+                ca_path,
+                pki.ca_chain_to_pem(cas),
+                f"refusing to overwrite an existing CA chain file: {ca_path} (remove it first)",
+            )
+        )
+    # Refuse every file this run would replace before writing any (vault BACKLOG #3514). cert.pem
+    # and ca-chain.pem were replaced without a word, as `cert self-signed` replaced cert.pem (#3073).
+    for path, _pem, refusal in public:
+        if path.exists():
+            return _cert_fail(refusal, as_json=args.json)
+    if key_path.exists():
+        return _cert_fail(refuse_key, as_json=args.json)
+
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         return _cert_fail(f"cannot create --out-dir {args.out_dir!r}: {exc}", as_json=args.json)
 
-    cert_path = out_dir / "cert.pem"
-    key_path = out_dir / "key.pem"
-    ca_path = out_dir / "ca-chain.pem"
-
-    # Key FIRST (O_EXCL): if it would clobber an existing key we stop before touching cert.pem.
+    # Key FIRST (O_EXCL), then the public files, each exclusive: all are written or none is.
     try:
         _write_private_key(key_path, pki.key_to_pem(key))
     except FileExistsError:
-        return _cert_fail(
-            f"refusing to overwrite an existing key file: {key_path} (remove it first)",
-            as_json=args.json,
-        )
+        return _cert_fail(refuse_key, as_json=args.json)
     except OSError as exc:
         return _cert_fail(f"cannot write {key_path}: {exc}", as_json=args.json)
 
-    cert_path.write_bytes(pki.cert_to_pem(cert))
-    wrote_ca = bool(cas)
-    if wrote_ca:
-        ca_path.write_bytes(pki.ca_chain_to_pem(cas))
+    failed = _write_public_pems(key_path, public, as_json=args.json)
+    if failed is not None:
+        return failed
 
     result: dict[str, object] = {
         "cert": str(cert_path),
@@ -6311,10 +6380,6 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
     line names any it could not remove. Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
 
-    # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
-    # It rides out a brief Windows hold on a file, such as a scanner opening the new key.
-    from messagefoundry.api.tls import _unlink_generated
-
     if args.days <= 0:
         return _cert_fail("--days must be a positive integer", as_json=args.json)
     out_dir = Path(args.out_dir)
@@ -6356,36 +6421,9 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
     except OSError as exc:
         return _cert_fail(f"cannot write {key_path}: {exc}", as_json=args.json)
 
-    # Exclusive create: a cert.pem that appeared after the check above is still never replaced.
-    cert_created = False
-    try:
-        with cert_path.open("xb") as fh:
-            cert_created = True
-            fh.write(cert_pem)
-    except BaseException as exc:
-        # BaseException, so an interrupt between the two writes still cleans up; it is re-raised.
-        # Remove only what THIS run wrote, never a file that was already there.
-        removed: list[str] = []
-        left: list[str] = []
-        for path in (key_path, cert_path) if cert_created else (key_path,):
-            try:
-                _unlink_generated(path)
-            except FileNotFoundError:
-                continue  # already gone, so nothing is left to remove
-            except OSError:
-                left.append(str(path))
-            else:
-                removed.append(str(path))
-        if not isinstance(exc, OSError):
-            raise
-        reason = (
-            refuse_cert if isinstance(exc, FileExistsError) else f"cannot write {cert_path}: {exc}"
-        )
-        if removed:
-            reason += f"; removed {', '.join(removed)}, which this run wrote"
-        if left:
-            reason += f"; could not remove {', '.join(left)}, so remove it before running again"
-        return _cert_fail(reason, as_json=args.json)
+    failed = _write_public_pems(key_path, [(cert_path, cert_pem, refuse_cert)], as_json=args.json)
+    if failed is not None:
+        return failed
 
     names = list(dict.fromkeys([args.cn, *sans]))
     result: dict[str, object] = {
