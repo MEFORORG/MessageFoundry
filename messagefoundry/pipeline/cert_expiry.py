@@ -586,10 +586,10 @@ class _HeldCopyLog:
         )
 
     def unchecked_later_crl(self, cert: MonitoredCert) -> None:
-        """Log that the signature check raised ``ValueError`` on a later CRL in ``cert``'s CA file,
-        after an earlier CRL's signature was not confirmed, so the scan counts the file as one the
-        engine cannot judge (BACKLOG #3512). The line is logged whether or not an alert is raised.
-        Called inside the ``except``, so the line carries the cause. Folded as :meth:`warn`
+        """Log that the signature check raised on a later CRL in ``cert``'s CA file, after an
+        earlier CRL's signature was not confirmed, so the scan counts the file as one the engine
+        cannot judge (BACKLOG #3512). The line is logged whether or not an alert is raised.
+        Called inside an ``except``, so the line carries the cause. Folded as :meth:`warn`
         folds."""
         self._log_once(
             cert,
@@ -649,9 +649,9 @@ def held_crl_label(path: str) -> str:
 
 
 #: The signature states of a :class:`~messagefoundry.pki.CrlSignature` the engine could not confirm
-#: either way. Named once, for at least the remedy that asks for a check, the guard that catches a
-#: ``ValueError`` the signature check raises on a later block after one of them, and the test for a
-#: state this scan does not name (BACKLOG #3512).
+#: either way. Named once, for at least the remedy that asks for a check, the guards that catch an
+#: error the signature check raises on a later block after one of them, and the test for a state
+#: this scan does not name (BACKLOG #3512).
 _UNCONFIRMED = frozenset({"unproven", "uncheckable"})
 
 #: The states that pass a CA file's CRL with no step of its own. ``unlisted`` is a CRL that no CA
@@ -685,9 +685,10 @@ def _ca_file_crl_refusal(
     the restart, after the reload's verdict, only where a hop holds a stale copy through that
     setting. A CRL that no CA in this file fits is not refused; :data:`_PASSING` says why.
     ``file_facts`` is the lenient reading, which tells an expired CRL from one that cannot be
-    judged. ``on_unchecked`` is called inside the ``except``. That happens when the signature
-    check raises ``ValueError`` on a later CRL, after one in :data:`_UNCONFIRMED`. The file is then
-    unjudged. Each remedy leads, because the alert instance keeps only the start of it."""
+    judged. ``on_unchecked`` is called inside an ``except``. That happens when the signature
+    check raises on a later CRL, after one in :data:`_UNCONFIRMED`, whatever the error's type. The
+    file is then unjudged. Each remedy leads, because the alert instance keeps only the start of
+    it."""
     if not crl_pem_blocks(pem):
         return None  # the CRL was moved out, and a CA file with none starts
     unjudged = (
@@ -718,13 +719,14 @@ def _ca_file_crl_refusal(
             f"{log_timestamp(early.this_update)}, before restarting: until then it refuses every "
             "peer under its issuer",
         )
+    # The states of the file's CRLs, merged. pki.crl_signature_refusal's flag is True for three of
+    # them, and only ``bad`` proves a failure (BACKLOG #3512). Bound before the ``try``, so its
+    # last handler can read it.
+    states: set[str] = set()
     try:
         # OpenSSL's own reading of these bytes, not of the file again, which may have changed.
         with staged_crl(pem) as copy:
             scratch = crl_scratch_context(str(copy), blocks, label="the CA file")
-        # The states of the file's CRLs, merged. pki.crl_signature_refusal's flag is True for
-        # three of them, and only ``bad`` proves a failure (BACKLOG #3512).
-        states: set[str] = set()
         try:
             for sig in judge_crl_signatures(pem, scratch.get_ca_certs(binary_form=True)):
                 states.add(sig.state)
@@ -736,8 +738,9 @@ def _ca_file_crl_refusal(
             # The unchecked block could be proven bad, so the file is one the engine cannot judge:
             # replace the CRL before restarting, not the unconfirmed remedy's check. Any other set
             # of states re-raises to the outer path, which leaves the file unjudged too, so no
-            # state is swallowed (BACKLOG #3512). An error of another type is not caught here. It
-            # takes an outer path, such as the one saying the scan could not check the file.
+            # state is swallowed (BACKLOG #3512). An error of another type is not caught here: the
+            # last handler below gives it this remedy after an unconfirmed block, and otherwise
+            # an outer remedy, such as the one saying the scan could not check the file.
             if not states & _UNCONFIRMED:
                 raise
             on_unchecked()
@@ -746,13 +749,22 @@ def _ca_file_crl_refusal(
         # At least two causes: OpenSSL loads other CRLs than were judged (crl_scratch_context), or
         # the signature check raised with no unconfirmed block before it, re-raised above.
         return unjudged
-    except ssl.SSLError as exc:
-        # Any block can cause it, a certificate as well as a CRL, and a restart fails on it too.
-        return (
-            "whose CA file OpenSSL cannot load",
-            f"Fix the CA file before restarting: OpenSSL cannot load it ({exc.reason or exc})",
-        )
     except Exception as exc:
+        if states & _UNCONFIRMED:
+            # Only the signature check runs once a state is recorded, so it raised this on a later
+            # block, after an unconfirmed one. That is the ValueError case above with another
+            # type, ssl.SSLError included, and it gets that case's remedy and line: before
+            # BACKLOG #3512 the check stopped at the unconfirmed block and said to replace the
+            # CRL, never that the scan could not check the file. This one handler takes what the
+            # ssl.SSLError and Exception handlers took apart, so what is caught is unchanged.
+            on_unchecked()
+            return unjudged
+        if isinstance(exc, ssl.SSLError):
+            # Any block can cause it, a certificate as well as a CRL, and a restart fails on it too.
+            return (
+                "whose CA file OpenSSL cannot load",
+                f"Fix the CA file before restarting: OpenSSL cannot load it ({exc.reason or exc})",
+            )
         # Not a verdict on the file, such as a disk that refuses the private copy. Said, rather
         # than raised, so the held copy's date still stands this pass.
         log.warning("cert_expiry: could not check the CRL in a CA file", exc_info=True)
