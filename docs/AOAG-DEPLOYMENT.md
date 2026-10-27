@@ -626,7 +626,7 @@ or an NLB with:
   probe to carry a bearer token, because unauthenticated probes get 401/403 on *every* node and
   black-hole traffic. The engine mints no static API token: the only bearer is a sign-in session
   token of an account holding `monitoring:read`, which expires, so something beside the LB must
-  refresh it ([`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) section 3.1 says what that takes). The tokenless `/health`
+  refresh it ([`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) section 3.1 describes the constraint). The tokenless `/health`
   returns 200 on every node and **cannot** select the primary; there is no tokenless primary-only
   endpoint.
 - **Set the probe interval comfortably above the ~1 s graph-reconcile interval** (e.g. 10 s) so
