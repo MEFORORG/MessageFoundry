@@ -86,7 +86,10 @@ def _connection(factory: Any, *, proxied: bool, **ca: Any) -> Any:
     from urllib3.connection import ProxyConfig
     from urllib3.util import parse_url
 
-    classes = _strict()._narrowed_pool_classes(factory, connector="Vault test hop")
+    # The proxy leg's revocation guard (#3561) has tests of its own; here it lets every leg pass.
+    classes = _strict()._narrowed_pool_classes(
+        factory, connector="Vault test hop", judge_proxy_leg=lambda _context, _host: None
+    )
     cls = classes["https"].ConnectionCls
     conn: Any
     if proxied:
