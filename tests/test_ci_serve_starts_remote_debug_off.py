@@ -11,17 +11,24 @@ The interpreter accepts ``-X disable_remote_debug`` and does nothing with it
 (``tests/test_isolated_launch.py`` runs that), so the reader compares the exact spelling.
 
 THESE READ TEXT, NOT A RUN. Most of those legs run on a schedule, on dispatch or in the merge queue,
-so a pull request never shows their result. At least these start an engine where no step text
-shows it, and nothing here reads them: the Windows service smoke (NSSM, read by
-``tests/test_isolated_launch.py``), the image smoke (the image's entry point, read there too), and
-any engine a harness module starts from Python, such as ``harness/load/failover.py``.
+so a pull request never shows their result, and no step reads the flag back off its running engine.
+At least these start an engine where no step text shows it, and nothing here reads them: the
+Windows service smoke (NSSM, read by ``tests/test_isolated_launch.py``), the image smoke (the
+image's entry point, read there too), and any engine a harness module starts from Python, such as
+the failover profile's nodes in ``harness/load/failover.py``.
+
+THE READER IS A TOKEN SCAN, NOT A SHELL PARSER. It fails closed on the shapes it cannot place: an
+interpreter named through a variable (``"$PY" -m messagefoundry serve``) or the console-script
+launcher reads as a problem. A start built inside a quoted ``bash -c`` string, or assembled from
+variables across lines, is read as text and can be missed.
 """
 
 from __future__ import annotations
 
 import functools
 import itertools
-from pathlib import PurePosixPath
+import re
+from pathlib import PureWindowsPath
 from typing import Any
 
 import pytest
@@ -29,21 +36,37 @@ import pytest
 from messagefoundry.startupcode import ISOLATED_LAUNCH_OPTIONS
 
 _SUBCOMMANDS = ("serve", "supervise")
-#: The remote-debug pair of the shipped launch options, which ``tests/test_isolated_launch.py``
-#: holds to one spelling with the children's flags.
-_OPTION = (ISOLATED_LAUNCH_OPTIONS[-2], ISOLATED_LAUNCH_OPTIONS[-1])
+_OPTION = ("-X", "disable-remote-debug")
+#: A word, or one of the characters that end a shell command. Quotes and redirections split words,
+#: so ``serve>engine.log`` and ``"python`` still yield ``serve`` and ``python``.
+_TOKEN = re.compile(r"[^\s;&|()<>\"'`]+|[;&|()]")
+_SEPARATORS = frozenset(";&|()")
+#: An interpreter's own name, with any version suffix: ``python``, ``python3.14``, ``python.exe``.
+_INTERPRETER = re.compile(r"python[\d.]*(\.exe)?", re.IGNORECASE)
+#: A line continuation, in bash (a backslash) or in pwsh (a backtick).
+_CONTINUATION = re.compile(r"[\\`]\r?\n")
+
+
+def _name(token: str) -> str:
+    """The last path part, split on either separator, lower-cased."""
+    return PureWindowsPath(token).name.lower()
+
+
+def _turns_remote_debug_off(options: list[str]) -> bool:
+    joined = _OPTION[0] + _OPTION[1]  # CPython also takes the attached form
+    return _OPTION in itertools.pairwise(options) or joined in options
 
 
 def engine_starts(script: str) -> list[tuple[str, str | None]]:
     """``(line, problem or None)`` for each engine start in ``script``.
 
-    ``script`` is a step's ``run`` text with its comment lines already dropped. A backslash line
-    continuation is joined first, so a start split across lines is still one start."""
+    ``script`` is a step's ``run`` text with its comment lines already dropped. Line continuations
+    are joined first, so a start split across lines is still one start."""
     starts: list[tuple[str, str | None]] = []
-    for line in script.replace("\\\n", " ").splitlines():
-        tokens = line.split()
+    for line in _CONTINUATION.sub(" ", script).splitlines():
+        tokens = _TOKEN.findall(line)
         for at, token in enumerate(tokens[:-1]):
-            if PurePosixPath(token).name not in ("messagefoundry", "messagefoundry.exe"):
+            if _name(token) not in ("messagefoundry", "messagefoundry.exe"):
                 continue
             if tokens[at + 1] not in _SUBCOMMANDS:
                 continue
@@ -52,11 +75,17 @@ def engine_starts(script: str) -> list[tuple[str, str | None]]:
                 # The console-script launcher cannot pass an option to the interpreter it starts.
                 problem = "started through the launcher, not the interpreter"
             else:
-                interpreter = max(
-                    (i for i in range(at - 1) if "python" in tokens[i].lower()), default=-1
-                )
-                options = tokens[interpreter + 1 : at - 1]
-                if interpreter == -1 or _OPTION not in itertools.pairwise(options):
+                # The interpreter of THIS command: the nearest one before `-m`, not past a separator.
+                interpreter = -1
+                for i in range(at - 2, -1, -1):
+                    if tokens[i] in _SEPARATORS:
+                        break
+                    if _INTERPRETER.fullmatch(_name(tokens[i])):
+                        interpreter = i
+                        break
+                if interpreter == -1:
+                    problem = "no interpreter named on the command, so no option can be read"
+                elif not _turns_remote_debug_off(tokens[interpreter + 1 : at - 1]):
                     problem = "remote debugging is not turned off"
             starts.append((line.strip(), problem))
     return starts
@@ -67,31 +96,41 @@ def start_problems(script: str) -> list[str]:
     return [f"{problem}: {line}" for line, problem in engine_starts(script) if problem]
 
 
+def _scripts_of(steps: list[dict[str, Any]]) -> list[str]:
+    """Each step's ``run`` text without its comment lines, for the steps that have one."""
+    found = []
+    for step in steps:
+        run = str(step.get("run") or "")
+        script = "\n".join(line for line in run.splitlines() if not line.lstrip().startswith("#"))
+        if script:
+            found.append(script)
+    return found
+
+
 @functools.cache
 def _step_scripts() -> tuple[tuple[str, str, str], ...]:
-    """``(workflow, job, comment-free script)`` for every step script of every workflow, parsed
-    once for the module: ci.yml alone takes a measurable share of a second."""
-    from tests._workflow_contexts import WORKFLOWS, jobs_of
+    """``(file, job, script)`` for every step script of every workflow and composite action,
+    parsed once for the module: ci.yml alone takes a measurable share of a second."""
+    import yaml
+
+    from tests._workflow_contexts import ROOT, WORKFLOWS, jobs_of
 
     found: list[tuple[str, str, str]] = []
-    for path in sorted(WORKFLOWS.glob("*.yml")):
-        jobs: dict[str, dict[str, Any]] = jobs_of(path.name)
-        for key, job in jobs.items():
-            for step in job.get("steps") or []:
-                run = str(step.get("run") or "")
-                script = "\n".join(
-                    line for line in run.splitlines() if not line.lstrip().startswith("#")
-                )
-                if script:
-                    found.append((path.name, key, script))
+    for path in sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")]):
+        for key, job in jobs_of(path.name).items():
+            found += [(path.name, key, s) for s in _scripts_of(job.get("steps") or [])]
+    actions = ROOT / ".github" / "actions"
+    for path in sorted([*actions.glob("*/action.yml"), *actions.glob("*/action.yaml")]):
+        runs = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("runs") or {}
+        name = path.parent.name
+        found += [(name, "runs", s) for s in _scripts_of(runs.get("steps") or [])]
     return tuple(found)
 
 
 def test_every_command_line_engine_start_turns_remote_debugging_off() -> None:
-    pytest.importorskip("yaml")
     problems = {
-        f"{workflow} / {job}": found
-        for workflow, job, script in _step_scripts()
+        f"{where} / {job}": found
+        for where, job, script in _step_scripts()
         if (found := start_problems(script))
     }
     assert not problems, (
@@ -103,10 +142,7 @@ def test_every_command_line_engine_start_turns_remote_debugging_off() -> None:
 def test_the_reader_meets_the_starts_it_was_written_for() -> None:
     """CONTROL: the reader above recognises the five load-leg starts as starts, so a reader that
     matched nothing would fail here rather than pass there."""
-    pytest.importorskip("yaml")
-    starting = {
-        (workflow, job) for workflow, job, script in _step_scripts() if engine_starts(script)
-    }
+    starting = {(where, job) for where, job, script in _step_scripts() if engine_starts(script)}
     expected = {
         ("benchmark.yml", "baseline-sqlite"),
         ("benchmark.yml", "baseline-postgres"),
@@ -115,6 +151,10 @@ def test_the_reader_meets_the_starts_it_was_written_for() -> None:
         ("ci.yml", "load-test-sqlserver"),
     }
     assert expected <= starting, sorted(expected - starting)
+
+
+def test_the_option_is_the_one_the_shipped_launch_passes() -> None:
+    assert _OPTION in itertools.pairwise(ISOLATED_LAUNCH_OPTIONS)
 
 
 @pytest.mark.parametrize(
@@ -129,11 +169,20 @@ def test_the_reader_meets_the_starts_it_was_written_for() -> None:
         "python -I -X utf8 -m messagefoundry serve --config c",
         # The option after the module is the engine's argument, not the interpreter's.
         "python -I -m messagefoundry serve -X disable-remote-debug --config c",
-        # The launcher cannot pass it at all.
+        # The launcher cannot pass it at all, on either separator.
         "messagefoundry serve --config c",
         ".venv/bin/messagefoundry serve --config c",
-        # Split across a continuation.
+        "& .\\.venv\\Scripts\\messagefoundry.exe serve --config c",
+        # Split across a continuation, in bash and in pwsh.
         "python -I \\\n  -m messagefoundry serve --config c",
+        "python -I `\n  -m messagefoundry serve --config c",
+        # Punctuation attached to the subcommand.
+        "python -m messagefoundry serve>engine.log 2>&1 &",
+        "python -m messagefoundry serve&",
+        "(python -m messagefoundry serve) &",
+        # The option belongs to an earlier command on the line, not to the engine's.
+        'python -X disable-remote-debug -c pass; "$PY" -m messagefoundry serve',
+        "python -X disable-remote-debug -c pass && python -m messagefoundry serve",
     ],
 )
 def test_the_reader_objects_to_a_planted_start(start: str) -> None:
@@ -146,10 +195,15 @@ def test_the_reader_objects_to_a_planted_start(start: str) -> None:
         "python -I -X disable-remote-debug -m messagefoundry serve --config c > engine.log 2>&1 &",
         "python -P -X disable-remote-debug -m messagefoundry supervise --config c",
         "python -I -X disable-remote-debug \\\n  -m messagefoundry serve --config c",
+        "python -I `\n  -X disable-remote-debug -m messagefoundry serve --config c",
+        "python -Xdisable-remote-debug -m messagefoundry serve --config c",
+        "python3.14 -X disable-remote-debug -X pycache_prefix=/tmp/python-cache -m messagefoundry serve",
+        "C:\\hostedtoolcache\\Python\\python.exe -I -X disable-remote-debug -m messagefoundry serve",
     ],
 )
 def test_the_reader_passes_a_start_with_the_option(start: str) -> None:
-    assert engine_starts(start + "\n") == [(start.replace("\\\n", " ").strip(), None)], start
+    starts = engine_starts(start + "\n")
+    assert [problem for _, problem in starts] == [None], (start, starts)
 
 
 @pytest.mark.parametrize(
