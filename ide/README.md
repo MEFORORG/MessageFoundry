@@ -264,19 +264,18 @@ set `caFile` on its `messagefoundry.environments` entry (or on one engine shard)
 the same file. When a request fails verification, the extension re-reads the file its anchor came
 from (or a `caFile` it could not read earlier) and, if the certificate changed, retries that request
 once against the new one; that retry is made for a GET only, so a POST that failed is not sent
-twice. Such a POST fails with a message saying the engine's certificate changed and a retry will
-work, rather than the usual advice to check `serviceConfig` or `caFile`; check whether an action
-already took effect before you repeat it. The next request uses the new certificate. The file is
-read without blocking the editor, so a `caFile` on an unreachable share slows only the request
-waiting on it.
+twice. Such a POST fails with a message that says the certificate changed. It does not repeat the
+usual advice about `serviceConfig` or `caFile`. Check whether an action already took effect before
+you repeat it. The next request uses the new certificate. The file is read without blocking the
+editor. A request waits at most two seconds for that read, then fails as it would have.
 
-For the loopback `messagefoundry.engineUrl` with no anchor yet (the engine was started after the
-window opened), and no `caFile` on an https entry for that `host:port`, a failure asks the engine again in the background:
-at most once a minute, and not while another refresh is already under way, unless that refresh had
-already heard from the engine when the failure arrived, in which case one more runs after it. That
-request still fails, and the status bar picks the certificate up when the answer arrives. Asking the
-engine is given 30 seconds before it is abandoned, so a hung interpreter cannot stop later setting
-changes from taking effect. Verification stays on for the retry.
+Sometimes the loopback `messagefoundry.engineUrl` has no anchor yet, because the engine started
+after the window opened. If no https `caFile` covers that `host:port`, a failure asks the engine
+again in the background. This happens at most once a minute. A failure that arrives while the
+engine is already being asked waits for that answer. If the answer does not fix it, the engine is
+asked once more. The failed request is not retried; the status bar picks the certificate up when
+the answer arrives. Asking the engine is abandoned after a minute, so a hung interpreter cannot stop
+later setting changes from taking effect. Verification stays on throughout.
 
 **The OS trust store.** Unmeasured. VS Code's `http.systemCertificates` (on by default) is meant to
 add the OS store to an extension's https requests. Reading the `@vscode/proxy-agent` 0.45.0 that VS

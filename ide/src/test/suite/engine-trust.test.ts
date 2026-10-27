@@ -581,7 +581,7 @@ suite("a request that fails verification follows a changed anchor once (BACKLOG 
     // And the user is told a retry will work, not sent to fix a configuration that is not at fault.
     await assert.rejects(postJson(TARGET, "/config/reload", {}), (err: unknown) => {
       assert.ok(err instanceof CertificateChangedError, String(err));
-      assert.ok(/new certificate/.test(err.message) && /Retry/.test(err.message), err.message);
+      assert.ok(/certificate .* changed/.test(err.message) && /Retry/.test(err.message), err.message);
       assert.ok(!/serviceConfig|caFile/.test(err.message), err.message);
       assert.strictEqual(err.code, "DEPTH_ZERO_SELF_SIGNED_CERT");
       return true;

@@ -86,17 +86,19 @@ export class NetworkError extends Error {
 }
 
 /**
- * A request that failed verification because the engine's certificate changed, where the client has
- * since followed the new certificate but did not resend the request (a POST; see
- * {@link withRenewalRetry}). A plain retry by the user will verify. Whether the engine received the
- * failed request is not known, so the message asks the user to check before repeating an action.
- * It keeps the TLS `code`, so a caller classifying by code still reads it as a trust failure.
+ * A request that failed verification after which the trust anchor for its engine changed, and that
+ * was not resent (a POST; see {@link withRenewalRetry}). The anchor changes because the engine renewed
+ * its certificate or because a refresh registered a different `caFile`; in the second case the new
+ * anchor is not known to verify, so the message promises nothing beyond "worth one retry". Whether
+ * the engine received the failed request is not known, so it asks the user to check before repeating
+ * an action. It keeps the TLS `code`, so a caller classifying by code still reads a trust failure.
  */
 export class CertificateChangedError extends NetworkError {
   constructor(baseUrl: string, code?: string) {
     super(
-      `the engine at ${baseUrl} presented a new certificate, which is now trusted; this request was ` +
-        `not sent again. Retry it (for an action, check first whether it already took effect).`,
+      `the trusted certificate for the engine at ${baseUrl} changed while this request was in ` +
+        `flight, and the request was not sent again. Retry it; for an action, first check whether ` +
+        `it took effect. If the retry fails the same way, its error names what to fix.`,
       code,
     );
     this.name = "CertificateChangedError";

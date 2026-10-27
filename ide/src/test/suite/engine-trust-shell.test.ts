@@ -467,8 +467,9 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(await trust.refreshEngineTrust(), false);
 
     stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
-    // The refresh runs in the BACKGROUND: it spawns a CLI with no timeout, and a request awaiting it
-    // would stop honouring its own. So this request is not retried; the anchor lands shortly after.
+    // The refresh runs in the BACKGROUND: it spawns a CLI that may run for up to its own timeout, and
+    // a request awaiting it would stop honouring its own. So this request is not retried; the anchor
+    // lands shortly after.
     assert.strictEqual(await trust.followCertificateChange(LOOPBACK, undefined), false);
     await settle();
     assert.strictEqual(invocations.length, 2, "the background refresh never ran");
@@ -642,13 +643,17 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
       await new Promise((resolve) => setImmediate(resolve));
     }
     assert.ok(hung !== undefined, "the refresh never reached the CLI");
-    assert.ok(
-      typeof timeout === "number" && timeout > 0 && timeout <= 60_000,
-      `cert inventory runs with no bounded timeout (${String(timeout)}), so one hung run stalls ` +
-        `every refresh queued behind it`,
-    );
-    // What Node's execFile reports when its timeout kills the child.
-    hung(Object.assign(new Error("killed"), { killed: true, signal: "SIGTERM" }), "", "");
+    try {
+      assert.ok(
+        typeof timeout === "number" && timeout > 0 && timeout <= 60_000,
+        `cert inventory runs with no bounded timeout (${String(timeout)}), so one hung run stalls ` +
+          `every refresh queued behind it`,
+      );
+    } finally {
+      // What Node's execFile reports when its timeout kills the child. In `finally`, so a failed
+      // assertion above does not leave this refresh hung under every later test.
+      hung(Object.assign(new Error("killed"), { killed: true, signal: "SIGTERM" }), "", "");
+    }
     assert.strictEqual(await first, false);
 
     // The count is back to 0, so a failure starts a refresh, and that one anchors the engine.
@@ -686,10 +691,10 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
   });
 
-  test("a failure while the CLI is still running is left to that refresh — the control", async () => {
+  test("a failure the refresh itself fixes runs no follow-up — the control", async () => {
     const planted = plantedEngine();
     childProcess.execFile = cliThatFirst(() => {
-      // Before the CLI answers: the answer below already includes the certificate.
+      // While the CLI runs: the failure is noted, and the answer below already has the certificate.
       void trust.followCertificateChange(LOOPBACK, undefined);
       stubInventory = planted;
     });
@@ -697,8 +702,52 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     await trust.refreshEngineTrust();
     await settle();
 
-    assert.strictEqual(invocations.length, 1, "a refresh that would see the cause ran again anyway");
+    assert.strictEqual(invocations.length, 1, "a refresh that fixed the cause ran again anyway");
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("a failure while the CLI runs is followed up when that refresh does not fix it", async () => {
+    // The CLI reads the engine's state partway through its run, so a certificate minted after that
+    // read and before the answer is invisible to it.
+    stubInventory = NO_CERT_YET;
+    childProcess.execFile = cliThatFirst(() => {
+      if (invocations.length === 0) {
+        void trust.followCertificateChange(LOOPBACK, undefined);
+      }
+    });
+
+    await trust.refreshEngineTrust();
+    await settle();
+
+    assert.strictEqual(invocations.length, 2, "the failure during the CLI run was dropped");
+  });
+
+  test("a refresh does not undo a rotation a request followed while it was reading", async () => {
+    const cert = plantCert(path.join("state", "api-cert.pem"));
+    stubInventory = inventoryFor(cert, "generated");
+    // Pins read after the engine's file, so the request's one read finishes before this refresh
+    // commits; that is the order in which an older read could overwrite a newer one.
+    stubConfig.environments = Array.from({ length: 20 }, (_, i) => ({
+      name: `E${i}`,
+      url: `https://h${i}.example.com:8765`,
+      caFile: plantCert(path.join("pki", `ca-${i}.pem`)),
+    }));
+    await trust.refreshEngineTrust();
+
+    let followed: Promise<boolean> | undefined;
+    onLog = (line): void => {
+      if (followed === undefined && line.includes(`trusting the engine certificate at ${cert}`)) {
+        // This refresh has read PEM. The engine renews now, and a request fails and follows it.
+        fs.writeFileSync(cert, RENEWED);
+        followed = trust.followCertificateChange(LOOPBACK, PEM);
+      }
+    };
+    await trust.refreshEngineTrust();
+    assert.ok(followed !== undefined, "the follow never ran, so this test proves nothing");
+    assert.strictEqual(await followed, true);
+    await settle();
+
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
   });
 
   test("late failures run one follow-up, never a chain", async () => {
