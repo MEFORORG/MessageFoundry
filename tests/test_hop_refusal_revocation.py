@@ -19,14 +19,16 @@ pre-clamp ALLOW and now assert the refusal; each says so at its own docstring.
 
 Loopback / attested hops are byte-identical; a non-enforcing hop WARNs. A synthetic-instance
 relaxation went with BACKLOG #1279 -- every instance carries patient data -- and a proven-terminator
-one (``proxy_proven``, which no call site set) with BACKLOG #3514 item 5. It
+one with BACKLOG #3514 item 5 (pinned below). It
 COMPOSES with #200: #200 refuses the CLEARTEXT / verify-off hop, so revocation fires ONLY on a VERIFYING
 hop — the two gates key on disjoint conditions and never double-refuse one hop.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
+import inspect
 import ssl
 from pathlib import Path
 
@@ -139,7 +141,7 @@ def test_revocation_hop_disposition_matrix() -> None:
     # #1279. Every instance carries patient data, so it had no input left to fire on and this row,
     # which used to ALLOW, now falls through to the refusal below.
     #
-    # enforcing, unproven → REFUSE.
+    # enforcing, not loopback, not CRL-checked, not attested → REFUSE.
     assert disp(enforcing=True) is HopDisposition.REFUSE
     # non-enforcing → WARN (crosses, loud-logged).
     assert disp(enforcing=False) is HopDisposition.WARN
@@ -185,6 +187,15 @@ def test_blanket_attestation_does_not_defeat_an_enforcing_posture() -> None:
             revocation_hop_disposition(enforcing=True, blanket_attested=True, **kwargs)
             is HopDisposition.ALLOW
         ), relaxation
+
+
+def test_the_proven_terminator_input_is_gone() -> None:
+    """BACKLOG #3514 item 5 removed ``proxy_proven``: no call site ever set it, so its ALLOW arm never
+    fired. DEPLOYMENT.md and CONNECTIONS.md now say the authority has no input for an egress
+    terminator, so a change that brings one back must change those pages too."""
+    assert "proxy_proven" not in inspect.signature(revocation_hop_disposition).parameters
+    assert "proxy_proven" not in inspect.signature(RevocationHopGuard.capture).parameters
+    assert "proxy_proven" not in {f.name for f in dataclasses.fields(RevocationHopGuard)}
 
 
 # --- the guard: construction gate + unstamped no-op + attestation audit ------------------------------
@@ -575,6 +586,9 @@ def test_the_store_refusal_names_a_lever_that_exists_for_it() -> None:
     assert "[store].ssl_crl_file" in str(exc.value)
     assert "[store].ssl_root_cert" not in str(exc.value)
     assert "tls_revocation_attested" not in str(exc.value)
+    # BACKLOG #3514 item 5: no proxy is offered. A proxy crosses only when the store is addressed on
+    # loopback, and then by the loopback carve-out, which records nothing.
+    assert "proxy" not in str(exc.value)
 
 
 def test_the_store_crl_closes_its_own_gate_on_the_default_path(bare_crl: str) -> None:
@@ -734,8 +748,7 @@ def test_the_synthetic_arm_is_gone_and_those_hops_now_refuse() -> None:
     Pinned once, on every cell that carried a SYNTHETIC arm before, rather than left implicit in six
     deleted lines. Each of these constructed silently on an instance declared synthetic; each refuses
     now, because there is no declaration that reaches this gate any more. The relaxations asserted
-    below are the two a guard built here can take: on-box and an operator attestation. A proven
-    terminator sat beside them until BACKLOG #3514 item 5 removed it, because no call site set it.
+    below are the two a guard built here can take: on-box and an operator attestation.
     """
     with active_hop_posture(SYNTHETIC_NOW_ENFORCING):
         with pytest.raises(InsecureHopRefused, match="revocation"):

@@ -600,8 +600,8 @@ than warn: `config/settings.py:2338-2342` derives `DataClass.PHI` for `dev`, `st
 and `settings.py:3675` defaults enforcement to `SecurityEnforcement.ENFORCE`. The disposition ladder
 at `tls_policy.py:963-973` has no global audited-opt-out arm (`:958-960`), so the only relaxations are
 loopback, a proven terminator, an attestation, or a non-PHI posture. *(Note 2026-10-27: on an
-outbound hop the "proven terminator" was the `proxy_proven` arm, which no call site ever set, and
-vault BACKLOG #3514 item 5 removed it. The sentence keeps its original wording.)*
+outbound hop the "proven terminator" arm is gone; the docstring of `revocation_hop_disposition`
+says why. The sentence keeps its original wording.)*
 
 **One caveat, stated so nobody reads more coverage into it than exists:**
 `RevocationHopGuard.enforce_construction` **no-ops when the posture is unstamped** — a direct test
@@ -717,8 +717,8 @@ OAuth2 token hop. Two reasons:
 - It delivers the second option's outcome without a second rule. With no context `crl_checked` is
   false, and `refuse_unrevoked_verified_hop` has no `proxy_proven` parameter. So on an enforcing
   instance only a loopback token host or the per-connection `tls_revocation_attested` crosses.
-  *(Note 2026-10-27: since vault BACKLOG #3514 item 5, `revocation_hop_disposition` and
-  `RevocationHopGuard` have no `proxy_proven` parameter either, so no hop can declare one.)*
+  *(Note 2026-10-27: `revocation_hop_disposition` and `RevocationHopGuard` have no `proxy_proven`
+  parameter either now, so no hop can declare one.)*
 
 **The refusal on the ECH arm names the attestation alone.** The default text offers
 `[tls].crl_file`, which cannot cross an ECH hop. (It also offered an egress proxy, which no call
@@ -791,10 +791,8 @@ which the same CRL relaxes the same hop without a sidecar.
   attesting is one environment variable and standing up a proxy is a project. The control is honest by
   construction — the flag is named an attestation and its use is audited — but the residual risk moves
   into a claim the engine cannot check. *(Note 2026-10-27: a revocation-checking egress proxy does
-  not cross the refusal, because the engine has no input for one; vault BACKLOG #3514 item 5 removed
-  the `proxy_proven` parameter that no call site set. Such a proxy still checks revocation on the
-  wire, but the hop crosses only by one of the ways `docs/DEPLOYMENT.md` lists under *The ways
-  across*. The bullet keeps its original wording.)*
+  not cross the refusal; `docs/DEPLOYMENT.md`, *The ways across*, lists what does. The bullet keeps
+  its original wording.)*
 - **Direction 3 remains opt-in and default-off**, so a site that configures nothing gets no
   client-certificate revocation and, on an enforcing PHI posture, a start-time refusal telling it so.
 - **An operator who enables direction 3 takes on CRL refresh.** The engine alarms on expiry

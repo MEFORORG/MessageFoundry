@@ -2482,8 +2482,7 @@ CREDENTIAL_HOP_WAYS_ACROSS = (
 #:
 #: It offered a third lever until BACKLOG #2987 (#2977 item 9): terminate at a revocation-checking
 #: egress proxy. No call site ever declared such a proxy, so routing egress through one never changed
-#: the decision, and the refusal named a remedy the operator could not perform (SDS-3.7). The dead
-#: parameter behind that lever went in BACKLOG #3514 item 5.
+#: the decision, and the refusal named a remedy the operator could not perform (SDS-3.7).
 _CONNECTION_WAYS_ACROSS = (
     "Configure [tls].crl_file so the engine checks a CRL on this hop, or set "
     "tls_revocation_attested=true with a tls_revocation_attested_reason on this connection."
@@ -2978,8 +2977,8 @@ def requests_verify_from_anchor(anchor: TrustAnchor, *, cell: str) -> str | None
     if anchor.crl_file is not None:
         raise ValueError(
             f"{cell}: [tls].crl_file cannot be expressed to a requests-based client, which takes one "
-            f"bundle path and no revocation flag. Terminate this hop at a revocation-checking proxy on "
-            f"the loopback interface or leave the CRL unset rather than have it silently ignored here."
+            f"bundle path and no revocation flag. Leave the CRL unset rather than have it silently "
+            f"ignored here."
         )
     if anchor.cafile is None:
         return None

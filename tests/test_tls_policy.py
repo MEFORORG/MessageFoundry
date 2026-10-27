@@ -1860,8 +1860,11 @@ def test_requests_verify_refuses_a_crl_it_cannot_express(_crl_material: dict[str
         load_system_roots=False,
         crl_file=_crl_material["fresh_only"],
     )
-    with pytest.raises(ValueError, match="crl_file"):
+    with pytest.raises(ValueError, match="crl_file") as refused:
         requests_verify_from_anchor(anchor, cell="probe")
+    # BACKLOG #3514 item 5: it offers no proxy. The Vault guard counts even a loopback address as off
+    # the box once requests selects a proxy, so a proxy is no reliable way across this hop.
+    assert "proxy" not in str(refused.value)
     # Without a CRL the two expressible shapes are unchanged.
     assert requests_verify_from_anchor(SYSTEM_TRUST_ANCHOR, cell="probe") is None
     assert (
