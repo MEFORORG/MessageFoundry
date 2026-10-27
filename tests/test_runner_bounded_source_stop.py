@@ -9,7 +9,9 @@ then kept as residual state and its error re-raised, so the next stop() or start
 
 The runner deliberately adds no bound of its own: cutting or abandoning a stop there would let
 start() rebind over a source still releasing its port or poll task. Each source's own stop() is
-the bound; FileSource's is tests/test_file_source_bounded_stop.py.
+the bound; FileSource's is tests/test_file_source_bounded_stop.py. The one exception is a
+teardown cancelled from outside: the in-flight stops get a bounded grace, then are cut, and a
+second cancel cuts at once (ADR 0157 Amendment B).
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
 """
@@ -34,17 +36,31 @@ class _Source:
     """A stand-in source. ``mode`` picks what ``stop()`` does."""
 
     def __init__(
-        self, name: str, events: list[str], mode: str, barrier: asyncio.Barrier | None = None
+        self,
+        name: str,
+        events: list[str],
+        mode: str,
+        barrier: asyncio.Barrier | None = None,
+        gate: asyncio.Event | None = None,
     ) -> None:
         self.name = name
         self.events = events
         self.mode = mode
         self.barrier = barrier
+        self.gate = gate
         self.stop_calls = 0
 
     async def stop(self) -> None:
         self.stop_calls += 1
         self.events.append(f"start:{self.name}")
+        try:
+            await self._body()
+        except asyncio.CancelledError:
+            self.events.append(f"cut:{self.name}")
+            raise
+        self.events.append(f"end:{self.name}")
+
+    async def _body(self) -> None:
         if self.mode == "slow":
             assert self.barrier is not None
             # Every stop must be in flight at once to pass this rendezvous; a serial loop never does.
@@ -56,7 +72,9 @@ class _Source:
                 raise OSError("shutdown raised")
         elif self.mode == "hangs":
             await asyncio.Event().wait()
-        self.events.append(f"end:{self.name}")
+        elif self.mode == "gated":
+            assert self.gate is not None
+            await self.gate.wait()
 
 
 class _Dispatcher:
@@ -67,12 +85,12 @@ class _Dispatcher:
         self.events.append("dispatchers")
 
 
-def _runner(events: list[str], **modes: str) -> RegistryRunner:
+def _runner(events: list[str], gate: asyncio.Event | None = None, **modes: str) -> RegistryRunner:
     runner = RegistryRunner(Registry(), store=None, egress=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]
     slow = sum(mode == "slow" for mode in modes.values())
     barrier = asyncio.Barrier(slow) if slow else None
     for name, mode in modes.items():
-        runner._sources[name] = _Source(name, events, mode, barrier)  # type: ignore[assignment]
+        runner._sources[name] = _Source(name, events, mode, barrier, gate)  # type: ignore[assignment]
     runner._dispatchers[Stage.INGRESS] = _Dispatcher(events)  # type: ignore[assignment]
     return runner
 
@@ -132,21 +150,80 @@ async def test_a_failed_stop_is_retried_by_the_next_stop() -> None:
     assert runner._sources == {} and not runner.has_residual_state
 
 
-async def test_an_outer_cancel_propagates_and_leaves_the_sources_residual() -> None:
-    """ADR 0157 D7: a cancelled teardown must surface the cancel and leave _sources populated, so
-    start() re-runs teardown instead of building over a listener that may still be bound."""
+async def _started(events: list[str], *names: str) -> None:
+    while not all(f"start:{name}" in events for name in names):
+        await asyncio.sleep(0)
+
+
+async def _yield(turns: int = 5) -> None:
+    for _ in range(turns):
+        await asyncio.sleep(0)
+
+
+async def test_an_outer_cancel_lets_the_in_flight_stops_finish() -> None:
+    """ADR 0157 Amendment B. Mutation: await gather() over the stops again. Red: the cancel cuts
+    both stops at once, so neither records end: and both record cut:."""
+    events: list[str] = []
+    gate = asyncio.Event()
+    runner = _runner(events, gate, IB_A="gated", IB_B="gated")
+
+    task = asyncio.create_task(runner.stop())
+    await _started(events, "IB_A", "IB_B")
+    task.cancel()
+    await _yield()
+    assert not task.done()  # the grace holds the cancel back while the stops run
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sorted(e for e in events if e.startswith(("end:", "cut:"))) == ["end:IB_A", "end:IB_B"]
+    assert "dispatchers" not in events  # the rest of teardown never ran
+    # ADR 0157 D7: the clears never ran, so start() re-runs teardown instead of building over them.
+    assert set(runner._sources) == {"IB_A", "IB_B"}
+    assert runner.has_residual_state and not runner.running
+
+
+async def test_an_outer_cancel_cuts_a_hung_stop_after_the_grace(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The grace is bounded, so one wedged stop cannot hang asyncio.run's shutdown. Mutation: wait
+    with no timeout. Red: the task never finishes and wait_for times out."""
+    monkeypatch.setattr(wiring_runner, "_CANCELLED_STOP_GRACE_SECONDS", 0.05)
     events: list[str] = []
     runner = _runner(events, IB_HANG="hangs", IB_OK="ok")
 
     task = asyncio.create_task(runner.stop())
-    while "start:IB_HANG" not in events:
-        await asyncio.sleep(0)
+    await _started(events, "IB_HANG", "IB_OK")
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    with (
+        caplog.at_level(logging.WARNING, logger=wiring_runner.log.name),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await asyncio.wait_for(task, _RENDEZVOUS_SECONDS)
 
+    assert "end:IB_OK" in events and "cut:IB_HANG" in events
+    assert "1 inbound stop(s) were still running" in caplog.text
     assert set(runner._sources) == {"IB_HANG", "IB_OK"}
     assert not runner.running
+
+
+async def test_a_second_outer_cancel_cuts_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mutation: drop the CancelledError arm around the grace wait. Red: the second cancel escapes
+    with the hung stop never cancelled, so cut:IB_HANG is missing."""
+    monkeypatch.setattr(wiring_runner, "_CANCELLED_STOP_GRACE_SECONDS", 60.0)
+    events: list[str] = []
+    runner = _runner(events, IB_HANG="hangs")
+
+    task = asyncio.create_task(runner.stop())
+    await _started(events, "IB_HANG")
+    task.cancel()
+    await _yield()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, _RENDEZVOUS_SECONDS)
+
+    assert "cut:IB_HANG" in events
+    assert set(runner._sources) == {"IB_HANG"}
 
 
 async def test_control_healthy_stops_log_nothing(caplog: pytest.LogCaptureFixture) -> None:

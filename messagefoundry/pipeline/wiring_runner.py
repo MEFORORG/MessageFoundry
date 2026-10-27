@@ -910,6 +910,10 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 #: inside one stop() — a 1x bound would cancel in precisely the slow-but-healthy case it exists to
 #: settle, taking the ADR 0031 rebind-failure branch instead.
 _PENDING_STOP_SETTLE_SECONDS = 10.0
+#: How long a SHUTDOWN teardown cancelled from outside still lets its in-flight source stops run
+#: before it cuts them (BACKLOG #1620, ADR 0157 Amendment B). The same 2x-client-grace sizing as
+#: above, for the same slow-but-healthy listener stop. A second cancel cuts at once.
+_CANCELLED_STOP_GRACE_SECONDS = _PENDING_STOP_SETTLE_SECONDS
 
 
 class DrIntakeState(NamedTuple):
@@ -5751,6 +5755,37 @@ class RegistryRunner:
                 _PENDING_STOP_SETTLE_SECONDS,
             )
 
+    async def _join_cancelled_source_stops(self, tasks: list[asyncio.Task[None]]) -> None:
+        """The SHUTDOWN source phase was cancelled from outside (BACKLOG #1620, ADR 0157 Amendment B).
+
+        Let the in-flight stops finish for up to :data:`_CANCELLED_STOP_GRACE_SECONDS`, then cut the
+        rest and join their cancellation. A second cancel during the grace cuts at once. Cutting at
+        once on the FIRST cancel would cut every source together (the serial loop cut one), and
+        Database/RemoteFile/Timer's stop() cancels its poll task when cut, a poll that may be inside
+        a store call. Waiting with no bound would hang ``asyncio.run``'s shutdown on one wedged
+        stop, which the serial loop never did. The caller re-raises the cancel; the clears never
+        run, so every source stays in ``_sources`` for the next stop()/start() (ADR 0157 D7).
+        """
+        try:
+            _done, still = await asyncio.wait(tasks, timeout=_CANCELLED_STOP_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            still = {task for task in tasks if not task.done()}
+        if still:
+            for task in still:
+                task.cancel()
+            log.warning(
+                "shutdown cancelled: %d inbound stop(s) were still running after %.1fs or a "
+                "second cancel and were cut; they stay registered and the next stop() or "
+                "start() stops them again",
+                len(still),
+                _CANCELLED_STOP_GRACE_SECONDS,
+            )
+            await asyncio.gather(*still, return_exceptions=True)
+        for task in tasks:
+            failure = None if task.cancelled() else task.exception()
+            if failure is not None:
+                log.warning("shutdown cancelled: an inbound stop() failed: %s", safe_exc(failure))
+
     async def _teardown_unsafe(
         self,
         reason: TeardownReason = TeardownReason.SHUTDOWN,
@@ -5765,7 +5800,8 @@ class RegistryRunner:
         lookup-executor close wait (:meth:`_teardown_body` states it); every other phase, and
         their order, is shared. Under SHUTDOWN the executed statements are the pre-ADR-0157 ones,
         except at least that the source stops now run concurrently and a failed one is raised only
-        after the rest of teardown has run (BACKLOG #1620); none is bounded or abandoned.
+        after the rest of teardown has run (BACKLOG #1620); none is bounded or abandoned, except
+        that a teardown cancelled from outside cuts them after a grace (ADR 0157 Amendment B).
 
         **THE INVARIANT: ``self._running = False`` must execute on every path.**
         ``Engine._reconcile_graph``'s bring-up branch is ``is_leader() and not running``, so a teardown
@@ -5854,16 +5890,28 @@ class RegistryRunner:
             # _sources after the clears below and the first failure is re-raised there, so it stays
             # residual state and the next stop()/start() retries it (DicomSource.stop() keeps its
             # server for exactly that retry).
+            # An OUTER cancel must not cut every in-flight stop at once, as gather() would: the
+            # serial loop cut at most one. asyncio.wait never cancels its awaitables, so the stops
+            # keep running; _join_cancelled_source_stops gives them a bounded grace (ADR 0157
+            # Amendment B) and the cancel is re-raised after it.
             sources = list(self._sources.items())  # snapshot BEFORE the await (ADR 0157 Inc 4)
-            results = await asyncio.gather(
-                *(source.stop() for _, source in sources), return_exceptions=True
-            )
-            for (name, source), result in zip(sources, results, strict=True):
-                if isinstance(result, BaseException):
-                    log.warning("inbound %r: stop() failed: %s", name, safe_exc(result))
+            tasks = [
+                asyncio.create_task(source.stop(), name=f"shutdown-stop:{name}")
+                for name, source in sources
+            ]
+            if tasks:
+                try:
+                    await asyncio.wait(tasks)
+                except asyncio.CancelledError:
+                    await self._join_cancelled_source_stops(tasks)
+                    raise
+            for (name, source), task in zip(sources, tasks, strict=True):
+                failure = asyncio.CancelledError() if task.cancelled() else task.exception()
+                if failure is not None:
+                    log.warning("inbound %r: stop() failed: %s", name, safe_exc(failure))
                     failed_sources[name] = source
                     if first_stop_failure is None:
-                        first_stop_failure = result
+                        first_stop_failure = failure
             # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
             # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
             # _stop.set(). The shared _stop already broke their loops; d.stop() cancels each
