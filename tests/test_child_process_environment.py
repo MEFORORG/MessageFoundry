@@ -41,10 +41,12 @@ from messagefoundry import _child_bootstrap, childenv
 from messagefoundry.config import settings
 from messagefoundry.config.environments import VALUE_ENV_PREFIX
 from messagefoundry.config.run_context import RunContext
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry, load_config
-from messagefoundry.pipeline import dr, supervisor
+from messagefoundry.pipeline import Engine, dr, supervisor
 from messagefoundry.pipeline import sandbox as sandbox_mod
 from messagefoundry.pipeline.dryrun import transform_one
+from messagefoundry.store import MessageStore
 from tests.test_dangerous_functionality_doc import (
     _ARGV,
     _ATTRIBUTE_STARTS,
@@ -492,7 +494,8 @@ async def test_a_listed_name_that_is_not_set_is_logged_by_name(
 def test_only_the_dependency_auditor_calls_the_deny_list() -> None:
     """``non_engine_environment`` lets a secret under any other name cross, so the spawn guard's
     trust in it is pinned to its one caller. The control plants a second caller."""
-    sources = _package_sources()
+    # Every tree the spawn guard reads, the web console included.
+    sources = _scanned_sources()
     target = "messagefoundry.childenv.non_engine_environment"
 
     def refers(source: str) -> bool:
@@ -562,29 +565,70 @@ def test_dr_pass_environment_is_refused_at_load(tmp_path: Path) -> None:
     assert loaded.dr.pass_environment == (_PASSED, "OTHER_NAME")
 
 
-def test_the_coordinator_warns_at_start_about_an_unset_listed_name(
+_EGRESS = EgressSettings(deny_by_default=False)
+
+
+@pytest.mark.asyncio
+async def test_the_engine_warns_at_construction_about_an_unset_listed_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Before the disaster: the coordinator that runs a hook is built only at the first activate,
+    so the engine itself checks. No hook configured is the control."""
+    monkeypatch.delenv(_PASSED, raising=False)
+    store = await MessageStore.open(tmp_path / "dr-env.db")
+    try:
+        for hook, expected in (("", False), ("exit 0", True)):
+            caplog.clear()
+            dr_settings = settings.DrSettings(
+                enabled=True, pass_environment=(_PASSED,), takeover_hook=hook
+            )
+            with caplog.at_level("WARNING", logger=dr.log.name):
+                Engine(store, config_dir=None, dr_settings=dr_settings, egress_settings=_EGRESS)
+            assert (_PASSED in caplog.text) is expected
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_hook_points_at_the_setting(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Before the disaster, not only when a hook runs. No hook configured is the control."""
-    monkeypatch.delenv(_PASSED, raising=False)
+    """The hook's output is discarded, so its failure names the allowlist as a suspect. The control
+    is a hook that succeeds, which logs nothing."""
 
-    def build(takeover_hook: str = "") -> None:
-        dr.DrCoordinator(
-            cast(Any, None),
-            settings.DrSettings(
-                enabled=True, pass_environment=(_PASSED,), takeover_hook=takeover_hook
-            ),
-            store_settings=None,
-            activate_profile=_never_awaited,
-            deactivate_profile=_never_awaited,
+    async def failing(command: str, **kwargs: Any) -> bool:
+        return command != "fails"
+
+    monkeypatch.setattr(dr, "_run_command", failing)
+    coordinator = dr.DrCoordinator(
+        cast(Any, None),
+        settings.DrSettings(enabled=True),
+        store_settings=None,
+        activate_profile=_never_awaited,
+        deactivate_profile=_never_awaited,
+    )
+    with caplog.at_level("WARNING", logger=dr.log.name):
+        await coordinator._run_vip_hook("works", phase="release", actor="t", now=0.0)
+        assert "[dr].pass_environment" not in caplog.text
+        await coordinator._run_vip_hook("fails", phase="release", actor="t", now=0.0)
+    assert "[dr].pass_environment" in caplog.text
+
+
+def test_a_secret_reference_may_not_be_passed_on(tmp_path: Path) -> None:
+    """Under ``[secrets].provider = "env"`` the engine reads a reference's variable as a secret, so
+    neither setting may hand it to a child. The control is the same file under another provider."""
+    path = tmp_path / "messagefoundry.toml"
+    for section in ("dr", "sandbox"):
+        text = (
+            '[auth]\nad_bind_password_secret = "SITE_BIND_PW"\n'
+            f'[{section}]\npass_environment = ["SITE_BIND_PW"]\n'
         )
-
-    with caplog.at_level("WARNING", logger=dr.log.name):
-        build()
-    assert _PASSED not in caplog.text
-    with caplog.at_level("WARNING", logger=dr.log.name):
-        build(takeover_hook="exit 0")
-    assert _PASSED in caplog.text
+        path.write_text('[secrets]\nprovider = "env"\n' + text, encoding="utf-8")
+        with pytest.raises(ValueError, match=f"{section}.pass_environment: SITE_BIND_PW"):
+            settings.load_settings(config_path=path, environ={})
+        path.write_text(text, encoding="utf-8")
+        loaded = settings.load_settings(config_path=path, environ={})
+        assert getattr(loaded, section).pass_environment == ("SITE_BIND_PW",)
 
 
 def test_an_engine_shard_keeps_every_variable() -> None:

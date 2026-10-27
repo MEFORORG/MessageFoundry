@@ -70,7 +70,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.crl_reload import CrlReloadRunner
-from messagefoundry.pipeline.dr import DrCoordinator
+from messagefoundry.pipeline.dr import DrCoordinator, warn_unset_pass_environment
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
 from messagefoundry.pipeline.intake_bound import IntakeBoundMonitor
@@ -804,6 +804,12 @@ class Engine:
         # until it is (vault BACKLOG #3140).
         self._priority_default = priority_default
         self._dr_settings = dr_settings or DrSettings()
+        if self._dr_settings.enabled and (
+            self._dr_settings.takeover_hook or self._dr_settings.release_hook
+        ):
+            # At start, not only when a hook runs, which on a DR box is during the disaster: the
+            # coordinator that runs hooks is built only at the first activate or release.
+            warn_unset_pass_environment(self._dr_settings.pass_environment)
         # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Latched from
         # [dr].enabled AND [dr].activate at construction; flipped True by the DR coordinator on a
         # successful POST /dr/activate (which then reloads the graph so the run-profile filter applies)

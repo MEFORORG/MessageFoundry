@@ -490,6 +490,6 @@ def test_pass_environment_never_echoes_a_value_typed_by_mistake(
     with pytest.raises(ValidationError) as refused:
         section(pass_environment=("OK_NAME", "SITE_FLAG=canary-value"))
     text = str(refused.value)
-    assert "entry 2" in text  # the control: this is the refusal for that entry
+    assert f"{key}: an entry is not" in text  # the control: this is the refusal for that entry
     assert "canary-value" not in text
     assert "SITE_FLAG" not in text

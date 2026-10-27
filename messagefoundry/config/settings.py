@@ -2333,12 +2333,16 @@ def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -
     ``MEFOR_*`` variable at all, and no secret a library reads on the engine's behalf
     (:func:`messagefoundry.childenv.outside_engine_namespace`, reused so the two cannot drift).
     Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
-    added. The text never echoes a value: an entry that is not a name is cited by its position,
-    since ``NAME=value`` typed by mistake would carry the value (vault BACKLOG #2600)."""
-    for position, name in enumerate(names, start=1):
+    added. The text never echoes an entry that is not a name, since ``NAME=value`` typed by
+    mistake would carry the value (vault BACKLOG #2600). Nor does it number one: the env form drops
+    empty entries before this runs, so a position could point at the wrong one.
+
+    A secret reference under ``[secrets].provider = "env"`` is refused once the model is built,
+    by :func:`_reject_passed_secret_references`, which sees every section."""
+    for name in names:
         if not (name.isascii() and name.isidentifier()):
             raise ValueError(
-                f"{key}: entry {position} is not an environment variable name; "
+                f"{key}: an entry is not an environment variable name; "
                 "list names only, never NAME=value"
             )
         if not outside_engine_namespace(name):
@@ -7598,6 +7602,23 @@ _SECRET_REFERENCE_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _reject_passed_secret_references(settings: ServiceSettings, data: Mapping[str, Any]) -> None:
+    """Refuse a ``pass_environment`` name that a ``[secrets].provider = "env"`` reference reads as
+    a secret, such as ``[auth].ad_bind_password_secret`` (vault BACKLOG #2587). The field
+    validators see one section, so this runs once the model is built. Names only, never a value."""
+    referenced = _env_secret_reference_names(data)
+    for key, names, receiver in (
+        ("sandbox.pass_environment", settings.sandbox.pass_environment, "a worker"),
+        ("dr.pass_environment", settings.dr.pass_environment, "a hook"),
+    ):
+        for name in names:
+            if _env_name_key(name) in referenced:
+                raise ValueError(
+                    f"{key}: {name} is a secret reference under [secrets].provider = 'env'; "
+                    f"it may not be passed to {receiver}"
+                )
+
+
 #: Whether this platform's environment names ignore letter case. On Windows ``os.environ`` holds
 #: every name in upper case and ``os.environ.get`` finds one written in any case, so the ``env``
 #: secret provider resolves a reference spelled ``Mefor_Smtp_Password``. The spare for such a
@@ -10013,6 +10034,7 @@ def load_settings(
         _merge(data, cli)
 
     settings = ServiceSettings.model_validate(data)
+    _reject_passed_secret_references(settings, data)
     # AFTER the CLI merge, so a `--host` that moved the socket off-box is reported as the posture
     # loosening it is. One-way: it only ever ADDS a loosening. See the helper for why.
     _reconcile_effective_bind(settings)

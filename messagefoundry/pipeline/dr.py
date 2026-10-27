@@ -229,9 +229,6 @@ class DrCoordinator:
     ) -> None:
         self._store = store
         self._settings = settings
-        if settings.takeover_hook or settings.release_hook:
-            # At start too, not only when a hook runs, which on a DR box is during the disaster.
-            _warn_unset_pass_environment(settings.pass_environment)
         # The instance posture, for the Vault hop the cold-seed verify can dial (vault BACKLOG
         # #2983). The engine passes its own. `None` counts as enforcing on that hop.
         self._hop_posture = hop_posture
@@ -1300,7 +1297,7 @@ class DrCoordinator:
             ok = False
             reason = f"VIP {phase} hook errored: {safe_exc(exc)}"
         else:
-            reason = "" if ok else f"VIP {phase} hook exited non-zero"
+            reason = "" if ok else f"VIP {phase} hook exited non-zero{_HOOK_ENVIRONMENT_HINT}"
         if not ok:
             if phase == "takeover":
                 # A hook that ran and then failed or was killed may have moved the address before
@@ -1375,7 +1372,15 @@ class DrCoordinator:
             log.warning("DR: %s alert failed", event, exc_info=True)
 
 
-def _warn_unset_pass_environment(names: Collection[str]) -> None:
+#: Appended to a failed hook's reason: its output is discarded, and a variable it read that nobody
+#: listed in `[dr].pass_environment` is the cause the allowlist adds (vault BACKLOG #2587).
+_HOOK_ENVIRONMENT_HINT = (
+    " (a hook gets only the variables childenv.hook_environment allows; add one it reads to "
+    "[dr].pass_environment and restart)"
+)
+
+
+def warn_unset_pass_environment(names: Collection[str]) -> None:
     """Log, by name only, each ``[dr].pass_environment`` name the engine's environment lacks."""
     unset = [name for name in names if name not in os.environ]
     if unset:
@@ -1412,7 +1417,7 @@ async def _run_command(
     processes, such as a service wrapper's tree kill or a signal to the engine's process group,
     can still end it. A hook that finishes on its own is left alone either way, including
     anything it left running."""
-    _warn_unset_pass_environment(pass_environment)
+    warn_unset_pass_environment(pass_environment)
     spawn = asyncio.ensure_future(
         asyncio.create_subprocess_shell(
             command,
