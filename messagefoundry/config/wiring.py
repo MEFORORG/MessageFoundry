@@ -794,8 +794,8 @@ def refuse_resolved_verify_off(
     if type_ is ConnectorType.REMOTEFILE:
         if remote_file_protocol(settings) == "ftp" and settings.get("tls_ca_file"):
             raise WiringError(
-                f"{where}: Ftp tls_ca_file would never be read: tls resolved to a false or empty "
-                "value, and plain FTP builds no TLS context."
+                f"{where}: Ftp tls_ca_file would never be read: the protocol resolved to plain "
+                "ftp (tls off), which builds no TLS context."
             )
         return
     if type_ is not ConnectorType.DICOMWEB or "verify_tls" not in settings:
@@ -1289,14 +1289,15 @@ _SETTINGS_FACTORY_NAMES: Final = frozenset({"DatabaseLookup"})
 
 #: The boolean settings a ``with_*`` composer in another module writes under a key that is not its
 #: parameter's name (``with_smart_backend(enabled=)`` stores ``smart_enabled``), so the annotation
-#: scan cannot find them (vault BACKLOG #3234), each with what a resolved ``None`` reads as. That is
-#: off, not the composer's default of on: the readers' documented rule is that a falsy flag is off,
-#: the conservative reading (``smart_auth_configured``, ``oauth2_auth_configured``), and reading a
-#: ``None`` as on would start a token hop the author did not ask for. Listed rather than imported,
-#: so the first resolve does not load the composers' modules and ``cryptography``.
-#: ``tests/test_env_uncast_bool_setting.py`` pins the key set against the composers' source.
-_COMPOSER_BOOL_SETTINGS: Final[Mapping[str, bool]] = MappingProxyType(
-    {"smart_enabled": False, "oauth2_enabled": False, "sign_enabled": False}
+#: scan cannot find them (vault BACKLOG #3234), each with what a resolved ``None`` reads as. SMART
+#: and OAuth2 read it as off, not the composer's default of on: their readers' documented rule is
+#: that a falsy flag is off (``smart_auth_configured``, ``oauth2_auth_configured``), and reading a
+#: ``None`` as on would start a token hop the author did not ask for. ``sign_enabled`` keeps
+#: ``None``: its reader, ``OutboundSigning``, refuses it, and off would silently stop signing.
+#: Listed rather than imported, so the first resolve does not load the composers' modules and
+#: ``cryptography``. ``tests/test_env_uncast_bool_setting.py`` pins the key set against the source.
+_COMPOSER_BOOL_SETTINGS: Final[Mapping[str, bool | None]] = MappingProxyType(
+    {"smart_enabled": False, "oauth2_enabled": False, "sign_enabled": None}
 )
 
 
@@ -4505,7 +4506,8 @@ def Ftp(
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
-    # An env() tls is truthy here; ``unread_ca_reason`` judges the resolved protocol (#3234).
+    # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
+    # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
     _check_tls_ca_file(
         "Ftp", tls_ca_file, unread=None if tls else "plain FTP (tls=False) builds no TLS context"
     )

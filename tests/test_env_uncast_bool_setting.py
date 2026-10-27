@@ -248,10 +248,12 @@ def test_a_composer_enabled_flag_reads_strictly(spelling: str, want: bool, cast:
 
 
 @pytest.mark.parametrize("key", _COMPOSER_KEYS)
-def test_a_composer_flag_reads_none_as_off_and_refuses_an_unknown_spelling(key: str) -> None:
-    # Off, not the composer's default of on: the readers' rule is that a falsy flag is off, so a
-    # None that used to reach them as off must not now start a token hop.
-    assert resolve_env_settings({key: env("k", default=None)}, {})[key] is False
+def test_a_composer_flag_keeps_its_none_reading_and_refuses_an_unknown_spelling(key: str) -> None:
+    # SMART and OAuth2: off, not the composer's default of on. Their readers' rule is that a falsy
+    # flag is off, so a None that used to reach them as off must not now start a token hop. Signing
+    # keeps the None, which OutboundSigning refuses, rather than silently stop signing.
+    want = {"smart_enabled": False, "oauth2_enabled": False, "sign_enabled": None}[key]
+    assert resolve_env_settings({key: env("k", default=None)}, {})[key] is want
     with pytest.raises(WiringError, match=f"setting '{key}' \\(env 'k'\\): value is not a valid"):
         resolve_env_settings({key: env("k")}, {"k": "maybe"})
 
@@ -306,7 +308,7 @@ def test_every_composer_bool_parameter_writes_a_listed_key() -> None:
         (key,) = [k for k in on.settings if on.settings[k] != off.settings.get(k)]
         written.add(key)
     assert written == set(_COMPOSER_BOOL_SETTINGS)
-    assert all(_bool_settings().defaults[key] is False for key in written)
+    assert {key: _bool_settings().defaults[key] for key in written} == _COMPOSER_BOOL_SETTINGS
 
 
 _COMPOSER_MODULE = """

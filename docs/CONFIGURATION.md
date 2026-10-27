@@ -499,7 +499,8 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   the `enabled` flag of `with_smart_backend`, `with_oauth2_client_credentials` and `with_signing`.
   It covers `Ftp(tls=...)` too, which the factory turns into the protocol, so `false` means plain
   FTP there. An empty value is refused, not read as false. A `None` default takes the setting's
-  own default, such as on for `verify_tls`. On a composer's `enabled` flag it reads as off. Not
+  own default, such as on for `verify_tls`. On the SMART and OAuth2 composers' `enabled` flag it
+  reads as off, and signing refuses it. Not
   every reading is covered. A code-first literal is passed as written. At least some checks read
   a setting before `env()` resolves, so they see the reference and not its value. A cast you write
   yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a boolean
