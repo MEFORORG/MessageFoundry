@@ -1036,8 +1036,14 @@ async def test_a_held_lane_pages_lane_stuck_once_at_the_infra_fault_bound(
     def broken(name: str, *, detail: str) -> None:
         raise RuntimeError("simulated alert sink fault")
 
+    # A second hold in the same episode (the tail's, after the head's) does not page again.
+    failures = 0
+    assert await dispatcher._land_while_holding("IB", "release_claimed", failing) is True
+    assert len(stuck) == 1
+
     monkeypatch.setattr(sink, "lane_stuck", broken)
     failures = 0
+    dispatcher._states["IB"].lane_stuck_alerted = False  # a new episode
     # A raising sink is logged, never raised: the serializer still holds the lane.
     assert await dispatcher._land_while_holding("IB", "release_claimed", failing) is True
 

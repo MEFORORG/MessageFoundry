@@ -1464,10 +1464,13 @@ class StageDispatcher:
         """Raise ``lane_stuck`` once for a lane held by :meth:`_land_while_holding`: a held lane
         never reaches :meth:`_apply_retry`, so the ADR 0070 fix B streak cannot page it. Marks the
         episode alerted, so :meth:`_maybe_lane_stuck_alert` does not page it again once the write
-        lands. A sink that raises is logged and swallowed, as :meth:`_to_stopped` does, because the
+        lands, and an episode already alerted (the head's hold, then the tail's) is not paged again.
+        A sink that raises is logged and swallowed, as :meth:`_to_stopped` does, because the
         serializer still holds the lane and must not die on an alert."""
         st = self._states.get(lane)
         if st is not None:
+            if st.lane_stuck_alerted:
+                return
             st.lane_stuck_alerted = True
         try:
             self._alert_sink.lane_stuck(
