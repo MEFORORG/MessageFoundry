@@ -323,7 +323,10 @@ def judge_every_crl(
     ``refuse_unread_extensions``** (:data:`_UNREAD_EXTENSIONS`; vault BACKLOG #3506). With it, such
     a block refuses by name, as a ``ValueError``, like any other block that cannot be judged. A
     start and the running-hop reload pass it. The expiry scan's check of a CRL in a CA file does
-    not, so what it reports for such a CRL is what it reported before #3506.
+    not, so what it reports for such a CRL is what it reported before #3506: a hold on engine PR
+    2566 (vault row #4532) found that that check reported it, by the ``ValueError``, as one to
+    replace before a restart, a report it had not made before. A start loads such a CRL from a CA
+    file unjudged.
 
     The strict sibling of :func:`read_soonest_crl_facts`, for a context load (``harden_crl_check``)
     and the running-hop reload (BACKLOG #299). The monitor skips a block it cannot judge so one bad
@@ -500,6 +503,12 @@ def quoted_issuer(issuer: str) -> str:
     return f"{quoted}... (cut: the name is {len(issuer)} characters)"
 
 
+#: What ``cryptography`` raises, at least, for CRL extensions it cannot read, beside a duplicate
+#: extension, which :func:`_crl_extensions` refuses itself: a general name it does not support,
+#: such as an x400Address, and, where warnings are errors, a deprecation it warns of. Neither is a
+#: ``ValueError``. :func:`judge_every_crl` says who refuses these by name (vault BACKLOG #3506).
+_UNREAD_EXTENSIONS = (x509.UnsupportedGeneralNameType, CryptographyDeprecationWarning)
+
 #: What ``cryptography`` raises for a CA certificate it cannot read, at least. A CA that raises
 #: one is skipped by :func:`judge_crl_signatures`, alone. ``InvalidVersion`` comes from the
 #: parse, and ``UnsupportedGeneralNameType`` from reading extensions; neither is a ``ValueError``.
@@ -509,18 +518,7 @@ def quoted_issuer(issuer: str) -> str:
 #: (:func:`_crl_extensions`). It stays here for any other deprecation the parse warns of, so such
 #: a CA is skipped alone rather than ending the whole judgment (vault BACKLOG #3506).
 #: :func:`_signature_state` reads a CRL whose own extensions raise one of these as ``unlisted``.
-_UNREADABLE_CA = (
-    ValueError,
-    x509.InvalidVersion,
-    x509.UnsupportedGeneralNameType,
-    CryptographyDeprecationWarning,
-)
-
-#: What ``cryptography`` raises, at least, for CRL extensions it cannot read, beside a duplicate
-#: extension, which :func:`_crl_extensions` refuses itself: a general name it does not support,
-#: such as an x400Address, and, where warnings are errors, a deprecation it warns of. Neither is a
-#: ``ValueError``. :func:`judge_every_crl` says who refuses these by name (vault BACKLOG #3506).
-_UNREAD_EXTENSIONS = (x509.UnsupportedGeneralNameType, CryptographyDeprecationWarning)
+_UNREADABLE_CA = (ValueError, x509.InvalidVersion, *_UNREAD_EXTENSIONS)
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
 _NameKey = tuple[tuple[tuple[str, bool, str | bytes], ...], ...]

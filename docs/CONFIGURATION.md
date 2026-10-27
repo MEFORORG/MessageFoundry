@@ -2212,6 +2212,12 @@ copy. If another setting names the same file, that file's row still reports thos
 share `warn_days` with certificates. So a CRL reissued more often than `warn_days` sits inside the
 window and alerts on every scan.
 
+The scan's check of a CA file does not judge a CRL whose extensions the engine cannot read, such as
+one naming its CA's issuer as an x400Address, though a start refuses that CRL in a CRL setting
+(vault BACKLOG #3506). A start loads it from a CA file unjudged. The scan logs an ERROR on each pass
+that it could not judge the held copies, and dates that row by the file alone, so an alert for it has
+an empty `detail`. A held copy that lapses sooner than the file then raises no alert of its own.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `warn_days` | int | 30 | alert when a served cert expires within this many days; **`0` disables** the monitor. `0`, or any value below `30`, is named as the security loosening `cert_monitor.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |

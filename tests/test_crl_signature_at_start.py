@@ -50,7 +50,6 @@ from messagefoundry.keywrap import der_children, read_der_tlv
 from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE, FIX, reload_replaced_crls
 from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
 from tests.test_crl_held_copy_alert import _bundle_scan
-from tests.test_crl_held_copy_alert import _hop as _bundle_hop
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
 from tests.test_trust_anchor_byte_binding import _handshake
 
@@ -1150,23 +1149,25 @@ def test_a_crl_whose_extensions_do_not_read_is_refused_by_name(tmp_path: Path) -
     assert _hop(ca_file, crl).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
-def test_the_ca_file_scan_reports_a_crl_whose_extensions_do_not_read_as_before(
+def test_the_ca_file_scan_does_not_call_a_crl_whose_extensions_do_not_read_unjudged(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The Lander's hold on vault BACKLOG #3506. The refusal by name above is for a start and the
-    reload. It must not change what the expiry scan reports for a CA file holding such a CRL,
-    which nothing at start checks, so a restart loads it. At fc2ee122f the scan reported it as
-    a CRL the engine cannot judge, to be replaced before a restart. What the scan reports is held
-    to what it reported before #3506, measured at origin/main 93f6438c7: no held-copy account and
-    no remedy, and one ERROR that it could not judge the held copies, with ``cryptography``'s own
-    error. That ERROR drops the held copy's date from the alert, before #3506 as now."""
+    """The Lander's hold on engine PR 2566 (vault row #4532, BACKLOG #3506). The refusal by name
+    above is for a start and the reload. It must not change what the expiry scan reports for a
+    CA file holding such a CRL, which nothing at start checks, so a restart loads it. An earlier
+    head of that PR reported it as a CRL the engine cannot judge, to be replaced before a
+    restart. What the scan reports is held to what it reported before #3506, measured at
+    origin/main 93f6438c7: no held-copy account and no remedy, and one ERROR that it could not
+    judge the held copies, with ``cryptography``'s own error. That ERROR leaves the held copy's
+    date out of the row, before #3506 as now, and ``docs/CONFIGURATION.md`` says so. A change
+    that closes that gap without the unjudged remedy may change the first assertion."""
     key = ec.generate_private_key(ec.SECP256R1())
     ca_pem = ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key, 0x01)).encode("ascii")
     bundle = tmp_path / "ca-bundle.pem"
     bundle.write_bytes(ca_pem + _crl(key, names=key, name=_ZERO_NAME))
     crl = tmp_path / "crl.pem"
     crl.write_bytes(_crl(key, names=key, name=_ZERO_NAME, age=2 * _DAY))
-    hop = _bundle_hop(bundle, crl)  # holds the CA file's CRL, and checks revocation
+    hop = _hop(bundle, crl)  # holds the CA file's CRL, and checks revocation
     bundle.write_bytes(ca_pem + _crl_naming_serial(key, key, 0x01, x400=True))
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.cert_expiry"):

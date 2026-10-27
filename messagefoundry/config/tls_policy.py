@@ -730,9 +730,10 @@ def judge_crl_bytes(
     load. An expired CRL refuses, because past ``nextUpdate`` it fails every peer, not only revoked
     ones. So does an issuer whose every CRL takes effect later (:class:`CrlNotInEffect`), unless
     ``require_in_effect`` is False: the reload asks :func:`crl_not_in_effect` itself, because a file
-    to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``.
-    ``refuse_unread_extensions`` goes to :func:`~messagefoundry.pki.judge_every_crl`, which says
-    what it does and who passes it.
+    to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``, except for a CRL
+    whose extensions ``cryptography`` cannot read: without ``refuse_unread_extensions`` its own
+    error, which is no ``ValueError``, raises as it is. That flag goes to
+    :func:`~messagefoundry.pki.judge_every_crl`, which says who passes it.
 
     No signature is checked here, because this has no CA list. A start checks it in
     :func:`_check_crl_signatures`, and the reload in
