@@ -422,10 +422,13 @@ def test_the_operator_page_names_each_library_secret_a_setting_refuses() -> None
             rows[section] = line
     assert {"[sandbox]", "[dr]"} <= set(rows)
     assert childenv.ENGINE_SECRETS_OUTSIDE_THE_PREFIX == _LIBRARY_FALLBACK_SECRETS
+    # Walk the names first: test_vacuous_absence_assert_lint counts only a comprehension's first
+    # loop, and this guard is what keeps `missing == []` from passing over no names at all.
+    assert _LIBRARY_FALLBACK_SECRETS
     missing = [
         (section, name)
-        for section in ("[sandbox]", "[dr]")
         for name in sorted(_LIBRARY_FALLBACK_SECRETS)
+        for section in ("[sandbox]", "[dr]")
         if f"`{name}`" not in rows[section]
     ]
     assert missing == []
