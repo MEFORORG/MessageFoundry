@@ -1147,8 +1147,13 @@ joined before the dispatchers stop, the source-then-dispatcher order the code co
 to "ADR 0066 D3" (this ADR's Context records that no such decision exists; the order is the
 code's own), and before `start()` can rebind on its failed-start and residual-state teardowns
 (review M-8). The relaxation is only the order in which the stops run, and when a failure is
-raised. Every other SHUTDOWN phase, and the order of the phases, is unchanged. The single-node
-parity sentinel in Inc 5 still holds, because no DEMOTE-only statement is reached.
+raised. Every other SHUTDOWN phase, and the order of the phases, is unchanged. The Inc 5
+single-node parity sentinel does not drive this branch, so it is no evidence for it either way;
+the tests below are the only controls on it.
+
+A stop task that ended cancelled although nobody cut it is raised as a `RuntimeError`, not as a
+`CancelledError`. A bare cancel raised from a teardown nobody cancelled would read as the caller's
+own cancel, and `Engine._graph_supervisor_loop` re-raises a cancel and exits.
 
 Joined is not stopped. A stop that raised can leave its listener live, for example a DICOM server
 whose shutdown raised, while the dispatchers and lanes are then cleared. That inbound is the
@@ -1165,12 +1170,16 @@ rest. A plain `gather` over concurrent stops would cut all of them at once. Inst
 1. The cancel reaches the `asyncio.wait`, which never cancels its awaitables (D6). The stops keep
    running.
 2. `_join_cancelled_source_stops` gives them up to `_CANCELLED_STOP_GRACE_SECONDS` (2.0s) to
-   finish. It is short on purpose: `Engine.stop()` cancels the graph supervisor after 10.0s, which
-   can land inside `start()`'s residual-state teardown, and the service's NSSM
-   `AppStopMethodConsole` is 15000 ms. A 10s grace there would have run past that window.
+   finish. It is short on purpose: the cancel usually comes from a caller already out of time, at
+   least `Engine.stop()`'s 10.0s wait on the graph supervisor, which can land inside `start()`'s
+   residual-state teardown, inside NSSM's 15000 ms `AppStopMethodConsole` window that also holds
+   uvicorn's drain and the lifespan steps before it. A short grace keeps the delay it adds small.
+   It does not make such a shutdown fit that window, and nothing here claims it does.
 3. Stops still running after the grace are cancelled and their cancellation is joined. A second
    cancel cuts at once, whether it arrives during the grace or is coalesced with the first in one
-   loop turn (read as `current_task().cancelling() > 1`).
+   loop turn. That is read as `current_task().cancelling()` rising by more than one over its value
+   before the wait, so a cancel the task already carried, swallowed in a cleanup path, does not
+   count.
 4. Every stop that finished with an error is logged by inbound name through `safe_exc`, even if a
    further cancel interrupts the join. Then the cancel is re-raised. The clears never run, so every
    source stays in `_sources`, and `_running = False` still runs in `_teardown_unsafe`'s `finally`
@@ -1206,11 +1215,19 @@ turns red if the branch goes back to `gather`. A hung stop is cut after a shorte
 cancel still surfaces, which turns red if the grace wait has no timeout. A second cancel cuts at
 once, which turns red without the second cancel's handler. Two coalesced cancels cut at once, which
 turns red without the `cancelling()` check. A stop that failed before the cancel is still logged by
-name, which turns red if the cancel path skips the failure read.
+name, which turns red if the cancel path skips the failure read. A cancel the task already carried
+does not skip the grace, which turns red without the baseline. A stop that ends cancelled on its
+own is raised as a `RuntimeError`, which turns red if it is re-raised as a cancel.
 
 ### Not changed here
 
 At least these were found in review and are left as they were, because the serial loop had them
 too: a stop that fails on every attempt keeps every later `start()` from building the graph; a
 re-raised stop failure skips `stop()`'s settle of a prior demotion's abandoned stops; and
-Database, RemoteFile and Timer `stop()` still join their poll task with no bound of their own.
+Database, RemoteFile and Timer `stop()` still join their poll task with no bound of their own; and
+a stop failure in `start()`'s failed-start unwind replaces the start error, which survives only as
+`__context__`.
+
+Also open, and new with this amendment: a third cancel during the join of the cut stops leaves
+them running unjoined, so a later `stop()` can overlap one; and a later teardown phase that raises
+replaces a deferred stop failure, which then survives only as its WARNING line.

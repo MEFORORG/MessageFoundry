@@ -3,8 +3,7 @@
 """The runner's plain (SHUTDOWN) source stop runs the stops concurrently (BACKLOG #1620).
 
 ``RegistryRunner.stop()`` used to await each ``source.stop()`` in turn, so N slow sources cost N
-times one. They now run together, every one is still joined before the dispatchers stop (ADR 0066
-D3), and a failed stop is logged rather than aborting the rest of teardown. The failed inbound is
+times one. They now run together, every one is still joined before the dispatchers stop, and a failed stop is logged rather than aborting the rest of teardown. The failed inbound is
 then kept as residual state and its error re-raised, so the next stop() or start() retries it.
 
 The runner deliberately adds no bound of its own: cutting or abandoning a stop there would let
@@ -19,6 +18,7 @@ Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Win
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 import pytest
@@ -72,6 +72,8 @@ class _Source:
                 raise OSError("shutdown raised")
         elif self.mode == "hangs":
             await asyncio.Event().wait()
+        elif self.mode == "self_cancels":
+            raise asyncio.CancelledError
         elif self.mode == "gated":
             assert self.gate is not None
             await self.gate.wait()
@@ -104,7 +106,7 @@ async def test_slow_stops_run_concurrently_and_finish_before_the_dispatchers() -
     await runner.stop()
 
     assert sorted(events[:3]) == ["start:IB_A", "start:IB_B", "start:IB_C"]
-    # ADR 0066 D3: every stop is joined before the dispatchers stop. Nothing is cut or abandoned.
+    # Every stop is joined before the dispatchers stop. Nothing is cut or abandoned.
     assert sorted(events[3:6]) == ["end:IB_A", "end:IB_B", "end:IB_C"]
     assert events[-1] == "dispatchers"
     assert runner._sources == {} and runner._pending_source_stops == []
@@ -150,6 +152,20 @@ async def test_a_failed_stop_is_retried_by_the_next_stop() -> None:
     assert runner._sources == {} and not runner.has_residual_state
 
 
+async def test_a_stop_that_ends_cancelled_is_raised_as_a_runtime_error() -> None:
+    """Nobody cancelled this teardown, so it must not raise CancelledError: the graph supervisor
+    would read that as its own cancel and exit. Mutation: re-raise the CancelledError. Red: the
+    raise is a CancelledError, not a RuntimeError."""
+    events: list[str] = []
+    runner = _runner(events, IB_ODD="self_cancels", IB_OK="ok")
+
+    with pytest.raises(RuntimeError, match=r"'IB_ODD': stop\(\) ended cancelled"):
+        await runner.stop()
+
+    assert events[-1] == "dispatchers"
+    assert list(runner._sources) == ["IB_ODD"]
+
+
 async def _started(events: list[str], *names: str) -> None:
     async def spin() -> None:
         while not all(f"start:{name}" in events for name in names):
@@ -181,7 +197,7 @@ async def test_an_outer_cancel_lets_the_in_flight_stops_finish() -> None:
 
     assert sorted(e for e in events if e.startswith(("end:", "cut:"))) == ["end:IB_A", "end:IB_B"]
     assert "dispatchers" not in events  # the rest of teardown never ran
-    # ADR 0157 D7: the clears never ran, so start() re-runs teardown instead of building over them.
+    # The clears never ran, so start() re-runs teardown instead of building over them.
     assert set(runner._sources) == {"IB_A", "IB_B"}
     assert runner.has_residual_state and not runner.running
 
@@ -245,6 +261,32 @@ async def test_two_coalesced_cancels_cut_at_once(monkeypatch: pytest.MonkeyPatch
 
     assert "cut:IB_HANG" in events
     assert set(runner._sources) == {"IB_HANG"}
+
+
+async def test_a_cancel_the_task_already_carried_does_not_skip_the_grace() -> None:
+    """stop() run from cleanup after a swallowed cancel: cancelling() is already 1. Mutation:
+    compare cancelling() > 1 with no baseline. Red: the first cancel here cuts both stops."""
+    events: list[str] = []
+    gate = asyncio.Event()
+    runner = _runner(events, gate, IB_A="gated", IB_B="gated")
+
+    async def cleanup_after_a_cancel() -> None:
+        with contextlib.suppress(asyncio.CancelledError):  # swallowed without uncancel()
+            await asyncio.Event().wait()
+        await runner.stop()
+
+    task = asyncio.create_task(cleanup_after_a_cancel())
+    await _yield()
+    task.cancel()
+    await _started(events, "IB_A", "IB_B")
+    task.cancel()
+    await _yield()
+    assert not task.done()
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sorted(e for e in events if e.startswith(("end:", "cut:"))) == ["end:IB_A", "end:IB_B"]
 
 
 async def test_a_failure_before_an_outer_cancel_is_logged_by_name(

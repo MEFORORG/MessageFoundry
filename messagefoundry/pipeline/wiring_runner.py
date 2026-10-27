@@ -911,10 +911,11 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 #: settle, taking the ADR 0031 rebind-failure branch instead.
 _PENDING_STOP_SETTLE_SECONDS = 10.0
 #: How long a SHUTDOWN teardown cancelled from outside still lets its in-flight source stops run
-#: before it cuts them (BACKLOG #1620, ADR 0157 Amendment B). Short on purpose: Engine.stop()
-#: cancels the graph supervisor after 10.0s, and NSSM's AppStopMethodConsole is 15000 ms, so the
-#: grace must fit the gap. It covers a stop that ends promptly; one still in a listener's client
-#: drain is cut, as the serial loop cut its one in-flight stop. A second cancel cuts at once.
+#: before it cuts them (BACKLOG #1620, ADR 0157 Amendment B). Short on purpose: the cancel usually
+#: comes from a caller already out of time (at least Engine.stop()'s 10.0s supervisor wait, inside
+#: NSSM's 15000 ms AppStopMethodConsole window), so the grace keeps the added delay small. It does
+#: NOT make such a shutdown fit that window. It covers a stop that ends promptly; one still in a
+#: listener's client drain is cut, as the serial loop cut its one in-flight stop.
 _CANCELLED_STOP_GRACE_SECONDS = 2.0
 
 
@@ -5757,15 +5758,19 @@ class RegistryRunner:
                 _PENDING_STOP_SETTLE_SECONDS,
             )
 
-    async def _join_cancelled_source_stops(self, tasks: list[asyncio.Task[None]]) -> None:
+    async def _join_cancelled_source_stops(
+        self, tasks: list[asyncio.Task[None]], cancels_before: int
+    ) -> None:
         """The SHUTDOWN source phase was cancelled from outside (ADR 0157 Amendment B).
 
         Let the in-flight stops finish for up to :data:`_CANCELLED_STOP_GRACE_SECONDS`, then cut the
         rest and join their cancellation. A second cancel cuts at once, whether it arrives during
-        the grace or was coalesced with the first (``cancelling() > 1``). The caller re-raises.
+        the grace or was coalesced with the first: ``cancelling()`` is compared against
+        ``cancels_before``, read before the wait, so a cancel the task already carried from earlier
+        does not count. The caller re-raises.
         """
         current = asyncio.current_task()
-        if current is not None and current.cancelling() > 1:
+        if current is not None and current.cancelling() - cancels_before > 1:
             still = {task for task in tasks if not task.done()}
         else:
             try:
@@ -5784,16 +5789,26 @@ class RegistryRunner:
             await asyncio.gather(*still, return_exceptions=True)
 
     @staticmethod
-    def _failed_source_stops(
-        sources: list[tuple[str, SourceConnector]], tasks: list[asyncio.Task[None]]
+    def _log_failed_source_stops(
+        sources: list[tuple[str, SourceConnector]],
+        tasks: list[asyncio.Task[None]],
+        *,
+        cancelled_is_failure: bool,
     ) -> list[tuple[str, SourceConnector, BaseException]]:
-        """Log and return each FINISHED stop that failed. A stop task that ended cancelled counts as
-        failed, as it did under gather(return_exceptions=True); one still running is skipped."""
+        """Log each FINISHED stop that failed, by inbound name, and return them; one still running is
+        skipped. With ``cancelled_is_failure`` a stop that ended cancelled although nobody cut it is
+        a failure, raised as a RuntimeError: a bare CancelledError re-raised from a teardown nobody
+        cancelled reads as the caller's own cancel (the graph supervisor would exit on it). Without
+        it, cancelled tasks are the ones the cancel path cut, already logged as a count."""
         failed: list[tuple[str, SourceConnector, BaseException]] = []
         for (name, source), task in zip(sources, tasks, strict=True):
-            if not task.done():
+            if not task.done() or (task.cancelled() and not cancelled_is_failure):
                 continue
-            failure = asyncio.CancelledError() if task.cancelled() else task.exception()
+            failure: BaseException | None = (
+                RuntimeError(f"inbound {name!r}: stop() ended cancelled")
+                if task.cancelled()
+                else task.exception()
+            )
             if failure is not None:
                 log.warning("inbound %r: stop() failed: %s", name, safe_exc(failure))
                 failed.append((name, source, failure))
@@ -5878,8 +5893,7 @@ class RegistryRunner:
             self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
         else:
             self._wake_worker_lanes()
-        failed_sources: dict[str, SourceConnector] = {}
-        first_stop_failure: BaseException | None = None
+        failed_stops: list[tuple[str, SourceConnector, BaseException]] = []
         if demote:
             # ADR 0157 Inc 5: DEMOTE INVERTS the ADR 0066 D3 order below, deliberately. Egress is the
             # split-brain-relevant action, so its budget must start NOW rather than after the source
@@ -5906,18 +5920,17 @@ class RegistryRunner:
                 for name, source in sources
             ]
             if tasks:
+                current = asyncio.current_task()
+                cancels_before = current.cancelling() if current is not None else 0
                 try:
                     await asyncio.wait(tasks)  # never cancels its awaitables (D6)
                 except asyncio.CancelledError:
                     try:
-                        await self._join_cancelled_source_stops(tasks)
+                        await self._join_cancelled_source_stops(tasks, cancels_before)
                     finally:
-                        self._failed_source_stops(sources, tasks)  # retrieve, name and redact
+                        self._log_failed_source_stops(sources, tasks, cancelled_is_failure=False)
                     raise
-            for name, source, failure in self._failed_source_stops(sources, tasks):
-                failed_sources[name] = source
-                if first_stop_failure is None:
-                    first_stop_failure = failure
+            failed_stops = self._log_failed_source_stops(sources, tasks, cancelled_is_failure=True)
             # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
             # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
             # _stop.set(). The shared _stop already broke their loops; d.stop() cancels each
@@ -6066,11 +6079,11 @@ class RegistryRunner:
         # ADR 0071 B5: reset the fusion degraded gauge so a start()-after-stop() begins clean (the
         # executors + pools were already torn down above; _fusion_active reset there too).
         self._fusion_pool_open_failed = False
-        if first_stop_failure is not None:
+        if failed_stops:
             # BACKLOG #1620: the rest of teardown ran; now restore what a failed stop used to leave,
             # the inbound itself as residual state, and the raise, so start() never builds over it.
-            self._sources.update(failed_sources)
-            raise first_stop_failure
+            self._sources.update((name, source) for name, source, _ in failed_stops)
+            raise failed_stops[0][2]
         # NOTE: `self._running = False` is NOT here — it moved into _teardown_unsafe's `finally`
         # (ADR 0157 D7) so a raised or cancelled teardown still leaves this node re-promotable.
 
