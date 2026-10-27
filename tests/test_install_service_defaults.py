@@ -727,6 +727,9 @@ def test_building_the_install_root_is_opt_in_and_never_editable() -> None:
     build = text.index("    Build-EngineInstall -InstallRoot $DefaultInstallRoot")
     check = text.index("$installProblem = Get-EngineInstallProblem")
     nssm_default = text.index("if (-not $BuildsInstall) { $NssmPath = Resolve-Nssm")
+    # An -NssmDir inside the root would make the root before the build: refused before NSSM acts.
+    inside = text.index("is inside the install root '$DefaultInstallRoot' that -EngineWheel builds")
+    assert inside < nssm_first
     # Every refusal that reads an input, NSSM's included, sits before the build, and the build
     # before the check. Without a build, the check comes before NSSM acts.
     assert preflight < lock_check < settings < block < nssm_first < build < check < nssm_default
@@ -747,7 +750,8 @@ _BUILD_STUB = """
   function Invoke-EngineBuildStep {
     param($What, $Exe, $Arguments)
     $log.Add("run $Exe | $($Arguments -join ' | ')")
-    $log.Add("env PIP_CONFIG_FILE=$env:PIP_CONFIG_FILE PIP_INDEX_URL=$env:PIP_INDEX_URL TEMP=$env:TEMP")
+    $log.Add("env PIP_CONFIG_FILE=$env:PIP_CONFIG_FILE PIP_INDEX_URL=$env:PIP_INDEX_URL " +
+      "TEMP=$env:TEMP TMPDIR=$env:TMPDIR")
     if ($Arguments -contains 'venv') {
       $h = if ($venvHome) { $venvHome } else { Split-Path -Parent $Exe }
       Set-Content -LiteralPath (Join-Path $Arguments[-1] 'pyvenv.cfg') -Value "home = $h"
@@ -755,8 +759,9 @@ _BUILD_STUB = """
     if ($failAt -and $What -like "*$failAt*") { throw "$What failed (exit 1)" }
   }
   $env:PIP_INDEX_URL = 'https://index.invalid/simple'
-  $env:PIP_CONFIG_FILE = 'C:\\corp\\pip.ini'
-  $before = "$env:PIP_CONFIG_FILE|$env:PIP_INDEX_URL|$env:TEMP"
+  $env:TMPDIR = 'C:\\op\\tmp'
+  Remove-Item -LiteralPath Env:PIP_CONFIG_FILE -ErrorAction SilentlyContinue
+  $before = "$env:PIP_INDEX_URL|$env:TEMP|$env:TMPDIR"
 """
 
 
@@ -809,7 +814,9 @@ def _build_call(
         f"  $res.root = Test-Path -LiteralPath {_psq(str(root))}\n"
         f"  $res.held = @(Get-ChildItem -LiteralPath {_psq(str(root))} -Force "
         "-ErrorAction SilentlyContinue).Count\n"
-        '  $res.restored = ("$env:PIP_CONFIG_FILE|$env:PIP_INDEX_URL|$env:TEMP" -eq $before)\n'
+        # Set ones come back with their values, and an unset one stays unset, not defined empty.
+        '  $res.restored = (("$env:PIP_INDEX_URL|$env:TEMP|$env:TMPDIR" -eq $before) -and '
+        "-not (Test-Path -LiteralPath Env:PIP_CONFIG_FILE))\n"
         "  $res | ConvertTo-Json -Compress\n"
     )
 
@@ -839,7 +846,9 @@ def test_the_build_sets_the_access_list_before_pip_and_pins_what_pip_installs(
     assert len(runs) == 5, log
     # Every pip step; the owner reset runs after the variables are back.
     for i in runs[:-1]:
-        assert log[i + 1] == f"env PIP_CONFIG_FILE=nul PIP_INDEX_URL= TEMP={root / 'buildtemp'}"
+        assert log[i + 1] == (
+            f"env PIP_CONFIG_FILE=nul PIP_INDEX_URL= TEMP={root / 'buildtemp'} TMPDIR="
+        ), log
     venv, deps, engine, check, owner = (log[i] for i in runs)
     stage = root / "wheelhouse"
     assert venv == f"run C:\\Python314\\python.exe | -I | -m | venv | {root}"

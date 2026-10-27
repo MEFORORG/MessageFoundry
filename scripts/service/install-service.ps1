@@ -40,8 +40,8 @@ param(
     # Build the default install root from this engine wheel before checking it (vault BACKLOG
     # #2626). Off unless passed: the installer cannot choose a wheel, or the hash it must have, by
     # itself, and it never falls back to an editable checkout. Needs -EngineWheelSha256 and
-    # -RequirementsLockSha256. Refused with -AppExe or -PythonExe, and when the root already holds
-    # anything. Build-EngineInstall lists the steps.
+    # -RequirementsLockSha256. Refused with -AppExe or -PythonExe, when the root already exists,
+    # even empty, and with an -NssmDir inside it. Build-EngineInstall lists the steps.
     [string]$EngineWheel,
     # The SHA-256 the -EngineWheel file must have, from the release you verified. requirements.lock
     # pins the dependencies and not the engine wheel, so this is the pin on the engine itself.
@@ -49,8 +49,9 @@ param(
     # The hash-locked dependency list -EngineWheel installs with --require-hashes. Defaults to
     # requirements.lock in the wheel's folder.
     [string]$RequirementsLock,
-    # The SHA-256 the -RequirementsLock file must have. Its hashes bind the dependencies only as
-    # far as the lock itself is the one you verified.
+    # The SHA-256 the -RequirementsLock file must have. It shows only that pip reads the file you
+    # hashed. No signature covers the lock, so check it against the release tag first; its hashes
+    # bind the dependencies only as far as that check does.
     [string]$RequirementsLockSha256,
     # The Python -EngineWheel makes the virtual environment from. The venv's python.exe starts it,
     # so the service runs it too. Defaults to the first python on PATH. Get-EngineBuildProblem
@@ -461,9 +462,9 @@ function Set-AdminOnlyAcl {
 function New-AdminOnlyFolder {
     <#
       Create $Path and any missing folder above it, and give each folder this call creates an
-      administrator-only access list and owner (Set-AdminOnlyAcl). Returns the folders it created,
-      outermost first. A folder that already existed is left as it is: its permissions are the
-      operator's choice, and each caller reads them with Get-NssmHomeProblem afterwards.
+      administrator-only access list and owner (Set-AdminOnlyAcl). A folder that already existed
+      is left as it is: its permissions are the operator's choice, and each caller reads them with
+      Get-NssmHomeProblem afterwards. Returns nothing.
     #>
     param([Parameter(Mandatory)][string]$Path)
     $missing = @()
@@ -474,7 +475,6 @@ function New-AdminOnlyFolder {
     }
     New-Item -ItemType Directory -Force -Path $Path | Out-Null
     foreach ($dir in $missing) { Set-AdminOnlyAcl -Path $dir }
-    return $missing
 }
 
 function Get-NssmHomeProblem {
@@ -1548,7 +1548,7 @@ function Build-EngineInstall {
            administrator-only.
         3. Copy the wheel and the lock into a folder in the root, and refuse unless each copy has
            its pinned SHA-256. pip reads the copies, which only an administrator can change.
-        4. Point TEMP and TMP at a folder in the root, so the files pip downloads and unpacks sit
+        4. Point TEMP and TMP at a folder in the root, and clear TMPDIR, so the files pip downloads and unpacks sit
            where only administrators can write too, not in the operator's own temp folder.
         5. Make the venv, and refuse unless its pyvenv.cfg names $BasePython's folder as home.
         6. Install the lock with --require-hashes and --only-binary :all:, so no source
@@ -1575,6 +1575,13 @@ function Build-EngineInstall {
     $stage = Join-Path $InstallRoot "wheelhouse"
     $buildTemp = Join-Path $InstallRoot "buildtemp"
     $saved = @{}
+    # $null removes the variable. [Environment]::SetEnvironmentVariable($name, $null) does not on
+    # PowerShell 7, which passes an empty string and leaves the variable defined but empty.
+    $setVariable = {
+        param([string]$Name, $Value)
+        if ($null -eq $Value) { Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue }
+        else { Set-Item -LiteralPath "Env:$Name" -Value $Value }
+    }
     $built = $false
     # finally, not catch: Ctrl+C stops the pipeline without running a catch block.
     try {
@@ -1596,14 +1603,16 @@ function Build-EngineInstall {
         }
         New-Item -ItemType Directory -Path $buildTemp | Out-Null
         # Saved together and before any is changed, so the finally below puts back exactly these.
+        # TMPDIR too: Python's tempfile reads it before TEMP and TMP, so it is cleared.
         $names = @(@(Get-ChildItem Env: | Where-Object { $_.Name -like 'PIP_*' } |
-                ForEach-Object { $_.Name }) + @("PIP_CONFIG_FILE", "TEMP", "TMP") | Select-Object -Unique)
+                ForEach-Object { $_.Name }) + @("PIP_CONFIG_FILE", "TEMP", "TMP", "TMPDIR") |
+            Select-Object -Unique)
         foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
-        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $null) }
+        foreach ($name in $names) { & $setVariable $name $null }
         # os.devnull on Windows. pip then loads no configuration file at all.
-        [Environment]::SetEnvironmentVariable("PIP_CONFIG_FILE", "nul")
-        [Environment]::SetEnvironmentVariable("TEMP", $buildTemp)
-        [Environment]::SetEnvironmentVariable("TMP", $buildTemp)
+        & $setVariable "PIP_CONFIG_FILE" "nul"
+        & $setVariable "TEMP" $buildTemp
+        & $setVariable "TMP" $buildTemp
         Invoke-EngineBuildStep -What "making the virtual environment" -Exe $BasePython `
             -Arguments @("-I", "-m", "venv", $InstallRoot)
         $cfg = Join-Path $InstallRoot "pyvenv.cfg"
@@ -1624,13 +1633,17 @@ function Build-EngineInstall {
         # here rather than at the service's first start.
         Invoke-EngineBuildStep -What "checking the installed dependencies" -Exe $venvPython `
             -Arguments (@("-I", "-m", "pip", "check") + $pipOptions)
-        foreach ($name in @("TEMP", "TMP")) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
-        Remove-Item -LiteralPath $stage, $buildTemp -Recurse -Force
+        foreach ($name in @("TEMP", "TMP", "TMPDIR")) { & $setVariable $name $saved[$name] }
+        # Only administrators can write these, so one left behind is clutter, not a hole: a warning,
+        # never a reason to delete the install just built.
+        try { Remove-Item -LiteralPath $stage, $buildTemp -Recurse -Force -ErrorAction Stop } catch {
+            Write-Warning "Could not delete the build's copies in '$InstallRoot' ($($_.Exception.Message)); delete them by hand."
+        }
         Invoke-EngineBuildStep -What "making Administrators the owner of '$InstallRoot'" -Exe "icacls" `
             -Arguments @($InstallRoot, "/setowner", "*S-1-5-32-544", "/T", "/C", "/Q")
         $built = $true
     } finally {
-        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
+        foreach ($name in $saved.Keys) { & $setVariable $name $saved[$name] }
         if (-not $built -and (Test-Path -LiteralPath $InstallRoot)) {
             Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
             if (Test-Path -LiteralPath $InstallRoot) {
@@ -1880,6 +1893,12 @@ if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
 else { $DbPath = Resolve-AbsolutePath $DbPath }
 
 $NssmDir = Resolve-AbsolutePath $NssmDir
+# NSSM is resolved before a build (vault BACKLOG #2626), so an -NssmDir at or inside the root would
+# make the root first, and the build refuses a root that exists.
+if ($BuildsInstall -and ($NssmDir.TrimEnd('\') + '\').StartsWith($DefaultInstallRoot.TrimEnd('\') + '\',
+        [StringComparison]::OrdinalIgnoreCase)) {
+    throw "-NssmDir '$NssmDir' is inside the install root '$DefaultInstallRoot' that -EngineWheel builds. Keep it outside."
+}
 
 # --- the service's command line, built before anything acts (vault BACKLOG #2626) --------------------
 # Built here, so a value it refuses stops the install before the NSSM copy below. -ListenHost goes
@@ -1949,9 +1968,10 @@ if ($BuildsInstall) {
 # refused.
 $installProblem = Get-EngineInstallProblem -InstallRoot $AppDirectory -PythonExe $PythonExe -AppExe $AppExe
 if ($installProblem) {
-    throw ("The engine install '$AppDirectory' is not administrator-only: $installProblem. Build " +
-        "the default root with -EngineWheel, or reset an existing root's access list and owner, " +
-        "as docs/SERVICE.md 'Install the engine where only administrators can write' shows.")
+    # -EngineWheel refuses a root that exists, so after a build the first remedy is the reset.
+    throw ("The engine install '$AppDirectory' is not administrator-only: $installProblem. Reset " +
+        "an existing root's access list and owner, or delete it and build the default root with " +
+        "-EngineWheel, as docs/SERVICE.md 'Install the engine where only administrators can write' shows.")
 }
 
 # AFTER the normalization: Resolve-Nssm copies nssm.exe into -NssmDir, and the service is registered

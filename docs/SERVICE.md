@@ -60,9 +60,10 @@ change, and the service would run their next edit.
    release wheel and verify it as [INSTALL-GUIDE.md](INSTALL-GUIDE.md) shows, with the lock from
    that release's tag, or build a wheel from a checkout as yourself, not elevated:
    `python -m pip wheel --no-deps -w dist .`
-2. Take the SHA-256 of each in the session that verified them:
-   `(Get-FileHash -Algorithm SHA256 <file>).Hash`. The lock pins every dependency by hash, but
-   not the engine wheel, and nothing pins the lock but this value.
+2. Take the SHA-256 of each: `(Get-FileHash -Algorithm SHA256 <file>).Hash`. The lock pins every
+   dependency by hash, but not the engine wheel. No signature covers the lock, so compare it with
+   the release tag's copy (`git show v<version>:requirements.lock`) before you hash it: its pin
+   shows only that pip reads the file you hashed.
 3. Pass them to the installer, elevated, with the options [Install](#install) names:
    ```powershell
    .\scripts\service\install-service.ps1 -EngineWheel D:\release\messagefoundry-0.5.2-py3-none-any.whl `
@@ -83,8 +84,8 @@ It refuses to build into a root that already exists, so it never upgrades in pla
 [Update to a new build](#update-to-a-new-build-restart-vs-reinstall). An unfinished build deletes
 the root. NSSM is fetched and checked before the build, so a refused `-NssmPath` or `-NssmDir`, or
 a failed download, leaves no root. When a step after the build fails, such as the service
-registration, re-run with `-EngineWheel` left out to use the root it built. `-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython`
-defaults to the first `python` on `PATH`; `Get-EngineBuildProblem` in the script lists what it
+registration, re-run with `-EngineWheel` left out to use the root it built.
+`-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython` defaults to the first `python` on `PATH`; `Get-EngineBuildProblem` in the script lists what it
 refuses there, at least a launcher, a shim, a venv's interpreter, a Python older than 3.14 and
 one anyone but administrators can write. The installer installs the engine wheel only. Install
 the web console wheel by hand if the service serves `/ui`, then reset the owner as below.
