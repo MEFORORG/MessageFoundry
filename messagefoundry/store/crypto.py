@@ -654,8 +654,9 @@ class RowSealUnverifiableError(CipherError):
     that. It is a seal naming a version Transit will not check: one below the key's
     ``min_decryption_version``, one newer than the Vault node that answered holds, or a planted
     version. The reply cannot tell those apart, so the sealer denies, and its callers treat the
-    row as they treat a failed seal, under their own audit action. Its text is fixed, never row
-    data or Vault's text.
+    row as they treat a failed seal, under their own audit action. Its text, ``str()``, is fixed,
+    never row data or Vault's text; its ``args``, and so its ``repr()``, carry ``probe_mac``, which
+    is Transit's MAC over the probe's fixed input and holds no row data.
 
     ``probe_mac`` is the key probe's own MAC, which names the latest version the node that answered
     the probe holds; the sealer reads that version, never a row value, from it."""

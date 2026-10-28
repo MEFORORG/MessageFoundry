@@ -10372,7 +10372,7 @@ class AuthService:
     async def _load_role(self, role_id: str) -> RoleRow | None:
         """The ``roles`` row ``role_id`` names, its integrity seal checked, or ``None``. Through
         :meth:`_checked_role`, which with :meth:`_load_custom_roles`, :meth:`_custom_role_held` and
-        :meth:`_sealed_ad_map` are the ONLY readers of the store's role and AD role-map readers in
+        :meth:`_checked_ad_map` are the ONLY readers of the store's role and AD role-map readers in
         this service;
         ``tests/test_role_seal.py`` holds that. A row that fails is reported and read as absent, so
         it grants nothing."""
@@ -10447,49 +10447,61 @@ class AuthService:
         sealed = await self._sealed_ad_map(name)
         return sealed if sealed is not None else AdMap(name)
 
-    async def _sealed_ad_map(
-        self, name: str, *, for_edit: bool = False, report: bool = True
-    ) -> AdMap | None:
+    async def _sealed_ad_map(self, name: str) -> AdMap | None:
         """:meth:`_ad_map`, but ``None`` rather than an empty map when the seal fails, for a caller
-        that must tell a failing map from an honestly empty one. The failure is reported unless
-        ``report`` is False, which a save that repairs a failing map passes, as
-        :meth:`update_custom_role` reports nothing.
-
-        With ``for_edit``, a map whose seal Vault transit refused to check raises
-        :class:`AdMapUnverifiableError` instead, after the report: an administrator's listing or
-        save must not treat pairs that may be genuine as absent (BACKLOG #2592). A failed seal is
-        still ``None`` there, because a save is how such a map is repaired."""
-        current = await self._store.get_ad_map(name)
-        holds = await _unless_unverifiable(ad_map_seal_ok(self._store.row_sealer(), current))
+        that must tell a failing map from an honestly empty one. The failure is still reported."""
+        current, holds = await self._checked_ad_map(name)
         if holds:
             return current
         # A map whose seal Vault transit refused to check is reported and stands in as failing,
         # so a role or channel decision only ever narrows: every such caller reads None as no pair.
-        if report:
-            await self._report_seal_failure(
-                f"{ADSET_KIND}:{name}",
-                f"the {name} {seal_report_text(holds is None).verb} and grants nothing",
-                {"kind": ADSET_KIND, "map": name},
-                unverifiable=holds is None,
-            )
-        if for_edit and holds is None:
-            raise AdMapUnverifiableError(name)
+        await self._ad_map_seal_failed(name, unverifiable=holds is None)
         return None
+
+    async def _checked_ad_map(self, name: str) -> tuple[AdMap, bool | None]:
+        """The AD map ``name`` with its seal's verdict, as :meth:`_checked_role` gives a role's:
+        ``True`` holds, ``False`` fails and ``None`` is a seal Vault transit refused to check
+        (BACKLOG #2592). It reports nothing; each caller decides."""
+        current = await self._store.get_ad_map(name)
+        return current, await _unless_unverifiable(
+            ad_map_seal_ok(self._store.row_sealer(), current)
+        )
+
+    async def _ad_map_seal_failed(self, name: str, *, unverifiable: bool) -> None:
+        """Report AD map ``name`` as failing its seal, or with ``unverifiable`` as one Vault
+        transit refused to check, through :meth:`_report_seal_failure`, keyed per map."""
+        await self._report_seal_failure(
+            f"{ADSET_KIND}:{name}",
+            f"the {name} {seal_report_text(unverifiable).verb} and grants nothing",
+            {"kind": ADSET_KIND, "map": name},
+            unverifiable=unverifiable,
+        )
 
     async def _ad_map_for_edit(self, name: str) -> AdMap:
         """The map ``name`` for an administrator to read and edit: empty when it fails its seal, so
-        a save re-seals only what is entered, and :class:`AdMapUnverifiableError` when Vault
-        transit refused to check it."""
-        sealed = await self._sealed_ad_map(name, for_edit=True)
-        return sealed if sealed is not None else AdMap(name)
+        a save re-seals only what is entered. When Vault transit refused to check it, reported and
+        :class:`AdMapUnverifiableError`: an empty listing would invite a save that replaces pairs
+        that may be genuine (BACKLOG #2592)."""
+        current, holds = await self._checked_ad_map(name)
+        if holds:
+            return current
+        await self._ad_map_seal_failed(name, unverifiable=holds is None)
+        if holds is None:
+            raise AdMapUnverifiableError(name)
+        return AdMap(name)
 
     async def _refuse_unverifiable_ad_map(self, name: str, entries: Sequence[object]) -> None:
         """Refuse replacing map ``name`` with ``entries`` while Vault transit refuses to check its
-        stored seal: :class:`AdMapUnverifiableError`. Clearing it, with no entries, is the
-        recovery and is let through, as deleting is for a role. Reports nothing, as
-        :meth:`update_custom_role` does not."""
-        if entries:
-            await self._sealed_ad_map(name, for_edit=True, report=False)
+        stored seal: reported, then :class:`AdMapUnverifiableError`. A failing map is not
+        reported, since this save repairs it, as :meth:`update_custom_role` repairs a role.
+        Clearing the map, with no entries, is the recovery and is let through, as deleting is for
+        a role."""
+        if not entries:
+            return
+        _current, holds = await self._checked_ad_map(name)
+        if holds is None:
+            await self._ad_map_seal_failed(name, unverifiable=True)
+            raise AdMapUnverifiableError(name)
 
     async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the AD group-to-role map gives ``groups``; none when the map fails its

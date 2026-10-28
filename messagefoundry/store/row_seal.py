@@ -325,7 +325,8 @@ class TransitSealUnverifiableError(Exception):
 
 #: The alert hook a :class:`TransitRowSealer` calls, with its cause (``"transit"`` for an outage,
 #: ``"transit-unverifiable"`` for a seal Transit refused to check) and a PHI-free reason, when it
-#: logs its throttled ERROR. ``serve`` arms it with the engine's alert sink.
+#: logs its throttled ERROR, and that :func:`alert_unverifiable_row` calls once per row its caller
+#: reports. ``serve`` arms it with the engine's alert sink.
 TransitSealAlertHook = Callable[[str, str], None]
 
 #: The cause :meth:`TransitRowSealer._unverifiable` reports under.
@@ -498,8 +499,9 @@ class TransitRowSealer:
     def _saw_held(self, version: int) -> None:
         """Transit just sealed or verified under ``version``, so it holds it: a remembered latest
         below that is out of date, and is moved up as :meth:`_saw_latest` moves it. Only raised
-        here, so seals answered by nodes on either side of a rotation do not empty the cache in
-        turn; the refusal path alone, through the probe, moves the latest back."""
+        here, so seals alone never move the latest back; a refused check's probe does. While a
+        node lags a rotation, refusals it answers and seals the current node answers can still
+        move the latest back and forth, emptying the cache each time."""
         if version > self._latest_version:
             self._saw_latest(version)
 
@@ -580,17 +582,22 @@ class TransitRowSealer:
             # replaces what this process remembered, so the comparison below rests on Transit's
             # current answer, as it would in a process started a moment ago.
             probed = _transit_version(exc.probe_mac)
-            if probed is not None:
-                self._saw_latest(probed)
-            if version == self._latest_version:
+            if probed is None:
+                # No current answer to compare against, and a remembered one would make the
+                # answer depend on this process's history: an outage, as a malformed seal reply is.
+                raise self._unavailable(
+                    CipherError("Transit's key probe returned a MAC of an unexpected shape")
+                ) from exc
+            self._saw_latest(probed)
+            if version == probed:
                 # Transit named this version as its latest in this same exchange, and Vault never
                 # lets the minimum pass the latest version, so a refusal of it cannot be a
                 # retirement: the node that refused lags a rotation the probing node has seen. An
                 # outage, never a revoked session.
                 raise self._unavailable(
                     CipherError(
-                        "Transit refused to check a seal under the newest key version this process"
-                        " has seen; a Vault node that lags a rotation does this"
+                        "Transit refused to check a seal under the version its own key probe names"
+                        " as latest; a Vault node that lags a rotation does this"
                     )
                 ) from exc
             raise self._unverifiable(exc) from exc
@@ -648,8 +655,9 @@ type Sealer = RowSealer | TransitRowSealer
 def alert_unverifiable_row(sealer: Sealer | None, reason: str) -> None:
     """Page one row whose seal Transit refused to check, through ``sealer``'s armed hook under the
     unverifiable cause, with no throttle here (BACKLOG #2592). The caller throttles per row, under
-    the same per-row key scheme it reports a failed seal with, so one such row never mutes
-    another's page, and the cause keeps a flood of them off a forgery's subject. ``reason`` names
+    the same per-row key scheme it reports a failed seal with, so its throttle never mutes another
+    row's page; a sink that throttles per subject still collapses them, as it does a forgery's.
+    The cause keeps a flood of them off a forgery's subject. ``reason`` names
     the row by an id, never a row value. Nothing for a local sealer, which never refuses a check,
     or with no hook armed."""
     if isinstance(sealer, TransitRowSealer) and sealer._alert is not None:

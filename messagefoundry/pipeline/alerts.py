@@ -1406,9 +1406,11 @@ def transit_seal_alert(sink: AlertSink) -> Callable[[str, str], None]:
     each call raises ``integrity_drift`` under :data:`TRANSIT_SEAL_UNVERIFIABLE_SUBJECT` for the
     ``"transit-unverifiable"`` cause and :data:`TRANSIT_SEAL_SUBJECT` for any other: the same
     method a failed seal raises (:func:`authority_seal_alert`). The sealer calls it on its own
-    throttled ERROR path only, so at most once per throttle window per cause.
+    throttled ERROR path, at most once per throttle window per cause, and
+    ``row_seal.alert_unverifiable_row`` calls it once per unverifiable row a caller reports, each
+    throttled per row by that caller (BACKLOG #2592).
 
-    The reason is a fixed sentence, never Vault's text or a row value. Never raises."""
+    The reason names no row value and never Vault's text. Never raises."""
 
     def _raise(cause: str, reason: str) -> None:
         subject = (

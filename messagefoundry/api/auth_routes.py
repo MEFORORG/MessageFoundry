@@ -2021,7 +2021,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 [(g, e.role) for g, e in zip(groups, body.entries, strict=True)],
                 actor=identity.username,
             )
-        for group in sorted((await admin_groups() - before) if grants else set()):
+        try:
+            after = await admin_groups() if grants else set()
+        except AdMapUnverifiableError:
+            # BACKLOG #2592: the save landed, but its read-back could not be checked, so every
+            # group it maps to Administrator pages rather than none.
+            after = {
+                g
+                for g, e in zip(groups, body.entries, strict=True)
+                if e.role == Role.ADMINISTRATOR.value
+            }
+        for group in sorted(after - before):
             _alert_administrator_granted(
                 app, f"ad-group:{group}", via="ad_group_map", granted_by=identity.username
             )

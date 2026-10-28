@@ -595,9 +595,27 @@ async def test_an_unverifiable_directory_map_refuses_a_listing_and_a_replace(
     assert await listing() == [pair]
 
 
-async def test_an_unverifiable_directory_map_is_a_409_naming_the_recovery(
-    transit_store: Opened,
+async def test_a_refusal_whose_probe_names_no_version_is_an_outage(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """With no current answer to compare against, a refusal is an outage, never a comparison with
+    a version this process remembers, so a fresh and a long-lived process agree (BACKLOG #2592)."""
+    store, _path, _transit = transit_store
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    fields = [("token_hash", "probe-shape")]
+    seal = await sealer.seal_async(SESSION_KIND, fields)
+    sealer._cache.clear()
+
+    def refused(_data: bytes, _mac: str) -> bool:
+        raise RowSealUnverifiableError("not a transit mac")
+
+    monkeypatch.setattr(sealer._backend, "verify_seal_hmac", refused)
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.verify_async(SESSION_KIND, fields, seal)
+
+
+def test_an_unverifiable_directory_map_is_a_409_naming_the_recovery() -> None:
     """The routes answer the refusal with HTTP 409 and the fixed recovery text, as the custom-role
     edit does."""
     from fastapi import HTTPException

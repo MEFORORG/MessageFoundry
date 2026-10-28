@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -1012,12 +1014,27 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         error: str | None = None,
         status_code: int = 200,
     ) -> HTMLResponse:
-        gmap = await admin.get_ad_group_map(service=service, _=identity)
-        smap = await admin.get_ad_group_scope_map(service=service, _=identity)
+        refused: list[str] = []
+
+        async def entries(read: Callable[..., Awaitable[Any]]) -> list[Any]:
+            # BACKLOG #2592: a map Vault transit cannot verify is a 409 naming the recovery. The
+            # page still renders, with that map's form empty and the 409's text shown; a save of
+            # it with entries is refused again, and one with none is the recovery.
+            try:
+                return list((await read(service=service, _=identity)).entries)
+            except HTTPException as exc:
+                if exc.status_code != status.HTTP_409_CONFLICT:
+                    raise
+                refused.append(str(exc.detail))
+                return []
+
+        gmap = await entries(admin.get_ad_group_map)
+        smap = await entries(admin.get_ad_group_scope_map)
         roles = await admin.list_roles(service=service, _=identity)
+        shown = "; ".join([m for m in (error, *refused) if m]) or None
         return HTMLResponse(
-            pages.ad_groups_page(gmap.entries, smap.entries, roles, error=error),
-            status_code=status_code,
+            pages.ad_groups_page(gmap, smap, roles, error=shown),
+            status_code=status.HTTP_409_CONFLICT if refused and status_code == 200 else status_code,
         )
 
     @app.get("/ui/ad-groups", response_class=HTMLResponse)
