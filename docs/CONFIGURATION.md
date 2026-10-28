@@ -777,6 +777,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `ad_session_recheck_seconds` | int | `300` | **Directory session reconciliation** ([ADR 0079](adr/0079-kerberos-idp-session-coordination.md) mechanism 2). How often to re-resolve directory principals holding **live** sessions and revoke those AD has disabled or deleted — without it, an AD disable does not take effect until the `[security].max_session_hours` cap (12 h). **`300` (five minutes) is the default** (ADR 0148 GIVEN 1 — the hardened path is the shipped path), floored at **60 s** (a pass costs one LDAP bind per signed-in directory user). `0` disables the loop and is a **loosening** once AD is on — `security_loosenings()` names it. The default is **inert without AD** (`should_reconcile()` also needs an LDAP client), so a non-AD deployment is unaffected; an **explicit** non-zero value without `ad_enabled` is still refused rather than left silently dead. |
 | `ad_session_recheck_strikes` | int | `2` | Consecutive passes a principal must fail to resolve before its sessions are revoked. *The search matched nothing* cannot tell *deleted* from *moved out of the search base*, so a single ambiguous result must never revoke; a set disabled bit and an unreadable `userAccountControl` strike the same way. A wave of unreadable answers is held instead of revoked, with no setting ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)). Range 1–10. |
 | `ad_session_recheck_max_users` | int | `200` | Per-pass bind budget. Beyond this, remaining users are picked up by later passes (least-recently-probed first), so a large estate degrades to a longer effective interval instead of a bind storm. A pass revokes no more accounts than it probed. So at or below `ad_session_revoke_max`, the breaker can never trip. With AD on and a non-zero interval, the engine then logs a **WARNING** at start that names both settings. It still loads, and revocation still works. To arm the breaker, raise this budget above the cap. |
+| `ad_reconcile_outage_passes` | int | `3` | **Lasting directory outage alert** (BACKLOG #3709). A pass on which every probe it asked fails to reach the directory, whatever the cause, is fail-open: it revokes nothing, so a directory disable or deletion reaches no signed-in session while it lasts, and it is audited as `auth.ad_reconcile_skipped`. One such pass pages nobody. Once a run of them is this long, one `ad_reconcile_aborted` alert is raised with reason `directory_unavailable` under its own source, `directory-reconciler-outage`; the passes after it in the same run do not page again. A pass that reaches the directory, including one that judges nothing, ends the run. A pass with nobody signed in asks nothing and leaves the run as it stands. A group search refused for its own deadline or cap reads the same as an unreachable directory here. On by default, and it cannot be turned off: range `2` to `100`, so a single blip never pages. The count is **in memory, per process**: a restart starts it again, so a standing outage pages again after one, and a fresh process does not resolve an outage alert an earlier run left open, which an operator resolves. Each engine process counts and pages on its own. When it resolves itself is under [When the reconciler's alerts resolve themselves](#when-the-reconcilers-alerts-resolve-themselves). |
 | `ad_session_revoke_max` | int | `5` | **Mass-revoke circuit breaker**, absolute half. A search base that names the wrong OU, an OU reorganisation that moves the users out of it, or a service account that lost read rights on the entries while it can still read the base answers "not found" for *every* user — indistinguishable from "everyone was deleted". A base that was deleted or moved, or that the service account may not read at all, usually ends the search with a result code instead: a configuration refusal, which raises its own `ad_reconcile_aborted` instance with reason `directory_misconfigured` on any pass that sees one. The refused account is neither struck nor revoked, but it still counts among the accounts the pass probed, the breaker's denominator. When such a pass aborts and revokes nothing before the breaker runs is stated once in [SECURITY.md](SECURITY.md) (BACKLOG #3010). A lost read right on `userAccountControl` alone is held instead ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)). At `0` the absolute half is gone, so a pass trips once it revokes more than the fraction of the accounts it probed. At or above `ad_session_recheck_max_users`, the breaker can never trip; that row says what the engine does. |
 | `ad_session_revoke_max_fraction` | float | `0.34` | Circuit breaker, proportional half. A pass exceeding **both** thresholds aborts, revokes nothing, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row. Requiring both means it fires only on a change simultaneously *large* and *broad* — the signature of a misconfiguration, not of offboarding (3-of-3 or 50-of-300 still applies). Range >0.0–1.0, but with AD on and a non-zero interval the engine refuses `1.0` at load. At `1.0` this half is never exceeded, for the reason the `ad_session_recheck_max_users` row gives, so the whole breaker would never trip. |
 | `kerberos_enabled` | bool | `false` | Windows SSO (experimental, off by default; needs `ad_enabled`) |
@@ -825,7 +826,8 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 
 The session reconciler's `ad_reconcile_aborted` (the breaker) and `ad_reconcile_held` (the hold)
 alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). So
-does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). This
+does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). The
+lasting outage's instance resolves on its own rule, stated below the list. This
 needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
 this engine process, for every signed-in directory account it did not just revoke.
 
@@ -856,7 +858,7 @@ three on its own, until it restarts again.
   and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
   in at the last referral has since been read in full, present and enabled, on a pass with no
   referral. A pass with any referral, probe fault or configuration refusal (BACKLOG #3010)
-  resolves none of these alerts.
+  resolves none of these three alerts.
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
   held account, a disabled one awaiting its strikes, and one that never answers all do this.
 - An engine gives up resolving the referral when an account signed in at the last referral leaves
@@ -896,6 +898,16 @@ A paging refusal opens one `ad_reconcile_aborted` instance per account, under th
 `directory-reconciler-paging:<username>` (vault BACKLOG #3696). Nothing resolves it automatically.
 Resolve it by hand once that account no longer hits the bound, for example once its sign-in
 succeeds again.
+
+A lasting directory outage opens its own `ad_reconcile_aborted` instance, with reason
+`directory_unavailable` and source `directory-reconciler-outage` (BACKLOG #3709), once a run of
+`ad_reconcile_outage_passes` passes has read the directory unreachable. It resolves on the first
+pass that reaches the directory, if a pass of this engine process paged it. A pass of referrals or
+configuration refusals reached it; a pass whose every probe failed or faulted did not, and neither
+ends the run nor resolves it. A run pages once: an alert resolved by hand while the outage lasts
+stays resolved until a later run pages. Like the others, it is
+not resolved where the alert was already open when the process started, or where another
+reconciler may share the store; resolve those by hand.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the

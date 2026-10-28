@@ -4833,8 +4833,10 @@ the right one*:
   set exceeds **both** `ad_session_revoke_max` (5) **and** `ad_session_revoke_max_fraction` (0.34) of
   the probed population **aborts**: nothing is revoked, nothing is written, the engine logs at ERROR
   and audits `auth.ad_reconcile_aborted`, raises the `ad_reconcile_aborted` alert, and the condition
-  latches until a clean pass. A whole-directory outage audits `auth.ad_reconcile_skipped` instead and
-  raises no alert. Both thresholds
+  latches until a clean pass. A whole-directory outage audits `auth.ad_reconcile_skipped` instead, and
+  one such pass raises no alert. A run of `ad_reconcile_outage_passes` of them (3 by default) pages
+  once, and the first pass that reaches the directory resolves it (BACKLOG #3709;
+  [CONFIGURATION.md](CONFIGURATION.md) has the row). Both thresholds
   must be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
 
@@ -4885,7 +4887,8 @@ estate is still reconciled. A pass with any fault logs one ERROR naming no accou
 `probe_fault`, under its own source `directory-reconciler-probe-fault`. If every probe faults or
 fails, at least one a fault, the pass judges no account it asked about and revokes nothing, like an
 outage, but it still pages, and it still strikes an id-less row (BACKLOG #3170). A pass where every
-probe fails and none faults is a plain outage, and pages nobody. A
+probe fails and none faults is a plain outage, and pages nobody until a run of them lasts
+`ad_reconcile_outage_passes` passes (BACKLOG #3709). A
 connection, timeout or name-lookup error that escapes the directory layer is still read as
 unreachable. So is at least an operating-system error saying the network or host is unreachable,
 down or reset. Another network-class error can still read as a probe fault and page.
@@ -4899,7 +4902,7 @@ A search the directory refuses with noSuchObject, invalidDNSyntax or insufficien
 configuration refusal (BACKLOG #3010). A search base that was deleted or moved, or that the service
 account may not read, answers so for every account on every pass. Before #3010 the engine read that
 as "not found", which struck every account and tripped the breaker on a large enough estate. Nor is
-it read as an outage, which would page nobody. The refused account is left unjudged: no strike, no
+it read as an outage, which would page only once the outage lasted. The refused account is left unjudged: no strike, no
 revocation. A pass with any such refusal logs one ERROR naming the code and no account, audits
 `auth.ad_reconcile_misconfigured`, and raises the `ad_reconcile_aborted` alert with reason
 `directory_misconfigured`, under its own source `directory-reconciler-misconfigured`. If every
