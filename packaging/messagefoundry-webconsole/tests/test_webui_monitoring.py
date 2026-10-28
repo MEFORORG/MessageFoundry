@@ -236,6 +236,26 @@ def test_status_builder_escapes_and_formats() -> None:
     svc = ServiceStatusInfo(enabled=True, state="running", service_name="MEFOR_Engine")
     html = str(status(sys_status, posture, cluster, nodes, dr, svc))
     assert "2.4 MiB" in html  # _bytes formatting
+    # BACKLOG #1563: the "Disk free" row renders by the backend's stated disk_free_status, so a
+    # server backend's unmeasured disk (nothing wrong) and a failed local probe (something wrong)
+    # never read alike, and neither reads as a quantity.
+    assert "9.3 GiB" in html  # observed: the figure, unchanged
+    assert "not measured by this engine" not in html and "health-warn" not in html
+
+    def _unmeasured(disk_status: str) -> str:
+        db = sys_status.db.model_copy(
+            update={"disk_free_bytes": None, "disk_free_status": disk_status}
+        )
+        return str(
+            status(sys_status.model_copy(update={"db": db}), posture, cluster, nodes, dr, svc)
+        )
+
+    server = _unmeasured("not_applicable")
+    assert "not measured by this engine (server backend" in server
+    assert "db directory missing or unreadable" not in server and "health-warn" not in server
+    failed = _unmeasured("unobservable")
+    assert '<span class="health-warn">db directory missing or unreadable</span>' in failed
+    assert "not measured by this engine" not in failed
     assert "yes" in html and "single-node" in html  # _yn + role
     assert "<b>host</b>" not in html  # hostile node host escaped
     assert "&lt;b&gt;host&lt;/b&gt;" in html
