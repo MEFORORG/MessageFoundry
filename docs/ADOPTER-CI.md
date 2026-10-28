@@ -168,9 +168,13 @@ Before installing anything, the job `pip download`s the pinned engine wheel and 
 > substitution of the engine wheel **fails the build** instead of shipping silently.
 
 - **Fail-closed by default.** A failed or cancelled `verify-engine` fails the whole gate.
-- Its token gets `contents: read` and `attestations: read`, the permission GitHub's attestations
-  API names, and its checkout keeps no credential. The workflow's default is no permission at all,
-  and each action is pinned to a commit, with its tag as a comment.
+- Its token gets `contents: read`, and `attestations: read`, the permission GitHub's attestations
+  API documents; whether a token reading another, public repository's attestations needs it has
+  not been measured. Its checkout keeps no credential. The workflow's default is no permission at
+  all.
+- Each action in the workflow is pinned to a commit, with its tag as a comment. Nothing in the
+  scaffold bumps them; move each commit and its tag together, by hand or with Dependabot's
+  `github-actions` ecosystem.
 - **Escape hatch:** if your package index strips attestations (some private mirrors do), set the
   repository variable `MEFOR_VERIFY_ENGINE=off` (Settings → Secrets and variables → Actions →
   Variables). The `check` job still runs.
@@ -202,26 +206,32 @@ that package's build code may run in CI:
 
 - **No lock**: `pip-audit -r requirements.txt --desc`, which resolves on Windows the closure your
   deployment installs, live and unhashed, and the job warns that it does.
-- **Hashed `requirements.lock` committed**: nothing resolves live. The job takes the engine's pin,
-  with its hashes, out of the lock, installs that pin alone with `--no-deps --require-hashes`, and
-  runs the engine's own auditor, `python -P -m messagefoundry.security.audit_all_platforms
-  requirements.lock`. That is the code the engine's own required audit runs, and the module
-  documents what it checks. It dry-run installs the lock with `--require-hashes`, then audits
-  **every pin, whatever its marker**.
-  - No other locked package is installed into the interpreter that runs the auditor, pip and
-    `pip-audit`, so no locked package's code (a `.pth` file runs at every interpreter start) runs
-    inside them.
-  - `requirements.txt` is not audited on its own. Instead the job fails when the lock does not pin
-    every name `requirements.txt` names, or pins one at another version than `requirements.txt`
-    pins with `==`; the lock audit still runs.
-  - The lock must pin `messagefoundry` exactly once, with its hashes, or the job says so and fails.
+- **Hashed `requirements.lock` committed**: neither file is resolved or installed live.
+  - `requirements.txt` is audited as written, with `pip-audit --disable-pip --no-deps`. So each of
+    its requirements must be pinned with `==`, and that form of `pip-audit` refuses one that is
+    not. It skips an included file without a word, so the job refuses a `-r` line in
+    `requirements.txt`; list those pins in it instead. Its closure is audited through the lock, so
+    a lock that was not regenerated after `requirements.txt` changed audits the old closure.
+  - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
+    alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
+    job says so and fails; pip refuses the pin if it carries no hash. No other locked package is
+    installed into the interpreter that runs the auditor, pip and `pip-audit`, so no other locked
+    package's code (a `.pth` file runs at every interpreter start) runs inside them.
+  - `pip-audit` itself is pinned to one version, and its own dependencies are installed into that
+    interpreter, resolved live and unhashed.
+  - Then it runs the engine's own auditor, `python -P -m messagefoundry.security.audit_all_platforms
+    requirements.lock`. That is the code the engine's own required audit runs, and the module
+    documents what it checks. It dry-run installs the lock with `--require-hashes`, installing
+    nothing, then audits **every pin, whatever its marker**.
   - The auditor's dry-run passes `--only-binary :all:` itself, whatever the job sets.
   - It needs an engine release that ships the module; 0.5.1 and earlier do not, and the job fails
     rather than fall back to an audit that skips pins.
   - It runs `pip-audit --strict`, so a pin no advisory database can look up (a private package)
-    fails the job, and `--ignore-vuln` does not cover that case. Name such a package with
-    `--skip-private <name>` before `requirements.lock` on the audit line; that one pin is left out
-    of the audit and printed as not audited, and every other pin is still looked up.
+    fails the job, and `--ignore-vuln` does not cover that case. From the first engine release
+    after 0.5.2, name such a package with `--skip-private <name>` before `requirements.lock` on the
+    audit line: that one pin is left out of the audit and printed as not audited, and every other
+    pin is still looked up. The dry-run still downloads it, so pip must be configured with the
+    index that serves it. It refuses the engine's own name.
   - It refuses a lock with pip option lines, such as an index URL, `--trusted-host` or `--find-links`.
     `uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock` writes none
     by default and writes every platform's pins. `pip-compile` needs its `--no-emit-*` flags for each
@@ -231,9 +241,8 @@ that package's build code may run in CI:
   - A requirement that continues onto a line other than a hash, option or comment fails, since a
     marker there would stay in place.
 - Each check is its own step, and a failed one does not hide a later one's result; the lock audit
-  needs the auditor the engine install brings, so a failed install skips it. `pip-audit` is pinned
-  to one version. The job's token is read-only and its checkout keeps no credential, because it
-  runs engine code from the lock.
+  needs the auditor the engine install brings, so a failed install skips it. The job's token is
+  read-only and its checkout keeps no credential, because it runs engine code from the lock.
 - The job does not wait on `verify-engine`, so a failed provenance check does not also silence the
   tripwire. The engine code it runs comes from your lock's hashes, which bind it to the bytes you
   locked, not to the wheel `verify-engine` attested.

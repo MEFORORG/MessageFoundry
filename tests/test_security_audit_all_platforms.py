@@ -184,7 +184,7 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
     assert audit[-2:] == ["--ignore-vuln", "PYSEC-0"]
     assert audited == STRIPPED
     out = capsys.readouterr().out
-    assert "3 pinned requirements, 2 un-gated" in out
+    assert "3 pinned requirements audited, 2 un-gated" in out
     assert "colorama==0.4.6 ; sys_platform == 'win32'" in out
 
 
@@ -224,22 +224,42 @@ def test_a_private_pin_the_adopter_names_is_left_out_of_the_audit_alone(
     assert checked == LOCK
     assert audited == STRIPPED.replace("idna==3.20 \\\n    --hash=sha256:cccc\n", "")
     assert "--strict" in audit
-    assert "not audited, named by --skip-private: idna==3.20" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "not audited, named by --skip-private: idna==3.20" in out
+    # Neither counted nor listed as audited.
+    assert "2 pinned requirements audited, 2 un-gated" in out
 
 
 @pytest.mark.parametrize(
-    "names",
-    [["not-in-the-lock"], ["colorama", "idna", "uvloop"]],
-    ids=["unpinned-name", "every-pin"],
+    ("names", "message"),
+    [
+        (["not-in-the-lock"], "names a package the lock does not pin"),
+        (["colorama", "idna", "uvloop"], "leaves no pin to audit"),
+        (["MessageFoundry"], "may not name the engine"),
+    ],
+    ids=["unpinned-name", "every-pin", "the-engine"],
 )
-def test_a_skip_private_that_matches_nothing_or_everything_is_refused(
-    tmp_path: Path, names: list[str]
+def test_a_skip_private_that_is_stale_total_or_the_engine_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], names: list[str], message: str
 ) -> None:
     """A stale name would read as an opt-out that still does something; skipping every pin would
-    read as a clean audit of nothing."""
+    read as a clean audit of nothing; the engine is the pin the tripwire exists to audit."""
     argv = [arg for name in names for arg in ("--skip-private", name)]
     status, seen = _seen_by(tmp_path, argv)
     assert (status, seen) == (2, [])
+    assert message in capsys.readouterr().err
+
+
+def test_a_skip_private_after_the_lock_is_refused_by_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """After the lock, argparse would hand it to pip-audit, which fails with a usage error."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src), "--skip-private", "idna"], run=run) == 2
+    assert not ran
+    assert "goes before the lock" in capsys.readouterr().err
 
 
 def test_a_failed_install_check_stops_before_the_audit(tmp_path: Path) -> None:

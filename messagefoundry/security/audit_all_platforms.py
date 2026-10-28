@@ -44,7 +44,9 @@ WHAT IT DOES, in order, exiting with the first non-zero status:
 and prints it as not audited (vault BACKLOG #3786 finding 1). It is for a package no advisory
 database can look up, such as an adopter's private one: ``--strict`` fails such a pin, and
 ``--ignore-vuln`` cannot clear that, since it names an advisory, not a package. Every other pin is
-still looked up under ``--strict``, and step 1 still checks the named one's hashes.
+still looked up under ``--strict``, and step 1 still checks the named one's hashes, so it must be
+downloadable from the index pip is configured with. Nothing checks that the named package is in
+fact private: like ``--ignore-vuln``, it is the adopter's recorded decision.
 
 WHY STRIPPING IS SOUND HERE. Every pin in a uv export is a version that uv resolved for some
 environment. The engine sets no ``[tool.uv] environments``, so that includes environments nobody
@@ -62,8 +64,8 @@ never writes and which would resolve against the temporary copy's directory, or 
 rather than audit what it names (``uv export --no-emit-project`` writes none; a lock tool can
 write at least an index URL, ``--trusted-host`` and ``--find-links`` lines unless told not to); and
 a requirement that continues onto a line other than a hash, option or comment, where a marker
-would stay in place; and a ``--skip-private`` name the lock does not pin, or names that would leave
-no pin to audit. It does not judge whether a non-empty lock is complete; released-line-audit
+would stay in place; and a ``--skip-private`` that names the engine, a package the lock does not
+pin, or every pin, or that comes after the lock. It does not judge whether a non-empty lock is complete; released-line-audit
 carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
@@ -223,6 +225,20 @@ def drop_requirements(text: str, names: Collection[str]) -> tuple[str, list[tupl
     return "".join(out), dropped
 
 
+#: The engine is the pin the adopter's tripwire exists to audit, so it is never skipped as private.
+_NEVER_PRIVATE = frozenset({"messagefoundry"})
+
+
+def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str]) -> str | None:
+    """Why a ``--skip-private`` request is refused, or ``None``."""
+    if "--skip-private" in pip_audit_args:
+        # After the lock, argparse hands it to pip-audit, which fails with a usage error that
+        # names neither the flag's position nor this module.
+        return "--skip-private goes before the lock, not after it"
+    named = sorted(_NEVER_PRIVATE.intersection(private))
+    return f"--skip-private may not name the engine: {named}" if named else None
+
+
 def _run(cmd: list[str]) -> int:
     # hook_environment: everything outside the engine's MEFOR_* namespace and its named secrets, so
     # pip and pip-audit keep the index, proxy and certificate settings they read from the
@@ -279,6 +295,10 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         )
         return 2
     private = {canonical_name(name) for name in args.skip_private}
+    refusal = _skip_private_refusal(private, args.pip_audit_args)
+    if refusal:
+        print(f"::error::{args.lock}: {refusal}", file=sys.stderr)
+        return 2
     text, skipped = drop_requirements(text, private)
     unmatched = private - {name for name, _ in skipped}
     if unmatched:
@@ -291,9 +311,13 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     if len(skipped) == requirements:
         print(f"::error::{args.lock}: --skip-private leaves no pin to audit", file=sys.stderr)
         return 2
+    # A skipped pin is neither counted nor listed as audited.
+    stripped = [
+        e for e in stripped if not (m := _NAME.match(e)) or canonical_name(m[0]) not in private
+    ]
     print(
-        f"{args.lock}: {requirements} pinned requirements, {len(stripped)} un-gated from a marker "
-        "the host would have evaluated:"
+        f"{args.lock}: {requirements - len(skipped)} pinned requirements audited, {len(stripped)} "
+        "un-gated from a marker the host would have evaluated:"
     )
     for entry in stripped:
         print(f"  {entry}")

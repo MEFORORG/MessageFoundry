@@ -366,10 +366,11 @@ _STEP_RUNS: dict[str | None, Callable[[bool, bool, dict[str, str]], bool]] = {
     ),
 }
 
-_READ_LOCK = "Take the engine's pin from the lock, and check the lock covers requirements.txt"
 _INSTALL_ENGINE = "Install the engine alone, from its locked hashes, for its auditor"
 _AUDIT_TXT = "Audit requirements.txt as Windows resolves it"
+_AUDIT_TXT_PINS = "Audit the pins of requirements.txt as written"
 _AUDIT_LOCK = "Audit every pin of requirements.lock, whatever its marker"
+_PIP_AUDIT = "pip-audit==2.10.1"
 
 
 def _run_audit_job(
@@ -378,6 +379,7 @@ def _run_audit_job(
     lock: str | None,
     fail_env: dict[str, str] | None = None,
     requirements: str = "messagefoundry==0.5.1\n",
+    lock_encoding: str = "utf-8",
 ) -> tuple[list[str], Path, str, list[str]]:
     """Run the audit job's ``run`` steps in order, as GitHub decides which run.
 
@@ -389,7 +391,7 @@ def _run_audit_job(
     work.mkdir()
     (work / "requirements.txt").write_text(requirements, encoding="utf-8")
     if lock is not None:
-        (work / "requirements.lock").write_text(lock, encoding="utf-8")
+        (work / "requirements.lock").write_text(lock, encoding=lock_encoding)
     recorder = tmp_path / "recorder.py"
     recorder.write_text(_AUDIT_RECORDER, encoding="utf-8")
     runner_temp = tmp_path / "runner-temp"
@@ -432,11 +434,9 @@ def _lock_calls(tmp_path: Path) -> list[str]:
         "python -I -",
         f"python -m pip install --no-deps --require-hashes -r {pin}",
         f"python -m pip install {_PIP_AUDIT}",
+        "pip-audit -r requirements.txt --desc --disable-pip --no-deps",
         "python -P -m messagefoundry.security.audit_all_platforms requirements.lock",
     ]
-
-
-_PIP_AUDIT = "pip-audit==2.10.1"
 
 
 def test_the_scaffolded_audit_job_runs_on_windows_on_its_own(
@@ -455,11 +455,15 @@ def test_the_scaffolded_audit_job_runs_on_windows_on_its_own(
     assert 0 < audit["timeout-minutes"] < 360
     # Static, so these hold where no bash can run the steps below.
     runs = {s["name"]: s["run"] for s in audit["steps"] if "run" in s}
-    assert runs[_INSTALL_ENGINE] == (
-        'python -m pip install --no-deps --require-hashes -r "$RUNNER_TEMP/engine-pin.txt"'
+    assert runs[_INSTALL_ENGINE].startswith("python -I - <<'PY'\n")
+    assert runs[_INSTALL_ENGINE].endswith(
+        '\npython -m pip install --no-deps --require-hashes -r "$RUNNER_TEMP/engine-pin.txt"\n'
     )
     assert runs["Install pip-audit"] == f"python -m pip install {_PIP_AUDIT}"
     assert runs[_AUDIT_TXT] == "pip-audit -r requirements.txt --desc"
+    assert runs[_AUDIT_TXT_PINS].endswith(
+        "\npip-audit -r requirements.txt --desc --disable-pip --no-deps\n"
+    )
     assert runs[_AUDIT_LOCK] == (
         "python -P -m messagefoundry.security.audit_all_platforms requirements.lock"
     )
@@ -471,8 +475,9 @@ def test_every_scaffolded_job_runs_with_least_privilege(
     """Each job states its token's permissions and keeps no credential in its checkout.
 
     The workflow's own default is no permission at all, so a job an adopter adds starts there.
-    verify-engine reads the engine's attestations through the GitHub API (vault BACKLOG #3786
-    finding 7); the API's documentation names ``attestations: read`` for that read.
+    verify-engine (vault BACKLOG #3786 finding 7) holds ``attestations: read``, the permission
+    GitHub's attestations API documents; whether its read of another, public repository needs it
+    was not measured.
     """
     root, jobs = scaffolded_jobs
     workflow = yaml.safe_load(
@@ -517,90 +522,77 @@ def test_the_scaffolded_audit_job_audits_every_pin_of_a_lock(
     assert "::warning::" not in output
 
 
-def test_with_a_lock_nothing_resolves_live_and_only_the_engine_is_installed(
+def test_with_a_lock_nothing_is_resolved_and_only_the_engine_pin_is_installed(
     scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
 ) -> None:
     """Vault BACKLOG #3786 findings 2 and 3.
 
-    Finding 3: with a lock, ``pip-audit -r requirements.txt`` would resolve the closure live and
-    unhashed, so it does not run; the lock audit covers that closure. Finding 2: installing the
-    whole lock into the interpreter that then runs pip and pip-audit ran each locked package's
-    ``.pth`` hook inside the auditor, so only the engine's own hashed pin is installed there.
+    Finding 3: with a lock, ``pip-audit -r requirements.txt`` resolved and installed the closure
+    live and unhashed; requirements.txt is now audited as written, with ``--disable-pip
+    --no-deps``. Finding 2: installing the whole lock into the interpreter that then runs pip and
+    pip-audit ran each locked package's ``.pth`` hook inside the auditor, so only the engine's own
+    hashed pin is installed there. pip-audit's own dependencies still resolve live; that is not
+    this test's subject.
     """
     calls, _, _, failed = _run_audit_job(scaffolded_ci, tmp_path, _ADOPTER_LOCK)
     assert not failed
-    assert not [c for c in calls if c.startswith("pip-audit ")], calls
+    audits = [c for c in calls if c.startswith("pip-audit ")]
+    assert audits == ["pip-audit -r requirements.txt --desc --disable-pip --no-deps"]
     installs = [c for c in calls if c.startswith("python -m pip install")]
     assert not [c for c in installs if "requirements" in c], installs
     pin = (tmp_path / "runner-temp" / "engine-pin.txt").read_text(encoding="utf-8")
     assert pin == "messagefoundry==0.5.1 \\\n    --hash=sha256:aaaa\n"
 
 
-@pytest.mark.parametrize(
-    ("requirements", "lock", "message"),
-    [
-        # The engine pin moved and the lock did not follow, so the lock audits the old engine.
-        (
-            "messagefoundry==0.5.2\n",
-            _ADOPTER_LOCK,
-            "requirements.txt pins messagefoundry==0.5.2; requirements.lock pins ['0.5.1']",
-        ),
-        # A Handler dependency declared in requirements.txt and never locked would go unaudited.
-        (
-            "messagefoundry==0.5.1\nAcme_Client>=1\n",
-            _ADOPTER_LOCK,
-            "requirements.txt names acme-client, which requirements.lock does not pin",
-        ),
-    ],
-    ids=["engine-version", "unlocked-name"],
-)
-def test_a_lock_that_does_not_cover_requirements_txt_fails_and_still_audits(
-    scaffolded_ci: tuple[str, Path, dict[str, Any]],
-    tmp_path: Path,
-    requirements: str,
-    lock: str,
-    message: str,
+def test_an_engine_pin_is_taken_from_a_utf16_lock_as_pip_reads_it(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
 ) -> None:
-    """Without the live requirements.txt audit, a requirement the lock lacks would pass unseen."""
-    calls, audited, output, failed = _run_audit_job(
-        scaffolded_ci, tmp_path, lock, requirements=requirements
+    calls, _, _, failed = _run_audit_job(
+        scaffolded_ci, tmp_path, _ADOPTER_LOCK, lock_encoding="utf-16"
     )
-    assert failed == [_READ_LOCK], output
-    assert f"::error::{message}" in output
-    # The lock it did pin is still audited.
-    assert calls == _lock_calls(tmp_path) and audited.exists()
+    assert (calls, failed) == (_lock_calls(tmp_path), [])
+    pin = (tmp_path / "runner-temp" / "engine-pin.txt").read_text(encoding="utf-8")
+    assert pin == "messagefoundry==0.5.1 \\\n    --hash=sha256:aaaa\n"
+
+
+def test_an_included_requirements_file_is_refused_and_the_lock_still_audited(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
+) -> None:
+    """``pip-audit --disable-pip --no-deps`` skips ``-r <file>`` without a word (measured
+    2026-10-27 with pip-audit 2.10.1: a file holding only ``-r`` of a vulnerable pin printed "No
+    known vulnerabilities found" and exited 0), so the step refuses an include instead."""
+    calls, audited, output, failed = _run_audit_job(
+        scaffolded_ci,
+        tmp_path,
+        _ADOPTER_LOCK,
+        requirements="messagefoundry==0.5.1\n-r handlers.txt\n",
+    )
+    assert failed == [_AUDIT_TXT_PINS]
+    assert "::error::requirements.txt includes another file" in output
+    assert calls == [c for c in _lock_calls(tmp_path) if not c.startswith("pip-audit ")]
+    assert audited.exists()
 
 
 @pytest.mark.parametrize(
-    ("lock", "pins", "hashed"),
+    ("lock", "times"),
     [
-        (_ADOPTER_LOCK.replace("messagefoundry==0.5.1", "messagefoundry-webconsole==0.5.0"), 0, 0),
-        (f"{_ADOPTER_LOCK}MessageFoundry==0.5.1 \\\n    --hash=sha256:dddd\n", 2, 2),
-        (
-            _ADOPTER_LOCK.replace(
-                "messagefoundry==0.5.1 \\\n    --hash=sha256:aaaa", "messagefoundry==0.5.1"
-            ),
-            1,
-            0,
-        ),
+        (_ADOPTER_LOCK.replace("messagefoundry==0.5.1", "messagefoundry-webconsole==0.5.0"), 0),
+        (f"{_ADOPTER_LOCK}MessageFoundry==0.5.1 \\\n    --hash=sha256:dddd\n", 2),
     ],
-    ids=["absent", "twice", "unhashed"],
+    ids=["absent", "twice"],
 )
-def test_a_lock_without_one_hashed_engine_pin_is_refused_by_name(
-    scaffolded_ci: tuple[str, Path, dict[str, Any]],
-    tmp_path: Path,
-    lock: str,
-    pins: int,
-    hashed: int,
+def test_a_lock_without_one_engine_pin_is_refused_by_name(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path, lock: str, times: int
 ) -> None:
-    """Without one hashed engine pin there is no auditor to install, and the job says why rather
-    than fail later with a ModuleNotFoundError."""
+    """Without one engine pin there is no auditor to install, and the job says why rather than
+    fail later with a ModuleNotFoundError. An unhashed pin is pip's to refuse, under
+    ``--require-hashes``."""
     calls, audited, output, failed = _run_audit_job(scaffolded_ci, tmp_path, lock)
     assert (
-        "::error::requirements.lock must pin messagefoundry once, with its hashes; "
-        f"it has {pins} pins of it, {hashed} hashed"
+        f"::error::requirements.lock must pin messagefoundry once; it pins it {times} times"
     ) in output
-    assert failed == [_READ_LOCK, _INSTALL_ENGINE] and not audited.exists()
+    assert failed == [_INSTALL_ENGINE] and not audited.exists()
+    assert calls[:2] == ["python -I -", f"python -m pip install {_PIP_AUDIT}"]
     assert not (tmp_path / "runner-temp" / "engine-pin.txt").exists()
 
 
@@ -612,8 +604,18 @@ def test_a_failed_engine_install_skips_only_the_lock_audit(
     calls, audited, _, failed = _run_audit_job(
         scaffolded_ci, tmp_path, _ADOPTER_LOCK, {"FAIL_ON": install}
     )
-    assert calls == _lock_calls(tmp_path)[:3]
+    assert calls == _lock_calls(tmp_path)[:4]
     assert failed == [_INSTALL_ENGINE] and not audited.exists()
+
+
+def test_a_requirements_txt_finding_does_not_hide_the_lock_audit(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
+) -> None:
+    calls, audited, _, failed = _run_audit_job(
+        scaffolded_ci, tmp_path, _ADOPTER_LOCK, {"PIP_AUDIT_FINDS": "1"}
+    )
+    assert calls == _lock_calls(tmp_path)
+    assert failed == [_AUDIT_TXT_PINS] and audited.exists()
 
 
 def test_the_scaffolded_audit_job_without_a_lock_audits_requirements_txt(
