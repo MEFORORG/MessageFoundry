@@ -1755,28 +1755,33 @@ first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA file is 
 material.
 
 An `SSLCA` file is also a trust anchor of the connection's lane, as a `tls_ca_file` is
-(`auth.trust_anchors`, module item 12). When the lane is built, and before a reload that keeps
-it running, the engine checks who can write the file and the folders above it, and audits its
-fingerprint in `auth.trust_anchor` rows. A file another account can replace refuses that lane at
-`[security].enforcement = enforce` and warns at `warn`. A file swapped since the last check is
-audited as `changed`, and refused if it now names an encryption header or a private key. The
-check does not run under `SSLmode=disable` (or `SSLMODE=DISABLED`), where the driver reads no
-CA, and there is no pin for this file. **What it does not cover:** the connections the driver's
-pool opens after the build are not checked again, and any check-then-load leaves a swap window,
-as for `SSLKEY`.
+(`auth.trust_anchors`, module item 12). The engine checks who can write the file and the folders
+above it, audits its fingerprint in `auth.trust_anchor` rows, and runs the content checks above
+again. A file another account can replace, or whose content now fails, refuses the lane when it
+is built or an operator starts it, at `[security].enforcement = enforce`; `warn` warns about the
+ACL and path instead. Before a reload, the same check on a lane the reload keeps running refuses
+the whole reload, and the running lane is not stopped. A file swapped since the last check is
+audited as `changed`. The check does not run under `SSLmode=disable` (or `SSLMODE=DISABLED`),
+where the driver reads no CA, and there is no pin for this file. **What it does not cover:** a
+running lane's pool goes on reading the file at each new connect until the lane is rebuilt, even
+after a later check refuses it, and any check-then-load leaves a swap window, as for `SSLKEY`.
 
-An `SSLCERT` file takes the key-wrap check `SSLKEY` takes (BACKLOG #3090), when the connection
-is built, with `sslpassword` as its passphrase. A key in it with a weak wrap is refused, and so
-is an encrypted key with no `sslpassword`. A legacy `Proc-Type: 4,ENCRYPTED` key is refused even
-with one. A certificate with no key passes, PEM or DER. The file is read the way an `SSLCA` file
-is: a missing file, a directory, a device or a pipe is left to the driver, and a file over 1 MiB
-is refused. Two gaps remain:
+An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-wrap check
+(BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key
+with a weak wrap is refused, and so is an encrypted key with no `sslpassword`. A legacy
+`Proc-Type: 4,ENCRYPTED` key is refused even with one. A certificate with no key passes, PEM or
+DER. With `SSLKEY` set, the key comes from that file, so `SSLCERT` is not read. Each file is read
+the way an `SSLCA` file is: a missing file, a directory, a device or a pipe is left to the
+driver, a padded value is checked as a driver may trim it, and a file over 1 MiB is refused. At
+least these gaps remain:
 
 - **MySQL's ODBC driver has no passphrase keyword.** An `sslpassword` set beside its `SSLCERT`
   passes this check, the driver ignores it, and it may still prompt for the key's password.
 - **libpq does not read a key out of `sslcert`.** It reads the key from `sslkey`, or from its own
-  default path, which this check never sees. An encrypted key inside `sslcert` is still refused
-  here, although libpq would not load it.
+  default path, which this check never sees. With no `sslkey` set, an encrypted key inside
+  `sslcert` is still refused here, although libpq would not load it.
+- **The key and certificate files are checked only when the connection is built.** Neither is a
+  lane trust anchor, so a file swapped afterwards is not checked.
 
 Any other keyword is refused when the connection is built, and the error names the keyword and
 the connection. That fails `messagefoundry check`, a reload and a `connection` edit. At `serve`

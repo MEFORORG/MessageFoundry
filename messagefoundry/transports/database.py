@@ -86,7 +86,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
-from messagefoundry.keywrap import refuse_weak_key_file, refuse_weak_key_wrap
+from messagefoundry.keywrap import refuse_weak_key_wrap
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
@@ -563,37 +563,38 @@ def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None 
     builder has already refused a keyword given twice, so the copy read here is the copy the driver
     reads. This binds only a driver that reads ``sslkey`` itself. psqlODBC takes a client key only
     through ``pqopt``, which the builder refuses, so there libpq finds the key on its own (at least
-    ``PGSSLKEY``, a service file, or its default path) and no key is checked (BACKLOG #2423)."""
-    key_path = named.get("sslkey")
-    if not key_path:
-        return
-    refuse_weak_key_file(
-        str(key_path),
-        setting=f"{hop_name_prefix(connection)}DATABASE odbc_params sslkey",
-        unlock_setting="odbc_params sslpassword",
-        passphrase_given=bool(named.get("sslpassword")),
-    )
+    ``PGSSLKEY``, a service file, or its default path) and no key is checked (BACKLOG #2423).
+
+    The file is read as :func:`_driver_file_spellings` reads it (vault BACKLOG #3090), so a pipe
+    named here is never opened for reading, and a padded value is checked as a driver may trim it."""
+    _refuse_weak_driver_wrap(named, "sslkey", "key file", connection)
 
 
 def _refuse_weak_driver_cert(named: Mapping[str, Any], *, connection: str | None = None) -> None:
     """Check the key wrap of a driver's client certificate file before the driver loads it (vault
     BACKLOG #3090, step 5).
 
-    ``sslcert`` names the client certificate a driver loads with its own TLS library, and a PEM
-    there may carry the private key too. A certificate-chain load is the one that can prompt for a
-    passphrase, so the file takes the wrap check :func:`_refuse_weak_driver_key` runs on
-    ``sslkey``, with ``sslpassword`` as the passphrase. A key in it with a weak wrap is refused, and
-    so is an encrypted one with no ``sslpassword``. A legacy ``Proc-Type: 4,ENCRYPTED`` key is
-    refused even with one, as it is under ``sslkey``. A plain certificate, PEM or DER, holds no key
-    and passes. The private-key-label refusal a CA file takes (BACKLOG #3745) does not apply here:
-    a client certificate file may hold its own key.
+    ``sslcert`` names the client certificate a driver loads with its own TLS library, and with no
+    ``sslkey`` a PEM there may carry the private key too. A certificate-chain load is the one that
+    can prompt for a passphrase, so the file takes :func:`_refuse_weak_driver_key`'s wrap check. A
+    plain certificate, PEM or DER, holds no key and passes. The private-key-label refusal a CA file
+    takes (BACKLOG #3745) does not apply: a client certificate file may hold its own key.
 
-    The file is read as :func:`_driver_file_spellings` reads it. It runs when the connection is
-    built, not at each connect. What it does not cover, at least MySQL's missing passphrase
-    keyword and libpq's own key path, is in docs/CONNECTIONS.md, under the generic dialect."""
-    for setting, data in _driver_file_spellings(
-        named, "sslcert", connection, "certificate file", "its key wrap"
-    ):
+    With ``sslkey`` set, the key comes from that file, which its own check reads, so ``sslcert`` is
+    not read here. That is the rule
+    :func:`~messagefoundry.keywrap.refuse_weak_cert_chain_key` follows. It runs when the
+    connection is built, not at each connect. docs/CONNECTIONS.md, under the generic dialect, says
+    what it does not cover."""
+    if not named.get("sslkey"):
+        _refuse_weak_driver_wrap(named, "sslcert", "certificate file", connection)
+
+
+def _refuse_weak_driver_wrap(
+    named: Mapping[str, Any], keyword: str, what: str, connection: str | None
+) -> None:
+    """Refuse a weak or unlockable key wrap in the ``keyword`` file, with ``sslpassword`` as its
+    passphrase, through :func:`~messagefoundry.keywrap.refuse_weak_key_wrap`."""
+    for setting, data in _driver_file_spellings(named, keyword, connection, what, "its wrap"):
         refuse_weak_key_wrap(
             data,
             setting=setting,
@@ -602,10 +603,10 @@ def _refuse_weak_driver_cert(named: Mapping[str, Any], *, connection: str | None
         )
 
 
-#: How much of an ``sslca`` or ``sslcert`` file :func:`_read_driver_file` reads: 1 MiB, the cap
-#: :mod:`messagefoundry.keywrap` puts on a key file (vault BACKLOG #3090, step 8). A CA bundle is
-#: tens or hundreds of KiB, and a client certificate with its key a few KiB. The read runs on the
-#: event loop when the connection is built, so the cap bounds that stall too.
+#: How much of an ``sslca``, ``sslcert`` or ``sslkey`` file :func:`_read_driver_file` reads: 1 MiB,
+#: the cap :mod:`messagefoundry.keywrap` puts on a key file (vault BACKLOG #3090, step 8). A CA
+#: bundle is tens or hundreds of KiB, and a client certificate with its key a few KiB. The read
+#: runs on the event loop when the connection is built, so the cap bounds that stall too.
 _MAX_DRIVER_CA_FILE_BYTES = 1 << 20
 #: ``ERROR_INVALID_NAME``: Windows' answer for a path it cannot spell, such as one with a leading
 #: space before the drive letter.
@@ -629,9 +630,8 @@ def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | N
     :func:`_driver_file_spellings` says which paths are left to the driver, and which spellings
     are read.
 
-    **It runs when the connection is built, not at each connect.** A file replaced afterwards
-    reaches the driver unchecked until the lane's next trust-anchor check, which refuses an
-    encryption header too (``auth.trust_anchors``, module item 12)."""
+    **It runs when the connection is built, not at each connect.** What checks the file after
+    that, and what does not, is ``auth.trust_anchors`` module item 12."""
     for setting, data in _driver_file_spellings(
         named, "sslca", connection, "CA file", "it for an encryption header or a private key"
     ):

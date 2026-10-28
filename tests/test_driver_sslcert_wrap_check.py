@@ -78,8 +78,14 @@ def _write(tmp_path: Path, data: bytes, name: str = "client.pem") -> str:
     return str(path)
 
 
-def _build(cert: str, *, sslpassword: str | None = None, spelling: str = "sslcert") -> str:
-    params: dict[str, str] = {"SSLmode": "verify-full", spelling: cert}
+def _build(
+    cert: str,
+    *,
+    sslpassword: str | None = None,
+    spelling: str = "sslcert",
+    extra: dict[str, str] | None = None,
+) -> str:
+    params: dict[str, str] = {"SSLmode": "verify-full", spelling: cert, **(extra or {})}
     if sslpassword is not None:
         params["sslpassword"] = sslpassword
     settings: dict[str, Any] = {
@@ -203,3 +209,36 @@ def test_an_sslcert_past_the_read_cap_is_refused(
     monkeypatch.setattr(database, "_MAX_DRIVER_CA_FILE_BYTES", len(data) - 1)
     with pytest.raises(ValueError, match="certificate file is larger than"):
         _build(path, sslpassword=_PASSPHRASE)
+
+
+def test_with_sslkey_set_sslcert_is_not_read(tmp_path: Path, client: _Client) -> None:
+    """With ``sslkey`` set the driver takes the key from that file, so an encrypted key left in a
+    combined ``sslcert`` export is never loaded. ``refuse_weak_cert_chain_key`` follows the same
+    rule. Red with the ``sslkey`` test taken out of ``_refuse_weak_driver_cert``."""
+    cert = _write(tmp_path, client.cert_pem + client.approved_key)
+    key = _write(tmp_path, client.plain_key, "client.key")
+    dsn = _build(cert, extra={"sslkey": key})
+    assert f"sslcert={{{cert}}}" in dsn and f"sslkey={{{key}}}" in dsn
+    # The control: the same sslcert alone is refused.
+    with pytest.raises(KeyWrapRefused, match="Set odbc_params sslpassword"):
+        _build(cert)
+
+
+def test_a_padded_sslkey_is_checked_as_a_driver_may_trim_it(
+    tmp_path: Path, client: _Client
+) -> None:
+    """``sslkey`` is read the way ``sslcert`` and ``sslca`` are, so a padded value is checked at
+    its trimmed spelling too. Red with ``_refuse_weak_driver_key`` back on ``refuse_weak_key_file``:
+    the raw spelling names no file, and the encrypted key passes."""
+    key = _write(tmp_path, client.approved_key, "client.key")
+    with pytest.raises(KeyWrapRefused, match="Set odbc_params sslpassword"):
+        _build(_write(tmp_path, client.cert_pem), extra={"sslkey": f" {key} "})
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes need POSIX mkfifo")
+def test_a_pipe_named_as_sslkey_is_not_opened(tmp_path: Path, client: _Client) -> None:
+    pipe = tmp_path / "client.key.pipe"
+    os.mkfifo(pipe)
+    assert f"sslkey={{{pipe}}}" in _build(
+        _write(tmp_path, client.cert_pem), extra={"sslkey": str(pipe)}
+    )

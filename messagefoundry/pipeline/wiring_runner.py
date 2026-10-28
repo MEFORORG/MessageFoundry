@@ -3773,8 +3773,8 @@ class RegistryRunner:
             self._anchor_refused.pop((direction, name), None)
 
     async def _check_inbound_lane_anchor(self, name: str) -> None:
-        """:meth:`_check_lane_anchor` for an inbound ``Ftp`` poller about to bind, the one inbound
-        that dials out. A no-op for any other inbound, a bound one, an unknown name and one not
+        """:meth:`_check_lane_anchor` for an inbound that dials out and is about to bind: an
+        ``Ftp`` poller or a ``DatabasePoll`` (:func:`_inbound_lane_reads_ca`). A no-op for any other inbound, a bound one, an unknown name and one not
         deployed: :meth:`_start_inbound_unsafe` answers those itself."""
         ic = self.registry.inbound.get(name)
         if ic is not None and not _inbound_lane_reads_ca(ic):

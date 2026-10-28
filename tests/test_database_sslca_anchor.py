@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -32,7 +34,7 @@ from messagefoundry.auth.trust_anchors import (
     TrustAnchorError,
 )
 from messagefoundry.config import wiring
-from messagefoundry.config.wiring import Database, DatabasePoll, Registry, load_config
+from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.store import MessageStore
 from messagefoundry.transports import database
@@ -168,6 +170,9 @@ def test_the_registry_collects_the_database_outbound_and_poller(tmp_path: Path) 
         f"inbound({_IN!r}, DatabasePoll(server='db.synthetic.test', dialect='generic', "
         "odbc_driver='MySQL ODBC 9.1 Unicode Driver', poll_statement='SELECT 1', "
         f"odbc_params={params!r}), router='r')\n"
+        "inbound('IB_DB_PLAIN', DatabasePoll(server='db.synthetic.test', dialect='generic', "
+        "odbc_driver='MySQL ODBC 9.1 Unicode Driver', poll_statement='SELECT 1', "
+        "odbc_params={'SSLMODE': 'VERIFY_IDENTITY'}), router='r')\n"
         f"outbound({_OUT!r}, Database(server='db.synthetic.test', dialect='generic', "
         "odbc_driver='MySQL ODBC 9.1 Unicode Driver', statement='INSERT INTO t VALUES (:a)', "
         f"odbc_params={params!r}))\n"
@@ -187,13 +192,20 @@ def test_the_registry_collects_the_database_outbound_and_poller(tmp_path: Path) 
     poller = registry.inbound[_IN]
     assert wiring_runner._inbound_lane_reads_ca(poller)
     assert wiring_runner._lane_ca_setting(poller.spec.settings) == "odbc_params sslca"
+    # The control: a poller with no sslca has no lane CA, and a tls_ca_file line keeps its name.
+    assert not wiring_runner._inbound_lane_reads_ca(registry.inbound["IB_DB_PLAIN"])
+    assert wiring_runner._lane_ca_setting({"tls_ca_file": str(ca)}) == "tls_ca_file"
 
 
-def test_the_runner_reads_a_poller_with_no_sslca_as_having_no_lane_ca() -> None:
-    plain = DatabasePoll(server="db.synthetic.test", dialect="generic", poll_statement="SELECT 1")
-    out = Database(server="db.synthetic.test", dialect="generic", statement="SELECT 1")
-    assert generic_odbc_param(plain.settings, "sslca") is None
-    assert wiring_runner._lane_ca_setting(out.settings) == "tls_ca_file"
+def test_a_path_object_names_the_anchor_as_its_text_does(tmp_path: Path) -> None:
+    """A code-first ``Path`` value builds, since the build reads ``str(value)``, so the lane
+    check takes it too. Red with the ``os.fspath`` step removed: no spec, so no check."""
+    ca = _ca(tmp_path)
+    settings = _settings(ca)
+    settings["odbc_params"]["SSLCA"] = ca
+    spec = ta.lane_anchor_spec("outbound", _OUT, settings)
+    assert spec is not None and spec.path == str(ca)
+    assert generic_odbc_param(settings, "sslca") == ca
 
 
 # --- the lane check ------------------------------------------------------------------------------
@@ -308,3 +320,39 @@ def test_an_sslca_file_one_byte_past_one_mib_is_refused(tmp_path: Path) -> None:
     assert "SSLCA=" in _build_odbc_dsn(_settings(at_cap), connection=_OUT)
     with pytest.raises(ValueError, match="larger than the 1 MiB"):
         _build_odbc_dsn(_settings(over), connection=_OUT)
+
+
+# --- a pipe never makes the check wait ------------------------------------------------------------
+
+
+async def test_a_ca_that_is_not_a_regular_file_at_read_time_is_refused_not_read(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spec is chosen by a ``stat``; a pipe swapped in before the check reads the file would
+    make a plain read wait. ``evaluate_anchor`` judges its own descriptor, so a file that is not
+    regular there is an anchor it cannot read. Runs on every platform: the descriptor is reported
+    as a pipe. Red with the regular-file test taken out of ``_read_regular_file``."""
+    ca = _ca(tmp_path)
+    settings = _settings(ca)
+    spec = ta.lane_anchor_spec("outbound", _OUT, settings)
+    assert spec is not None
+    real_fstat = os.fstat
+
+    def as_pipe(fd: int) -> Any:
+        fields = list(real_fstat(fd))
+        fields[0] = stat.S_IFIFO | 0o600
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", as_pipe)
+    with pytest.raises(OSError, match="not a regular file"):
+        ta.evaluate_anchor(spec)
+    with pytest.raises(TrustAnchorError, match="could not read the trust anchor"):
+        await ta.make_lane_anchor_check(store, enforcing=True)("outbound", _OUT, settings)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes need POSIX mkfifo")
+def test_a_real_pipe_is_refused_without_waiting(tmp_path: Path) -> None:
+    pipe = tmp_path / "ca.pipe"
+    os.mkfifo(pipe)
+    with pytest.raises(OSError, match="not a regular file"):
+        ta.evaluate_anchor(ta.AnchorSpec("outbound:X", "setting", str(pipe)))

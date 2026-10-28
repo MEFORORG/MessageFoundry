@@ -188,25 +188,28 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     This change covers the SQL Server pin only; that gap is unfiled.
 12. **A generic DATABASE connection's driver CA** (vault BACKLOG #3090, step 7). The CA file a
     generic-dialect ``Database`` outbound or ``DatabasePoll`` names as ``odbc_params`` ``sslca``
-    is a lane CA, as in item 9 (:func:`database_ca_anchor_spec`), under the lane's own label. The
-    lane check takes the checks of items 1 to 4 when the lane is built and before a reload, so a
-    group- or world-writable file refuses that lane at ``enforce`` and warns at ``warn``. Its
-    content checks are the build's own: the encryption-header refusal and the private-key
-    refusal. A file swapped after the build is checked against the audited fingerprint at the next
-    lane check: a ``changed`` row, and a refusal if the new bytes fail. A CA the driver never reads
-    under ``sslmode=disable`` is not checked (:func:`unread_ca_reason`), and neither is a value
-    that names no regular file, which the build leaves to the driver.
+    is a lane CA, as in item 9 (:func:`database_ca_anchor_spec`), under the lane's own label. It
+    takes the checks of items 1 to 4, and the build's own content checks: the encryption-header
+    refusal and the private-key refusal. When those land follows item 9: a group- or
+    world-writable file, or one whose bytes fail, refuses that lane when the lane is built or an
+    operator starts it, and refuses the whole reload when a reload pre-check finds it on a lane it
+    keeps running. ``warn`` warns instead for the ACL and path. A file swapped since the last
+    check writes a ``changed`` row. A CA the driver never reads under ``sslmode=disable`` is not
+    checked (:func:`unread_ca_reason`), and neither is a value that names no regular file, which
+    the build leaves to the driver.
 
     **Not covered**, as in item 9: the driver reads the file by path, at every connect its pool
-    opens. The connections the pool opens after the build are not checked again, and any
-    check-then-load leaves a swap window, as for ``sslkey``. There is no pin: ``odbc_params`` has
-    no pin setting.
+    opens. A running lane is not stopped when its file fails a later check: its pool goes on
+    reading the file at each new connect until the lane is rebuilt, and the refused reload is the
+    only signal. Any check-then-load leaves a swap window, as for ``sslkey``. There is no pin:
+    ``odbc_params`` has no pin setting.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -214,6 +217,7 @@ import os
 import re
 import shlex
 import ssl
+import stat
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -1028,14 +1032,27 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
 # --- evaluation + enforcement -------------------------------------------------------------------
 
 
+def _read_regular_file(path: str) -> bytes:
+    """The whole file at ``path``, opened once and judged by its own descriptor. Anything but a
+    regular file raises ``OSError``, which every caller reports as an anchor it cannot read.
+    ``O_NONBLOCK``, where the platform has it, keeps the open from waiting on a pipe with no
+    writer, so a pipe swapped in for a CA is refused rather than waited on (vault BACKLOG #3090)."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(path, flags), "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        return handle.read()
+
+
 def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
     """Inspect one anchor file: compute its fingerprint, its DACL verdict, and (if pinned) whether the
     fingerprint matches the pin. Pure inspection — no enforcement, no audit. Reads the file + the DACL,
     so callers on the event loop should dispatch it via :func:`asyncio.to_thread`.
 
     The file is read ONCE, and the verdict carries those bytes as ``data``, so a consumer can load
-    what was hashed rather than open the file again (BACKLOG #1142, slice 2)."""
-    data = Path(spec.path).read_bytes()
+    what was hashed rather than open the file again (BACKLOG #1142, slice 2). It reads only a
+    regular file (:func:`_read_regular_file`), so a pipe never makes the check wait."""
+    data = _read_regular_file(spec.path)
     fingerprint = anchor_digest_hex(ANCHOR_DIGEST, data)
     pin_ok: bool | None = None
     if spec.pin is not None:
@@ -1573,14 +1590,14 @@ def database_ca_anchor_spec(
     ``None`` (module item 12, vault BACKLOG #3090 step 7).
 
     ``None`` when the connection names no ``sslca``, when its driver never reads it
-    (:func:`unread_ca_reason`), and when no spelling of the value names a regular file. The value
-    is tried as sent and trimmed, as the build tries it. A directory, a pipe or a missing file is
-    left to the driver, as the build leaves it: :func:`evaluate_anchor` reads the whole file with no
-    cap, and a pipe would make that read wait. The test is a ``stat`` before that read, so a pipe
-    swapped in between the two is read. ``kind`` and ``label`` are :func:`outbound_anchor_spec`'s.
-    The keyword is matched as the build matches it, and ``odbc_params`` never holds an ``env()``
-    value, which the factories refuse."""
+    (:func:`unread_ca_reason`), and when no spelling of the value names a regular file, as sent or
+    trimmed: the build leaves a directory, a pipe or a missing file to the driver. The first
+    spelling that names one is checked. A pipe swapped in after this ``stat`` is refused by
+    :func:`evaluate_anchor`'s read, not waited on. ``kind`` and ``label`` are
+    :func:`outbound_anchor_spec`'s. Module item 12 says what the check covers."""
     value = _generic_odbc_param(settings, "sslca")
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
     if not isinstance(value, str) or unread_ca_reason(settings) is not None:
         return None
     path = next((p for p in dict.fromkeys((value, value.strip())) if p and os.path.isfile(p)), None)
@@ -1758,7 +1775,7 @@ def registry_anchor_specs(
     DATABASE outbound or ``DatabasePoll`` takes its ``odbc_params`` ``sslca`` there (module item
     12). A ``DatabaseLookup`` has no generic dialect, so it has no such CA.
 
-    ``lanes=False`` leaves out the outbound and ``Ftp`` poller CAs, which the start checks lane by
+    ``lanes=False`` leaves out the outbound, ``Ftp`` poller and ``DatabasePoll`` CAs, which the start checks lane by
     lane instead (module item 9). A connection whose anchor settings do not resolve is skipped:
     its own build refuses it, and that error names the missing value."""
     from messagefoundry.config.models import ConnectorType
@@ -2152,7 +2169,8 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     An anchor whose consumer reads ``cafile=`` (``loads_verified_bytes`` False, the outbound CAs,
     vault BACKLOG #2371) skips the shape check. ``cafile=`` loads a ``TRUSTED CERTIFICATE`` block,
     for one, so refusing it here would refuse what the build accepts. It takes the private-key
-    check alone (BACKLOG #3745), since no build needs a key in its CA file. That check reads the
+    check (BACKLOG #3745), since no build needs a key in its CA file, and a driver's CA takes the
+    encryption-header check too (:func:`_refuse_by_path_content`). Each reads the
     bytes this preflight read; the hop reads the file again, so the gap the docs name for a swapped
     file holds for a key too.
 
@@ -2405,7 +2423,7 @@ LaneAnchorCheck = Callable[[str, str, Mapping[str, Any]], Awaitable[None]]
 def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
     """The engine's per-lane check of a dialling CA (vault BACKLOG #2371, ADR 0031 amendment of
     2026-10-06). The runner awaits it inside each outbound lane build, at start and at an operator
-    start, and before it binds an inbound ``Ftp`` poller. A refusal raises there, so the existing
+    start, and before it binds an inbound ``Ftp`` poller or ``DatabasePoll``. A refusal raises there, so the existing
     isolation fails that lane only. Before a reload quiesces, the runner awaits it for each lane
     that reload builds or keeps running, and a refusal refuses the reload. Each label is
     :func:`lane_anchor_spec`'s.
@@ -2430,13 +2448,19 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
             return (spec.path, spec.pin, "unreadable", exc.errno)
         return (spec.path, spec.pin, v.fingerprint, v.acl_ok, v.pin_ok, v.path_ok)
 
+    def look(
+        direction: str, name: str, settings: Mapping[str, Any]
+    ) -> tuple[AnchorSpec, tuple[object, ...]] | None:
+        # One thread hop: a DATABASE lane's spec stats its sslca path (database_ca_anchor_spec).
+        spec = lane_anchor_spec(direction, name, settings)
+        return None if spec is None else (spec, state(spec))
+
     async def check(direction: str, name: str, settings: Mapping[str, Any]) -> None:
-        # Off the loop: a DATABASE lane's spec stats its sslca path (database_ca_anchor_spec).
-        spec = await asyncio.to_thread(lane_anchor_spec, direction, name, settings)
-        if spec is None:
+        found = await asyncio.to_thread(look, direction, name, settings)
+        if found is None:
             refused.pop(f"{direction}:{name}", None)
             return
-        now = await asyncio.to_thread(state, spec)
+        spec, now = found
         prior = refused.pop(spec.label, None)
         if prior is not None and prior[0] == now:
             refused[spec.label] = prior
