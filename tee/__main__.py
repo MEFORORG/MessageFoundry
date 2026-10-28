@@ -661,9 +661,10 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    # Printed whatever the cause, and before the store is read, so every run says it. With no
-    # prefix the site-code scrub matches nothing, and the leak-check's live-tables field does not
-    # name the prefix. A warning, not a refusal: a token-less public build loads none (BACKLOG #3516).
+    # Printed whatever the cause, and before the store is read, so every run that passes the salt
+    # and overlay checks says it, one with no captured bodies too. With no prefix the site-code
+    # scrub matches nothing, and the leak-check's live-tables field does not name the prefix. A
+    # warning, not a refusal: a token-less public build loads none (BACKLOG #3516).
     if not site_prefixes_loaded():
         print(
             "warning: no site prefix loaded, so no site code is scrubbed. The token source "
@@ -673,9 +674,9 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # The store is read AFTER the salt and overlay checks above, and after the warning. Read before them, a run with no captured bodies
-    # returned here and never read the overlay, so a bad one stayed hidden until a run that had
-    # bodies (BACKLOG #3003).
+    # The store is read AFTER the salt and overlay checks above. Read before them, a run with no
+    # captured bodies returned here and never read the overlay, so a bad one stayed hidden until
+    # a run that had bodies (BACKLOG #3003).
     store = await RelayStore.open(args.db)
     try:
         rows = await store.captures(

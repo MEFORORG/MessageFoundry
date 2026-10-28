@@ -2375,9 +2375,10 @@ What the `date` kind does to a value:
 - An `OBX-5` result whose `OBX-2` type is `DT` or `TS`, such as a last menstrual period, takes the
   `date` kind too: the year stays, and a value that is not a valid timestamp is scrubbed to
   empty. A date under any other type gets that type's treatment. So a date sent as `NM` is kept
-  whole when it fits the `NM` grammar below: digits alone, such as `20110715`, even after a sign
-  or a comparator. A dash or a slash inside the date, as in `2011-07-15`, does not fit, so that
-  one is redacted whole, as is one sent as `DTM` or `ST`.
+  whole whenever it fits the `NM` grammar below. At least these fit: digits alone, such as
+  `20110715`, even after a sign or a comparator; one decimal point, such as `2011.07`; and a date
+  split across repetitions. A dash or a slash inside the date, as in `2011-07-15`, does not fit,
+  so that one is redacted whole, as is one sent as `DTM` or `ST`.
 - An `OBX-5` result whose `OBX-2` type is `NM`, `SN` or `TM` is kept whole only when it fits the
   grammar of that type (vault BACKLOG #2961). `NM` is an optional comparator, an optional sign,
   digits and at most one decimal point. `SN` is a comparator, a number, a separator and a second

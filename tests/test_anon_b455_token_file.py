@@ -103,15 +103,18 @@ def test_a_kept_path_that_a_rule_also_rewrites_is_not_listed_as_kept(package: st
 def _tee_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> str:
-    """One in-process ``anonymize-captures`` run over one synthetic capture; its stderr."""
+    """One in-process ``anonymize-captures`` run over one synthetic capture; its stderr. Every
+    run here writes its dataset: the warning is a warning, not a refusal."""
     # The in-process run must not reconfigure logging for the whole pytest session.
     monkeypatch.setattr("tee.__main__._configure_logging", lambda level: None)
     monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
     db = str(tmp_path / "tee.db")
     _seed(db, (_MESSAGE,))
     capsys.readouterr()
-    tee_main(["anonymize-captures", "--db", db, "--out", str(tmp_path / "ds.jsonl")])
-    return capsys.readouterr().err
+    code = tee_main(["anonymize-captures", "--db", db, "--out", str(tmp_path / "ds.jsonl")])
+    err = capsys.readouterr().err
+    assert code == 0 and "wrote 1 de-identified message(s)" in err
+    return err
 
 
 @pytest.mark.parametrize("unreadable", [False, True], ids=["no-file", "unreadable-file"])
@@ -165,6 +168,4 @@ def test_the_tee_does_not_warn_when_a_prefix_loaded(
     monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", _TOKENS)
     tee_surrogates.reload_site_prefixes()
     assert tee_surrogates.site_prefixes_loaded()
-    err = _tee_stderr(tmp_path, monkeypatch, capsys)
-    assert _WARNING not in err
-    assert "wrote 1 de-identified message(s)" in err
+    assert _WARNING not in _tee_stderr(tmp_path, monkeypatch, capsys)
