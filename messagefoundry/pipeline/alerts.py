@@ -215,8 +215,12 @@ class AlertSink(Protocol):
         outbound delivery worker halted (``InternalErrorPolicy.STOP`` on an internal/code error, a
         credential or configuration fault), an inbound's router or transform worker halted under the
         same policy, a connection failed to build or bind at start (ADR 0031; ``detail`` starts
-        ``failed to start:``), or a log-write halt stopped it (#122). ``name`` is the bare connection
-        name, whichever direction stopped; ``detail`` says what stopped."""
+        ``failed to start:``), or a log-write halt stopped it (#122). For a connection, ``name`` is
+        the bare connection name, whichever direction stopped. Some raises are not about a
+        connection and carry a prefixed stand-in instead, which no connection name can hold (the
+        name grammar has no colon): at least ``reference:<set>`` for a reference set that failed to
+        sync, ``fhir_lookup:<name>`` for a lookup that failed to build, and
+        ``cluster:transform-state`` for a state-convergence failure. ``detail`` says what stopped."""
         ...
 
     def connection_started(self, name: str) -> None:
@@ -226,8 +230,14 @@ class AlertSink(Protocol):
         :meth:`connection_error`. Emits **no** notification; it exists so durable alert-state (ADR
         0044) can **auto-resolve** the open ``connection_stopped`` instance for ``name``, such as an
         inbound's bind failure. Auto-resolve-only, never a rule-targetable alert type. The default
-        :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is the
-        connection label only (no PHI)."""
+        :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is always a
+        bare inbound name, so it never resolves a prefixed stand-in instance. At least these
+        starts never raise it: an outbound's own start; a start where the runner cannot see every
+        cause (on a clustered node, or on an engine shard that does not own the outbound
+        namesake); and the start inside a ``restart_inbound`` that a ``connection_stopped`` rule
+        dispatched for its own inbound, so a rule-driven crash loop keeps one open instance. A
+        pause or park of the outbound namesake does not hold it back. ``RegistryRunner._emit_inbound_started`` holds the
+        checks. ``name`` is the connection label only (no PHI)."""
         ...
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:

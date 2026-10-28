@@ -163,7 +163,7 @@ async def test_a_held_outbound_halt_keeps_the_inbound_namesake_from_resolving(
 ) -> None:
     # The outbound halted at run time: a STOP site raises connection_stopped and records the hold,
     # which is what _hold_for_operator does at every outbound STOP. A restart of the inbound of the
-    # same name must leave that alert open, and so must a paused outbound.
+    # same name must leave that alert open. A pause alone is no cause, so it does not.
     reg = Registry()
     reg.add_inbound(build_inbound_connection("SHARED", MLLP(port=0), router="r"))
     reg.add_router("r", lambda m: [])
@@ -182,10 +182,11 @@ async def test_a_held_outbound_halt_keeps_the_inbound_namesake_from_resolving(
         assert runner.inbound_running("SHARED")
         assert sink.started == ["SHARED"]
         runner._release_operator_hold("SHARED", "outbound")
-        runner._outbound_paused.add("SHARED")
+        await runner.stop_outbound("SHARED")
         await runner.restart_inbound("SHARED", operator=True)
-        assert sink.started == ["SHARED"]
-        runner._outbound_paused.discard("SHARED")
+        assert sink.started == ["SHARED", "SHARED"]
+        # A build that failed as the outbound left the DR park is a cause.
+        runner._dr_unbuilt["SHARED"] = True
         await runner.restart_inbound("SHARED", operator=True)
         assert sink.started == ["SHARED", "SHARED"]
     finally:
@@ -378,10 +379,12 @@ async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
     runner = _runner(reg, store, sink, claim_mode="per_lane")
     restarts: list[str] = []
 
-    async def _control(action: str, target: str, *, default_target: bool) -> None:
-        assert action == "restart_inbound"
+    async def _control(
+        action: str, target: str, *, default_target: bool, self_restart: bool = False
+    ) -> None:
+        assert action == "restart_inbound" and self_restart
         restarts.append(target)
-        await runner.restart_inbound(target)
+        await runner.restart_inbound(target, resolve_stop=not self_restart)
 
     async def _cycle() -> int:
         await asyncio.sleep(0.01)
@@ -430,11 +433,11 @@ async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
     assert [e["severity"] for e in pages.events] == ["warning", "warning", "critical", "critical"]
 
 
-async def test_only_the_rules_own_restart_skips_the_resolve() -> None:
-    # The sink-level contract, through _emit: only the restart_inbound a connection_stopped of the
-    # same inbound dispatched skips the resolve, keeping the count and the suspend entry. A restart
-    # another alert type drove, an operator start and every other inverse resolve, dropping both,
-    # as ADR 0133 D1 says.
+async def test_only_the_rules_own_restart_is_flagged_a_self_restart() -> None:
+    # The sink-level contract: only the restart_inbound a connection_stopped of the same inbound
+    # dispatched carries self_restart=True. A restart another alert type drove does not. The sink
+    # itself resolves every connection_started it sees; the skip is the runner's, scoped to the
+    # start it makes under its reload lock (test_a_start_another_door_... pins that).
     resolved: list[tuple[object, object]] = []
 
     class _Resolve:
@@ -450,50 +453,22 @@ async def test_only_the_rules_own_restart_skips_the_resolve() -> None:
         for t in ("connection_stopped", "queue_buildup")
     ]
     sink = NotifierAlertSink([], rules=rules, store=_Resolve())  # type: ignore[arg-type]
-    key = "connection_stopped:IB"
-    seen: list[tuple[int | None, bool]] = []
+    flags: list[bool] = []
 
-    async def _control(action: str, target: str, *, default_target: bool) -> None:
-        sink._suspended[key] = 1e12
-        sink.connection_started(target)  # the start inside the restart
-        seen.append((sink._occurrences.get(key), key in sink._suspended))
+    async def _control(
+        action: str, target: str, *, default_target: bool, self_restart: bool = False
+    ) -> None:
+        flags.append(self_restart)
 
     sink.set_control_callback(_control)
     sink.connection_stopped("IB", detail="router halted")
-    await _settle(sink, sink._control_tasks)
-    await _settle(sink)
-    assert seen.pop() == (1, True) and resolved == []
     sink.queue_buildup("IB", depth=10, oldest_age_seconds=1.0)
     await _settle(sink, sink._control_tasks)
-    await _settle(sink)
-    assert seen.pop() == (None, False) and resolved == [("connection_stopped", "IB")]
-    assert sink._restarting == {}
+    assert flags == [True, False]
 
-    # Two restarts of the same key overlap: the first to finish must not drop the other's mark.
-    held = asyncio.Event()
-
-    async def _slow(action: str, target: str, *, default_target: bool) -> None:
-        await held.wait()
-        sink.connection_started(target)
-
-    async def _quick(action: str, target: str, *, default_target: bool) -> None:
-        return
-
-    resolved.clear()
-    sink._occurrences[key] = 5
-    slow = asyncio.ensure_future(
-        sink._run_control(_slow, "restart_inbound", "IB", default_target=True, mark=key)
-    )
-    await asyncio.sleep(0)
-    await sink._run_control(_quick, "restart_inbound", "IB", default_target=True, mark=key)
-    held.set()
-    await slow
-    await _settle(sink)
-    assert sink._occurrences[key] == 5 and sink._restarting == {} and resolved == []
-
-    # A start nobody's rule asked for: an operator start after a fix.
+    # A connection_started reaching the sink always resolves, dropping the count (ADR 0133 D1).
     sink.connection_started("IB")
-    assert key not in sink._occurrences
+    assert "connection_stopped:IB" not in sink._occurrences
     sink._occurrences["connection_error:OB"] = 5
     sink.connection_restored("OB")
     assert "connection_error:OB" not in sink._occurrences
@@ -501,12 +476,9 @@ async def test_only_the_rules_own_restart_skips_the_resolve() -> None:
     assert resolved == [("connection_stopped", "IB"), ("connection_error", "OB")]
 
 
-@pytest.mark.parametrize(("control_target", "resolves"), [("IB", False), ("OTHER", True)])
-async def test_a_rule_naming_its_own_inbound_skips_the_resolve_too(
-    control_target: str, resolves: bool
-) -> None:
-    # A rule that names its own inbound as control_target is the same self-restart; one that names
-    # another connection is not, so a start of the stopped inbound during it still resolves.
+async def test_a_bare_inbound_start_never_resolves_a_prefixed_stand_in() -> None:
+    # connection_stopped is also raised under stand-in keys no connection name can hold. An inbound
+    # start of the same bare name resolves only the bare-name instance.
     resolved: list[object] = []
 
     class _Resolve:
@@ -517,24 +489,134 @@ async def test_a_rule_naming_its_own_inbound_skips_the_resolve_too(
             resolved.append(kw["connection"])
             return 0
 
+    sink = NotifierAlertSink([], store=_Resolve())  # type: ignore[arg-type]
+    for stand_in in ("reference:IB", "fhir_lookup:IB", "cluster:transform-state"):
+        sink.connection_stopped(stand_in, detail="failed")
+    sink.connection_started("IB")
+    await _settle(sink)
+    assert resolved == ["IB"]
+    assert {"connection_stopped:reference:IB", "connection_stopped:fhir_lookup:IB"} <= set(
+        sink._occurrences
+    )
+
+
+async def test_restart_inbound_with_resolve_stop_off_raises_no_start(
+    store: MessageStore,
+) -> None:
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    sink = _Recording()
+    runner = _runner(reg, store, sink)
+    await runner.start()
+    try:
+        sink.started.clear()
+        await runner.restart_inbound("IB", resolve_stop=False)
+        assert runner.inbound_running("IB") and sink.started == []
+        assert runner._unresolving_starts == set()
+        await runner.restart_inbound("IB")
+        assert sink.started == ["IB"]
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize(("control_target", "resolves"), [("IB", False), ("OTHER", True)])
+async def test_a_rule_naming_its_own_inbound_is_a_self_restart_too(
+    control_target: str, resolves: bool
+) -> None:
+    # A rule that names its own inbound as control_target is the same self-restart; one that names
+    # another connection is not.
     rule = AlertRule(
         event_type="connection_stopped",
         connection="IB",
         control_action="restart_inbound",
         control_target=control_target,
     )
-    sink = NotifierAlertSink([], rules=[rule], store=_Resolve())  # type: ignore[arg-type]
-    targets: list[str] = []
+    sink = NotifierAlertSink([], rules=[rule])
+    calls: list[tuple[str, bool]] = []
 
-    async def _control(action: str, target: str, *, default_target: bool) -> None:
-        targets.append(target)
+    async def _control(
+        action: str, target: str, *, default_target: bool, self_restart: bool = False
+    ) -> None:
         assert default_target is False
-        sink.connection_started("IB")
+        calls.append((target, self_restart))
 
     sink.set_control_callback(_control)
     sink.connection_stopped("IB", detail="router halted")
     await _settle(sink, sink._control_tasks)
-    await _settle(sink)
-    assert targets == [control_target]
-    assert resolved == (["IB"] if resolves else [])
-    assert ("connection_stopped:IB" in sink._occurrences) is not resolves
+    assert calls == [(control_target, not resolves)]
+
+
+async def test_a_start_another_door_makes_while_the_rules_restart_waits_resolves(
+    store: MessageStore,
+) -> None:
+    # The rule's restart is queued behind the reload lock while another door, holding it, brings
+    # the inbound up. That start is genuine, so the alert resolves; only the start the restart
+    # itself makes is skipped.
+    from types import SimpleNamespace
+
+    from messagefoundry.api.app import _alert_control_action
+
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    rule = AlertRule(
+        event_type="connection_stopped", connection="IB", control_action="restart_inbound"
+    )
+    sink = NotifierAlertSink([], rules=[rule], store=store)
+    runner = _runner(reg, store, sink)
+    engine = SimpleNamespace(registry_runner=runner)
+
+    async def _control(action: str, target: str, **kw: Any) -> None:
+        await _alert_control_action(engine, action, target, **kw)  # type: ignore[arg-type]
+
+    sink.set_control_callback(_control)
+    await runner.start()
+    try:
+        await _settle(sink)
+        async with runner._reload_lock:
+            await runner._stop_inbound_unsafe("IB")
+            sink.connection_stopped("IB", detail="router halted on internal error")
+            for _ in range(5):
+                await asyncio.sleep(0)  # the restart is now waiting for the lock
+            assert sink._control_tasks
+            await runner._start_inbound_unsafe("IB")  # a reload or scheduler door's start
+        await _settle(sink, sink._control_tasks)
+        await _settle(sink)
+        assert runner.inbound_running("IB")
+        assert await _open(store) == set()
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("park", ["deployed", "paused"])
+async def test_a_deliberately_parked_outbound_namesake_does_not_block_the_resolve(
+    store: MessageStore, held_port: tuple[int, socket.socket], tmp_path: Path, park: str
+) -> None:
+    # A pause or a deployed=False park of the outbound of the same name raises no
+    # connection_stopped, so it is no cause, and must not hold the inbound's bind-failure alert open.
+    port, blocker = held_port
+    reg = _registry(port)
+    reg.add_outbound(
+        OutboundConnection(
+            "SHARED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "out")}),
+            deployed=park != "deployed",
+        )
+    )
+    sink = NotifierAlertSink([], store=store)
+    runner = _runner(reg, store, sink)
+    await runner.start()
+    try:
+        if park == "paused":
+            await runner.stop_outbound("SHARED")
+        assert runner.inbound_failed("SHARED") and not runner.outbound_running("SHARED")
+        await _settle(sink)
+        assert await _open(store) == {("connection_stopped", "SHARED")}
+        blocker.close()
+        await runner.start_inbound("SHARED", operator=True)
+        assert runner.inbound_running("SHARED")
+        await _settle(sink)
+        assert await _open(store) == set()
+    finally:
+        await runner.stop()

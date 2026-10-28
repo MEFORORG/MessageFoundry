@@ -1659,6 +1659,9 @@ class RegistryRunner:
         # BACKLOG #1741: inbounds a reload in progress started, whose connection_started waits for
         # the swap to commit (reload says why). None outside a reload.
         self._started_pending: list[str] | None = None
+        # BACKLOG #1741: inbounds inside a restart_inbound(resolve_stop=False), whose start raises no
+        # connection_started. Held only under the reload lock, so no other door's start sees it.
+        self._unresolving_starts: set[str] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
         # resolved in _start_pooled_dispatchers AFTER trying to open the sync pools + build the per-stage
@@ -3287,14 +3290,27 @@ class RegistryRunner:
         async with self._reload_lock:
             await self._stop_inbound_unsafe(name)
 
-    async def restart_inbound(self, name: str, *, operator: bool = False) -> None:
+    async def restart_inbound(
+        self, name: str, *, operator: bool = False, resolve_stop: bool = True
+    ) -> None:
+        """Stop then start one inbound under one reload-lock span.
+
+        ``resolve_stop=False`` is the restart a ``connection_stopped`` rule dispatched for this
+        same inbound: its own start raises no ``connection_started``, so a rule-driven crash loop
+        keeps one open, escalating instance (BACKLOG #1741). The skip is scoped to the start made
+        inside the lock, so a start another door makes while this call waits for it still counts."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
-            await self._stop_inbound_unsafe(name)
-            await self._checked_inbound_start(name)
+            if not resolve_stop:
+                self._unresolving_starts.add(name)
+            try:
+                await self._stop_inbound_unsafe(name)
+                await self._checked_inbound_start(name)
+            finally:
+                self._unresolving_starts.discard(name)
 
     def _dr_refuses(self, name: str, *, operator: bool) -> bool:
         """Whether a passive DR standby refuses an engine start of inbound ``name`` (vault BACKLOG
@@ -4392,7 +4408,10 @@ class RegistryRunner:
 
     def _note_inbound_started(self, name: str) -> None:
         """An inbound came up on a door that re-armed its internal stages: emit ``connection_started``
-        now, or after the swap when a reload is in progress (BACKLOG #1741)."""
+        now, or after the swap when a reload is in progress, or not at all inside a
+        ``restart_inbound(resolve_stop=False)`` (BACKLOG #1741)."""
+        if name in self._unresolving_starts:
+            return
         if self._started_pending is not None:
             self._started_pending.append(name)
             return
@@ -4403,14 +4422,17 @@ class RegistryRunner:
         open ``connection_stopped`` instance under that name, such as a bind failure (BACKLOG #1741,
         ADR 0031 section 1, ADR 0044 D2).
 
+        :meth:`AlertSink.connection_started` states the contract; these are the checks behind it.
         Only when no known cause still holds the name down IN EITHER DIRECTION, because alerts key on
         the bare name while every cause here keys on direction (#1813). The alert row lives in the
         store every process shares, so a clustered node, or an engine shard that does not own the
         outbound namesake, cannot see every cause and resolves nothing. A pooled lane a dispatcher
         STOPPED on its own account without a hold (a leadership-loss STOP) counts as a cause too, and
-        so does any pause of the outbound namesake. A skipped resolve leaves an alert open for an
-        operator, which is the safe direction, and nothing retries it. This docstring is the one
-        statement of when the inverse fires. Never raises: an alert failure must not break a start
+        so does an outbound namesake whose build failed as it left the DR park. A pause or a park of
+        the outbound namesake (an operator or schedule stop, ``deployed=False``, ``auto_start=False``)
+        is not a cause: it raises no ``connection_stopped``, and a halt that pauses a lane is caught
+        by its own record above. A skipped resolve leaves an alert open for an operator, which is the
+        safe direction, and nothing retries it. Never raises: an alert failure must not break a start
         or the tail of a committed reload."""
         try:
             blocked = (
@@ -4422,7 +4444,7 @@ class RegistryRunner:
                 or (name in self.registry.outbound and not self._owns_destination(name))
                 or self.outbound_failed(name) is not None
                 or ("outbound", name) in self._stop_held
-                or name in self._outbound_paused
+                or self.outbound_dr_failed(name)
                 or any(d.stopped(name) for d in self._dispatchers.values())
             )
             if not blocked:

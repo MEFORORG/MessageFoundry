@@ -27,11 +27,15 @@ class _Control:
     def __init__(self, *, fail: bool = False) -> None:
         self.calls: list[tuple[str, str]] = []
         self.defaults: list[bool] = []
+        self.self_restarts: list[bool] = []
         self.fail = fail
 
-    async def __call__(self, action: str, target: str, *, default_target: bool) -> None:
+    async def __call__(
+        self, action: str, target: str, *, default_target: bool, self_restart: bool = False
+    ) -> None:
         self.calls.append((action, target))
         self.defaults.append(default_target)
+        self.self_restarts.append(self_restart)
         if self.fail:
             raise RuntimeError("restart rejected")
 
@@ -292,7 +296,7 @@ async def test_callback_maps_action_to_runner_restart() -> None:
         def outbound_dr_failed(self, name: str) -> bool:
             return False
 
-        async def restart_inbound(self, name: str) -> None:
+        async def restart_inbound(self, name: str, *, resolve_stop: bool = True) -> None:
             self.calls.append(("restart_inbound", name))
 
         async def restart_outbound(self, name: str) -> None:
@@ -303,9 +307,15 @@ async def test_callback_maps_action_to_runner_restart() -> None:
     class _FakeEngine:
         registry_runner = rr
 
-    async def _alert_control(action: str, target: str, *, default_target: bool) -> None:
+    async def _alert_control(
+        action: str, target: str, *, default_target: bool, self_restart: bool = False
+    ) -> None:
         await _alert_control_action(
-            cast(Any, _FakeEngine()), action, target, default_target=default_target
+            cast(Any, _FakeEngine()),
+            action,
+            target,
+            default_target=default_target,
+            self_restart=self_restart,
         )
 
     rule = AlertRule(event_type="connection_stopped", control_action="restart_outbound")
@@ -410,6 +420,7 @@ class _RecordingRunner:
         draining: tuple[str, ...] = (),
     ) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.resolve_stops: list[bool] = []
         self.registry = _FakeRegistry(inbound=inbound, outbound=outbound)
         self.knows_outbound = _knows_outbound(self.registry, draining)
 
@@ -419,8 +430,9 @@ class _RecordingRunner:
     def outbound_dr_failed(self, name: str) -> bool:
         return False
 
-    async def restart_inbound(self, name: str) -> None:
+    async def restart_inbound(self, name: str, *, resolve_stop: bool = True) -> None:
         self.calls.append(("restart_inbound", name))
+        self.resolve_stops.append(resolve_stop)
 
     async def restart_outbound(self, name: str) -> None:
         self.calls.append(("restart_outbound", name))
@@ -484,3 +496,24 @@ async def test_a_draining_outbound_counts_as_an_outbound() -> None:
 async def test_an_unknown_action_with_a_default_target_restarts_nothing() -> None:
     rr = _RecordingRunner(inbound=("FEED",), outbound=("FEED",))
     assert await _control_action(rr, "restart_everything", "FEED", default_target=True) == []
+
+
+async def test_a_self_restart_reaches_the_runner_as_resolve_stop_off() -> None:
+    # BACKLOG #1741: the sink's self_restart becomes the runner's resolve_stop=False, so the start
+    # that restart makes under the reload lock resolves nothing.
+    from messagefoundry.api.app import _alert_control_action
+
+    rr = _RecordingRunner(inbound=("FEED",), outbound=())
+
+    class _FakeEngine:
+        registry_runner = rr
+
+    for self_restart in (True, False):
+        await _alert_control_action(
+            cast(Any, _FakeEngine()),
+            "restart_inbound",
+            "FEED",
+            default_target=True,
+            self_restart=self_restart,
+        )
+    assert rr.resolve_stops == [False, True]
