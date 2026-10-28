@@ -545,7 +545,7 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
     The sniff reads MSH-1 and MSH-2. A fragment carrying custom delimiters but no MSH header declares
     nothing, so there is no delimiter set to recover and it passes through. This fix does NOT claim
     completeness. The "never put PHI in an exception message" convention binds only the engine's own
-    authors, Router and Handler authors included, and never a remote peer, a library or the runtime
+    authors, Router and Handler authors included, in text they write themselves, and never a remote peer, a library or the runtime
     (docs/PHI.md section 7, *Who the exception-message convention binds*).
 
     The fixture read ``mrn MRN123$$$H$MR here`` until BACKLOG #2079, whose labelled-MRN pass now
@@ -573,7 +573,7 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
 def test_a_long_name_run_keeps_a_token_on_each_4j_plus_1_remainder(
     text: str, expected: str
 ) -> None:
-    """DOCUMENTED RESIDUAL, OPEN (BACKLOG #2079), pinned so a change to it is deliberate.
+    """DOCUMENTED RESIDUAL, OPEN (found under BACKLOG #2079), pinned so a change to it is deliberate.
 
     Each ``_NAME_RUN`` arm takes two to four tokens and the scan resumes after a match, so a run of
     4j+1 tokens keeps its last token and every other length loses all. ``_COMMA_NAME_RUN`` runs first
@@ -582,11 +582,21 @@ def test_a_long_name_run_keeps_a_token_on_each_4j_plus_1_remainder(
     assert redact(text) == expected
 
 
-@pytest.mark.parametrize("text", ["x Jane DOE y", "x JANE Doe y", "x Mary JO Smith y"])
-def test_a_name_mixing_the_two_cases_passes_whole(text: str) -> None:
-    """DOCUMENTED RESIDUAL, OPEN (BACKLOG #2079): each ``_NAME_RUN`` arm needs one case throughout."""
-    assert redact(text) == text
-    assert redact("x Jane Doe y") == "x [redacted] y"  # control: one case is caught
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("x Jane Doe y", "x [redacted] y"),  # control: one case throughout is caught
+        ("x Jane DOE y", "x Jane DOE y"),
+        ("x JANE Doe y", "x JANE Doe y"),
+        ("x Mary JO Smith y", "x Mary JO Smith y"),
+        ("x Mary Ann DOE y", "x [redacted] DOE y"),  # the same-case pair is still taken
+        ("x DOE, Jane y", "x DOE, Jane y"),  # the comma arm has the same rule
+    ],
+)
+def test_a_name_token_with_no_same_case_neighbour_passes(text: str, expected: str) -> None:
+    """DOCUMENTED RESIDUAL, OPEN (found under BACKLOG #2079): each name arm needs one case throughout
+    a run, so a token whose neighbours are all in the other case is read alone and passes."""
+    assert redact(text) == expected
 
 
 # --- safe_name: a partner-chosen FILE NAME (BACKLOG #1748) --------------------

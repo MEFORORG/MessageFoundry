@@ -1566,7 +1566,7 @@ provides `redact()` (scrubs HL7 segment/field content from free text, keeping se
 de-identification (§9). Beyond HL7-shaped spans, `redact()` now also applies a **conservative free-text
 heuristic** — date/DOB runs and multi-token name runs (e.g. `DOE JANE`) are scrubbed even without HL7
 delimiters — so the prior free-text residual is **narrowed** to, at least, a *single-token* or
-non-name-shaped identifier and the shapes listed two paragraphs down, some of which a real name hits
+non-name-shaped identifier and the shapes the next paragraph lists, some of which a real name hits
 with no adversary. The "never put PHI in an exception message" convention binds only some of the
 text those residuals reach; *Who the exception-message convention binds*, below, says which.
 The HL7 delimiters are **read from the message's MSH header** rather than assumed to be `| ^ ~ &`
@@ -1580,10 +1580,11 @@ date (`19800505123000-0500`, fraction included), an ISO date-time in either form
 `19800505T123000`, with `Z` or a numeric offset), a family-comma-given name (`Doe, Jane`,
 `DOE, JANE`, up to four tokens a side) and a dashed SSN (`123-45-6789`). It still does NOT take, at
 least: a US `MM/DD/YYYY` date with a time glued to it, an undashed or spaced SSN, a name with an
-apostrophe or an inner capital (`O'Brien`, `McDoe`), a name mixing the two cases (`Jane DOE`
-passes whole), and part of a long name: a run of 5, 9 or any 4j+1 tokens keeps its last token, and
-a comma name can keep one token on each side (the `_NAME_RUN` comment in `redaction.py` states the
-rule as measured). Both name residuals are open, not accepted. One engine-owned shape is carved out by name: a
+apostrophe or an inner capital (`O'Brien`, `McDoe`), a token of a name mixing the two cases that
+has no neighbour in its own case (`Jane DOE` and `DOE, Jane` pass whole, `Mary Ann DOE` keeps
+`DOE`), and part of a long name: a run of 5, 9 or any 4j+1 tokens keeps its last token, and a comma
+name can keep one token on each side (the `_NAME_RUN` comment in `redaction.py` states the rule as
+measured). The mixed-case and long-name residuals are open, not accepted. One engine-owned shape is carved out by name: a
 backup archive's stamp followed by `.mfbak`. The price is over-redaction of a 10-, 12- or 14-digit
 number opening `19` or `20`, of any ISO time in a message, and of upper-case codes joined with a
 comma. Engine text works around that at its source, which is a convention and not a guarantee:

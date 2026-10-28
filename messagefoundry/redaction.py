@@ -30,7 +30,7 @@ clamp's cut (which falls before :data:`_REDACT_WINDOW`, and further back after i
 clamp drops the header the sniff needs and the fragment in the kept head survives (BACKLOG #1848,
 accepted below under :data:`_CUT_CHARS`), and the structured shapes the
 section comment above :func:`_redact_structured` lists. The "never put PHI in an exception message"
-convention binds only the engine's own authors, Router and Handler authors included, and never a
+convention binds only the engine's own authors, Router and Handler authors included, in text they write themselves, and never a
 remote peer, a library or the runtime (docs/PHI.md section 7, *Who the exception-message convention
 binds*).
 
@@ -283,7 +283,7 @@ _CREDENTIAL_AHEAD = re.compile(
 #: :func:`log_timestamp` in a form no arm here reads, and ``isoformat()`` in engine text fails
 #: ``tests/test_engine_text_survives_the_name_run.py``. Residual, at least: the US ``MM/DD/YYYY`` arm
 #: takes no time, so ``05/05/1980T12:30`` passes. The "never put PHI in an exception message"
-#: convention binds only the engine's own authors, Router and Handler authors included, and never a
+#: convention binds only the engine's own authors, Router and Handler authors included, in text they write themselves, and never a
 #: remote peer, a library or the runtime (docs/PHI.md section 7, *Who the exception-message
 #: convention binds*).
 _DATE_RUN = re.compile(
@@ -348,17 +348,22 @@ _SSN_RUN = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
 #: and ``Else If``. ``tests/test_engine_text_survives_the_name_run.py`` fails on a new run of either
 #: arm in at least the message shapes it scans; its docstring names the ones it does not.
 #:
-#: **Residuals, OPEN (BACKLOG #2079), and a real name can hit both with no adversary:**
+#: **Residuals, at least these two, OPEN (found under BACKLOG #2079), and a real name can hit both
+#: with no adversary.** docs/PHI.md section 7 lists other name shapes this misses (an apostrophe, an
+#: inner capital), and the module docstring the rest.
 #:
 #: - **A run is taken four tokens at a time.** Each arm stops at four and the scan resumes after the
 #:   match, so a run of 4j+1 tokens (5, 9, ...) keeps its LAST token and every other length loses all
 #:   of them (2 to 4, 6 to 8, ...): ``Mary Ann Jo Lee Smith`` reaches the log as ``[redacted] Smith``.
-#:   :data:`_COMMA_NAME_RUN` runs first and takes at most four tokens each side of its comma; what is
-#:   left on either side is then read as a run by the same rule. So five tokens before the comma keep
-#:   the FIRST one (``Aaron Bobby Carl Dave Eve, Jane`` becomes ``Aaron [redacted]``), five after it
-#:   keep the last, and five on each side keep two.
-#: - **A run mixing the two cases matches neither arm.** Each arm needs every token in one case, so
-#:   ``Jane DOE`` passes whole.
+#:   The one exception is a trailing ``MRN`` label, which :func:`_name_run_replacement` keeps at any
+#:   length. :data:`_COMMA_NAME_RUN` runs first and takes at most four tokens each side of its comma;
+#:   what is left on either side is then read as a run by the same rule. So five tokens before the
+#:   comma keep the FIRST one (``Aaron Bobby Carl Dave Eve, Jane`` becomes ``Aaron [redacted]``),
+#:   five after it keep the last, and five on each side keep two.
+#: - **A token with no neighbour in its own case is read alone.** Each arm needs every token of a run
+#:   in one case, so a mixed name splits into same-case runs and a run of one passes: ``Jane DOE``
+#:   passes whole, and ``Mary Ann DOE`` becomes ``[redacted] DOE``. The comma arm has the same rule,
+#:   so ``DOE, Jane`` passes whole too.
 #:
 #: Neither is fixed; ``tests/test_redaction.py`` pins both as they stand.
 _NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
@@ -484,7 +489,7 @@ def _sniff_delimiters(text: str) -> frozenset[str]:
     custom-delimiter fragment declares nothing, so there is nothing to recover and it passes through
     (``id MRN123$$$H$MR here`` still survives). This claims no completeness. The "never put PHI in an
     exception message" convention binds only the engine's own authors, Router and Handler authors
-    included, and never a remote peer, a library or the runtime (docs/PHI.md section 7, *Who the
+    included, in text they write themselves, and never a remote peer, a library or the runtime (docs/PHI.md section 7, *Who the
     exception-message convention binds*)."""
     found: set[str] = set()
     for match in _MSH_DELIMITERS.finditer(text):
@@ -1080,7 +1085,7 @@ def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 # prose; :func:`_redact_xml_elements` states them.
 #
 # **Residuals, at least these; the "never put PHI in an exception message" convention binds only the
-# engine's own authors, Router and Handler authors included, and never a remote peer, a library or
+# engine's own authors, Router and Handler authors included, in text they write themselves, and never a remote peer, a library or
 # the runtime (docs/PHI.md section 7, *Who the exception-message convention binds*):** JSON or XML quoted INSIDE a JSON string (``\"family\"`` escapes defeat the
 # key and attribute patterns); a structure that uses PHI as its KEYS, since keys are always kept; a
 # string under a JSON ``name`` or ``address`` that the shape rule reads as an operator's, such as
@@ -1719,7 +1724,7 @@ def redact(text: str) -> str:
     comment above them says what running them first cost). The free-text heuristic narrows the prior
     residual to, at least, *single-token* identifiers (a lone name with no second token, no date) and
     the shapes the module docstring and :data:`_NAME_RUN` name. The "never put PHI in an exception
-    message" convention binds only the engine's own authors, Router and Handler authors included, and
+    message" convention binds only the engine's own authors, Router and Handler authors included, in text they write themselves, and
     never a remote peer, a library or the runtime (docs/PHI.md section 7, *Who the exception-message
     convention binds*). The percent-encoded run (:data:`_HL7_ENCODED_FIELD_RUN`) comes
     after all of them, as the last paragraph here says. Meant to be idempotent, since the literal ``[redacted]`` substituted

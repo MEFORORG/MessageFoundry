@@ -3866,7 +3866,8 @@ write methods — so an HL7-shaped fragment can't land in those columns. HL7-sha
 for free-text PHI a script invents (e.g. a bare `"DOE^JANE"`) remains the read-side gate above + the "never
 put PHI in an exception" convention. That convention binds neither a remote peer, whose captured
 reply lands here, nor a library or the runtime, whose exception text can quote a received value
-(`int()` does); for that text only the read-side gate and the encryption below remain
+(`int()` does); for what the scrub misses in that text, only the read-side gate and the encryption
+below remain
 ([PHI.md](PHI.md) section 7, *Who the exception-message convention binds*). These columns are also **encrypted at rest on every backend** —
 SQLite, Postgres, **and SQL Server** (H4 brought SQL Server to parity; `docs/PHI.md` §3) — as
 defense-in-depth around the scrub.

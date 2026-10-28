@@ -11,9 +11,9 @@ convention binds*, and the other places point there.
 This pins the absence of the old claim, in the shapes the controls below hold, over ``docs/``,
 ``messagefoundry/``, ``tests/``, ``packaging/``, ``harness/`` and ``scripts/``. It is a lexical floor:
 a paraphrase that never says "the control" passes it. It also pins that the statement the pointers
-cite is still in section 7. A ``CORRECTED`` note may quote the old wording verbatim: a match with
-that marker in the :data:`_CORRECTED_REACH` folded characters before it is a quoted retraction, not
-the claim.
+cite is still in section 7. A correction note may quote the old wording verbatim: a match that sits
+inside a quote opened after a ``CORRECTED`` marker and ``read`` or ``said`` (:data:`_QUOTED_RETRACTION`)
+is a quoted retraction, not the claim.
 """
 
 from __future__ import annotations
@@ -47,9 +47,13 @@ def _folded(text: str) -> str:
     return " ".join(_LINE_MARKER.sub("", text).split())
 
 
-#: How far back a ``CORRECTED`` marker may sit and still own a quoted claim: room for the marker's
+#: How far back a correction marker may sit and still own a quoted claim: room for the marker's
 #: date and a lead-in such as ``this read``, never a whole paragraph.
 _CORRECTED_REACH = 200
+#: A quoted retraction: a ``CORRECTED`` or ``Corrected`` marker (``UNCORRECTED`` is not one), then in
+#: the same sentence ``read`` or ``said`` and an opening quote that is still open where the claim
+#: starts. A claim merely near an unrelated correction note is not exempt.
+_QUOTED_RETRACTION = re.compile(r"\bcorrected\b[^.]*?\b(?:read|said)\b[^.\"]*\"[^\"]*$", re.I)
 
 
 def _claims(text: str) -> list[str]:
@@ -59,7 +63,7 @@ def _claims(text: str) -> list[str]:
     return [
         m.group(0)
         for m in _CLAIM.finditer(folded)
-        if "CORRECTED" not in folded[max(0, m.start() - _CORRECTED_REACH) : m.start()]
+        if not _QUOTED_RETRACTION.search(folded[max(0, m.start() - _CORRECTED_REACH) : m.start()])
     ]
 
 
@@ -77,6 +81,10 @@ def _claims(text: str) -> list[str]:
         # variants a reword could reach for
         'the "never put PHI in an exception message" convention is still the only control',
         'the "never put PHI in an exception message" convention** remains the **control**',
+        # a claim near an unrelated correction is still the claim
+        "**CORRECTED 2026-10-01:** this said the gate was per route. Neither is a completeness "
+        "claim; the convention above remains the control for both.",
+        'An UNCORRECTED fragment, read "x". The convention above remains the control for both.',
     ],
 )
 def test_the_scan_finds_each_shipped_wording(shipped: str) -> None:
@@ -92,6 +100,8 @@ def test_the_scan_finds_each_shipped_wording(shipped: str) -> None:
         'the "never put PHI in an exception message" convention is the controller',
         # a retraction quoting the old claim verbatim
         '**CORRECTED 2026-10-28:** this read "the convention above remains the control for both".',
+        '*Corrected 2026-10-01 (BACKLOG #2443 step 4):* this said "the convention above remains '
+        'the control for both".',
     ],
 )
 def test_the_scan_passes_other_prose(prose: str) -> None:

@@ -976,7 +976,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 > named residuals include at least **a single-token or non-name-shaped identifier** — a lone MRN
 > or surname with no second token and no delimiter — and the other shapes [PHI.md](PHI.md) section 7
 > lists, some of which a real name or date hits with no adversary. The *"never put PHI in an exception
-> message"* convention binds only the engine's own authors, Router and Handler authors included, and
+> message"* convention binds only the engine's own authors, Router and Handler authors included, in text they write themselves, and
 > never a remote peer, a library or the runtime; it is a rule, not a check (PHI.md section 7, *Who the
 > exception-message convention binds*). So "always-on, every sink" is the coverage guarantee; it is **not** a guarantee
 > that PHI cannot reach a log. Size log-handling risk accordingly, and keep `level` off `debug`.
