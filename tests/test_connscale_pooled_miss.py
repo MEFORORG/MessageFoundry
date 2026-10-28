@@ -14,15 +14,16 @@ run fails even if no comparison row can see it.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from harness.load.connscale import runner as runner_mod
 from harness.load.connscale.profile import load_connscale_profile_text
-from harness.load.connscale.report import EXIT_SLO_VIOLATION
-from harness.load.connscale.runner import ConnScaleError, run_connscale
+from harness.load.connscale.report import EXIT_SLO_VIOLATION, ConnScaleRecord
+from harness.load.connscale.runner import ConnScaleError, _build_record, run_connscale
+from harness.load.enginepoll import EnginePoller, EngineSample
+from harness.load.metrics import Counters, Histogram
 
 _POOLED_ONLY = """
 [connscale]
@@ -37,12 +38,54 @@ claim_modes = ["pooled"]
 _POOLED_FUSE_AB = """
 [connscale]
 name = "pooled-fuse-ab"
-counts = [10]
+counts = [10, 20]
 aggregate_rate = 5.0
 sweep_mode = "fixed_aggregate"
 claim_modes = ["pooled"]
 fuse_modes = [false, true]
 """
+
+
+def _sample(n: int) -> EngineSample:
+    return EngineSample(
+        elapsed_s=0.0,
+        pending=0,
+        inflight=0,
+        done=n,
+        dead=0,
+        read=n,
+        written=n,
+        out_dead=0,
+        queue_depth=0,
+        in_pipeline=0,
+        db_size_bytes=0,
+        journal_mode="wal",
+        synchronous="normal",
+        uptime_s=0.0,
+    )
+
+
+def _clean_record(*, fuse_mode: bool, mode: str, count: int) -> ConnScaleRecord:
+    """A real record for a step that ran and lost nothing: 4 sent, read, written and delivered."""
+    poller = EnginePoller("http://127.0.0.1:1", token=None, origin=0.0)
+    poller._samples = [_sample(0), _sample(4)]
+    return _build_record(
+        claim_mode="pooled",
+        fuse_mode=fuse_mode,
+        batch_mode=False,
+        mode=mode,
+        count=count,
+        aggregate_rate=5.0,
+        metrics_counters=Counters(sent=4, acked=4, sink_received=4),
+        ack_hist=Histogram(),
+        poller=poller,
+        samples=[],
+        in_hold_samples=0,
+        in_hold_floor_ticks=0,
+        proc_readings=[],
+        drain_seconds=1.0,
+        reload_seconds=None,
+    )
 
 
 def _refuse_every_step(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -70,19 +113,29 @@ async def test_a_single_arm_pooled_setup_fault_raises_like_per_lane(
 async def test_a_swallowed_miss_no_comparison_row_sees_still_fails_the_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _refuse_every_step(monkeypatch)
-    # Stands in for a comparison that cannot see the miss: in a real fusion A/B, a cell whose B0 and
-    # B1 both failed while another cell ran leaves no row and no baseline gap, so the comparison
-    # passes. Forcing it to pass here leaves the swallowed-miss gate as the only thing that can fail.
-    monkeypatch.setattr(
-        runner_mod, "build_fuse_comparison", lambda *_a, **_kw: SimpleNamespace(ok=True)
-    )
+    # The N=10 cell fails to start in BOTH arms; the N=20 cell runs clean in both. The fusion
+    # comparison pairs B1 against the B0 cells it saw, so N=10 leaves it no row and no baseline gap.
+    calls: list[tuple[bool, int]] = []
+
+    async def _step(
+        _profile: object, *, fuse_mode: bool, mode: str, count: int, **_kw: Any
+    ) -> ConnScaleRecord:
+        calls.append((fuse_mode, count))
+        if count == 10:
+            raise ConnScaleError("engine failed to start (synthetic)")
+        return _clean_record(fuse_mode=fuse_mode, mode=mode, count=count)
+
+    monkeypatch.setattr(runner_mod, "_run_one_step", _step)
     profile = load_connscale_profile_text(_POOLED_FUSE_AB)
 
     report = await run_connscale(profile, engine_api_port_base=9000, sink_port=8000)
 
-    assert calls == ["pooled", "pooled"]  # an A/B keeps sweeping past a pooled miss
-    assert report.records == []
+    # An A/B keeps sweeping past a pooled miss, so all four steps were tried.
+    assert sorted(calls) == [(False, 10), (False, 20), (True, 10), (True, 20)]
+    assert len(report.records) == 2
     assert any("POOLED ARM MISSING" in note for note in report.notes), report.notes
+    # The control: the comparison and every SLO pass, so only the swallowed-miss gate can fail it.
+    assert report.fuse_comparison is not None and report.fuse_comparison.ok
+    assert all(check.ok for check in report.slos)
     assert not report.result_ok
     assert report.exit_code == EXIT_SLO_VIOLATION

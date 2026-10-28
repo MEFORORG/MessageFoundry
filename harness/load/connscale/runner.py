@@ -247,12 +247,10 @@ async def run_connscale(
     # for the batch comparison too, so a swallowed B0/B1 batching arm is never silently compared against
     # nothing.
     batch_missing_detail: dict[tuple[str, str, int], str] = {}
-    # Whether any A/B axis is multi-arm, so a comparison exists to report a swallowed pooled miss, and
-    # how many steps were swallowed. Counted here rather than read off the dicts above, whose keys
-    # collapse arms, so the run-level gate below holds whichever comparison would have seen the miss.
-    ab_axis = any(
-        len(arms) > 1 for arms in (profile.claim_modes, profile.fuse_modes, profile.batch_modes)
-    )
+    # Whether an A/B exists to report a swallowed pooled miss, and how many steps were swallowed.
+    # Counted at the swallow itself, so the run-level gate below does not depend on which of the
+    # detail dicts above a later change keeps writing.
+    ab_axis = bool(profile.ab_axes())
     steps_missed = 0
     # claim_mode is the OUTER axis (ADR 0066 A/B): each mode gets a full (sweep_mode × counts) sweep,
     # so a single-arm profile (the default ("per_lane",)) is byte-identical to the pre-A/B behavior.
@@ -319,8 +317,11 @@ async def run_connscale(
                                 # #3132). A single-arm profile has no comparison, so a pooled-only
                                 # sweep such as connscale.toml re-raises a setup fault exactly as
                                 # per_lane does: exit 2 at once, not a miss per cell and a late exit 1.
-                                if claim_mode != "pooled" or not ab_axis:
+                                # It keeps the RCSI attribution the miss note would have carried.
+                                if claim_mode != "pooled":
                                     raise
+                                if not ab_axis:
+                                    raise ConnScaleError(_pooled_miss_reason(str(exc))) from exc
                                 # Only attribute the miss to the RCSI fail-closed gate when the engine
                                 # log actually shows it; otherwise surface the REAL failure (OOM at 1500
                                 # conns, a DB-connect fault, a config error, a port-bind clash) so an
@@ -1823,7 +1824,10 @@ def _reconcile(
     floor_short = population // 2 - read
     deliver_short = written - sink_received
     # Every message the engine READ must be WRITTEN (BACKLOG #3132). Each connscale inbound routes to
-    # exactly one outbound, so after the drain `written >= read`; at-least-once may make it greater.
+    # exactly one outbound, so after the drain `written >= read`. `written` counts DONE outbound rows,
+    # one per message per destination, so a redelivery does not raise it (that shows as
+    # `sink_received > written`); it exceeds `read` only by rows that predate the baseline or by a
+    # duplicated handoff row.
     # Without this term a dead-lettered or refused message passed: it is read, never written, never
     # reaches the sink, and leaves no backlog, so the intake, delivery and drain checks all hold. No
     # excusal applies: `read` counts rows the engine holds, not sends that may never have arrived.
@@ -1831,8 +1835,8 @@ def _reconcile(
     # KNOWN LIMITS, stated rather than hidden. A message the listener NAKed is recorded as an ERROR
     # row, so it counts in `read` and fails this term; the corpus is valid synthetic HL7, so a NAK is
     # a defect in the run, and excusing NAKs would let a dead-letter hide behind one. And these are
-    # COUNTS: one duplicate delivery (at-least-once) cancels one lost message. Only a per-message
-    # audit separates the two.
+    # COUNTS: one duplicated outbound row, or one row carried over from before the baseline, cancels
+    # one lost message. Only a per-message audit separates them.
     write_short = read - written
     drained = backlog == 0
     # The three reload guards. Each is a SIGNATURE, not a fraction of the offered volume, and none
@@ -1878,7 +1882,11 @@ def _reconcile(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
     if write_short > 0:
-        naked = f"; {c.nak} send(s) were NAKed, which also count here" if c.nak else ""
+        naked = (
+            f"; {c.nak} send(s) were NAKed, and a NAK counts here only where its row was recorded"
+            if c.nak
+            else ""
+        )
         parts.append(
             f"engine_written {written} < engine_read {read} ({write_short} read but never "
             f"delivered; causes include a dead-letter, a worker refusal, a rejection recorded "

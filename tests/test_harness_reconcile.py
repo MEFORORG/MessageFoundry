@@ -287,8 +287,9 @@ def test_connscale_reconcile_unconfirmed_excusal_does_not_reach_written_vs_read(
     assert "1 read but never delivered" in result.detail
 
 
-def test_connscale_reconcile_redelivery_is_not_loss() -> None:
-    # At-least-once may write a message twice, so `written > read` is healthy and must pass.
+def test_connscale_reconcile_written_above_read_does_not_fail_this_term() -> None:
+    # The term is one-sided: `written` above `read` (rows from before the baseline, or a duplicated
+    # handoff row) is not judged here. Pinned so the term cannot quietly become an equality.
     c = Counters(sent=36, acked=36, sink_received=37)
     result = connscale_reconcile(c, _BASE, _sample(read=36, written=37), unconfirmed_budget=_BUDGET)
     assert result.ok, result.detail

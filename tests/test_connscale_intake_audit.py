@@ -759,7 +759,8 @@ def test_a_failing_reconcile_carries_the_audit_verdict_into_its_own_message() ->
 
 def test_a_passing_reconcile_is_left_byte_identical() -> None:
     """No verdict is appended to a detail that reports no problem: the audit rides in its own field
-    and on the console, and a clean step's ``no_loss`` string is unchanged from pre-#1292."""
+    and on the console, and a clean step's ``no_loss`` string is exactly the reconcile's all-clear.
+    That all-clear gained ``written>=read`` with BACKLOG #3132, not with the audit."""
     led = _ledger(accepted=4)
     audit = judge(
         led, StoreSnapshot(_all_ids(led), 4), moment=MOMENT_POST_MORTEM, sent=4, read_short=0
