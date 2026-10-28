@@ -4073,19 +4073,31 @@ def read_audit_anchor_file(path: str | Path) -> str:
     same reason :func:`parse_audit_anchor` is one parser: the encoding handling, the byte bound and the
     first-line rule are each a place a later hardening would otherwise reach one caller and miss the
     other. Only the first line is returned, bounded by :data:`AUDIT_ANCHOR_MAX_BYTES`."""
-    with Path(path).open("rb") as fh:
-        # Read one byte past the bound so an oversized file is DETECTED rather than silently truncated
-        # into a parse failure that blames the operator's anchor for the reader's cap.
-        data = fh.read(AUDIT_ANCHOR_MAX_BYTES + 1)
-    if len(data) > AUDIT_ANCHOR_MAX_BYTES:
-        raise OSError(
-            f"anchor file is larger than {AUDIT_ANCHOR_MAX_BYTES} bytes, so it is not an anchor "
-            f"(an anchor is one short COUNT:HEAD line)"
-        )
+    lines = read_bounded_utf8_lines(
+        path,
+        AUDIT_ANCHOR_MAX_BYTES,
+        too_large=f"anchor file is larger than {AUDIT_ANCHOR_MAX_BYTES} bytes, so it is not an "
+        "anchor (an anchor is one short COUNT:HEAD line)",
+    )
     # The first line only: a file whose SECOND line is something else is a refusal either way, and
     # taking one line keeps whatever follows out of the refusal message that quotes this back.
-    lines = data.decode("utf-8-sig").splitlines()
     return lines[0] if lines else ""
+
+
+def read_bounded_utf8_lines(path: str | Path, max_bytes: int, *, too_large: str) -> list[str]:
+    """The lines of a UTF-8 text file of at most ``max_bytes``, for the anchor file and the
+    ``audit-verify --expected-rows-file`` pair file (vault BACKLOG #2612): one reader, so a later
+    hardening of the encoding or the bound reaches both. Raises ``OSError`` carrying ``too_large``
+    for a bigger file, and ``UnicodeDecodeError`` for one that is not UTF-8 (a ``ValueError``, so a
+    caller catching only ``OSError`` lets it escape). ``utf-8-sig`` absorbs the BOM PowerShell 5.1's
+    ``Set-Content -Encoding utf8`` writes."""
+    with Path(path).open("rb") as fh:
+        # Read one byte past the bound so an oversized file is DETECTED rather than silently truncated
+        # into a parse failure that blames the operator's input for the reader's cap.
+        data = fh.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise OSError(too_large)
+    return data.decode("utf-8-sig").splitlines()
 
 
 def parse_audit_anchor(text: str) -> tuple[int, str]:
@@ -4775,6 +4787,7 @@ def verify_audit_rows(
     capable: bool,
     expected_anchor: tuple[int, str] | None = None,
     expected_prefix: tuple[int, str] | None = None,
+    expected_rows: Sequence[tuple[int, str]] | None = None,
 ) -> AuditVerdict:
     """Recompute the audit chain over ``rows`` (all of ``audit_log``, in ``seq`` order) -- the ONE
     walk all three backends' ``verify_audit_chain`` run, so the rule cannot drift between them.
@@ -4806,6 +4819,14 @@ def verify_audit_rows(
     ``expected_anchor`` or ``expected_prefix``. An anchor is ``(seq, head)`` -- the newest row's
     sequence number and hash -- which is what the off-box tee forwards for every row.
 
+    ``expected_rows`` is a set of ``(seq, row_hash)`` pairs, such as the ones read back from the
+    off-box copy the tee forwards (vault BACKLOG #2612). Each is checked as ``expected_prefix`` checks
+    its one pair: the row at that ``seq`` must still be there and carry that hash. Every row hash
+    chains in the one before it, so a matching pair also vouches for every row below it. **All the
+    pairs are checked in this one walk**, never one walk each: under ``vault_transit`` each row MAC is
+    a Transit round trip, so K walks would cost K times N of them. Keyed on ``seq``, the chain's own
+    coordinate, never on the row id, which can skip numbers.
+
     **Constant-time, full-walk (ASVS 11.2.4)**, as before: every row MAC is compared with
     :func:`hmac.compare_digest` over :func:`audit_mac_bytes`, the walk always runs to completion, and
     the first divergent position is reported after it. A structural break is reported at its own
@@ -4830,9 +4851,15 @@ def verify_audit_rows(
     #: (walk position, row id, reason). The position is the sequence number that row should hold.
     breaks: list[tuple[int, Any, str | None]] = []
     prev: Any = ""
-    #: Head as it stood AT ``expected_prefix[0]`` rows. Stays None when the walk never gets there,
-    #: which is the truncation case and must FAIL rather than pass vacuously (BACKLOG #328).
-    prefix_head: str | None = None
+    # The prefix (BACKLOG #328) and the expected rows (vault BACKLOG #2612) are one mechanism: a set
+    # of (seq, head) witnesses, each head captured AT its position in this same walk. A repeated pair
+    # is checked once. A position the walk never reaches stays absent from `witness_heads`, which is
+    # the truncation case and must FAIL rather than pass vacuously.
+    witnesses = sorted(
+        {*(() if expected_prefix is None else (expected_prefix,)), *(expected_rows or ())}
+    )
+    witness_positions = frozenset(seq for seq, _ in witnesses)
+    witness_heads: dict[int, str] = {}
     # The range being walked: its key, its first position and that row's id, and its digest.
     range_key: str | None = None
     range_from, range_from_id = 1, None
@@ -4928,13 +4955,13 @@ def verify_audit_rows(
         # Chain from the STORED hash (not `expected`) so a divergence is reported once, at its own
         # row, instead of cascading a false break onto every successor.
         prev = r["row_hash"] or ""
-        # BACKLOG #328: remember the head AT the recorded prefix position, in this same pass. A
-        # POSITION test, not a data-dependent branch, so it does not reintroduce the early-return
-        # the walk deliberately avoids (ASVS 11.2.4) and costs one comparison per row. On a chain
+        # BACKLOG #328, vault #2612: remember the head AT each witness position, in this same pass.
+        # A POSITION test, not a data-dependent branch, so it does not reintroduce the early-return
+        # the walk deliberately avoids (ASVS 11.2.4) and costs one set lookup per row. On a chain
         # with no break the position IS the row's sequence number, so the anchor's number, the tee's
         # and the walk's are one coordinate.
-        if expected_prefix is not None and pos == expected_prefix[0]:
-            prefix_head = prev
+        if pos in witness_positions:
+            witness_heads[pos] = prev
     if (
         capable
         and genesis_key is not None
@@ -5002,24 +5029,41 @@ def verify_audit_rows(
                 f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
                 f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten",
             )
-    if expected_prefix is not None:
-        ok, msg = audit_prefix_verdict(expected_prefix, prefix_head, count)
+    # Every witness is compared, in seq order, before any is reported: the comparator count does not
+    # depend on where the first mismatch sits (ASVS 11.2.4, as above).
+    failed: list[str | None] = []
+    for pair in witnesses:
+        ok, msg = audit_prefix_verdict(pair, witness_heads.get(pair[0]), count)
         if not ok:
-            return AuditVerdict(False, msg)
+            failed.append(msg)
+    if failed:
+        if not expected_rows:
+            # The prefix alone keeps its own message: the engine routes on its marker (#328).
+            return AuditVerdict(False, failed[0])
+        return AuditVerdict(
+            False,
+            f"{len(failed)} of {len(witnesses)} expected audit row(s) are not in the chain as "
+            f"it stands; the first by seq: {failed[0]}",
+        )
     if key_unavailable:
         # Last, after every check that needs no key has passed: a break those checks found is a
         # break, and outranks "could not check".
+        checked = [
+            "the sequence numbers",
+            "that each row hash is non-empty text",
+            "any key-range digests",
+        ]
+        if expected_anchor is not None or expected_prefix is not None:
+            checked.append("the expected anchor")
+        if expected_rows:
+            checked.append("the expected rows")
         return AuditVerdict(
             False,
             "audit chain not checked: its first row names a store key, and no store "
             "encryption key/MAC is available in this process, so no row MAC was recomputed. Only "
-            f"checks that need no key ran over its {count} row(s) (at least the sequence numbers, "
-            "that each row hash is non-empty text, and any key-range digests"
-            + (
-                ", and the expected anchor"
-                if expected_anchor is not None or expected_prefix is not None
-                else ""
-            )
+            f"checks that need no key ran over its {count} row(s) (at least "
+            + ", ".join(checked[:-1])
+            + f", and {checked[-1]}"
             + "), and they found no break. That is not a pass: the first row may have been "
             "changed to name a key, and any row's content may have been changed, which only the "
             "key shows. Re-run with the settings and key the engine runs with",
@@ -15253,6 +15297,7 @@ class MessageStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``.
 
@@ -15282,6 +15327,7 @@ class MessageStore:
             capable=self._audit_keyed_capable(),
             expected_anchor=expected_anchor,
             expected_prefix=expected_prefix,
+            expected_rows=expected_rows,
         )
 
     async def has_prior_backup_history(self) -> bool:

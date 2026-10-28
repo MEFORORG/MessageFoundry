@@ -12625,6 +12625,7 @@ class SqlServerStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns (ok, message) — see the SQLite store.
 
@@ -12646,6 +12647,7 @@ class SqlServerStore:
             capable=self._audit_keyed_capable(),
             expected_anchor=expected_anchor,
             expected_prefix=expected_prefix,
+            expected_rows=expected_rows,
         )
 
     # --- auth: users / roles / sessions --------------------------------------

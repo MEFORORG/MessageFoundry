@@ -6238,8 +6238,8 @@ onto keyless rows fails the verify, and is also reported as
 | Exit | Meaning |
 |---|---|
 | `0` | A clean walk, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. It covers at least one row, unless `--allow-empty` or an expected anchor of `0:` accepted an empty log (see exit `3`). |
-| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. A key, key-provider or database error that stops the check part way prints one too, such as a Transit outage or a row that is not UTF-8. That line names the error's class and its cause's class, never its text. It says the rest of the chain was not checked. Before vault BACKLOG #3054 these exited 1 or 2 with no `FAIL` line. An error the command does not classify still exits 1 with none. |
-| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), and an empty log in a shell that holds no key and whose settings require one. |
+| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, an expected row (`--expected-row`, `--expected-rows-file`) that is gone or whose hash differs, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. A key, key-provider or database error that stops the check part way prints one too, such as a Transit outage or a row that is not UTF-8. That line names the error's class and its cause's class, never its text. It says the rest of the chain was not checked. Before vault BACKLOG #3054 these exited 1 or 2 with no `FAIL` line. An error the command does not classify still exits 1 with none. |
+| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), a malformed expected row or an `--expected-rows-file` that cannot be read or holds no pair (vault BACKLOG #2612), and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
 | `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. It prints a `NOT CHECKED` line. This is not a pass. |
 | `5` | The chain is keyless and walked clean as plain SHA-256. This shell holds no key, and its settings require one. So the chain was not checked to their standard. It prints a `NOT CHECKED` line and a `WARNING` on stderr. This is not a pass. Before vault BACKLOG #3054 it exited 0. The paragraph on the setup where this goes wrong, below, says what a move between 4 and 5 means. |
@@ -6336,7 +6336,18 @@ while the chain is still quiesced (a maintenance window, a DB move, a backup/res
 hand-off). Anchoring and re-verifying in one breath compares a value to itself, and a held anchor
 re-checked against a **running** engine alarms on every boot, because a running engine writes audit
 rows; for continuous coverage the off-box tee is still the control ([BACKLOG #328](BACKLOG.md); the
-`[retention].audit_days` row in [`CONFIGURATION.md`](CONFIGURATION.md) is the source of record). Every audit row carries a
+`[retention].audit_days` row in [`CONFIGURATION.md`](CONFIGURATION.md) is the source of record).
+To check the store against that tee, pass the pairs it forwarded back as `messagefoundry audit-verify
+--expected-row SEQ:ROW_HASH` (repeatable), or `--expected-rows-file PATH` with one pair per line
+(vault BACKLOG #2612). Each pair asks whether the row at `seq` is still in the chain with that
+`row_hash`. Each row hash chains in the one before it, so a pair that matches also vouches for every
+row below it, and unlike the exact anchor a pair stays valid as the chain grows. A pair whose row is
+gone, or whose hash differs, is a broken chain, exit 1. A malformed pair, a pair at `seq` 0, or a
+file that holds no pair is exit 2. Key the pairs on `seq`, never on the record's `row_id`, which can
+skip numbers. All the pairs are checked in one walk of the chain, which matters under
+`vault_transit`, where each row costs a Transit round trip. A check run with no key compares each
+pair with the stored hash only, so it cannot see a row whose content was edited and whose stored
+hash was left as it was; only a check with the key sees that. Every audit row carries a
 `row_hash` from the moment it is written: the column is `NOT NULL` on all three backends and the
 startup backfill that used to chain pre-feature rows was deleted with it (BACKLOG #1198), because a
 row it could repair can no longer be written. The `client` address is folded **inside** the chained
