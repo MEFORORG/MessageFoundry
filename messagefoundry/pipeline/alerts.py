@@ -1415,10 +1415,12 @@ _TRANSIT_UNVERIFIABLE_CAUSE = "transit-unverifiable"
 #: addresses or of planted rows, cannot open an alert instance, and send a page, per key. The
 #: security-signal detectors (``security_signals.py``) and the unverifiable-row pages share it.
 MAX_SUBJECT_ALERTS: Final = 5
-#: The window the unverifiable-row cap counts over: the sealer's per-row page interval
+#: The window the unverifiable-row cap counts over: twice the sealer's per-row page interval
 #: (``row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS``), spelled here to import nothing from the
-#: store, so a row that stays unverifiable keeps its own subject for as long as it keeps paging.
-_UNVERIFIABLE_SUBJECT_WINDOW_SECONDS: Final = 300.0
+#: store. Strictly longer than the interval, so a row that stays unverifiable pages again before
+#: its own entry ages out, and keeps its own subject for as long as it keeps paging. At exactly
+#: the interval, the entry would always be evicted first.
+_UNVERIFIABLE_SUBJECT_WINDOW_SECONDS: Final = 600.0
 
 
 class SubjectCap:

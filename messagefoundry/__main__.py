@@ -8281,11 +8281,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
-        store = await open_store(
-            settings.store,
-            create=True,
-            posture=posture,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        # Armed (BACKLOG #2592): a repair write on an existing account that the store refuses for
+        # an unverifiable seal pages its row, as every other host command's does.
+        store = _arm_seal_pages(
+            await open_store(
+                settings.store,
+                create=True,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
         )
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:

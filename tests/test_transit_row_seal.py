@@ -1167,6 +1167,47 @@ async def test_the_reconciler_holds_the_scope_diff_on_an_unverifiable_scope_map(
     assert [(r.username, r.reason) for r in plan.revocations] == [("jdoe", "roles_changed")]
 
 
+@pytest.mark.parametrize("unverifiable", [AD_ROLE_MAP, AD_SCOPE_MAP])
+async def test_a_held_reconcile_pass_confirms_nobody_behind_a_trip(
+    transit_store: Opened, unverifiable: str
+) -> None:
+    """A pass that held a diff on an unverifiable map judged no account's roles or scope, so a
+    PRESENT read on it must not confirm an account behind a breaker trip, and the pass must mark
+    neither the breaker's clear nor the hold's. Control: the same pass on a verifying map
+    confirms the account and marks the breaker's clear.
+
+    RED when: the held pass clears ``_reconcile_unconfirmed`` from its PRESENT reads, or marks
+    ``breaker_clear``."""
+    from messagefoundry.auth import reconcile
+    from tests.test_ad_session_reconcile import _FakeLdap, _principal, _signed_in_ad_user
+
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    ldap = _FakeLdap({"jdoe": _principal("jdoe", _OPS, _CHANS)})
+    service = await _directory_service(store, ldap)
+    await service.set_ad_group_map([(_OPS, "operator")], actor="t")
+    await service.set_ad_group_scope_map([(_CHANS, "chan-a")], actor="t")
+    assert await _signed_in_ad_user(service, store, "jdoe") is not None
+    user = await store.get_user_by_username("jdoe")
+    assert user is not None
+    service._reconcile_breaker_standing = "tripped"
+    service._reconcile_hold_standing = "held"
+    service._reconcile_unconfirmed = {user.id}
+    await _set_map_version(path, unverifiable, planted=True)
+    _lapse_cache(store)
+    held = await service.reconcile_directory_sessions()
+    assert held.aborted is None and held.outcomes[user.id] is reconcile.ProbeOutcome.PRESENT
+    assert (held.breaker_clear, held.hold_clear) == (False, False)
+    assert service._reconcile_unconfirmed == {user.id}
+    # Control: once the map verifies again, the same read confirms the account and clears.
+    await _set_map_version(path, unverifiable, planted=False)
+    _lapse_cache(store)
+    clean = await service.reconcile_directory_sessions()
+    assert service._reconcile_unconfirmed == set()
+    assert (clean.breaker_clear, clean.hold_clear) == (True, True)
+
+
 # --- a write refused for an unverifiable seal pages, once per refusal (BACKLOG #2592) -----------
 
 
@@ -1320,6 +1361,28 @@ async def test_a_host_command_store_pages_a_refused_write(
     assert len(lines) == 1 and f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:user:cli-u" in lines[0]
 
 
+def test_provision_admin_arms_the_store_it_writes_through() -> None:
+    """``provision-admin`` repairs an existing administrator's row through the store's write
+    helpers, so a write they refuse for an unverifiable seal must page as every other host
+    command's does: its store is armed. Read from the source, since the command needs a terminal.
+
+    RED when: the command opens its writing store with a bare ``open_store``."""
+    import ast
+    import inspect
+
+    from messagefoundry import __main__ as cli
+
+    tree = ast.parse(inspect.getsource(cli._provision_admin))
+    armed = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_arm_seal_pages"
+    ]
+    assert armed, "provision-admin opens a store that is not armed for unverifiable-seal pages"
+
+
 # --- a write refused for an unverifiable seal is filed as unverifiable, not a forgery -----------
 
 
@@ -1441,14 +1504,45 @@ def test_the_cli_names_vault_first_for_an_unverifiable_write() -> None:
 # --- the per-row unverifiable subjects are capped; a forgery's page is not ----------------------
 
 
-def test_the_cap_window_is_the_sealers_per_row_page_interval() -> None:
-    """alerts.py spells the window to import nothing from the store; this ties the two, so a row
-    that keeps paging keeps its own subject."""
+def test_the_cap_window_outlasts_the_sealers_per_row_page_interval() -> None:
+    """alerts.py spells the window to import nothing from the store; this ties the two. The window
+    must be strictly longer than the interval: at equal values a row's entry has always aged out
+    by the time its throttle lets it page again, so a row that keeps paging could be folded into
+    the aggregate subject.
+
+    RED when: the window is at most the interval."""
     from messagefoundry.pipeline import alerts
 
     assert (
-        alerts._UNVERIFIABLE_SUBJECT_WINDOW_SECONDS == row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS
+        alerts._UNVERIFIABLE_SUBJECT_WINDOW_SECONDS
+        == 2 * row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS
     )
+
+
+def test_a_row_that_keeps_paging_keeps_its_own_subject_past_the_cap() -> None:
+    """A row pages, then fills the cap with other rows just before its throttle interval ends,
+    then one more row pages after it, and the first row pages again shortly after. Its earlier
+    page must still hold its place, so it pages under its own subject, not the aggregate.
+
+    RED when: the cap window is no longer than the sealer's per-row interval, so the first row's
+    entry ages out before it may page again and a newer row takes its place."""
+    from messagefoundry.pipeline.alerts import MAX_SUBJECT_ALERTS
+
+    interval = row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS
+    now = [1000.0]
+    raised: list[str] = []
+    sink = LoggingAlertSink()
+    sink.integrity_drift = lambda name, *, reason, drift_count: raised.append(name)  # type: ignore[method-assign]
+    hook = transit_seal_alert(sink, clock=lambda: now[0])
+    hook("transit-unverifiable:adset:map", "r")
+    now[0] = 1000.0 + interval - 1.0
+    for i in range(MAX_SUBJECT_ALERTS - 1):
+        hook(f"transit-unverifiable:session:s{i}", "r")
+    now[0] = 1000.0 + interval + 50.0
+    hook("transit-unverifiable:session:late", "r")
+    now[0] = 1000.0 + interval + 100.0  # the map's throttle has let it page again
+    hook("transit-unverifiable:adset:map", "r")
+    assert raised[-1] == f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:adset:map"
 
 
 def test_unverifiable_row_subjects_are_capped_into_one_aggregate() -> None:
@@ -1474,7 +1568,9 @@ def test_unverifiable_row_subjects_are_capped_into_one_aggregate() -> None:
     hook("transit", "outage")
     assert raised[-1][0] == TRANSIT_SEAL_SUBJECT
     # Control: once the window passes, a new row is named again.
-    now[0] += 301.0
+    from messagefoundry.pipeline import alerts
+
+    now[0] += alerts._UNVERIFIABLE_SUBJECT_WINDOW_SECONDS + 1.0
     hook(f"{row_seal.TRANSIT_UNVERIFIABLE_CAUSE}:{SESSION_KIND}:late", "late")
     assert raised[-1][0] == f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:{SESSION_KIND}:late"
 

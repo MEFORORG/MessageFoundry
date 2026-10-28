@@ -3023,7 +3023,8 @@ class CustomRoleUnverifiableError(Exception):
             " was not saved: a save would replace the permissions it may still hold."
             f" {UNVERIFIABLE_RECOVERY} Only if the role was sealed under a key version the audit"
             " key's min_decryption_version has retired, lower that minimum until the role"
-            " verifies and save it again, which re-seals it; deleting the role and creating it"
+            " verifies and save it again, which re-seals it, then raise the minimum back at once,"
+            " so the retired versions are refused again; deleting the role and creating it"
             " again is the last resort"
         )
 
@@ -3047,7 +3048,8 @@ class AdMapUnverifiableError(Exception):
             " cannot be listed or replaced: an edit would overwrite the pairs it may still hold."
             f" {UNVERIFIABLE_RECOVERY} Only if the map was sealed under a key version the audit"
             " key's min_decryption_version has retired, lower that minimum until the map verifies"
-            " and save it again, which re-seals it; clearing the map by saving it with no entries"
+            " and save it again, which re-seals it, then raise the minimum back at once, so the"
+            " retired versions are refused again; clearing the map by saving it with no entries"
             " (PUT /ad-group-map or /ad-group-scope-map) and entering its pairs again is the last"
             " resort"
         )
@@ -8022,6 +8024,8 @@ class AuthService:
         scope_map = (
             None if role_map is None else await self._ad_map_unless_unverifiable(AD_SCOPE_MAP)
         )
+        # A held diff judged nothing, so this pass confirms no account and marks no clear.
+        diffs_held = role_map is None or scope_map is None
         for probe in probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT or role_map is None:
                 # plan_pass reads an account missing from both as no role change and no scope
@@ -8097,7 +8101,8 @@ class AuthService:
             if outcome is reconcile.ProbeOutcome.PRESENT
         }
         if plan.aborted is None:
-            self._reconcile_unconfirmed.difference_update(read_present)
+            if not diffs_held:
+                self._reconcile_unconfirmed.difference_update(read_present)
         elif not plan.judged_nothing:
             self._reconcile_unconfirmed = set(keyed)
             self._advance_breaker_standing("tripped")
@@ -8133,7 +8138,7 @@ class AuthService:
                 # item 9). A pass that judged nothing (an outage, or one whose every answer went
                 # unjudged) leaves the hold's message alone and marks no clear (BACKLOG #2538).
                 await self._record_reconcile_hold(plan)
-                plan = self._mark_reconcile_clears(plan, users)
+                plan = self._mark_reconcile_clears(plan, users, diffs_held=diffs_held)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
             return plan
 
@@ -8212,11 +8217,17 @@ class AuthService:
         # over every APPLIED revocation, quiet ones included: a quiet revocation's account holds no
         # session now, and the account a skipped revocation left signed in still counts toward the
         # evidence.
-        marked = self._mark_reconcile_clears(replace(plan, revocations=tuple(applied)), users)
+        marked = self._mark_reconcile_clears(
+            replace(plan, revocations=tuple(applied)), users, diffs_held=diffs_held
+        )
         return replace(marked, revocations=tuple(reported))
 
     def _mark_reconcile_clears(
-        self, plan: reconcile.ReconcilePlan, users: Mapping[str, UserRecord]
+        self,
+        plan: reconcile.ReconcilePlan,
+        users: Mapping[str, UserRecord],
+        *,
+        diffs_held: bool = False,
     ) -> reconcile.ReconcilePlan:
         """Say on the plan whether this pass is EVIDENCE that each standing condition has cleared.
 
@@ -8318,6 +8329,10 @@ class AuthService:
 
         ``users`` is this pass's candidate set, and a clear rests on reading every one of them.
 
+        ``diffs_held`` says a directory map was unverifiable, so the pass held the role or scope
+        diff for every account (BACKLOG #2592). Such a pass judged no account's roles or scope, so
+        it marks neither the breaker's clear nor the hold's: a missed clear, never a false one.
+
         **This is one process's evidence, and the instances are the store's.** Where
         ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
         ``[cluster]`` node or in an engine that runs more than one engine shard, the lifespan task
@@ -8371,6 +8386,7 @@ class AuthService:
             )
         hold_clear = (
             settled
+            and not diffs_held
             and not plan.hold
             and not revoked_undetermined
             and plan.readable > 0
@@ -8380,6 +8396,7 @@ class AuthService:
             self._advance_hold_standing("settled")
         breaker_clear = (
             settled
+            and not diffs_held
             and plan.aborted is None
             and self._reconcile_breaker_standing == "tripped"
             and all(self._reconcile_strikes.get(uid, 0) == 0 for uid in ids)
@@ -15342,8 +15359,10 @@ class AuthService:
         if checked is None or checked[0].builtin:
             raise ValueError("no such custom role")
         if checked[1] is None:
-            # Reported, and so paged per row, as a read of the role is; nothing was written.
-            await self._role_seal_failed(role_id, unverifiable=True)
+            # Reported, and so paged per row, as a read of the role is; nothing was written. Keyed
+            # by the stored row's id, as the reader keys it, so a request that spells the id in
+            # another case on a case-insensitive collation lands on the same throttle and subject.
+            await self._role_seal_failed(checked[0].id, unverifiable=True)
             raise CustomRoleUnverifiableError()
         perms = validate_custom_role_permissions(permissions)  # raises CustomRoleError
         await self._store.upsert_role(
