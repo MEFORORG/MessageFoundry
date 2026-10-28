@@ -98,6 +98,7 @@ __all__ = [
     "checked_sender",
     "envelope_address_problem",
     "envelope_recipients",
+    "partial_refusal_under",
 ]
 
 logger = logging.getLogger(__name__)
@@ -272,37 +273,54 @@ class CheckedEnvelope:
         msg["From"] = list(self.from_header)
         msg["To"] = list(self.to_header)
 
-    def send(self, smtp: smtplib.SMTP, msg: EmailMessage, *, cell: str = "SMTP") -> None:
+    def send(self, smtp: smtplib.SMTP, msg: EmailMessage, *, cell: str) -> None:
         """Submit ``msg`` with ``MAIL FROM`` and ``RCPT TO`` taken from the checked addresses.
 
-        ``smtplib`` raises only when the relay refuses EVERY recipient. When it refuses some, the
-        send succeeds and ``send_message`` returns the refused ones in a dict, so a message one of
-        two recipients never got would read as delivered. A non-empty dict is therefore a failed
-        delivery: a permanent :class:`~messagefoundry.transports.base.NegativeAckError` with code
-        ``partial-refusal``, which the delivery worker dead-letters at once (vault BACKLOG #2924).
-        Permanent because the relay already accepted the message for the other recipients, so a
-        retry would send them a duplicate every attempt; a replay of the dead-lettered row is the
-        operator's choice and re-sends to every recipient. Neither fault flag is set: one mailbox
-        refused is not a fault in the connection, and a config fault would stop the lane.
+        ``smtplib`` raises when the relay refuses every recipient, or drops the session. When it
+        refuses some, the send succeeds and ``send_message`` returns the refused ones in a dict, so
+        a message one of two recipients never got would read as delivered. A non-empty dict is
+        therefore a failed delivery: a permanent
+        :class:`~messagefoundry.transports.base.NegativeAckError` with code ``partial-refusal``,
+        which the delivery worker dead-letters at once (vault BACKLOG #2924). Permanent because the
+        relay already accepted the message for the other recipients, so a retry would send them a
+        duplicate every attempt; a replay of the dead-lettered row is the operator's choice and
+        re-sends to every recipient. Neither fault flag is set: one mailbox refused is not a fault
+        in the connection, and a config fault would stop the lane.
+
+        Each address gets one ``RCPT``. smtplib decides "every recipient refused" by comparing the
+        dict's size with the list's, so a listed-twice address refused would otherwise read as a
+        partial refusal of a message nobody received.
 
         The text is ``cell`` and two counts. It holds no address, and none of the relay's reply
-        codes or texts, because a reply text can echo the address. The dict is dropped before the
-        raise, and the raise is in no ``except`` block, so neither the chain nor this frame's locals
-        carry it."""
-        refused = smtp.send_message(msg, from_addr=self.sender, to_addrs=list(self.recipients))
+        codes or texts, because a reply text can echo the address, and the raise is in no
+        ``except`` block, so the chain carries nothing either. A caller that sends ``QUIT`` after
+        this raises recovers the refusal with :func:`partial_refusal_under`."""
+        to_addrs = list(dict.fromkeys(self.recipients))
+        refused = smtp.send_message(msg, from_addr=self.sender, to_addrs=to_addrs)
         if not refused:
             return
-        # smtplib keys the dict by each to_addrs entry as given, so this counts refused RCPT lines,
-        # a listed-twice address included. The `or` keeps a non-empty dict from reading as zero.
-        refused_count = sum(1 for address in self.recipients if address in refused) or len(refused)
-        del refused
         raise NegativeAckError(
-            f"{cell}: {refused_count} of {len(self.recipients)} recipients refused",
+            f"{cell}: {len(refused)} of {len(to_addrs)} recipients refused",
             code="partial-refusal",
             permanent=True,
             credential_fault=False,
             config_fault=False,
         )
+
+
+def partial_refusal_under(exc: BaseException) -> NegativeAckError | None:
+    """The partial refusal :meth:`CheckedEnvelope.send` raised, when ``exc`` replaced it on the way
+    out of a ``with smtplib.SMTP(...)`` block, or ``None``.
+
+    The block's exit sends ``QUIT`` and raises ``SMTPResponseException`` on any reply but ``221``.
+    That exception then carries the refusal only as its ``__context__``, and a caller's
+    ``SMTPException`` arm would turn a permanent refusal into a transient retry, re-sending to the
+    recipients that already have the message. The Email and Direct destinations check this first
+    and raise the refusal instead."""
+    context = exc.__context__
+    if isinstance(context, NegativeAckError) and context.code == "partial-refusal":
+        return context
+    return None
 
 
 def checked_envelope(cell: str, sender: str, recipients: Any) -> CheckedEnvelope:
@@ -653,6 +671,7 @@ class EmailDestination(DestinationConnector):
             # captured cleartext decision so a reload can't route PHI around the construction-only gate.
             self._hop_guard.assert_send()
         msg = self._build_message(payload)
+        partial: NegativeAckError | None = None
         try:
             with self._connect() as smtp:
                 if self.username is not None:
@@ -688,13 +707,19 @@ class EmailDestination(DestinationConnector):
             # operator needs and it contains no message content.
             raise DeliveryError(f"Email {self.host}:{self.port} refused: {exc}") from exc
         except smtplib.SMTPException as exc:
-            raise DeliveryError(
-                f"Email {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
-            ) from exc
+            # A QUIT refused after a partial refusal must not turn it into a retry. The refusal is
+            # raised below, outside this handler, so its own chain stays empty.
+            partial = partial_refusal_under(exc)
+            if partial is None:
+                raise DeliveryError(
+                    f"Email {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
+                ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(
                 f"Email {self.host}:{self.port} unreachable: {type(exc).__name__}"
             ) from exc
+        if partial is not None:
+            raise partial
 
     async def test_connection(self) -> None:
         await asyncio.to_thread(self._probe)

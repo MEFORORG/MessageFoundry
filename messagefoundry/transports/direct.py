@@ -86,7 +86,11 @@ from messagefoundry.transports.base import (
     float_setting,
     register_destination,
 )
-from messagefoundry.transports.email import checked_envelope, refuse_unverified_smtp_credential
+from messagefoundry.transports.email import (
+    checked_envelope,
+    partial_refusal_under,
+    refuse_unverified_smtp_credential,
+)
 
 __all__ = ["DirectDestination"]
 
@@ -795,6 +799,7 @@ class DirectDestination(DestinationConnector):
                 code="smime-build",
                 permanent=True,
             )
+        partial: NegativeAckError | None = None
         try:
             with self._connect() as smtp:
                 if self.username is not None:
@@ -825,13 +830,19 @@ class DirectDestination(DestinationConnector):
             # operator needs and it contains no message content.
             raise DeliveryError(f"Direct {self.host}:{self.port} refused: {exc}") from exc
         except smtplib.SMTPException as exc:
-            raise DeliveryError(
-                f"Direct {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
-            ) from exc
+            # A QUIT refused after a partial refusal must not turn it into a retry. The refusal is
+            # raised below, outside this handler, so its own chain stays empty.
+            partial = partial_refusal_under(exc)
+            if partial is None:
+                raise DeliveryError(
+                    f"Direct {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
+                ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(
                 f"Direct {self.host}:{self.port} unreachable: {type(exc).__name__}"
             ) from exc
+        if partial is not None:
+            raise partial
 
     async def test_connection(self) -> None:
         await asyncio.to_thread(self._probe)

@@ -300,18 +300,25 @@ async def test_the_notifier_logs_a_partial_refusal_without_an_address(
 _UNENCODABLE = "synthetic alert detail \udc80 tail"
 
 
-@pytest.mark.parametrize("part", ["plain", "html"])
+#: A lone surrogate the Subject header refuses as it is set (``\udc80`` sets, and fails later).
+_UNENCODABLE_SUBJECT = "synthetic alert detail \ud800 tail"
+
+
+@pytest.mark.parametrize("part", ["plain", "html", "subject"])
 def test_an_unencodable_alert_body_fails_content_free(wire: _WireCapture, part: str) -> None:
-    # set_content() and add_alternative() raise a UnicodeEncodeError whose text names the character
-    # and whose `.object` is the whole body; the notifier logs that with exc_info (vault BACKLOG
-    # #3011). The refusal keeps the type name only, with no chain, and nothing is sent.
-    with pytest.raises(ValueError, match="the alert body could not be encoded") as caught:
+    # set_content(), add_alternative() and the Subject header raise a UnicodeEncodeError whose text
+    # names the character and whose `.object` is the whole value; the notifier logs that with
+    # exc_info (vault BACKLOG #3011). The refusal keeps the type name only, with no chain, and
+    # nothing is sent.
+    with pytest.raises(
+        ValueError, match="the alert subject or body could not be encoded"
+    ) as caught:
         send_plain_email(
             host="127.0.0.1",
             port=wire.port,
             sender="engine@hospital.example",
             recipients=["ops@hospital.example"],
-            subject="synthetic",
+            subject=_UNENCODABLE_SUBJECT if part == "subject" else "synthetic",
             body=_UNENCODABLE if part == "plain" else "synthetic alert",
             html_body=f"<p>{_UNENCODABLE}</p>" if part == "html" else None,
             use_tls=False,
@@ -320,7 +327,8 @@ def test_an_unencodable_alert_body_fails_content_free(wire: _WireCapture, part: 
     exc = caught.value
     assert not isinstance(exc, UnicodeError)
     rendered = f"{exc} | {exc!r}".lower()
-    assert "udc80" not in rendered and "\udc80" not in rendered
+    for ch in ("dc80", "d800", "\udc80", "\ud800"):
+        assert ch not in rendered
     assert "synthetic alert detail" not in rendered
     assert exc.__cause__ is None and exc.__context__ is None
     assert wire.connections == 0

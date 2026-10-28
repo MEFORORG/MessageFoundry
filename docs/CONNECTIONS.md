@@ -2272,7 +2272,8 @@ A relay that refuses **some** of the recipients, and accepts the message for the
 a **permanent** `partial-refusal` `NegativeAckError`: the row dead-letters on the first attempt and reads as
 `ERROR`, never as delivered. It is not retried, because each retry would re-send to the recipients that
 already have it. A replay is the operator's choice, and re-sends to **every** recipient. The error names the
-connection and the two counts (*"1 of 2 recipients refused"*), never an address or the relay's reply. A
+relay's host and port and two counts (*"Email relay.example:587: 1 of 2 recipients refused"*), never an
+address or the relay's reply; the delivery worker's log line names the connection. A
 refusal of **every** recipient is still an ordinary SMTP failure, retried like one. The Direct destination
 fails a partial refusal the same way, and the `[alerts]` mail logs it as a failed send.
 
