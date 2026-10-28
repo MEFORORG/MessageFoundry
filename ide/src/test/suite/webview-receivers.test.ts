@@ -775,6 +775,20 @@ const wiringMap: Receiver = {
 
 const RECEIVERS: Receiver[] = [alertRules, codeSet, connection, home, security, sourceControl, wiringMap];
 
+// Discriminants no receiver handles. Each is message text, so a discard warning reports it with a
+// fixed phrase and never echoes it (BACKLOG #1123). The hostile one would show quoting or markup if
+// it got through; the number and the list are not strings, and the list String()s to its text.
+const UNKNOWN_KINDS: unknown[] = [
+  "notAType",
+  `"'><img src=x onerror=1> PID|1||A123`,
+  "hasOwnProperty",
+  12345,
+  ["PID|1||A123"],
+];
+// The whole warning a known-kind discard writes: the page's own key, and nothing from the message.
+const STATE_WARNING = 'MessageFoundry Security Settings: discarded a malformed "state" message';
+const RULES_WARNING = 'MessageFoundry Alert Rules: discarded a malformed "rules" message';
+
 suite("webview receivers discard a malformed payload and render a well-formed one", () => {
   teardown(closeWindows);
 
@@ -808,6 +822,27 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     for (const [mode, check, want] of modes) {
       assert.deepStrictEqual(["s", undefined, null, 7].map(check), want, mode);
     }
+  });
+
+  test("mfShapeOk refuses an entry that is not a function, and a check that is truthy but not true", () => {
+    // SHAPE_HELPERS is the source every receiver embeds, so this runs the shipped helper. Every
+    // panel's entries are functions returning booleans, so only this pins the two guards.
+    // The helpers get their own `console` as a parameter, never the global one: in the VS Code
+    // Extension Host console.warn is an accessor whose setter does not install an assigned stub, so
+    // a stub on the global console saw nothing there (measured at VS Code 1.143.1).
+    const warned: string[] = [];
+    const pageConsole = { warn: (...args: unknown[]) => void warned.push(args.map(String).join(" ")) };
+    const h = new Function("console", `${SHAPE_HELPERS}; return { mfShapeOk };`)(pageConsole) as {
+      mfShapeOk(d: Payload, key: string, shapes: Record<string, unknown>, panel: string): boolean;
+    };
+    const shapes = { notCallable: 1, truthy: () => 1, ok: () => true };
+    assert.strictEqual(h.mfShapeOk({ command: "notCallable" }, "command", shapes, "P"), false);
+    assert.strictEqual(h.mfShapeOk({ command: "truthy" }, "command", shapes, "P"), false);
+    assert.strictEqual(h.mfShapeOk({ command: "ok" }, "command", shapes, "P"), true, "control");
+    assert.deepStrictEqual(warned, [
+      'MessageFoundry P: discarded a malformed "notCallable" message',
+      'MessageFoundry P: discarded a malformed "truthy" message',
+    ]);
   });
 
   test("the fixtures the host builds are the shape the malformed cases assume", () => {
@@ -940,7 +975,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       const shown = refusalShown(p);
       assert.ok(shown.startsWith(REFUSAL), `${why}: no refusal, got "${shown}"`);
       assert.ok(shown.includes(problem), `${why}: the refusal does not say "${problem}": "${shown}"`);
-      assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "state"')), `${why}: console.warn was dropped`);
+      // Exactly the one fixed warning, so no field value from the message reaches the console either.
+      assert.deepStrictEqual(p.warnings, [STATE_WARNING], `${why}: console.warn was dropped or carried more`);
       // The message's own values are never echoed: the refusal names a kind, not what was sent.
       assert.ok(!shown.includes(SENT), `${why}: the refusal echoed a value from the message`);
     }
@@ -1021,7 +1057,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       const rest = shown.replace(problem, "<problem>");
       advice ??= rest;
       assert.strictEqual(rest, advice, `${why}: the text around the problem differs from the other cases: "${shown}"`);
-      assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "rules"')), `${why}: console.warn was dropped`);
+      assert.deepStrictEqual(p.warnings, [RULES_WARNING], `${why}: console.warn was dropped or carried more`);
       // Nothing the message carried is echoed, and nothing in it became an element.
       assert.ok(!shown.includes("onerror"), `${why}: the refusal echoed a value from the message`);
       assert.strictEqual(doc.getElementById("error").children.length, 0, `${why}: markup was parsed`);
@@ -1045,7 +1081,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       `${ALERT_REFUSAL} The list sent to this panel is malformed: ` +
       "the entry at position 0 of the list (counted from 0), min_depth: expected a number, got string. ";
     assert.ok(shown.startsWith(want), `the refusal does not name position 0 alone: "${shown}"`);
-    assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "rules"')), "console.warn was dropped");
+    assert.deepStrictEqual(p.warnings, [RULES_WARNING], "console.warn was dropped or carried more");
     // Past the first entry too: index 5 at position 1, behind a well-formed entry.
     const q = alertRules.load();
     q.deliver({ command: "rules", rules: [{ index: 0 }, { connection: 3, index: 5 }] });
@@ -1281,24 +1317,30 @@ suite("webview receivers discard a malformed payload and render a well-formed on
           } else {
             assert.strictEqual(p.snapshot(), before, `${r.panel} "${type}", ${why}: the page changed`);
           }
-          assert.ok(
-            p.warnings.some((w) => w.includes(`MessageFoundry ${r.panel}: discarded a malformed "${type}"`)),
-            `${r.panel} "${type}", ${why}: the discard was not named in the console`,
+          // Exactly the one fixed warning, naming the page's own key: nothing from the message.
+          assert.deepStrictEqual(
+            p.warnings,
+            [`MessageFoundry ${r.panel}: discarded a malformed "${type}" message`],
+            `${r.panel} "${type}", ${why}: the discard was not named in the console, or carried more`,
           );
         });
       }
     }
 
-    test(`${r.panel}: discards a message type it does not handle`, () => {
-      const p = r.load();
-      const before = p.snapshot();
-      p.deliver({ [r.key]: "notAType", message: "x", text: "x" });
-      assert.deepStrictEqual(p.errors.map(String), []);
-      assert.strictEqual(p.snapshot(), before);
-      assert.ok(
-        p.warnings.some((w) => w.includes(`MessageFoundry ${r.panel}: discarded a malformed "notAType"`)),
-        `${r.panel}: an unhandled type was not named in the console`,
-      );
-    });
+    for (const kind of UNKNOWN_KINDS) {
+      test(`${r.panel}: discards a message type it does not handle, without echoing it: ${JSON.stringify(kind)}`, () => {
+        const p = r.load();
+        const before = p.snapshot();
+        p.deliver({ [r.key]: kind, message: "x", text: "x" });
+        assert.deepStrictEqual(p.errors.map(String), []);
+        assert.strictEqual(p.snapshot(), before);
+        assert.deepStrictEqual(
+          p.warnings,
+          [`MessageFoundry ${r.panel}: discarded a malformed message of an unknown kind`],
+          `${r.panel}: an unhandled type was not reported with the fixed phrase`,
+        );
+        assert.ok(!p.warnings.some((w) => w.includes(String(kind))), `${r.panel}: the unhandled type was echoed`);
+      });
+    }
   }
 });

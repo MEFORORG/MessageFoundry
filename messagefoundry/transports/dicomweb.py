@@ -79,6 +79,7 @@ from messagefoundry.transports.rest import (
     auth_challenge_refused,
     egress_route_from_settings,
     enforce_outbound_length_limits,
+    hop_reaches_a_proxy,
     http_credentials_sent,
     http_family_trust_anchor,
     refuse_cleartext_credentials,
@@ -255,9 +256,12 @@ class DicomWebDestination(DestinationConnector):
             scheme,
             self._headers,
             self.base_url,
-            attested=attested,
-            cleartext_accepted=accepted,
-            cleartext_reason=accept_reason,
+            credentials=http_credentials_sent(
+                ConnectorType.DICOMWEB,
+                s,
+                cleartext=True,
+                proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.base_url),
+            ),
             connection=config.name,
         )
         # ASVS 12.2.1: the STOW-RS multipart body carries the DICOM object (PHI), so a cleartext http
