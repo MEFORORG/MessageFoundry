@@ -2441,9 +2441,9 @@ refuses.
 **A keep on a field the default rules scrub turns that scrub off.** A keep on `PID-5` leaves the
 patient name in the output as captured, whatever the keep was added for. A default-scrubbed field
 already counts as decided, so a keep on one never clears a refusal. `load_rules` logs one WARNING
-line for each such field, but not on every load. It remembers each set of lines it has logged in
-this process, and skips a set it remembers. The line names the field and the kind of scrub it
-lost, never a value. A keep on a
+line for each such field, on every load. The anonymizer takes no overlay path, so a caller loads
+the overlay once and passes the rules to every message. The line names the field and the kind of
+scrub it lost, never a value. A keep on a
 field with no default rule logs nothing. `python -m tee anonymize-captures` also prints one
 `warning:` line that lists those fields, and `--log-level` cannot hide it.
 
@@ -2451,11 +2451,24 @@ field with no default rule logs nothing. `python -m tee anonymize-captures` also
 field as captured.** The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn`
 rewrite the first component only, so `PID-5` pointed at `id` leaves the given name. `date` keeps
 the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check counts such a field
-as scrubbed, and its shape detectors do not scan what is left. So a clean return does not clear it. `load_rules`
-logs one WARNING line for each such field, under the same once-per-set rule as a keep. The line
-names the field, the default kind and the new kind. `python -m tee anonymize-captures` prints
-one `warning:` line that lists them. A retarget to the same kind does not warn, and neither does
-a `drop`. Nothing refuses the retarget (vault BACKLOG #3000).
+as scrubbed, and its shape detectors do not scan what is left. So a clean return does not clear it.
+
+**`load_rules` refuses such a retarget unless the overlay lists the field under
+`retarget_acknowledged`** (vault BACKLOG #3000):
+
+```toml
+[hl7]
+retarget_acknowledged = ["PID-5"]
+
+[hl7.fields]
+"PID-5" = "id"
+```
+
+A retarget to the same kind, to `drop` or to `freetext` needs no entry, because none of them
+leaves part of the value. An entry that names no retarget needing it, such as a misspelt field,
+is refused too. A listed retarget loads, and `load_rules` logs one WARNING line for each, as it
+does for a keep. The line names the field, the default kind and the new kind, never a value.
+`python -m tee anonymize-captures` prints one `warning:` line that lists them.
 
 **The tee checks the salt and reads the overlay once, before it reads the store.** A salt the
 keyer refuses, an overlay it cannot read or parse, or one that breaks the schema, refuses the

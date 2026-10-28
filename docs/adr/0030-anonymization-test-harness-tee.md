@@ -62,6 +62,13 @@
   characters of any one key or value, and of the list of unknown keys. **This changes none of the
   §2 ratified choices:** the overlay still only maps a field to an existing kind.
   [PHI.md](../PHI.md) §9 is the long form for the retarget.
+- **AMENDED 2026-10-27 (vault BACKLOG #3000, #3493): a retarget is refused now, unless the overlay
+  lists it.** This reverses the amendment above on one point: the loader refuses a retarget of a
+  default path to a different kind, other than `drop` or `freetext`, unless the overlay also
+  names that path in a new `[hl7]` list, `retarget_acknowledged`. A listed retarget loads and is
+  warned about. **This changes none of the §2 ratified choices:** the new key selects nothing and
+  maps nothing, and the overlay still only maps a field to an existing kind.
+  [PHI.md](../PHI.md) §9 is the long form.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
