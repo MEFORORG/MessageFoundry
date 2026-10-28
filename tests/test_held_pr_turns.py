@@ -3,8 +3,9 @@
 """The held-PR turn report tells the Lander whose move each PR is, so its classification matters most.
 
 These drive the REAL ``main()`` against canned GraphQL replies through ``--input``, with no network.
-The positive control is ``test_classification_keys_on_body_prefix_not_login``: every seat posts under
-one GitHub login, so a classifier keyed on the author login would fail it.
+The unsafe error is AUTHOR on a PR that is really the Lander's, so most cases below are shapes that
+must NOT read as a hold. The positive control is ``test_classification_keys_on_body_not_login``:
+every seat posts under one GitHub login, so a classifier keyed on the author login would fail it.
 """
 
 from __future__ import annotations
@@ -40,10 +41,16 @@ KORUS = hpt.KORUS_REPO
 ENGINE_REQUIRED = ["CI gate", "cla"]
 NOW = datetime(2026, 10, 28, 18, 0, 0, tzinfo=UTC)
 LOGIN = "wshallwshall"  # every seat posts under this one login
+SESSION = "Lander (session 8a04c9f3), 2026-10-28. "
 
 
 def _sha(n: int) -> str:
     return f"{n:040x}"
+
+
+def _marker_body(sha: str, prose: str = "**Held, back to the author.** Finding 2 stands.") -> str:
+    """The contract's shape, as engine PR 2608's hold comment has it."""
+    return f"<!-- lander-hold head={sha} -->\n{SESSION}{prose}"
 
 
 def _comment(
@@ -61,14 +68,21 @@ def _comment(
     }
 
 
-def _hold(at: str, sha: str | None, *, still: bool = False) -> dict[str, Any]:
-    word = "Still held" if still else "Held, back to the author"
-    where = f", at `{sha}`" if sha else ""
-    body = (
-        f"Lander (session 8a04c9f3), 2026-10-28. **{word}{where}.** Finding 2 changes behaviour; "
-        f"the fix commit `abcdef123` is not on the head."
-    )
-    return _comment(body, at)
+def _hold(at: str, sha: str) -> dict[str, Any]:
+    return _comment(_marker_body(sha), at)
+
+
+def _review(body: str, at: str, *, state: str = "COMMENTED", bot: bool = False) -> dict[str, Any]:
+    return {
+        "body": body,
+        "state": state,
+        "submittedAt": at,
+        "authorAssociation": "NONE" if bot else "OWNER",
+        "author": {
+            "__typename": "Bot" if bot else "User",
+            "login": "greptile-apps" if bot else LOGIN,
+        },
+    }
 
 
 def _runs(names: list[str], conclusion: str = "SUCCESS") -> list[dict[str, Any]]:
@@ -161,37 +175,35 @@ def _engine_rows(
     return {r["number"]: r for r in rows}
 
 
-def test_no_lander_comment_is_lander_turn(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def _turn(row: dict[str, Any]) -> tuple[str, list[str]]:
+    return row["turn"], row["flags"]
+
+
+def _is_hold(body: str, *, trusted: bool = True, dismissed: bool = False) -> bool:
+    return hpt.Event(NOW, body, bot=False, trusted=trusted, dismissed=dismissed).held_at is not None
+
+
+# ---- the turn ------------------------------------------------------------------------------------
+
+
+def test_no_lander_event_is_lander_turn(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     row = _engine_rows(tmp_path, capsys, _pr(1))[1]
-    assert (row["turn"], row["flags"]) == ("LANDER", ["no-lander-comment"])
+    assert _turn(row) == ("LANDER", ["no-hold"])
     assert row["requiredGreen"] == "yes"
 
 
-def test_hold_with_nothing_newer_is_author_turn(
+def test_marker_hold_with_nothing_newer_is_author_turn(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    pr = _pr(2, comments=[_hold("2026-10-28T12:00:00Z", _sha(2)[:9])])
-    row = _engine_rows(tmp_path, capsys, pr)[2]
-    assert (row["turn"], row["flags"]) == ("AUTHOR", ["held"])
+    # A short marker SHA, upper-cased, still matches the head by prefix.
+    full = _pr(2, comments=[_hold("2026-10-28T12:00:00Z", _sha(2))])
+    short = _pr(3, comments=[_hold("2026-10-28T12:00:00Z", _sha(3)[:9].upper())])
+    rows = _engine_rows(tmp_path, capsys, full, short)
+    assert _turn(rows[2]) == ("AUTHOR", ["held"])
+    assert _turn(rows[3]) == ("AUTHOR", ["held"])
 
 
-def test_hold_then_new_commit_is_lander_turn(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # The committedDate predates the hold (an old local commit pushed late), yet the SHA named in the hold differs
-    # from the head, which is the stronger signal.
-    pr = _pr(
-        3,
-        comments=[_hold("2026-10-28T12:00:00Z", "f4f4dd470")],
-        committed="2026-10-28T08:00:00Z",
-    )
-    row = _engine_rows(tmp_path, capsys, pr)[3]
-    assert (row["turn"], row["flags"]) == ("LANDER", ["new-commit"])
-
-
-def test_hold_then_manager_comment_same_head_flags_no_new_commit(
+def test_marker_hold_then_manager_comment_at_same_head_is_lander_turn(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     pr = _pr(
@@ -202,76 +214,204 @@ def test_hold_then_manager_comment_same_head_flags_no_new_commit(
         ],
     )
     row = _engine_rows(tmp_path, capsys, pr)[4]
-    assert (row["turn"], row["flags"]) == ("LANDER", ["no-new-commit"])
+    assert _turn(row) == ("LANDER", ["replied", "no-new-commit"])
     assert row["age"] == "5h00m"
 
 
-def test_still_held_variant_is_a_hold(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    pr = _pr(
-        5,
-        comments=[
-            _hold("2026-10-28T07:00:00Z", "deadbeef0"),
-            _comment("Manager: merged origin/main in.", "2026-10-28T12:00:00Z"),
-            _hold("2026-10-28T16:00:00Z", _sha(5), still=True),
-        ],
-    )
-    row = _engine_rows(tmp_path, capsys, pr)[5]
-    assert (row["turn"], row["flags"]) == ("AUTHOR", ["held"])
-
-
-def test_non_hold_lander_comment_latest_is_lander_turn(
+def test_marker_hold_then_new_head_is_lander_turn(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    pr = _pr(
+    # The committer date predates the hold (an old local commit pushed late); only the SHA counts.
+    moved = _pr(
+        5, comments=[_hold("2026-10-28T12:00:00Z", "f4f4dd470")], committed="2026-10-28T08:00:00Z"
+    )
+    both = _pr(
         6,
         comments=[
-            _hold("2026-10-28T07:00:00Z", _sha(6)),
-            _comment("Lander (session 8a04c9f3): reviewing now.", "2026-10-28T09:00:00Z"),
+            _hold("2026-10-28T12:00:00Z", "f4f4dd470"),
+            _comment("Manager: pushed the fix.", "2026-10-28T13:00:00Z"),
         ],
     )
-    row = _engine_rows(tmp_path, capsys, pr)[6]
-    assert (row["turn"], row["flags"]) == ("LANDER", ["lander-not-hold"])
+    rows = _engine_rows(tmp_path, capsys, moved, both)
+    assert _turn(rows[5]) == ("LANDER", ["new-commit"])
+    assert _turn(rows[6]) == ("LANDER", ["new-commit", "replied"])
 
 
-def test_classification_keys_on_body_prefix_not_login(
+def test_same_second_tie_goes_to_the_lander(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Positive control: the hold and the Manager's reply share one login, and the reply flips the
-    turn. A classifier keyed on the login would see only one author and call it AUTHOR's turn. A
-    'Lander handover' body is a Manager's, not a Lander comment."""
-    pr = _pr(
+    reply = _pr(
         7,
         comments=[
             _hold("2026-10-28T12:00:00Z", _sha(7)),
+            _comment("Manager: fixed.", "2026-10-28T12:00:00Z"),
+        ],
+    )
+    rows = _engine_rows(tmp_path, capsys, reply)
+    assert _turn(rows[7]) == ("LANDER", ["replied", "no-new-commit"])
+    # A hold tied with a non-hold Lander comment is no hold, in either list order.
+    head = _sha(8)
+    hold = hpt.Event(NOW, _marker_body(head), bot=False, trusted=True)
+    note = hpt.Event(NOW, SESSION + "looking now.", bot=False, trusted=True)
+    assert hpt.classify(head, [hold, note]) == ("LANDER", ["no-hold"])
+    assert hpt.classify(head, [note, hold]) == ("LANDER", ["no-hold"])
+    # Two tied holds must both match the head.
+    other = hpt.Event(NOW, _marker_body("f4f4dd470"), bot=False, trusted=True)
+    assert hpt.classify(head, [hold, other]) == ("LANDER", ["new-commit"])
+
+
+def test_newer_non_hold_lander_comment_is_lander_turn(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr = _pr(
+        9,
+        comments=[
+            _hold("2026-10-28T07:00:00Z", _sha(9)),
+            _comment(SESSION + "reviewing now.", "2026-10-28T09:00:00Z"),
+        ],
+    )
+    assert _turn(_engine_rows(tmp_path, capsys, pr)[9]) == ("LANDER", ["no-hold"])
+
+
+def test_legacy_prose_hold_is_lander_turn(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hold written before the marker reads as a non-hold Lander comment: LANDER, the safe side."""
+    prose = SESSION + f"**Held, back to the author, at `{_sha(10)[:9]}`.** Finding 2 stands."
+    pr = _pr(10, comments=[_comment(prose, "2026-10-28T12:00:00Z")])
+    assert _turn(_engine_rows(tmp_path, capsys, pr)[10]) == ("LANDER", ["no-hold"])
+    assert hpt.Event(NOW, prose, bot=False, trusted=True).lander
+
+
+def test_classification_keys_on_body_not_login(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control: the hold and the Manager's reply share one login, and the reply flips the
+    turn. A classifier keyed on the login would see one author and call it AUTHOR's turn. The same
+    marker hold under another login is still a hold, so the body, not the login, decides."""
+    pr = _pr(
+        11,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(11)),
             _comment("Lander handover from the batch 453 Manager: fixed.", "2026-10-28T13:00:00Z"),
         ],
     )
-    other = _pr(8, comments=[_comment("Lander handover: ready.", "2026-10-28T13:00:00Z")])
-    rows = _engine_rows(tmp_path, capsys, pr, other)
-    assert (rows[7]["turn"], rows[7]["flags"]) == ("LANDER", ["no-new-commit"])
-    assert rows[8]["flags"] == ["no-lander-comment"]
+    other_login = _pr(
+        12, comments=[_comment(_marker_body(_sha(12)), "2026-10-28T12:00:00Z", login="someone")]
+    )
+    handover = _pr(13, comments=[_comment("Lander handover: ready.", "2026-10-28T13:00:00Z")])
+    rows = _engine_rows(tmp_path, capsys, pr, other_login, handover)
+    assert _turn(rows[11]) == ("LANDER", ["replied", "no-new-commit"])
+    assert _turn(rows[12]) == ("AUTHOR", ["held"])
+    assert _turn(rows[13]) == ("LANDER", ["no-hold"])
 
 
-def _review(body: str, at: str, *, state: str = "COMMENTED", bot: bool = False) -> dict[str, Any]:
-    return {
-        "body": body,
-        "state": state,
-        "submittedAt": at,
-        "authorAssociation": "NONE" if bot else "OWNER",
-        "author": {
-            "__typename": "Bot" if bot else "User",
-            "login": "greptile-apps" if bot else LOGIN,
-        },
-    }
+# ---- the hold contract ---------------------------------------------------------------------------
+
+
+def test_real_hold_shape_is_a_hold() -> None:
+    sha = "eead80e5efa654bf063b3260ebdea1ea8f24f999"
+    assert hpt.hold_head(_marker_body(sha)) == sha
+    assert hpt.hold_head(_marker_body("ABCDEF1")) == "abcdef1"
+    # Trailing spaces, a tab and a carriage return after the marker are stripped.
+    assert hpt.hold_head(f"<!-- lander-hold head={sha} --> \t\r\n{SESSION}**Held.**") == sha
+
+
+def test_marker_without_a_lander_second_line_is_not_a_hold() -> None:
+    marker = "<!-- lander-hold head=abcdef1 -->"
+    assert not _is_hold(marker)
+    assert not _is_hold(marker + "\nManager: this is how a hold looks.")
+    assert not _is_hold(marker + "\n\n" + SESSION + "**Held.**")
+    assert not _is_hold(marker + "\n " + SESSION + "**Held.**")
+
+
+def test_marker_indented_or_after_a_blank_line_is_not_a_hold() -> None:
+    marker = "<!-- lander-hold head=abcdef1 -->"
+    assert not _is_hold(" " + marker + "\n" + SESSION)
+    assert not _is_hold("\t" + marker + "\n" + SESSION)
+    assert not _is_hold("\n" + marker + "\n" + SESSION)
+    assert not _is_hold("\r\n" + marker + "\n" + SESSION)
+
+
+def test_marker_anywhere_but_line_one_is_not_a_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    marker = "<!-- lander-hold head=abcdef1 -->"
+    for body in (
+        SESSION + "**Cleared.**\n" + marker,
+        SESSION + "**Cleared.**\n\n> " + marker + "\n> " + SESSION,
+        "> " + marker + "\n> " + SESSION,
+        "```\n" + marker + "\n" + SESSION + "\n```",
+        "`" + marker + "`\n" + SESSION,
+        marker + " trailing prose\n" + SESSION,
+        "<!-- lander-hold head=abcdef1 --><!-- lander-hold head=abcdef1 -->\n" + SESSION,
+    ):
+        assert not _is_hold(body), body
+    quoted = _pr(14, comments=[_comment("> " + marker + "\n> " + SESSION, "2026-10-28T12:00:00Z")])
+    assert _engine_rows(tmp_path, capsys, quoted)[14]["turn"] == "LANDER"
+
+
+def test_marker_head_must_be_7_to_40_hex() -> None:
+    for bad in ("abcdef", "a" * 41, "xyzxyzx", "", "abcdef1g"):
+        assert hpt.hold_head(_marker_body(bad)) is None, bad
+    # The contract's spacing is exact.
+    assert hpt.hold_head("<!--lander-hold head=abcdef1-->\n" + SESSION) is None
+    assert hpt.hold_head("<!--  lander-hold head=abcdef1 -->\n" + SESSION) is None
+
+
+def test_unicode_line_breaks_in_line_one_are_not_a_hold() -> None:
+    """``str.splitlines`` would split these; the contract splits on a line feed only."""
+    marker = "<!-- lander-hold head=abcdef1 -->"
+    for sep in ("\x0b", " ", "\x1c", "\x85", "\x0c"):
+        assert not _is_hold(marker + sep + SESSION + "**Held.**"), repr(sep)
+        # Nor as trailing whitespace on the marker line: only space, tab and CR are stripped.
+        assert not _is_hold(marker + sep + "\n" + SESSION + "**Held.**"), repr(sep)
+
+
+def test_untrusted_minimized_or_dismissed_is_not_a_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    body = _marker_body(_sha(15))
+    assert _is_hold(body)
+    assert not _is_hold(body, trusted=False)
+    assert not _is_hold(body, dismissed=True)
+    outsider = _pr(
+        15, comments=[_comment(body, "2026-10-28T12:00:00Z", login="x", association="NONE")]
+    )
+    contributor = _pr(
+        16,
+        comments=[
+            _comment(_marker_body(_sha(16)), "2026-10-28T12:00:00Z", association="CONTRIBUTOR")
+        ],
+    )
+    dismissed = _pr(17, reviews=[_review(_marker_body(_sha(17)), "2026-10-28T12:00:00Z")])
+    dismissed["reviews"]["nodes"][0]["state"] = "DISMISSED"
+    hidden = _hold("2026-10-28T12:00:00Z", _sha(18))
+    hidden["isMinimized"] = True
+    rows = _engine_rows(
+        tmp_path, capsys, outsider, contributor, dismissed, _pr(18, comments=[hidden])
+    )
+    for n in (15, 16, 17, 18):
+        assert _turn(rows[n]) == ("LANDER", ["no-hold"]), n
+
+
+def test_marker_hold_posted_as_a_review_is_a_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr = _pr(19, reviews=[_review(_marker_body(_sha(19)), "2026-10-28T12:00:00Z")])
+    assert _turn(_engine_rows(tmp_path, capsys, pr)[19]) == ("AUTHOR", ["held"])
+
+
+# ---- what counts as an event ---------------------------------------------------------------------
 
 
 def test_bot_review_does_not_move_the_turn_but_dates_the_pr(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     bot = _review("<!-- greptile-auto-approve -->", "2026-10-28T14:30:00Z", bot=True)
-    pr = _pr(9, comments=[_hold("2026-10-28T12:00:00Z", _sha(9))], reviews=[bot])
-    row = _engine_rows(tmp_path, capsys, pr)[9]
-    assert (row["turn"], row["flags"]) == ("AUTHOR", ["held"])
+    pr = _pr(20, comments=[_hold("2026-10-28T12:00:00Z", _sha(20))], reviews=[bot])
+    row = _engine_rows(tmp_path, capsys, pr)[20]
+    assert _turn(row) == ("AUTHOR", ["held"])
     assert row["age"] == "3h30m"
 
 
@@ -283,177 +423,56 @@ def test_review_bodies_and_inline_only_reviews_count_as_replies(
     rows = _engine_rows(
         tmp_path,
         capsys,
-        _pr(10, comments=[_hold("2026-10-28T12:00:00Z", _sha(10))], reviews=[reply]),
-        _pr(13, comments=[_hold("2026-10-28T12:00:00Z", _sha(13))], reviews=[inline_only]),
+        _pr(21, comments=[_hold("2026-10-28T12:00:00Z", _sha(21))], reviews=[reply]),
+        _pr(22, comments=[_hold("2026-10-28T12:00:00Z", _sha(22))], reviews=[inline_only]),
     )
-    assert (rows[10]["turn"], rows[10]["flags"]) == ("LANDER", ["no-new-commit"])
-    assert (rows[13]["turn"], rows[13]["flags"]) == ("LANDER", ["no-new-commit"])
+    assert _turn(rows[21]) == ("LANDER", ["replied", "no-new-commit"])
+    assert _turn(rows[22]) == ("LANDER", ["replied", "no-new-commit"])
 
 
-def test_pending_review_is_ignored_and_minimized_comment_is_never_a_hold(
+def test_pending_review_is_ignored_and_minimized_reply_still_counts(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     pending = _review("Manager: draft, not submitted.", "2026-10-28T15:00:00Z", state="PENDING")
-    pr = _pr(14, comments=[_hold("2026-10-28T12:00:00Z", _sha(14))], reviews=[pending])
-    # A minimized reply after the hold still hands the turn back: hiding it is no new hold.
+    pr = _pr(23, comments=[_hold("2026-10-28T12:00:00Z", _sha(23))], reviews=[pending])
     hidden = _comment("Manager: answered in thread.", "2026-10-28T15:00:00Z")
     hidden["isMinimized"] = True
-    replied = _pr(15, comments=[_hold("2026-10-28T12:00:00Z", _sha(15)), hidden], reviews=[pending])
-    # A minimized hold is no hold.
-    old = _hold("2026-10-28T12:00:00Z", _sha(16))
-    old["isMinimized"] = True
-    rows = _engine_rows(tmp_path, capsys, pr, replied, _pr(16, comments=[old]))
-    assert (rows[14]["turn"], rows[14]["flags"]) == ("AUTHOR", ["held"])
-    assert (rows[15]["turn"], rows[15]["flags"]) == ("LANDER", ["no-new-commit"])
-    assert (rows[16]["turn"], rows[16]["flags"]) == ("LANDER", ["no-lander-comment"])
+    replied = _pr(24, comments=[_hold("2026-10-28T12:00:00Z", _sha(24)), hidden])
+    rows = _engine_rows(tmp_path, capsys, pr, replied)
+    assert _turn(rows[23]) == ("AUTHOR", ["held"])
+    assert _turn(rows[24]) == ("LANDER", ["replied", "no-new-commit"])
 
 
-def test_outside_account_cannot_post_a_hold(
+def test_undatable_comment_is_an_error_row_not_dropped(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    fake = _comment(
-        f"Lander (session x). **Held, at `{_sha(15)[:9]}`.**",
-        "2026-10-28T12:00:00Z",
-        login="someone",
-        association="NONE",
+    undated = _pr(
+        25,
+        comments=[_hold("2026-10-28T12:00:00Z", _sha(25))],
+        reviews=[{"body": "Manager: fixed.", "state": "COMMENTED", "authorAssociation": "OWNER"}],
     )
-    row = _engine_rows(tmp_path, capsys, _pr(15, comments=[fake]))[15]
-    assert (row["turn"], row["flags"]) == ("LANDER", ["no-lander-comment"])
+    rows = _engine_rows(tmp_path, capsys, undated, _pr(26))
+    assert rows[25]["turn"] == "ERROR" and "PR unreadable" in rows[25]["error"]
+    assert rows[26]["turn"] == "LANDER"
 
 
-def test_bold_held_quoted_in_a_non_hold_comment_is_not_a_hold(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    body = (
-        "Lander (session x). **Cleared; merging once CI is green.** The earlier **Held** is fixed."
-    )
-    pr = _pr(16, comments=[_comment(body, "2026-10-28T12:00:00Z")])
-    row = _engine_rows(tmp_path, capsys, pr)[16]
-    assert (row["turn"], row["flags"]) == ("LANDER", ["lander-not-hold"])
-
-
-def test_hold_without_sha_falls_back_to_commit_date(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    newer = _pr(
-        11, comments=[_hold("2026-10-28T12:00:00Z", None)], committed="2026-10-28T13:00:00Z"
-    )
-    older = _pr(
-        12, comments=[_hold("2026-10-28T12:00:00Z", None)], committed="2026-10-28T11:00:00Z"
-    )
-    rows = _engine_rows(tmp_path, capsys, newer, older)
-    assert (rows[11]["turn"], rows[11]["flags"]) == ("LANDER", ["new-commit", "date-fallback"])
-    assert (rows[12]["turn"], rows[12]["flags"]) == ("AUTHOR", ["held", "date-fallback"])
-
-
-def test_hold_heads_reads_the_headline_only() -> None:
-    body = "Lander (session x). **Held, at `1234567AB`.** The fix `fedcba987` is elsewhere."
-    assert hpt.hold_heads(body) == ("1234567ab",)
-    assert hpt.hold_heads("Lander (session x). **Held.** See `fedcba987`.") == ()
-    # The SHA after "at" wins over another commit the headline names.
-    lander = "Lander (session x). "
-    assert hpt.hold_heads(lander + "**Held: fix `bbbbbbb` missing, at `aaaaaaa`.**") == ("aaaaaaa",)
-    # A recap of an earlier hold before the bold headline is outside it.
-    recap = "Lander (session x), 2026-10-28. **Still held, at `aaaaaaa`.** Earlier at `ccccccc`."
-    assert hpt.hold_heads(recap) == ("aaaaaaa",)
-    assert hpt.hold_heads(lander + "**Cleared.**") is None
-
-
-def test_backticked_sha_without_at_is_the_held_head() -> None:
-    """Regression: with no "at `sha`" form, a backticked SHA in the headline is still the head, so
-    the turn never silently falls to the weaker committer date while a SHA is present."""
-    lander = "Lander (session x). "
-    assert hpt.hold_heads(lander + "**Held on `aaaaaaa`.**") == ("aaaaaaa",)
-    assert hpt.hold_heads(lander + "**Held at head `aaaaaaa`.**") == ("aaaaaaa",)
-    # Two distinct heads and no "at": ambiguous, which the classifier hands to the Lander.
-    two = lander + "**Held on `aaaaaaa`: the fix `bbbbbbb` is missing.**"
-    assert hpt.hold_heads(two) == ("aaaaaaa", "bbbbbbb")
-
-
-def test_sha_fallback_beats_the_commit_date(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # The committer date predates the hold, so the date fallback would call these the author's.
-    moved = _pr(
-        100,
-        comments=[_comment("Lander (session x). **Held on `f4f4dd470`.**", "2026-10-28T12:00:00Z")],
-        committed="2026-10-28T08:00:00Z",
-    )
-    same = _pr(
-        101,
-        comments=[
-            _comment(
-                f"Lander (session x). **Held at head `{_sha(101)[:9]}`.**", "2026-10-28T12:00:00Z"
-            )
-        ],
-        committed="2026-10-28T08:00:00Z",
-    )
-    two = _pr(
-        102,
-        comments=[
-            _comment(
-                f"Lander (session x). **Held on `{_sha(102)[:9]}`, fix `abcdef1` missing.**",
-                "2026-10-28T12:00:00Z",
-            )
-        ],
-    )
-    rows = _engine_rows(tmp_path, capsys, moved, same, two)
-    assert (rows[100]["turn"], rows[100]["flags"]) == ("LANDER", ["new-commit"])
-    assert (rows[101]["turn"], rows[101]["flags"]) == ("AUTHOR", ["held"])
-    assert (rows[102]["turn"], rows[102]["flags"]) == ("LANDER", ["sha-ambiguous"])
-
-
-def test_negated_or_past_tense_hold_is_not_a_hold(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def hold(body: str) -> bool:
-        return hpt.Event(NOW, body, bot=False, trusted=True).hold
-
-    assert not hold("Lander (session x). No longer **held**; merging.")
-    assert not hold("Lander (session x), 2026-10-28. Earlier **Held** answered.")
-    assert not hold("Lander (session x). **Held** answered; merging.")
-    assert not hold("Lander (session x). **Held earlier, now cleared.**")
-    assert not hold("Lander (session x). **Held no longer.**")
-    # A whole-sentence headline does not read the next sentence.
-    assert hold("Lander (session x). **Held, at `abcdef1`.** Finding 1 is cleared; 2 stands.")
-    pr = _pr(
-        103, comments=[_comment("Lander (session x). No longer **held**.", "2026-10-28T12:00:00Z")]
-    )
-    row = _engine_rows(tmp_path, capsys, pr)[103]
-    assert (row["turn"], row["flags"]) == ("LANDER", ["lander-not-hold"])
-
-
-def test_same_second_reply_or_commit_goes_to_the_lander(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    reply = _pr(
-        104,
-        comments=[
-            _hold("2026-10-28T12:00:00Z", _sha(104)),
-            _comment("Manager: fixed.", "2026-10-28T12:00:00Z"),
-        ],
-    )
-    commit = _pr(
-        105, comments=[_hold("2026-10-28T12:00:00Z", None)], committed="2026-10-28T12:00:00Z"
-    )
-    rows = _engine_rows(tmp_path, capsys, reply, commit)
-    assert (rows[104]["turn"], rows[104]["flags"]) == ("LANDER", ["no-new-commit"])
-    assert (rows[105]["turn"], rows[105]["flags"]) == ("LANDER", ["new-commit", "date-fallback"])
+# ---- errors and exit codes -----------------------------------------------------------------------
 
 
 def test_overflowing_stamp_is_one_error_row_and_exit_zero(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    crafted = _pr(106, comments=[_comment("Manager: hi.", "9999-12-31T23:59:59-14:00")])
-    doc = {ENGINE: {"pages": [_page([crafted, _pr(107)])], "required": ENGINE_REQUIRED}}
+    crafted = _pr(30, comments=[_comment("Manager: hi.", "9999-12-31T23:59:59-14:00")])
+    doc = {ENGINE: {"pages": [_page([crafted, _pr(31)])], "required": ENGINE_REQUIRED}}
     code, rows = _run(tmp_path, doc, capsys, "--repo", ENGINE)
     assert code == 0
     by = {r["number"]: r for r in rows}
-    assert by[106]["turn"] == "ERROR" and "OverflowError" in by[106]["error"]
-    assert by[107]["turn"] == "LANDER"
+    assert by[30]["turn"] == "ERROR" and "OverflowError" in by[30]["error"]
+    assert "report defect" in by[30]["error"]
+    assert by[31]["turn"] == "LANDER"
     code, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
     assert code == 0
-    assert any(line.split()[:3] == ["ERROR", "MessageFoundry", "106"] for line in out.splitlines())
+    assert any(line.split()[:3] == ["ERROR", "MessageFoundry", "30"] for line in out.splitlines())
 
 
 def test_a_per_pr_defect_does_not_collapse_the_repo(
@@ -462,178 +481,28 @@ def test_a_per_pr_defect_does_not_collapse_the_repo(
     real = hpt._events
 
     def events(pr: dict[str, Any]) -> list[Any]:
-        if pr.get("number") == 108:
+        if pr.get("number") == 32:
             raise TypeError("unexpected shape")
         return real(pr)
 
     monkeypatch.setattr(hpt, "_events", events)
-    rows = _engine_rows(tmp_path, capsys, _pr(108), _pr(109))
-    assert rows[108]["turn"] == "ERROR" and "TypeError" in rows[108]["error"]
-    assert rows[109]["turn"] == "LANDER"
+    rows = _engine_rows(tmp_path, capsys, _pr(32), _pr(33))
+    assert rows[32]["turn"] == "ERROR" and "TypeError" in rows[32]["error"]
+    assert "read failed" not in rows[32]["error"]
+    assert rows[33]["turn"] == "LANDER"
 
 
-def _marked(marker: str, prose: str = "**Reviewed; see below.**") -> str:
-    return f"Lander (session x), 2026-10-28. {prose}\n\n{marker}"
-
-
-def test_hold_marker_is_the_primary_signal(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_a_defect_in_the_reader_is_not_reported_as_a_read_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The prose is no hold, yet the marker makes it one.
-    marker = f"<!-- lander-hold head={_sha(110)} -->"
-    stay = _pr(110, comments=[_comment(_marked(marker), "2026-10-28T12:00:00Z")])
-    # The prose names the current head; the marker names another, and wins.
-    moved = _pr(
-        111,
-        comments=[
-            _comment(
-                _marked("<!-- lander-hold head=f4f4dd470 -->", f"**Held, at `{_sha(111)[:9]}`.**"),
-                "2026-10-28T12:00:00Z",
-            )
-        ],
-    )
-    rows = _engine_rows(tmp_path, capsys, stay, moved)
-    assert (rows[110]["turn"], rows[110]["flags"]) == ("AUTHOR", ["held"])
-    assert (rows[111]["turn"], rows[111]["flags"]) == ("LANDER", ["new-commit"])
+    def broken(doc: object, repo: str) -> Any:
+        raise AttributeError("a bug, not GitHub")
 
-
-def test_marker_validation_and_release() -> None:
-    heads = hpt.hold_heads
-
-    assert heads(_marked("<!-- lander-hold head=ABCDEF1 -->")) == ("abcdef1",)
-    assert heads(_marked("<!--lander-hold head=abcdef1-->")) == ("abcdef1",)
-    # Anything but 7-40 hex is no marker, so the (non-hold) prose decides.
-    for bad in ("abcdef", "a" * 41, "xyzxyzx", "", "abcdef1g"):
-        assert heads(_marked(f"<!-- lander-hold head={bad} -->")) is None, bad
-    # ...and a prose hold still counts as the fallback beside an invalid marker.
-    assert heads(_marked("<!-- lander-hold head=nope -->", "**Held.**")) == ()
-    # A release marker beats a hold marker and a prose hold alike.
-    both = _marked("<!-- lander-hold head=abcdef1 --> <!-- lander-release -->", "**Held.**")
-    assert heads(both) is None
-    assert heads(_marked("<!-- lander-release -->", "**Still held.**")) is None
-    # The marker is gated like the prose: an outside account or a non-Lander body is no hold.
-    marker = "<!-- lander-hold head=abcdef1 -->"
-    assert not hpt.Event(NOW, _marked(marker), bot=False, trusted=False).hold
-    assert not hpt.Event(NOW, f"Manager: {marker}", bot=False, trusted=True).hold
-    assert hpt.Event(NOW, _marked(marker), bot=False, trusted=True).hold
-
-
-def test_release_comment_after_a_hold_is_lander_turn(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    pr = _pr(
-        112,
-        comments=[
-            _comment(_marked(f"<!-- lander-hold head={_sha(112)} -->"), "2026-10-28T12:00:00Z"),
-            _comment(_marked("<!-- lander-release -->", "**Held.**"), "2026-10-28T13:00:00Z"),
-        ],
-    )
-    row = _engine_rows(tmp_path, capsys, pr)[112]
-    assert (row["turn"], row["flags"]) == ("LANDER", ["lander-not-hold"])
-
-
-def test_hold_headline_rules() -> None:
-    def hold(body: str) -> bool:
-        return hpt.Event(NOW, body, bot=False, trusted=True).hold
-
-    assert hold("Lander (session x), 2026-10-28. **Held, back to the author, at `abcdef1`.**")
-    assert hold("Lander (session x). **Still Held, at `abcdef1`.**")
-    assert hold("Lander (session x). **HELD.**")
-    assert not hold("Lander (session x). **Held-over check cleared; merging.**")
-    # A bold Held far past the session marker is a mention in a triage note, not a headline.
-    assert not hold(
-        "Lander (session x), 2026-10-28, triage. The merge queue ejected this PR. "
-        "The earlier **Held** is resolved; requeueing."
-    )
-    assert not hpt.Event(NOW, "Lander (session x). **Held.**", bot=False, trusted=False).hold
-
-
-def test_same_second_tie_and_unknown_head_go_to_the_lander() -> None:
-    hold = hpt.Event(NOW, "Lander (session x). **Held, at `abcdef1`.**", bot=False, trusted=True)
-    note = hpt.Event(NOW, "Lander (session x): looking now.", bot=False, trusted=True)
-    head = "abcdef1" + "0" * 33
-    assert hpt.classify(head, None, [hold, note]) == ("LANDER", ["lander-not-hold"])
-    assert hpt.classify(head, None, [note, hold]) == ("LANDER", ["lander-not-hold"])
-    no_sha = hpt.Event(NOW, "Lander (session x). **Held.**", bot=False, trusted=True)
-    assert hpt.classify(head, None, [no_sha]) == ("LANDER", ["head-unknown", "date-fallback"])
-
-
-def test_queue_and_auto_merge_are_flagged(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    queued = _pr(90)
-    queued["mergeQueueEntry"] = {"state": "QUEUED"}
-    armed = _pr(91)
-    armed["autoMergeRequest"] = {"enabledAt": "2026-10-28T10:00:00Z"}
-    rows = _engine_rows(tmp_path, capsys, queued, armed)
-    assert rows[90]["flags"] == ["no-lander-comment", "in-queue"]
-    assert rows[91]["flags"] == ["no-lander-comment", "auto-armed"]
-
-
-def test_non_utc_stamp_and_odd_number_do_not_break_the_report(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    odd = _pr(80, committed="2026-10-28T12:00:00+02:00")
-    odd["number"] = "eighty"
-    code, rows = _run(
-        tmp_path, {ENGINE: {"pages": [_page([odd])], "required": ENGINE_REQUIRED}}, capsys
-    )
+    monkeypatch.setattr(hpt, "from_input", broken)
+    code, rows = _run(tmp_path, {}, capsys, "--repo", KORUS)
     assert code == 0
-    row = next(r for r in rows if r["repo"] == ENGINE)
-    assert row["newestEvent"] == "2026-10-28T10:00:00Z"
-
-
-def test_table_names_the_reason_for_an_unknown_green(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    doc = {ENGINE: {"pages": [_page([_pr(81), _pr(82)])]}}
-    code, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
-    assert code == 0
-    assert "note: MessageFoundry GREEN ? on 2 PR(s): required list unreadable" in out
-
-
-def test_vault_pr_uses_the_vault_required_list(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    green = _pr(20, runs=_runs(list(hpt.VAULT_REQUIRED)))
-    # The engine's contexts are green, but none of the vault's are, so it is not green.
-    wrong = _pr(21, runs=_runs(ENGINE_REQUIRED))
-    doc = {VAULT: {"pages": [_page([green, wrong])]}}
-    code, rows = _run(tmp_path, doc, capsys, "--repo", VAULT)
-    assert code == 0
-    by = {r["number"]: r for r in rows}
-    assert by[20]["requiredGreen"] == "yes"
-    assert by[21]["requiredGreen"] == "no"
-    assert sorted(by[21]["required"]["missing"]) == sorted(hpt.VAULT_REQUIRED)
-
-
-def test_required_context_missing_on_head_is_not_green(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    rows = _engine_rows(
-        tmp_path,
-        capsys,
-        _pr(30, runs=_runs(["CI gate"])),
-        _pr(31, runs=_runs(["CI gate"]) + _runs(["cla"], conclusion="FAILURE")),
-    )
-    assert rows[30]["requiredGreen"] == "no"
-    assert rows[30]["required"]["missing"] == ["cla"]
-    assert rows[31]["requiredGreen"] == "no"
-    assert rows[31]["required"]["failing"] == ["cla"]
-
-
-def test_engine_required_list_unreadable_is_unknown_not_green(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    doc = {ENGINE: {"pages": [_page([_pr(32)])]}}
-    _, rows = _run(tmp_path, doc, capsys, "--repo", ENGINE)
-    assert rows[0]["requiredGreen"] == "?"
-    assert "required list unreadable" in rows[0]["required"]["reason"]
-
-
-def test_draft_pr_is_excluded(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    rows = _engine_rows(tmp_path, capsys, _pr(40, draft=True), _pr(41))
-    assert list(rows) == [41]
+    assert rows[0]["turn"] == "ERROR"
+    assert "report defect" in rows[0]["error"] and "read failed" not in rows[0]["error"]
 
 
 def test_failed_repo_read_is_an_error_row_and_exit_zero(
@@ -641,16 +510,16 @@ def test_failed_repo_read_is_an_error_row_and_exit_zero(
 ) -> None:
     doc = {
         ENGINE: {"error": "gh api graphql exited 1: HTTP 502"},
-        VAULT: {"pages": [_page([_pr(50)])]},
+        VAULT: {"pages": [_page([_pr(40)])]},
         # korus is absent from the file: also an ERROR row, never silently omitted.
     }
     code, rows = _run(tmp_path, doc, capsys)
     assert code == 0
     errors = {r["repo"]: r["error"] for r in rows if r["turn"] == "ERROR"}
     assert set(errors) == {ENGINE, KORUS}
-    assert "502" in errors[ENGINE]
+    assert "502" in errors[ENGINE] and errors[ENGINE].startswith("read failed")
     assert rows[0]["turn"] == "ERROR" and rows[1]["turn"] == "ERROR"
-    assert [r["number"] for r in rows if r["turn"] != "ERROR"] == [50]
+    assert [r["number"] for r in rows if r["turn"] != "ERROR"] == [40]
 
 
 def test_live_gh_failure_is_an_error_row_and_exit_zero(capsys: pytest.CaptureFixture[str]) -> None:
@@ -664,8 +533,128 @@ def test_live_gh_failure_is_an_error_row_and_exit_zero(capsys: pytest.CaptureFix
     assert "could not resolve host" in out
 
 
+def test_unreadable_input_file_is_error_rows(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = hpt.main(["--input", str(tmp_path / "missing.json")], now=lambda: NOW)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert sum(line.startswith("ERROR") for line in out.splitlines()) == 3
+
+
+def test_non_object_pr_node_is_an_error_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    page = _page([_pr(41)])
+    page["data"]["repository"]["pullRequests"]["nodes"].insert(0, None)
+    doc = {ENGINE: {"pages": [page], "required": ENGINE_REQUIRED}}
+    code, rows = _run(tmp_path, doc, capsys, "--repo", ENGINE)
+    assert code == 0
+    assert [r["turn"] for r in rows] == ["ERROR", "LANDER"]
+
+
+# ---- the green column, flags, paging and the table -----------------------------------------------
+
+
+def test_vault_pr_uses_the_vault_required_list(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    green = _pr(50, runs=_runs(list(hpt.VAULT_REQUIRED)))
+    # The engine's contexts are green, but none of the vault's are, so it is not green.
+    wrong = _pr(51, runs=_runs(ENGINE_REQUIRED))
+    doc = {VAULT: {"pages": [_page([green, wrong])]}}
+    code, rows = _run(tmp_path, doc, capsys, "--repo", VAULT)
+    assert code == 0
+    by = {r["number"]: r for r in rows}
+    assert by[50]["requiredGreen"] == "yes"
+    assert by[51]["requiredGreen"] == "no"
+    assert sorted(by[51]["required"]["missing"]) == sorted(hpt.VAULT_REQUIRED)
+
+
+def test_required_context_missing_or_failing_on_head_is_not_green(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _pr(52, runs=_runs(["CI gate"])),
+        _pr(53, runs=_runs(["CI gate"]) + _runs(["cla"], conclusion="FAILURE")),
+    )
+    assert rows[52]["requiredGreen"] == "no"
+    assert rows[52]["required"]["missing"] == ["cla"]
+    assert rows[53]["requiredGreen"] == "no"
+    assert rows[53]["required"]["failing"] == ["cla"]
+
+
+def test_engine_required_list_unreadable_is_unknown_and_named_in_the_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    doc = {ENGINE: {"pages": [_page([_pr(54), _pr(55)])]}}
+    _, rows = _run(tmp_path, doc, capsys, "--repo", ENGINE)
+    assert rows[0]["requiredGreen"] == "?"
+    assert "required list unreadable" in rows[0]["required"]["reason"]
+    code, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
+    assert code == 0
+    assert "note: MessageFoundry GREEN ? on 2 PR(s): required list unreadable" in out
+
+
+def test_listed_commit_not_the_head_names_why_green_is_unknown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr = _pr(56)
+    pr["headRefOid"] = _sha(999)
+    row = _engine_rows(tmp_path, capsys, pr)[56]
+    assert row["requiredGreen"] == "?"
+    assert "not the head" in row["required"]["reason"]
+    # ...but a base other than main keeps its own reason, which a re-run cannot fix.
+    other = _pr(57)
+    other["headRefOid"] = _sha(998)
+    other["baseRefName"] = "release/1.0"
+    row = _engine_rows(tmp_path, capsys, other)[57]
+    assert "release/1.0" in row["required"]["reason"]
+
+
+def test_turn_reads_head_ref_oid_not_the_listed_commit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The listed commit still matches the marker, but headRefOid has moved: a new commit.
+    pr = _pr(58, comments=[_hold("2026-10-28T12:00:00Z", _sha(58))])
+    pr["headRefOid"] = _sha(997)
+    assert _turn(_engine_rows(tmp_path, capsys, pr)[58]) == ("LANDER", ["new-commit"])
+
+
+def test_queue_and_auto_merge_are_flagged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    queued = _pr(60)
+    queued["mergeQueueEntry"] = {"state": "QUEUED"}
+    armed = _pr(61)
+    armed["autoMergeRequest"] = {"enabledAt": "2026-10-28T10:00:00Z"}
+    rows = _engine_rows(tmp_path, capsys, queued, armed)
+    assert rows[60]["flags"] == ["no-hold", "in-queue"]
+    assert rows[61]["flags"] == ["no-hold", "auto-armed"]
+
+
+def test_draft_pr_is_excluded(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    rows = _engine_rows(tmp_path, capsys, _pr(62, draft=True), _pr(63))
+    assert list(rows) == [63]
+
+
+def test_non_utc_stamp_and_odd_number_do_not_break_the_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    odd = _pr(64, committed="2026-10-28T12:00:00+02:00")
+    odd["number"] = "sixty-four"
+    code, rows = _run(
+        tmp_path, {ENGINE: {"pages": [_page([odd])], "required": ENGINE_REQUIRED}}, capsys
+    )
+    assert code == 0
+    row = next(r for r in rows if r["repo"] == ENGINE)
+    assert row["newestEvent"] == "2026-10-28T10:00:00Z"
+
+
 def test_live_read_paginates_in_one_query_per_page(capsys: pytest.CaptureFixture[str]) -> None:
-    pages = [_page([_pr(60)]), _page([_pr(61)])]
+    pages = [_page([_pr(70)]), _page([_pr(71)])]
     pages[0]["data"]["repository"]["pullRequests"]["pageInfo"] = {
         "hasNextPage": True,
         "endCursor": "c1",
@@ -680,32 +669,23 @@ def test_live_read_paginates_in_one_query_per_page(capsys: pytest.CaptureFixture
     assert hpt.main(["--repo", KORUS, "--json"], gh=gh, now=lambda: NOW) == 0
     rows = json.loads(capsys.readouterr().out)
     assert [c["cursor"] for c in calls] == [None, "c1"]
-    assert sorted(r["number"] for r in rows) == [60, 61]
-
-
-def test_unreadable_input_file_is_error_rows(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code = hpt.main(["--input", str(tmp_path / "missing.json")], now=lambda: NOW)
-    out = capsys.readouterr().out
-    assert code == 0
-    assert sum(line.startswith("ERROR") for line in out.splitlines()) == 3
+    assert sorted(r["number"] for r in rows) == [70, 71]
 
 
 def test_table_sorts_lander_first_then_oldest(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     held = _pr(
-        70, comments=[_hold("2026-10-28T08:00:00Z", _sha(70))], committed="2026-10-28T01:00:00Z"
+        72, comments=[_hold("2026-10-28T08:00:00Z", _sha(72))], committed="2026-10-28T01:00:00Z"
     )
-    fresh = _pr(71, committed="2026-10-28T17:00:00Z")
-    stale = _pr(72, committed="2026-10-26T15:00:00Z")
+    fresh = _pr(73, committed="2026-10-28T17:00:00Z")
+    stale = _pr(74, committed="2026-10-26T15:00:00Z")
     doc = {ENGINE: {"pages": [_page([held, fresh, stale])], "required": ENGINE_REQUIRED}}
     code, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
     assert code == 0
     lines = out.splitlines()
     assert lines[0].split()[:2] == ["TURN", "FLAGS"]
-    assert [line.split()[3] for line in lines[1:]] == ["72", "71", "70"]
+    assert [line.split()[3] for line in lines[1:]] == ["74", "73", "72"]
     assert "2d03h" in lines[1]
 
 
@@ -713,130 +693,3 @@ def test_age_text() -> None:
     assert hpt.age_text(45 * 60) == "45m"
     assert hpt.age_text(3 * 3600 + 12 * 60) == "3h12m"
     assert hpt.age_text(-5) == "0m"
-
-
-def test_marker_quoted_or_in_code_is_not_read() -> None:
-    heads = hpt.hold_heads
-    marker = "<!-- lander-hold head=abcdef1 -->"
-    cleared = "Lander (session y), 2026-10-28. **Cleared; merging.**\n\n"
-    # A marker quoted from an earlier hold, in a blockquote or a code block, is no hold.
-    assert heads(cleared + "> Earlier hold:\n> " + marker) is None
-    assert heads(cleared + "```\n" + marker + "\n```") is None
-    assert heads(cleared + "~~~\n" + marker + "\n~~~") is None
-    assert heads(cleared + "Mark a hold with `" + marker + "`.") is None
-    # A release marker shown as an instruction does not release a real hold.
-    told = "Lander (session x). **Held, at `abcdef1`.** Post `<!-- lander-release -->` when fixed."
-    assert heads(told) == ("abcdef1",)
-    assert heads(_marked("> <!-- lander-release -->", "**Held, at `abcdef1`.**")) == ("abcdef1",)
-    # A stray backtick opens no code span, so it hides no release marker after it.
-    stray = "Lander (session x). **Held.** A stray ` then <!-- lander-release -->"
-    assert heads(stray) is None
-    # A live marker beside a quoted one still counts.
-    assert heads(cleared + "> " + marker + "\n\n<!-- lander-hold head=1234567 -->") == ("1234567",)
-
-
-def test_bare_held_headline_reads_its_sentence_for_the_head_and_negation() -> None:
-    heads = hpt.hold_heads
-    assert heads("Lander (session x). **Held**, at `abcdef1`.") == ("abcdef1",)
-    assert heads("Lander (session x). **Still held**: at `abcdef1`. Fix `1234567` next.") == (
-        "abcdef1",
-    )
-    assert heads("Lander (session x). **Held:** at `abcdef1`.") == ("abcdef1",)
-    # A label-form headline's predicate is read for negation.
-    assert heads("Lander (session x). **Held:** answered, merging.") is None
-    assert heads("Lander (session x). **Held;** no longer, merging once green.") is None
-    # The head named after a bare headline beats the weaker commit date.
-    hold = hpt.Event(NOW, "Lander (session x). **Held**, at `abcdef1`.", bot=False, trusted=True)
-    old = datetime(2026, 10, 28, 9, 0, 0, tzinfo=UTC)
-    assert hpt.classify("1234567" + "0" * 33, old, [hold]) == ("LANDER", ["new-commit"])
-
-
-def test_same_second_holds_naming_different_heads_are_ambiguous() -> None:
-    a = hpt.Event(NOW, "Lander (session x). **Held, at `abcdef1`.**", bot=False, trusted=True)
-    b = hpt.Event(NOW, "Lander (session x). **Held, at `1234567`.**", bot=False, trusted=True)
-    head = "abcdef1" + "0" * 33
-    assert hpt.classify(head, None, [a, b]) == ("LANDER", ["sha-ambiguous"])
-    assert hpt.classify(head, None, [b, a]) == ("LANDER", ["sha-ambiguous"])
-    # A tied hold naming no head brings the date check in, whatever the other names.
-    bare = hpt.Event(NOW, "Lander (session x). **Held.**", bot=False, trusted=True)
-    assert hpt.classify(head, None, [a, bare]) == ("LANDER", ["head-unknown", "date-fallback"])
-    assert hpt.classify(head, NOW, [bare, a]) == ("LANDER", ["new-commit", "date-fallback"])
-
-
-def test_undatable_comment_is_an_error_row_not_dropped(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    undated = _pr(
-        113,
-        comments=[_hold("2026-10-28T12:00:00Z", _sha(113))],
-        reviews=[{"body": "Manager: fixed.", "state": "COMMENTED", "authorAssociation": "OWNER"}],
-    )
-    rows = _engine_rows(tmp_path, capsys, undated, _pr(114))
-    assert rows[113]["turn"] == "ERROR"
-    assert rows[114]["turn"] == "LANDER"
-
-
-def test_non_object_pr_node_is_an_error_row(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    page = _page([_pr(115)])
-    page["data"]["repository"]["pullRequests"]["nodes"].insert(0, None)
-    doc = {ENGINE: {"pages": [page], "required": ENGINE_REQUIRED}}
-    code, rows = _run(tmp_path, doc, capsys, "--repo", ENGINE)
-    assert code == 0
-    assert [r["turn"] for r in rows] == ["ERROR", "LANDER"]
-
-
-def test_listed_commit_not_the_head_names_why_green_is_unknown(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    pr = _pr(116)
-    pr["headRefOid"] = _sha(999)
-    row = _engine_rows(tmp_path, capsys, pr)[116]
-    assert row["requiredGreen"] == "?"
-    assert "not the head" in row["required"]["reason"]
-    # ...but a base other than main keeps its own reason, which a re-run cannot fix.
-    other = _pr(117)
-    other["headRefOid"] = _sha(998)
-    other["baseRefName"] = "release/1.0"
-    row = _engine_rows(tmp_path, capsys, other)[117]
-    assert "release/1.0" in row["required"]["reason"]
-
-
-def test_hold_waiting_on_someone_else_is_not_the_authors_turn() -> None:
-    heads = hpt.hold_heads
-    assert (
-        heads("Lander (session x). **Held for an owner ruling on finding 3, at `abcdef1`.**")
-        is None
-    )
-    assert (
-        heads("Lander (session x). **Held pending CI on `abcdef1`; I merge when green.**") is None
-    )
-    assert heads("Lander (session x). **Held in the merge queue at `abcdef1`.**") is None
-    assert heads("Lander (session x). **Held, back to the author, at `abcdef1`.**") == ("abcdef1",)
-
-
-def test_live_text_follows_markdown_fences_spans_and_quotes() -> None:
-    heads = hpt.hold_heads
-    held = "Lander (session x). **Held, at `abcdef1`.**\n\n"
-    release = "<!-- lander-release -->"
-    # A fence closes only on its own kind and length, so a live release after it is read.
-    assert heads(held + "```\n~~~\n```\n" + release) is None
-    assert heads(held + "````\n```\n````\n" + release) is None
-    # A line opening with an inline triple-backtick span is no fence.
-    assert heads(held + "```x``` is shown\n" + release) is None
-    cleared = "Lander (session y), 2026-10-28. **Cleared; merging.**\n\n"
-    marker = "<!-- lander-hold head=abcdef1 -->"
-    # An indented code block, a double-backtick span and a lazy quote line show a marker.
-    assert heads(cleared + "Holds look like:\n\n    " + marker) is None
-    assert heads(cleared + "Shown as `` `" + marker + "` `` here.") is None
-    assert heads(cleared + "> Earlier hold said\nsee " + marker) is None
-    # A hold marker counts only on a line of its own.
-    assert heads(cleared + "Write " + marker + " to hold.") is None
-    assert heads(cleared + marker) == ("abcdef1",)
-
-
-def test_bare_headline_sentence_survives_an_inner_dot() -> None:
-    heads = hpt.hold_heads
-    assert heads("Lander (session x). **Held**, PR 2564 vs. main: answered.") is None
-    assert heads("Lander (session x). **Held** at v1.2, `abcdef1`.") == ("abcdef1",)
