@@ -56,7 +56,12 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, NamedTuple
 
-from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE, has_encryption_header_bytes
+from messagefoundry.auth.trust_anchors import (
+    ENCRYPTION_HEADER_SCOPE,
+    PRIVATE_KEY_SCOPE,
+    has_encryption_header_bytes,
+    has_private_key_label_bytes,
+)
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import (
     DEFAULT_DB_CONNECT_TIMEOUT,
@@ -561,7 +566,9 @@ def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | N
     not. So the file goes through
     :func:`~messagefoundry.auth.trust_anchors.has_encryption_header_bytes` first. The refusal names
     the setting and never the file's content. A file past :data:`_MAX_DRIVER_CA_FILE_BYTES` is
-    refused rather than read in part, since a header past the cut would pass unseen.
+    refused rather than read in part, since a header past the cut would pass unseen. A file with a
+    private-key label is refused too, through
+    :func:`~messagefoundry.auth.trust_anchors.has_private_key_label_bytes` (BACKLOG #3745).
 
     Like :func:`~messagefoundry.keywrap.refuse_weak_key_file`, a path that does not exist is left to
     the driver, which reports it. So is anything that is not a regular file: a directory, which
@@ -611,7 +618,8 @@ def _refuse_one_encrypted_ca_file(path: str, setting: str) -> None:
             logger.debug("%s: no CA file at this spelling, so no encryption-header check", setting)
             return
         raise ValueError(
-            f"{setting}: the CA file could not be read to check it for an encryption header: "
+            f"{setting}: the CA file could not be read to check it for an encryption header or "
+            "a private key: "
             f"{exc.strerror or type(exc).__name__}"
         ) from exc
     if len(data) > _MAX_DRIVER_CA_FILE_BYTES:
@@ -624,6 +632,11 @@ def _refuse_one_encrypted_ca_file(path: str, setting: str) -> None:
             f"{setting}: the CA file {ENCRYPTION_HEADER_SCOPE}. The driver loads it with its own "
             "TLS library, which can wait for a password on an encrypted block; refusing to hand "
             "it over (BACKLOG #3090)"
+        )
+    if has_private_key_label_bytes(data):
+        raise ValueError(
+            f"{setting}: the CA file {PRIVATE_KEY_SCOPE}. A CA file is public trust material, so "
+            "a private key does not belong in it; refusing to hand it over (BACKLOG #3745)"
         )
 
 
@@ -752,8 +765,8 @@ def _warn_generic_tls_unenforced(
     BACKLOG #1178 it was the whole of what stood between a generic PHI connection with no TLS keyword
     and a plaintext crossing. The refusal now lives in :func:`generic_cleartext_hop_guard`, which puts
     the same classifier's verdict through the shared hop authority. This still fires beside that gate,
-    and it is the ONLY report on the arm the gate no-ops: an unstamped posture (a direct embedding, or
-    a live-serve rebuild after the enforced pre-flight already vetted the config).
+    and it is the ONLY report on the arm the gate no-ops: an unstamped posture, such as a direct
+    embedding or test build. The runner stamps its live serve builds, so they reach the gate.
 
     ``connection`` names the declaring connection (#333). Without it a site running several generic DB
     connections gets a line it cannot act on — the remedy is per-connection, so the report must be too.

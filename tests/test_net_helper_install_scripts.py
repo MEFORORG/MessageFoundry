@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Static guards on the two mefor-net-helper service scripts (BACKLOG #1523, ADR 0056).
+"""Static guards on the two mefor-net-helper service scripts (BACKLOG #1523, ADR 0056), and on the
+service-name parameter they share with install-service.ps1 (BACKLOG #1680).
 
 NOTHING IN CI RUNS THESE SCRIPTS. They need an elevated Windows session, a published helper binary
 and an nssm.exe, so the first thing that reads them end to end is an operator on a cluster node. That
@@ -35,6 +36,7 @@ from pathlib import Path
 import pytest
 
 import messagefoundry.service as svc
+import messagefoundry.service_status as svc_status
 
 _INSTALL_SERVICE = svc.install_script_path()
 _DIR = _INSTALL_SERVICE.parent if _INSTALL_SERVICE is not None else None
@@ -74,7 +76,7 @@ $report = @{{}}
 
 # ParseFile parses; it never runs the file.
 $parse = @{{}}
-foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1')) {{
+foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1', 'install-service.ps1')) {{
   $path = Join-Path {_psq(str(_DIR))} $name
   $errs = $null
   $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errs)
@@ -86,7 +88,7 @@ $report['parse'] = $parse
 # ACTUALLY binds. The two are asked separately on purpose -- matching text is not a matching
 # decision, and `param(...)` is the only thing that can answer the second question.
 $names = @{{}}
-foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1')) {{
+foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1', 'install-service.ps1')) {{
   $path = Join-Path {_psq(str(_DIR))} $name
   $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
   foreach ($p in $ast.ParamBlock.Parameters) {{
@@ -98,7 +100,9 @@ foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1')) {{
     # Bind the REAL declaration, lifted verbatim out of the script's own param block.
     foreach ($probe in @(
         @{{ key = 'spaced'; value = 'MessageFoundry Prod' }},
-        @{{ key = 'quoted'; value = "MessageFoundry'" }})) {{
+        @{{ key = 'quoted'; value = "MessageFoundry'" }},
+        @{{ key = 'trailing_lf'; value = "MessageFoundry`n" }},
+        @{{ key = 'kelvin'; value = "MessageFoundr$([char]0x212A)" }})) {{
       $sb = [scriptblock]::Create("param($($p.Extent.Text))`n`$$pname")
       $splat = @{{ $pname = $probe.value }}
       try {{ $null = & $sb @splat; $row[$probe.key] = $true }}
@@ -244,20 +248,22 @@ def test_the_uninstaller_releases_the_address_only_when_asked(
     )
 
 
-def test_both_scripts_take_the_same_service_names(ast_report: dict[str, object]) -> None:
-    """Whatever the installer will accept as a service name, the uninstaller must accept too.
+def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]) -> None:
+    """Whatever one script accepts as a service name, the others must accept too.
 
-    ONE DEFINITION, ``messagefoundry/service.py``'s ``_SAFE_SERVICE_NAME``, and two literal copies of
-    it in ``param()`` blocks. The copies cannot be dot-sourced away: a PowerShell attribute argument
-    must be a compile-time constant, and ``[ValidatePattern($pattern)]`` is refused at parse with
+    ONE DEFINITION, ``messagefoundry/service_status.py``'s ``_SAFE_SERVICE_NAME``, and literal copies
+    of it in ``param()`` blocks, ``install-service.ps1``'s ``-ServiceName`` among them (BACKLOG #1680),
+    so the engine installer cannot register a name the helper scripts, the tray or the CLI refuse.
+    The copies cannot be dot-sourced away: a PowerShell attribute argument must be a compile-time
+    constant, and ``[ValidatePattern($pattern)]`` is refused at parse with
     *"Attribute argument must be a constant or a script block"*. So the copies are pinned here
-    instead, which is what makes them one definition rather than three.
+    instead, which is what makes them one definition rather than four.
 
-    The pattern is there because both names are interpolated into a WQL filter, where a single quote
-    ends the literal. A space cannot, and ``install-service.ps1`` puts no validation on its own
-    ``-ServiceName`` -- so an engine installed as ``MessageFoundry Prod`` is a name the node really
-    can carry. A tighter pattern on one side makes that helper installable and not removable, and it
-    fails at parameter binding, before the script can explain itself.
+    The pattern is there because the helper names are interpolated into a WQL filter, where a single
+    quote ends the literal. A space cannot, and a space is legal in a Windows service name -- so an
+    engine installed as ``MessageFoundry Prod`` is a name the node really can carry. A tighter
+    pattern on one side makes that helper installable and not removable, and it fails at parameter
+    binding, before the script can explain itself.
 
     BOTH HALVES ARE ASKED. Equal text is not an equal decision, so the harness also BINDS each
     declaration verbatim; and "it accepts a space" would be equally true of a parameter with no
@@ -265,11 +271,12 @@ def test_both_scripts_take_the_same_service_names(ast_report: dict[str, object])
     """
     rows = ast_report["service_names"]
     assert isinstance(rows, dict)
-    expected = svc._SAFE_SERVICE_NAME.pattern
+    expected = svc_status._SAFE_SERVICE_NAME.pattern
     assert set(rows) == {
         "install-net-helper.ps1::ServiceName",
         "install-net-helper.ps1::EngineServiceName",
         "uninstall-net-helper.ps1::ServiceName",
+        "install-service.ps1::ServiceName",
     }, (
         "CONTROL FAILED: the harness found a different set of service-name parameters than this "
         f"guard was aimed at ({sorted(rows)}) -- re-aim it, do not relax it"
@@ -277,24 +284,34 @@ def test_both_scripts_take_the_same_service_names(ast_report: dict[str, object])
     for key, row in sorted(rows.items()):
         assert isinstance(row, dict)
         assert row["pattern"] == expected, (
-            f"{key} validates against {row['pattern']!r}, not messagefoundry/service.py's "
-            f"_SAFE_SERVICE_NAME ({expected!r}). Both scripts must take the same names: a helper "
+            f"{key} validates against {row['pattern']!r}, not messagefoundry/service_status.py's "
+            f"_SAFE_SERVICE_NAME ({expected!r}). Every script must take the same names: a helper "
             "installed under a name one of them rejects cannot be removed by the other."
         )
         assert row["spaced"] is True, (
-            f"{key} refuses 'MessageFoundry Prod' at parameter binding. install-service.ps1 puts no "
-            "validation on its own -ServiceName and a space is legal in a Windows service name."
+            f"{key} refuses 'MessageFoundry Prod' at parameter binding, and a space is legal in a "
+            "Windows service name."
         )
         assert row["quoted"] is False, (
             f"CONTROL FAILED: {key} accepts a single quote. The name is interpolated into a WQL "
             "filter, where a quote ends the literal -- and an unvalidated parameter would pass the "
             "space assertion above for the wrong reason."
         )
+        assert row["trailing_lf"] is False, (
+            f"{key} accepts a name ending in a line feed. `$` matches before a final line feed in "
+            ".NET as in Python, so the pattern must end in `\\z` (BACKLOG #1680)."
+        )
+        assert row["kelvin"] is False, (
+            f"{key} accepts a name ending in the Kelvin sign. ValidatePattern ignores case unless "
+            "Options = 'None', and a case-insensitive [A-Za-z] matches U+212A (BACKLOG #1680)."
+        )
 
 
-@pytest.mark.parametrize("name", ["install-net-helper.ps1", "uninstall-net-helper.ps1"])
+@pytest.mark.parametrize(
+    "name", ["install-net-helper.ps1", "uninstall-net-helper.ps1", "install-service.ps1"]
+)
 def test_the_script_parses(ast_report: dict[str, object], name: str) -> None:
-    # No CI leg runs either script, so a syntax error would first show up on an operator's node
+    # No CI leg runs these scripts, so a syntax error would first show up on an operator's node
     # mid-install. Parsing is not running: ParseFile never executes the file.
     parse = ast_report["parse"]
     assert isinstance(parse, dict)

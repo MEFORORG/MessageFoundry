@@ -289,7 +289,9 @@ _DANGEROUS_ANCHORS: tuple[str, ...] = (
     "/uploads",
     "takeover_hook",
     "ShellExecute",
-    "_is_safe_service_name",
+    # The one service-name guard, service_status.is_safe_service_name since BACKLOG #1680. A
+    # substring of the older `_is_safe_service_name` spelling, so the row matches either way.
+    "is_safe_service_name",
     "shell=False",
     "transports/file.py",
     "edit-resend",

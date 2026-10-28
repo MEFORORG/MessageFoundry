@@ -442,7 +442,7 @@ SITES: dict[str, Site] = {
     ),
     # --- messagefoundry/ ---
     "messagefoundry/__main__.py::_cert_import": Site(3, OPERATOR, _CERT_OUT),
-    "messagefoundry/__main__.py::_cert_self_signed": Site(2, OPERATOR, _CERT_OUT),
+    "messagefoundry/__main__.py::_cert_self_signed": Site(3, OPERATOR, _CERT_OUT),
     "messagefoundry/__main__.py::_check_env_file_present": Site(
         1,
         REVIEWED,
@@ -922,11 +922,15 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        27,
+        38,
         OPERATOR,
         "Fixed names under paths the operator passes or the script derives (repo root, install "
-        "root and its site-packages and dist-info folders, project root, data directory, NSSM "
-        "directory, temp), plus registry keys named after the service's own images.",
+        "root and its site-packages, dist-info, wheelhouse and buildtemp folders, the engine "
+        "wheel's folder, "
+        "the base interpreter's folder and the one above it, "
+        "project root, data directory, NSSM directory, temp), the leaf name of the engine wheel "
+        "the operator passes, which must match messagefoundry-<version>-*.whl, plus registry keys "
+        "named after the service's own images.",
     ),
     "scripts/service/measure-store-access.ps1": Site(
         21,

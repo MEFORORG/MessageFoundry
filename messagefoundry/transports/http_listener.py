@@ -716,7 +716,9 @@ class HttpSource(SourceConnector):
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # Per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file), built once at
         # construction so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
-        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True, name=config.name or "")
+        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(
+            s, server=True, name=config.name or "", listener_family="HTTP listener"
+        )
         # The loop runs this listener's handshakes on every loop, so a failed one never reaches
         # `_on_client`. The context reports it, as a throttled `tls_handshake_failed` event like the
         # MLLP listener's (vault BACKLOG #3302). The peer is not known there.

@@ -196,7 +196,7 @@ backend-limited.
 | `require_least_privilege` | bool | `false` | least-**privilege** precondition on the store principal (#1008, ASVS 13.2.2) — the privilege sibling of `require_managed_identity` above, which constrains the credential's *kind* and never what it may do (a `sysadmin` gMSA satisfies that one clean; never grant one — [`DEPLOY-SERVER-DB.md` §1.1](DEPLOY-SERVER-DB.md)). **The probe itself is NOT gated by this setting:** it runs at every start regardless, logs what it observed, writes a `store_privilege_preflight` audit row, and reports any excess grant in `security_loosenings()` / `GET /security/posture`. **With it left `false`, an OBSERVED over-grant already refuses** under `[security].enforcement = enforce` ([ADR 0199](adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-09-27), unless `[security].allow_over_granted_store_principal = true` accepts it (audited); an **unobservable** probe only warns. Setting this flag `true` is the stricter declaration: `serve` also refuses when **the probe could not run at all**, since a declared refusal that passed an unobservable principal would be the fail-open shape it exists to prevent, and it outranks the opt-out, so with both set an over-grant still refuses. Refuse/warn splits on `[security].enforcement` exactly like `require_managed_identity`: under `warn` every arm here only warns. SQLite is exempt (a local file has no server principal). |
 | `schema_management` | enum | `external` on `sqlserver`/`postgres`; always `auto` on `sqlite` | who runs the store's schema DDL (BACKLOG #305, ASVS 13.2.2). **`external`** (the server-DB default): `serve` runs **no** DDL. It reads the `schema_meta` marker and **refuses to start** when it does not match this build, naming the fix: a DBA runs `messagefoundry store provision-schema` as a DDL-capable principal before the first start and before the first start of any upgrade whose schema moved. The runtime login then needs row access only, and the startup privilege probe counts `db_ddladmin` (SQL Server) or `CREATE` on the store schema (Postgres) as excess. **`auto`**: the engine builds and upgrades its own schema at open, so its runtime login needs standing DDL rights; on a server DB this is reported by `security_loosenings()` as `schema_management`. An explicit `external` on `sqlite` is refused at load. [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §2 |
 | `encrypt`, `trust_server_certificate` | bool | `true`/`false` | TLS to the DB |
-| `ssl_root_cert` | path | — | server DBs — verify the DB server by a **file** you supply, **without** a machine-wide trust import, on the **secure** posture only (`encrypt = true`, `trust_server_certificate = false`). It is never applied on a weakened posture. **Postgres:** a CA bundle for a private/self-signed DB CA, loaded into an asyncpg `SSLContext` (chain + hostname still checked). **SQL Server:** the server's **own certificate**, not its CA, sent as the ODBC Driver **18.1+** `ServerCertificate` keyword with `Encrypt=strict`. The match is exact. Strict, because on the Driver 18.7 build tested the pin was enforced with `Encrypt=strict` and not with `Encrypt=yes`. Strict encryption is TDS 8.0, so the pin needs **SQL Server 2022 or later** (the supported floor); an older server refuses the connection rather than taking an unenforced pin. Under strict the driver's own chain, host-name and expiry checks do not apply to a pin match (Microsoft documents the exact match as done instead of them), so the engine checks the pinned certificate's validity period itself at each store open, refusing a pin that is expired or not yet valid, and watches its expiry with `[cert_monitor]` as `store.ssl_root_cert`. A store opened before the pin expires keeps connecting until restart, so act on that alert. A file holding several certificates, or a CA certificate that signs others (keyCertSign), is refused at load. So is a file whose text names a PEM encryption header (`Proc-Type` or `DEK-Info`) after its first `-----BEGIN`, because the driver loads it with its own TLS library (BACKLOG #3090). The pin is then the connection's only trust anchor, so it takes the trust-anchor ACL and path checks: a pin file or folder a broad principal can write refuses at `[security].enforcement = enforce` and warns at `warn`. Replace the pin when the server certificate is renewed. Do not count it as a revocation control. Rejected for SQLite (no TLS); a missing file fails loud at load. A path, not a secret — may live in the file. See [`DEPLOY-SERVER-DB.md` §5](DEPLOY-SERVER-DB.md). |
+| `ssl_root_cert` | path | — | server DBs — verify the DB server by a **file** you supply, **without** a machine-wide trust import, on the **secure** posture only (`encrypt = true`, `trust_server_certificate = false`). It is never applied on a weakened posture. **Postgres:** a CA bundle for a private/self-signed DB CA, loaded into an asyncpg `SSLContext` (chain + hostname still checked). **SQL Server:** the server's **own certificate**, not its CA, sent as the ODBC Driver **18.1+** `ServerCertificate` keyword with `Encrypt=strict`. The match is exact. Strict, because on the Driver 18.7 build tested on Windows the pin was enforced with `Encrypt=strict` and not with `Encrypt=yes` (vault BACKLOG #2223, measured under #3009). The Linux driver has not been measured. Strict encryption is TDS 8.0, so the pin needs **SQL Server 2022 or later** ([the supported floor](SYSTEM-REQUIREMENTS.md#databases-message-store)); an older server refuses the connection rather than taking an unenforced pin. Under strict the driver's own chain, host-name and expiry checks do not apply to a pin match (Microsoft documents the exact match as done instead of them), so the engine checks the pinned certificate's validity period itself at each store open, refusing a pin that is expired or not yet valid, and watches its expiry with `[cert_monitor]` as `store.ssl_root_cert`. A store opened before the pin expires keeps connecting until restart, so act on that alert. A file holding several certificates, or a CA certificate that signs others (keyCertSign), is refused at load. So is a file whose text names a PEM encryption header (`Proc-Type` or `DEK-Info`) after its first `-----BEGIN`, because the driver loads it with its own TLS library (BACKLOG #3090). The pin is then the connection's only trust anchor, so it takes the trust-anchor ACL and path checks: a pin file or folder a broad principal can write refuses at `[security].enforcement = enforce` and warns at `warn`. Replace the pin when the server certificate is renewed. **Never pin the self-signed certificate SQL Server makes for itself.** SQL Server on Windows generates this fallback certificate during startup when it has no trusted or valid certificate ([Microsoft](https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/configure-sql-server-encryption#certificate-precedence)). It then logs `A self-generated certificate was successfully loaded for encryption.` ([Microsoft](https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/configure-sql-server-encryption#sql-server-generated-self-signed-certificates)). If a restart generates a new one, a pin of the old one stops matching, and the store refuses every connection. Microsoft also lists an installed certificate as a prerequisite of strict encryption ([Microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/security/networking/connect-with-strict-encryption#prerequisite)). So a strict connection to a server with only the fallback certificate may fail at once, before any restart. Neither outcome has been measured. Check the server's error log for that line, install a certificate the server uses, and pin that one. Do not count the pin as a revocation control. Rejected for SQLite (no TLS); a missing file fails loud at load. A path, not a secret — may live in the file. See [`DEPLOY-SERVER-DB.md` §5](DEPLOY-SERVER-DB.md). |
 | `ssl_crl_file` | path | — | **Postgres only** — a PEM file of CRLs checked against the **DB server's** certificate (BACKLOG #299). The store builds its own context and resolves no trust anchor, so `[tls].crl_file` never reaches it; this is its own knob rather than a silent inheritance. It loads on **both verifying branches**: with `ssl_root_cert` (the pinned CA) and without it (the system trust store). The engine builds the `SSLContext` asyncpg uses on both, so both narrow to the approved suites and both can carry a CRL (BACKLOG #300; before that, the default path handed asyncpg `ssl=True` and this setting required `ssl_root_cert`). It is also what crosses the #201 revocation refusal on a production-PHI remote store hop: a blanket `MEFOR_TLS_REVOCATION_ATTESTED` no longer suffices there ([`DEPLOYMENT.md` §Revocation-guard behavior](DEPLOYMENT.md#revocation-guard-behavior)). Setting it on SQL Server or SQLite, or on a hop that verifies nothing (`encrypt = false` or `trust_server_certificate = true`), is **refused at load** rather than silently ignored — it could not be checked on any of them. A missing path is refused at load; one that is unloadable or past `nextUpdate` is refused at store open, not at the first DB handshake. So is one carrying a certificate the store did not already hold (BACKLOG #1890), so give it a bare CRL. The engine re-reads the file for every new pool connection, so a refreshed CRL applies to each new connection. Connections already open keep the CRL they were made with until the pool replaces them, so restart the engine to apply a revocation at once. If the file goes missing or expires while the engine runs, the next new connection fails with an error naming this setting. Refresh it by writing a new file and renaming it into place: a connection opened while the file is half-written fails. |
 | `multi_subnet_failover` | bool | `false` | **SQL Server only** — emit the ODBC `MultiSubnetFailover=Yes` keyword so a client connecting to an Always On Availability Group **listener** reaches the current primary promptly across subnets, instead of serially waiting out each replica subnet's DNS/TCP timeout on failover. A no-op for Postgres/SQLite (they never see the ODBC string). Off by default — only a multi-subnet AOAG needs it. |
 | `pool_size` | int | 40 | server DBs — **server-DB only** (no-op on SQLite). The inverted-U optimum (raised from 5; do **not** set higher — over-provisioning is catastrophic, [ADR 0062](adr/0062-default-store-pool-size.md)). **Per engine:** `engines × pool_size` share one `max_connections` — see [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §3 |
@@ -270,7 +270,7 @@ The one row that *does* vary:
 | `tls_key_password` | secret | _unset_ | passphrase for an encrypted key — **env only** (`MEFOR_API_TLS_KEY_PASSWORD`), never the file. |
 | `tls_min_version` | str | `1.2` | minimum negotiated TLS version floor (NIST SP 800-52r2): `1.2` or `1.3`. |
 | `tls_ciphers` | str | _unset_ | optional OpenSSL cipher string (unset = the approved AEAD suites, the default on every hop the engine builds, BACKLOG #300). **Validated against a strict positive allow-list at config load** ([BACKLOG #1317](BACKLOG.md), ASVS 12.1.2): every suite the string resolves to must be forward-secret, must actually encrypt, must authenticate the peer, **and** must be named in `_APPROVED_TLS_SUITES`. The list is AEAD-only, so it excludes the six CBC-SHA2 suites the interpreter default enables, and since BACKLOG #300 so does the unset default. Since BACKLOG #2042 (owner ruling of 2026-09-26) it also excludes the three AES-128-GCM TLS 1.2 suites, so `ECDHE+AESGCM` refuses and `ECDHE+AESGCM+AES256:ECDHE+CHACHA20` passes. TLS 1.3's `TLS_AES_128_GCM_SHA256` stays on Python 3.14, a recorded gap, and goes on a Python that has `SSLContext.set_ciphersuites` (expected in 3.15). The three property checks exist because forward secrecy alone admitted `ECDHE-RSA-NULL-SHA` (plaintext) and `ADH-AES256-GCM-SHA384` (authenticates nobody). Needing a suite that is not listed is a change to that set, not a configuration override. |
-| `tls_client_ca_file` | str | _unset_ | CA bundle to **require + verify client certs** (opt-in mTLS, e.g. the console). Requires `tls_cert_file`. **The engine reads the file once, checks those bytes, and loads the same bytes** (BACKLOG #1142), so a file swapped after the check is not trusted. It loads plain `CERTIFICATE` PEM blocks. A file the TLS library will not load refuses at start and at reload. That includes at least a `TRUSTED CERTIFICATE` block, a file with no PEM block, a file holding only a CRL, and a damaged block anywhere in the file. The engine also refuses a file whose text names a `Proc-Type:` or `DEK-Info:` encryption header anywhere after its first `-----BEGIN `, whether or not it sits inside a block, before the TLS library reads it (BACKLOG #2270). A comment line that is not ASCII is dropped before the check. A private key encrypted in that legacy header format is one such block; a PKCS#8 `ENCRYPTED PRIVATE KEY` block has no such header and is not refused by this rule. A well-formed CRL beside a certificate is ignored: put it in `tls_client_crl_file`. The same rules hold for `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and an inbound connection's `tls_ca_file`. An outbound connection's `tls_ca_file` takes the pin, permission and change checks too, but not these PEM rules, since its hop still loads the file by path ([CONNECTIONS.md](CONNECTIONS.md#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin), vault BACKLOG #2371). **For this file, `[auth].oidc_tls_ca_cert_file` and `[auth].ad_tls_ca_cert_file`, a changed file takes effect at the next restart, not at a reload** (BACKLOG #2185). A reload re-checks each of the three and refuses one that breaks the rules above. It does not load the new bytes. While a file differs from the bytes in use, each reload that passes this check logs a WARNING. It also writes an `auth.trust_anchor` audit row with `event` set to `restart_required`. A reload that applies and answers in time also names the setting in its response's `restart_required` list. A dry run leaves that `null`, because it skips this check. A reload refused after this check, or one that outlives its request deadline, answers no list, though its WARNING is already logged (BACKLOG #3015). The list covers only the engine process that answered: another engine shard, or a cluster node that converges on the reload, says so only in its own log, since the audit row names no node. A file nothing loaded gets no warning, since a restart would apply nothing. AD over plain `ldap://` is one such case. **A path that is set is still checked when nothing loads it** (BACKLOG #2269). So `[auth].ad_tls_ca_cert_file` with AD off or on plain `ldap://`, or `[auth].oidc_tls_ca_cert_file` with OIDC off, still refuses the start, and every reload that is not a dry run, if the file breaks the rules above or cannot be read. Unset a path nothing uses. The pins are read at start too. So after you rotate a pinned file and change its pin, each reload that is not a dry run is refused until you restart. |
+| `tls_client_ca_file` | str | _unset_ | CA bundle to **require + verify client certs** (opt-in mTLS, e.g. the console). Requires `tls_cert_file`. **The engine reads the file once, checks those bytes, and loads the same bytes** (BACKLOG #1142), so a file swapped after the check is not trusted. It loads plain `CERTIFICATE` PEM blocks. A file the TLS library will not load refuses at start and at reload. That includes at least a `TRUSTED CERTIFICATE` block, a file with no PEM block, a file holding only a CRL, and a damaged block anywhere in the file. The engine also refuses a file whose text names a `Proc-Type:` or `DEK-Info:` encryption header anywhere after its first `-----BEGIN `, whether or not it sits inside a block, before the TLS library reads it (BACKLOG #2270). A comment line that is not ASCII is dropped before the check. A private key encrypted in that legacy header format is one such block. **The engine also refuses a file whose text names a PEM label ending in `PRIVATE KEY` anywhere after its first `-----BEGIN `**, such as `PRIVATE KEY`, a PKCS#8 `ENCRYPTED PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`, whether or not it sits inside a block (BACKLOG #3745). A trust anchor is public trust material, so keep the key in its own file. The refusal names the setting, never the content. This check reads the raw file, so a non-ASCII line is checked too. A well-formed CRL beside a certificate is ignored: put it in `tls_client_crl_file`. The same rules hold for `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and an inbound connection's `tls_ca_file`. An outbound connection's `tls_ca_file` takes the pin, permission and change checks too, and of these PEM rules only the private-key refusal, since its hop still loads the file by path ([CONNECTIONS.md](CONNECTIONS.md#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin), vault BACKLOG #2371). **For this file, `[auth].oidc_tls_ca_cert_file` and `[auth].ad_tls_ca_cert_file`, a changed file takes effect at the next restart, not at a reload** (BACKLOG #2185). A reload re-checks each of the three and refuses one that breaks the rules above. It does not load the new bytes. While a file differs from the bytes in use, each reload that passes this check logs a WARNING. It also writes an `auth.trust_anchor` audit row with `event` set to `restart_required`. A reload that applies and answers in time also names the setting in its response's `restart_required` list. A dry run leaves that `null`, because it skips this check. A reload refused after this check, or one that outlives its request deadline, answers no list, though its WARNING is already logged (BACKLOG #3015). The list covers only the engine process that answered: another engine shard, or a cluster node that converges on the reload, says so only in its own log, since the audit row names no node. A file nothing loaded gets no warning, since a restart would apply nothing. AD over plain `ldap://` is one such case. **A path that is set is still checked when nothing loads it** (BACKLOG #2269). So `[auth].ad_tls_ca_cert_file` with AD off or on plain `ldap://`, or `[auth].oidc_tls_ca_cert_file` with OIDC off, still refuses the start, and every reload that is not a dry run, if the file breaks the rules above or cannot be read. Unset a path nothing uses. The pins are read at start too. So after you rotate a pinned file and change its pin, each reload that is not a dry run is refused until you restart. |
 | `tls_client_crl_file` | str | _unset_ | **Opt-in revocation checking for mTLS client certificates** (BACKLOG #1005). A PEM file holding the CRL for the client CA. Read only when the engine terminates TLS itself and `tls_client_ca_file` is set. Otherwise nothing applies this key, including under `tls_terminated_upstream` with no `tls_cert_file`. A missing or blank path is still refused at load in every configuration, naming this setting (BACKLOG #1997). **Unset, a revoked but chain-valid client certificate is accepted**, because `tls_client_ca_file` checks the chain and RFC 5280 conformance only. Set, a revoked client certificate fails the TLS handshake. It checks the client's own certificate, not the rest of its chain, and there is no OCSP. **The engine reads the file at start, and again when you replace it.** It refuses to start on a bad file: at least a missing file, a file with no CRL, and an expired CRL. **An expired CRL would refuse every client, not only revoked ones.** So replace the file before its `nextUpdate`. When the new file passes the start rules and supersedes the old one, new handshakes check it within about a minute, without a restart. The [`[cert_monitor]`](#cert_monitor) section says what that takes, and what it does not reach (BACKLOG #299). The scan warns before that date. The engine refuses to start if the file carries a certificate the client trust store does not already hold (BACKLOG #1890). Loading one would make it a trusted client CA, outside the pin. Give this setting a bare CRL, and put the client CA in `tls_client_ca_file`. The CRL file itself has no pin or permission check: whoever can write it can change what is revoked, not what is trusted. Source of record: `harden_crl_check` in [`config/tls_policy.py`](../messagefoundry/config/tls_policy.py). |
 | `tls_client_ca_pin` | str | _unset_ | optional pin (*Trust-anchor pin syntax* under [`[api]`](#api)) over the corresponding CA anchor PEM (`tls_client_ca_file`); a mismatch refuses at load + reload (ASVS 6.7.1); unset = no pin (dormant); set but empty or whitespace refuses at load. |
 | `tls_client_cert_identities` | map issuer DN → (map str→str) | `{}` | **(#200, ADR 0002; activated by [ADR 0083](adr/0083-mtls-client-certificate-identity.md)):** mTLS client-cert → MessageFoundry principal map. Meaningful only with in-process mTLS (`tls_client_ca_file` set, so uvicorn `CERT_REQUIRED`-verifies the peer): a **verified** peer cert's issuer and subject CN / SAN are resolved to an existing account through this **allow-list** — a service-to-service identity that carries no bearer token. **The map is nested by issuer (BACKLOG #2237).** The outer key is the subject DN of the CA certificate, loaded from `tls_client_ca_file`, that signed the client's certificate. The inner keys are the qualified cert name `CN:<commonName>` or `SAN:<type>:<value>` (e.g. `SAN:DNS:svc.internal`). **Each value is the target account's id, not its username (BACKLOG #2238)**: the 32 lowercase hex characters in the `id` field of `GET /users`. A rename can hand a username to another account, and a map keyed by name would then follow it; the id never moves. A value that is not an id is refused at load. Write the issuer as a TOML literal (single-quoted) key, so any backslash in it stays as written: `[api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US']` followed by `"CN:svc.internal" = "<the account's id>"`. A subject maps only under the CA named for it, so when `tls_client_ca_file` holds several CAs, the same subject from another of them reaches nothing. **The engine finds the issuer by signature, not by the client certificate's issuer field**: a loaded CA counts only when its subject equals that field exactly and its key verifies the certificate's signature. **An intermediate the client sends never counts**, since any trusted CA could mint one carrying another CA's name. If an intermediate signs your client certificates, load it in `tls_client_ca_file` with its root, and name the intermediate. A client certificate loaded in `tls_client_ca_file` itself is named by its own subject. **Two loaded CA certificates with the same subject DN and different keys name no issuer at all**, because the map cannot tell them apart; a CA re-issued under the same key counts as one issuer. Mid-rollover to a new key, the old and new CA name no issuer until the old one is removed. `serve` logs a WARNING at start for any issuer key that names no loaded CA, or names two. **Write the issuer DN in RFC 4514 form**, most specific attribute first, exactly as `cryptography` prints the CA certificate's subject: `python -c "import sys; from cryptography import x509; print(x509.load_pem_x509_certificate(open(sys.argv[1], 'rb').read()).subject.rfc4514_string())" ca.pem`. `openssl x509 -noout -subject -nameopt RFC2253` prints the same string after its `subject=` prefix when the name is plain ASCII and uses only CN, OU, O, DC, L, ST and C. **Refused at load:** a flat entry with no issuer, an issuer key that `cryptography` cannot parse unless it has the exact shape `cryptography` renders (its parser refuses some names its renderer prints, such as a three-letter `C=`), a name `cryptography` reads but writes differently (the error names the form to write), an issuer with no names, a name no certificate can carry (`CN:` or `SAN:<type>:<value>` with every part filled in), and a value that is not an account id. The loader cannot check attribute ORDER: a DN written in certificate order parses and never matches, and the start warning names it. **Deny-by-default:** an unmapped verified cert, a spoofed CN, or a listed subject from an unlisted, unloaded or ambiguous CA, or an unknown or disabled account, resolves to no identity and is denied. A structured map, so **TOML-only** (no env-string form). Empty (the default) disables cert-identity. **LIVE, not inert (ADR 0083).** Stock uvicorn does not surface the peer cert to the ASGI scope — so `serve` swaps in a scope-populating uvicorn HTTP-protocol subclass ([`api/tls_client_cert.py`](../messagefoundry/api/tls_client_cert.py)) **whenever `tls_client_ca_file` and this map are both set** ([`__main__.py`](../messagefoundry/__main__.py), the `ssl_context_factory` block), and that shim is why a `CERT_REQUIRED`-verified peer cert reaches the resolver. Both conditions are required: a mutual-auth-only bind (client CA, empty map) keeps the stock protocol. **What a cert identity can reach — narrower than "the request".** It is admitted **only** on routes declared with `require_service_cert` — today exactly one, `GET /service/identity` (`monitoring:read`). That plane is cert-**only** and never crosses the bearer/session plane (a cert-only caller gets 401 on every bearer route, a bearer-only caller gets 401 here); it carries **no session, no second factor and no step-up**; and it is **PHI-fenced** — `require_service_cert` raises at app construction if asked to gate a PHI-view permission. So mapping a cert to a privileged principal does **not** confer general API access, and can never reach the interactive or patient-data surface. |
@@ -1614,20 +1614,21 @@ environment. The operator API client and the tray ignore the environment proxy.
 ##### The Vault and OpenBao clients also name a proxy where they use it
 
 The start WARNING reads the environment once, and only under `serve` and `supervise` (vault
-BACKLOG #4028). So when the client's adapter picks the connection for a send, after its own
-refusals at that point, it names the proxy `requests` picked, in one WARNING. A refusal later in
-the same send, before or at connect time, can still follow it, so the WARNING says the proxy was
-picked, not that the request reached Vault. It names the proxy as the start WARNING does, and
-names it "an unreadable value" where the parser that dials the proxy reads a different scheme,
-host or port from it. The engine gives these clients no proxy setting, so any proxy they pick
-came from the environment or the system settings.
+BACKLOG #4028). So the client's adapter names the proxy `requests` picked for a send, in one
+WARNING. It does so when it picks the connection, once its own refusals at that point pass. A
+refusal later in the same send can still follow, before or at connect time. So the WARNING says
+the proxy was picked, not that the request reached Vault. It names the proxy as the start
+WARNING does. The parser that dials the proxy may read a different scheme, host or port from it.
+Then the WARNING names it "an unreadable value". The engine gives these clients no proxy
+setting, so any proxy they pick came from the environment or the system settings. *Some hosts
+go direct*, above, says which Vault hosts go direct, and when a loopback one is proxied.
 
 It logs once per hop and distinct proxy value in a process. A value the hop has not named before is
 named on the first send that picks it, which is how a proxy set after start is disclosed. A hop that
 goes back to a proxy it already named does not name it again, so the last line for a hop need not
 name the proxy in use now. It is a WARNING, so a log level above WARNING hides it, as it hides the
-start WARNING. A send that goes direct, because no proxy is set or a bypass list names the Vault
-host, logs nothing.
+start WARNING. A send that goes direct logs nothing. It goes direct at least when no proxy is
+set for its scheme, or a bypass list names the Vault host.
 
 It is logged by every command whose Vault client sends, at least `serve`, `supervise`,
 `check-privileges`, `verify`, and the commands that open a store keyed from Vault. The urllib hops
@@ -1957,13 +1958,12 @@ issuer. The engine applies a replaced file only when all three of these hold:
    engine refuses one. A `-----BEGIN X509 CRL-----` marker inside a comment line refuses the file
    too, on purpose: the engine cannot tell that text from a CRL the file is meant to hold. Take
    the marker text out of the comment. The file carries no certificate the hop does not already
-   trust. On a hop that already holds a CRL, a start also makes a private copy of the file in the
-   engine's temporary directory. If it cannot make or read that copy, it refuses and names the
-   setting and the file. That refusal is about the temporary directory, not the CRL.
+   trust.
 2. Each CRL's signature verifies against a CA certificate in the hop's own trust store. OpenSSL checks
    that signature only during a handshake, so without this rule a badly signed CRL would be applied
-   and then fail every handshake it judges. The reload cannot see an intermediate CA that the peer sends in its handshake,
-   and may not see a CA in a CA directory or the system store. A restart applies such a file. Where
+   and then fail every handshake it judges. The reload cannot see an intermediate CA that the peer
+   sends in its handshake, and may not see a CA in a CA directory or the system store. A restart
+   applies such a file. Where
    the hop has its own CA file, adding the issuing intermediate to it lets later reloads verify the
    CRL without a restart. The engine checks again every pass, because a CA directory adds a CA only
    when a handshake first needs it.
@@ -1972,12 +1972,22 @@ issuer. The engine applies a replaced file only when all three of these hold:
    same scope, signing key and critical extensions.
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
-what to do. It also raises the `crl_reload_refused` alert described further down. A file failing rule 1 would also stop the engine starting, so fix the file. A file whose
-CRL fails its signature check under rule 2 is held back too. On the signature, a start refuses it
-only where the engine proves the signature bad, so fix that file. Short of that proof the signature
-does not stop a start: unless another rule refuses the file, a start loads it with a warning, and
-each handshake then decides. The next paragraphs say what counts as proof, and name cases that
-load.
+what to do. It also raises the `crl_reload_refused` alert described further down. A file failing
+rule 1 would also stop the engine starting, so fix the file. A file whose CRL fails its signature
+check under rule 2 is held back too. On the signature, a start refuses it only where the engine
+proves the signature bad, so fix that file. Short of that proof the signature does not stop a
+start: unless another rule refuses the file, a start loads it with a warning, and each handshake
+then decides. *A start checks each CRL's signature too*, further down, says what counts as proof,
+and names cases that load.
+
+**The private copy is about the temporary directory, not the CRL.** The reload loads a private copy
+of the file, made in the engine's temporary directory. When it cannot make that copy, it refuses with
+`retry` and tries again every pass, so do not fix the file. A start makes the same copy on a hop
+that already holds a CRL, such as one whose CA file carries a CRL. If it cannot make or read the
+copy, it refuses, and names the setting and the file. So before you restart on a `retry` whose ERROR
+line says the reload could not stage the file, check that the engine's account can write to its
+temporary directory, and that there is room there.
+
 A file failing only rule 3 needs a restart to apply. Examples are a rollback to an older CRL,
 a file that drops an issuer, and a CRL signed under a new key. When the hops holding one file need
 different things, the ERROR names the strongest: fix the file, then restart, then wait. When it names
@@ -1987,8 +1997,9 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
 the file in one case only, where it has proof. Three things all hold then. A listed CA has the
 CRL's issuer name, compared as OpenSSL compares it for the case of ASCII letters and exactly
-otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its key identifier. The engine
-ran the signature check with that key, and the check failed. Where several listed CAs share that
+otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its
+key identifier. The engine ran the signature check with that key, and the check failed. Where
+several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
 authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
 `CRL signature failure`, an error that does not name the file. The refusal names the setting, the
@@ -1996,9 +2007,12 @@ file and the CRL. Give the setting the CRL that CA signed. No setting turns this
 an expired CRL.
 
 The check reads only the file a CRL setting names. A CRL can also reach a hop through its CA file
-alone, on at least the hops that the paragraph on a CRL inside a CA file, further down, names. It
-is in use there, and the engine does not check its signature, at a start or at a reload. OpenSSL
-still checks it at each handshake it judges.
+alone, on at least the hops that the paragraph on a CRL inside a CA file, further down, names. The
+PostgreSQL store is another: it loads `[store].ssl_root_cert` whole, CRL blocks included, and once
+`[store].ssl_crl_file` turns revocation checking on, those CRLs are checked too. Such a CRL is in
+use, and neither a start nor a reload checks its signature. The expiry scan may judge one, but only
+for its alert, and it refuses nothing; the paragraph on a CRL inside a CA file says what it
+checks. OpenSSL still checks the signature at each handshake it judges.
 
 Each CRL in the file is judged on its own, as for an expired CRL. So a badly signed copy refuses
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
@@ -2025,16 +2039,25 @@ three cases warn:
   Two measured examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature
   over SHA-1 that the CA did make.
 
-If the check itself fails, the engine logs an ERROR that says so, and loads the file.
+If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
+it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
+CRLs it judged and could not confirm are reported in the WARNING too, which names the first three
+and counts the rest; one it verified is not reported. The CRLs after
+the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
-engine process logs the WARNING once while the file keeps the same bytes. It keeps that record for
-one version only, the last one it logged a line for. So an earlier version is logged again when it
-returns after another version that was logged. A version in between that logged nothing, because
-it verified or was refused, does not reset the record. A hop whose CA list
+engine process logs the WARNING once while the file keeps the same bytes, and the ERROR above
+once for each type of exception that ended the check. It keeps that record for one version only, the last one it logged either line for. So
+an earlier version is logged again when it returns after another version that was logged. A
+version in between that logged neither line does not reset the record. That includes at least one
+that verified, and one refused with no failure in the check. A version refused after the check failed part way did log
+its ERROR, so it does reset the record. A hop whose CA list
 gives a different result for the same file logs its own line, and each engine shard logs its own. A system
-root the hop has loaded counts as a listed CA. So the same proof against a system root's key refuses
-the start too.
+root the hop has loaded counts as a listed CA, including one whose serial number is not positive,
+as at least some roots carry. A CRL whose authority key identifier carries such a serial is judged
+too. So the same proof against a system root's key refuses the start too, at least where the
+engine can read both that root and the CRL. A CA certificate the engine cannot read at all is
+skipped, as though the hop did not list it.
 
 The reload is stricter than a start. Under rule 2 it holds back every CRL it cannot confirm against
 a listed CA. Where the engine matches the CRL to a listed CA and cannot confirm the signature with
@@ -2086,7 +2109,7 @@ transport it is a WARNING in the log, beside the reload's ERROR.
 | `remedy_class` | a short token for what to do next; see the next table |
 | `stale_contexts` | how many running TLS contexts still held the old copy at the last reload pass that reported the refusal. A reminder carries that latest count, so it can differ from the count the alert was first raised with |
 | `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
-| `start_refuses` | `true`, and present only then. The remedy names a restart, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then |
+| `start_refuses` | `true`, and present only then. The remedy could lead you to restart, by naming a restart or by saying a start can load the file, and a start would refuse the file too at least until one of its CRLs takes effect. Do not restart before then. That time is no promise that a start loads the file: with `bad_signature`, for one, a start refuses it after then too, where it proves the signature bad |
 
 This event carries no CRL contents. The reason for the refusal quotes CRL issuer names and dates, so
 it is left out of this event. It is in the engine log, in the `crl_reload` ERROR line. Read that
@@ -2133,7 +2156,14 @@ follows a fix. A resolve made by hand in the alert list does not end it.
 
 **Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
 the event carries no `start_refuses`. With any other class a start can refuse the file too, and
-then the engine does not come up.
+then the engine does not come up. Two more points:
+
+- A `retry` whose ERROR line says the reload could not stage the file. A start can need the same
+  private copy and refuse too, so fix the temporary directory first (*The private copy is about
+  the temporary directory*, above).
+- `not_provable` is not in that list, although its remedy names a restart. A restart applies the
+  file only where the hop already trusts the certificate the file carries. Otherwise a start
+  refuses it, so give the setting a bare CRL.
 
 **The alert resolves itself.** Its inverse, `crl_reload_applied`, pages nobody and cannot be a
 rule's `event_type`. The engine raises it once the refusal no longer stands on that process:
@@ -2178,11 +2208,25 @@ each one in a row labelled `held-crl:` and the CA file's path. The reload does n
 file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. A start does
 not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It applies a CRL setting's
 start rules, with no clock skew, and checks each CRL's signature against the CA the file lists for
-its issuer. If the new CRL is expired, not yet in effect, a delta CRL, unreadable, or badly signed,
-`detail` says to fix it in the CA file before restarting. Put a CRL in
-the hop's CRL setting instead to have it applied without a restart. The listeners, OIDC and AD load
-only the certificates from their CA files, so a CRL there is ignored, as the CA file rows above say.
-The PostgreSQL store's `[store].ssl_root_cert` is not watched this way: it records no held copy.
+its issuer. In at least these cases `detail` says to fix the CRL in the CA file before restarting.
+The CRL is expired, not yet in effect, a delta CRL, unreadable, or proven badly signed. For a CRL
+not yet in effect, `detail` offers a wait too. The hop's copy of that issuer's CRL may lapse before
+the new one takes effect. Then waiting refuses that issuer's peers in between, so replace the CRL
+instead. For a proven bad signature it says what a start says of a CRL setting: a handshake
+OpenSSL judges by that CRL fails. The engine may still be unable to confirm the signature, short
+of that proof. Then `detail` asks you to check the CRL, and claims no failure. The start's WARNING
+cases above say why (BACKLOG #3512). Where only CA files load it, `detail` then says to restart.
+Where a CRL setting names it too, as `[store].ssl_crl_file` can, the check comes before the
+restart. A start judges that setting. A hop may still hold a stale copy through a CRL setting.
+Only then does the restart wait for the reload's verdict. So after the CA-file step, `detail` says
+to restart once the reload has applied the file. Or it gives a refused reload's remedy and reason.
+The CA-file hop's restart follows, unless that remedy is itself a restart of the engine. The scan
+may log a WARNING that it could not check the signature of a later CRL in the CA file. It does so
+only after a CRL that `detail` would ask you to check. Then `detail` does not ask for a check: it
+says to replace the CRL before restarting. Put a CRL in the hop's CRL setting instead to have it
+applied without a restart. The listeners, OIDC and AD load only the certificates from their CA
+files, so a CRL there is ignored, as the CA file rows above say. The PostgreSQL store's
+`[store].ssl_root_cert` is not watched this way: it records no held copy.
 
 At least two cases still need a restart: a CRL inside a CA file, and a replacement refused under rule
 3. A hop may hold a CRL from a path no setting above names, such as an inbound `tls_crl_file` given
@@ -2191,6 +2235,14 @@ through `env()`. The scan then adds a row for it, labelled `held-crl:` and the p
 copy. If another setting names the same file, that file's row still reports those hops' copies. CRLs
 share `warn_days` with certificates. So a CRL reissued more often than `warn_days` sits inside the
 window and alerts on every scan.
+
+One CRL in a CA file gets none of the `detail` remedies above: one that names a general name
+`cryptography` does not support, such as an x400Address, in its authority key identifier or issuer
+extensions. A start refuses that CRL in a CRL setting, and loads it from a CA file unjudged (vault
+BACKLOG #3506). While a hop holds a copy of that CA file's CRLs that differs from the file, each pass
+logs an ERROR that the scan could not judge the copies live hops hold. The row is then dated by the
+file alone, so an alert for it has an empty `detail`, and a held copy that lapses sooner than the
+file raises no alert of its own.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|

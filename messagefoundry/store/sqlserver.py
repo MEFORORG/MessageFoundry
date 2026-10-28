@@ -2717,14 +2717,6 @@ def _odbc_brace(value: str) -> str:
     return "{" + value.replace("}", "}}") + "}"
 
 
-def _pin_path(settings: StoreSettings) -> str | None:
-    """The ``[store].ssl_root_cert`` pin the store sends, or ``None``: it rides only the secure
-    posture, so an escaped weakened one (verify off, or no encryption) sends none."""
-    if settings.trust_server_certificate or not settings.encrypt:
-        return None
-    return settings.ssl_root_cert or None
-
-
 def check_pinned_certificate(
     settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
 ) -> None:
@@ -2734,41 +2726,63 @@ def check_pinned_certificate(
     Vault BACKLOG #2223: under ``Encrypt=strict`` a pin match stands in for the driver's own chain,
     host-name and expiry checks, and the pinned file is the connection's only trust anchor. So:
 
-    * the file must be one server certificate (:func:`~messagefoundry.pki.read_pinned_server_certificate`);
     * it takes the trust-anchor ACL and path checks with their own rules and messages
-      (:func:`~messagefoundry.auth.trust_anchors.enforce_anchor`): a file or folder a broad
+      (:func:`~messagefoundry.auth.trust_anchors.enforced_anchor`): a file or folder a broad
       principal can write refuses at ``[security].enforcement = enforce`` and warns at ``warn``,
       and no posture counts as enforcing. The driver reads the file by path, so the spec carries
-      ``loads_verified_bytes=False``;
+      ``loads_verified_bytes=False`` (:func:`~messagefoundry.auth.trust_anchors.store_pin_anchor_spec`);
+    * it must be no larger than :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES`, judged by its size
+      on disk before the anchor checks read it, and again on the bytes they read;
+    * the file must be one server certificate (:func:`~messagefoundry.pki.pinned_server_certificate`);
     * it must be inside its validity period at ``now`` (default the wall clock); notAfter itself
       still counts as valid, as RFC 5280 reads it.
+
+    The file is read once, and the certificate checks read the bytes the anchor checks read
+    (BACKLOG #3714). It writes no audit row. The audited check is the settings preflight
+    (:mod:`messagefoundry.auth.trust_anchors`, module item 11, which says what a reload skips).
 
     Blocking: it reads the file and, on Windows, runs ``icacls``. :meth:`SqlServerStore.open` and
     :meth:`SqlServerStore._one_connection_store` run it off the event loop once per store open,
     before any connect, never per query. A store opened before notAfter keeps connecting after it,
     so the certificate-expiry monitor, which watches this file, is what warns ahead of that date."""
-    from messagefoundry.auth.trust_anchors import AnchorSpec, TrustAnchorError, enforce_anchor
-    from messagefoundry.pki import read_pinned_server_certificate
+    from messagefoundry.auth.trust_anchors import (
+        TrustAnchorError,
+        enforced_anchor,
+        store_pin_anchor_spec,
+    )
+    from messagefoundry.pki import (
+        oversized_pin_reason,
+        pinned_server_certificate,
+        unreadable_pin_reason,
+    )
     from messagefoundry.redaction import log_timestamp
 
-    path = _pin_path(settings)
-    if path is None:
+    spec = store_pin_anchor_spec(settings)
+    if spec is None:
         return
-    cert = read_pinned_server_certificate(path)
+    path = spec.path
+    # The anchor checks read the whole file, so a file too large for a pin is refused first.
+    if (too_large := oversized_pin_reason(path)) is not None:
+        raise ValueError(f"[store].ssl_root_cert {path!r} {too_large}")
+    checked: bytes | str  # the bytes the anchor checks read, or the refusal
+    try:
+        enforcing = posture is None or posture.enforcing
+        # remember_warning: serve's preflight checks this file again moments later, and need not
+        # log the same warning twice (BACKLOG #3714).
+        checked = enforced_anchor(spec, enforcing=enforcing, remember_warning=True).data
+    except TrustAnchorError as exc:
+        checked = str(exc)  # the anchor module's own message, which names the setting and the fix
+    except (OSError, ValueError, TypeError) as exc:  # the last two: a path open() refuses
+        checked = f"[store].ssl_root_cert {path!r} {unreadable_pin_reason(exc)}"
+    except MemoryError:
+        # Turns a MemoryError raised while the anchor checks run into a refusal naming the setting.
+        # The store open does not guard a FIFO or an endless device: such a read can block or never end.
+        checked = f"[store].ssl_root_cert {path!r} could not be read: the engine ran out of memory"
+    if isinstance(checked, str):  # raised outside the handler, so no chained parser text
+        raise ValueError(checked)
+    cert = pinned_server_certificate(checked)
     if isinstance(cert, str):
         raise ValueError(f"[store].ssl_root_cert {path!r} {cert}")
-    spec = AnchorSpec(
-        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
-    )
-    refusal: str | None = None
-    try:
-        enforce_anchor(spec, enforcing=posture is None or posture.enforcing)
-    except TrustAnchorError as exc:
-        refusal = str(exc)  # the anchor module's own message, which names the setting and the fix
-    except OSError as exc:
-        refusal = f"[store].ssl_root_cert {path!r} could not be read: {exc.strerror or type(exc).__name__}"
-    if refusal is not None:
-        raise ValueError(refusal)
     moment = time.time() if now is None else now
     not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
     if moment > not_after.timestamp():
@@ -2849,7 +2863,7 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     # done instead of the expiry, host-name and chain checks, so the engine checks the pinned
     # certificate itself at store open (check_pinned_certificate). Not a revocation control. Both
     # keywords stay inside the last-wins tail.
-    pin = _pin_path(settings)
+    pin = settings.sqlserver_pin_path()
     if pin:
         parts.append(f"ServerCertificate={_odbc_brace(pin)}")
     encrypt = "strict" if pin else ("yes" if settings.encrypt else "no")
@@ -3096,8 +3110,11 @@ class SqlServerStore:
         # against this and re-reads only the sets that differ. Seeded at open (_load_reference_cache)
         # and on every write_reference_snapshot.
         self._reference_versions: dict[str, str] = {}
-        # Serializes audit-chain appends in-process (the store is the single audit writer per engine
-        # process; active-passive = one active node) — see record_audit.
+        # A near gate only: it orders the appends in THIS process that take it (record_audit and
+        # its siblings; _append_operator_audit does not). The chain's lock is `_AUDIT_APPEND_LOCK`,
+        # taken by every append in every engine-shard process (why: record_audit). That premise is
+        # tested in tests/test_control_premises.py (offline: the applock precedes the head read)
+        # and the gated tests/test_sqlserver_audit_applock.py (live: it holds across processes).
         self._audit_lock = asyncio.Lock()
         # H1 fencing token: the held leader epoch + the leader_lease row to validate it against, pushed
         # by the engine on promotion via set_leader_epoch() (the store NEVER imports the coordinator —
