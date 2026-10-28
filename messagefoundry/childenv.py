@@ -5,25 +5,32 @@
 A process started with no ``env=`` gets a copy of its parent's whole environment. The engine's own
 environment holds its secrets by design: the store key, the store password and every ``env()``
 connection secret arrive as ``MEFOR_*`` variables. So each spawn site names what its child gets,
-through one of the four builders here, and ``tests/test_child_process_environment.py`` fails a
+through one of the builders here, and ``tests/test_child_process_environment.py`` fails a
 process start whose environment does not come from one of them.
 
-* :func:`system_tool_environment` is the platform's start-up names and **nothing else**, for a
-  fixed operating-system tool the engine runs by its absolute path, such as ``icacls`` or ``sc``
-  (vault BACKLOG #2716). Such a tool reads no engine setting, so it gets no ``MEFOR_*`` variable,
-  no interpreter variable and nothing an operator added.
+* :func:`system_tool_environment` is the platform's start-up names, for a fixed
+  operating-system tool the engine runs by its absolute path, such as ``icacls`` or ``sc``
+  (vault BACKLOG #2716), and for ``openssl``. Such a tool reads no engine setting, so it gets no
+  ``MEFOR_*`` variable and no interpreter variable. A caller may add only the tool's own
+  variables, by name, and fixed values that replace inherited ones (BACKLOG #3803).
 
 * :func:`worker_environment` is an **allowlist**, for a child that runs code the engine does not
   fully trust (the sandbox worker). It carries what the platform and the interpreter need to start,
   and the extra names its caller adds. A variable nobody listed does not cross.
-* :func:`hook_environment` is **everything except the engine's own namespace**, for a command an
-  operator configured (the DR hook). Such a command may need ordinary variables the engine cannot
-  list in advance, such as a cloud profile or a proxy. It has no use for the engine's settings, so
-  the whole ``MEFOR_*`` prefix is dropped. Dropping a prefix does not go stale the way a list of
-  secret names would. A few names outside the prefix are dropped too
-  (:data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`). **A secret kept under any other name still reaches
-  the hook**: a ``[secrets].provider = "env"`` reference may name any variable, a library may read
-  one this module does not know, and neither can be listed here.
+* :func:`hook_environment` is an **allowlist** too, for a shell command an operator configured (the
+  DR hook): the platform's start-up names, on Windows the few
+  machine-layout names a shell script expects (:data:`_WINDOWS_SHELL_NAMES`), and the names the
+  operator listed in ``[dr].pass_environment``. A variable nobody listed does not cross, so no
+  secret is in the hook's own environment by default, whatever name it is kept under. Settings
+  load refuses the engine's own names in that setting.
+* :func:`non_engine_environment` is **everything except the engine's own namespace**: the whole
+  ``MEFOR_*`` prefix, and the few names outside it in :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`.
+  It is a deny-list, so **a secret kept under any other name still crosses**: a
+  ``[secrets].provider = "env"`` reference may name any variable, and a library may read one this
+  module does not know. Only for a fixed tool the engine's own code names, run on a build or CI
+  runner rather than by the service, that reads settings the engine cannot list in advance: the
+  dependency auditor's ``pip`` and ``pip-audit``, which read their index, proxy and certificate
+  settings from the environment. ``tests/test_child_process_environment.py`` fails another caller.
 * :func:`engine_environment` is the **whole** environment, for a Python child started through the
   bootstrap that runs the engine's own trusted code: an engine shard, which opens the store and
   builds connections and so needs the secrets, and other such children, the tray's relaunch among
@@ -52,6 +59,7 @@ __all__ = [
     "engine_environment",
     "hook_environment",
     "inherited_interpreter_flags",
+    "non_engine_environment",
     "outside_engine_namespace",
     "python_child_argv",
     "python_module_argv",
@@ -175,6 +183,24 @@ _POSIX_NAMES: Final = frozenset(
         "LC_NAME",
         "LC_PAPER",
         "LC_TELEPHONE",
+    }
+)
+
+#: What a Windows shell script expects beyond :data:`_WINDOWS_NAMES`, for the DR hook only: where
+#: programs and shared data are installed. Machine layout, never a secret. Measured on Windows 11
+#: with the start-up names alone, ``cmd`` leaves ``%ProgramFiles%`` unexpanded. ``PSModulePath``
+#: is left out on purpose: PowerShell builds it when it is unset, as measured, and the engine's
+#: own value may name another PowerShell edition's modules.
+_WINDOWS_SHELL_NAMES: Final = frozenset(
+    {
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "COMMONPROGRAMW6432",
+        "ALLUSERSPROFILE",
+        "PUBLIC",
     }
 )
 
@@ -317,6 +343,15 @@ def _source(environ: Mapping[str, str] | None) -> Mapping[str, str]:
     return os.environ if environ is None else environ
 
 
+def _extra_keys(extra_names: Collection[str]) -> frozenset[str]:
+    """``extra_names`` as :func:`_key` compares them."""
+    if isinstance(extra_names, str):
+        # A bare string is a collection of its characters, so no name would cross and nothing
+        # would say why.
+        raise TypeError("extra_names takes a collection of names, not one string")
+    return frozenset(_key(name) for name in extra_names)
+
+
 def worker_environment(
     environ: Mapping[str, str] | None = None,
     *,
@@ -340,41 +375,86 @@ def worker_environment(
     writes to it (vault BACKLOG #2724). A default in the engine's own namespace is refused, as
     ``[sandbox].pass_environment`` refuses one: a builder call is all the spawn guard checks.
     """
-    if isinstance(extra_names, str):
-        # A bare string is a collection of its characters, so no name would cross and nothing
-        # would say why.
-        raise TypeError("extra_names takes a collection of names, not one string")
-    extras = frozenset(_key(name) for name in extra_names)
+    extras = _extra_keys(extra_names)
     env = _without_working_directory_entries(
         {n: v for n, v in _source(environ).items() if _allowed_for_a_worker(n, extras)}
     )
     present = {_key(name) for name in env}
     for name, value in (defaults or {}).items():
-        if not outside_engine_namespace(name):
-            raise ValueError(f"defaults may not name the engine's own variable {name!r}")
-        if _key(name) in _INTERPRETER_NAMES:
-            # The worker's import path is the inherited one, filtered above, and nothing else.
-            raise ValueError(f"defaults may not set the interpreter's variable {name!r}")
-        if _key(name) not in present:
+        # Refuses an engine or interpreter name: the worker's import path is the inherited one,
+        # filtered above, and nothing else.
+        key = _ordinary_key(name, "defaults")
+        if key not in present:
             env[name] = value
     return env
 
 
-def system_tool_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment for a fixed operating-system tool: the platform's start-up names only.
+def _ordinary_key(name: str, argument: str) -> str:
+    """``name`` as :func:`_key` compares it. A name of the engine's namespace or of the
+    interpreter is refused, since a value a builder sets for it would bypass that builder's own
+    filter. ``argument`` names the caller's argument in the refusal."""
+    if not outside_engine_namespace(name):
+        raise ValueError(f"{argument} may not name the engine's own variable {name!r}")
+    if _key(name) in _INTERPRETER_NAMES:
+        raise ValueError(f"{argument} may not name the interpreter's variable {name!r}")
+    return _key(name)
 
-    For a tool the engine runs by its absolute path, with an argument list and no shell, that
-    reads none of the engine's settings: ``icacls`` and ``sc`` (vault BACKLOG #2716). It gets what
-    the platform needs to start a process and find its temp and profile directories, and nothing
-    else. No interpreter variable crosses, because the tool is not Python."""
-    return {n: v for n, v in _source(environ).items() if _key(n) in _platform_names()}
+
+def system_tool_environment(
+    environ: Mapping[str, str] | None = None,
+    *,
+    extra_names: Collection[str] = (),
+    pinned: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The environment for a fixed operating-system tool: the platform's start-up names, plus
+    what ``extra_names`` and ``pinned`` add.
+
+    For a tool the engine runs with an argument list and no shell, that reads none of the
+    engine's settings: ``icacls`` and ``sc`` by their absolute paths (vault BACKLOG #2716), and
+    ``openssl``, which ``verify`` finds on ``PATH`` as the manual check does. It gets what the
+    platform needs to start a process and find its temp and profile directories, and nothing
+    else. No interpreter variable crosses, because the tool is not Python.
+
+    ``extra_names`` are the tool's own variables, which cross as ``environ`` holds them: the
+    ``OPENSSL_*`` names for ``openssl`` (BACKLOG #3803 item 5). ``pinned`` are fixed values that
+    replace whatever ``environ`` holds under the same name, such as the ``PATH`` and
+    ``PSModulePath`` of the cipher probe's PowerShell (BACKLOG #3803 S1). Both are set here, not on
+    the returned dict, for the reason :func:`worker_environment` gives for ``defaults``. Neither may
+    name a variable of the engine's namespace or of the interpreter."""
+    if isinstance(extra_names, str):
+        # A bare string is a collection of its characters, so no name would cross.
+        raise TypeError("extra_names takes a collection of names, not one string")
+    pins = pinned or {}
+    allowed = _platform_names() | {_ordinary_key(name, "extra_names") for name in extra_names}
+    allowed -= {_ordinary_key(name, "pinned") for name in pins}
+    return {**{n: v for n, v in _source(environ).items() if _key(n) in allowed}, **pins}
 
 
-def hook_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment for a command an operator configured: everything outside the engine's own
-    ``MEFOR_*`` namespace, less :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`.
+def hook_environment(
+    environ: Mapping[str, str] | None = None, *, extra_names: Collection[str] = ()
+) -> dict[str, str]:
+    """The DR hooks' allowlist over ``environ`` (default :data:`os.environ`), as the module
+    docstring describes; ``extra_names`` is ``[dr].pass_environment``.
 
-    ``PYTHONPATH`` crosses as this process has it."""
+    No interpreter variable crosses unless listed: the hook is a shell command, not this
+    interpreter's child. ``LD_LIBRARY_PATH`` does, with the other POSIX start-up names, so a hook
+    that starts an interpreter needing it still starts. An extra in the engine's own namespace
+    raises :class:`ValueError`. Settings load refuses one first, so this is the last check, not
+    the first."""
+    extras = _extra_keys(extra_names)
+    for key in extras:
+        if not outside_engine_namespace(key):
+            raise ValueError(f"extra_names may not name the engine's own variable {key!r}")
+    names = _platform_names() | extras
+    if sys.platform == "win32":
+        names |= _WINDOWS_SHELL_NAMES
+    return {n: v for n, v in _source(environ).items() if _key(n) in names}
+
+
+def non_engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Everything in ``environ`` (default :data:`os.environ`) outside the engine's own ``MEFOR_*``
+    namespace, less :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`: the deny-list the module docstring
+    says is only for the dependency auditor. ``PYTHONPATH`` crosses as ``environ`` has it."""
     return {n: v for n, v in _source(environ).items() if outside_engine_namespace(n)}
 
 

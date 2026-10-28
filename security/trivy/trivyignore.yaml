@@ -10,11 +10,13 @@
 # was proposed for the released-line-audit gate, and the reasoning holds here.
 #
 # WHY THIS FILE EXISTS. `--ignore-unfixed` filters on "does UPSTREAM have a fix", not "can WE apply
-# it". Both entries below are pip's VENDORED copies: pip 26.2.1 pins msgpack==1.1.2 and
-# setuptools==70.3.0 in pip/_vendor/vendor.txt and publishes them in pip/_vendor/bom.cdx.json, which
-# Trivy ingests. Neither package is in docker/locks/requirements-core.lock, neither appears in the
-# image's /opt/venv site-packages, nothing in the engine imports them, and the image entrypoint is
-# `tini -- messagefoundry`, which never runs pip.
+# it". Both entries below are pip's VENDORED copies: pip 26.2.2, the image's pip since BACKLOG
+# #3905 moved the base digest (read from its wheel on 2026-10-27; 26.2.1 before it pinned the
+# same), pins msgpack==1.1.2 and setuptools==70.3.0 in pip/_vendor/vendor.txt and publishes them
+# in pip/_vendor/bom.cdx.json, which Trivy ingests. Neither package is in
+# docker/locks/requirements-core.lock, neither is installed as a package of its own in the
+# image's /opt/venv site-packages (the pip there vendors them under pip/_vendor), nothing in the
+# engine imports them, and the image entrypoint runs `-m messagefoundry`, which never runs pip.
 #
 # MEASURED, enumerated over every failed run of this job in 2026-07-01..08-30: 30 failures in two
 # contiguous episodes. The July episode (CVE-2026-59885, CVE-2026-59886 on pyasn1 0.6.3) was a REAL

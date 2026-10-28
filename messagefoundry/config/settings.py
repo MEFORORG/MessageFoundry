@@ -951,7 +951,8 @@ class StoreSettings(_Section):
     # Optional certificate file to verify the DB server WITHOUT installing anything box-globally into the OS
     # trust store (the common hospital-estate posture is a PRIVATE / self-signed CA). Honored by BOTH
     # server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false),
-    # and never applied on a weakened one. The two backends read it differently:
+    # and never applied on a weakened one; SQL Server refuses it at load beside one (BACKLOG #3714).
+    # The two backends read it differently:
     #   * POSTGRES — asyncpg takes an SSLContext, so this loads ssl.create_default_context(cafile=...), a
     #     CA-bundle pin (chain + hostname still verified).
     #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's OWN certificate
@@ -1168,16 +1169,25 @@ class StoreSettings(_Section):
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
                 "SQLite uses no TLS, so pinning a certificate has no effect."
             )
-        sends_pin = self.encrypt and not self.trust_server_certificate  # as the store decides
-        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER and sends_pin:
+        pin = self.sqlserver_pin_path()
+        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER and pin is None:
+            # Vault BACKLOG #3714 item 9: the store sends the pin only on the verifying posture, so
+            # beside a weakened one it would be dropped with nothing said. Refuse rather than ignore,
+            # as _ssl_crl_file_reachable does for its own setting.
+            raise ValueError(
+                "[store].ssl_root_cert requires a verifying SQL Server hop (encrypt=true and "
+                "trust_server_certificate=false); with verification off the store sends no pin, "
+                "so the pinned certificate would NOT be checked."
+            )
+        if pin:
             # Vault BACKLOG #2223: on SQL Server the file is an exact-match pin, so a bundle or a CA
             # certificate would refuse every connect. Say so at load, naming the setting. The file
             # holds only a public certificate, and no part of it goes into the message.
             from messagefoundry.pki import read_pinned_server_certificate
 
-            problem = read_pinned_server_certificate(self.ssl_root_cert)
+            problem = read_pinned_server_certificate(pin)
             if isinstance(problem, str):
-                raise ValueError(f"[store].ssl_root_cert {self.ssl_root_cert!r} {problem}")
+                raise ValueError(f"[store].ssl_root_cert {pin!r} {problem}")
         return self
 
     @field_validator("ssl_crl_file")
@@ -1267,6 +1277,22 @@ class StoreSettings(_Section):
         if self.backend is StoreBackend.SQLITE:
             return SchemaManagement.AUTO
         return self.schema_management or SchemaManagement.EXTERNAL
+
+    def sqlserver_pin_path(self) -> str | None:
+        """The ``ssl_root_cert`` file the SQL Server store sends as its ``ServerCertificate`` pin,
+        or ``None`` (vault BACKLOG #2223). Only SQL Server sends one, and only on the verifying
+        posture: ``encrypt`` on and ``trust_server_certificate`` off.
+
+        The load check, the store and the trust-anchor preflight ask here, so those three cannot
+        disagree on whether a pin is sent (BACKLOG #3714). The certificate-expiry monitor
+        (``pipeline/cert_expiry.py``) still writes the same test out itself. Load refuses a pin beside a weakened
+        posture, so on loaded settings the posture arm is a second guard for settings built
+        without validation."""
+        if self.backend is not StoreBackend.SQLSERVER:
+            return None
+        if not self.encrypt or self.trust_server_certificate:
+            return None
+        return self.ssl_root_cert or None
 
 
 #: The hosts that count as a loopback bind for the OPERATOR API, i.e. not exposed off-box. Both IPv4 and
@@ -1493,7 +1519,8 @@ def uvicorn_trusted_hosts(entries: Sequence[str]) -> list[str]:
 
 
 def _split_address_list(v: object) -> object:
-    """Split the env form of a list of addresses or origins on COMMAS, never ``os.pathsep``.
+    """Split the env form of a list (addresses, origins, or the ``pass_environment`` variable names)
+    on COMMAS, never ``os.pathsep``.
     ``os.pathsep`` is ':' on POSIX, which also separates IPv6 groups and an origin's port, so it
     would shred both on the Linux leg (BACKLOG #3042). A list from the file passes through."""
     if isinstance(v, str):
@@ -2323,20 +2350,33 @@ class PipelineSettings(_Section):
     snapshot_on_send: bool = Field(default=True)
 
 
-def _pass_environment_refusal(name: str) -> str | None:
-    """Why ``name`` may not be handed to a sandbox worker, or ``None`` if it may.
+def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -> tuple[str, ...]:
+    """``names``, or a :class:`ValueError` for the first one that may not be handed to ``receiver``.
 
-    The worker runs the code ``[sandbox]`` exists to keep the engine's secrets from, so nothing of
-    the engine's own may be named: no ``MEFOR_*`` variable at all, and no secret a library reads on
-    the engine's behalf. That is the rule the DR hook's environment follows
-    (:func:`messagefoundry.childenv.outside_engine_namespace`), reused so the two cannot drift.
+    For the two ``pass_environment`` settings: ``[sandbox]``'s, read by the sandbox worker, and
+    ``[dr]``'s, read by the DR hooks. Each child gets an allowlist
+    (:mod:`messagefoundry.childenv`), and this keeps the engine's own names off both lists: no
+    ``MEFOR_*`` variable at all, and no secret a library reads on the engine's behalf
+    (:func:`messagefoundry.childenv.outside_engine_namespace`, reused so the two cannot drift).
     Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
-    added. The text never echoes a value, only the name the operator typed."""
-    if not (name.isascii() and name.isidentifier()):
-        return f"{name!r} is not an environment variable name"
-    if not outside_engine_namespace(name):
-        return f"{name} is one of the engine's own variables; it may not be passed to a worker"
-    return None
+    added. The text never echoes an entry that is not a name, since ``NAME=value`` typed by
+    mistake would carry the value (vault BACKLOG #2600). Nor does it number one: the env form drops
+    empty entries before this runs, so a position could point at the wrong one.
+
+    A secret reference under ``[secrets].provider = "env"`` is refused once the model is built,
+    by :func:`_reject_passed_secret_references`, which sees every section."""
+    for name in names:
+        if not (name.isascii() and name.isidentifier()):
+            raise ValueError(
+                f"{key}: an entry is not an environment variable name; "
+                "list names only, never NAME=value"
+            )
+        if not outside_engine_namespace(name):
+            raise ValueError(
+                f"{key}: {name} is one of the engine's own variables; "
+                f"it may not be passed to {receiver}"
+            )
+    return names
 
 
 class SandboxSettings(_Section):
@@ -2406,25 +2446,18 @@ class SandboxSettings(_Section):
     # (messagefoundry/childenv.py). The worker loads the config again under that allowlist, so a
     # config that reads another variable needs it named here, or its worker is refused when the
     # graph it builds differs from the engine's. Names only, and never a MEFOR_* name or another
-    # of the engine's own: see _pass_environment_refusal.
+    # of the engine's own: see _checked_pass_environment.
     pass_environment: tuple[str, ...] = ()
 
     @field_validator("pass_environment", mode="before")
     @classmethod
     def _split_pass_environment(cls, v: object) -> object:
-        # The env layer delivers MEFOR_SANDBOX_PASS_ENVIRONMENT as one string; split on commas.
-        if isinstance(v, str):
-            return [name.strip() for name in v.split(",") if name.strip()]
-        return v
+        return _split_address_list(v)
 
     @field_validator("pass_environment")
     @classmethod
     def _pass_environment_names(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        for name in v:
-            refusal = _pass_environment_refusal(name)
-            if refusal is not None:
-                raise ValueError(f"sandbox.pass_environment: {refusal}")
-        return v
+        return _checked_pass_environment(v, "sandbox.pass_environment", "a worker")
 
 
 class DiagnosticsSettings(_Section):
@@ -6181,9 +6214,10 @@ class SecretRotationSettings(_Section):
     engine persists a non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and
     watches the DEK off it, so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
     **override**, not a prerequisite. The connector/AD/SMTP/Vault/OIDC credentials the engine holds are
-    tracked too — each is fingerprinted with a DEK-derived keyed MAC into store meta and its clock reset
-    when the fingerprint changes (rotation auto-detected). The broader ``SecretProvider`` generalization
-    (a pluggable secret backend) remains a design-only follow-on (ADR 0019 §5)."""
+    tracked too — each is fingerprinted with a keyed MAC sealed as a store-cipher cell (BACKLOG #3472)
+    and its clock reset when the secret no longer matches it (rotation auto-detected). The broader
+    ``SecretProvider`` generalization (a pluggable secret backend) remains a design-only follow-on
+    (ADR 0019 §5)."""
 
     warn_days: int = (
         14  # alert this many days before a secret is due for rotation (0 = reminder off)
@@ -6688,6 +6722,21 @@ class DrSettings(_Section):
     # latest anchor differs → activation refuses closed). "" (the default) = OFF: the #102 gate is
     # byte-unchanged and SQLite is a no-op. A URL is rejected (local/UNC only, like seed_archive).
     restore_token: str = ""
+    # Environment variable NAMES the takeover and release hooks are given, beyond the allowlist
+    # messagefoundry/childenv.py hook_environment builds: a cloud profile, a proxy, a credential
+    # the hook's own tool reads. Names only, and never a MEFOR_* name or another of the engine's
+    # own: see _checked_pass_environment.
+    pass_environment: tuple[str, ...] = ()
+
+    @field_validator("pass_environment", mode="before")
+    @classmethod
+    def _split_pass_environment(cls, v: object) -> object:
+        return _split_address_list(v)
+
+    @field_validator("pass_environment")
+    @classmethod
+    def _pass_environment_names(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        return _checked_pass_environment(v, "dr.pass_environment", "a hook")
 
     @field_validator("takeover_hook", "release_hook")
     @classmethod
@@ -7332,6 +7381,32 @@ def _env_overrides(environ: Mapping[str, str]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _secrets_directory_overrides(environ: Mapping[str, str]) -> dict[str, dict[str, Any]]:
+    """The secret-class settings fields the secrets directory supplies, as ``{section: {key:
+    value}}`` (vault BACKLOG #2595, ADR 0214).
+
+    Merged over the environment layer, so a setting's file wins over its variable, which is the
+    accessor's rule in ``engine_secrets``. Every file the directory holds for a setting is read and
+    checked here, so a load refuses an unusable one even when nothing else would read it, such as a
+    Vault token file on a site with no Vault. Only names that are settings fields are returned: the
+    two Vault tokens are read by their own modules, and the store key is never read from the
+    directory. Raises ``SecretsDirectoryError``, a ``ValueError``, when the directory cannot be
+    used."""
+    from messagefoundry.engine_secrets import DIRECTORY_SETTING_NAMES, open_secrets_directory
+
+    directory = open_secrets_directory(environ)
+    if directory is None:
+        return {}
+    found = {name: directory.read(name) for name in DIRECTORY_SETTING_NAMES}
+    return _env_overrides(
+        {
+            name: value
+            for name, value in found.items()
+            if value is not None and name not in _OUT_OF_BAND_ENV
+        }
+    )
+
+
 def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | None:
     """The active environment ``MEFOR_AI_ENVIRONMENT`` names, or ``None`` when it is unset or blank.
 
@@ -7551,6 +7626,8 @@ _OUT_OF_BAND_ENV: frozenset[str] = frozenset(
         "MEFOR_SECRETS_VAULT_CA_FILE",
         "MEFOR_SECRETS_VAULT_KV_MOUNT",
         "MEFOR_SECRETS_VAULT_TOKEN",
+        # Where the secrets directory is (engine_secrets.py, vault BACKLOG #2595, ADR 0214).
+        "MEFOR_SECRETS_DIRECTORY",
         # The store's Vault KeyProvider and Transit cipher (store/keyprovider_vault.py,
         # store/crypto_transit.py).
         "MEFOR_STORE_TRANSIT_AUDIT_KEY",
@@ -7577,6 +7654,23 @@ _SECRET_REFERENCE_KEYS: tuple[tuple[str, str], ...] = (
     ("auth", "oidc_client_private_key_ref"),
     ("alerts", "email_password_secret"),
 )
+
+
+def _reject_passed_secret_references(settings: ServiceSettings, data: Mapping[str, Any]) -> None:
+    """Refuse a ``pass_environment`` name that a ``[secrets].provider = "env"`` reference reads as
+    a secret, such as ``[auth].ad_bind_password_secret`` (vault BACKLOG #2587). The field
+    validators see one section, so this runs once the model is built. Names only, never a value."""
+    referenced = _env_secret_reference_names(data)
+    for key, names, receiver in (
+        ("sandbox.pass_environment", settings.sandbox.pass_environment, "a worker"),
+        ("dr.pass_environment", settings.dr.pass_environment, "a hook"),
+    ):
+        for name in names:
+            if _env_name_key(name) in referenced:
+                raise ValueError(
+                    f"{key}: {name} is a secret reference under [secrets].provider = 'env'; "
+                    f"it may not be passed to {receiver}"
+                )
 
 
 #: Whether this platform's environment names ignore letter case. On Windows ``os.environ`` holds
@@ -9943,7 +10037,10 @@ def load_settings(
     environ: Mapping[str, str] | None = None,
     default_file: bool = True,
 ) -> ServiceSettings:
-    """Resolve settings with CLI > env > file > default precedence.
+    """Resolve settings with CLI > secrets directory > env > file > default precedence.
+
+    The secrets directory supplies only the secret-class settings, and only when
+    ``MEFOR_SECRETS_DIRECTORY`` names one (vault BACKLOG #2595, ADR 0214).
 
     ``config_path`` reads that TOML file (error if it's missing); when ``None``, ``./messagefoundry.toml``
     is used **only if it exists**. ``cli`` is a nested ``{section: {key: value}}`` of explicitly-provided
@@ -9988,12 +10085,17 @@ def load_settings(
     # typo that causes a validation error is named. Over `environ` itself, so it reports the
     # variable as the operator spelled it; `data` is read for what the settings name.
     _reject_unknown_env_keys(environ, data)
+    # The secrets directory (vault BACKLOG #2595, ADR 0214), after the unread-variable warnings and
+    # the refusals above, so a directory it refuses does not hide a mistyped variable or key
+    # until the next start. It writes only secret values, which nothing above reads.
+    _merge(data, _secrets_directory_overrides(environ))
     _desugar_security(data)
 
     if cli:
         _merge(data, cli)
 
     settings = ServiceSettings.model_validate(data)
+    _reject_passed_secret_references(settings, data)
     # AFTER the CLI merge, so a `--host` that moved the socket off-box is reported as the posture
     # loosening it is. One-way: it only ever ADDS a loosening. See the helper for why.
     _reconcile_effective_bind(settings)

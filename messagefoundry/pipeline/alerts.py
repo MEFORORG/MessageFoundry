@@ -145,17 +145,20 @@ def crl_reload_refused_detail(
     #2904). Fixed words, a count and the engine's own remedy sentence: nothing read from the CRL.
 
     The alert instance's reason column keeps only about the first 200 characters, so the class
-    and the count lead. A warning not to restart yet comes next, ahead of a remedy that names a
-    restart, because a reader may see only the start of the line. The reason is not part of this
+    and the count lead. A warning not to restart yet comes next, ahead of a remedy that can lead
+    to a restart, because a reader may see only the start of the line. The reason is not part of this
     alert, because it quotes CRL issuer names and dates; the reload's ERROR line has it."""
     parts = [
         f"CRL reload refused ({remedy_class}): {stale_contexts} running TLS context(s) keep the "
         "copy they hold."
     ]
     if start_refuses:
+        # "At least": the time is when one cause of a refusal ends, not a promise that a start
+        # loads the file then. A proven bad signature, or a private copy a start cannot make,
+        # still refuses after it (vault BACKLOG #3506); the remedy that follows says when.
         parts.append(
-            "A start refuses this file too until its CRL takes effect, so do not restart before "
-            "then."
+            "A start refuses this file too at least until its CRL takes effect, so do not restart "
+            "before then."
         )
     if remedy:
         parts.append(f"{remedy}.")
@@ -180,15 +183,17 @@ def sandbox_worker_refused_detail(*, content_only: bool) -> str:
     BACKLOG #2724). Fixed words that name the cause and the remedy: never a message body, and not
     the refusal itself, which the runner logs whole in a WARNING line. The alert instance's reason
     column keeps only about the first 200 characters, so the cause and the remedy lead."""
+    # A worker runs the engine's config snapshot and never reads the directory (vault BACKLOG
+    # #2596), so an edit on disk is not a cause, and a reload does not cure a graph that differs
+    # by name.
     if content_only:
         cause = (
-            "A config file changed on disk since the engine loaded it, with no reload. Reload the "
-            "config."
+            "The worker ran other config module bytes than the engine loaded. Reload the config."
         )
     else:
         cause = (
-            "Most often a config file changed on disk with no reload: reload the config. Or config "
-            "reads a variable the worker lacks: add it to [sandbox].pass_environment and restart."
+            "Config most likely reads a variable the worker lacks: add it to "
+            "[sandbox].pass_environment and restart."
         )
     return (
         f"{cause} Until then every message on this inbound fails at routing or transform: "
@@ -403,8 +408,9 @@ class AlertSink(Protocol):
         on; ``pipeline/crl_reload.py`` holds the set). ``stale_contexts`` counts the contexts
         still on the old copy at the last pass that reported the refusal, so a reminder carries
         the latest count, not the one first raised. ``remedy`` is the engine's own fixed
-        sentence for that class. ``start_refuses`` is True when the remedy names a restart and a
-        start would refuse the file too, until one of its CRLs takes effect.
+        sentence for that class. ``start_refuses`` is True when the remedy can send the operator
+        to a restart, as one that names a restart or says a start can load the file does, and a
+        start would refuse the file too, at least until one of its CRLs takes effect.
 
         **No CRL contents.** The refusal's reason quotes CRL issuer names and dates, so it stays
         in the engine log and is never passed here. Not a connection-scoped event: one CRL file

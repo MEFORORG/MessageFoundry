@@ -1048,7 +1048,7 @@ def test_the_command_provisions_where_serve_would_start(
         # ONE warning, on both stores (BACKLOG #2081). The command builds AuthService once; an
         # existing store used to build it twice, and so printed the same warning twice.
         assert len(warned) == 1, warned
-        assert "enforcement=warn, starting anyway" in warned[0]
+        assert "enforcement=warn, using it anyway" in warned[0]
 
 
 @pytest.mark.parametrize("hop", _HOPS)

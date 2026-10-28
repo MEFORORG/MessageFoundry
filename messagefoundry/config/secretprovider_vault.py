@@ -38,6 +38,7 @@ from messagefoundry.config.tls_policy import (
     assert_hvac_tls_suites,
     vault_client_verify_kwargs,
 )
+from messagefoundry.engine_secrets import SecretsDirectoryError, secret_setting
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretsSettings
@@ -193,6 +194,20 @@ def _split_ref(ref: str) -> tuple[str, str]:
     return path, field
 
 
+def _token_setting() -> str | None:
+    """``MEFOR_SECRETS_VAULT_TOKEN`` through the one accessor: its file in the secrets directory,
+    else the environment (vault BACKLOG #2595). A directory that cannot be used raises
+    :class:`SecretProviderError`, so the subsystem fails closed as it does for any other bad Vault
+    setting."""
+    # The refusal is raised outside the handler and carries only the message, so nothing the
+    # directory read held rides along on its chain (BACKLOG #2307 states the rule).
+    try:
+        return secret_setting(_ENV_TOKEN)
+    except SecretsDirectoryError as exc:
+        refusal = str(exc)
+    raise SecretProviderError(refusal)
+
+
 class VaultSecretProvider:
     """``vault`` — read a connector credential from Vault KV v2 (ADR 0019 §5)."""
 
@@ -207,7 +222,7 @@ class VaultSecretProvider:
         path, field = _split_ref(ref)
         mount = _kv_mount()
         addr = os.environ.get(_ENV_ADDR)
-        token = os.environ.get(_ENV_TOKEN)
+        token = _token_setting()
         # OUTSIDE the try on purpose. The TLS suite assertion inside `_build_client` raises
         # ValueError, and the `except Exception` below would relabel it "could not read secret ...
         # from Vault KV" — turning a configuration refusal into what reads as a connectivity failure,
@@ -267,12 +282,12 @@ def secrets_vault_token() -> str:
     reads ``VAULT_TOKEN`` and then ``~/.vault-token``: in an operator's shell that is the operator's
     own token, and the check would judge it, or read a secret with it, as the engine's. Raises
     :class:`SecretProviderError`, which the probe reports as not observed."""
-    token = os.environ.get(_ENV_TOKEN)
+    token = _token_setting()
     if not token:
         raise SecretProviderError(
-            f"{_ENV_TOKEN} is not set, so the connector-secret token is not known. The check reads "
-            f"only the token named there, never VAULT_TOKEN or ~/.vault-token; run it with the "
-            f"service's environment"
+            f"{_ENV_TOKEN} is not set, in the secrets directory or the environment, so the "
+            f"connector-secret token is not known. The check reads only the token named there, never "
+            f"VAULT_TOKEN or ~/.vault-token; run it with the service's environment"
         )
     return token
 

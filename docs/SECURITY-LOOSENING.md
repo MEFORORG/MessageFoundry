@@ -44,11 +44,16 @@ statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
 or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
-or starts the service, except SFTP: the host key is known only once the server answers, so that
-refusal comes at connect, before the password is sent. **No lever in this guide lifts a refusal in
+or starts the service, with two exceptions. SFTP: the host key is known only once the server
+answers, so that refusal comes at connect, before the password is sent. The AI broker: the engine
+builds it for each `POST /ai/chat`, so that request is refused and answers `503`, and the refusal
+names `[ai].endpoint`. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
 `tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection, or
-the `[auth]` setting for the AD bind, and offers only settings that do fix it. `Email` and `Direct`
+the `[auth]` setting for the AD bind, and offers only settings that can fix it. A verify-off refusal
+names a header off the allowlist apart from any credential. Where such headers are all it lists, it
+also offers removing them. The engine then judges the hop as one with no credential, under its own
+levers. `Email` and `Direct`
 check the credential before the cleartext and verify-off checks, so a credentialed hop is never
 pointed at one of those levers.
 
@@ -60,34 +65,46 @@ pointed at one of those levers.
 | `Rest`, `Soap`, `FHIR`, `DICOMweb`, `FhirLookup` | `verify_tls = false` on an `https` URL | turn `verify_tls` on; pin a private CA with `tls_ca_file` |
 | `Sftp` with a `password` | the server's host key is not in `known_hosts` | add the host key to `known_hosts` |
 | `[auth]` AD binds over LDAPS | `ad_tls_verify = false` | turn it on; pin a private CA with `ad_tls_ca_cert_file` |
+| AI broker (`[ai].endpoint`) | the endpoint is plain `http` | use an `https` endpoint |
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
-a static header that settings views would mask, such as `Authorization` or an API key. That last
-test leans toward caution: a header named like a key, such as `X-Routing-Key`, also counts. The
-HTTP family reads its auth-setting credentials from the same reader as the static-credential
-inventory. That inventory does not yet count a static header or a `url` query credential, so for
-those two kinds this rule is the wider of the two. A hop with no credential is not refused by this
-rule. Its own loosening entry decides it.
+a static header that settings views would mask, such as `Authorization` or an API key. On a
+`verify_tls = false` hop, the engine also refuses any other static header, unless its name is
+`Accept`, `Content-Type`, `User-Agent` or `X-Request-ID`, in any case. The refusal names such a
+header as outside the allowlist, not as a credential. That allowlist fails closed, so a
+secret under a neutral name, such as `X-Session`, is refused without being recognized. A
+credential-shaped value under an allowlisted name is still refused. The HTTP family reads its
+auth-setting credentials from the same reader as the static-credential inventory. That inventory
+does not yet count a static header or a `url` query credential, so for those two kinds this rule is
+the wider of the two. A hop with no credential and no such header is not refused by this rule. Its own loosening entry
+decides it.
 
 An AD bind always carries a credential, because the service account must bind first. So
-`ad_tls_verify = false` over LDAPS is refused in every case.
+`ad_tls_verify = false` over LDAPS is refused in every case. The AI broker is the same: it refuses
+an empty `[ai].api_key`, so every call sends the key, and a plain `http` endpoint is refused in
+every case.
 
 **The rule does not reach every hop yet.** At least these still send a credential to a peer the
 engine has not verified, when the lever named beside each is set:
 
 - an HTTP-family credential over plain `http`, under `cleartext_accepted` or `tls_hop_attested`;
-- an HTTP-family secret the refusal cannot see as a credential, on a `verify_tls = false` hop or
-  over plain `http`, under that hop's own levers. That covers at least a static header with a
-  neutral name, such as `X-Session`, and a secret in the path of the `url`. The test for a
-  credential header reads the header's name, and the `url` test reads only its query;
+- an HTTP-family secret in the `url` that the refusal cannot see as a credential, on a
+  `verify_tls = false` hop or over plain `http`, under that hop's own levers. That covers at least a
+  query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
+  like a credential. A secret anywhere in the path crosses unrefused too. A path secret cannot be
+  told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
+- an HTTP-family static header with a neutral name, such as `X-Session`, over plain `http`, under
+  that hop's own levers. The header allowlist applies on `verify_tls = false` hops only;
+- a secret that is not credential-shaped under an allowlisted header name, such as an opaque token
+  in `X-Request-ID`, on a `verify_tls = false` hop. The allowlist reads names, and the value test
+  knows only auth-scheme prefixes and JWTs;
 - the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;
 - the AD binds over plain `ldap://`, under `ad_allow_insecure_ldap = true`;
 - the `[alerts]` SMTP relay login, under `email_tls_verify = false`;
-- the AI broker's `[ai].api_key` over a plain `http` endpoint, and a secret in the path of an
-  alert webhook URL over `http`, each under `MEFOR_ALLOW_INSECURE_TLS` at
+- a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
   `[security].enforcement = warn`;
 - a credential header a Handler stamps per message under `dynamic_headers`, on a `verify_tls =
   false` hop. The refusal reads settings, so it cannot see one.
@@ -1249,9 +1266,16 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   reviewed (BACKLOG #299). **On an instance at `enforcement = warn` it does change something:**
   where the posture reaches the guard, it turns the warning into a silent crossing, and no line
   is logged. The shared rule every revocation guard decides by ranks it so.
-- **Named gap, the proxy leg:** through an `https://` proxy the hop has a second TLS leg, to the
-  proxy. Nothing checks revocation of the proxy's certificate, and this attestation does not
-  claim it. The Vault leg's own TLS, inside the tunnel, is what protects the token.
+- **The proxy leg is guarded too, and this attestation covers it (vault BACKLOG #3561):** through
+  an `https://` proxy the hop has a second TLS leg, to the proxy. The Vault leg's own TLS, inside
+  the tunnel, still protects the token. But proxy credentials and the Vault host name cross the
+  proxy leg, and nothing on the wire checks revocation of the proxy's certificate either. That
+  leg is judged under the same rule as the Vault leg, before its socket opens. So when you set
+  the flag on a hop that goes through an `https://` proxy, the reason must cover the proxy's
+  certificate as well as the Vault server's. A proxy on a loopback address does not lift this:
+  the Vault leg still counts any proxied hop as off the box. Under `warn` an unattested leg
+  crosses with a WARNING of its own, unless `MEFOR_TLS_REVOCATION_ATTESTED` is set, which makes
+  that crossing silent.
 - **How it is reported:** at least five ways. `security_loosenings()` names it as
   `store.vault_revocation_attested` or `secrets.vault_revocation_attested`, with the reason, so
   `messagefoundry security show` and `GET /security/posture` list it. The serve-time loosening
@@ -1752,8 +1776,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
     caller who can restart the engine adds a read at each start and stop.
   - **No file name.** The injecting process chooses the script's name, so neither the row nor
     the alert carries it. The engine's log output can still hold the name. Usually it is in the
-    refusal's WARNING line, bounded and escaped. In the case below where the guard reads as
-    missing, the interpreter writes the full path to standard error instead. Some refusals have
+    refusal's WARNING line, bounded and escaped. Where another audit hook refuses the script
+    ahead of the guard, as a point below says, the interpreter writes the full path to standard
+    error instead. Some refusals have
     no line with the name at all. At least these do: one past the backlog of 64, one still
     waiting to be logged when the process exits, and every one where the thread that writes the
     lines could not start.
@@ -1830,20 +1855,41 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `pythonw -m messagefoundry.tray`, has the interface on. That process hands over to the branded
   relaunch. Where branding is unavailable, or the branded child exits at once, it runs the whole
   tray itself with the interface on.
-- **`remote_debug_unguarded`: the interface is on, and the hook is not installed.** A process the
-  operating system lets attach could run Python inside the engine, with the store key, the
-  connection secrets and the messages in flight. An application that builds the API without
-  `serve` reports this, until something in it imports the command-line module, which installs
-  the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
-  in at least two cases. Both need an audit hook that something else added to the process first.
-  In one, that hook refused the engine's, so the engine's hook is missing and an injected script
-  runs. In the other, that hook raises on the event the engine uses to ask whether its own hook
-  is there. The engine's hook is then in place and refuses a script, but the entry still reads
-  as unguarded. A refusal in that state writes no WARNING, and the entry shows no count of
-  refusals. The interpreter reports each one on standard error, with the script's full path.
-  The refusal is still counted, so under `serve` the `remote_debug_refused` audit row and alert
-  still come. In the first case nothing is refused, so there is no row and no alert. The entry cannot tell the two cases apart, so read
-  it as the first, and look for what else in the process adds an audit hook.
+- **`remote_debug_unguarded`: the interface is on, and the hook did not answer.** Read it as the
+  hook not installed: a process the operating system lets attach could run Python inside the
+  engine, with the store key, the connection secrets and the messages in flight. An application
+  that builds the API without `serve` reports this, until something in it imports the
+  command-line module, which installs the hook. `messagefoundry/api/tls.py` does that when it
+  writes a key. `serve` would report it in at least two cases. Both need an audit hook that
+  something else added to the process first. In one, that hook refused the engine's, so the
+  engine's hook is missing and an injected script runs. Nothing is refused, so there is no
+  WARNING, no row and no alert. In the other, that hook raises on the event the engine uses to
+  ask whether its own hook is there. The engine's hook is then usually in place and refuses a
+  script, but the entry still reads as unguarded. Where that hook also refused the engine's, as
+  in the first case, the engine's hook is missing and nothing is refused, and the engine cannot
+  tell that from its hook being in. A refusal in the second case is logged as a WARNING and
+  counted like any other, so under `serve` the `remote_debug_refused` audit row and alert come
+  too (vault BACKLOG #3463). Once a refusal is counted, the entry as `GET /security/posture`
+  reads it carries the count, which the first case cannot produce. The serve-time warning is
+  read once, at start, so it carries a count only for a refusal before then. A count says
+  the hook was in at some point, not that it still is, so read the entry as missing either way.
+  In either case a later install call adds the hook again. So a hook the other one refused at
+  import still goes in if that hook stops refusing by the time `serve` or `supervise` makes its
+  own call. In the first case nothing stacks, because the interpreter dropped the hook. In the
+  second a copy can stack, one per install call, and nothing else bounds them. `serve` and
+  `supervise` make at least two calls, at import and then as each starts. Under `python -m`, the
+  `api/tls.py` import above runs the import-time call again, and an application makes one per
+  call it adds. A stacked copy changes no count: the first copy refuses the script, and the
+  interpreter asks no hook after one that raised. Each copy does run on every other audited
+  event, so the hook's per-event cost is paid once per copy. Without a count,
+  the entry cannot tell the cases apart, so read it as the first, and look for what else in the
+  process adds an audit hook.
+- **An audit hook added earlier can refuse a script ahead of the engine's, in any state.** Where
+  it raises on the interpreter's injection event, it refuses the script itself and the engine's
+  hook is never asked, whichever entry the engine reports. The script does not run, but there is
+  no WARNING, no count, no row and no alert, and the interpreter writes the script's full path on
+  standard error. The engine leaves that line, as it is the other hook's and the only record of
+  the refusal.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
   It logs the line a second time once its off-box log forwarder is installed, so the collector's
@@ -2014,9 +2060,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **`service_environment_secret`: another engine secret is in that list.** The entry names each
   one it finds: the store password, the AD bind password, the OIDC client secret, the OIDC
   signing key and its passphrase, the SMTP password, the API TLS key passphrase, both Vault
-  tokens and the AI key. The same ruling would refuse them. No protected way in exists for them
-  yet, so a refusal would leave a Windows service no way to start with one, and the entry names
-  them instead. Refusing them waits on that way in.
+  tokens and the AI key. The same ruling would refuse them. The protected way in is the secrets
+  directory that `MEFOR_SECRETS_DIRECTORY` names, one restricted file per setting
+  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)): move each
+  one there and remove it from the list. A secret left in the list is still named and not refused;
+  the refusal is later work under vault BACKLOG #2595.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. A key in the service's own

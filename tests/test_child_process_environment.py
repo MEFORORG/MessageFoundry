@@ -31,19 +31,22 @@ import types
 from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 
 import messagefoundry
 from messagefoundry import _child_bootstrap, childenv
 from messagefoundry.config import settings
 from messagefoundry.config.environments import VALUE_ENV_PREFIX
 from messagefoundry.config.run_context import RunContext
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry, load_config
-from messagefoundry.pipeline import dr, supervisor
+from messagefoundry.pipeline import Engine, dr, supervisor
 from messagefoundry.pipeline import sandbox as sandbox_mod
 from messagefoundry.pipeline.dryrun import transform_one
+from messagefoundry.store import MessageStore
 from tests.test_dangerous_functionality_doc import (
     _ARGV,
     _ATTRIBUTE_STARTS,
@@ -246,23 +249,67 @@ def _dump_environment_command(target: Path) -> str:
     return f"env > '{target}'"
 
 
+#: A name the operator lists in ``[dr].pass_environment``, such as a cloud profile.
+_PASSED = "OPERATOR_HOOK_PROFILE"
+
+
+async def _hook_sees(tmp_path: Path, pass_environment: tuple[str, ...]) -> set[str]:
+    """The upper-cased names a real hook, run by the real ``_run_command``, finds in its own
+    environment."""
+    target = tmp_path / "hook-environment.txt"
+    command = _dump_environment_command(target)
+    assert await dr._run_command(command, pass_environment=pass_environment) is True
+    lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    return {line.split("=", 1)[0].upper() for line in lines if "=" in line}
+
+
 @pytest.mark.asyncio
-async def test_a_dr_hook_keeps_ordinary_variables_and_gets_none_of_the_engines(
+async def test_a_dr_hook_gets_its_allowlist_and_nothing_the_operator_did_not_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for name in (*_SECRET_NAMES, _ORDINARY):
+    for name in (*_SECRET_NAMES, _ORDINARY, _PASSED):
         monkeypatch.setenv(name, _MARKER)
-    target = tmp_path / "hook-environment.txt"
 
-    assert await dr._run_command(_dump_environment_command(target)) is True
+    seen = await _hook_sees(tmp_path, pass_environment=(_PASSED,))
 
-    lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
-    seen = {line.split("=", 1)[0].upper() for line in lines if "=" in line}
-    # Control: an operator's own variable reaches the hook, so the file is a real environment dump.
-    assert _ORDINARY in seen
-    assert "PATH" in seen
+    # Controls: a start-up name and the passed name reach the hook, so the file is a real dump and
+    # a name can cross. On Windows a shell's machine-layout name crosses too.
+    assert {"PATH", _PASSED} <= seen
+    if sys.platform == "win32":
+        assert "PROGRAMFILES" in seen
+    # An ordinary variable nobody listed does not, which is what makes this an allowlist.
+    assert _ORDINARY not in seen
     assert seen & _SECRET_NAMES == set()
     assert [name for name in seen if name.startswith(childenv.ENGINE_ENV_PREFIX)] == []
+
+
+async def _never_awaited() -> None:
+    raise AssertionError("running a hook must not apply or release the run-profile")
+
+
+@pytest.mark.asyncio
+async def test_the_coordinator_hands_the_hook_the_dr_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``[dr].pass_environment`` reaches ``_run_command`` from the coordinator that runs a hook,
+    in both phases."""
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    async def fake_run_command(command: str, **kwargs: Any) -> bool:
+        calls.append((command, tuple(kwargs["pass_environment"])))
+        return True
+
+    monkeypatch.setattr(dr, "_run_command", fake_run_command)
+    coordinator = dr.DrCoordinator(
+        cast(Any, None),  # never read: running a hook touches no store
+        settings.DrSettings(enabled=True, pass_environment=(_PASSED,)),
+        store_settings=None,
+        activate_profile=_never_awaited,
+        deactivate_profile=_never_awaited,
+    )
+    for phase in ("takeover", "release"):
+        assert await coordinator._run_vip_hook("hook", phase=phase, actor="t", now=0.0) is True
+    assert calls == [("hook", (_PASSED,)), ("hook", (_PASSED,))]
 
 
 # --- the builders -------------------------------------------------------------------------------
@@ -316,6 +363,35 @@ def test_a_system_tool_gets_the_platforms_start_up_names_and_nothing_else() -> N
     assert spelled == expected
 
 
+def test_a_system_tool_extra_name_crosses_and_no_interpreter_variable_does() -> None:
+    """``openssl`` reads its own variables and no Python one (BACKLOG #3803 item 5). A name in the
+    engine's namespace or the interpreter's is refused, since a system tool reads neither."""
+    parent = {**_parent_environment(), "OPENSSL_CONF": "/etc/x.cnf", "PYTHONUTF8": "1"}
+    env = childenv.system_tool_environment(parent, extra_names=("OPENSSL_CONF",))
+    assert env == {"PATH": "/usr/bin", "TZ": "UTC", "OPENSSL_CONF": "/etc/x.cnf"}
+    for refused in ("MEFOR_STORE_KEY", "VAULT_TOKEN", "PYTHONPATH"):
+        with pytest.raises(ValueError, match=refused):
+            childenv.system_tool_environment(parent, extra_names=(refused,))
+    with pytest.raises(TypeError):
+        childenv.system_tool_environment(parent, extra_names="OPENSSL_CONF")
+
+
+def test_a_system_tool_pin_replaces_the_inherited_value() -> None:
+    """The cipher probe's PowerShell gets a fixed ``PATH`` and ``PSModulePath`` whatever the
+    operator's shell holds (BACKLOG #3803 S1). Set through the builder, not on its result, which
+    the static guard below would refuse (vault BACKLOG #2724)."""
+    parent = {**_parent_environment(), "PSModulePath": "/srv/operator/Modules"}
+    env = childenv.system_tool_environment(parent, pinned={"PATH": "/sys", "PSModulePath": "/m"})
+    assert env == {"PATH": "/sys", "TZ": "UTC", "PSModulePath": "/m"}
+    if sys.platform == "win32":
+        # One variable whatever its spelling, as Windows reads it: the pin is the only PATH left.
+        spelled = childenv.system_tool_environment({"Path": "x"}, pinned={"PATH": "/sys"})
+        assert spelled == {"PATH": "/sys"}
+    for refused in ("MEFOR_STORE_KEY", "PGPASSWORD", "PYTHONPATH"):
+        with pytest.raises(ValueError, match=refused):
+            childenv.system_tool_environment(parent, pinned={refused: "x"})
+
+
 def test_a_variable_that_only_looks_like_the_interpreters_or_the_locales_does_not_cross() -> None:
     """The allowlist is names, not prefixes: an operator's own variable can start with the same
     letters as an interpreter or a locale variable."""
@@ -332,18 +408,129 @@ def test_an_extra_name_crosses_and_nothing_else_in_the_engine_namespace_does() -
         childenv.worker_environment(_parent_environment(), extra_names=switch)
 
 
-def test_the_operator_page_names_each_library_secret_the_hook_loses() -> None:
-    """The ``[dr]`` rows state the rule in words an operator reads. Hold them to the code's list."""
+def test_the_operator_page_names_each_library_secret_a_setting_refuses() -> None:
+    """Each ``pass_environment`` row, ``[sandbox]``'s and ``[dr]``'s, states what load refuses in
+    words an operator reads. Hold them to the code's list."""
     repository = Path(__file__).resolve().parents[1]
     page = (repository / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
-    row = next(line for line in page.splitlines() if line.startswith("| `takeover_hook` |"))
+    rows: dict[str, str] = {}
+    section = ""
+    for line in page.splitlines():
+        if line.startswith("### "):
+            section = line.split("`")[1] if "`" in line else line
+        elif line.startswith("| `pass_environment` |"):
+            rows[section] = line
+    assert {"[sandbox]", "[dr]"} <= set(rows)
     assert childenv.ENGINE_SECRETS_OUTSIDE_THE_PREFIX == _LIBRARY_FALLBACK_SECRETS
-    assert [name for name in sorted(_LIBRARY_FALLBACK_SECRETS) if f"`{name}`" not in row] == []
+    # Walk the names first: test_vacuous_absence_assert_lint counts only a comprehension's first
+    # loop, and this guard is what keeps `missing == []` from passing over no names at all.
+    assert _LIBRARY_FALLBACK_SECRETS
+    missing = [
+        (section, name)
+        for name in sorted(_LIBRARY_FALLBACK_SECRETS)
+        for section in ("[sandbox]", "[dr]")
+        if f"`{name}`" not in rows[section]
+    ]
+    assert missing == []
 
 
-def test_the_hook_environment_drops_the_engine_namespace_and_nothing_else() -> None:
+def test_the_hook_environment_is_an_allowlist() -> None:
+    """Nothing crosses that nobody named: not a secret, not an ordinary variable, not an
+    interpreter variable. The control is the same parent through the deny-list, which keeps the
+    ordinary variable, so the parent really held it."""
     parent = _parent_environment()
-    env = childenv.hook_environment(parent)
+    assert childenv.hook_environment(parent) == {"PATH": "/usr/bin", "TZ": "UTC"}
+    assert childenv.non_engine_environment(parent)[_ORDINARY] == _MARKER
+
+
+def test_a_name_the_operator_passes_reaches_the_hook() -> None:
+    env = childenv.hook_environment(_parent_environment(), extra_names=(_ORDINARY,))
+    assert env == {"PATH": "/usr/bin", "TZ": "UTC", _ORDINARY: _MARKER}
+    with pytest.raises(TypeError):
+        childenv.hook_environment(_parent_environment(), extra_names=_ORDINARY)
+
+
+@pytest.mark.parametrize("name", [*sorted(_SECRET_NAMES), "mefor_store_password"])
+def test_the_hook_builder_refuses_an_engine_name_passed_to_it(name: str) -> None:
+    """Settings load refuses these first. The builder refuses them too, so a caller that skipped
+    settings cannot hand a hook a secret."""
+    with pytest.raises(ValueError, match="engine's own variable"):
+        childenv.hook_environment(_parent_environment(), extra_names=(name,))
+
+
+def test_a_windows_hook_gets_the_machine_layout_names_a_tool_does_not() -> None:
+    parent = {"PATH": "x", "ProgramFiles": "C:\\Program Files", "PSModulePath": "y"}
+    hook = childenv.hook_environment(parent)
+    if sys.platform == "win32":
+        assert hook == {"PATH": "x", "ProgramFiles": "C:\\Program Files"}
+    else:
+        assert hook == {"PATH": "x"}
+    # The control: a fixed system tool does not get the shell's names.
+    assert childenv.system_tool_environment(parent) == {"PATH": "x"}
+
+
+def test_the_hook_builder_refuses_an_engine_name_from_a_one_shot_iterable() -> None:
+    """The refusal reads the same pass over the names that lets them in, so an iterator cannot
+    slip one past it."""
+    with pytest.raises(ValueError, match="engine's own variable"):
+        childenv.hook_environment(_parent_environment(), extra_names=iter(("VAULT_TOKEN",)))  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_a_listed_name_that_is_not_set_is_logged_by_name(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The hook's output is discarded, so this is the one place the cause of a failed hook can
+    show. The control is the same name set, which logs nothing."""
+    monkeypatch.delenv(_PASSED, raising=False)
+    with caplog.at_level("WARNING", logger=dr.log.name):
+        assert await dr._run_command("exit 0", pass_environment=(_PASSED,)) is True
+    assert [r.getMessage() for r in caplog.records if _PASSED in r.getMessage()] != []
+    caplog.clear()
+    monkeypatch.setenv(_PASSED, _MARKER)
+    with caplog.at_level("WARNING", logger=dr.log.name):
+        assert await dr._run_command("exit 0", pass_environment=(_PASSED,)) is True
+    assert [r for r in caplog.records if _PASSED in r.getMessage()] == []
+    assert _MARKER not in caplog.text
+
+
+def test_only_the_dependency_auditor_calls_the_deny_list() -> None:
+    """``non_engine_environment`` lets a secret under any other name cross, so the spawn guard's
+    trust in it is pinned to its one caller. The control plants a second caller."""
+    # Every tree the spawn guard reads, the web console included.
+    sources = _scanned_sources()
+    target = "messagefoundry.childenv.non_engine_environment"
+
+    def refers(source: str) -> bool:
+        # Any reference, called or not, through any import alias: the spawn guard resolves
+        # aliases, so this must too.
+        tree = ast.parse(source)
+        aliases = _aliases(tree)
+        return any(
+            _dotted(node, aliases) == target
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name | ast.Attribute)
+        )
+
+    def callers(tree: Mapping[str, str]) -> set[str]:
+        return {module for module, source in tree.items() if refers(source)}
+
+    assert callers(sources) == {"security/audit_all_platforms.py"}
+    planted = {
+        **sources,
+        "pipeline/a.py": "from messagefoundry.childenv import non_engine_environment as e\n"
+        "env = e()\n",
+        "pipeline/b.py": "from messagefoundry import childenv\n"
+        "env = childenv.non_engine_environment()\n",
+    }
+    expected = {"security/audit_all_platforms.py", "pipeline/a.py", "pipeline/b.py"}
+    assert callers(planted) == expected
+
+
+def test_the_non_engine_environment_drops_the_engine_namespace_and_nothing_else() -> None:
+    """The dependency auditor's deny-list (``security/audit_all_platforms.py``)."""
+    parent = _parent_environment()
+    env = childenv.non_engine_environment(parent)
     dropped = set(parent) - set(env)
     assert dropped == {
         n
@@ -354,12 +541,97 @@ def test_the_hook_environment_drops_the_engine_namespace_and_nothing_else() -> N
     assert env[_ORDINARY] == _MARKER
 
 
-def test_the_hook_environment_ignores_the_case_of_the_engine_prefix() -> None:
+def test_the_non_engine_environment_ignores_the_case_of_the_engine_prefix() -> None:
     """Windows treats a variable's name as case-insensitive, so the lower-case spelling is the same
     variable there."""
-    assert childenv.hook_environment({"mefor_store_password": _MARKER, "Path": "x"}) == {
+    assert childenv.non_engine_environment({"mefor_store_password": _MARKER, "Path": "x"}) == {
         "Path": "x"
     }
+
+
+def test_dr_pass_environment_is_refused_at_load(tmp_path: Path) -> None:
+    """Through the loader, from a file and from the environment, with an ordinary name as the
+    control that the same path loads."""
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text('[dr]\npass_environment = ["VAULT_TOKEN"]\n', encoding="utf-8")
+    with pytest.raises(ValidationError, match="dr.pass_environment"):
+        settings.load_settings(config_path=path, environ={})
+    path.write_text(f'[dr]\npass_environment = ["{_PASSED}"]\n', encoding="utf-8")
+    loaded = settings.load_settings(config_path=path, environ={})
+    assert loaded.dr.pass_environment == (_PASSED,)
+    environ = {"MEFOR_DR_PASS_ENVIRONMENT": f"{_PASSED},PGPASSWORD"}
+    with pytest.raises(ValidationError, match="dr.pass_environment"):
+        settings.load_settings(config_path=path, environ=environ)
+    # The control for the environment layer: the same variable with an ordinary name loads.
+    environ = {"MEFOR_DR_PASS_ENVIRONMENT": f"{_PASSED},OTHER_NAME"}
+    loaded = settings.load_settings(config_path=path, environ=environ)
+    assert loaded.dr.pass_environment == (_PASSED, "OTHER_NAME")
+
+
+_EGRESS = EgressSettings(deny_by_default=False)
+
+
+@pytest.mark.asyncio
+async def test_the_engine_warns_at_construction_about_an_unset_listed_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Before the disaster: the coordinator that runs a hook is built only at the first activate,
+    so the engine itself checks. No hook configured is the control."""
+    monkeypatch.delenv(_PASSED, raising=False)
+    store = await MessageStore.open(tmp_path / "dr-env.db")
+    try:
+        for hook, expected in (("", False), ("exit 0", True)):
+            caplog.clear()
+            dr_settings = settings.DrSettings(
+                enabled=True, pass_environment=(_PASSED,), takeover_hook=hook
+            )
+            with caplog.at_level("WARNING", logger=dr.log.name):
+                Engine(store, config_dir=None, dr_settings=dr_settings, egress_settings=_EGRESS)
+            assert (_PASSED in caplog.text) is expected
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_hook_points_at_the_setting(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The hook's output is discarded, so its failure names the allowlist as a suspect. The control
+    is a hook that succeeds, which logs nothing."""
+
+    async def failing(command: str, **kwargs: Any) -> bool:
+        return command != "fails"
+
+    monkeypatch.setattr(dr, "_run_command", failing)
+    coordinator = dr.DrCoordinator(
+        cast(Any, None),
+        settings.DrSettings(enabled=True),
+        store_settings=None,
+        activate_profile=_never_awaited,
+        deactivate_profile=_never_awaited,
+    )
+    with caplog.at_level("WARNING", logger=dr.log.name):
+        await coordinator._run_vip_hook("works", phase="release", actor="t", now=0.0)
+        assert "[dr].pass_environment" not in caplog.text
+        await coordinator._run_vip_hook("fails", phase="release", actor="t", now=0.0)
+    assert "[dr].pass_environment" in caplog.text
+
+
+def test_a_secret_reference_may_not_be_passed_on(tmp_path: Path) -> None:
+    """Under ``[secrets].provider = "env"`` the engine reads a reference's variable as a secret, so
+    neither setting may hand it to a child. The control is the same file under another provider."""
+    path = tmp_path / "messagefoundry.toml"
+    for section in ("dr", "sandbox"):
+        text = (
+            '[auth]\nad_bind_password_secret = "SITE_BIND_PW"\n'
+            f'[{section}]\npass_environment = ["SITE_BIND_PW"]\n'
+        )
+        path.write_text('[secrets]\nprovider = "env"\n' + text, encoding="utf-8")
+        with pytest.raises(ValueError, match=f"{section}.pass_environment: SITE_BIND_PW"):
+            settings.load_settings(config_path=path, environ={})
+        path.write_text(text, encoding="utf-8")
+        loaded = settings.load_settings(config_path=path, environ={})
+        assert getattr(loaded, section).pass_environment == ("SITE_BIND_PW",)
 
 
 def test_an_engine_shard_keeps_every_variable() -> None:
@@ -780,6 +1052,7 @@ _BUILDERS = frozenset(
     for name in (
         "worker_environment",
         "hook_environment",
+        "non_engine_environment",
         "engine_environment",
         "system_tool_environment",
     )
@@ -844,11 +1117,13 @@ _MUST_CHOOSE = frozenset(
         ("service.py", "service_state", "subprocess.run"),
         ("service_status.py", "_query", "subprocess.run"),
         # verify's host cipher policy probes (BACKLOG #3277): PowerShell by its pinned path takes
-        # the start-up names; openssl takes worker_environment, which adds the interpreter's
-        # PYTHON* names, plus the OPENSSL_* names OpenSSL reads (OPENSSL_CONF).
+        # the start-up names, with PATH and PSModulePath pinned; openssl takes the start-up names
+        # plus the OPENSSL_* names OpenSSL reads (OPENSSL_CONF), and no PYTHON* name (#3803).
+        # Both openssl runs, the suite list and the OPENSSLDIR read, start in _openssl_lines.
         ("verify/cipher_policy.py", "_windows_enabled_suites", "subprocess.run"),
-        ("verify/cipher_policy.py", "_openssl_suites", "subprocess.run"),
-        # The dependency auditor's pip and pip-audit, with hook_environment: no MEFOR_* secret.
+        ("verify/cipher_policy.py", "_openssl_lines", "subprocess.run"),
+        # The dependency auditor's pip and pip-audit, with non_engine_environment: no MEFOR_*
+        # secret.
         ("security/audit_all_platforms.py", "_run", "subprocess.run"),
     }
 )

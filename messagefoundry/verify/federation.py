@@ -306,7 +306,6 @@ def _serve_crossing(settings: ServiceSettings, exc: Exception) -> str | None:
     disposition = revocation_hop_disposition(
         enforcing=posture.enforcing,
         is_loopback_hop=False,
-        proxy_proven=False,
         attested=False,
         crl_checked=False,
     )

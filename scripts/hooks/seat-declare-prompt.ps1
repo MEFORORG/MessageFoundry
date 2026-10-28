@@ -99,6 +99,7 @@ try {
 
     $sessionId = ''
     $sessionName = ''
+    $source = ''
     if ($raw) {
         try {
             $payload = $raw | ConvertFrom-Json -ErrorAction Stop
@@ -107,6 +108,9 @@ try {
                     $sessionId = [string]$payload.$f; break
                 }
             }
+            # startup, resume, clear or compact. seat.ps1 hands the worktree lock to the new id on the
+            # last three (BACKLOG #2524).
+            if ($payload.PSObject.Properties.Name -contains 'source' -and $payload.source) { $source = [string]$payload.source }
             foreach ($f in 'name', 'session_name') {
                 if ($payload.PSObject.Properties.Name -contains $f -and $payload.$f) {
                     $sessionName = [string]$payload.$f; break
@@ -127,6 +131,7 @@ try {
     $args = @('-NoProfile', '-File', $seat, '-Prompt')
     if ($sessionId) { $args += @('-SessionId', $sessionId) }
     if ($sessionName) { $args += @('-DerivedSeat', $sessionName) }
+    if ($source -match '\A[a-z]+\z') { $args += @('-Source', $source) }
 
     if (-not $cwdFault) {
         $out = & pwsh @args 2>&1

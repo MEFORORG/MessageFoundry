@@ -34,11 +34,14 @@ from messagefoundry.auth.trust_anchors import (
     run_anchor_preflight,
 )
 from messagefoundry.config.settings import (
+    AlertRule,
     AlertsSettings,
     ApiSettings,
     AuthSettings,
     EgressSettings,
+    EscalationTier,
     LoggingSettings,
+    StoreSettings,
     TlsSettings,
 )
 from messagefoundry.store import MessageStore
@@ -55,8 +58,10 @@ async def store(tmp_path: Path):
 
 @pytest.fixture(autouse=True)
 def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test starts with no consumer load recorded (BACKLOG #2185), whatever ran before it."""
+    """Each test starts with no consumer load recorded (BACKLOG #2185), and no open-time warning
+    (BACKLOG #3714), whatever ran before it."""
     monkeypatch.setattr(ta, "_LOADED", {})
+    monkeypatch.setattr(ta, "_WARNED_AT_OPEN", {})
 
 
 def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[AnchorSpec]:
@@ -67,6 +72,7 @@ def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[
         tls=TlsSettings(),
         alerts=AlertsSettings(),
         log_settings=LoggingSettings(),
+        store=StoreSettings(),
     )
 
 
@@ -694,7 +700,7 @@ def test_group_writable_refusal_carries_its_own_fix(
         assert any(line.startswith(f"Then run icacls {q} again.") for line in lines)
     else:
         assert f"  chmod go-w {shlex.quote(str(p))}" in lines
-    assert lines[-1] == "[security].enforcement=enforce refuses to start"
+    assert lines[-1] == "[security].enforcement=enforce refuses it"
 
 
 @_windows_only
@@ -752,7 +758,7 @@ def test_indeterminate_dacl_refuses_at_enforce_and_names_both_fixes(
     assert "move the anchor" in text
     assert "set [api].tls_client_ca_pin to" in text
     assert hashlib.sha256(b"body").hexdigest() in text
-    assert "enforce refuses to start" in text and text.isascii()
+    assert "enforce refuses it" in text and text.isascii()
 
 
 def test_indeterminate_dacl_with_a_matching_pin_loads_with_a_warning(
@@ -789,7 +795,7 @@ def test_indeterminate_dacl_warns_at_warn(
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     assert enforce_anchor(AnchorSpec("t", "[x]", str(p), None), enforcing=False)
-    assert "could not settle" in caplog.text and "starting anyway" in caplog.text
+    assert "could not settle" in caplog.text and "using it anyway" in caplog.text
     assert "pin it to" in caplog.text  # no pin setting named, so the generic spelling
 
 
@@ -2110,8 +2116,10 @@ def _byte_order_mark_before_the_block() -> bytes:
 
 def _encrypted_key_beside_the_certificate() -> bytes:
     """Manager decision: a key block with a legacy encryption header refuses too, though cadata=
-    loads the certificate beside it, since the header is refused in a block of any label. A PKCS#8
-    ENCRYPTED PRIVATE KEY block, or a plain key block, has no such header and is not refused."""
+    loads the certificate beside it, since the header is refused in a block of any label. It is
+    refused by the header check, with that check's text, before the private-key check of BACKLOG
+    #3745 reads it; a PKCS#8 ENCRYPTED PRIVATE KEY block, or a plain key block, has no such header
+    and is refused by that later check instead (the #3745 tests below)."""
     label = b"RSA PRIVATE" + b" KEY"  # split, so the secret scanner does not read a real key
     key = b"-----BEGIN " + label + b"-----\n" + _ENCRYPTED + b"AAAA\n-----END " + label + b"-----\n"
     return _real_ca("crl-test-ca")[0] + key
@@ -2249,6 +2257,131 @@ def test_the_vault_hop_states_the_same_scope() -> None:
         and isinstance(stmt.value, ast.Constant)
     ]
     assert value == ta.ENCRYPTION_HEADER_SCOPE
+
+
+# --- BACKLOG #3745: a private-key block in a trust anchor refuses (a Manager decision) ------------
+#
+# Every label is split in the source and every body is fake, so no committed byte reads as a key.
+
+_PRIVATE = "PRIVATE" + " KEY"
+_KEY_LABELS = [_PRIVATE, "ENCRYPTED " + _PRIVATE, "RSA " + _PRIVATE, "EC " + _PRIVATE]
+_NON_ASCII = b"\xc3\xa9 "  # a UTF-8 e-acute and a space
+
+
+def _key_block(label: str) -> bytes:
+    return f"-----BEGIN {label}-----\nAAAA\n-----END {label}-----\n".encode("ascii")
+
+
+@pytest.mark.parametrize("label", _KEY_LABELS)
+@pytest.mark.parametrize("first", [False, True], ids=["after the certificate", "before it"])
+def test_a_private_key_block_in_an_anchor_refuses(
+    monkeypatch: pytest.MonkeyPatch, label: str, first: bool
+) -> None:
+    """Red with the private-key check removed from anchor_cadata: cadata= skips the key block and
+    loads the certificate beside it. The refusal names the setting and never the content."""
+    cert = _real_ca("crl-test-ca")[0]
+    data = _key_block(label) + cert if first else cert + _key_block(label)
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    with pytest.raises(TrustAnchorError) as err:
+        ta.anchor_cadata(data, spec)
+    text = str(err.value)
+    assert ta.PRIVATE_KEY_SCOPE in text and "[api].tls_client_ca_file" in text
+    assert "AAAA" not in text
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        # OpenSSL finds a BEGIN after 254 bytes of one line, so a line-start check would miss it.
+        pytest.param(
+            lambda: _real_ca("crl-test-ca")[0] + b"#" * 254 + _key_block(_PRIVATE),
+            id="BEGIN after 254 bytes",
+        ),
+        # The check errs wide, as the header check does, and the text says so.
+        pytest.param(
+            lambda: _real_ca("crl-test-ca")[0] + f"# no {_PRIVATE}----- here\n".encode(),
+            id="label in a comment after the last END",
+        ),
+        # A non-ASCII line is dropped from the cadata= text, but the check reads the bytes. Both
+        # the BEGIN and the END line are non-ASCII, so a check of the kept text finds no label.
+        pytest.param(
+            lambda: (
+                _real_ca("crl-test-ca")[0]
+                + _NON_ASCII
+                + _key_block(_PRIVATE).replace(b"-----END", _NON_ASCII + b"-----END")
+            ),
+            id="key on a non-ASCII line",
+        ),
+        pytest.param(lambda: _real_ca("crl-test-ca")[0] + _key_block(_PRIVATE.lower()), id="lower"),
+    ],
+)
+def test_a_private_key_label_refuses_in_the_shapes_a_line_check_misses(
+    monkeypatch: pytest.MonkeyPatch, shape: Any
+) -> None:
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    with pytest.raises(TrustAnchorError) as err:
+        ta.anchor_cadata(shape(), spec)
+    assert ta.PRIVATE_KEY_SCOPE in str(err.value)
+
+
+def test_a_certificate_only_anchor_still_loads() -> None:
+    """The control: two plain certificates, with a key-like word that is not a label above and
+    between them, still load."""
+    data = (
+        b"# the CA, not its PRIVATE KEY\n"
+        + _real_ca("crl-test-ca")[0]
+        + f"# the second CA; its {_PRIVATE} stays with its owner\n".encode()
+        + _real_ca("second-ca")[0]
+    )
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    assert ta.anchor_cadata(data, spec) == data.decode()
+    assert not ta.has_private_key_label(data.decode())
+    assert not ta.has_private_key_label(_key_block(_PRIVATE).decode().replace("-----BEGIN ", ""))
+
+
+async def test_a_cafile_anchor_refuses_a_key_and_still_takes_a_trusted_block(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An anchor whose hop loads cafile= (loads_verified_bytes False) skips the shape check, so a
+    TRUSTED CERTIFICATE block still passes it, but a key block refuses (BACKLOG #3745). Red with
+    the private-key check removed from _preflight_one."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+
+    def spec(body: bytes, name: str) -> AnchorSpec:
+        path = tmp_path / name
+        path.write_bytes(body)
+        return AnchorSpec(
+            "tls_internal_ca", "[tls].internal_ca_file", str(path), loads_verified_bytes=False
+        )
+
+    keyed = spec(_real_ca("crl-test-ca")[0] + _key_block("EC " + _PRIVATE), "keyed.pem")
+    with pytest.raises(TrustAnchorError) as err:
+        await run_anchor_preflight([keyed], store, enforcing=True)
+    assert ta.PRIVATE_KEY_SCOPE in str(err.value) and "[tls].internal_ca_file" in str(err.value)
+    assert "pem_refused" in {r["event"] for r in await _rows(store, "tls_internal_ca")}
+    # The control: the shape check stays off for this anchor.
+    trusted = spec(b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n", "trusted.pem")
+    await run_anchor_preflight([trusted], store, enforcing=True)
+
+
+def test_the_vault_hop_states_the_same_private_key_scope() -> None:
+    """The twin of :func:`test_the_vault_hop_states_the_same_scope` for BACKLOG #3745."""
+    import ast
+
+    import messagefoundry.transports as transports
+
+    source = (Path(transports.__file__).parent / "strict_requests.py").read_text(encoding="utf-8")
+    (value,) = [
+        stmt.value.value
+        for stmt in ast.parse(source).body
+        if isinstance(stmt, ast.Assign)
+        and any(isinstance(n, ast.Name) and n.id == "_PRIVATE_KEY_CA_TEXT" for n in stmt.targets)
+        and isinstance(stmt.value, ast.Constant)
+    ]
+    assert value == ta.PRIVATE_KEY_SCOPE
 
 
 def _ran(returncode: int, stdout: str | None, stderr: str = "") -> Any:
@@ -2517,6 +2650,7 @@ def _dialling_specs(
         tls=TlsSettings(**with_ca("internal_ca_file", tls)),
         alerts=AlertsSettings(**with_ca("email_tls_ca_file", alerts)),
         log_settings=LoggingSettings(**with_ca("forward_tls_ca_file", log_settings)),
+        store=StoreSettings(),
     )
 
 
@@ -2908,3 +3042,595 @@ async def test_a_store_fault_on_an_earlier_anchor_does_not_hide_a_later_refusal(
         await preflight()
     assert isinstance(err.value.__cause__, TrustAnchorError)
     assert "[auth].ad_tls_ca_cert_file" in str(err.value)
+
+
+# --- vault BACKLOG #3714 item 1: the SQL Server store pin is a settings anchor ------------------
+
+
+def _sqlserver_pin(tmp_path: Path) -> Path:
+    """A real server certificate, which a SQL Server ``ssl_root_cert`` must be to load."""
+    from messagefoundry import pki
+
+    pin = tmp_path / "db-server.pem"
+    pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])
+    return pin
+
+
+def _store_specs(**store: Any) -> list[AnchorSpec]:
+    """:func:`collect_anchor_specs` with every other section at its default, which names no CA."""
+    base: dict[str, Any] = {"server": "db.example", "database": "mefor", "username": "mefor"}
+    return collect_anchor_specs(
+        AuthSettings(),
+        ApiSettings(),
+        tls=TlsSettings(),
+        alerts=AlertsSettings(),
+        log_settings=LoggingSettings(),
+        store=StoreSettings(**{**base, **store}),
+    )
+
+
+def test_the_sqlserver_store_pin_is_a_settings_anchor(tmp_path: Path) -> None:
+    """Red under: the store section left out of :func:`collect_anchor_specs`. The driver reads the
+    pin by path at each connect, so the spec carries no fingerprint pin and
+    ``loads_verified_bytes=False``."""
+    pin = str(_sqlserver_pin(tmp_path))
+    (spec,) = _store_specs(backend="sqlserver", ssl_root_cert=pin)
+    assert (spec.label, spec.setting, spec.path) == (
+        "store_sqlserver_pin",
+        "[store].ssl_root_cert",
+        pin,
+    )
+    assert spec.pin is None and spec.loads_verified_bytes is False
+
+
+def test_a_postgres_ssl_root_cert_is_not_a_settings_anchor(tmp_path: Path) -> None:
+    """The control for the case above: the same file as a PostgreSQL ``ssl_root_cert`` is not
+    collected, since this check covers the SQL Server pin only (module item 11), and neither is a
+    SQL Server store with no pin. Red under: the backend arm dropped from the store's pin
+    predicate."""
+    pin = str(_sqlserver_pin(tmp_path))
+    assert _store_specs(backend="postgres", ssl_root_cert=pin) == []
+    assert _store_specs(backend="sqlserver") == []
+
+
+async def test_the_sqlserver_store_pin_is_audited_at_start_and_rechecked_at_reload(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's own check at open writes no row, because the store that holds them is not open
+    yet. The settings preflight does: a start writes the ``observed`` row, a reload after a swap
+    writes ``changed``, and a reload after the file becomes writable by others refuses at
+    ``enforce`` with its ``acl_insecure`` row. Red under: the store pin left out of
+    :func:`collect_anchor_specs`, where no row is written and the last reload passes."""
+    from messagefoundry import pki
+    from messagefoundry.config.wiring import WiringError
+
+    acl: dict[str, bool] = {"ok": True}
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: acl["ok"])
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    await run_anchor_preflight(specs, store, enforcing=True)  # the start
+    assert [r["event"] for r in await _rows(store, "store_sqlserver_pin")] == ["observed"]
+    preflight = ta.make_settings_anchor_preflight(specs, store, enforcing=True)
+    assert preflight is not None
+    pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])  # the server's renewed cert
+    assert await preflight() == ()  # the driver reads the file per connect: no restart to report
+    events = [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+    assert sorted(events) == ["changed", "observed"], events
+    acl["ok"] = False
+    with pytest.raises(WiringError, match=r"\[store\]\.ssl_root_cert") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert "acl_insecure" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+
+
+async def test_a_start_at_warn_logs_the_pins_warning_once(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A serve start checks the pin twice: at store open, then in the lifespan preflight. At
+    ``warn`` it logs the warning once, and the preflight still writes its row. The control is the
+    reload after it, which warns again. Red under: the preflight ignoring the open's warning."""
+    import logging
+
+    from messagefoundry import pki
+    from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.store.sqlserver import check_pinned_certificate
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    from messagefoundry.config.settings import StoreBackend
+
+    settings = StoreSettings(
+        backend=StoreBackend.SQLSERVER,
+        server="db.example",
+        database="mefor",
+        username="mefor",
+        ssl_root_cert=str(pin),
+    )
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+
+    def warnings_logged() -> int:
+        return sum("writable by a non-owner" in r.getMessage() for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING, logger=ta.__name__):
+        check_pinned_certificate(settings, posture=HopPosture(enforcing=False))  # the store open
+        await run_anchor_preflight(specs, store, enforcing=False)  # the lifespan
+        assert warnings_logged() == 1
+        assert "acl_insecure" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+        await run_anchor_preflight(specs, store, enforcing=False)  # a reload
+        assert warnings_logged() == 2
+        # The control that can differ: a file swapped between the open and the preflight is a
+        # different verdict, so the preflight warns about it too. Red under: matching on the
+        # label alone, without the verdict.
+        check_pinned_certificate(settings, posture=HopPosture(enforcing=False))
+        pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])
+        await run_anchor_preflight(specs, store, enforcing=False)
+        assert warnings_logged() == 4
+
+
+# --- BACKLOG #3470: the hops built before the audited start check -----------------------------------
+#
+# The forwarder's own checks are in tests/test_supervisor_log_forwarding.py, which runs `serve` and
+# `supervise` with every other gate cleared.
+
+
+class _NotifierBuilt(Exception):
+    """Raised by the stand-in notifier factory, so a test sees the lifespan reach it."""
+
+
+def _smtp_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    start_checked: bool = True,
+    email: bool = True,
+    rules: tuple[AlertRule, ...] = (),
+) -> tuple[Any, list[AlertsSettings]]:
+    """A managed app whose alert notifier dials ``_SMTP`` with a CA, and the ``[alerts]`` each
+    notifier factory call was given. A call with the operator's own settings raises
+    :class:`_NotifierBuilt`, so a lifespan that reaches it stops there; a call with any other
+    settings builds no notifier. ``start_checked=False`` gives the app no anchor specs, as an
+    embedding that checks none. ``email=False`` names no alert recipient, so only the security
+    notices read the CA. Each app also has a webhook."""
+    from messagefoundry.api.app import create_managed_app
+
+    built: list[AlertsSettings] = []
+    ca = str(_pem(tmp_path))
+    smtp = _SMTP if email else {**_SMTP, "email_to": []}
+    operator = AlertsSettings(
+        email_tls_ca_file=ca,
+        webhook_url="https://hooks.example.org/mefor",
+        rules=list(rules),
+        **smtp,
+    )
+
+    def _factory(alerts: AlertsSettings, **kwargs: object) -> None:
+        built.append(alerts)
+        if alerts is operator:
+            raise _NotifierBuilt
+
+    monkeypatch.setattr("messagefoundry.api.app.notifier_from_settings", _factory)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        alerts_settings=operator,
+        trust_anchor_specs=_dialling_specs(ca, alerts=smtp) if start_checked else (),
+        trust_anchors_enforcing=True,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    return app, built
+
+
+def _webhook_only(built: list[AlertsSettings]) -> bool:
+    """Whether the notifier was built once, with the webhook kept and the email transport dropped."""
+    return [(a.webhook_url, a.email_to) for a in built] == [("https://hooks.example.org/mefor", [])]
+
+
+async def test_a_refused_alerts_ca_builds_no_email_transport_and_still_writes_its_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lifespan checks the SMTP hop's CA before it builds the notifier, which sends before the
+    audited start check runs. Red before the fix: the notifier was built with email first. The
+    webhook is kept, so it still pages. The refusal still comes from the audited check, so its
+    row is written."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, built = _smtp_app(tmp_path, monkeypatch)
+    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert _webhook_only(built)
+    reopened = await MessageStore.open(tmp_path / "m.db")
+    try:
+        assert "acl_insecure" in [r["event"] for r in await _rows(reopened, "alerts_email_ca")]
+    finally:
+        await reopened.close()
+
+
+async def test_a_refused_alerts_ca_drops_email_from_every_rule_and_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The notifier refuses a rule or tier that routes to a transport it lacks, so a rule naming
+    email would drop the webhook with it. Red before the fix: the rules reached the factory with
+    email still named."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    rule = AlertRule(
+        transports=["email", "webhook"],
+        escalate=[EscalationTier(after_count=2, transports=["email"])],
+    )
+    # The operator's own suppression stays one: an empty list is not widened.
+    muted = AlertRule(transports=[], escalate=[EscalationTier(after_count=3, transports=[])])
+    app, built = _smtp_app(tmp_path, monkeypatch, rules=(rule, AlertRule(), muted))
+    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert _webhook_only(built)
+    assert [(r.transports, [t.transports for t in r.escalate]) for r in built[0].rules] == [
+        (["webhook"], [["webhook"]]),
+        (None, []),
+        ([], [[]]),
+    ]
+
+
+def test_a_rule_naming_a_missing_transport_still_refuses_with_no_transport_left() -> None:
+    """With no webhook the rules that route only the notifier are dropped, but not a rule naming a
+    transport this instance lacks. The notifier still refuses that rule, so the lifespan logs the
+    error in this start. Red on 84590597630d: every rule was dropped, and the error waited a
+    restart."""
+    from messagefoundry.api.app import _alerts_without_email
+    from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+
+    typo = AlertRule(transports=["webhook"])
+    alerts = AlertsSettings(rules=[AlertRule(transports=["email"]), typo], **_SMTP)
+    stripped = _alerts_without_email(alerts)
+    assert [r.transports for r in stripped.rules] == [["webhook"]]
+    with pytest.raises(ValueError, match="unconfigured transport"):
+        notifier_from_settings(stripped)
+
+
+@pytest.mark.parametrize("webhook", [True, False])
+@pytest.mark.parametrize("event_type", ["integrity_drift", "any"])
+def test_a_refused_alerts_ca_never_makes_an_email_only_alert_quieter(
+    event_type: str, webhook: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rule that sent an alert only by email must still page or log it once email is dropped.
+    With a webhook it pages the webhook, never the empty list that means suppress. With none
+    there is no notifier, so the engine's logging sink logs it at WARNING, and nothing tells the
+    operator to configure the email they did configure. Red on c53d91e21c: the rule became an
+    empty list, which suppresses with a webhook and logs that advice without one."""
+    from messagefoundry.api.app import _alerts_without_email
+    from messagefoundry.pipeline.alert_sinks import (
+        AlertRuleSet,
+        NotifierAlertSink,
+        notifier_from_settings,
+    )
+
+    alerts = AlertsSettings(
+        webhook_url="https://hooks.example.org/mefor" if webhook else None,
+        rules=[
+            AlertRule(
+                event_type=event_type,
+                transports=["email"],
+                escalate=[EscalationTier(after_count=2, transports=["email"])],
+            )
+        ],
+        **_SMTP,
+    )
+    stripped = _alerts_without_email(alerts)
+    with caplog.at_level("WARNING", logger="messagefoundry.pipeline.alert_sinks"):
+        sink = notifier_from_settings(stripped)
+    assert "no transport is configured" not in caplog.text
+    if not webhook:
+        # No notifier: the lifespan puts the engine on LoggingAlertSink, which logs at WARNING.
+        assert sink is None
+        return
+    assert isinstance(sink, NotifierAlertSink)
+    decision = AlertRuleSet(stripped.rules).decide(
+        {"type": "integrity_drift", "connection": "store-cipher"}
+    )
+    assert decision.transports == ("webhook",)
+    assert [tier.transports for tier in decision.escalate] == [["webhook"]]
+
+
+async def test_a_secret_store_that_is_down_does_not_hide_a_refused_alerts_ca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Email is dropped for a refused CA, so its SMTP password is not resolved. A secret store
+    that is down then cannot abort the lifespan before the audited check refuses the start and
+    writes its row. Red on c53d91e21c: the reference was kept, and the provider's error ended the
+    start with no row."""
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.config.secretprovider import SecretProviderError
+    from messagefoundry.config.settings import SecretsSettings
+
+    class _Down:
+        def resolve(self, ref: str) -> str:
+            raise SecretProviderError("the secret store is down")
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    monkeypatch.setattr("messagefoundry.api.app.resolve_secret_provider", lambda *a, **k: _Down())
+    ca = str(_pem(tmp_path))
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        alerts_settings=AlertsSettings(
+            email_tls_ca_file=ca, email_password_secret="alerts/smtp#password", **_SMTP
+        ),
+        secrets_settings=SecretsSettings(),
+        trust_anchor_specs=_dialling_specs(ca, alerts=_SMTP),
+        trust_anchors_enforcing=True,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
+        async with app.router.lifespan_context(app):
+            pass
+    reopened = await MessageStore.open(tmp_path / "m.db")
+    try:
+        assert "acl_insecure" in [r["event"] for r in await _rows(reopened, "alerts_email_ca")]
+    finally:
+        await reopened.close()
+
+
+async def test_a_notifier_refusal_behind_a_refused_alerts_ca_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A second refusal from the notifier, such as a cleartext webhook, does not stop the start,
+    since the audited check refuses it for the CA anyway. It is logged, so it does not wait a
+    restart to be seen. Red before the fix: it was dropped without a line."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, _built = _smtp_app(tmp_path, monkeypatch)
+
+    def _webhook_refused(*args: object, **kwargs: object) -> None:
+        raise ValueError("the webhook hop is cleartext")
+
+    monkeypatch.setattr("messagefoundry.api.app.notifier_from_settings", _webhook_refused)
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.api.app"),
+        pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"),
+    ):
+        async with app.router.lifespan_context(app):
+            pass
+    assert any("the webhook hop is cleartext" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_clean_alerts_ca_builds_the_notifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the case above: the same app with an owner-only CA reaches the factory."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    app, built = _smtp_app(tmp_path, monkeypatch)
+    with pytest.raises(_NotifierBuilt):
+        async with app.router.lifespan_context(app):
+            pass
+    assert len(built) == 1
+
+
+async def test_the_notifier_check_adds_no_check_the_start_does_not_make(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An app given no anchor specs checks none, so the early check only moves a refusal the
+    audited check would make. Red under: the early check reading the settings alone."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, built = _smtp_app(tmp_path, monkeypatch, start_checked=False)
+    with pytest.raises(_NotifierBuilt):
+        async with app.router.lifespan_context(app):
+            pass
+    assert len(built) == 1
+
+
+async def test_an_alerts_ca_refused_before_the_notifier_refuses_the_start_if_it_then_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file changed between the two checks, or a read failed once. The notifier sends no
+    email by then, so the first refusal stops the start even though the audited check passed. It
+    is marked ``unaudited``: no row records it."""
+    verdicts = iter([False, True])
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: next(verdicts))
+    app, built = _smtp_app(tmp_path, monkeypatch)
+    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file") as err:
+        async with app.router.lifespan_context(app):
+            pass
+    assert _webhook_only(built) and err.value.unaudited
+
+
+async def test_a_notifier_with_no_email_transport_is_not_held_back_by_the_ca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no alert recipient the alert notifier reads no CA; only the security notifier does,
+    and it is built after the audited check. So the early check leaves the notifier alone."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, built = _smtp_app(tmp_path, monkeypatch, email=False)
+    with pytest.raises(_NotifierBuilt):
+        async with app.router.lifespan_context(app):
+            pass
+    assert len(built) == 1
+
+
+def _forwarder_app(tmp_path: Path) -> tuple[Any, TrustAnchorError]:
+    """A managed app as ``serve`` builds it after ``_start_logging`` refused the collector's CA:
+    the forwarder CA's spec, and that early refusal."""
+    from messagefoundry.api.app import create_managed_app
+
+    specs = _dialling_specs(str(_pem(tmp_path)), log_settings=_SYSLOG_TLS)
+    refusal = ta.anchor_refusal(specs[0], enforcing=True)
+    assert refusal is not None
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        trust_anchor_specs=specs,
+        trust_anchors_enforcing=True,
+        prestore_anchor_refusals=(refusal,),
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    return app, refusal
+
+
+async def test_a_forwarder_ca_serve_refused_early_refuses_the_start_with_its_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``serve`` builds no forwarder for a refused collector CA and hands the refusal on. The
+    lifespan's audited check then refuses the start and writes the row. Red before the fix: the
+    lifespan took no such refusal."""
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    app, early = _forwarder_app(tmp_path)
+    with pytest.raises(TrustAnchorError, match=r"\[logging\]\.forward_tls_ca_file") as err:
+        async with app.router.lifespan_context(app):
+            pass
+    assert err.value is not early and not err.value.unaudited
+    reopened = await MessageStore.open(tmp_path / "m.db")
+    try:
+        events = [r["event"] for r in await _rows(reopened, "logging_forward_ca")]
+    finally:
+        await reopened.close()
+    assert "acl_insecure" in events, events
+
+
+async def test_a_forwarder_ca_serve_refused_early_still_refuses_if_the_check_then_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine runs without its forwarder only on the way to a refusal. When the audited check
+    passes after the early refusal, the early refusal is raised, marked ``unaudited``."""
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    verdicts = iter([False, True])
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: next(verdicts))
+    app, early = _forwarder_app(tmp_path)
+    with pytest.raises(TrustAnchorError) as err:
+        async with app.router.lifespan_context(app):
+            pass
+    assert err.value is early and err.value.unaudited
+
+
+def _offline_settings(ca: str, *, tls: dict[str, Any] | None = None) -> Any:
+    """Service settings whose offline security notifier dials a verified relay, with ``ca`` as
+    ``[alerts].email_tls_ca_file``, or as the internal CA when ``tls`` is given."""
+    from messagefoundry.config.settings import ServiceSettings
+
+    smtp = {k: v for k, v in _SMTP.items() if k != "email_to"}
+    if tls is None:
+        return ServiceSettings(alerts=AlertsSettings(email_tls_ca_file=ca, **smtp))
+    return ServiceSettings(
+        alerts=AlertsSettings(**smtp), tls=TlsSettings(internal_ca_file=ca, **tls)
+    )
+
+
+@pytest.mark.parametrize(
+    ("tls", "setting"),
+    [
+        pytest.param(None, "[alerts].email_tls_ca_file", id="own-ca"),
+        pytest.param({"trust_anchor_mode": "pinned"}, "[tls].internal_ca_file", id="internal-ca"),
+    ],
+)
+def test_the_offline_notifier_drops_the_notice_for_a_refused_relay_ca(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tls: dict[str, Any] | None,
+    setting: str,
+) -> None:
+    """The recovery commands' notifier checks the relay's CA as ``serve`` does. A refusal warns
+    and yields no channel, so the recovery goes on. Red before the fix: the channel was built.
+    The control is the same CA with an owner-only ACL."""
+    from messagefoundry.__main__ import _offline_security_notifier
+    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    settings = _offline_settings(str(_pem(tmp_path)), tls=tls)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    assert _offline_security_notifier(settings) is None
+    err = capsys.readouterr().err
+    assert setting in err and "This command goes on, but it sends no security notice" in err
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    assert isinstance(_offline_security_notifier(settings), SecurityEventNotifier)
+
+
+def test_the_offline_notifier_warns_and_sends_under_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``warn`` loads an exposed CA with a warning, as the start check does."""
+    from messagefoundry.__main__ import _offline_security_notifier
+    from messagefoundry.config.settings import SecurityEnforcement, SecuritySettings
+    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    settings = _offline_settings(str(_pem(tmp_path))).model_copy(
+        update={"security": SecuritySettings(enforcement=SecurityEnforcement.WARN)}
+    )
+    with caplog.at_level("WARNING"):
+        assert isinstance(_offline_security_notifier(settings), SecurityEventNotifier)
+    assert "enforcement=warn" in caplog.text
+
+
+def test_an_unreadable_anchor_is_a_refusal_naming_its_setting(tmp_path: Path) -> None:
+    """:func:`anchor_refusal` turns an unreadable file into the refusal the audited check makes,
+    at either dial."""
+    spec = AnchorSpec("logging_forward_ca", "[logging].forward_tls_ca_file", str(tmp_path / "x"))
+    refusal = ta.anchor_refusal(spec, enforcing=False)
+    assert isinstance(refusal, TrustAnchorError)
+    assert str(refusal).startswith("[logging].forward_tls_ca_file: could not read")
+
+
+@pytest.mark.parametrize(
+    ("alerts", "tls", "label"),
+    [
+        pytest.param({"email_tls_ca_file": "ca.pem"}, {}, "alerts_email_ca", id="own-ca"),
+        pytest.param({}, {"trust_anchor_mode": "augment"}, "tls_internal_ca", id="internal"),
+        pytest.param({}, {}, None, id="internal-system"),
+        pytest.param(
+            {"email_tls_ca_file": "ca.pem"},
+            {"trust_anchor_mode": "pinned"},
+            "alerts_email_ca",
+            id="own-ca-wins",
+        ),
+        pytest.param(
+            {"email_tls_verify": False}, {"trust_anchor_mode": "pinned"}, None, id="no-verify"
+        ),
+        pytest.param(
+            {"email_smtp_host": None}, {"trust_anchor_mode": "pinned"}, None, id="no-host"
+        ),
+        pytest.param(
+            {"email_smtp_host": "127.0.0.1"},
+            {"trust_anchor_mode": "pinned"},
+            None,
+            id="internal-loopback-relay",
+        ),
+        pytest.param(
+            {"email_smtp_host": "127.0.0.1", "email_tls_ca_file": "ca.pem"},
+            {"trust_anchor_mode": "pinned"},
+            "alerts_email_ca",
+            id="own-ca-loopback-relay",
+        ),
+        pytest.param(
+            {"email_tls_ca_file": "ca.pem", "email_use_tls": False},
+            {"trust_anchor_mode": "pinned"},
+            None,
+            id="own-ca-cleartext",
+        ),
+    ],
+)
+def test_the_smtp_hop_spec_names_the_ca_the_hop_reads(
+    alerts: dict[str, Any], tls: dict[str, Any], label: str | None
+) -> None:
+    """The relay's own CA wins; with none set the hop falls back to the internal CA, which the
+    ``system`` mode ignores. A hop that verifies nothing, or has no sender, reads neither."""
+    spec = ta.smtp_hop_anchor_spec(
+        AlertsSettings(**{**_SMTP, **alerts}),
+        AuthSettings(),
+        TlsSettings(internal_ca_file="internal.pem", **tls),
+    )
+    assert (spec and spec.label) == label

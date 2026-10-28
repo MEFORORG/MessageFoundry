@@ -117,6 +117,7 @@ import functools
 import re
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -2513,9 +2514,9 @@ def test_a_binary_option_value_is_not_an_install_target() -> None:
     assert _install_targets("pip install --no-binary :none: requests==2.0") == ["requests==2.0"]
 
 
-#: The security.yml jobs that audit a dependency lock, which vault BACKLOG #3861 closed. Not every job
-#: that installs a lock: at least sbom, sbom-windows, bandit and repo-scan install one without either
-#: control, and are not pinned here.
+#: The security.yml jobs that audit a dependency lock, the ones vault BACKLOG #3861 names (that row
+#: stays PARTIAL). Not every job that installs a lock: at least sbom, bandit and repo-scan install one
+#: with neither control, and sbom-windows with the checkout control only. None of those is pinned here.
 _LOCK_AUDIT_JOBS = ("pip-audit", "released-line-audit", "dependency-and-secret-scan")
 
 
@@ -2534,6 +2535,54 @@ def test_a_lock_audit_job_takes_wheels_only_and_keeps_no_checkout_token(job: str
     assert checkouts, f"{job} has no checkout step"
     for step in checkouts:
         assert (step.get("with") or {}).get("persist-credentials") is False, job
+
+
+#: A command line that runs ``uv lock`` or ``uv export``, in comment-stripped shell.
+_UV_LOCK_OR_EXPORT = re.compile(r"^\s*uv (?:lock|export)\b", re.M)
+
+
+def _runs_uv_lock_or_export(step: dict[str, Any]) -> bool:
+    return bool(_UV_LOCK_OR_EXPORT.search(_executed_shell(str(step.get("run", "")))))
+
+
+def _steps_running_uv_without_no_build(workflow: dict[Any, Any]) -> list[str]:
+    """Each step of ``workflow`` that runs ``uv lock`` or ``uv export`` with no ``UV_NO_BUILD: "1"``
+    at workflow, job or step level."""
+    top = (workflow.get("env") or {}).get("UV_NO_BUILD")
+    found = []
+    for name, job in (workflow.get("jobs") or {}).items():
+        at_job = (job.get("env") or {}).get("UV_NO_BUILD", top)
+        for step in job.get("steps") or []:
+            switch = (step.get("env") or {}).get("UV_NO_BUILD", at_job)
+            if _runs_uv_lock_or_export(step) and switch != "1":
+                found.append(f"{name}: {step.get('name', '<unnamed>')}")
+    return found
+
+
+def test_every_uv_lock_or_export_builds_no_sdist() -> None:
+    """``uv lock --check`` and ``uv export`` read no ``PIP_*`` variable, so ``PIP_ONLY_BINARY`` does not
+    stop them building an sdist to read its metadata; ``UV_NO_BUILD`` does (vault BACKLOG #4083
+    finding 5). Every workflow is read, but only a line that starts with ``uv lock`` or ``uv export``
+    is seen: at least ``uv sync``, ``uv pip`` and a uv call after ``if !`` or a flag are not."""
+    pytest.importorskip("yaml")
+    from tests._workflow_contexts import load_workflow
+
+    seen, missing = 0, []
+    for path in sorted(_WORKFLOWS.glob("*.yml")):
+        workflow = load_workflow(path.name)
+        missing += [f"{path.name} {step}" for step in _steps_running_uv_without_no_build(workflow)]
+        jobs = (workflow.get("jobs") or {}).values()
+        seen += sum(_runs_uv_lock_or_export(s) for job in jobs for s in job.get("steps") or [])
+    assert seen >= 3, f"found only {seen} uv lock/export steps; the scan has gone blind"
+    assert not missing, missing
+    # The control: a step that runs uv with no switch is reported, a commented-out line is not, and
+    # a step-level switch clears it.
+    bare = {"jobs": {"j": {"steps": [{"name": "s", "run": "uv lock --check"}]}}}
+    assert _steps_running_uv_without_no_build(bare) == ["j: s"]
+    commented = {"jobs": {"j": {"steps": [{"run": "# uv lock --check"}]}}}
+    assert _steps_running_uv_without_no_build(commented) == []
+    switched = {"jobs": {"j": {"steps": [{"run": "uv export", "env": {"UV_NO_BUILD": "1"}}]}}}
+    assert _steps_running_uv_without_no_build(switched) == []
 
 
 def test_the_released_line_auditor_runs_without_the_gh_token() -> None:

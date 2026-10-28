@@ -134,7 +134,13 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
-from messagefoundry.pki import CrlBlock, CrlFacts, CrlIssuerKey, crl_signature_refusal
+from messagefoundry.pki import (
+    CrlBlock,
+    CrlFacts,
+    CrlIssuerKey,
+    crl_signature_refusal,
+    quoted_issuer,
+)
 from messagefoundry.redaction import log_timestamp
 
 __all__ = [
@@ -219,8 +225,10 @@ _RETRIED = frozenset({WAIT, LAPSES_FIRST, RETRY, NO_ISSUER})
 #: :data:`LAPSES_FIRST` is a fix too, and the most urgent one: every peer is refused, restart or not.
 _PRECEDENCE = (FIX, BAD_SIGNATURE, _NOT_PROVABLE, LAPSES_FIRST, RESTART, NO_ISSUER, RETRY, WAIT)
 _RANK = {remedy: rank for rank, remedy in enumerate(_PRECEDENCE)}
-#: The remedies that send the operator to a restart, which fails while the file is not in effect.
-_SAYS_RESTART = frozenset({RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE})
+#: The remedies that can send the operator to a restart, which fails while the file is not in
+#: effect. :data:`BAD_SIGNATURE` names no restart, but it says a start can load the file, which is
+#: false until then, so it takes the same caveat (vault BACKLOG #3506).
+_LEADS_TO_A_START = frozenset({RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE, BAD_SIGNATURE})
 #: A short token per remedy, for the ``crl_reload_refused`` alert (vault BACKLOG #2904). The alert
 #: carries this and the remedy sentence, never the refusal's reason, which quotes CRL issuer
 #: names and dates. ``docs/CONFIGURATION.md`` lists the tokens under ``[cert_monitor]``.
@@ -282,8 +290,9 @@ class ReloadOutcome:
     refusal: ReloadRefusal | None
     #: Contexts still on the copy they held when this pass ended. 0 when ``refusal`` is ``None``.
     stale: int = 0
-    #: True when the remedy names a restart and a start would refuse the file too, until one of
-    #: its CRLs takes effect. The reason says so with the time; an alert carries only this flag.
+    #: True when the remedy can send the operator to a restart (:data:`_LEADS_TO_A_START`) and a
+    #: start would refuse the file too, at least until one of its CRLs takes effect. The reason
+    #: says so with the time; an alert carries only this flag.
     start_refuses: bool = False
 
     @property
@@ -430,8 +439,9 @@ class _Refusals:
         self.pending = False
         #: An unexpected failure, logged with its traceback once per file version.
         self.error: BaseException | None = None
-        #: True when the refusal reported names a restart and a start would refuse the file too,
-        #: until one of its CRLs takes effect (:attr:`ReloadOutcome.start_refuses`).
+        #: True when the refusal reported can send the operator to a restart and a start would
+        #: refuse the file too, at least until one of its CRLs takes effect
+        #: (:attr:`ReloadOutcome.start_refuses`).
         self.start_refuses = False
 
     def add(self, reason: str, remedy: str, *, stops: bool = True) -> None:
@@ -691,7 +701,9 @@ def _reload_path(
     try:
         # A CRL not in effect yet is judged here, not refused there: a context at the cap, a held
         # CRL nothing supersedes, or a file to fix each outranks a wait, and must be reported.
-        facts, blocks = judge_crl_bytes(pem, label=label, now=now, require_in_effect=False)
+        facts, blocks = judge_crl_bytes(
+            pem, label=label, now=now, require_in_effect=False, refuse_unread_extensions=True
+        )
         verdicts: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         timing: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         # Every stale context, with the verdict that holds it back, if any. Each still gets the
@@ -742,7 +754,7 @@ def _reload_path(
         refusals.error = exc
     if (
         refusals.strongest is not None
-        and refusals.strongest[1] in _SAYS_RESTART
+        and refusals.strongest[1] in _LEADS_TO_A_START
         and (unmet := crl_not_in_effect(blocks, now=now)) is not None
     ):
         # For the alert, which carries no reason. The reopen below is what lets this flag live
@@ -750,9 +762,13 @@ def _reload_path(
         # ``_pending`` never replays it without the flag.
         refusals.start_refuses = True
         why, remedy = refusals.strongest
+        # "At least": the time ends one cause of a refusal, and a start can refuse after it for
+        # another, such as a proven bad signature, which the reload cannot tell from an unproven
+        # one (vault BACKLOG #3506). The remedy says when.
         refusals.strongest = (
-            f"{why}. Not before {log_timestamp(unmet.this_update)}: a start until then refuses this "
-            f"file too, since its CRL from issuer {unmet.issuer!r} is not in effect",
+            f"{why}. Not before {log_timestamp(unmet.this_update)}: a start refuses this file "
+            f"too at least until then, since its CRL from issuer "
+            f"{quoted_issuer(unmet.issuer)} is not in effect",
             remedy,
         )
         # Judged again each pass, so the warning goes once its time has passed.

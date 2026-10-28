@@ -243,7 +243,7 @@ async def test_unreadable_bundle_applies_and_names_the_fingerprint_step(
     await eng.start()
     try:
 
-        def _unreadable(directory: Any) -> dict[str, object]:
+        def _unreadable(directory: Any, **_kw: Any) -> dict[str, object]:
             raise OSError("config dir vanished mid-reload")
 
         monkeypatch.setattr(
@@ -293,7 +293,7 @@ async def test_fingerprint_is_taken_before_the_swap(
         assert runner is not None
         original_reload = runner.reload
 
-        def _recording_fingerprint(directory: Any) -> dict[str, object]:
+        def _recording_fingerprint(directory: Any, **_kw: Any) -> dict[str, object]:
             order.append("fingerprint")
             return {"fingerprint": "deadbeef", "files": 1}
 

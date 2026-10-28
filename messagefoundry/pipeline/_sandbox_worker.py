@@ -9,12 +9,13 @@ would. It speaks the length-prefixed **MFW2** codec
 decode path cannot name a type, import a module, or reach ``__reduce__``. Nothing is pickled in either
 direction, in either process.
 
-1. **Bootstrap** — reads one ``boot`` frame ``{config_dir, forbidden, mem_mb, code_sets}``, loads
-   the message :class:`~messagefoundry.config.wiring.Registry` from ``config_dir`` (the same loader
-   the engine uses — it executes admin config under the unchanged safe-source gate),
-   **adopts the engine's code-set tables** from the frame in place of its own re-read of ``codesets/``
-   (when the parent published any — a session constructed without them leaves the child on its own
-   load), applies the POSIX resource caps where available, installs the forbidden-import guard, and
+1. **Bootstrap** — reads one ``boot`` frame ``{snapshot, forbidden, mem_mb, code_sets}``, loads
+   the message :class:`~messagefoundry.config.wiring.Registry` from the engine's config snapshot
+   (``load_snapshot``, the loader the engine uses, over the bytes the engine loaded and checked; the
+   worker never reads the config directory, vault BACKLOG #2596),
+   **adopts the engine's code-set tables** from the frame in place of the snapshot's ``codesets/``,
+   which the frame then leaves out (when the parent published any — a session constructed without
+   them sends the files and leaves the child to parse them), applies the POSIX resource caps where available, installs the forbidden-import guard, and
    replies ``ready`` (or ``bootfail`` on any failure).
 2. **Serve** — for each subsequent ``req`` frame ``{id, phase, name, payload, rc}`` it rebuilds the
    payload with the engine's own constructor, looks the Router/Handler up in *its own* registry,
@@ -347,9 +348,13 @@ def main() -> int:
         return 0  # parent closed the pipe before bootstrap — nothing to do
     try:
         boot = codec.decode_boot(frame)
-        from messagefoundry.config.wiring import load_config
+        from messagefoundry.config.wiring import load_snapshot
 
-        registry = load_config(boot.config_dir)
+        # The engine's own bytes, never the directory: a respawn runs what the engine loaded, not
+        # what is on disk now (vault BACKLOG #2596). The engine ran the trust check when it read
+        # them. The engine's parsed tables, when it sent any, stand in for codesets/, whose files
+        # the frame then leaves out.
+        registry = load_snapshot(boot.snapshot, code_sets=boot.code_sets)
         # Pre-import every module the serve loop touches BEFORE the guard goes up, so a first-time
         # (transitive) import of an engine helper can't be misread as a forbidden user import. Once
         # cached in sys.modules, a later `import` short-circuits ahead of the meta_path finder.

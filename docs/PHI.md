@@ -227,7 +227,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `queue.handler_name` / `destination_name` / `channel_id` | all three | No — names, not bodies | No (metadata, deliberately not ciphered) | **PL-4** | The handler the transform worker runs; the destination the delivery worker drains | `n/a — not PHI` |
 | `messages.control_id`, `messages.message_type` | all three | Low (MSH-10/MSH-9) | **No** — plaintext by design | **PL-4** | Needed plaintext for dedup/routing/indexes (`ix_messages_control`). Covered only by the whole-DB / volume layer | `keep-forever by design` — dedup/routing keys that live and die with the message row |
 | `messages.origin`, `messages.origin_actor` (vault BACKLOG #2615) | all three | **No** — a fixed label and a username, never message content | **No** — plaintext by design | **PL-4** | How the row came to exist: `partner`, `operator_edit`, `operator_upload` or `reingress`, and for the two operator origins the acting user. Written at insert and never updated. Plain on purpose, because it must outlive the body and the ciphered `metadata`, which retention blanks. `NULL` on a row written before the column existed means not recorded. See [§6](#6-audit--accountability) | `keep-forever by design` — provenance that lives and dies with the message row |
-| `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access* and other actions, not the PHI itself. Its writers store at least filter shapes, counts and ids. Some also store more: an edit-resend row holds **keyed** HMAC-SHA256 digests of the original and the edited body, and an upload-inject row one of the injected body. Without the store key a digest cannot be recovered or tested against a guess ([§6](#6-audit--accountability), vault BACKLOG #2615). And some store bounded engine-authored text: at least the `connection_test` and `connection_credential_test` rows carry the probe outcome, a fixed line or `safe_text()`/`safe_exc()`-scrubbed connector error text (BACKLOG #2372). Some store a client address beside the row's own `client`: at least the federated step-up's `auth.reauth` row, whose `start_client` is the address that started the step-up and whose `client_moved` says whether the callback came from another host (BACKLOG #2160, vault BACKLOG #3145). None stores a message body. *Corrected 2026-10-07:* this said the writers "only ever store filter shapes, counts and ids" | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
+| `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access* and other actions, not the PHI itself. Its writers store at least filter shapes, counts and ids. Some also store more: an edit-resend row holds **keyed** HMAC-SHA256 digests of the original and the edited body, and an upload-inject row one of the injected body. Without the store key a digest cannot be recovered or tested against a guess ([§6](#6-audit--accountability), vault BACKLOG #2615). And some store bounded engine-authored text: at least the `connection_test` and `connection_credential_test` rows carry the probe outcome, a fixed line or `safe_text()`/`safe_exc()`-scrubbed connector error text (BACKLOG #2372). Some store a client address beside the row's own `client`: at least the federated step-up's `auth.reauth` row, whose `start_client` is the address that started the step-up and whose `client_moved` says whether the callback came from another host (BACKLOG #2160, vault BACKLOG #3145). And once its build lands, the directory enrolment code's `auth.enrolment_code_spent_notice` row, written under the issuing Administrator's name, would name the client address the spend came from ([ADR 0207](adr/0207-a-single-use-enrolment-code-for-a-directory-account-s-first-engine-factor.md) Amendment A, vault BACKLOG #2609). None stores a message body. *Corrected 2026-10-07:* this said the writers "only ever store filter shapes, counts and ids" | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
 | `audit_log.client` (ADR 0150) | all three | **No** — a network address; identifies a *host*, not a patient | No (metadata, deliberately not ciphered) | **PL-4** | The caller's client address — the "from where" of an audited action; `NULL` for engine-internal/`system` writes. **Personal data, but not PHI**, and exactly what HIPAA §164.312(b) audit controls exist to capture. Plaintext by decision: it must stay greppable/indexable for incident response, it already appears in the clear in `sessions.client`, and it is folded **inside** the tamper-evident hash chain — so it carries **integrity** protection even without confidentiality. Widens a store-file compromise from *who did what* to *who did what from where*; volume encryption + owner-only ACLs on whichever host owns the files — the engine's own `_secure_file` covers the **SQLite** store only ([§10](#10-secure-deployment--operations-checklist)) — are the control | `keep-forever by design` — same `audit_log` row lifetime as `detail`; the value is folded **inside** the hash chain |
 | `delivered_keys` (H2 idempotency ledger) | all three | **No** — hashes + ids only | No (deliberately not ciphered — nothing to protect) | **PL-4** | One row per completed outbound delivery: a SHA-256 `delivery_key` over non-PHI ids + a replay-stable seq, plus `outbox_id`/`message_id`/`destination_name`/`delivery_seq`. **Never a body or any PHI** — `control_id` is only *folded into the hash input*, never stored in the clear here. Lets the FIFO claim skip-and-complete a re-claimed already-delivered head without re-sending | `keep-forever by design` — the idempotency ledger a re-claimed already-delivered row checks instead of re-sending |
 | `state.namespace` / `state.key` | all three | **Possibly** — a Handler that keys correlation state on a raw MRN stores that identifier here in the clear | **No** — plaintext by construction: the pair is the composite primary key **and** the AAD input for `state.value`, so it cannot be ciphered without losing the lookup | **PL-4** | Authors must key state on a **surrogate, never a raw identifier**. Covered only by the whole-DB / volume layer. Rides `[retention].state_max_age_days` with its value | ``rides `[retention].state_max_age_days` `` |
@@ -235,7 +235,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `sessions.token_hash` / `client`, `resend_log`, `processed_files`, `pending_approvals.params`, `webauthn_credentials.public_key` | all three | **No** | No (deliberately not ciphered) | **PL-4** | Session tokens are stored as SHA-256 only; `processed_files` holds a hashed derived file key, never a path; approval params carry connection names / channel ids / a config dir by construction; COSE public keys (ADR 0068) are **verification material, not secrets** and are explicitly excluded from the cipher and from rekey | `n/a — not PHI` |
 | `session_lineage` (`retired_hash` / `successor_hash` / `retired_at`, vault BACKLOG #3028, ADR 0210) | all three | **No** | No (deliberately not ciphered) | **PL-4** | Two SHA-256 session token hashes and a time, the same class as `sessions.token_hash`: which hash an elevation retired and which replaced it. Read only by the sign-in supersession, never by a session read, so a retired hash authenticates nothing; not sealed, because a forged link can only direct a revoke. The session reaper deletes links past the window the supersession follows them for (section 8) | `n/a — not PHI` |
 | `known_login_addresses` (`user_id` / `address` / `first_seen` / `last_seen`, vault BACKLOG #2145) | all three | **No** — a network address tied to an account; identifies a *host*, not a patient | No (metadata, deliberately not ciphered) | **PL-4** | The first-seen sign-in address baseline (BACKLOG #288): one row per host an account finished a sign-in from, or, in the cases [SECURITY.md](SECURITY.md) Table A lists, passed a step-up or confirmed a factor enrolment from, keyed on the account id. **Personal data, not PHI** — the same class and the same decision as `sessions.client` and `audit_log.client`. Read only by the sign-in signal; **no API surface**. Each write to the account's record, even one that re-records a known address, is followed by a prune of its rows past the signal's 90-day lookback. An event that writes nothing prunes nothing, such as a sign-in that still owes a factor. A failed prune deletes nothing either. So a dormant account keeps its stale rows until its next write. An administrator's password or MFA reset deletes the account's rows and leaves one marker row holding no address (vault BACKLOG #2946). `delete_user` removes every row with the account, and the account's foreign key cascades to any row a racing write leaves | `n/a — not PHI` |
-| `secret_rotation_meta` (`secret_key` / `fingerprint` / `tracked_since` / `last_rotated`) | **All three backends** (#1186 — SQLite `MessageStore`, `SqlServerStore` and `PostgresStore` each create the table at open and implement the `SecretRotationMetaStore` protocol) | **No** — non-secret rotation state: a **keyed MAC** (DEK-derived, one-way — never the secret value) + ISO dates only | No (deliberately not ciphered — it is neither PHI nor a secret; the MAC is one-way and un-guessable without the DEK) | **PL-4** | ASVS 13.3.4 rotation watcher (BACKLOG #282). `fingerprint` is a keyed MAC so obtaining the rows leaks no secret. Written on a keyed store; absent on a keyless one | `n/a — not PHI` |
+| `secret_rotation_meta` (`secret_key` / `fingerprint` / `tracked_since` / `last_rotated`), the cipher cell `secret_rotation_meta.fingerprint` | **All three backends** (#1186 — SQLite `MessageStore`, `SqlServerStore` and `PostgresStore` each create the table at open and implement the `SecretRotationMetaStore` protocol) | **No** — non-secret rotation state: a **keyed MAC** (one-way — never the secret value) + ISO dates only | **Yes, for each non-DEK `fingerprint`** — a store-cipher cell (BACKLOG #3472, [ADR 0213](adr/0213-seal-the-secret-rotation-fingerprint-as-a-store-cipher-cell.md)) holding a random per-row HMAC key, the value's MAC and the row's `secret_key`; AAD `("secret_rotation_meta","fingerprint",secret_key)`; store DEK. The DEK row's `fingerprint` (its one-way key id) and the dates are plaintext | **PL-4** | ASVS 13.3.4 rotation watcher (BACKLOG #282). Sealed so that obtaining the rows without the store key gives nothing to test a guess of a low-entropy secret against, and so that `rotate-key` re-seals rather than moves it. Its AAD is built in `store/crypto.py`, so the per-backend counts below leave it out. Written on a keyed store; absent on a keyless or `vault_transit` one | `n/a — not PHI` |
 | SQLite DB file + `-wal` / `-shm` / temp files, and every index | SQLite | **Yes** (mirror the above) | **No** — the app cipher cannot reach them | **PL-5** | WAL/shm hold recently-written PHI outside any app-level encryption. Cover: SQLCipher (whole-DB) and/or FDE on the engine host's data volume. A purge zeroes what it frees, and the WAL truncate is tried hourly, both by default; what they miss is in [§8](#8-retention--purge) (vault BACKLOG #2619) | `n/a — not PHI` |
 | SQL Server `.ldf` **transaction log** + the **tempdb version store**, and every index | SQL Server | **Yes** (row images of `messages`/`queue`, ciphertext columns **plus** the always-plaintext `control_id`/`message_type`) | **No** — outside the app-level AEAD entirely | **PL-5** | The engine itself makes this load-bearing: it **force-enables `READ_COMMITTED_SNAPSHOT` and `ALLOW_SNAPSHOT_ISOLATION`** on the store database at open, so tempdb's version store holds row images for the lifetime of every open snapshot. The `.ldf` holds every row image for the same reason. Additional tempdb objects: the `#eligible` temp table used by `purge_message_bodies` and the FIFO-claim table variables (ids only, non-PHI). Cover: **SQL Server TDE at the database + FDE on the *SQL Server host's* volumes** — **not** BitLocker on the engine host | `n/a — not PHI` |
 | PostgreSQL WAL (`pg_wal`), base files and every index | Postgres | **Yes** (mirror the above) | **No** — outside the app-level AEAD | **PL-5** | Cover: cluster-level / filesystem encryption on the database host, infra-owned | `n/a — not PHI` |
@@ -302,7 +302,9 @@ and has no notion of a credential. `tests/test_no_store_phi_coverage.py` binds t
 
 **Per-backend cipher coverage, stated exactly.** The store cipher covers **18** `(table, column)`
 pairs on SQLite. **SQL Server** covers 17 = the SQLite set **minus** `shared_body.body` (never written
-there). **Postgres** covers 17 = the SQLite set **minus** `shared_body.body`. SQL Server's count was
+there). **Postgres** covers 17 = the SQLite set **minus** `shared_body.body`. Each count leaves out
+`secret_rotation_meta.fingerprint`: its cell AAD is built in `store/crypto.py`, not in a backend
+module, though each backend's `reencrypt_to_active` re-seals it (BACKLOG #3472). SQL Server's count was
 18 until the legacy `outbox.payload` was retired (below); the two server backends now carry the same
 set. One asymmetry remains and is worth knowing: neither SQL Server nor Postgres sweeps
 `attachment_chunk` in its *on-open* plaintext→cipher migration (only in `rotate-key`), which is
@@ -560,7 +562,8 @@ for defense-in-depth without swapping the `aiosqlite` connector.
 1. **Application-level AES-256-GCM `[BUILT]`.** The store's `_cipher`
    ([store/crypto.py](../messagefoundry/store/crypto.py)) encrypts the cipher-covered columns.
    **[§2](#2-where-phi-lives--data-at-rest-inventory) is the normative list** — 18 `(table, column)`
-   pairs on SQLite, 17 on SQL Server, 17 on Postgres, plus the two `uploaded_file` sidecar cells. The
+   pairs on SQLite, 17 on SQL Server, 17 on Postgres, plus the two `uploaded_file` sidecar cells and the
+   `secret_rotation_meta.fingerprint` cell on every backend. The
    per-level blocks below group that same set; they do not redefine it, and CI pins the counts **and**
    the membership of both sections to the store's cipher registry, so they cannot diverge. Stored format
    `mfenc:v1 ‖ key_id ‖ base64(nonce ‖ ciphertext ‖ GCM tag)` — the GCM tag
@@ -718,12 +721,12 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    key, then drop the retired key. `rotate-key` also opens a new range of the audit chain under the new
    key and verifies the chain first; do not drop the retired key until it exits 0 and prints its audit
    line as `OK:` ([ADR 0193](adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md),
-   BACKLOG #1904). Keep the retired key through the engine's first start after the rotation too. The
-   secret-rotation watcher keys its fingerprints off the store key, and that start re-keys them. With
-   the retired key in hand, a secret changed in the same window still reads as rotated. Without it,
-   the watcher keeps each secret's older date and logs a warning (BACKLOG #2242). Under the Windows
-   service that first start runs without it: the engine refuses a store key in the service's
-   environment lists (SERVICE.md, "Protect the store encryption key at rest"). The same command re-seals the uploaded-file store, and on a first key-enable it
+   BACKLOG #1904). The same pass re-seals the secret-rotation watcher's fingerprint cells, so the
+   engine's first start after the rotation needs no retired key to tell an unchanged secret from a
+   rotated one, under the Windows service too (BACKLOG #3472,
+   [ADR 0213](adr/0213-seal-the-secret-rotation-fingerprint-as-a-store-cipher-cell.md)). A cell no
+   configured key opens is left as it is; the next start keeps that secret's dates and seals a new
+   one. The same command re-seals the uploaded-file store, and on a first key-enable it
    seals the plaintext uploads a keyed store refuses until then (BACKLOG #1169). An undecryptable
    value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.
@@ -1023,14 +1026,17 @@ is no plaintext to protect.
 `channel_id` · `messages.control_id` / `message_type` · `messages.origin` / `origin_actor` · `webauthn_credentials.public_key` · `state.namespace` /
 `state.key` · `reference.name` / `version` / `key` · `connection_event.peer_host` · `known_login_addresses` · the `attachment`
 header row (`content_type`, `total_bytes`, `refcount`, `created_at`) + the `message_attachment`
-linkage · `secret_rotation_meta` (all three backends) · `.mfbak` on the server backends · and,
+linkage · `secret_rotation_meta` (all three backends), including the `secret_rotation_meta.fingerprint`
+cell · `.mfbak` on the server backends · and,
 from the [harness table](#the-test-harnesss-own-at-rest-data-harness), the `MEFOR_COORD_DIR` coord
 files · the load, scenario and acceptance run reports (`--report-json` and its siblings, but **not**
 the reconcile compare report, which is PL-1) · the `remotefile_known_hosts` pin file · the GUI's
 `QSettings` layout.
 
 Deliberately **not** ciphered, so that ids stay indexable and the audit trail stays greppable for
-incident response. Integrity for `audit_log` comes from the **tamper-evident hash chain** (the `client`
+incident response. **One exception:** each non-DEK `secret_rotation_meta.fingerprint` is a store-cipher
+cell, AAD-bound to its row (BACKLOG #3472). It is not PHI; it is sealed because the keyed MAC inside
+it is the only thing between a store reader and offline guessing of a low-entropy secret. Integrity for `audit_log` comes from the **tamper-evident hash chain** (the `client`
 address is folded *inside* it), not from a cipher. Its strength is **key-custody-dependent**: HMAC-SHA256 on a DEK-derived subkey or a Transit MAC when the chain is keyed, keyless SHA-256 when it is not. §3 item 1 says when each applies.
 
 **Access, per tier — several of these ARE returned by an API, under RBAC:**
@@ -1083,8 +1089,9 @@ on the store-file ACL plus the volume/whole-DB layer for the rest.
 - `attachment` header + `message_attachment` linkage — the join rows are `DELETE`d and the header's
   `refcount` decremented (GC at 0) inside `purge_message_bodies` / `purge_dead_letters`
   (`_release_message_attachments`), with a startup `sweep_orphan_attachments` reclaiming orphans.
-- `secret_rotation_meta` — **no purge path on any backend**; one row per tracked secret, replaced in
-  place by the watcher's upsert (all three backends since #1186).
+- `secret_rotation_meta`, its `secret_rotation_meta.fingerprint` cell included — **no purge path on any
+  backend**; one row per tracked secret, replaced in place by the watcher's upsert (all three backends
+  since #1186).
 - `.mfbak` — keep-N (`[backup].retention_keep`), as PL-1; the canonical name only, with `.failed` / `.part`
   archives unbounded as PL-1 records.
 - The test harness's PL-4 files — each row of the
@@ -2131,6 +2138,7 @@ window purely so a replay can be richer — is precisely the defect ASVS 14.2.7 
 | File-connector output / spill dirs (`.hl7`, `.processed`, `.error`) | no window, and no engine sweep of any kind — `pipeline/retention.py`'s only filesystem pass is `_sweep_app_logs`, which scans the log directory alone. These are operator-configured output paths, so the engine deleting from them would be deleting data an operator or a downstream system owns. On a first deployment they would accumulate plaintext **PL-1** bodies indefinitely; the cover is the operator's: volume or share encryption plus an ACL ([§10](#10-secure-deployment--operations-checklist)) |
 | Test-harness stores (the [harness table](#the-test-harnesss-own-at-rest-data-harness) in §2) | no engine sweep removes them after a run, and that table states each one's retention. The stores an operator can feed real messages, and which would then accumulate them, are named there: at least the reconcile capture, its compare report and the Compose-fed file drop |
 | `users.totp_secret` | no window by design — it lives and dies with the user row |
+| `secret_rotation_meta.fingerprint` | no window by design — one row per tracked secret, replaced in place by the rotation watcher; not PHI (BACKLOG #3472) |
 | `audit_log`, `delivered_keys`, `resend_log` | keep-forever by design (see below) |
 | `messages.control_id`, `messages.message_type` | kept for the life of the message row by design (dedup/routing keys) |
 | `messages.origin`, `messages.origin_actor` | kept for the life of the message row by design. Retention blanks the body and `metadata`, whose `edited_from` goes with it, and leaves these, so an operator-made message stays identifiable (vault BACKLOG #2615) |
@@ -2180,7 +2188,8 @@ Properties of the anonymizer:
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
   scrubbed dataset stays structurally realistic.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
-  loose string search.
+  loose string search. With no site prefix loaded it matches nothing, and
+  `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
   reach. Plain `anonymize` and `anonymize_checked` both refuse it, on the engine and on the tee.
@@ -2202,8 +2211,8 @@ both are described below:
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IP address, survives | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
-| A dashed SSN (`NNN-NN-NNNN`) appears whole inside one field | Fields no rule maps |
-| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears whole inside one field | Fields no rule maps |
+| A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps. A cut shape counts when at least one of its fields is one no rule maps |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps. A cut shape counts when at least one of its fields is one no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it as `PV2 (line with no fields)` | Every line but the header. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
@@ -2213,13 +2222,28 @@ a bare ten-digit phone number, an account number and a free-text note. A Z-segme
 case, since no default rule names one. A name in `PV1-11`, the temporary location, passes the same
 way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
 
-**A shape split across fields by the message's own field separator passes.** The detectors read
-one field at a time, after the message is split on the separator its header declares. Under a
-field separator of `-`, at least the lines `ZZZ-1-123-45-6789` and `ZZZ-1-555-555-0100` would
-pass `anonymize_checked` on both anonymizers. The message itself cuts each value into three
-fields. Under `|`, the same two values are refused. With `require_full_coverage` on, such a
-message is refused only because nobody decided the `ZZZ` fields. A `keep` on each of them would
-let it through.
+**A shape cut across fields by the message's own field separator is refused, but not in every
+form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three
+fields, and none of them holds the shape. The check also reads each line as written, so both
+anonymizers refuse it, naming the fields: `unmapped SSN-shaped value across ZZZ-2 to ZZZ-4, cut
+by the field separator` (vault BACKLOG #3465). A match whose every field a rule rewrites is not
+a hit. The cost: under `-`, numeric fields side by side that read as such a shape are refused
+whatever they hold, so `OBR-1-123-45-6789` is refused as an SSN in `OBR-2` to `OBR-4`. At least
+these still get through, on both anonymizers:
+
+- The rest of a shape whose first or last part a rule scrubbed, which is no shape. Under `OBX-5`
+  typed `ST`, `OBX-1-ST-8480^S^LN--123-45-6789` leaves as `...--[REDACTED]-45-6789`, and
+  `OBX-1-ST-123-45-6789` as `OBX-1-ST-123-45-[REDACTED]`. `NTE-3` and `OBX-5` typed `TX` leave
+  such a rest too.
+- A shape whose separators the sender escaped, as HL7 asks: `123\F\45\F\6789`. No detector
+  decodes an escape.
+- A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
+  it. The detectors read that digit as part of a longer number.
+- A shape in the header line, which the check skips whole.
+
+With `require_full_coverage` on, such a message is refused for as long as nobody decides the
+fields that carry the rest of the shape. A `keep` on each of them would let it through. That
+switch skips the header line too, so it does not refuse a shape there.
 
 **A wrapped line can still look like a segment, but its id is never printed.** A line such as
 `KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id
@@ -2398,8 +2422,11 @@ What the `date` kind does to a value:
   one timestamp, and a second one after the component separator is not a precision code.
 - An `OBX-5` result whose `OBX-2` type is `DT` or `TS`, such as a last menstrual period, takes the
   `date` kind too: the year stays, and a value that is not a valid timestamp is scrubbed to
-  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is still
-  kept whole, and one sent as `DTM` or `ST` is redacted whole.
+  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is kept
+  whole whenever it fits the `NM` grammar below. At least these fit: digits alone, such as
+  `20110715`, even after a sign or a comparator; one decimal point, such as `2011.07`; and a date
+  split across repetitions. A dash or a slash inside the date, as in `2011-07-15`, does not fit,
+  so that one is redacted whole, as is one sent as `DTM` or `ST`.
 - An `OBX-5` result whose `OBX-2` type is `NM`, `SN` or `TM` is kept whole only when it fits the
   grammar of that type (vault BACKLOG #2961). `NM` is an optional comparator, an optional sign,
   digits and at most one decimal point. `SN` is a comparator, a number, a separator and a second
@@ -2407,17 +2434,17 @@ What the `date` kind does to a value:
   becomes `[REDACTED]`. So `123-45-6789` or `555-555-0100` under a numeric label would no longer
   leave whole, and neither would an eight-digit date under `TM`. **The grammar cannot tell a
   number from an identifier written as a number.** At least these would still leave whole under
-  `NM`, and in a number part of an `SN`: an undashed nine-digit number, which is the shape of an
-  SSN; an undashed ten-digit number, or eleven digits after a `+`, which is the shape of a phone
-  number; an eight-digit number that reads as a date; and an identifier split across repetitions.
+  `NM`, and in a number part of an `SN`. An undashed nine-digit number has the shape of an SSN.
+  An undashed ten-digit number, or eleven digits after a `+`, has the shape of a phone number. An
+  eight-digit number can read as a date. And an identifier can be split across repetitions.
   Under `TM`, at least a six-digit date whose parts are in range for a time would still leave
   whole: `150312` reads as 15:03:12. The leak-check's shape detectors do not scan `OBX-5`,
   because a rule maps it, so nothing refuses these. A message that declares a digit or one of
   `+ - . : / < > =` as its component, repetition or subcomponent separator keeps no numeric
-  `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, at
-  least a value such as `000-12-3456` would still leave whole. The message itself splits it
-  across `OBX-5`, `OBX-6` and `OBX-7`. The first part is a valid number, and no rule maps the
-  other two fields. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
+  `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, a
+  value such as `000-12-3456` is split by the message itself across `OBX-5`, `OBX-6` and `OBX-7`.
+  The first part is a valid number, so the guard keeps it, and the leak-check refuses the cut
+  shape, as *What the leak-check refuses, and what it lets through* says. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
   under one of them, such as a surname, would still leave whole.
 - When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
   site code. The site-code pass and the leak-check's site-code test skip a field that the `date`

@@ -39,6 +39,7 @@ from messagefoundry.remotedebug import (
 #
 # `_serve` and `_supervise` still make the same call first. Their comments describe the window
 # as it was before this call existed; with this one in place theirs normally adds nothing.
+# `install_remote_debug_guard` says when a later call adds a copy, including this one run again.
 install_remote_debug_guard()
 
 # PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that
@@ -95,7 +96,9 @@ if TYPE_CHECKING:
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
+    from messagefoundry.config.environments import EnvironmentValuesReader
     from messagefoundry.config.settings import ServiceSettings, StoreSettings
+    from messagefoundry.config.snapshot import ConfigSnapshot
     from messagefoundry.config.static_credentials import StaticCredentialGateOutcome
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.config.wiring import Registry
@@ -228,9 +231,10 @@ def _refuse_toolkit_command(command: str, argv: Sequence[str]) -> int:
     ``_emit_error`` writes JSON to stdout or one line to stderr, never both, and its own return value
     is 1, so it is not returned. ``argv_wants_json`` is the one pre-parse JSON rule both commands use.
 
-    The line names no install command. The toolkit distribution is not yet on PyPI, and
-    tests/test_install_instruction_provenance.py refuses shipped text that tells a user to install
-    an unclaimed name.
+    The line names no install command. It was written while the toolkit name was unclaimed on PyPI,
+    when tests/test_install_instruction_provenance.py refused shipped text telling a user to
+    install it by name. ADR 0201 slice 3 recorded the name as claimed; the docs that give a
+    bare-name install arrive with slice 4.
     """
     _emit_error(
         f"`{command}` is not a messagefoundry command. It is an authoring command: run it as "
@@ -790,7 +794,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "import",
         help="import a PKCS#12/.pfx bundle into cert.pem / key.pem / ca-chain.pem. The passphrase is "
         "read ONLY from MEFOR_PFX_PASSWORD (never a CLI arg); key.pem is written owner-only (mode 0600 "
-        "on POSIX, a restrictive access list on Windows) and refuses to overwrite an existing key",
+        "on POSIX, a restrictive access list on Windows). It refuses to overwrite an existing "
+        "cert.pem, key.pem or ca-chain.pem, refuses a directory holding a ca-chain.pem when the "
+        "bundle carries no CA, since that chain would not chain the new key, and removes the files "
+        "it wrote if one cannot be written",
     )
     cert_import.add_argument(
         "--pfx", required=True, help="path to the PKCS#12/.pfx bundle to import"
@@ -836,8 +843,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) as a TLS PLACEHOLDER (no "
         "chain of trust: better than cleartext, worse than an operator-supplied chain, so replace "
         "it); key.pem is written owner-only (mode 0600 on POSIX, a restrictive access list on "
-        "Windows). It refuses to overwrite an existing cert.pem or key.pem, and removes the key it "
-        "wrote if cert.pem cannot be written",
+        "Windows). It refuses to overwrite an existing cert.pem or key.pem, refuses a directory "
+        "holding a ca-chain.pem, which would not chain the new key, and removes the files it wrote "
+        "if one cannot be written",
     )
     cert_self_signed.add_argument(
         "--cn",
@@ -2183,6 +2191,7 @@ def _start_logging(
     enforcing: bool,
     spool_dir: str,
     configure: Callable[[SyslogForward | None], bool],
+    deferred_ca_refusals: list[TrustAnchorError] | None = None,
 ) -> int | None:
     """Pass the off-box forwarding gates, then install this process's log handlers.
 
@@ -2191,7 +2200,10 @@ def _start_logging(
     refusal. It does not hold every gate that guards the collector: at least the static-credential
     and open-egress gates run in each caller before it, so a new one must be given to both.
     ``spool_dir`` is this process's own spool directory (:func:`_forward_spool_dir`); the spool
-    locks it.
+    locks it. The last gate checks the collector's CA as a trust anchor (BACKLOG #3470). A caller
+    that passes ``deferred_ca_refusals`` takes that refusal itself: it is appended there, and
+    logging is configured without the forwarder. ``serve`` does, so its audited preflight refuses
+    the start, with a row when it can read the file.
 
     ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
     passed (``None`` with no collector). It stays at the call site because level, format and the
@@ -2340,6 +2352,38 @@ def _start_logging(
             )
             return 2
 
+    # BACKLOG #3470: the collector's CA takes the trust-anchor checks before the forwarder loads
+    # it. In `serve` the audited preflight runs only in the API lifespan, after the forwarder has
+    # sent; `supervise` runs none. trust_anchors module item 10 says what a refusal does.
+    from messagefoundry.auth.trust_anchors import anchor_refusal, log_forward_anchor_spec
+
+    _forward_ca = log_forward_anchor_spec(settings.logging)
+    # Under `warn` the check warns rather than refuses. Its text quotes a configured path, so it is
+    # taken here and printed scrubbed, as the #2375 gate notes above are: no handler is installed
+    # yet, so a logged warning would reach bare stderr with any newline in the path intact.
+    _ca_notes: list[str] = []
+    _ca_refusal = (
+        anchor_refusal(_forward_ca, enforcing=enforcing, warn=_ca_notes.append)
+        if _forward_ca is not None
+        else None
+    )
+    for _ca_note in _ca_notes:
+        print(f"warning: {scrub_control_chars(_ca_note)}", file=sys.stderr)
+    if _ca_refusal is not None:
+        if deferred_ca_refusals is None:
+            # `supervise`: its process has no audited preflight, so it refuses here, before any
+            # engine shard spawns. Scrubbed: the refusal quotes a configured path, and a newline
+            # in it must not forge a line.
+            print(
+                f"error: {scrub_control_chars(str(_ca_refusal))}\nThe start is refused before the "
+                "log forwarder is built, so no record reached the collector.",
+                file=sys.stderr,
+            )
+            return 2
+        # `serve`: no forwarder, and the caller hands the refusal to its audited preflight.
+        deferred_ca_refusals.append(_ca_refusal)
+        log_forward = None
+
     try:
         forwarder_live = configure(log_forward)
     except OSError as exc:
@@ -2377,6 +2421,18 @@ def _start_logging(
     # handlers too. Each caller logs its #1989 static-credential lines next, for the same reason.
     for _gate_note in _gate_notes:
         logging.getLogger(__name__).warning("%s", _gate_note)
+    if deferred_ca_refusals is None:
+        # `supervise` only: its forwarder is up now, so the collector gets the record that this
+        # CA was trusted under `warn`. `serve`'s audited preflight logs the same warning again.
+        for _ca_note in _ca_notes:
+            logging.getLogger(__name__).warning("%s", _ca_note)
+    if _ca_refusal is not None:
+        logging.getLogger(__name__).warning(
+            "off-box log forwarding is off: the collector's CA was refused (%s). The start check "
+            "refuses the start once the store is open. trust_anchors module item 10 says when "
+            "that refusal has an audit row.",
+            _ca_refusal,
+        )
     if forwarder_live and log_forward is not None:
         # Only announce forwarding when configure_logging actually installed the handler. With the
         # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
@@ -2420,16 +2476,46 @@ def _exposure_description(settings: ServiceSettings, *, exposed: bool) -> str:
     return "admin interface reachable from beyond this host"
 
 
-def _read_environment_values(*, base_dir: Path, dir_name: str, environment: str) -> dict[str, Any]:
+def _environment_values_reader(
+    *, base_dir: Path, dir_name: str, environment: str
+) -> EnvironmentValuesReader:
+    """``serve``'s ``env_values_provider``: :func:`_read_environment_values` over one value file.
+
+    The Engine calls it with no arguments at start, and with a reload's config snapshot on a
+    reload that read one, so a value file the snapshot covers is parsed from the bytes the reload's
+    digest names (vault BACKLOG #2596). ``supervise`` builds the same reader."""
+    from messagefoundry.config.environments import EnvironmentValuesReader
+
+    return EnvironmentValuesReader(
+        _read_environment_values, base_dir=base_dir, dir_name=dir_name, environment=environment
+    )
+
+
+def _read_environment_values(
+    *,
+    base_dir: Path,
+    dir_name: str,
+    environment: str,
+    snapshot: ConfigSnapshot | None = None,
+) -> dict[str, Any]:
     """This instance's environment values: the value file
     :func:`~messagefoundry.config.environments.values_file_path` names, plus the ``MEFOR_VALUE_*``
-    environment. ``serve`` hands it to the Engine as the ``env_values_provider``, so it runs at
-    start and again on every reload."""
+    environment. ``serve`` hands it to the Engine as the ``env_values_provider``
+    (:func:`_environment_values_reader`), so it runs at start and again on every reload.
+
+    With ``snapshot``, the value file is parsed from the bytes the snapshot read and never read
+    from disk, so a file edited after that read does not apply, and one created or removed since is
+    refused (vault BACKLOG #2596). A value file outside the snapshot's ``environments/`` folder
+    raises :class:`~messagefoundry.config.snapshot.NotInSnapshot` instead."""
     import os
 
-    from messagefoundry.config.environments import load_environment_values, values_file_path
+    from messagefoundry.config.environments import (
+        environment_values_from_bytes,
+        load_environment_values,
+        values_file_path,
+    )
+    from messagefoundry.config.snapshot import NotInSnapshot
     from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
-    from messagefoundry.redaction import safe_exc
 
     # Guarded HERE because this is the one site that knows the value file's PATH, and because this
     # function is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
@@ -2456,15 +2542,37 @@ def _read_environment_values(*, base_dir: Path, dir_name: str, environment: str)
     # reads it again on every reload. So each read vets it again first, and a file edited or
     # created after the start is not read unvetted. Outside the try below, because WiringError
     # is a ValueError and that arm would wrap the refusal as a read failure.
+    from messagefoundry.engine_secrets import SecretsDirectoryError
+    from messagefoundry.redaction import safe_exc
+
     env_file = values_file_path(base_dir, dir_name, environment)
-    assert_trusted_start_paths([env_file], lead="refusing to read environment values from")
+    if snapshot is not None and not snapshot.covers_environment_file(env_file):
+        # Before the vetting below, so the plain read the engine then makes vets the file once.
+        raise NotInSnapshot(f"{env_file} is not in the config snapshot's environments folder")
+    # With a snapshot, its folder is vetted even when the file has gone: the bytes that apply were
+    # read earlier, and whoever can write the folder could have planted them (vault BACKLOG #2596).
+    assert_trusted_start_paths(
+        [env_file],
+        lead="refusing to read environment values from",
+        folders=[env_file.parent] if snapshot is not None else (),
+    )
     try:
+        if snapshot is not None:
+            return environment_values_from_bytes(
+                snapshot.environment_file(env_file), path=env_file, environ=os.environ
+            )
         return load_environment_values(
             base_dir=base_dir,
             dir_name=dir_name,
             environment=environment,
             environ=os.environ,
         )
+    except SecretsDirectoryError as exc:
+        # Vault BACKLOG #2595: the secrets directory, not the value file, refused. Its message names
+        # the file and its remedy and never a value, so it is passed whole rather than blamed on
+        # env_file and cut to safe_exc's length.
+        refusal = str(exc)
+        failed_on = "could not read environment values from the secrets directory"
     except (ValueError, RecursionError, OSError) as exc:
         # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
         # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
@@ -2474,11 +2582,12 @@ def _read_environment_values(*, base_dir: Path, dir_name: str, environment: str)
         # an embedder's arbitrary callable, while this one wraps our own call into a function that
         # returns a dict or raises.
         refusal = safe_exc(exc)
+        failed_on = f"could not read environment values from {env_file}"
     # Raised AFTER the handler, so neither __cause__ nor __context__ is set (BACKLOG #2307). A
     # TOMLDecodeError keeps the whole document on .doc and a UnicodeDecodeError keeps the file's
     # bytes on .object, so chaining either would carry every credential the file holds. `from None`
     # would not do: it leaves __context__ set.
-    raise WiringError(f"could not read environment values from {env_file}: {refusal}")
+    raise WiringError(f"{failed_on}: {refusal}")
 
 
 def _start_files_refused(service_config: str | None, env_file: Path, *, fleet: str = "") -> bool:
@@ -2948,6 +3057,10 @@ def _serve(args: argparse.Namespace) -> int:
         if settings.logging.file is not None
         else None
     )
+    # BACKLOG #3470: a refused collector CA does not stop the start here. The forwarder is not
+    # built, and the API lifespan's audited preflight refuses the start. It writes its audit row
+    # when it can read the file.
+    _forward_ca_refusals: list[TrustAnchorError] = []
     _logging_refused = _start_logging(
         settings,
         env_name=env_name,
@@ -2960,6 +3073,7 @@ def _serve(args: argparse.Namespace) -> int:
             log_file=_log_file,
             stop_on_write_failure=settings.logging.on_write_failure is LogWriteFailurePolicy.STOP,
         ),
+        deferred_ca_refusals=_forward_ca_refusals,
     )
     if _logging_refused is not None:
         return _logging_refused
@@ -4499,11 +4613,8 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError
     from messagefoundry.redaction import safe_exc
 
-    env_values = functools.partial(
-        _read_environment_values,
-        base_dir=env_base,
-        dir_name=settings.environments.dir,
-        environment=env_name,
+    env_values = _environment_values_reader(
+        base_dir=env_base, dir_name=settings.environments.dir, environment=env_name
     )
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
@@ -4779,7 +4890,8 @@ def _serve(args: argparse.Namespace) -> int:
         # GET /logging/level next to the (possibly runtime-overridden) effective level.
         configured_log_level=settings.logging.level,
         # #285 (ASVS 6.7.1): the operator-supplied auth-path trust anchors (OIDC / AD / api-mTLS client
-        # CA), plus the settings CAs an engine hop dials with (vault BACKLOG #3188), that the
+        # CA), plus the settings CAs an engine hop dials with (vault BACKLOG #3188) and the SQL
+        # Server store pin (vault BACKLOG #3714), that the
         # lifespan + /config/reload preflight for ACL + optional SHA-256 pin. Empty when none is
         # configured → dormant, byte-identical. `enforcing` is the [security].enforcement refuse/warn dial.
         trust_anchor_specs=collect_anchor_specs(
@@ -4788,8 +4900,11 @@ def _serve(args: argparse.Namespace) -> int:
             tls=settings.tls,
             alerts=settings.alerts,
             log_settings=settings.logging,
+            store=settings.store,  # the SQL Server pin (vault BACKLOG #3714)
         ),
         trust_anchors_enforcing=enforcing,
+        # BACKLOG #3470: the collector CA `_start_logging` refused, for the lifespan to refuse on.
+        prestore_anchor_refusals=tuple(_forward_ca_refusals),
     )
     # log_config=None: uvicorn's loggers propagate to the handler configure_logging installed,
     # so everything shares one format/stream (and one log file under NSSM).
@@ -5301,8 +5416,7 @@ def _supervise(args: argparse.Namespace) -> int:
             registry_guard=_chain_registry_guards(
                 refuse_keep_forever_overrides,
                 _fleet_connection_key_file_refusal(
-                    functools.partial(
-                        _read_environment_values,
+                    _environment_values_reader(
                         base_dir=env_base,
                         dir_name=settings.environments.dir,
                         environment=env_name,
@@ -6011,6 +6125,106 @@ def _write_private_key(path: Path, pem: bytes) -> None:
     write_restricted_file(path, pem)
 
 
+def _refuse_overwrite(kind: str, path: Path) -> str:
+    """The failure line for a `cert` command that would replace an existing ``kind`` file."""
+    return f"refusing to overwrite an existing {kind} file: {path} (remove it first)"
+
+
+def _name_taken(path: Path) -> bool:
+    """Whether anything holds ``path``, a link included, dangling or not. ``exists()`` follows a
+    link, so a dangling one read as free, and on Windows the exclusive create then followed it and
+    wrote outside ``--out-dir`` (vault BACKLOG #3514)."""
+    return path.exists(follow_symlinks=False)
+
+
+def _refusal_for_existing(files: list[tuple[Path, str]]) -> str | None:
+    """The refusal for the first of ``files`` (``(path, kind)``) whose name is taken, else
+    ``None``. A `cert` command checks before it writes any file, so a refusal leaves the directory
+    as it was."""
+    for path, kind in files:
+        if _name_taken(path):
+            return _refuse_overwrite(kind, path)
+    return None
+
+
+def _refuse_a_stale_ca_chain(ca_path: Path, verb: str, why: str) -> str | None:
+    """The refusal for a run that writes no ca-chain.pem into a directory that holds one, else
+    ``None``. That chain would sit beside a key it does not chain (vault BACKLOG #3514). ``why``
+    is the sentence saying why this run has no chain to write. A setting may still name that
+    chain, so the remedy offers another directory before removing it."""
+    if not _name_taken(ca_path):
+        return None
+    return (
+        f"refusing to {verb} beside an existing CA chain file: {ca_path}. {why}, so that chain "
+        "does not belong to the new key (choose another --out-dir, or remove it first)"
+    )
+
+
+def _write_cert_files(
+    out_dir: Path,
+    key_path: Path,
+    key_pem: bytes,
+    public: list[tuple[Path, bytes, str]],
+    *,
+    as_json: bool,
+) -> int | None:
+    """Create ``out_dir``, write the private key, then each public PEM, every file NEW.
+
+    ``public`` holds ``(path, pem, kind)``, ``kind`` naming the file in a refusal. Each create is
+    exclusive, so a file that appeared after the caller's :func:`_refusal_for_existing` check is
+    still never replaced. If a write fails or is interrupted, every file this run wrote is
+    removed, the key included, and the failure line names any it could not remove. Returns
+    ``None`` when every file is written, else the command's exit code (BACKLOG #3073; vault
+    BACKLOG #3514 for `cert import`)."""
+    # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
+    # It rides out a brief Windows hold on a file, such as a scanner opening the new key.
+    from messagefoundry.restricted_file import unlink_generated
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _cert_fail(f"cannot create --out-dir {str(out_dir)!r}: {exc}", as_json=as_json)
+    written: list[Path] = []
+    path, kind = key_path, "key"
+    # One try over every write, so an interrupt anywhere between them, even between two files,
+    # still cleans up. BaseException for that reason; anything but an OSError is re-raised.
+    try:
+        _write_private_key(key_path, key_pem)  # on an OSError it leaves nothing at key_path
+        written.append(key_path)
+        for entry in public:
+            path, pem, kind = entry  # path and kind name the file a failure line reports
+            with path.open("xb") as fh:
+                written.append(path)
+                fh.write(pem)
+    except BaseException as exc:
+        # Remove only what THIS run wrote, never a file that was already there.
+        removed: list[str] = []
+        left: list[str] = []
+        for done in written:
+            try:
+                unlink_generated(done)
+            except FileNotFoundError:
+                continue  # already gone, so nothing is left to remove
+            except OSError:
+                left.append(str(done))
+            else:
+                removed.append(str(done))
+        if not isinstance(exc, OSError):
+            raise
+        reason = (
+            _refuse_overwrite(kind, path)
+            if isinstance(exc, FileExistsError)
+            else f"cannot write {path}: {exc}"
+        )
+        if removed:
+            reason += f"; removed {', '.join(removed)}, which this run wrote"
+        if left:
+            them = "it" if len(left) == 1 else "them"
+            reason += f"; could not remove {', '.join(left)}, so remove {them} before running again"
+        return _cert_fail(reason, as_json=as_json)
+    return None
+
+
 def _cert(args: argparse.Namespace) -> int:
     """`cert` command group (BACKLOG #71/#72) — dispatch to import / inventory / self-signed."""
     if args.cert_command == "import":
@@ -6028,7 +6242,9 @@ def _cert_import(args: argparse.Namespace) -> int:
     passphrase, so a bundle whose PBMAC1 MAC used one can be imported (BACKLOG #2456). It is never
     a CLI arg and never echoed. A bad password / malformed bundle is
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
-    public; key.pem is written by :func:`_write_private_key`, which refuses to overwrite."""
+    public; key.pem is written by :func:`_write_private_key`. It refuses an existing cert.pem,
+    key.pem or ca-chain.pem before it writes, and if a file is not written, the files this run
+    wrote are removed (:func:`_write_cert_files`)."""
     import os
 
     from messagefoundry import pki
@@ -6063,35 +6279,30 @@ def _cert_import(args: argparse.Namespace) -> int:
     if key is None:
         return _cert_fail("the PKCS#12 bundle contains no private key", as_json=args.json)
 
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return _cert_fail(f"cannot create --out-dir {args.out_dir!r}: {exc}", as_json=args.json)
-
     cert_path = out_dir / "cert.pem"
     key_path = out_dir / "key.pem"
     ca_path = out_dir / "ca-chain.pem"
+    public = [(cert_path, pki.cert_to_pem(cert), "certificate")]
+    if cas:
+        public.append((ca_path, pki.ca_chain_to_pem(cas), "CA chain"))
+    # Refuse before writing any file (vault BACKLOG #3514). cert.pem and ca-chain.pem were replaced
+    # without a word, as `cert self-signed` replaced cert.pem (#3073). An earlier ca-chain.pem is
+    # refused even when this bundle carries no CA, or it would sit beside a key it does not chain.
+    # The second check reaches an existing ca-chain.pem only when the bundle has no CA to write.
+    refusal = _refusal_for_existing(
+        [(path, kind) for path, _pem, kind in public] + [(key_path, "key")]
+    ) or _refuse_a_stale_ca_chain(ca_path, "import", "This bundle carries no CA certs")
+    if refusal is not None:
+        return _cert_fail(refusal, as_json=args.json)
 
-    # Key FIRST (O_EXCL): if it would clobber an existing key we stop before touching cert.pem.
-    try:
-        _write_private_key(key_path, pki.key_to_pem(key))
-    except FileExistsError:
-        return _cert_fail(
-            f"refusing to overwrite an existing key file: {key_path} (remove it first)",
-            as_json=args.json,
-        )
-    except OSError as exc:
-        return _cert_fail(f"cannot write {key_path}: {exc}", as_json=args.json)
-
-    cert_path.write_bytes(pki.cert_to_pem(cert))
-    wrote_ca = bool(cas)
-    if wrote_ca:
-        ca_path.write_bytes(pki.ca_chain_to_pem(cas))
+    failed = _write_cert_files(out_dir, key_path, pki.key_to_pem(key), public, as_json=args.json)
+    if failed is not None:
+        return failed
 
     result: dict[str, object] = {
         "cert": str(cert_path),
         "key": str(key_path),
-        "ca_chain": str(ca_path) if wrote_ca else None,
+        "ca_chain": str(ca_path) if cas else None,
         "ca_count": len(cas),
     }
     if args.json:
@@ -6100,7 +6311,7 @@ def _cert_import(args: argparse.Namespace) -> int:
         _safe_print(f"Imported .pfx into {out_dir}:")
         _safe_print(f"  cert:     {cert_path}")
         _safe_print(f"  key:      {key_path} (private; {_key_protection()})")
-        if wrote_ca:
+        if cas:
             _safe_print(f"  ca-chain: {ca_path} ({len(cas)} CA cert(s))")
         else:
             _safe_print("  ca-chain: (none — the bundle carried no CA certs)")
@@ -6328,29 +6539,26 @@ def _san_labels(names: list[str]) -> str:
 def _cert_self_signed(args: argparse.Namespace) -> int:
     """`cert self-signed` — mint a self-signed EC P-256 cert+key, a TLS PLACEHOLDER.
 
-    Writes cert.pem + key.pem to ``--out-dir``. It refuses an existing cert.pem or key.pem before
-    it mints, and both writes are exclusive, so a file that appears meanwhile is still never
-    replaced. If cert.pem is not written, the files this run wrote are removed, and the failure
-    line names any it could not remove. Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
+    Writes cert.pem + key.pem to ``--out-dir``. It refuses an existing cert.pem, key.pem or
+    ca-chain.pem before it mints, and both writes are exclusive, so a file that appears meanwhile
+    is still never replaced. If cert.pem is not written, the files this run wrote are removed,
+    and the failure line names any it could not remove. Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
-
-    # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
-    # It rides out a brief Windows hold on a file, such as a scanner opening the new key.
-    from messagefoundry.api.tls import _unlink_generated
 
     if args.days <= 0:
         return _cert_fail("--days must be a positive integer", as_json=args.json)
     out_dir = Path(args.out_dir)
     cert_path = out_dir / "cert.pem"
     key_path = out_dir / "key.pem"
-    refuse_cert = (
-        f"refusing to overwrite an existing certificate file: {cert_path} (remove it first)"
+    # Checked before the mint, so a refused run generates no key. A ca-chain.pem an earlier `cert
+    # import` left is refused too, as that command refuses it (vault BACKLOG #3514).
+    refusal = _refusal_for_existing(
+        [(cert_path, "certificate"), (key_path, "key")]
+    ) or _refuse_a_stale_ca_chain(
+        out_dir / "ca-chain.pem", "mint", "A self-signed certificate has no CA chain"
     )
-    refuse_key = f"refusing to overwrite an existing key file: {key_path} (remove it first)"
-    if cert_path.exists():
-        return _cert_fail(refuse_cert, as_json=args.json)
-    if key_path.exists():
-        return _cert_fail(refuse_key, as_json=args.json)
+    if refusal is not None:
+        return _cert_fail(refusal, as_json=args.json)
 
     sans = args.san or []
     try:
@@ -6367,48 +6575,11 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
         # names the rejected value and never carries key material.
         return _cert_fail(f"cannot mint the certificate: {exc}", as_json=args.json)
 
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return _cert_fail(f"cannot create --out-dir {args.out_dir!r}: {exc}", as_json=args.json)
-
-    try:
-        _write_private_key(key_path, key_pem)
-    except FileExistsError:
-        return _cert_fail(refuse_key, as_json=args.json)
-    except OSError as exc:
-        return _cert_fail(f"cannot write {key_path}: {exc}", as_json=args.json)
-
-    # Exclusive create: a cert.pem that appeared after the check above is still never replaced.
-    cert_created = False
-    try:
-        with cert_path.open("xb") as fh:
-            cert_created = True
-            fh.write(cert_pem)
-    except BaseException as exc:
-        # BaseException, so an interrupt between the two writes still cleans up; it is re-raised.
-        # Remove only what THIS run wrote, never a file that was already there.
-        removed: list[str] = []
-        left: list[str] = []
-        for path in (key_path, cert_path) if cert_created else (key_path,):
-            try:
-                _unlink_generated(path)
-            except FileNotFoundError:
-                continue  # already gone, so nothing is left to remove
-            except OSError:
-                left.append(str(path))
-            else:
-                removed.append(str(path))
-        if not isinstance(exc, OSError):
-            raise
-        reason = (
-            refuse_cert if isinstance(exc, FileExistsError) else f"cannot write {cert_path}: {exc}"
-        )
-        if removed:
-            reason += f"; removed {', '.join(removed)}, which this run wrote"
-        if left:
-            reason += f"; could not remove {', '.join(left)}, so remove it before running again"
-        return _cert_fail(reason, as_json=args.json)
+    failed = _write_cert_files(
+        out_dir, key_path, key_pem, [(cert_path, cert_pem, "certificate")], as_json=args.json
+    )
+    if failed is not None:
+        return failed
 
     names = list(dict.fromkeys([args.cn, *sans]))
     result: dict[str, object] = {
@@ -7617,7 +7788,8 @@ def _offline_security_notifier(
     **ANY failure to build the channel is WARNED and yields ``None`` rather than refusing.** This
     serves a recovery command, and losing the notice is the smaller harm than losing the recovery. A
     build error escaping here would also land after the store was created, leaving no administrator.
-    The audit row then records that no channel was wired.
+    The audit row then records that no channel was wired. That covers a relay CA the trust-anchor
+    checks refuse (BACKLOG #3470): the CA is never loaded, and the notice is dropped.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
     from messagefoundry.pipeline.security_notify import security_notifier_from_settings
@@ -7643,6 +7815,22 @@ def _offline_security_notifier(
             file=sys.stderr,
         )
     try:
+        # BACKLOG #3470: the relay's CA takes the trust-anchor checks `serve` gives it. A refusal
+        # drops the notice, as any other failure here does; the recovery itself goes on.
+        from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
+        from messagefoundry.config.settings import SecurityEnforcement
+        from messagefoundry.controlchars import scrub_control_chars
+
+        relay_ca = smtp_hop_anchor_spec(alerts, settings.auth, settings.tls)
+        enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+        if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
+            # The refusal's text is written for a start. This command does not stop on it.
+            print(
+                f"WARNING: {scrub_control_chars(str(refusal))}\nThis command goes on, but it "
+                "sends no security notice over that relay.",
+                file=sys.stderr,
+            )
+            return None
         return security_notifier_from_settings(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
@@ -9376,8 +9564,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     Run **offline** (engine stopped): set ``MEFOR_STORE_ENCRYPTION_KEY`` to the NEW active key and keep
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
-    rotate. After it finishes and the engine has started once, the retired key can be removed; that
-    start re-keys the secret-rotation fingerprints (BACKLOG #2242).
+    rotate. After it finishes the retired key can be removed. The store pass re-seals the
+    secret-rotation fingerprint cells too, so no engine start needs the retired key to read them
+    (BACKLOG #3472, ADR 0213).
 
     **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
     a store another connection holds, which is how a serving engine holds it; see
@@ -10153,16 +10342,29 @@ def _connection(args: argparse.Namespace) -> int:
     env_name = settings.ai.environment
     # Anchor environments/<env>.toml the same way serve does (honor [environments].base_dir), so a
     # GUI/CLI edit validates against the same env() values the running instance will resolve.
-    env_values = (
-        load_environment_values(
-            base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
-            dir_name=settings.environments.dir,
-            environment=env_name,
-            environ=os.environ,
+    from messagefoundry.engine_secrets import SecretsDirectoryError
+
+    try:
+        env_values = (
+            load_environment_values(
+                base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
+                dir_name=settings.environments.dir,
+                environment=env_name,
+                environ=os.environ,
+            )
+            if env_name is not None
+            else {}
         )
-        if env_name is not None
-        else {}
-    )
+    except (ValueError, RecursionError, OSError) as exc:
+        # Vault BACKLOG #2595: a MEFOR_VALUE_* file the secrets directory cannot supply names the
+        # file and never a value, so it is printed as the refusal it is. Anything else from the read
+        # is a malformed or unreadable value file, reported the way serve's reader reports it,
+        # through safe_exc, rather than as a traceback the IDE bridge sees as no output.
+        if isinstance(exc, SecretsDirectoryError):
+            return _emit_error(str(exc), as_json=args.json)
+        from messagefoundry.redaction import safe_exc
+
+        return _emit_error(f"could not read environment values: {safe_exc(exc)}", as_json=args.json)
 
     def validate(config_dir: Path) -> None:
         # allow_empty: this is an AUTHORING surface, and removing the last connection is a legitimate

@@ -68,13 +68,17 @@ from typing import Final
 
 __all__ = [
     "PBKDF2_MIN_ITERATIONS",
+    "DerTlv",
     "KeyWrapRefused",
+    "MalformedDer",
     "Pkcs12EncryptedPart",
+    "der_children",
     "key_wrap_refusal",
     "load_checked_cert_chain",
     "load_connection_cert_chain",
     "pkcs12_encrypted_parts",
     "pkcs12_wrap_refusal",
+    "read_der_tlv",
     "refuse_weak_cert_chain_key",
     "refuse_weak_key_file",
     "refuse_weak_key_wrap",
@@ -193,6 +197,17 @@ def _children(buf: bytes, tlv: _Tlv) -> list[_Tlv]:
         out.append(child)
         pos = child.end
     return out
+
+
+#: The DER reader under public names, for :mod:`messagefoundry.pki`'s read of the serial
+#: numbers in a CA and in a CRL's authority key identifier (vault BACKLOG #3506). One reader, so
+#: the two modules cannot drift apart on what they accept. It reads definite lengths and
+#: single-byte tags, and does not insist that a long-form length is minimal, so it accepts some
+#: BER that is not DER.
+MalformedDer = _Malformed
+DerTlv = _Tlv
+read_der_tlv = _read_tlv
+der_children = _children
 
 
 def _oid(buf: bytes, tlv: _Tlv) -> str:

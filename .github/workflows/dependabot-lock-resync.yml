@@ -133,6 +133,10 @@ jobs:
 
       - name: Re-export the lock files (DEP-1 — byte-for-byte identical flags/paths)
         if: steps.creds.outputs.present == 'true'
+        # uv reads no PIP_* variable, so this is what keeps the check and the exports from building an
+        # sdist, as the SECURITY MODEL above requires (vault BACKLOG #4083 finding 5).
+        env:
+          UV_NO_BUILD: "1"
         run: |
           set -euo pipefail
           # Mirror the DEP-1 gate (security.yml, pip-audit job) EXACTLY. "--check" validates the

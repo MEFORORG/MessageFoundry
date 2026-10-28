@@ -145,8 +145,9 @@ transport = "mllp"
   the type it wanted. A quoted TOML value is always a string, so write the number or `true`/`false`
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
   an environment value arrives as text and an **uncast** ref hands the connector that text. A
-  boolean setting is mostly the exception: it is read strictly whatever the cast (vault BACKLOG
-  #3234; [CONFIGURATION.md](CONFIGURATION.md) gives the spellings and the settings it misses). An inline
+  boolean setting is mostly the exception: once resolved, it is read strictly whatever the cast,
+  `ftp`'s `tls` included (vault BACKLOG #3234; [CONFIGURATION.md](CONFIGURATION.md) gives the
+  spellings and what it misses). An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
   The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
@@ -316,10 +317,9 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > `tls_crl_file` is the in-engine fix to prefer. The process-wide
 > `MEFOR_TLS_REVOCATION_ATTESTED=1` no longer crosses an enforcing outbound hop (BACKLOG #299): one
 > variable cannot say which hop's PKI was reviewed. Routing egress through a revocation-checking
-> proxy does **not** change the decision — the
-> authority has an input for it that no call site sets. Anything else is a *posture change* rather than
-> a fix: `[security].enforcement = warn` downgrades it to a WARN. Nothing silences it instance-wide
-> any more — the synthetic declaration that did was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
+> proxy does **not** change the decision: the authority has no input for one. Anything else is a
+> *posture change* rather than a fix: `[security].enforcement = warn` downgrades it to a WARN.
+> Nothing silences it instance-wide any more — the synthetic declaration that did was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
 >
 > **Some of the engine's other verifying TLS hops are not gated at all** — the inbound FTPS poll,
 > the `Database(...)` destination / `DatabasePoll(...)` source, the SQL Server store
@@ -1303,6 +1303,15 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   refused (`RejectPolicy`) even with the variable set; it takes effect only on a non-enforcing / non-PHI
   instance. A login with a `password` never takes the escape: its unknown host key is refused in
   every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)).
+  The connector only reads the `known_hosts` file; it never writes a key into it (vault BACKLOG
+  #3533). A key the escape accepts is pinned in memory for that connector's later logins, and a
+  changed key is then refused. A `known_hosts` entry for the host wins over the pin, so a key you
+  add there is used at the next login. A password login that names the same file never inherits
+  the pin. The pin lasts as long as the connector does, and a new connector starts with none. An
+  outbound keeps its connector across a lane stop and restart, so its pin holds there. At least an
+  engine restart, a reload that changes the connection, and a rebuild of a failed lane build a new
+  outbound connector. An inbound poller builds a new connector every time it starts, which at least
+  a lane restart and any reload do.
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
@@ -1500,7 +1509,7 @@ one.
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — supply via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
-| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab. None of these reaches a connection that carries a credential: that is refused in every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
+| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab. None of these reaches a connection that carries a credential, or a static header outside a short allowlist: that is refused in every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while chain + hostname stay verified — the narrow alternative to `verify_tls=false`. Same contract as the [MLLP row](#mllp--mllp): **no posture gate and no escape variable**. It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
@@ -1743,7 +1752,9 @@ file with its own TLS library, which can wait for a password on an encrypted blo
 runs when the connection is built, not at each connect, so a file replaced afterwards is not
 checked. At least these cases are left to the driver unchecked: a file that does not exist, a
 directory (an `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot
-read, or one over 16 MiB, is refused. An `SSLCERT` file is not checked this way.
+read, or one over 16 MiB, is refused. An `SSLCA` file that names a PEM label ending in
+`PRIVATE KEY` after its first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA
+file is public trust material. An `SSLCERT` file is not checked this way.
 
 Any other keyword is refused when the connection is built, and the error names the keyword and
 the connection. That fails `messagefoundry check`, a reload and a `connection` edit. At `serve`
@@ -1804,8 +1815,9 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > hop is allowed, a per-connection `tls_hop_attested` with its `tls_hop_attested_reason` allows it (audited, and reported),
 > `cleartext_accepted` warns
 > and audits, a non-enforcing instance warns, and an **enforcing** instance **refuses** it. The refusal
-> lands at construction, so it fails `messagefoundry check` / dry-run / reload / the `serve` pre-flight
-> before anything starts.
+> lands at construction: it fails `messagefoundry check`, dry-run and reload as a whole, and in the live
+> build when `serve` starts it fails that connection, which is recorded failed while the rest of the
+> graph starts (ADR 0031).
 >
 > What is gated is the case the classifier can judge: **no** ssl/tls/encrypt keyword, or one pinned to
 > a no-TLS value. A keyword set to anything outside that deny-list is still delegated, because the
@@ -3128,7 +3140,8 @@ elsewhere. Keep a weakly wrapped key out of those places.
 ## Declaring a cleartext hop (`cleartext_accepted`)
 
 An **outbound** connection whose hop has no TLS is **refused** at `messagefoundry check` / dry-run /
-reload / the serve pre-flight under the default `[security].enforcement = enforce`
+reload, and in the live build when `serve` starts (that outbound is recorded failed and the rest of
+the graph starts), under the default `[security].enforcement = enforce`
 ([ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)). No data
 label relaxes that — `data_class = "synthetic"` used to allow every cleartext hop silently, and no longer
 does. There are exactly three ways such a hop crosses:
@@ -3285,7 +3298,7 @@ outbound(
 | Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
 | What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane, except on `FhirLookup()`, where it refuses the start. At a reload it refuses the reload, if the reload builds or keeps that lane running. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
 | What if it is blank? | On these six factories, and on `Email()` and `Direct()`, a blank literal is refused at load. A blank `env()` value is refused when it resolves, naming the setting, the connection and the environment key (vault BACKLOG #2370). |
-| When is it refused as unread? | On `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. On the others, a token hop can still read it. |
+| When is it refused as unread? | At least on `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. An `Ftp(tls=env(...))` whose value is a false spelling is refused the same way once it resolves, at start, check and reload (vault BACKLOG #3234). One that resolves to `None` is FTPS and reads the CA. On the others, a token hop can still read it. |
 | What if it is unset? | The hop is built exactly as before, from the instance `[tls]` block or the OS store. |
 
 **It is opt-in.** Every default still trusts the OS store, so an internal hop without it is verified
@@ -3311,7 +3324,7 @@ checks.
 | An operator start (`POST /connections/{name}/start`), such as of an `auto_start = false` lane | That connection only. |
 | Start, for a `FhirLookup()` | The whole start. A lookup has no lane of its own to fail. |
 | A reload, for a lane it builds or keeps running, and for a `FhirLookup()` | The whole reload, before anything changes. |
-| A reload, for an idle lane | Nothing. The reload does not read its CA. An idle lane is one below a DR threshold, an `auto_start = false` lane not running, an `Ftp()` poller outside its schedule window, or a lane its CA refused whose config has not changed. The reload leaves that last kind failed: fixing the file alone does not heal it on a reload. A config change, an operator start or a restart builds it, and checks it then. Only the pin, permission and path checks are skipped: a reload's build check still builds every deployed `MLLP()`, `Ftp()`, `Email()` and `Direct()`, which read the file as they are built, so a file they cannot load still refuses the reload. |
+| A reload, for an idle lane | Nothing. The reload does not read its CA. An idle lane is one below a DR threshold, an `auto_start = false` lane not running, an `Ftp()` poller outside its schedule window, or a lane its CA refused whose config has not changed. The reload leaves that last kind failed: fixing the file alone does not heal it on a reload. A config change, an operator start or a restart builds it, and checks it then. Only the pin, permission, path and private-key checks are skipped: a reload's build check still builds every deployed `MLLP()`, `Ftp()`, `Email()` and `Direct()`, which read the file as they are built, so a file they cannot load still refuses the reload. |
 
 | What the check finds | What happens |
 |---|---|
@@ -3319,6 +3332,7 @@ checks.
 | An account other than the owner can write the file, or replace it through a folder on its path | Refused under `[security].enforcement = enforce`. A WARNING under `warn`. |
 | The engine cannot read the file's permissions or its path | Refused under `enforce`, **even with a matching pin**. A WARNING under `warn`. Move the file into a folder whose permissions the engine can read. |
 | The file cannot be read at all | Refused, naming the connection and the path. |
+| The file names a PEM label ending in `PRIVATE KEY` anywhere after its first `-----BEGIN ` (BACKLOG #3745) | Refused, whatever `[security].enforcement` says, with a `pem_refused` audit row. A CA file is public trust material; keep the key in its own file. |
 | The file's SHA-256 differs from the one the last check saw | An `auth.trust_anchor` audit row with `event` set to `changed`. |
 
 Each check writes its `auth.trust_anchor` rows under `outbound:<connection name>`,
@@ -3338,7 +3352,8 @@ unchecked until that connection is built again. A restart rebuilds it. A reload 
 when its config changed. A later reload checks and audits the file on disk, not the bytes the live
 hop loaded. So a `changed` row does not mean the hop now trusts the new file. A pin would vouch for
 bytes the hop never loaded. For the same reason the check does not refuse a file the hop itself can
-load, such as one holding a `TRUSTED CERTIFICATE` block.
+load, such as one holding a `TRUSTED CERTIFICATE` block. The one exception is a private key, which
+no hop needs in its CA file (BACKLOG #3745).
 
 `tls_ca_pin` with no `tls_ca_file` is refused at load, since nothing would check it. So is a pin that
 is empty or whitespace; leave it out for no pin. On the eight factories above, a literal pin that

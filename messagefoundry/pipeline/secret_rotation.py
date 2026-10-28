@@ -12,10 +12,13 @@ periodically compares each tracked secret's **last-rotated date** against its **
 keyed start :func:`reconcile_rotation_meta` persists a NON-SECRET stamp (the DEK's one-way key-id + a
 *tracked-since* floor date) in store meta, and the runner falls back to it when
 ``store_key_last_rotated`` is unset. The enumeration is widened beyond the DEK: each configured secret
-class the engine holds is fingerprinted with a **DEK-derived KEYED MAC** (HMAC — never a salted hash, so
-a low-entropy secret is not offline-guessable) into store meta; when a fingerprint changes the clock is
-reset (rotation **auto-detected**, never operator-attested). A fingerprint that changed only because
-a DEK rotation changed the MAC key is a re-key and keeps its date (BACKLOG #2242). Under ``[security].enforcement=ENFORCE`` a
+class the engine holds is fingerprinted with a **KEYED MAC** (HMAC under a per-row random key — never a
+salted hash) and the key and MAC are sealed together as a **store-cipher cell** in store meta, so a
+reader without the store key has nothing to test a guess of a low-entropy secret against (BACKLOG
+#3472, ADR 0213). When the secret no longer matches its cell the clock is reset (rotation
+**auto-detected**, never operator-attested). ``rotate-key`` re-seals each cell under the new store
+key, so a store key rotation never reads as a rotation of every other secret, and a cell the engine
+cannot open keeps its dates. Under ``[security].enforcement=ENFORCE`` a
 DEK past ``max_age + grace`` escalates its alert severity at restart **and the engine refuses to start**
 (:func:`enforce_store_key_expiry`, BACKLOG #1004) — the calendar axis now stops, the way the usage axis
 always has. ``[secret_rotation].enforce_store_key_expiry = false`` is the operator escape, and it is a
@@ -35,7 +38,7 @@ clock + a pure :meth:`run_once` make it deterministically testable; the loop onl
 set of secrets to watch is supplied by an injected **callable** so it is recomputed each pass (a config
 reload is picked up automatically, and tests can drive it with a literal list). Engine-side, so it never
 pulls the API or console into the engine. It imports ``store.crypto`` for the stored fingerprints'
-scheme tags (BACKLOG #3421).
+scheme tags (BACKLOG #3421) and to seal and open the fingerprint cells (BACKLOG #3472).
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ import datetime
 import hashlib
 import hmac
 import logging
-import os
+import secrets
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -53,17 +56,21 @@ from typing import TYPE_CHECKING
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import CONNECTOR_SECRET_EXPIRY_CLASS
+from messagefoundry.engine_secrets import secret_settings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.store.crypto import (
     KEY_ID_SCHEME,
+    CipherError,
     UnknownSchemeError,
+    open_rotation_fingerprint,
     read_scheme_tag,
     scheme_tagged,
+    seal_rotation_fingerprint,
 )
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretRotationSettings
-    from messagefoundry.store.store import SecretRotationMetaStore
+    from messagefoundry.store.store import SecretRotationMetaRow, SecretRotationMetaStore
 
 __all__ = [
     "MonitoredSecret",
@@ -196,9 +203,13 @@ def fingerprints_equal(stored: str, current: str) -> bool:
     value was written before tags and reads as today's scheme, so an unchanged secret still compares
     equal. Any other tag raises :class:`~messagefoundry.store.crypto.UnknownSchemeError`. A
     ``current`` with no compiled tag is a caller's error and raises ``ValueError``: compared as an
-    untagged value it would read every unchanged key as rotated."""
+    untagged value it would read every unchanged key as rotated.
+
+    Only the DEK's key-id fingerprint is compared this way. A non-DEK fingerprint is a sealed cell
+    holding its own random key (BACKLOG #3472), so it is opened and checked against the value, never
+    compared as text: two seals of one value differ."""
     scheme, _, value = current.partition(":")
-    if scheme not in (KEY_ID_SCHEME, _FP_SCHEME):
+    if scheme != KEY_ID_SCHEME:
         raise ValueError("fingerprints_equal: current must carry a scheme tag this release makes")
     return hmac.compare_digest(
         _fingerprint_bytes(read_scheme_tag(stored, scheme)), _fingerprint_bytes(value)
@@ -209,17 +220,17 @@ def fingerprint_changed(stored: str, current: str) -> bool | None:
     """Whether ``stored`` differs from ``current``, by :func:`fingerprints_equal`. ``None`` when
     ``stored`` names a scheme this release does not compile in: it is refused, not read under any
     scheme, so nothing can say whether the secret changed. The caller keeps the row's dates and
-    re-stamps it under ``current``, as an undecided re-key is: the clock never resets, and the next
-    rotation is detected (BACKLOG #3421)."""
+    re-stamps it under ``current``: the clock never resets, and the next rotation is detected
+    (BACKLOG #3421)."""
     try:
         return not fingerprints_equal(stored, current)
     except UnknownSchemeError:
         return None
 
 
-#: The scheme tag of a stored non-DEK fingerprint (BACKLOG #3421): :func:`_bare_mac`, HMAC-SHA256
-#: cut to 32 hex, behind :func:`_fingerprint_key_id`'s key id. Changing either function means a new
-#: tag, or every non-DEK secret would read as rotated.
+#: The scheme tag of a non-DEK fingerprint written before BACKLOG #3472: a key id and an
+#: HMAC-SHA256 cut to 32 hex, under a key derived from the store DEK. This release makes none. A row
+#: still carrying it is never compared: its dates are kept and a sealed cell replaces it (ADR 0213).
 _FP_SCHEME = "hmac-sha256-32"
 
 
@@ -229,82 +240,79 @@ def dek_fingerprint(key_id: str) -> str:
     return scheme_tagged(KEY_ID_SCHEME, key_id)
 
 
-#: The fixed, public message :func:`_fingerprint_key_id` MACs under each fingerprint key.
-_FP_KEY_ID_LABEL = b"mefor/secret-rotation-fp-key-id/v1"
-_FP_KEY_ID_LEN = 16
-
-
-def _fingerprint_key_id(key: bytes) -> str:
-    """The non-secret id of one fingerprint MAC key (BACKLOG #2242): the key's MAC over a fixed
-    label, a key check value. It names the key without revealing it."""
-    return hmac.new(key, _FP_KEY_ID_LABEL, hashlib.sha256).hexdigest()[:_FP_KEY_ID_LEN]
-
-
-def _keyed_fingerprint(key: bytes, value: str, key_id: str | None = None) -> str:
-    """A one-way KEYED-MAC fingerprint of ``value`` under the DEK-derived ``key`` (ASVS 13.3.4). HMAC-
-    SHA256, NOT a salted hash: a salted hash of a low-entropy AD/SMTP password is offline-guessable,
-    whereas without the DEK-derived key this MAC is not — the persisted fingerprint reveals nothing about
-    the value. Truncated to :data:`_FP_HEX_LEN`; used only to detect *change*, never to recover a value.
-
-    Prefixed ``<key id>:`` (BACKLOG #2242). The key is DEK-derived, so a DEK rotation changes every
-    fingerprint while no secret changed; the id says which key made a stored fingerprint, so the
-    reconcile can tell that re-key from a rotation. Stored behind :data:`_FP_SCHEME` (BACKLOG
-    #3421). ``key_id`` is :func:`_fingerprint_key_id` of ``key``, for a caller that computed it."""
-    kid = _fingerprint_key_id(key) if key_id is None else key_id
-    return scheme_tagged(_FP_SCHEME, f"{kid}:{_bare_mac(key, value)}")
+#: Bytes of the per-row random HMAC key a sealed fingerprint cell holds (BACKLOG #3472).
+_CELL_KEY_BYTES = 32
+_LOWER_HEX = "0123456789abcdef"
 
 
 def _bare_mac(key: bytes, value: str) -> str:
-    """The truncated HMAC-SHA256 of ``value`` under ``key``, without the key-id prefix."""
-    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()[:_FP_HEX_LEN]
+    """The HMAC-SHA256 of ``value`` under ``key``, cut to :data:`_FP_HEX_LEN` hex. ``surrogatepass``
+    for the reason :func:`_fingerprint_bytes` gives: an environment value POSIX decoded with
+    ``surrogateescape`` would otherwise raise here, and the engine's reconcile handler would swallow
+    it for every class. Identical to strict UTF-8 for every value that encodes at all."""
+    return hmac.new(key, value.encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()[
+        :_FP_HEX_LEN
+    ]
 
 
-def _rekeyed(
-    stored: str,
-    value: str,
-    current_key: bytes,
-    current_id: str,
-    prior_keys: Mapping[str, bytes],
-) -> bool | None:
-    """Whether a ``stored`` fingerprint that differs from ``value``'s under ``current_key`` (id
-    ``current_id``) is a RE-KEY rather than a rotation (BACKLOG #2242). ``prior_keys`` maps each
-    retired fingerprint key's id to the key.
+def _fingerprint_cell(class_id: str, value: str) -> str:
+    """The plaintext of a sealed fingerprint (BACKLOG #3472, ADR 0213): a fresh random HMAC key,
+    ``value``'s MAC under it, and ``class_id``, as ``<key hex>:<mac hex>:<class id>``.
 
-    ``True`` when ``stored`` is ``value``'s fingerprint under the prior key it names: the secret is
-    the same and only the DEK-derived key moved.
+    A KEYED MAC, never a salted hash, and the key lives only inside the sealed cell, so reading the
+    row without the store key gives nothing to test a guess of a low-entropy AD or SMTP password
+    against. The store key seals the cell, so a store key rotation re-seals it without changing what
+    is compared, and a key that leaked before a rotation opens no cell sealed after it. The class id
+    is bound inside as well as in the cell AAD, so a cell moved to another row reads as unreadable
+    even under ``[store].aad_bind = false``."""
+    key = secrets.token_bytes(_CELL_KEY_BYTES)
+    return f"{key.hex()}:{_bare_mac(key, value)}:{class_id}"
 
-    ``False`` when the key that made ``stored`` is in hand and ``value`` does not match under it: a
-    real rotation, including one made together with a DEK rotation.
 
-    ``None`` when the key that made ``stored`` is not in hand, which happens once the retired DEK is
-    dropped: nothing can tell whether the secret changed. The caller keeps the older date. That
-    direction can only over-report an age; resetting the clock instead is what lifted every overdue
-    refusal on a DEK rotation.
+def _cell_unchanged(cell: str, class_id: str, value: str) -> bool | None:
+    """Whether the opened fingerprint ``cell`` of row ``class_id`` matches ``value``: ``True`` the
+    same secret, ``False`` a changed one, ``None`` when the cell is malformed or names another row.
 
-    A ``stored`` value with no key id was written before ids existed, or out of band. It is settled
-    against every key in hand: a match is ``True``, and no match is ``False``, as before ids."""
-    # Every MAC goes through compare_digest, as everywhere in this module (ASVS 11.2.4). The key id
-    # is non-secret (stored beside the MAC), so a plain lookup is fine for it.
-    stored_id, sep, stored_mac = stored.partition(":")
-    if not sep:
-        stored_bytes = _fingerprint_bytes(stored)
-        return any(
-            hmac.compare_digest(stored_bytes, _fingerprint_bytes(_bare_mac(key, value)))
-            for key in (current_key, *prior_keys.values())
-        )
-    if stored_id == current_id:
-        return False
-    key = prior_keys.get(stored_id)
-    if key is None:
+    The MAC goes through ``compare_digest`` over bytes (ASVS 11.2.4, BACKLOG #1167). The key and
+    the class id are read out of an authenticated cell, so testing them is not a secret compare."""
+    parts = cell.split(":", 2)  # the key and MAC are hex, so only the class id may hold a ':'
+    if len(parts) != 3 or parts[2] != class_id:
         return None
-    return hmac.compare_digest(
-        _fingerprint_bytes(stored_mac), _fingerprint_bytes(_bare_mac(key, value))
-    )
+    key_hex, mac = parts[0], parts[1]
+    if (
+        len(key_hex) != 2 * _CELL_KEY_BYTES
+        or len(mac) != _FP_HEX_LEN
+        or (key_hex + mac).strip(_LOWER_HEX)
+    ):
+        return None
+    key = bytes.fromhex(key_hex)
+    return hmac.compare_digest(_fingerprint_bytes(mac), _fingerprint_bytes(_bare_mac(key, value)))
+
+
+def _is_legacy_fingerprint(stored: str) -> bool:
+    """Whether ``stored`` is a non-DEK fingerprint an earlier release wrote: tagged
+    :data:`_FP_SCHEME`, or untagged as every value before BACKLOG #3421 was. The rule for a tag is
+    :func:`~messagefoundry.store.crypto.read_scheme_tag`'s. For the log line only; every unreadable
+    row is handled the same way."""
+    head, sep, _ = stored.partition(":")
+    untagged = not sep or bool(head and not head.strip(_LOWER_HEX))
+    return bool(stored) and (head == _FP_SCHEME or untagged)
+
+
+def _kept_dates(prior: SecretRotationMetaRow) -> tuple[datetime.date, datetime.date]:
+    """``prior``'s ``(tracked_since, last_rotated)``, total over a row written out of band. A date
+    that does not parse falls back to the other one, never to today, which would reset the clock
+    and lift an overdue refusal. With neither parseable, both are the earliest date: an
+    undetermined age is not a young one (BACKLOG #1004's ruling), so the class reads as overdue."""
+    tracked = _parsed_date(prior.tracked_since)
+    rotated = _parsed_date(prior.last_rotated)
+    floor = tracked or rotated or datetime.date.min
+    return floor, rotated or floor
 
 
 def _parsed_date(text: str) -> datetime.date | None:
     """``text`` as an ISO date, or ``None`` when it is not one (``secret_rotation_meta`` is writable
-    out of band). Used on the re-key path only; the other parses here raise as they always have."""
+    out of band)."""
     try:
         return datetime.date.fromisoformat(text)
     except ValueError:
@@ -314,22 +322,21 @@ def _parsed_date(text: str) -> datetime.date | None:
 def held_env_secret_values(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """The fixed ``MEFOR_*`` secret values the engine actually holds — present and non-empty — in
     ``environ`` (default :data:`os.environ`). Returned transiently to be fingerprinted; **never** stored
-    or logged. A class absent from the environment is simply not tracked (deny-by-default)."""
-    env = os.environ if environ is None else environ
-    out: dict[str, str] = {}
-    for name, _label in _ENV_SECRET_CLASSES:
-        val = env.get(name)
-        if val:
-            out[name] = val
-    return out
+    or logged. A class absent from the environment is simply not tracked (deny-by-default).
+
+    Each value is read through the one accessor, so a secret the secrets directory supplies is
+    fingerprinted as one from the environment is (vault BACKLOG #2595, ADR 0214)."""
+    found = secret_settings((name for name, _label in _ENV_SECRET_CLASSES), environ=environ)
+    return {name: val for name, val in found.items() if val}
 
 
 @dataclass(frozen=True)
 class SecretStamp:
-    """The reconciled watch state for one tracked secret class (ASVS 13.3.4). NON-SECRET: ``fingerprint``
-    is a keyed MAC / DEK key-id, ``tracked_since`` the age-floor first-observed date, ``last_rotated`` the
-    date the fingerprint last changed. Carries ``max_age_days`` so the runner can build a
-    :class:`MonitoredSecret` per class."""
+    """The reconciled watch state for one tracked secret class (ASVS 13.3.4). NON-SECRET:
+    ``fingerprint`` is the stored value, a sealed keyed-MAC cell or the DEK key-id;
+    ``tracked_since`` the age-floor first-observed date; ``last_rotated`` the date a change was last
+    detected. Carries ``max_age_days`` so the runner can build a :class:`MonitoredSecret` per
+    class."""
 
     class_id: str
     label: str
@@ -355,11 +362,11 @@ def secrets_from_settings_and_stamps(
     auto-detected tracked-since / rotation stamp — so the DEK is tracked LIVE-BY-DEFAULT without operator
     action, ASVS 13.3.4) plus one entry per reconciled non-DEK class stamp. PHI-free: dates + identifiers
     only."""
-    secrets: list[MonitoredSecret] = []
+    watched: list[MonitoredSecret] = []
     dek_stamp = stamps.get(_DEK_CLASS_ID)
     if settings.store_key_last_rotated:
         # Operator override wins (validated ISO YYYY-MM-DD at settings load, so fromisoformat is safe).
-        secrets.append(
+        watched.append(
             MonitoredSecret(
                 label=_DEK_LABEL,
                 class_id=_DEK_CLASS_ID,  # the secret's env-var NAME/label, never its value
@@ -368,7 +375,7 @@ def secrets_from_settings_and_stamps(
             )
         )
     elif dek_stamp is not None:
-        secrets.append(
+        watched.append(
             MonitoredSecret(
                 label=dek_stamp.label,
                 class_id=_DEK_CLASS_ID,  # identifier/label, never the value
@@ -379,7 +386,7 @@ def secrets_from_settings_and_stamps(
     for class_id, stamp in stamps.items():
         if class_id == _DEK_CLASS_ID:
             continue
-        secrets.append(
+        watched.append(
             MonitoredSecret(
                 label=stamp.label,
                 class_id=class_id,  # identifier/label, never the value
@@ -387,7 +394,7 @@ def secrets_from_settings_and_stamps(
                 max_age_days=stamp.max_age_days,
             )
         )
-    return secrets
+    return watched
 
 
 async def reconcile_rotation_meta(
@@ -400,118 +407,48 @@ async def reconcile_rotation_meta(
     now: float | None = None,
     extra_values: Mapping[str, str] | None = None,
     env_values: Mapping[str, str] | None = None,
-    prior_fingerprint_keys: Collection[bytes] = (),
 ) -> dict[str, SecretStamp]:
     """Reconcile the persisted secret-rotation stamps against what the engine holds RIGHT NOW, at engine
     start (ASVS 13.3.4, BACKLOG #282). For each tracked class — the store DEK (by its one-way key-id) and
-    every configured ``MEFOR_*`` / connector secret the engine holds (fingerprinted with a DEK-derived
-    KEYED MAC) — this:
+    every configured ``MEFOR_*`` / connector secret the engine holds (a KEYED MAC sealed as a
+    store-cipher cell, BACKLOG #3472) — this:
 
     * stamps a NEW class with ``tracked_since = last_rotated = today`` (an age FLOOR — a pre-existing
       year-old key gets a fresh clock on upgrade and does **not** retroactively alert);
-    * on a CHANGED fingerprint resets ``last_rotated = today`` (rotation is AUTO-DETECTED, never
+    * on a CHANGED secret resets ``last_rotated = today`` (rotation is AUTO-DETECTED, never
       operator-attested) while keeping ``tracked_since``;
-    * on a fingerprint that changed only because the DEK-derived fingerprint key did, re-fingerprints
-      under the current key and keeps both dates (a RE-KEY, BACKLOG #2242; see :func:`_rekeyed`).
-      ``prior_fingerprint_keys`` are the keys a retired DEK derives; with them in hand a secret that
-      changed together with the DEK still reads as rotated;
+    * on a stored fingerprint it cannot read keeps both dates and stores a fresh one. That covers a
+      cell no configured key opens, a cell moved from another row, a corrupt or blank one, a
+      pre-#3472 DEK-derived keyed MAC and a scheme this release does not know. Keeping the dates can
+      only over-report an age; a reset is what would lift an overdue refusal (ADR 0213);
     * leaves an unchanged class untouched (no rewrite).
+
+    A store key rotation does not read as a change of every secret: ``rotate-key`` re-seals each cell
+    under the new key, and what is compared inside it does not move (ADR 0213, which supersedes the
+    BACKLOG #2242 re-key rule).
 
     It then arms the **ENFORCE escalation**: under ``[security].enforcement=ENFORCE``, a DEK older than
     ``store_key_max_age_days + enforce_grace_days`` emits its ``secret_rotation_due`` alert with
     ``enforced=True`` at restart. Returns the reconciled stamps for the runner's live secret source.
 
-    PHI/secret-safe: a secret value is read only to compute its keyed MAC; only the MAC + dates are ever
-    persisted or alerted, never the value."""
+    PHI/secret-safe: a secret value is read only to compute its keyed MAC; only the sealed MAC + dates
+    are ever persisted, and only dates and counts are alerted or logged, never the value."""
     ts = time.time() if now is None else now
     today = datetime.datetime.fromtimestamp(ts, tz=_UTC).date()
     stored = await meta_store.get_secret_rotation_meta()
-
-    # (class_id, label, fingerprint, max_age_days, value) for every class the engine currently holds.
-    # The value is None for the DEK; for the rest it is read only to tell a re-key from a rotation.
-    classes: list[tuple[str, str, str, int, str | None]] = []
-    if dek_key_id:
-        # The DEK's fingerprint IS its one-way key-id (SHA-256 of the key) — no value is handled here.
-        classes.append(
-            (
-                _DEK_CLASS_ID,
-                _DEK_LABEL,
-                dek_fingerprint(dek_key_id),
-                settings.store_key_max_age_days,
-                None,
-            )
-        )
-    fp_key = meta_store.secret_rotation_fingerprint_key()
-    current_id = ""
-    prior_keys: dict[str, bytes] = {}
-    if fp_key is not None:
-        current_id = _fingerprint_key_id(fp_key)
-        prior_keys = {_fingerprint_key_id(k): k for k in prior_fingerprint_keys}
-        held: dict[str, str] = dict(held_env_secret_values(env_values))
-        if extra_values:  # per-Connection env() credentials the engine resolved (same mechanism)
-            held.update(extra_values)
-        labels = dict(_ENV_SECRET_CLASSES)
-        for class_id, held_value in held.items():
-            label = labels.get(class_id, class_id)
-            fingerprint = _keyed_fingerprint(fp_key, held_value, current_id)
-            classes.append((class_id, label, fingerprint, settings.secret_max_age_days, held_value))
-
     stamps: dict[str, SecretStamp] = {}
-    undecided: list[str] = []  # re-keyed with the prior key not in hand (BACKLOG #2242)
-    refused = 0  # stored under a scheme this release does not compile in (BACKLOG #3421)
-    for class_id, label, fingerprint, max_age, value in classes:
-        prior = stored.get(class_id)
-        if prior is None:
-            tracked_since = today
-            last_rotated = today
-            changed = True
-        # ASVS 11.2.4 (BACKLOG #1167). Both operands are keyed and secret-derived — `_keyed_fingerprint`
-        # is an HMAC-SHA256 over a live secret value — so `fingerprints_equal` compares with
-        # `hmac.compare_digest`, never `!=`, which short-circuits on the first differing byte and so
-        # leaks how much of the stored MAC a guess already matches. `_fingerprint_bytes` is what keeps
-        # the comparison total; read its docstring before changing either side. Pinned by the
-        # monkeypatched-comparator call-count test in tests\test_secret_rotation_watcher.py, whose
-        # positive control asserts a plain `!=` counts zero compares.
-        elif changed_fp := fingerprint_changed(prior.fingerprint, fingerprint):  # True: changed
-            tracked_since = datetime.date.fromisoformat(prior.tracked_since)
-            # The DEK row carries no value: its fingerprint is its key-id, never re-keyed. A value is
-            # only ever held with a fingerprint key; the second test narrows the type.
-            rekeyed = (
-                False
-                if value is None or fp_key is None
-                else _rekeyed(
-                    read_scheme_tag(prior.fingerprint, _FP_SCHEME),
-                    value,
-                    fp_key,
-                    current_id,
-                    prior_keys,
-                )
-            )
-            if rekeyed is False:
-                last_rotated = today  # rotation auto-detected, so reset the clock
-            else:
-                # BACKLOG #2242: the fingerprint key moved with the DEK. Re-fingerprint under the
-                # current key and keep the age, or a DEK rotation would reset every class's clock.
-                # A malformed stored date falls back to the older tracked_since, never to today.
-                last_rotated = _parsed_date(prior.last_rotated) or tracked_since
-                if rekeyed is None:
-                    undecided.append(class_id)
-            changed = True
-        elif changed_fp is None:
-            # BACKLOG #3421: refused. Its dates are kept, as for an undecided re-key, and it is
-            # re-stamped under today's scheme so the next rotation is detected.
-            refused += 1
-            tracked_since = datetime.date.fromisoformat(prior.tracked_since)
-            last_rotated = _parsed_date(prior.last_rotated) or tracked_since
-            changed = True
-        else:
-            tracked_since = datetime.date.fromisoformat(prior.tracked_since)
-            last_rotated = datetime.date.fromisoformat(prior.last_rotated)
-            # Equal. A value written before tags is re-stamped in its tagged form, dates kept, so no
-            # untagged row outlives this release for a later scheme to misread (BACKLOG #3421). The
-            # tag is public, so a prefix test is not a secret-dependent compare.
-            changed = not prior.fingerprint.startswith(fingerprint.partition(":")[0] + ":")
-        if changed:
+
+    async def _record(
+        class_id: str,
+        label: str,
+        fingerprint: str,
+        max_age: int,
+        tracked_since: datetime.date,
+        last_rotated: datetime.date,
+        *,
+        write: bool,
+    ) -> None:
+        if write:
             await meta_store.upsert_secret_rotation_meta(
                 class_id,
                 fingerprint=fingerprint,
@@ -526,6 +463,110 @@ async def reconcile_rotation_meta(
             last_rotated=last_rotated,
             max_age_days=max_age,
         )
+
+    # The DEK row stored under a scheme this release does not compile in (BACKLOG #3421).
+    refused = 0
+    if dek_key_id:
+        # The DEK's fingerprint IS its one-way key-id (SHA-256 of the key) — no value is handled here.
+        fingerprint = dek_fingerprint(dek_key_id)
+        prior = stored.get(_DEK_CLASS_ID)
+        if prior is None:
+            await _record(
+                _DEK_CLASS_ID,
+                _DEK_LABEL,
+                fingerprint,
+                settings.store_key_max_age_days,
+                today,
+                today,
+                write=True,
+            )
+        else:
+            tracked_since, last_rotated = _kept_dates(prior)
+            # ASVS 11.2.4 (BACKLOG #1167): `fingerprint_changed` compares with `hmac.compare_digest`,
+            # never `!=`. `_fingerprint_bytes` is what keeps the comparison total; read its docstring
+            # before changing either side. Pinned by the monkeypatched-comparator call-count test in
+            # tests\test_secret_rotation_watcher.py.
+            changed_fp = fingerprint_changed(prior.fingerprint, fingerprint)
+            if changed_fp:
+                last_rotated = today  # rotation auto-detected, so reset the clock
+            elif changed_fp is None:
+                # BACKLOG #3421: refused. Its dates are kept and it is re-stamped under today's
+                # scheme, so the next rotation is detected.
+                refused += 1
+            # Written when changed or refused, and when equal but stored before tags: that row is
+            # re-stamped in its tagged form, dates kept, so no untagged row outlives this release
+            # for a later scheme to misread (BACKLOG #3421). The tag is public, so a prefix test is
+            # not a secret-dependent compare.
+            await _record(
+                _DEK_CLASS_ID,
+                _DEK_LABEL,
+                fingerprint,
+                settings.store_key_max_age_days,
+                tracked_since,
+                last_rotated,
+                write=changed_fp is not False
+                or not prior.fingerprint.startswith(f"{KEY_ID_SCHEME}:"),
+            )
+
+    cipher = meta_store.secret_rotation_cipher()
+    labels = dict(_ENV_SECRET_CLASSES)
+    legacy = 0  # a pre-#3472 DEK-derived keyed MAC, read only to keep its dates (ADR 0213)
+    unreadable = 0  # sealed, but no configured key opens it under this row, or it is malformed
+    failed = 0  # the cipher refused to seal or open, so the class has no stamp this start
+    if cipher is not None:
+        # Off the event loop: the secrets directory read is file and access-list I/O.
+        held = dict(await asyncio.to_thread(held_env_secret_values, env_values))
+        if extra_values:  # per-Connection env() credentials the engine resolved (same mechanism)
+            held.update(extra_values)
+        for class_id, value in held.items():
+            label = labels.get(class_id, class_id)
+            max_age = settings.secret_max_age_days
+            prior = stored.get(class_id)
+            try:
+                if prior is None:
+                    sealed = seal_rotation_fingerprint(
+                        cipher, class_id, _fingerprint_cell(class_id, value)
+                    )
+                    await _record(class_id, label, sealed, max_age, today, today, write=True)
+                    continue
+                tracked_since, last_rotated = _kept_dates(prior)
+                cell = open_rotation_fingerprint(cipher, class_id, prior.fingerprint)
+                unchanged = None if cell is None else _cell_unchanged(cell, class_id, value)
+                if unchanged:
+                    await _record(
+                        class_id,
+                        label,
+                        prior.fingerprint,
+                        max_age,
+                        tracked_since,
+                        last_rotated,
+                        write=False,
+                    )
+                    continue
+                if unchanged is False:
+                    last_rotated = today  # rotation auto-detected, so reset the clock
+                elif _is_legacy_fingerprint(prior.fingerprint):
+                    # Unreadable, here and below: nothing can say whether the secret changed, so
+                    # its dates are kept and a fresh cell is sealed, and the next change is seen.
+                    legacy += 1
+                else:
+                    unreadable += 1
+                sealed = seal_rotation_fingerprint(
+                    cipher, class_id, _fingerprint_cell(class_id, value)
+                )
+                await _record(
+                    class_id, label, sealed, max_age, tracked_since, last_rotated, write=True
+                )
+            except (CipherError, UnicodeEncodeError):
+                # The cipher refused: at least its AES-GCM invocation ceiling, or a class id it
+                # cannot encode into the cell AAD. Only this class goes without a stamp, so the
+                # others stay tracked and the DEK escalation below still runs; an opted-in class
+                # with no stamp refuses under ENFORCE, the fail-closed direction.
+                failed += 1
+
+    # One line per kind for the lot, carrying the COUNT only: the ids come from the secret-bearing
+    # mapping (for a Connection credential the id is the env() key), and CodeQL's clear-text-logging
+    # rule flags a log line built from them.
     if refused:
         log.warning(
             "secret rotation: %d stored fingerprint(s) name a scheme this release does not know, "
@@ -534,17 +575,28 @@ async def reconcile_rotation_meta(
             "key was rotated, [secret_rotation].store_key_last_rotated records its real date.",
             refused,
         )
-    if undecided:
-        # One line for the lot: a graph with many connector credentials would otherwise log one
-        # warning per credential on the same start. This warning carries the COUNT only: the ids
-        # come from the secret-bearing tuples (for a Connection credential the id is the env()
-        # key), and CodeQL's clear-text-logging rule flags a log line built from them.
+    if legacy:
         log.warning(
-            "secret rotation: %d secret(s) were fingerprinted under a store key that is no longer "
-            "configured, so a change made with the store key's rotation cannot be detected. "
-            "Their last-rotated dates are kept. Keeping the prior key in "
-            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED for the first start after rotate-key avoids this.",
-            len(undecided),
+            "secret rotation: %d secret fingerprint(s) were written by an earlier release, under a "
+            "key derived from the store key, and were not compared. Their last-rotated dates are "
+            "kept and each is now a sealed store-cipher cell, so a change made before this start "
+            "is not detected, and the next one is.",
+            legacy,
+        )
+    if failed:
+        log.warning(
+            "secret rotation: %d secret(s) could not be sealed or opened by the store cipher, so "
+            "they are not tracked this start. An expiry opt-in for one of them refuses under "
+            "enforce, as an undetermined age does.",
+            failed,
+        )
+    if unreadable:
+        log.warning(
+            "secret rotation: %d secret fingerprint(s) could not be read: no configured store key "
+            "opens it, it belongs to another row, or it is blank, malformed or in a format this "
+            "release does not know. A change made before this start cannot be detected. Their "
+            "last-rotated dates are kept and a new fingerprint was sealed for each.",
+            unreadable,
         )
 
     _maybe_escalate_dek(

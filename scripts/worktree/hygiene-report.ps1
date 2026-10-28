@@ -32,6 +32,12 @@
       c. Installed-hook drift, read by running that clone's own scripts\coord\install-git-hooks.ps1
          -Status. Nothing here re-implements that check; this only picks out the lines worth reading.
       d. A proposed cleanup list, and a separate NEEDS A HUMAN LOOK list.
+      e. Seat locks whose session is gone (BACKLOG #2524). seat.ps1 locks a seat's worktree on arrival
+         and the SessionEnd hook unlocks it, so a lock left behind names a seat that died. The rule
+         for what counts as a seat lock and as gone is worktree-audit.ps1's.
+      f. Worktree folders emptied in place (BACKLOG #2525): under `.claude\worktrees\`, no `.git`, and
+         not in `git worktree list`, each with the Desktop log line that emptied it.
+         find-emptied-worktrees.ps1 prints the same list on demand.
 
     "MERGED" COMES FROM GITHUB, ONE BULK CALL PER CLONE PER RUN. This repository squash-merges, so
     `merge-base --is-ancestor` cannot see a landing, and the clone is shallow as well. One
@@ -107,6 +113,10 @@
 .PARAMETER ConfigRoot
     Claude config roots for the liveness fence. Defaults to every <userprofile>\.claude* registry.
 
+.PARAMETER DesktopLogRoot
+    Directories holding Claude Desktop `*.log` files, for section f. Defaults to every profile's logs
+    directory (worktree-audit.ps1, Get-DesktopLogFiles). They are read only when a folder was emptied.
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\worktree\hygiene-report.ps1
     pwsh -NoProfile -File scripts\worktree\hygiene-report.ps1 -SkipFetch -NoExtraRoots
@@ -126,7 +136,8 @@ param(
     [double]$HoldHours = 24,
     [double]$IdleHours = 72,
     [int]$Throttle = 8,
-    [string[]]$ConfigRoot
+    [string[]]$ConfigRoot,
+    [string[]]$DesktopLogRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -149,6 +160,8 @@ $env:GIT_TERMINAL_PROMPT = '0'
 $env:GCM_INTERACTIVE = 'never'
 
 . "$PSScriptRoot\..\coord\occupancy.ps1"
+# Read-only by the same rule as this file; the lock WRITES live in seat-lock.ps1, which is not loaded.
+. "$PSScriptRoot\worktree-audit.ps1"
 
 if (-not $Gh) { $Gh = if ($env:MEFOR_HYGIENE_GH) { $env:MEFOR_HYGIENE_GH } else { 'gh' } }
 if (-not $RepoRoot) { $RepoRoot = $PSScriptRoot }
@@ -479,6 +492,43 @@ function Get-CloneReport($R) {
         human  = @($rows | Where-Object { $_.verdict -eq 'HUMAN' })
         missing = @($rows | Where-Object { $_.verdict -eq 'MISSING' })
     }
+    # A seat locks its worktree on arrival and unlocks it on a clean exit (worktree-audit.ps1 says why).
+    # One that died keeps the lock, and then every reclaimer keeps the tree. Listed, never unlocked here.
+    # Each command carries the host circuit breaker CLAUDE.md section 5 requires: on a shared root the
+    # other PC has a tree at the same path, maybe with a live seat in it.
+    # It also re-reads the `locked` file when pasted and refuses unless it still holds the exact reason
+    # reported, so a lock handed to a new session since this run is never released by it.
+    $thisHost = [Environment]::MachineName
+    $seatLocks = @(Get-StaleSeatLocks -Worktrees $others -ConfigRoot $ConfigRoot)
+    $rep.staleSeatLocks = @(foreach ($s in @($seatLocks | Where-Object { $_.State -ne 'CODEX' })) {
+            $q = { param($t) "'$(([string]$t) -replace "'", "''")'" }
+            $command = ''; $held = ''
+            # The occupancy veto, as for a removal: a tree a session sits in gets no unlock command.
+            if (-not $occ.Available) { $held = "the liveness fence could not look: $($occ.Detail)" }
+            else {
+                $occupants = @(Get-WorktreeOccupants -Occupancy $occ -Path $s.Path -IncludeNested)
+                if ($occupants.Count -gt 0) { $held = "a session is in it: $(($occupants | ForEach-Object { "$($_.Short) $($_.State)" }) -join ', ')" }
+            }
+            if (-not $held) {
+                # The reason is read with no throw on any path: an unreadable lock reads '' and stops.
+                $command = "if ([Environment]::MachineName -ne $(& $q $thisHost)) { Write-Host ""STOP     this must run on $thisHost, but this is `$([Environment]::MachineName); nothing ran"" } " +
+                    "else { `$g = git -C $(& $q $s.Path) rev-parse --path-format=absolute --git-dir 2>`$null; " +
+                    "`$r = if (`$g) { ([string](Get-Content -LiteralPath ""`$g/locked"" -Raw -ErrorAction SilentlyContinue)).Trim() } else { '' }; " +
+                    "if (`$r -cne $(& $q $s.Reason)) { Write-Host 'STOP     the lock no longer reads the reason this report saw; nothing ran' } " +
+                    "else { git -C $(& $q $root) worktree unlock $(& $q $s.Path) } }"
+            }
+            [ordered]@{
+                path = $s.Path; reason = $s.Reason; seat = $s.Seat; session = $s.SessionKey; state = $s.State; detail = $s.Detail
+                command = $command; heldBecause = $held
+            }
+        })
+    # A Codex seat cannot be fenced, so its liveness is unknown: listed apart, with no command.
+    $rep.codexSeatLocks = @(foreach ($s in @($seatLocks | Where-Object { $_.State -eq 'CODEX' })) {
+            [ordered]@{ path = $s.Path; reason = $s.Reason; seat = $s.Seat; session = $s.SessionKey }
+        })
+    $rep.emptied = @(foreach ($e in (Find-EmptiedWorktrees -PrimaryPath $root -Worktrees $occ.Worktrees -LogRoot $DesktopLogRoot)) {
+            [ordered]@{ path = $e.Path; entries = $e.Entries; logLines = @($e.LogLines | ForEach-Object { [ordered]@{ file = $_.File; line = $_.LineNumber; text = $_.Text } }) }
+        })
     $reconcile = Join-Path $root 'scripts/coord/claim-reconcile.ps1'
     $rep.claimReconcile = if (Test-Path -LiteralPath $reconcile -PathType Leaf) { "pwsh -NoProfile -File `"$reconcile`"" } else { '' }
 
@@ -633,6 +683,44 @@ foreach ($c in $report.clones) {
         $md.Add("")
         foreach ($w in $c.cleanup.missing) { $md.Add("- ``$($w.path)`` (``$($w.branch)``)") }
     }
+
+    $md.Add("")
+    $md.Add("### e. Seat locks whose session is gone ($($c.staleSeatLocks.Count))")
+    $md.Add("")
+    if ($c.staleSeatLocks.Count -eq 0) { $md.Add("None. Rule: scripts/worktree/worktree-audit.ps1, Get-SeatLockReading.") }
+    else {
+        $md.Add("These seats did not unlock at exit, so every reclaimer keeps the tree. ``NO RECORD`` cannot tell an exited session from one that never registered, so check before unlocking:")
+        $md.Add("")
+        foreach ($s in $c.staleSeatLocks) { $md.Add("- ``$($s.path)``: ``$($s.reason)``, $($s.state) ($($s.detail))$(if ($s.heldBecause) { ". No command: $($s.heldBecause)" })") }
+        $cmds = @($c.staleSeatLocks | Where-Object { $_.command })
+        if ($cmds.Count -gt 0) {
+            $md.Add("")
+            $md.Add("Each command refuses on another host, and refuses if the lock no longer reads the reason above:")
+            $md.Add("")
+            $md.Add('```powershell')
+            foreach ($s in $cmds) { $md.Add($s.command) }
+            $md.Add('```')
+        }
+    }
+    if ($c.codexSeatLocks.Count -gt 0) {
+        $md.Add("")
+        $md.Add("**Codex seat locks ($($c.codexSeatLocks.Count)).** Nothing here can fence a Codex session, so whether each is gone is unknown, and no command is given:")
+        $md.Add("")
+        foreach ($s in $c.codexSeatLocks) { $md.Add("- ``$($s.path)``: ``$($s.reason)``") }
+    }
+
+    $md.Add("")
+    $md.Add("### f. Worktree folders emptied in place ($($c.emptied.Count))")
+    $md.Add("")
+    if ($c.emptied.Count -eq 0) { $md.Add("None: every folder under ``.claude\worktrees\`` has a ``.git`` or is a registered worktree.") }
+    else {
+        $md.Add("Each has no ``.git`` and is not in ``git worktree list``. A session may still be in one, so recover before deleting: docs/WORKTREES.md, *A seat locks its worktree on arrival*.")
+        $md.Add("")
+        foreach ($e in $c.emptied) {
+            $md.Add("- ``$($e.path)`` ($($e.entries) entries left)$(if ($e.logLines.Count -eq 0) { ': no Desktop log line names it. The logs rotate, so that is not evidence either way.' })")
+            foreach ($l in $e.logLines) { $md.Add("  - ``$($l.file):$($l.line)``: ``$($l.text)``") }
+        }
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -649,8 +737,8 @@ foreach ($f in $files) { Set-Content -LiteralPath $f.Path -Value $f.Text -Encodi
 Set-Content -LiteralPath $lastRun -Encoding utf8NoBOM -Value "OK $($report.generatedAt)"
 
 foreach ($c in $report.clones) {
-    Write-Output ("{0}: {1} worktrees, {2} proposed for removal, {3} need a human look, {4} hook line(s) flagged" -f `
-            $c.root, $c.worktrees.Count, $c.cleanup.remove.Count, $c.cleanup.human.Count, $c.hooks.flagged.Count)
+    Write-Output ("{0}: {1} worktrees, {2} proposed for removal, {3} need a human look, {4} hook line(s) flagged, {5} stale seat lock(s), {6} emptied folder(s)" -f `
+            $c.root, $c.worktrees.Count, $c.cleanup.remove.Count, $c.cleanup.human.Count, $c.hooks.flagged.Count, $c.staleSeatLocks.Count, $c.emptied.Count)
 }
 Write-Output "Report written: $(Join-Path $OutDir "hygiene-$stamp.md")"
 Write-Output "           and: $(Join-Path $OutDir "hygiene-$stamp.json")"

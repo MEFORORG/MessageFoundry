@@ -330,12 +330,20 @@ def test_a_failure_grouping_the_rows_folds_nothing(
     # logs its own line, as before the fix. A quieter log must not cost a row its only mention.
     site = _site(ca, tmp_path, 3)
 
-    def _broken(rows: object) -> dict[str, tuple[str, ...]]:
+    # Any arguments: a stub that took fewer than the call passes failed on a TypeError instead, and
+    # the test passed without reaching its own failure (BACKLOG #3512).
+    def _broken(*args: object) -> dict[str, tuple[str, ...]]:
         raise RuntimeError("synthetic grouping failure")
 
     monkeypatch.setattr("messagefoundry.pipeline.cert_expiry._rows_by_crl_file", _broken)
 
     sink = _scan(site.registry, caplog)
+
+    grouped = [r for r in caplog.records if "could not group the CRL rows" in r.getMessage()]
+    assert len(grouped) == 1
+    assert grouped[0].exc_info is not None
+    assert grouped[0].exc_info[0] is RuntimeError
+    assert str(grouped[0].exc_info[1]) == "synthetic grouping failure"
 
     lines = site.lines(caplog)
     assert len(lines) == 3

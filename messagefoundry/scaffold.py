@@ -277,11 +277,16 @@ jobs:
   # audit's result, and a requirements.txt finding never hides the lock audit's. The lock audit
   # needs the auditor the install brings, so a failed install skips it.
   # It runs engine code from the lock, so the token reads only, and the checkout keeps no credential.
+  # Wheels only for every pip in the job, pip-audit's included: building an sdist runs its build code
+  # here, so a dependency that ships no wheel for Windows fails the job instead. Drop it only once
+  # you have decided that package's build code may run in CI.
   audit-pin:
     runs-on: windows-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      PIP_ONLY_BINARY: ":all:"
     defaults:
       run:
         shell: bash
@@ -409,7 +414,9 @@ It runs on **Windows**, the engine's only supported deployment platform: `pip-au
 whose environment marker does not match the runner, so a Linux runner never audits the engine's
 Windows-only dependencies. With a `requirements.lock` it also runs the engine's own auditor
 (`python -P -m messagefoundry.security.audit_all_platforms requirements.lock`), which audits every pin
-in the lock whatever its marker; the engine's `docs/ADOPTER-CI.md` lists what it refuses.
+in the lock whatever its marker; the engine's `docs/ADOPTER-CI.md` lists what it refuses. The job
+takes wheels only (`PIP_ONLY_BINARY`), so a dependency with no wheel for Windows fails it rather
+than having its build code run in CI.
 
 ## Transitive supply-chain (your deps, not the engine)
 `gh attestation verify` authenticates the **engine wheel** only; `pip install -r requirements.txt`

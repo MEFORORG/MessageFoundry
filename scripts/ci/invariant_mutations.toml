@@ -8,8 +8,9 @@
 # checked-in list, so each row is a reviewed claim that a named control has a red.
 #
 # Seeded from the thirteen instances Fable review packet 18 (finding P18-01) named, where the instance
-# is reachable offline. The server-backend locks (#1610) need a live PostgreSQL or SQL Server and are
-# not here; a row for them belongs on the gated live leg, not in this list.
+# is reachable offline. That a server-backend lock HOLDS across processes (#1610) needs a live
+# PostgreSQL or SQL Server and is not here; that belongs on the gated live leg. That a lock is TAKEN
+# is observable with a fake cursor, so a row for that half belongs here (#1746 limb 3).
 #
 # Fields, all required:
 #   id       stable name, used by --only
@@ -167,4 +168,35 @@ replace = '''
 '''
 tests = [
     "tests/test_connection_audit_writes.py::test_flag_route_audits_connection_flag_set_under_the_acting_user",
+]
+
+[[mutation]]
+id = "unsafe-db-lookup-own-argument-only"
+item = 1658
+file = "messagefoundry/checks.py"
+find = '''
+            if _unsafe_lookup_hit(node, lookup_envs.get(id(node))):
+'''
+replace = '''
+            if _unsafe_lookup_hit(node):
+'''
+tests = [
+    "tests/test_checks_handler_security.py::test_handler_security_matrix[db_pos_assign_then_pass_fstring]",
+    "tests/test_checks_handler_security.py::test_handler_security_matrix[db_pos_assign_then_pass_percent]",
+    "tests/test_checks_handler_security.py::test_handler_security_matrix[db_pos_augassign_build]",
+]
+
+[[mutation]]
+id = "sqlserver-audit-append-no-applock"
+item = 1605
+file = "messagefoundry/store/sqlserver.py"
+find = '''
+        await self._applock(cur, _AUDIT_APPEND_LOCK)
+        await cur.execute("SELECT TOP (1) seq, row_hash FROM audit_log ORDER BY seq DESC")
+'''
+replace = '''
+        await cur.execute("SELECT TOP (1) seq, row_hash FROM audit_log ORDER BY seq DESC")
+'''
+tests = [
+    "tests/test_control_premises.py::test_every_audit_append_takes_the_database_applock_before_it_reads_the_head",
 ]
