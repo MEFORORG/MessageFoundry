@@ -256,7 +256,8 @@ def _rate_limited(request: Request, label: str) -> HTTPException:
     """Log a throttled (HTTP 429) attempt so password-spraying is no longer silent (ASVS 16.3.3),
     then return the exception to raise. We log (the rotating general log) rather than write an
     audit_log row per rejection so a sustained flood can't amplify into unbounded DB growth — the
-    per-account ``auth.login_failed``/``auth.login_locked`` events already provide the audit trail."""
+    per-account ``auth.login_failed``/``auth.login_locked``/``auth.directory_login_locked`` events
+    already provide the audit trail."""
     _log.warning("rate-limited %s attempt from client=%s", label, client_ip(request))
     return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too many attempts; please retry later")
 

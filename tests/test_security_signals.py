@@ -412,10 +412,10 @@ async def test_a_marked_directory_lock_refusal_from_the_real_writer_is_not_count
     a lock to a reader without users:manage. The control: the same writer's ``disabled`` refusal,
     an ordinary ``auth.login_failed``, does count."""
     sink = _Sink()
+    store = await MessageStore.open(str(tmp_path / "s.db"))
     remove = install_security_signals(
         sink, _thresholds(signin_failures=3), asyncio.get_running_loop()
     )
-    store = await MessageStore.open(str(tmp_path / "s.db"))
     try:
         service = AuthService(store, AuthSettings())
         marker = {"callback_floor_exempt_amr": ["wia"]}

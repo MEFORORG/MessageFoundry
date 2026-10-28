@@ -2639,8 +2639,8 @@ def _floor_exempt_marker(floor_exempt_amr: Sequence[str]) -> dict[str, object]:
     exemption applied, a directory lock refusal included since BACKLOG #3726 gave that row its own
     whole-hidden action (see :meth:`AuthService._refuse_directory_row`). So the review
     ``docs/SECURITY-LOOSENING.md`` asks for also sees exempted attempts that failed. At least the
-    role-resync and session-rotation rows the attempt writes do not carry it. The values are the CONFIGURED ones the token matched, never
-    the token's own."""
+    role-resync and session-rotation rows the attempt writes do not carry it. The values are the
+    CONFIGURED ones the token matched, never the token's own."""
     return {"callback_floor_exempt_amr": list(floor_exempt_amr)} if floor_exempt_amr else {}
 
 
@@ -6528,9 +6528,11 @@ class AuthService:
         federated leg passes the ``callback_floor_exempt_amr`` marker through it (BACKLOG #3220).
 
         **A lock refusal is written under its own action,** ``auth.directory_login_locked``, not
-        ``auth.login_failed`` (BACKLOG #3726). Readers without ``users:manage`` read no row under
-        that action (owner ruling 2026-09-28), so ``extra`` cannot show them the lock, and the
-        sign-in burst signal, which counts ``auth.login_failed``, never counts one.
+        ``auth.login_failed`` (BACKLOG #3726). The audit read routes show no row under that action
+        to a reader without ``users:manage`` (owner ruling 2026-09-28;
+        :mod:`messagefoundry.auth.audit_visibility` names the paths), so ``extra`` cannot show them
+        the lock there, and the sign-in burst signal, which counts ``auth.login_failed``, never
+        counts one.
         """
         action = (
             DIRECTORY_LOGIN_LOCKED_ACTION if reason == DIRECTORY_LOCKED else "auth.login_failed"

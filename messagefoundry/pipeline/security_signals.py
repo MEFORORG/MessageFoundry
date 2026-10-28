@@ -19,10 +19,11 @@ commit and its tee) is missed here too.
 **What a detector never sends.** No message body, no message id, no audit row ``detail`` and no
 typed username. The sign-in detector keys on the client address for that last reason: a typed
 username can be a password typed into the wrong box. It counts ``auth.login_failed``, which the
-engine writes once per refused sign-in in every lock state (``auth/audit_visibility.py``), so the
-count does not say whether an account is locked. The lock rows themselves are not read, and so an
-account lock raises no alert: that would show lock state to a reader the 2026-09-28 owner ruling
-withholds it from.
+engine writes once per refused local sign-in in every lock state (``auth/audit_visibility.py``), so
+the count does not say whether an account is locked. A directory sign-in refused by a lock writes
+``auth.directory_login_locked`` instead (BACKLOG #3726). The lock rows themselves are not read,
+and so an account lock raises no alert: that would show lock state to a reader the 2026-09-28 owner
+ruling withholds it from.
 
 **Bounded where the caller chooses the key.** A windowed detector tracks at most
 :data:`MAX_SUBJECTS` subjects. Past :data:`MAX_SUBJECT_ALERTS` alerts in one window it raises under

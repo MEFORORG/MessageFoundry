@@ -259,7 +259,7 @@ class _FakeNotifier:
 # way that reader does -- through the real routes, as the built-in Auditor -- and compare the two
 # campaigns row for row.
 
-#: The four actions the ruling hides from a reader without ``users:manage``. Named here, not
+#: The actions the ruling hides from a reader without ``users:manage``. Named here, not
 #: imported, so a change to the engine's set has to change this test as well.
 _HIDDEN_LOCK_ACTIONS = (
     "auth.account_locked",
@@ -699,8 +699,10 @@ async def test_a_marked_directory_lock_refusal_is_hidden_whole_on_every_read_pat
                     "/ui/login", data={"username": reader, "password": _READER_PASSWORD}
                 )
                 assert r.status_code == 303, r.text
-                page = (await c.get("/ui/audit")).text
-                assert ("probe-locked" in page) is expect_shown, reader
+                r = await c.get("/ui/audit")
+                # A redirect or an error page would pass the Auditor's half with nothing proven.
+                assert r.status_code == 200 and "auth.login_success" in r.text, (reader, r.text)
+                assert ("probe-locked" in r.text) is expect_shown, reader
     finally:
         await world.engine.stop()
 

@@ -786,8 +786,9 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   `callback_floor_exempt_amr`: under `evidence` on the `auth.login_success` row of a sign-in, and at
   the top of the `auth.reauth` row of a step-up. A pass the exemption let through that is then
   refused carries it too, at the top of its refusal row (BACKLOG #3220), a directory lock refusal
-  included: that row has its own action, `auth.directory_login_locked`, which only `users:manage`
-  reads, so the marker shows the lock to nobody else (BACKLOG #3726). With the list set, a too-early step-up's code is
+  included: that row has its own action, `auth.directory_login_locked`, which the audit read
+  routes show only to `users:manage` ([Audit](#audit) names them), so the marker shows a reader
+  without it no lock there (BACKLOG #3726). With the list set, a too-early step-up's code is
   redeemed before the refusal, because only the exchange yields the `amr`. The exemption lifts
   only the floor. While `oidc_require_mfa_claim` is on, the token must still carry another `amr`
   in `oidc_mfa_amr_values` or an `acr` in `oidc_required_acr_values`, so an IdP that sends only
@@ -5832,8 +5833,7 @@ directory lookup
 Kerberos and OIDC sign-ins are the exception to
 "before": they read both locks only once the ticket or token has verified and the principal has
 resolved, then refuse with `auth.directory_login_locked` and `reason=locked`
-(`_directory_login_refusal`; its own action since BACKLOG #3726, so it is hidden whole and never
-counted as a refused sign-in by the sign-in burst signal).
+(`_directory_login_refusal`; its own action since BACKLOG #3726).
 The attempt that crosses the threshold, on any feeding leg,
 also writes `auth.account_locked`. The re-proofs are not refused by either lock; the failure that spends a
 session's cap revokes it, answers **401** on the JSON routes (the console sends the browser to
@@ -5956,7 +5956,7 @@ below its default, and as off at `0`. The `[approvals].min_dwell_seconds` floor 
 **Throttle observability.** A rate-limited auth attempt is written to the rotating general log at
 WARNING with a route label and the client address, deliberately **not** to the hash-chained
 `audit_log`, so a sustained flood cannot amplify into unbounded DB growth (ASVS 16.3.3); the durable
-trail is the per-account `auth.login_failed` / `auth.login_locked` rows, plus `auth.mfa_failed` and
+trail is the per-account `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` rows, plus `auth.mfa_failed` and
 `auth.webauthn_failed` for refusals on the factor legs (a lockout hit while proving a second factor
 is audited under those names, not `auth.login_locked`), `auth.reauth` and `auth.password_change_failed`
 for the post-session re-proofs, and the two 6.3.5 events, `auth.account_locked` and
@@ -5988,7 +5988,7 @@ IP is a backlog follow-up).
 ## Audit
 
 Every authentication and authorization event is written to the durable `audit_log` with the acting
-user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.logout` /
+user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` / `auth.logout` /
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
 `auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
