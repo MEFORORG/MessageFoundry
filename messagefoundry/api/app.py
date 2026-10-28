@@ -291,6 +291,7 @@ from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
     MISCONFIGURED_ABORT,
+    OUTAGE_ABORT,
     PAGING_CAP,
     PAGING_DEADLINE,
     PROBE_FAULT_ABORT,
@@ -10489,6 +10490,12 @@ _PAGING_ALERT_SOURCE = "directory-reconciler-paging"
 #: The source label of a lasting directory outage's own ``ad_reconcile_aborted`` instance (BACKLOG
 #: #3709), apart from the others for the same reasons.
 _OUTAGE_ALERT_SOURCE = "directory-reconciler-outage"
+#: What the lasting outage tells the operator. Short, for the store's 200-character reason, and
+#: about probes rather than the network: a group search past the engine's own bound reads the same.
+_OUTAGE_ALERT_TEXT: Final[str] = (
+    "No directory probe succeeded in {passes} reconcile passes running, so no directory disable or "
+    "deletion ends a session. Check the directory and the path to it."
+)
 #: What each paging refusal cause tells the operator. Short, and the consequence first, because
 #: the store keeps only the first 200 characters of an instance's reason; the account is in the
 #: source.
@@ -10539,7 +10546,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_reconcile_aborted`` alert with reason ``directory_misconfigured``, under its own source
     label (:data:`_MISCONFIGURED_ALERT_SOURCE`). Like the fault's, it has no inverse. Before #3010
     such a base read as "not found" for every account, so it tripped the breaker on an estate
-    large enough; read as an outage, it would page nobody.
+    large enough; read as an outage, it would page only once the outage lasted (BACKLOG #3709).
 
     A paging refusal (vault BACKLOG #3696) pages once per account as it enters that state, after
     the revocations and on an outage-shaped pass too, matching its ``auth.ad_reconcile_paging_refused`` row;
@@ -10576,22 +10583,18 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     earlier run left open (:func:`_without_inherited_clears` drops that clear);
     ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
-        if plan.outage_page:
-            # BACKLOG #3709. One pass is a blip; the pass whose run reached the setting pages once.
-            sink.ad_reconcile_aborted(
-                _OUTAGE_ALERT_SOURCE,
-                # Never None on an outage; the fallback is only for the type checker.
-                reason=plan.aborted or "directory_unavailable",
-                probed=plan.asked,
-                detail=(
-                    f"The directory has been unreachable for {plan.outage_passes} reconcile passes "
-                    "running. No directory disable or deletion reaches a signed-in session until a "
-                    "pass reaches it. Check [auth].ad_server and the network path to it."
-                ),
-            )
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
         _alert_paging_refusals(plan, sink)
+        if plan.outage_page:
+            # BACKLOG #3709. After the paging refusals, which page once per account, so a sink that
+            # raises here cannot cost one.
+            sink.ad_reconcile_aborted(
+                _OUTAGE_ALERT_SOURCE,
+                reason=OUTAGE_ABORT,
+                probed=plan.asked,
+                detail=_OUTAGE_ALERT_TEXT.format(passes=plan.outage_passes),
+            )
         return
     if plan.aborted is not None and not plan.judged_nothing:
         # A breaker trip. A pass that judged nothing is not one: its alerts are the referral's, the

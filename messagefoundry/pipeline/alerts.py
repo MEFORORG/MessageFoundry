@@ -606,8 +606,8 @@ class AlertSink(Protocol):
         (``group_search_deadline`` or ``group_search_cap``, vault BACKLOG #3696), raised once as
         the account enters that state, which leaves it unjudged too; or the directory has stayed
         unreachable for ``[auth].ad_reconcile_outage_passes`` passes running
-        (``directory_unavailable``, BACKLOG #3709, the run's last ``auth.ad_reconcile_skipped``
-        row), raised once per run. The type's name predates every case but the first. Read
+        (``directory_unavailable``, BACKLOG #3709, the ``auth.ad_reconcile_skipped`` row whose
+        ``passes`` the page names), raised once per run. The type's name predates every case but the first. Read
         ``reason`` before naming the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
@@ -1192,8 +1192,8 @@ class LoggingAlertSink:
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
             # The count is the candidates the pass took up for the breaker and a paging refusal, or
-            # the probes the pass asked for a referral, a configuration refusal and a probe fault
-            # (BACKLOG #3170); see AlertSink.ad_reconcile_aborted.
+            # the probes the pass asked for a referral, a configuration refusal, a probe fault and a
+            # lasting outage (BACKLOG #3170, #3709); see AlertSink.ad_reconcile_aborted.
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked or unjudged, in a pass counting "
             "%d principal(s) "
             "(%s): %s",

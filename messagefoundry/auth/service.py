@@ -3284,10 +3284,12 @@ class AuthService:
         #: ``"fresh"``: no pass here saw a referral. ``"referred"``: one did. ``"forfeit"``: see
         #: `_forfeit_clears_on_attrition`. Only `_advance_referral_standing` moves it.
         self._reconcile_referral_standing: _ReferralStanding = "fresh"
-        #: Passes running that read the directory unreachable, and whether a run of them paged in
-        #: THIS process (BACKLOG #3709). In memory, so a restart starts the count again and
-        #: resolves no outage instance an earlier run opened. `_note_directory_outage` keeps both.
+        #: Passes running that read the directory unreachable, whether the current run's page is
+        #: recorded, and whether any run paged in THIS process (BACKLOG #3709). In memory, so a
+        #: restart starts the count again and resolves no outage instance an earlier run opened.
+        #: `_note_directory_outage` and `_latch_outage_page` keep them.
         self._reconcile_outage_passes = 0
+        self._reconcile_outage_run_paged = False
         self._reconcile_outage_paged = False
         #: The accounts behind the trip, referral and hold now open, kept only so that a forfeited
         #: standing logs once per new one (BACKLOG #3083). Logging state: no decision reads it.
@@ -7654,7 +7656,8 @@ class AuthService:
             # answer, so it is FAULT and not UNAVAILABLE. verify_mfa refuses on it (fail closed),
             # the certificate path keeps its per-account fault logging, and the reconciler skips
             # this one account and alerts on every pass that probes it (`_record_reconcile_fault`).
-            # A pass of faults only is no longer read as a directory outage, which pages nobody.
+            # A pass of faults only is no longer read as a directory outage, which pages nobody
+            # until it lasts `[auth].ad_reconcile_outage_passes` passes (BACKLOG #3709).
             #
             # NOT LIKE #1639, AND THE COST IS NAMED. An unreadable userAccountControl is an answer
             # the directory gave, so it strikes as UNDETERMINED. This says nothing about the
@@ -7732,10 +7735,12 @@ class AuthService:
 
         Every outage pass is fail-open: it revokes nothing, so a directory disable or deletion
         reaches no signed-in session while the outage lasts, and the pass is audited as skipped.
-        One such pass is a blip and pages nobody. The pass that makes the run
-        ``[auth].ad_reconcile_outage_passes`` long pages, once: the passes after it in the same run
-        do not. **Every cause counts**: the plan reads an outage whenever every probe it asked came
-        back UNAVAILABLE, whatever made each one so.
+        One such pass is a blip and pages nobody. Once the run is
+        ``[auth].ad_reconcile_outage_passes`` long, a pass pages, once per run: the page is latched
+        only once that pass's rows are written (:meth:`_latch_outage_page`), as a paging refusal's
+        is, so a pass that raises before then leaves the next pass to page. **Every cause counts**:
+        the plan reads an outage whenever every probe it asked came back UNAVAILABLE, whatever made
+        each one so, a group search refused for the engine's own bound included.
 
         A pass that asked the directory anything and is not an outage reached it, even one that
         judged nothing, such as a pass of referrals only. It ends the run, and once a run here has
@@ -7749,26 +7754,34 @@ class AuthService:
         drop every other (``_mark_reconcile_clears`` states that rule)."""
         if plan.directory_outage:
             self._reconcile_outage_passes += 1
-            page = self._reconcile_outage_passes == self._settings.ad_reconcile_outage_passes
-            if page:
-                self._reconcile_outage_paged = True
-                _log.error(
-                    "directory reconcile: the directory has been unreachable for %d passes running; "
-                    "no directory disable or deletion reaches a signed-in session until a pass "
-                    "reaches it",
-                    self._reconcile_outage_passes,
-                )
+            page = (
+                not self._reconcile_outage_run_paged
+                and self._reconcile_outage_passes >= self._settings.ad_reconcile_outage_passes
+            )
             return replace(plan, outage_passes=self._reconcile_outage_passes, outage_page=page)
         if plan.asked == 0:
             return replace(plan, outage_passes=self._reconcile_outage_passes)
-        if self._reconcile_outage_passes:
+        if self._reconcile_outage_run_paged:
             _log.warning(
-                "directory reconcile: the directory was reached again after %d unreachable "
-                "pass(es)",
+                "directory reconcile: the directory was reached again after %d unreachable passes",
                 self._reconcile_outage_passes,
             )
         self._reconcile_outage_passes = 0
+        self._reconcile_outage_run_paged = False
         return replace(plan, outage_clear=self._reconcile_outage_paged)
+
+    def _latch_outage_page(self, plan: reconcile.ReconcilePlan) -> None:
+        """Record that this run's outage page is raised, once its pass's rows are written (BACKLOG
+        #3709; :meth:`_note_directory_outage` says why it waits for them)."""
+        if not plan.outage_page:
+            return
+        self._reconcile_outage_run_paged = True
+        self._reconcile_outage_paged = True
+        _log.error(
+            "directory reconcile: the directory has been unreachable for %d passes running; no "
+            "directory disable or deletion reaches a signed-in session until a pass reaches it",
+            plan.outage_passes,
+        )
 
     async def _record_paging_refusals(self, plan: reconcile.ReconcilePlan) -> None:
         """Log, audit and latch each account entering the paging-refused state (vault BACKLOG
@@ -8033,6 +8046,7 @@ class AuthService:
                 await self._record_reconcile_fault(plan)
             # Vault BACKLOG #3696. On every abort, an outage-shaped one included, as its page is.
             await self._record_paging_refusals(plan)
+            self._latch_outage_page(plan)  # BACKLOG #3709. After the outage's skipped row.
             if not plan.judged_nothing:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
                 # item 9). A pass that judged nothing (an outage, or one whose every answer went
@@ -9178,7 +9192,8 @@ class AuthService:
         It leaves that account unjudged: no strike and no revocation. A deleted or moved search base
         refuses every account on every pass, so while it lasts nothing is revoked and the sessions
         run to the absolute cap. Before #3010 such a search read as "not found", which tripped the
-        mass-revoke breaker on a large enough estate, and a plain outage would page nobody. So
+        mass-revoke breaker on a large enough estate, and a plain outage would page nobody until
+        it lasted ``[auth].ad_reconcile_outage_passes`` passes (BACKLOG #3709). So
         every pass with such a refusal latches the message, logs it at ERROR with the first
         refusal's text, and writes an ``auth.ad_reconcile_misconfigured`` row, and the lifespan
         task raises it as ``ad_reconcile_aborted`` with reason ``directory_misconfigured`` under its

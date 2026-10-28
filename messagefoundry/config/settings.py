@@ -3426,7 +3426,8 @@ class AuthSettings(_Section):
     # (BACKLOG #3709). Every such pass is fail-open: it revokes nothing, so a disable or deletion
     # does not reach a signed-in session while it lasts. One pass is a blip and pages nobody; a run
     # of them pages once, as `ad_reconcile_aborted` under its own source, and the first pass that
-    # reaches the directory resolves it. At least 2, so a single blip never pages. The count is
+    # reaches the directory resolves it. 2 to 100: a single blip never pages, and the page cannot
+    # be switched off by a huge value. The count is
     # process-local, like the strikes, so a restart starts it again.
     ad_reconcile_outage_passes: int = 3
     # --- mass-revoke circuit breaker ---
@@ -3970,9 +3971,10 @@ class AuthSettings(_Section):
     @field_validator("ad_reconcile_outage_passes")
     @classmethod
     def _check_ad_reconcile_outage_passes(cls, value: int) -> int:
-        # >=2: one unreachable pass is a blip, and paging on it would page on every blip.
-        if value < 2:
-            raise ValueError("ad_reconcile_outage_passes must be >= 2")
+        # >=2: one unreachable pass is a blip, and paging on it would page on every blip. <=100:
+        # a larger value would switch the page off in all but name.
+        if not 2 <= value <= 100:
+            raise ValueError("ad_reconcile_outage_passes must be between 2 and 100")
         return value
 
     @field_validator("ad_session_revoke_max")

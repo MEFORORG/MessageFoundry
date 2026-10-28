@@ -2539,7 +2539,8 @@ async def test_a_lasting_outage_pages_once_and_the_next_reach_resolves_it(thresh
         kind, _source, payload = paged[0]
         assert kind == "ad_reconcile_aborted"
         assert payload["reason"] == "directory_unavailable" and payload["probed"] == 2
-        assert f"unreachable for {threshold} reconcile passes" in payload["detail"]
+        assert f"succeeded in {threshold} reconcile passes" in payload["detail"]
+        assert len(payload["detail"]) <= 200  # the store keeps 200 characters of a reason
 
         await _pass(service, sink)  # one more unreachable pass after firing
         assert len(_outage_events(sink)) == 1
@@ -2616,9 +2617,64 @@ async def test_a_pass_that_asks_nothing_leaves_the_outage_run_alone() -> None:
 def test_the_outage_page_threshold_is_at_least_two() -> None:
     """BACKLOG #3709. One pass is a blip, so a threshold of one would page on every blip."""
     assert _ad_settings().ad_reconcile_outage_passes == 3
-    with pytest.raises(ValidationError, match="ad_reconcile_outage_passes"):
-        _ad_settings(ad_reconcile_outage_passes=1)
-    assert _ad_settings(ad_reconcile_outage_passes=2).ad_reconcile_outage_passes == 2
+    for refused in (1, 101):  # 101: a huge value would switch the page off in all but name
+        with pytest.raises(ValidationError, match="ad_reconcile_outage_passes"):
+            _ad_settings(ad_reconcile_outage_passes=refused)
+    for kept in (2, 100):
+        assert _ad_settings(ad_reconcile_outage_passes=kept).ad_reconcile_outage_passes == kept
+
+
+async def test_a_pass_of_id_less_rows_only_leaves_the_outage_run_alone() -> None:
+    """BACKLOG #3709. A pass whose only candidates are id-less rows asks the directory nothing, so
+    it neither ends the run nor resolves a page.
+
+    RED when: such a pass resets the count, or raises the inverse."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for _ in range(2):
+            await _pass(service, sink)
+        assert len(_outage_events(sink)) == 1
+        for name in ("alice", "bob"):
+            await _clear_directory_object_id(store, name)
+        unasked = await _pass(service, sink)
+        assert unasked.asked == 0 and unasked.outage_passes == 2 and not unasked.outage_clear
+        assert len(_outage_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_threshold_pass_that_raises_pages_on_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3709. The page is latched only once its pass's rows are written, so a pass that
+    raises first leaves the next outage pass to page, as a paging refusal's does.
+
+    RED when: the latch is set before the pass can raise, so the run never pages."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        await _pass(service, sink)
+        real = service._record_paging_refusals
+
+        async def boom(plan: reconcile.ReconcilePlan) -> None:
+            raise RuntimeError("synthetic: store refused")
+
+        monkeypatch.setattr(service, "_record_paging_refusals", boom)
+        with pytest.raises(RuntimeError):
+            await service.reconcile_directory_sessions()
+        monkeypatch.setattr(service, "_record_paging_refusals", real)
+        plan = await _pass(service, sink)
+        assert plan.outage_page and plan.outage_passes == 3
+        assert len(_outage_events(sink)) == 1
+        await _pass(service, sink)
+        assert len(_outage_events(sink)) == 1
+    finally:
+        await store.close()
 
 
 async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id() -> None:

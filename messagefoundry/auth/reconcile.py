@@ -44,7 +44,8 @@ probe raised something that is not an LDAP error, or a response ldap3 could not 
 unjudged like an unreachable one, and unlike one it alerts on every pass that probes it. A pass
 whose only answers are faults and failures, at least one a fault, aborts as ``probe_fault``, which
 judges no account it asked about and alerts.
-A pass where every probe fails and none faults is a plain outage, which pages nobody.
+A pass where every probe fails and none faults is a plain outage, which pages nobody until a run
+of them lasts ``[auth].ad_reconcile_outage_passes`` passes (BACKLOG #3709).
 It too still strikes an UNKEYED row (BACKLOG #3170).
 
 A search the directory refused for a reason that points at the configuration is not an outage
@@ -202,6 +203,11 @@ _READABLE = frozenset({ProbeOutcome.PRESENT, ProbeOutcome.DISABLED})
 #: The closed-set slug the held audit row and alert carry (ADR 0195 rule item 9).
 HOLD_REASON = "user_account_control_undetermined"
 
+#: The ``aborted`` slug of a pass on which every probe it asked failed to reach the directory: a
+#: whole-directory outage (:attr:`ReconcilePlan.directory_outage`). Also the reason slug of the
+#: lasting outage's alert (BACKLOG #3709).
+OUTAGE_ABORT = "directory_unavailable"
+
 #: The ``aborted`` slug of a pass whose every answer went unjudged, at least one a referral (BACKLOG
 #: #2538); the others may be failures, configuration refusals or faults (BACKLOG #3010, #3100),
 #: which are then recorded under their own alerts as well. Also the reason slug of the referral's
@@ -334,11 +340,13 @@ class ReconcilePlan:
     paging_refused: tuple[tuple[str, str, str], ...] = ()
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709): how many
     #: passes running, this one included, have read the directory unreachable
-    #: (:attr:`directory_outage`), in this process. 0 on a pass that reached it, and unchanged by
-    #: a pass that asked the directory nothing. ``AuthService._note_directory_outage`` keeps it.
+    #: (:attr:`directory_outage`), in this process. 0 on a pass that reached it. A pass whose
+    #: candidates are all id-less rows asked nothing and carries the run's count unchanged; a pass
+    #: with nobody signed in returns an empty plan, which reads 0, and leaves the run as it stands
+    #: too. ``AuthService._note_directory_outage`` keeps it.
     outage_passes: int = 0
-    #: Whether this pass is the one whose outage run reached ``[auth].ad_reconcile_outage_passes``,
-    #: so the lifespan task pages, once per run (BACKLOG #3709).
+    #: Whether the lifespan task pages for the outage run on this pass: the run has reached
+    #: ``[auth].ad_reconcile_outage_passes`` and its page is not yet recorded (BACKLOG #3709).
     outage_page: bool = False
     #: Whether this pass reached the directory after a run that paged, in this process (BACKLOG
     #: #3709). Read like the other ``*_clear`` flags: the caller resolves the outage's instance on it.
@@ -350,7 +358,7 @@ class ReconcilePlan:
         service audits this as skipped rather than aborted, and the lifespan task pages nobody for
         one such pass, only for a run of them (BACKLOG #3709, ``outage_page``). Both read this one
         predicate, so the audit row and the alert cannot disagree."""
-        return self.aborted == "directory_unavailable"
+        return self.aborted == OUTAGE_ABORT
 
     @property
     def directory_referral(self) -> bool:
@@ -534,7 +542,8 @@ def plan_pass(
     if alerting and len(unavailable) + alerting == asked:
         # BACKLOG #2538, #3010, #3100. Nothing the pass asked was answered, as on an outage, so it
         # judges nothing and the hold's state carries over. Checked before the outage, so such a
-        # pass is not read as a plain outage, which pages nobody. A user search base in another
+        # pass is not read as a plain outage, which pages only once a run of them lasts (#3709). A
+        # user search base in another
         # domain of the forest refers every probe, a deleted one is refused for every probe, and an
         # entry or a defect that raises does so on every pass. A referral wins, then a
         # configuration refusal: each names the fix, and a fault does not.
@@ -567,7 +576,7 @@ def plan_pass(
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
-            aborted="directory_unavailable",
+            aborted=OUTAGE_ABORT,
             latched=latched,
         )
 

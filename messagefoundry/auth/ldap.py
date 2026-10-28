@@ -151,7 +151,7 @@ class LdapUnansweredError(LdapError):
         (:data:`_CONFIGURATION_CODES`): noSuchObject (32), invalidDNSyntax (34) and
         insufficientAccessRights (50). Such a code recurs on every attempt until the configuration
         changes, so the session reconciler reads it as misconfigured, which alerts, and not as
-        unavailable, which pages nobody (BACKLOG #3010)."""
+        unavailable, which pages only once an outage lasts (BACKLOG #3010, #3709)."""
         return self.code in _CONFIGURATION_CODES
 
 
@@ -854,7 +854,8 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
     **The cost, named.** Neither reading revokes, so a code that recurs on every pass, such as a
     deleted search base, stops offboarding and the role re-diff for as long as it lasts. A
     configuration code alerts on every pass it answers, and a pass where nothing else answered
-    aborts as ``directory_misconfigured``. Any other code reads as an outage, which pages nobody.
+    aborts as ``directory_misconfigured``. Any other code reads as an outage, which pages only once
+    it lasts ``[auth].ad_reconcile_outage_passes`` passes (BACKLOG #3709).
     This warns once per operation and code, and the text carries no directory text: the code,
     ldap3's name for it and the operation, never the diagnostic message the directory sent.
 
