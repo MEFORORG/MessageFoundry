@@ -153,7 +153,7 @@ leaves the engine.
 | | `[store].secure_delete` | `true` (*conditional* — a loosening only on a file-backed SQLite store; `false` leaves a purged body's bytes in the file) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`; `0` turns the reconciler off, and an interval above `300` s is named) |
 | | `[auth].ad_session_recheck_strikes`, `ad_session_recheck_max_users` | `2` / `200` (*conditional* — a loosening only while the reconciler runs; more strikes, or a smaller per-pass budget, is named) |
-| | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` | `5` / `0.34` (*conditional* — a loosening only while the reconciler runs; a value above its default is named. A lower one is a stricter brake, and is not named) |
+| | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` | `5` / `0.34` (*conditional* — a loosening only while the reconciler runs; a value below its default aborts smaller waves of revocations, and is named. A higher one ends more sessions and keeps none, and is not named) |
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
 | | `[auth].ad_connect_timeout`, `ad_receive_timeout`, `ad_group_search_deadline` | `10` s / `10` s / `120` s (*conditional* — a loosening only once `ad_enabled`; a value above its default is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
 | | `[auth].admin_new_ip_step_up` | `true` |
@@ -429,7 +429,9 @@ false premise.
 - **Where it is reported:** `security_loosenings()` names a value above `30` minutes or `12` hours
   (vault BACKLOG #2600), so the serve-time warning, `messagefoundry security show` and
   `GET /security/posture` list it. A value of `0` or less ends every session at once, which is
-  stricter, and is not named.
+  stricter, and is not named. The registry reads the value the load copied into `[auth]`, so the
+  preview `messagefoundry security set` prints does not show a new value yet; the next
+  `security show` does, when it can load the whole file.
 
 ### `block_unlisted_outbound = false` — allow-any outbound egress
 - **What you lose:** deny-by-default egress; a transform may send to **any** destination (PHI exfiltration
@@ -769,7 +771,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   design, so it was never a substitute for these.
 - **See:** [ADR 0079](adr/0079-kerberos-idp-session-coordination.md) (2026-07-28 amendment).
 
-### The directory reconciler's knobs looser than their defaults **while it runs** — revocation arrives later, or the brake holds later
+### The directory reconciler's knobs looser than their defaults **while it runs** — revocation arrives later, or a pass aborts it
 > **Conditional** on the reconciler running: `[auth].ad_enabled` with a non-zero
 > `ad_session_recheck_seconds` (vault BACKLOG #2600). With it off nothing reads these, and the `0`
 > interval is named by the entry above. Each is named alone, with its value or its default.
@@ -777,13 +779,17 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `ad_session_recheck_seconds` is above `300` s, when `ad_session_recheck_strikes` is above `2` (a pass
   revokes only after that many in a row find the account absent or disabled), or when
   `ad_session_recheck_max_users` is below `200` (a larger estate takes more passes to cover). The
-  mass-revoke circuit breaker aborts a pass only when it would revoke more than **both**
-  `ad_session_revoke_max` accounts and `ad_session_revoke_max_fraction` of the accounts it probed. A
-  value above either default lets a misconfigured search base, or a lost read right, sign out a wider
-  wave of directory users before the brake holds. Load already refuses a fraction of `1.0` while the
-  reconciler runs, and warns of a budget at or below the cap (BACKLOG #3085).
-- **Not named:** fewer strikes, a larger budget, or a lower brake threshold. Each is stricter. A lower
-  brake threshold aborts a smaller wave, and an aborted pass says so in an ERROR and an audit row.
+  strike count delays only an account found absent or disabled; a role or scope change revokes on
+  the first pass. The mass-revoke circuit breaker aborts a pass that would revoke more than **both**
+  `ad_session_revoke_max` accounts and `ad_session_revoke_max_fraction` of the accounts it probed,
+  and an aborted pass revokes nothing. A value below either default aborts a smaller wave of
+  genuine offboarding or demotions, and keeps aborting while those accounts stay as they are. Each
+  abort writes an ERROR and an audit row.
+- **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
+  sooner or ends more of them, and none keeps a session the directory withdrew. A higher brake
+  threshold costs availability instead: a misconfigured search base, or a lost read right, signs out
+  a wider wave before the brake holds. Load refuses a fraction of `1.0` while the reconciler runs,
+  and warns of a budget at or below the cap (BACKLOG #3085).
 - **When acceptable:** a directory that cannot absorb the bind load of the defaults, or an estate whose
   ordinary offboarding waves trip the default brake.
 - **Compensating controls:** keep `[security].max_session_hours` and `sign_out_after_idle_minutes`
@@ -1121,7 +1127,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > code, so an administrator's reset is the only way back, which is stricter and is not named. The
 > load refuses a value outside `0` to `50`. The entry does not quote the configured value.
 - **What you lose:** each recovery code passes the second factor on its own, once. More codes means a
-  copied or photographed list carries more ways past it, and a guess has more codes to match.
+  copied or photographed list carries more ways past it, and a guess has more codes to match. Each
+  recovery-code attempt also runs one password-hash check per code the setting allows, so a run of
+  wrong attempts costs the engine more.
 - **When acceptable:** a site whose users lose authenticators often and cannot reach an administrator.
 - **Compensating controls:** none that substitute; enrol a second authenticator or a passkey instead.
 - **Reversible:** yes, for new enrolments — restore `10` and restart. Codes already minted stay valid
@@ -1129,8 +1137,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 
 ### `[auth].password_min_length` below `15` — a shorter local password
 > No other setting gates it: sign-in is always on, and every local account has a password (vault
-> BACKLOG #2600). `0` or less sets no length floor at all. The entry does not quote the configured
-> value.
+> BACKLOG #2600). `0` or less sets no length floor at all, and is named as off. The entry does not
+> quote the configured value.
 - **What you lose:** the password policy refuses a local password shorter than this when it is set. A
   lower floor leaves a guessing attack fewer candidates to try.
 - **When acceptable:** a legacy standard that mandates a shorter floor, with composition rules beside
@@ -1142,7 +1150,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 
 ### `[auth].oidc_*` lifetimes and skew looser than their defaults **with OIDC on** — federated sign-in accepts more
 > **Conditional** on `[auth].oidc_enabled` (vault BACKLOG #2600). With it off nothing reads these.
-> Each is named alone, with its value and its default.
+> Each is named alone. Every entry but the `0`-or-less refetch one quotes the configured value and a
+> default.
 - **What you lose:**
   - `oidc_clock_skew_seconds` above `60` s accepts an expired id_token for that much longer, and lets
     an IdP step-up answer that was not freshly re-authenticated pass from further back.

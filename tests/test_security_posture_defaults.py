@@ -746,14 +746,16 @@ def test_a_session_limit_set_in_security_reaches_the_registry(
         ("ad_session_recheck_max_users", 10_000, False),
         ("ad_session_recheck_max_users", 199, True),
         ("ad_session_recheck_max_users", 6, True),
+        # A higher brake threshold ends more sessions and keeps none: stricter for revocation.
         ("ad_session_revoke_max", 5, False),
-        ("ad_session_revoke_max", 0, False),
-        ("ad_session_revoke_max", 6, True),
-        ("ad_session_revoke_max", 150, True),
+        ("ad_session_revoke_max", 6, False),
+        ("ad_session_revoke_max", 150, False),
+        ("ad_session_revoke_max", 4, True),
+        ("ad_session_revoke_max", 0, True),
         ("ad_session_revoke_max_fraction", 0.34, False),
-        ("ad_session_revoke_max_fraction", 0.01, False),
-        ("ad_session_revoke_max_fraction", 0.35, True),
-        ("ad_session_revoke_max_fraction", 0.99, True),  # the load refuses 1.0 while it runs
+        ("ad_session_revoke_max_fraction", 0.99, False),  # the load refuses 1.0 while it runs
+        ("ad_session_revoke_max_fraction", 0.33, True),
+        ("ad_session_revoke_max_fraction", 0.01, True),
     ],
 )
 def test_a_reconciler_knob_is_named_only_in_its_looser_direction(
@@ -768,8 +770,8 @@ def test_a_reconciler_knob_is_named_only_in_its_looser_direction(
     [
         ("ad_session_recheck_strikes", 10),
         ("ad_session_recheck_max_users", 6),
-        ("ad_session_revoke_max", 150),
-        ("ad_session_revoke_max_fraction", 0.99),
+        ("ad_session_revoke_max", 0),
+        ("ad_session_revoke_max_fraction", 0.01),
     ],
 )
 def test_a_reconciler_knob_is_not_named_while_no_reconciler_runs(field: str, value: float) -> None:
@@ -851,12 +853,68 @@ def test_the_two_jwks_refetch_entries_say_which_way_they_loosen() -> None:
 
 
 def test_the_breaker_direction_is_the_consumers() -> None:
-    """The direction the reconciler entries rest on, read from ``breaker_tripped``: a higher cap or a
-    larger share lets a wave through that the default aborts."""
-    wave = {"revoke_count": 6, "probed": 10}
-    assert breaker_tripped(**wave, max_absolute=5, max_fraction=0.34)
-    assert not breaker_tripped(**wave, max_absolute=6, max_fraction=0.34)
-    assert not breaker_tripped(**wave, max_absolute=5, max_fraction=0.6)
+    """The direction the breaker entries rest on, read from ``breaker_tripped``: a lower cap or a
+    smaller share aborts a wave of revocations the default lets through."""
+    wave = {"revoke_count": 4, "probed": 10}
+    assert not breaker_tripped(**wave, max_absolute=5, max_fraction=0.34)
+    assert breaker_tripped(**wave, max_absolute=3, max_fraction=0.34)
+    assert not breaker_tripped(**wave, max_absolute=5, max_fraction=0.01)
+    assert breaker_tripped(revoke_count=6, probed=100, max_absolute=5, max_fraction=0.01)
+    assert not breaker_tripped(revoke_count=6, probed=100, max_absolute=5, max_fraction=0.34)
+
+
+def test_a_password_floor_of_zero_says_there_is_none() -> None:
+    """At 0 or less ``PasswordPolicy`` refuses nothing for length, so the entry says off, not
+    shorter. Still no configured value in either text."""
+    off = _risk(AuthSettings(password_min_length=0), "password_min_length")
+    assert off is not None and "NO length floor" in off
+    assert off == _risk(AuthSettings(password_min_length=-3), "password_min_length")
+    shorter = _risk(AuthSettings(password_min_length=8), "password_min_length")
+    assert shorter is not None and "shorter than the default of 15" in shorter
+    assert "NO length floor" not in shorter
+
+
+def test_the_strike_entry_does_not_claim_to_delay_a_role_change() -> None:
+    """``plan_pass`` counts strikes only for an absent or disabled account."""
+    risk = _risk(_ad(ad_session_recheck_strikes=5), "ad_session_recheck_strikes")
+    assert risk is not None
+    assert "groups" not in risk and "disabled or deleted" in risk
+
+
+#: Every numeric [auth] field, and where its looser direction is decided. A new numeric field reds
+#: here until someone reads its consumer and adds it, to the registry or to the exempt set with a
+#: reason. The bool floor below cannot see these: it iterates booleans.
+_NUMERIC_AUTH_NAMED = {
+    "session_idle_timeout_minutes", "session_absolute_hours", "max_sessions_per_user",
+    "step_up_max_age_seconds", "totp_skew_steps", "mfa_recovery_code_count",
+    "mfa_verify_min_elapsed_seconds", "password_min_length", "lockout_threshold",
+    "lockout_minutes", "lockout_max_minutes", "initial_password_expiry_hours",
+    "ad_connect_timeout", "ad_receive_timeout", "ad_group_search_deadline",
+    "ad_session_recheck_seconds", "ad_session_recheck_strikes", "ad_session_recheck_max_users",
+    "ad_session_revoke_max", "ad_session_revoke_max_fraction", "oidc_clock_skew_seconds",
+    "oidc_jwks_ttl_seconds", "oidc_jwks_min_refetch_seconds", "oidc_flow_ttl_seconds",
+    "oidc_callback_min_elapsed_seconds", "oidc_flow_cache_max", "oidc_max_age_seconds",
+    "login_rate_limit_per_ip", "login_rate_limit_global", "login_rate_limit_window_seconds",
+    "phi_read_rate_limit_per_actor", "phi_read_rate_limit_window_seconds",
+    "admin_write_rate_limit_per_actor", "admin_write_rate_limit_window_seconds",
+    "admin_write_min_interval_seconds",
+}  # fmt: skip
+_NUMERIC_AUTH_EXEMPT = {
+    # Only lowers a session's end: the sign-in takes the earlier of it and the token's expiry.
+    "oidc_session_max_hours": "never looser",
+    # Ships OFF (0), so no value of it is looser than the default.
+    "phi_read_rate_limit_global": "ships off",
+}
+
+
+def test_every_numeric_auth_field_is_named_or_exempt() -> None:
+    numeric = {
+        name
+        for name, field in AuthSettings.model_fields.items()
+        if field.annotation in (int, float, int | None, float | None)
+    }
+    assert numeric == _NUMERIC_AUTH_NAMED | set(_NUMERIC_AUTH_EXEMPT)
+    assert not _NUMERIC_AUTH_NAMED & set(_NUMERIC_AUTH_EXEMPT)
 
 
 def _jwk(kid: str) -> dict[str, str]:

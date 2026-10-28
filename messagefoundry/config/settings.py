@@ -8353,18 +8353,24 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       temporary-password life of 0 or less means no expiry, and is named as off. None is gated on
       another setting. The last two entries quote no configured value.
 
-    The rest of step 4 reads every remaining numeric ``[auth]`` field the same way. Each entry
-    below is named in its looser direction only, and only while the code that reads it is built.
-    A load-time bound is not treated as a gate where a value inside it is still looser.
+    The rest of step 4 reads the remaining numeric ``[auth]`` fields the same way, at least those
+    below; ``tests/test_security_posture_defaults.py`` holds a census of every numeric field that
+    reds on a new one. Each entry below is named in its looser direction only, and only while the
+    code that reads it is built. A load-time bound is not treated as a gate where a value inside it
+    is still looser.
 
     * ``mfa_recovery_code_count``: enrolment mints this many single-use codes, and any one passes
       the second factor, so more than the default is looser. 0 mints none, which is stricter. Not
       gated: any account may enrol TOTP. ``password_min_length``: ``PasswordPolicy`` refuses a
-      password shorter than this, so a lower floor is looser, and 0 or less sets none. Not gated:
-      sign-in is always on. Neither entry quotes the configured value.
+      password shorter than this, so a lower floor is looser, and 0 or less sets none, named as
+      off. Not gated: sign-in is always on. Neither entry quotes the configured value.
     * ``session_idle_timeout_minutes`` and ``session_absolute_hours`` are the ``[security]``
       switches ``sign_out_after_idle_minutes`` and ``max_session_hours``, copied in by the desugar.
       Their ``[auth]`` spellings are refused at load, so the entries carry the ``[security]`` names.
+      They are read off the ``[auth]`` copy, since this function is handed no ``[security]``. A
+      caller whose two disagree misses them: at least the ``security set`` preview, which pairs the
+      edited ``[security]`` with the ``[auth]`` it loaded before the edit, and a ``security show``
+      that could not load the whole file and fell back to a default ``[auth]``.
       ``SessionRecord.is_live`` refuses a session idle past the first or older than the second (its
       expiry is stamped from it at sign-in), so a longer one is looser, and 0 or less
       ends every session at once, which is stricter.
@@ -8373,12 +8379,14 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       :func:`security_loosenings` names), ``ad_session_recheck_strikes`` above its default
       (``plan_pass`` revokes only at that many failing passes in a row), and
       ``ad_session_recheck_max_users`` below its default (``select_candidates`` probes at most that
-      many per pass). Each makes a revocation arrive later. ``ad_session_revoke_max`` and
-      ``ad_session_revoke_max_fraction`` feed ``breaker_tripped``, which aborts a pass only when it
-      would revoke more than both. Above the default the brake lets a wider wave through, which is
-      the direction BACKLOG #3085 refuses at 1.0 and warns of at the budget, so that is named.
-      Below it the brake aborts a smaller wave, loudly (an ERROR and an audit row), and that is
-      not named.
+      many per pass). Each makes a revocation arrive later; the strike count delays only an absent
+      or disabled account, since a role or scope change revokes on the first pass.
+      ``ad_session_revoke_max`` and ``ad_session_revoke_max_fraction`` feed ``breaker_tripped``,
+      which aborts a pass that would revoke more than both, and an aborted pass revokes nothing.
+      Below the default a smaller wave of genuine revocations aborts, so that is named, as the 0
+      interval is. Above it the brake lets a wider wave through: more sessions end, none is kept,
+      so it is stricter for revocation and costs availability, as a lock on the first failure
+      does. BACKLOG #3085 refuses the dead 1.0 share and warns of a budget at or below the cap.
     * The federated sign-in knobs, named while ``oidc_enabled`` holds. ``oidc_clock_skew_seconds``
       above its default accepts an expired id_token for longer and widens the step-up freshness
       test. ``oidc_jwks_ttl_seconds`` above its default keeps a withdrawn signing key verifying for
@@ -8863,10 +8871,20 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 "more single-use recovery codes are minted at enrolment than the default of "
                 f"{_auth_default('mfa_recovery_code_count')}, and any one of them passes the second "
                 "factor alone, so a copied or photographed list carries more ways past it and a "
-                "guess has more codes to match",
+                "guess has more codes to match. Each recovery-code attempt also runs one "
+                "password-hash check per code the setting allows, so each costs more",
             )
         )
-    if auth.password_min_length < _auth_default("password_min_length"):
+    # PasswordPolicy refuses len(password) < password_min_length, so at 0 or less nothing is refused.
+    if auth.password_min_length <= 0:
+        out.append(
+            (
+                "password_min_length",
+                "a local password has NO length floor when it is set, so even an empty one passes "
+                "the length check, and only the other screens stand in its way",
+            )
+        )
+    elif auth.password_min_length < _auth_default("password_min_length"):
         out.append(
             (
                 "password_min_length",
@@ -8878,7 +8896,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
     # The [security] session limits. They desugar into these two [auth] fields, whose own spellings
     # the load refuses, so each entry carries the [security] name an operator sets. A value of 0 or
-    # less ends every session at once, which is stricter.
+    # less ends every session at once, which is stricter. Read off the [auth] copy because this
+    # function sees no [security]; a caller whose two disagree (the `security set` preview) misses
+    # them, as the docstring says.
     for switch, field, unit in (
         ("sign_out_after_idle_minutes", "session_idle_timeout_minutes", "minute(s)"),
         ("max_session_hours", "session_absolute_hours", "hour(s)"),
@@ -8910,6 +8930,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}",
                 )
             )
+        # plan_pass counts strikes only for an absent or disabled account; a role or scope change
+        # on a present one revokes on the first pass whatever this says.
         strikes = auth.ad_session_recheck_strikes
         if strikes > _auth_default("ad_session_recheck_strikes"):
             out.append(
@@ -8917,7 +8939,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "ad_session_recheck_strikes",
                     f"the reconciler revokes only after {strikes} passes in a row find an account "
                     "absent or disabled, more than the default of "
-                    f"{_auth_default('ad_session_recheck_strikes')}, so {late}",
+                    f"{_auth_default('ad_session_recheck_strikes')}, so a directory account that "
+                    "was disabled or deleted keeps its live engine sessions for longer before "
+                    "they are revoked",
                 )
             )
         if auth.ad_session_recheck_max_users < _auth_default("ad_session_recheck_max_users"):
@@ -8929,26 +8953,29 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"more passes to cover, and {late}",
                 )
             )
+        # breaker_tripped aborts a pass that would revoke more than BOTH of these, and an aborted
+        # pass revokes nothing, so a lower one aborts smaller waves of genuine revocations.
         brake = (
-            "so a misconfigured search base, or a lost read right, signs out more of the "
-            "signed-in directory users in one pass before the mass-revoke circuit breaker holds"
+            "so a smaller wave of revocations the directory calls for (offboarded accounts, "
+            "demotions) aborts the whole pass, which revokes nothing and keeps aborting while "
+            "those accounts stay as they are (each abort is logged and audited)"
         )
         cap = auth.ad_session_revoke_max
-        if cap > _auth_default("ad_session_revoke_max"):
+        if cap < _auth_default("ad_session_revoke_max"):
             out.append(
                 (
                     "ad_session_revoke_max",
-                    f"the mass-revoke circuit breaker's absolute floor is {cap} accounts, above "
+                    f"the mass-revoke circuit breaker's absolute floor is {cap} accounts, below "
                     f"the default of {_auth_default('ad_session_revoke_max')}, {brake}",
                 )
             )
         share = auth.ad_session_revoke_max_fraction
-        if share > _auth_default("ad_session_revoke_max_fraction"):
+        if share < _auth_default("ad_session_revoke_max_fraction"):
             out.append(
                 (
                     "ad_session_revoke_max_fraction",
                     f"the mass-revoke circuit breaker's share is {share!r} of the accounts a pass "
-                    f"probed, above the default of {_auth_default('ad_session_revoke_max_fraction')}"
+                    f"probed, below the default of {_auth_default('ad_session_revoke_max_fraction')}"
                     f", {brake}",
                 )
             )
@@ -8961,9 +8988,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 (
                     "oidc_clock_skew_seconds",
                     f"the clock skew allowed on an id_token is {skew} s, more than the default of "
-                    f"{_auth_default('oidc_clock_skew_seconds')} s, so an expired token is accepted "
-                    "for that much longer, and an IdP step-up that was not freshly re-authenticated "
-                    "passes the freshness test from further back",
+                    f"{_auth_default('oidc_clock_skew_seconds')} s, so an id_token is accepted up "
+                    "to that many seconds past its expiry instead of the default's, and an IdP "
+                    "step-up that was not freshly re-authenticated passes the freshness test from "
+                    "further back",
                 )
             )
         ttl, default_ttl = auth.oidc_jwks_ttl_seconds, _auth_default("oidc_jwks_ttl_seconds")
