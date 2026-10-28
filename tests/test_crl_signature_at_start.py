@@ -562,8 +562,8 @@ def test_a_crl_its_named_ca_proves_bad_refuses_beside_a_ca_with_no_ski_that_veri
     assert verdict_of_scan[1].startswith("Replace the CRL in the CA file with one its CA signed")
 
     # Control: OpenSSL fails a strict handshake through the named CA. Which error depends on the
-    # order OpenSSL sorts same-name CAs in, which differs by C runtime, not on the file order.
-    # Where it tries the named CA first, the handshake reaches this CRL and fails on it. Where it
+    # order OpenSSL tries same-name CAs in, which was measured to follow the CA-file order on one
+    # host and may differ by C runtime, so both file orders run. Where it tries the named CA first, the handshake reaches this CRL and fails on it. Where it
     # tries the CA with no SKI first, whose key is of the leaf's kind, the strict check fails the
     # chain on the missing SKI before the CRL, whatever the CRL (open question 4 in the PR body).
     # The CRL's own failure, in both orders, is the unchecked-CA test's control above; a CA with

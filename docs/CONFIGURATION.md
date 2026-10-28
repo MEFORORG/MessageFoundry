@@ -2072,7 +2072,9 @@ three cases warn:
   it judges by it, as for any held-back file. What it avoids is applying live, with nobody acting, a CRL on which a
   host that refuses SHA-1, by its build or its system policy, would fail every handshake through
   that CA. It does not prevent that failure: on such a host the restart loads the CRL with the
-  WARNING, and the handshakes through that CA then fail. The engine checks with the
+  WARNING, and the handshakes through that CA then fail. Where the copy the hop holds is itself an
+  earlier SHA-1 CRL from that CA, such a host fails those handshakes already, and holding the new
+  copy back gains nothing there. The engine checks with the
   `cryptography` library's OpenSSL and the handshake runs on Python's, so it cannot tell which
   kind of host it is on. A forged SHA-1 signature that names a listed CA's key is still proved
   bad, and refuses the file.

@@ -453,10 +453,11 @@ class CrlSignature:
       and its key does not verify the CRL. The CRL names that key, and that key did not sign it.
     * ``uncheckable``: no judged CA verifies, and some judged CA could not be checked: one the CRL
       names, or, where it names none, any fitting CA. "Cannot check" is not "does not verify"
-      (:func:`_verifies`). It covers a signature over SHA-1 that a judged CA did make, which a
-      start loads with a warning and the reload holds back until a restart; a forged one is
-      ``bad``. ``docs/CONFIGURATION.md`` states that trade-off, in the bullet on a signature the
-      engine cannot check.
+      (:func:`_verifies`). It covers at least an RSA signature over SHA-1 that a judged CA did
+      make, which a start loads with a warning and the reload holds back until a restart; a
+      forged one that names a listed CA's key of the signature's kind is ``bad``.
+      ``docs/CONFIGURATION.md`` states that trade-off, in the bullet on a signature the engine
+      cannot check.
     * ``unproven``: every fitting CA was checked and none verifies, but the CRL names none of them
       by key identifier. A CRL with no key identifier fits every CA of that name. So a CA that
       renewed its key reads this way, while the peer's own chain may still carry the CA that
