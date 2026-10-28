@@ -169,10 +169,11 @@ async def test_lockout_counter_contract() -> None:
     SQL bodies implement is asserted once rather than worded three times."""
     store = await _store()
 
-    def corrupt(cell: str) -> Callable[[str], Awaitable[None]]:
+    def corrupt(cell: str | bytes) -> Callable[[str], Awaitable[None]]:
         async def write(user_id: str) -> None:
             await store._db.execute(
-                f"UPDATE webauthn_credentials SET transports={cell} WHERE user_id=?", (user_id,)
+                "UPDATE webauthn_credentials SET transports=CAST(? AS TEXT) WHERE user_id=?",
+                (cell, user_id),
             )
             await store._db.commit()
 
@@ -184,8 +185,8 @@ async def test_lockout_counter_contract() -> None:
             corrupt_passkeys={
                 # Not UTF-8: sqlite3 raises OperationalError while FETCHING the row, before any
                 # parse runs.
-                "fetch": corrupt("CAST(X'FF' AS TEXT)"),
-                "parse": corrupt("'not json'"),
+                "fetch": corrupt(bytes([0xFF])),
+                "parse": corrupt("not json"),
             },
         )
     finally:

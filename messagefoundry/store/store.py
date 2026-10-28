@@ -2951,7 +2951,9 @@ class UnreadablePasskeys(Enum):
 _SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
 
 
-def _unreadable_passkey_set(exc: Exception) -> bool:
+def _unreadable_passkey_set(
+    exc: PasskeyRowMalformed | UnicodeDecodeError | sqlite3.OperationalError,
+) -> bool:
     """Whether ``exc``, raised by a backend's passkey read, says the set cannot be read rather than
     that the read itself failed: a row that does not parse (:class:`PasskeyRowMalformed`), or a
     cell the driver cannot decode while fetching, before any row is parsed. At least two drivers
@@ -2959,7 +2961,7 @@ def _unreadable_passkey_set(exc: Exception) -> bool:
     asyncpg and pyodbc a ``UnicodeDecodeError``. Any other driver error is not this."""
     if isinstance(exc, sqlite3.OperationalError):
         return str(exc).startswith(_SQLITE_DECODE_FAILURE)
-    return isinstance(exc, (PasskeyRowMalformed, UnicodeDecodeError))
+    return True
 
 
 async def escalation_passkeys(
@@ -2990,7 +2992,7 @@ async def escalation_passkeys(
         return None
     try:
         return await read_passkeys()
-    except Exception as exc:
+    except (PasskeyRowMalformed, UnicodeDecodeError, sqlite3.OperationalError) as exc:
         if not _unreadable_passkey_set(exc):
             raise
         # The class name only: a decode error's message and arguments quote the cell.

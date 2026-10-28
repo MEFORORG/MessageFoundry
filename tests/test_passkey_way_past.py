@@ -37,7 +37,7 @@ from messagefoundry.auth.service import (  # noqa: E402
     lockable_account_census,
 )
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
-from messagefoundry.store.store import MessageStore  # noqa: E402
+from messagefoundry.store.store import MessageStore, PasskeyRowMalformed  # noqa: E402
 from tests._admin_account import login_admin  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
@@ -1864,19 +1864,39 @@ async def test_an_unreadable_passkey_row_counts_the_failure_and_escalates_the_lo
         await store.close()
 
 
+def _real_sqlite_decode_failure() -> sqlite3.OperationalError:
+    """The error sqlite3 itself raises fetching a TEXT cell that is not UTF-8, so the classifier
+    is tested against the stdlib's own message rather than a copy of the prefix it matches."""
+    db = sqlite3.connect(":memory:")
+    try:
+        db.execute("SELECT CAST(X'FF' AS TEXT)").fetchall()
+    except sqlite3.OperationalError as exc:
+        return exc
+    finally:
+        db.close()
+    raise AssertionError("sqlite3 decoded a cell that is not UTF-8")
+
+
 @pytest.mark.parametrize(
     ("error", "unreadable"),
     [
-        (
-            sqlite3.OperationalError("Could not decode to UTF-8 column 'transports' with text 'x'"),
-            True,
-        ),
+        (_real_sqlite_decode_failure(), True),
         (UnicodeDecodeError("utf-16-le", b"\x00\xd8", 0, 2, "unpaired surrogate"), True),
+        (PasskeyRowMalformed("JSONDecodeError"), True),
         (sqlite3.OperationalError("database is locked"), False),
         (sqlite3.DatabaseError("disk I/O error"), False),
+        (ValueError("a driver value error that is no decode failure"), False),
         (RuntimeError("anything else"), False),
     ],
-    ids=["sqlite-decode", "driver-decode", "sqlite-locked", "sqlite-io", "other"],
+    ids=[
+        "sqlite-decode",
+        "driver-decode",
+        "parse",
+        "sqlite-locked",
+        "sqlite-io",
+        "value",
+        "other",
+    ],
 )
 async def test_only_a_decode_or_parse_failure_escalates_rather_than_rolling_back(
     monkeypatch: pytest.MonkeyPatch, error: Exception, unreadable: bool
