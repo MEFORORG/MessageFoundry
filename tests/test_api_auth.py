@@ -714,7 +714,9 @@ async def test_logout_passes_a_proven_at_read_before_its_gate(
     assert proven[0] is not None, (
         "the route passed no proven_at, so it took the credential-free bound"
     )
-    assert proven[0] < gate_reads[0], "proven_at was read after the gate proved the token"
+    assert start < proven[0] < gate_reads[0], (
+        "proven_at is not a wall-clock read taken during this request, before the gate"
+    )
 
 
 async def test_a_logout_audit_row_names_the_caller_and_the_client_address(engine: Engine) -> None:

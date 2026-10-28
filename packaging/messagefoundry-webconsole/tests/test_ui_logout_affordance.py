@@ -44,6 +44,9 @@ PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the A
 
 LOGOUT_FORM = 'action="/ui/logout"'
 
+#: The logger :meth:`AuthService.logout` writes its fail-soft ERROR lines to.
+_SERVICE_LOGGER = "messagefoundry.auth.service"
+
 #: The pages/*.py builders allowed to suppress the nav entirely: both are reached WITHOUT a session.
 UNAUTHENTICATED_BARE_BUILDERS = frozenset({"login", "sso_challenge"})
 
@@ -349,10 +352,6 @@ async def test_ui_logout_clears_the_cookie_when_the_row_fails_after_the_revoke(
     ]
 
 
-#: The logger :meth:`AuthService.logout` writes its fail-soft ERROR lines to.
-_SERVICE_LOGGER = "messagefoundry.auth.service"
-
-
 def _assert_signed_out(out: httpx.Response) -> None:
     """The route finished the sign-out: it redirected, sent Clear-Site-Data and expired the cookie."""
     assert out.status_code == 303
@@ -382,8 +381,10 @@ async def test_ui_logout_clears_the_cookie_when_the_owner_lookup_fails(
     async def _refuse_owner(user_id: str) -> object:
         raise OSError("the user store refused the read")
 
-    monkeypatch.setattr(engine.store, "get_user", _refuse_owner)
-    with caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
+    # Scoped to the sign-out, so a session left live fails the check below on its own terms
+    # rather than on this planted fault.
+    with monkeypatch.context() as patch, caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
+        patch.setattr(engine.store, "get_user", _refuse_owner)
         out = await _sign_out_with(engine, service, token)
     _assert_signed_out(out)
     assert await service.identity_for_token(token, activity=False) is None
