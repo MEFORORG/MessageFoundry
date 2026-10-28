@@ -2,8 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A refused sandbox worker raises one ``sandbox_worker_refused`` alert (vault BACKLOG #2724).
 
-Owner ruling 2026-10-16: alert, keep dead-letter. A config file edited on disk with no reload makes
-the next ``[sandbox].mode = "subprocess"`` worker refuse. The message in hand still fails as before;
+Owner ruling 2026-10-16: alert, keep dead-letter. A worker whose config module bytes differ from the
+ones the engine loaded refuses. Since vault BACKLOG #2596 a worker runs the snapshot it is sent, so an
+edit on disk no longer reaches it, and these tests send the worker the edited bytes to provoke the
+refusal. The message in hand still fails as before;
 these tests pin that an operator is also told, once per refusal and not once per message, and that
 the alert carries fixed words and no message content.
 
@@ -26,6 +28,7 @@ from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
     EgressSettings,
 )
+from messagefoundry.config.snapshot import read_config_snapshot
 from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink, sandbox_worker_refused_detail
@@ -78,6 +81,15 @@ def _edit(cfg: Path) -> None:
     (cfg / "graph.py").write_text(_GRAPH.replace('"COUNT="', '"EDITED="'), encoding="utf-8")
 
 
+def _loaded_then_sent_edited(cfg: Path) -> Registry:
+    """A graph loaded from ``cfg`` whose snapshot, the bytes its sandbox workers are sent, is then
+    a read of the edited file: a worker that runs other bytes than the engine loaded."""
+    registry = load_config(cfg)
+    _edit(cfg)
+    registry.config_snapshot = read_config_snapshot(cfg, strict=True)
+    return registry
+
+
 def _runner(registry: Registry, store: MessageStore, cfg: Path, sink: Any) -> RegistryRunner:
     return RegistryRunner(
         registry,
@@ -96,8 +108,7 @@ async def test_the_first_refusal_alerts_once_and_later_messages_do_not(
     fails and dead-letters under the policy), the alert fires on the first, and the cached
     refusals for the next messages on the same inbound raise no second alert. The whole refusal,
     digests included, is logged once."""
-    registry = load_config(edited_config)
-    _edit(edited_config)
+    registry = _loaded_then_sent_edited(edited_config)
     sink = _Recorder()
     store = await MessageStore.open(tmp_path / "refusal.db")
     try:
@@ -214,8 +225,7 @@ async def test_the_shipped_notifier_carries_fixed_words_and_no_body(
 ) -> None:
     """What an operator's webhook receives and what the alert list shows. The CONTROL is the
     refusal itself, which the engine log carries: it names what differs."""
-    registry = load_config(edited_config)
-    _edit(edited_config)
+    registry = _loaded_then_sent_edited(edited_config)
     transport, state = _RecordingTransport("webhook"), _RecordingStore()
     sink = NotifierAlertSink([transport], store=cast(Any, state))
     store = await MessageStore.open(tmp_path / "notifier.db")
@@ -249,9 +259,11 @@ def test_the_detail_names_the_cause_and_the_remedy_first() -> None:
     names = sandbox_worker_refused_detail(content_only=False)
     # The alert instance's reason column keeps what this bound leaves (docs/PHI.md section 8).
     kept_edited, kept_names = safe_text(edited, limit=200), safe_text(names, limit=200)
-    assert "Reload the config." in kept_edited and "changed on disk" in kept_edited
+    assert "Reload the config." in kept_edited and "other config module bytes" in kept_edited
     assert "pass_environment" not in edited
-    assert "reload the config" in kept_names
+    # A worker runs the engine's snapshot, so a disk edit is no cause and a reload no remedy.
+    assert "changed on disk" not in edited + names
+    assert "reload" not in names.lower()
     assert "add it to [sandbox].pass_environment and restart" in kept_names
 
 
@@ -261,7 +273,7 @@ def test_the_logging_sink_warns(caplog: pytest.LogCaptureFixture) -> None:
     (record,) = caplog.records
     assert record.levelno == logging.WARNING
     assert record.getMessage().startswith(
-        "ALERT sandbox_worker_refused: inbound 'IB_PARITY': A config file changed on disk"
+        "ALERT sandbox_worker_refused: inbound 'IB_PARITY': The worker ran other config module"
     )
 
 

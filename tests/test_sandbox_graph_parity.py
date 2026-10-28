@@ -22,7 +22,7 @@ from pydantic import ValidationError
 from messagefoundry.config import settings, wiring
 from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import Registry, WiringError, config_code_digest, load_config
+from messagefoundry.config.wiring import Registry, config_code_digest, load_config
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.dryrun import transform_one
 from messagefoundry.pipeline.sandbox import (
@@ -112,7 +112,9 @@ def test_a_worker_whose_graph_differs_from_the_engines_is_refused(
     assert "IB_PARITY" in text
     assert "allowlist" in text
     assert "[sandbox].pass_environment" in text
-    assert "reload" in text
+    # A worker runs the snapshot it is sent (vault BACKLOG #2596), so a reload is no remedy for a
+    # graph that differs by name, and the refusal does not send the operator after one.
+    assert "reload" not in text
     # What differs, and on which side: the engine has two handlers the worker never built.
     assert "handlers (engine only: h_1, h_2)" in text
 
@@ -155,48 +157,56 @@ def test_a_config_module_edited_on_disk_refuses_the_worker_though_every_name_mat
     assert str(deliveries[0].payload) == "EDITED=1"
 
 
-def test_a_module_rewritten_while_the_load_runs_refuses_the_load(
+def test_a_module_rewritten_while_the_load_runs_does_not_change_what_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The digest is read before the modules run. A rewrite in between would let a worker pass the
-    comparison with code its digest does not describe, so the load is refused. The control is
-    the same load with nothing rewritten."""
+    """Vault BACKLOG #2596 step 1. The load reads the directory once and runs those bytes, so a
+    rewrite while it runs changes neither the code that runs nor the digest that describes it.
+    Before, the digest was read first and each module read again to run it, and a rewrite in
+    between was refused after it had run. The control loads the rewritten file afresh."""
     monkeypatch.delenv(_VARIABLE, raising=False)
-    (tmp_path / "graph.py").write_text(_GRAPH, encoding="utf-8")
-    assert load_config(tmp_path).code_digest is not None
+    graph = tmp_path / "graph.py"
+    graph.write_text(_GRAPH, encoding="utf-8")
     real = wiring._exec_module
 
     def rewrite_then_run(path: Path, helpers: Any) -> None:
-        path.write_text(_GRAPH + "\n# edited\n", encoding="utf-8")
+        path.write_text(_GRAPH.replace('"COUNT="', '"EDITED="'), encoding="utf-8")
         real(path, helpers)
 
     monkeypatch.setattr(wiring, "_exec_module", rewrite_then_run)
-    with pytest.raises(WiringError, match="changed on disk while they were loading"):
-        load_config(tmp_path)
+    registry = load_config(tmp_path)
+    monkeypatch.setattr(wiring, "_exec_module", real)
+    deliveries, _, _, _ = transform_one(registry, "h_0", RAW)
+    assert str(deliveries[0].payload) == "COUNT=1"
+    assert registry.config_snapshot is not None
+    assert registry.code_digest == config_code_digest(registry.config_snapshot)
+    assert registry.code_digest != config_code_digest(tmp_path)  # the disk moved on
+    edited = load_config(tmp_path)
+    assert str(transform_one(edited, "h_0", RAW)[0][0].payload) == "EDITED=1"
 
 
-def test_a_module_unreadable_after_the_load_is_not_called_an_edit(
+def test_a_load_reads_each_config_file_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """One read per file, for the module, a helper it imports, a code set and connections.toml:
+    every later use is of those bytes (vault BACKLOG #2596)."""
     monkeypatch.delenv(_VARIABLE, raising=False)
-    (tmp_path / "graph.py").write_text(_GRAPH, encoding="utf-8")
-    real = wiring._exec_module
+    (tmp_path / "graph.py").write_text("import _shared\n" + _GRAPH, encoding="utf-8")
+    (tmp_path / "_shared.py").write_text("X = 1\n", encoding="utf-8")
+    (tmp_path / "codesets").mkdir()
+    (tmp_path / "codesets" / "diets.csv").write_text("k,v\na,b\n", encoding="utf-8")
+    (tmp_path / "connections.toml").write_text("", encoding="utf-8")
     real_read = Path.read_bytes
-    ran: list[bool] = []
+    reads: list[str] = []
 
-    def refuse_after_the_load(self: Path) -> bytes:
-        if ran and self.name == "graph.py":
-            raise PermissionError("held open")
+    def counting(self: Path) -> bytes:
+        reads.append(self.name)
         return real_read(self)
 
-    def run(path: Path, helpers: Any) -> None:
-        real(path, helpers)
-        ran.append(True)
-
-    monkeypatch.setattr(wiring, "_exec_module", run)
-    monkeypatch.setattr(Path, "read_bytes", refuse_after_the_load)
-    with pytest.raises(WiringError, match="could not be read again"):
-        load_config(tmp_path)
+    monkeypatch.setattr(Path, "read_bytes", counting)
+    registry = load_config(tmp_path)
+    assert "h_0" in registry.handlers
+    assert sorted(reads) == ["_shared.py", "connections.toml", "diets.csv", "graph.py"]
 
 
 def test_an_unreadable_module_leaves_no_digest_and_says_so(
@@ -213,7 +223,7 @@ def test_an_unreadable_module_leaves_no_digest_and_says_so(
     monkeypatch.setattr(Path, "read_bytes", refuse)
     with caplog.at_level("WARNING", logger="messagefoundry.config.wiring"):
         assert config_code_digest(tmp_path) is None
-    assert "not compared" in caplog.text and "held open" in caplog.text
+    assert "not compared" in caplog.text and "graph.py" in caplog.text
 
 
 def test_the_code_digest_covers_each_module_a_load_may_run(tmp_path: Path) -> None:
@@ -430,15 +440,28 @@ def test_the_shape_of_a_loaded_graph(config_dir: str, monkeypatch: pytest.Monkey
 # --- the setting ---------------------------------------------------------------------------------
 
 
-def test_pass_environment_takes_ordinary_names() -> None:
+#: The two ``pass_environment`` settings share one refusal (vault BACKLOG #2587): the section, the
+#: key its refusal names, and who the refusal says the name may not be passed to.
+_PASS_ENVIRONMENT_SECTIONS = pytest.mark.parametrize(
+    ("section", "key", "receiver"),
+    [
+        (settings.SandboxSettings, "sandbox.pass_environment", "a worker"),
+        (settings.DrSettings, "dr.pass_environment", "a hook"),
+    ],
+)
+
+
+@_PASS_ENVIRONMENT_SECTIONS
+def test_pass_environment_takes_ordinary_names(section: Any, key: str, receiver: str) -> None:
     names = ["SITE_GRAPH_VARIANT", "TENANT_COUNT"]
-    assert settings.SandboxSettings(pass_environment=tuple(names)).pass_environment == tuple(names)
-    assert settings.SandboxSettings().pass_environment == ()
+    assert section(pass_environment=tuple(names)).pass_environment == tuple(names)
+    assert section().pass_environment == ()
     # The environment layer delivers the setting as one comma-separated string.
-    from_env = settings.SandboxSettings.model_validate({"pass_environment": " A_NAME , B_NAME "})
+    from_env = section.model_validate({"pass_environment": " A_NAME , B_NAME "})
     assert from_env.pass_environment == ("A_NAME", "B_NAME")
 
 
+@_PASS_ENVIRONMENT_SECTIONS
 @pytest.mark.parametrize(
     "name",
     [
@@ -450,13 +473,33 @@ def test_pass_environment_takes_ordinary_names() -> None:
         "MEFOR_ANYTHING_AT_ALL",
     ],
 )
-def test_pass_environment_refuses_the_engines_own_names(name: str) -> None:
+def test_pass_environment_refuses_the_engines_own_names(
+    section: Any, key: str, receiver: str, name: str
+) -> None:
     with pytest.raises(ValidationError) as refused:
-        settings.SandboxSettings(pass_environment=(name,))
-    assert "pass_environment" in str(refused.value)
+        section(pass_environment=(name,))
+    assert key in str(refused.value)
+    assert f"passed to {receiver}" in str(refused.value)
 
 
+@_PASS_ENVIRONMENT_SECTIONS
 @pytest.mark.parametrize("name", ["", "A=B", "HAS SPACE", "1LEADING", "TRAILING\n"])
-def test_pass_environment_refuses_what_is_not_a_variable_name(name: str) -> None:
-    with pytest.raises(ValidationError):
-        settings.SandboxSettings(pass_environment=(name,))
+def test_pass_environment_refuses_what_is_not_a_variable_name(
+    section: Any, key: str, receiver: str, name: str
+) -> None:
+    with pytest.raises(ValidationError) as refused:
+        section(pass_environment=(name,))
+    assert key in str(refused.value)
+
+
+@_PASS_ENVIRONMENT_SECTIONS
+def test_pass_environment_never_echoes_a_value_typed_by_mistake(
+    section: Any, key: str, receiver: str
+) -> None:
+    """``NAME=value`` in the list would carry the value into the load error, which serve prints."""
+    with pytest.raises(ValidationError) as refused:
+        section(pass_environment=("OK_NAME", "SITE_FLAG=canary-value"))
+    text = str(refused.value)
+    assert f"{key}: an entry is not" in text  # the control: this is the refusal for that entry
+    assert "canary-value" not in text
+    assert "SITE_FLAG" not in text

@@ -100,8 +100,9 @@ def mount_ui(app: FastAPI, deps: UiDeps) -> None:
     for module in _REGISTRARS:
         module.register(app, deps)
 
-    # Install the /ui browser-security hardening LAST so Starlette makes it the OUTERMOST middleware
-    # (added after the engine's security-headers middleware): its response send-wrapper runs last and
+    # Install the /ui browser-security hardening here, after the engine's security-headers middleware,
+    # so Starlette puts it OUTSIDE that layer (create_app registers more layers further out still):
+    # its response send-wrapper runs after the engine's and
     # thus owns the effective-https /ui CSP/COOP/reporting headers, while deferring to the engine's
     # static app.state.ui_csp untouched over cleartext loopback (byte-identity). Guarded so a re-mount
     # of the SAME app (the idempotency contract above) does not stack a second, nonce-conflicting copy.

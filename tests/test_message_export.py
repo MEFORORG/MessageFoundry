@@ -536,9 +536,8 @@ async def test_the_stop_reaches_the_server_as_an_abort(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The stop must leave the whole app as a raise. This pins the raise, NOT what the client
-    receives: the engine's ``@app.middleware("http")`` layers end the response cleanly before the
-    raise leaves them, so the client still gets a short file that looks complete (found under
-    BACKLOG #3381, unfixed; see ``ExportStopped``)."""
+    receives; ``tests/test_export_stop_wire.py`` measures that over a real server, where the raise
+    ends the download as a failed transfer (BACKLOG #3907; see ``ExportStopped``)."""
     service = await _service(engine)
     uid = await _add_user(service, "op", [Role.OPERATOR.value])
     mid_a, mid_b = await _seed(engine)

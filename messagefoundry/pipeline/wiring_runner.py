@@ -5490,9 +5490,11 @@ class RegistryRunner:
 
         Returns ``None`` — the byte-identical in-process path — unless ``[sandbox].mode=subprocess``
         AND a config dir is known. The child re-loads the graph to look a function up by name, from
-        ``Registry.source_dir`` (the directory the served graph came from), else the constructor's
-        ``sandbox_config_source``. A reload of a running runner closes the sessions, so a reload
-        from another root moves the children with it (vault BACKLOG #3094). **A graph built in code with no
+        ``Registry.config_snapshot``, the bytes the served graph was loaded from, and never reads
+        the directory (vault BACKLOG #2596). A graph with no snapshot hands the session
+        ``Registry.source_dir``, else the constructor's ``sandbox_config_source``, which the session
+        reads once. A reload of a running runner closes the sessions, so a reload from another root
+        moves the children with it (vault BACKLOG #3094). **A graph built in code with no
         config dir cannot isolate**, and degrades to in-process. That degradation is **silent**: a
         library embedder that asked for ``subprocess`` gets the in-process path and nothing says so.
         Every ``serve`` route carries a config dir. The :class:`SandboxSession` object is created
@@ -5519,6 +5521,9 @@ class RegistryRunner:
                 env=env,
                 graph=self._engine_graph_shape,
                 code_sets=self.registry.code_sets,
+                # The bytes the served graph was loaded from: every worker of this session runs
+                # them and never reads the directory (vault BACKLOG #2596).
+                snapshot=self.registry.config_snapshot,
             )
             self._sandbox_sessions[name] = session
         return session
@@ -10845,6 +10850,8 @@ def _source_config(
     apply_hop_attestation(
         settings, f"inbound connection {ic.name!r}", ic.tls_hop_attested, ic.tls_hop_attested_reason
     )
+    # Vault BACKLOG #3234: an Ftp poller's env() tls can resolve to plain ftp beside a CA.
+    refuse_resolved_verify_off(ic.spec.type, settings, f"inbound connection {ic.name!r}")
     # Inbound MLLP/TCP/X12 listeners never carry an author-supplied host (wiring rejects one) — they
     # bind to the per-connection bind_address if set, else the service-level [inbound].bind_host. File
     # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's
