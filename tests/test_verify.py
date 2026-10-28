@@ -1075,8 +1075,20 @@ def _open_store_calls_in_verify() -> list[tuple[str, ast.Call, set[str]]]:
 def test_verify_opens_a_store_only_through_open_store_by_its_own_name() -> None:
     """The two AST tests below find opens by the name ``open_store``. An import under another name,
     or a backend's own ``open``, would hide an open from both, so neither may appear."""
+    # Floors first, so a walk that finds nothing fails here instead of passing every absence
+    # assertion below on nothing: the source files and the function walk must each reach every
+    # pinned opener. These floors do not widen what the walks see (``_verify_functions`` says which
+    # functions that is). The ``len`` floor is the shape the vacuous-absence lint reads as a guard.
+    sources = sorted(Path(smoke.__file__).parent.glob("*.py"))
+    opener_files = {where.split("::")[0] for where in _VERIFY_STORE_OPENERS}
+    assert opener_files <= {p.name for p in sources}, "the verify source glob is blind"
+    functions = _verify_functions()
+    assert len(functions) >= len(_VERIFY_STORE_OPENERS), "the verify function walk is blind"
+    assert set(_VERIFY_STORE_OPENERS) <= {where for where, _ in functions}, (
+        "the verify function walk misses a pinned opener"
+    )
     renamed: list[str] = []
-    for source_file in sorted(Path(smoke.__file__).parent.glob("*.py")):
+    for source_file in sources:
         for node in ast.walk(ast.parse(source_file.read_text(encoding="utf-8"))):
             if isinstance(node, ast.ImportFrom | ast.Import):
                 renamed += [
@@ -1086,7 +1098,7 @@ def test_verify_opens_a_store_only_through_open_store_by_its_own_name() -> None:
                 ]
     direct = [
         where
-        for where, node in _verify_functions()
+        for where, node in functions
         for sub in ast.walk(node)
         if isinstance(sub, ast.Call)
         and isinstance(sub.func, ast.Attribute)
@@ -1096,7 +1108,7 @@ def test_verify_opens_a_store_only_through_open_store_by_its_own_name() -> None:
     # ``open_store`` named anywhere but as a callee -- ``partial(open_store, ...)``, or bound to a
     # local and called by that name -- would hide the call's keywords from the tests below.
     passed_on: list[str] = []
-    for source_file in sorted(Path(smoke.__file__).parent.glob("*.py")):
+    for source_file in sources:
         tree = ast.parse(source_file.read_text(encoding="utf-8"))
         called_at = {id(sub.func) for sub in ast.walk(tree) if isinstance(sub, ast.Call)}
         passed_on += [
@@ -1119,6 +1131,9 @@ def test_every_open_store_in_verify_goes_through_the_gate() -> None:
     green through the regression it names. An AST walk, in the pattern
     :func:`test_verify_does_not_import_the_generators` already uses on this package."""
     calls = _open_store_calls_in_verify()
+    # The equality at the end also fails on an empty walk, but only after the absence assertion has
+    # passed on nothing; this floor says it first, where the vacuous-absence lint reads a guard.
+    assert len(calls) >= len(_VERIFY_STORE_OPENERS), "the open_store call walk is blind"
     ungated = sorted({where for where, _, called in calls if "missing_sqlite_store" not in called})
     assert not ungated, (
         f"{ungated} call open_store without missing_sqlite_store first, so verify would create the "
@@ -1150,6 +1165,8 @@ def test_every_open_store_in_verify_is_read_only_but_the_one_exception() -> None
     with ONE exception: ``_WRITABLE_EXCEPTION``, whose value must be the helper's call inline. Any
     other computed value would let a later change pass ``False`` through a variable."""
     calls = _open_store_calls_in_verify()
+    # The same floor as the gate test above, for the same reason.
+    assert len(calls) >= len(_VERIFY_STORE_OPENERS), "the open_store call walk is blind"
     refused = [
         where
         for where, call, _ in calls
