@@ -705,6 +705,10 @@ from typing import Any
 #: would charge twice; a newer one on an older engine would raise AttributeError at sign-in. They
 #: force a bump. Re-derived with ``--write`` on this branch's tree (from abc94c8c0254d1ff).
 #:
+#: BACKLOG #3937 merged with main, after BACKLOG #1563 landed there (digest 5c0af7774d52531e;
+#: this branch at 27c38abe54f0ffde). The value below was re-derived with ``--write`` on the merged
+#: tree, so it covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

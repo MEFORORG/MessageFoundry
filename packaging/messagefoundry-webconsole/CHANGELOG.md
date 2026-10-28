@@ -37,7 +37,6 @@ this line.**
   Needs the engine seam that carries `AuthService.take_passkey_challenge`. With no configured
   public origin the enrol-first notice offers TOTP alone. The console also asks `must_enrol_before_rotating` once per
   request, and the two passkey ceremonies share one serializer in `app.js`. (BACKLOG #3937)
-
 - **The message-export script reports a stopped export as unfinished.** The engine now ends a
   stopped export as a failed transfer. Once a download has started, the `[data-mf-msg-export]`
   script in `static/app.js` now says the export did not finish after N messages, that the engine
