@@ -3331,8 +3331,8 @@ class AuthSettings(_Section):
     lockout_minutes: int = 15
     # ADR 0197 (BACKLOG #1131, ASVS 6.1.1): the CEILING an escalating lock doubles up to. A lock
     # doubles per cycle only where the owner has a way past it (the second-step lock on a local
-    # account, and the sign-in lock on a local account with TOTP enrolled); every other lock keeps
-    # `lockout_minutes`. 1440 (24 hours) is the owner's ruling of 2026-09-27. Must be at least
+    # account, and the sign-in lock on a local account with TOTP enrolled or a discoverable passkey
+    # under the configured relying party, BACKLOG #3937); every other lock keeps `lockout_minutes`. 1440 (24 hours) is the owner's ruling of 2026-09-27. Must be at least
     # `lockout_minutes`.
     lockout_max_minutes: int = 1440
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that

@@ -5130,10 +5130,16 @@ class AuthService:
             # BACKLOG #3422: the sign-in lock keeps its fixed length beside a TOTP the store KNOWS
             # is refused, judged on the locked row's cell; otherwise totp_enabled decides, as before.
             totp_usable=_opened_totp_state,
-            # BACKLOG #3937 item 8: a discoverable passkey the owner may sign in with is a way past
-            # the sign-in lock too, so that lock escalates beside one, as the lock notice names it.
-            # Without the [webauthn] extra no passkey can sign in, so none counts.
-            passkey_escalates=self._way_past_counts() if webauthn.available() else None,
+            # BACKLOG #3937 item 8: a discoverable passkey under the configured relying party is a
+            # way past the sign-in lock too, so that lock escalates beside one. The factor-drop
+            # gates' rule (_gate_counts), not the sign-in's: with no configured rp_id a passkey
+            # pinned to another hostname is no way past, and a longer lock must not rest on a
+            # passkey the owner may not be able to use. Without the [webauthn] extra none counts.
+            passkey_escalates=(
+                self._gate_counts
+                if self.passkeys_count_as_way_past() and webauthn.available()
+                else None
+            ),
             counter=counter,
             threshold=self._policy.lockout_threshold,
             lockout_seconds=self._policy.lockout_minutes * 60,

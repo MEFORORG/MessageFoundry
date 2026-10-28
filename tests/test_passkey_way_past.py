@@ -1237,6 +1237,9 @@ async def test_the_escalation_rule_cannot_be_omitted() -> None:
     try:
         param = inspect.signature(store.increment_login_failure).parameters["totp_usable"]
         assert param.default is inspect.Parameter.empty
+        # BACKLOG #3937 item 8: the passkey rule is required the same way.
+        param = inspect.signature(store.increment_login_failure).parameters["passkey_escalates"]
+        assert param.default is inspect.Parameter.empty
         with pytest.raises(TypeError, match="totp_usable"):
             await store.increment_login_failure(  # type: ignore[call-arg]
                 "nobody",
@@ -1255,6 +1258,7 @@ async def test_the_escalation_rule_cannot_be_omitted() -> None:
                 lockout_seconds=900.0,
                 max_lockout_seconds=86_400.0,
                 totp_usable=none,
+                passkey_escalates=None,
             )
     finally:
         await store.close()
@@ -1766,15 +1770,15 @@ async def _two_sign_in_cycles(service: AuthService, user_id: str) -> float:
 
 
 @pytest.mark.parametrize(
-    ("configured", "escalates"), [(RP, True), (None, True), ("elsewhere.example", False)]
+    ("configured", "escalates"), [(RP, True), (None, False), ("elsewhere.example", False)]
 )
 async def test_the_sign_in_lock_escalates_beside_a_discoverable_passkey(
     configured: str | None, escalates: bool
 ) -> None:
     """A passkey-only account's sign-in lock doubles per cycle as a TOTP account's does, because
-    the combined passkey sign-in passes it. Which passkey counts is the lock notice's rule: under
-    the configured relying party where there is one, any discoverable one where there is none. A
-    passkey under another relying party is no way past, so its lock keeps the fixed length."""
+    the combined passkey sign-in passes it. Only a passkey under the configured relying party
+    counts, the factor-drop gates' rule: one under another relying party, or any passkey where none
+    is configured, may not sign the owner in, so its lock keeps the fixed length."""
     store = await MessageStore.open(":memory:")
     try:
         _, identity, _, _ = await _passkey_owner(store)
@@ -1807,6 +1811,23 @@ async def test_without_the_webauthn_extra_a_passkey_does_not_escalate_the_lock(
     try:
         service, identity, _, _ = await _passkey_owner(store)
         monkeypatch.setattr(wa, "available", lambda: False)
+        assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_row_that_does_not_parse_still_lets_the_lock_arm() -> None:
+    """The escalation reads the passkey set inside the count's own transaction. A row that does not
+    parse must not roll the count back, or the account would never lock: it keeps the fixed length
+    instead, and the lock arms on every cycle."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, _, _ = await _passkey_owner(store)
+        await store._db.execute(
+            "UPDATE webauthn_credentials SET transports='not json' WHERE user_id=?",
+            (identity.user_id,),
+        )
+        await store._db.commit()
         assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
     finally:
         await store.close()

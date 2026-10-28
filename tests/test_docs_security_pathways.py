@@ -2167,8 +2167,8 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
         "account, and the sign-in lock does so on a local account with a TOTP enrolled unless "
         "the engine KNOWS this release refuses that enrolment: a TOTP whose cell does not open, "
         "or whose value will not compute, still escalates. It does so too on a local account "
-        "holding a discoverable passkey under the configured relying party, or any discoverable "
-        "one where none is configured (BACKLOG #3937). Every other lock keeps "
+        "holding a discoverable passkey under the configured relying party (BACKLOG #3937). "
+        "Every other lock keeps "
         "`lockout_minutes`. A local account whose enrolment is known to be refused keeps it for "
         "serial failures only: a race listed under [WebAuthn passkeys]"
     )

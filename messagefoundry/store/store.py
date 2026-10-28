@@ -2887,19 +2887,60 @@ async def escalation_verdict(
     if counter != "sign_in":
         return None
     pre = await get_user(user_id)
-    if (
-        pre is None
-        or pre.auth_provider != "local"
-        or not pre.totp_enabled
-        or pre.password_generated
-        or pre.sign_in_locked(now)
-    ):
-        return None
-    # The count this failure would reach, as next_lockout_state computes it: a lapsed lock restarts it.
-    reaches = (0 if pre.locked_until is not None else pre.failed_attempts) + 1
-    if reaches < threshold or pre.lock_cycles < 1:
+    if pre is None or not pre.totp_enabled or not sets_a_later_sign_in_lock(pre, threshold, now):
         return None
     return await judge_totp(opener, totp_usable, pre)
+
+
+def sets_a_later_sign_in_lock(row: UserRecord | UserRow, threshold: int, now: float) -> bool:
+    """Whether one more SIGN-IN failure on ``row`` sets a lock whose length an escalation can
+    change: a local account whose lock can arm (:func:`lockout_arms`) and is not live, a count that
+    reaches ``threshold`` as :func:`next_lockout_state` computes it (a lapsed lock restarts it), on
+    a later cycle, since a first lock has the base length either way. The gate both halves of the
+    escalation ask before paying for their input: the TOTP judgement (:func:`escalation_verdict`)
+    and the passkey read (:func:`escalation_passkeys`)."""
+    if row.auth_provider != "local" or not lockout_arms(
+        "sign_in", password_generated=row.password_generated
+    ):
+        return False
+    if row.locked_until is not None and now < row.locked_until:
+        return False  # a live lock is never re-escalated (next_lockout_state)
+    reaches = (0 if row.locked_until is not None else row.failed_attempts) + 1
+    return reaches >= threshold and row.lock_cycles >= 1
+
+
+async def escalation_passkeys(
+    counter: LockoutCounter,
+    *,
+    passkey_escalates: PasskeyCounts | None,
+    threshold: int,
+    now: float,
+    read_record: Callable[[], Awaitable[UserAuthzRecord | None]],
+    read_passkeys: Callable[[], Awaitable[list[WebAuthnCredential]]],
+) -> list[WebAuthnCredential] | None:
+    """The passkey set a SIGN-IN failure's escalation reads (BACKLOG #3937 item 8), or ``None``
+    where it cannot matter. Every backend calls it inside the increment's own transaction:
+    ``read_record`` locks the account row there (the writer lock on SQLite, ``FOR UPDATE``,
+    ``UPDLOCK``), and only where :func:`sets_a_later_sign_in_lock` holds on THAT row does
+    ``read_passkeys`` run, so a racing failure cannot make the gate stale, a passkey write waits,
+    and a wrong password below the threshold costs no passkey read.
+
+    A passkey row that does not parse answers ``None``, logged: the lock then keeps the fixed
+    length, and the count still lands. Raising here would roll the count back, and a malformed row
+    would then stop the account ever locking."""
+    if counter != "sign_in" or passkey_escalates is None:
+        return None
+    record = await read_record()
+    if record is None or not sets_a_later_sign_in_lock(record.row, threshold, now):
+        return None
+    try:
+        return await read_passkeys()
+    except (ValueError, TypeError, KeyError) as exc:
+        log.warning(
+            "a passkey row did not parse (%s); this sign-in lock keeps its fixed length",
+            type(exc).__name__,
+        )
+        return None
 
 
 @dataclass(frozen=True)
@@ -3088,7 +3129,7 @@ def lockout_increment(
     It also escalates where ``passkeys``, the account's set read in the same transaction as the
     write, hold one that ``passkey_escalates`` counts (:func:`discoverable_way_past`, trusted only
     where it matches the locked row's digest on a ``sealed`` store; BACKLOG #3937 item 8). The
-    backend reads the set only where :func:`lockout_reads_passkeys` says it can matter, and passes
+    backend reads the set only where :func:`escalation_passkeys` says it can matter, and passes
     ``None`` otherwise; ``None`` for either counts no passkey, the fixed length callers had before."""
     attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
 
@@ -7073,34 +7114,6 @@ def lockout_arms(counter: LockoutCounter, *, password_generated: bool) -> bool:
     Read by every backend inside its atomic increment, from ``password_generated`` on the row it
     locked, so the decision and the count come from one read."""
     return counter != "sign_in" or not password_generated
-
-
-def lockout_reads_passkeys(
-    counter: LockoutCounter,
-    record: UserAuthzRecord | None,
-    *,
-    passkey_escalates: PasskeyCounts | None,
-    threshold: int,
-    now: float,
-) -> bool:
-    """Whether a failure on ``counter`` needs the account's passkey set (BACKLOG #3937 item 8): only
-    where a passkey can change the length of the lock this failure sets. That is a SIGN-IN failure
-    on a local account whose lock can arm and is not already live, that reaches ``threshold``, on a
-    later cycle, since a first lock has the base length either way (the gate
-    :func:`escalation_verdict` applies to the TOTP half). Judged on ``record`` as the write's own
-    transaction locked it, so a racing failure cannot make the answer stale, and a wrong password
-    below the threshold costs no passkey read."""
-    if counter != "sign_in" or passkey_escalates is None or record is None:
-        return False
-    row = record.row
-    if row.auth_provider != "local" or not lockout_arms(
-        counter, password_generated=row.password_generated
-    ):
-        return False
-    if row.locked_until is not None and now < row.locked_until:
-        return False  # a live lock is never re-escalated (next_lockout_state)
-    reaches = (0 if row.locked_until is not None else row.failed_attempts) + 1
-    return reaches >= threshold and row.lock_cycles >= 1
 
 
 @dataclass(frozen=True)
@@ -16335,7 +16348,7 @@ class MessageStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
-        passkey_escalates: PasskeyCounts | None = None,
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -16366,12 +16379,13 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             # The passkey set the escalation reads is read under the same writer lock as the write
             # (BACKLOG #3937 item 8), so a passkey added or removed meanwhile cannot slip between.
-            read_passkeys = lockout_reads_passkeys(
+            passkeys = await escalation_passkeys(
                 counter,
-                await self._read_user_record(user_id) if passkey_escalates is not None else None,
                 passkey_escalates=passkey_escalates,
                 threshold=threshold,
                 now=now,
+                read_record=lambda: self._read_user_record(user_id),
+                read_passkeys=lambda: self._account_passkeys(user_id),
             )
             change = lockout_increment(
                 counter,
@@ -16381,7 +16395,7 @@ class MessageStore:
                 now=now,
                 out=out,
                 totp_counts=totp_counts,
-                passkeys=await self._account_passkeys(user_id) if read_passkeys else None,
+                passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 passkey_escalates=passkey_escalates,
             )

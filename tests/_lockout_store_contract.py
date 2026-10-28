@@ -63,6 +63,8 @@ from messagefoundry.auth.tokens import credential_id_hash
 _PK_RESIDENT = credential_id_hash(b"rot-pk-resident")
 _PK_AGAIN = credential_id_hash(b"rot-pk-again")
 _RF_RESIDENT = credential_id_hash(b"rot-rf-resident")
+_LOCK_PK = credential_id_hash(b"lock-pk-resident")
+_LOCK_PK_AD = credential_id_hash(b"lock-pk-ad-resident")
 
 #: Small so the arithmetic below is readable; the shipped default is 5.
 THRESHOLD = 3
@@ -326,7 +328,7 @@ async def _assert_passkey_escalates_the_sign_in_lock(store: Any) -> None:
         "the sign-in lock escalated beside a passkey that is not discoverable"
     )
     await store.add_webauthn_credential(
-        _cred("lock-pk", "resident", id_hash=_PK_RESIDENT, rp_id="t", discoverable=True)
+        _cred("lock-pk", "resident", id_hash=_LOCK_PK, rp_id="t", discoverable=True)
     )
     assert await lengths_of("lock-pk", passkey_is_way_past, 6) == expected_escalated, (
         "the sign-in lock did not escalate beside a discoverable passkey"
@@ -359,7 +361,7 @@ async def _assert_passkey_escalates_the_sign_in_lock(store: Any) -> None:
     first = await _lock_cycle(
         store, "lock-pk", start=start, counter="sign_in", passkey_escalates=passkey_is_way_past
     )
-    assert await store.delete_webauthn_credential("lock-pk", _PK_RESIDENT)
+    assert await store.delete_webauthn_credential("lock-pk", _LOCK_PK)
     second = await _lock_cycle(
         store,
         "lock-pk",
@@ -382,7 +384,7 @@ async def _assert_passkey_escalates_the_sign_in_lock(store: Any) -> None:
         password_generated=False,
     )
     await store.add_webauthn_credential(
-        _cred("lock-pk-ad", "resident", id_hash=_PK_AGAIN, rp_id="t", discoverable=True)
+        _cred("lock-pk-ad", "resident", id_hash=_LOCK_PK_AD, rp_id="t", discoverable=True)
     )
     assert await lengths_of("lock-pk-ad", passkey_is_way_past, 4) == fixed, (
         "a directory account's sign-in lock escalated beside a passkey"
