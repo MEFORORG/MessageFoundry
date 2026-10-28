@@ -1289,16 +1289,23 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       }
     }
 
-    test(`${r.panel}: discards a message type it does not handle`, () => {
-      const p = r.load();
-      const before = p.snapshot();
-      p.deliver({ [r.key]: "notAType", message: "x", text: "x" });
-      assert.deepStrictEqual(p.errors.map(String), []);
-      assert.strictEqual(p.snapshot(), before);
-      assert.ok(
-        p.warnings.some((w) => w.includes(`MessageFoundry ${r.panel}: discarded a malformed "notAType"`)),
-        `${r.panel}: an unhandled type was not named in the console`,
-      );
-    });
+    // An unhandled discriminant is message text, so the warning says so in a fixed phrase and never
+    // echoes it (BACKLOG #1123). The hostile one would show quoting or markup if it got through.
+    const UNKNOWN_KINDS = ["notAType", `"'><img src=x onerror=1> PID|1||A123`, "hasOwnProperty"];
+    for (const kind of UNKNOWN_KINDS) {
+      test(`${r.panel}: discards a message type it does not handle, without echoing it: ${JSON.stringify(kind)}`, () => {
+        const p = r.load();
+        const before = p.snapshot();
+        p.deliver({ [r.key]: kind, message: "x", text: "x" });
+        assert.deepStrictEqual(p.errors.map(String), []);
+        assert.strictEqual(p.snapshot(), before);
+        assert.deepStrictEqual(
+          p.warnings,
+          [`MessageFoundry ${r.panel}: discarded a malformed message of an unknown kind`],
+          `${r.panel}: an unhandled type was not reported with the fixed phrase`,
+        );
+        assert.ok(!p.warnings.some((w) => w.includes(kind)), `${r.panel}: the unhandled type was echoed`);
+      });
+    }
   }
 });

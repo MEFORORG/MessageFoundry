@@ -139,7 +139,7 @@ function clone(p: Payload): Payload {
  * nothing threw. The no-throw half matters: a renderer that crashed partway would also leave
  * `detail` alone, and would read here as a discard it is not.
  */
-function assertDiscarded(payload: Payload, why: string): void {
+function assertDiscarded(payload: Payload, why: string): Bench {
   const b = bench();
   b.detail.innerHTML = SENTINEL;
   const before = { html: b.detail.innerHTML, d: b.detail.style.display, r: b.results.style.display };
@@ -148,6 +148,7 @@ function assertDiscarded(payload: Payload, why: string): void {
   assert.strictEqual(b.detail.innerHTML, before.html, `${why}: detail was re-rendered`);
   assert.strictEqual(b.detail.style.display, before.d, `${why}: detail visibility changed`);
   assert.strictEqual(b.results.style.display, before.r, `${why}: results visibility changed`);
+  return b;
 }
 
 /** Assert that `payload` RENDERS, and return the bench so the caller can inspect what rendered. */
@@ -516,10 +517,24 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
     ]);
   });
 
-  test("an unknown type is discarded, as it was before the shape check", () => {
-    assertDiscarded({ type: "nothingWeRender", source: "a.hl7" }, "unknown type");
-    assertDiscarded({ type: 7 }, "numeric type");
-    assertDiscarded({ type: "hasOwnProperty" }, "a type naming an Object.prototype member");
+  test("an unknown type is discarded, and its warning carries no text from the message", () => {
+    const cases: [Payload, string][] = [
+      [{ type: "nothingWeRender", source: "a.hl7" }, "unknown type"],
+      [{ type: 7 }, "numeric type"],
+      [{ type: "hasOwnProperty" }, "a type naming an Object.prototype member"],
+      [{ type: `"'><img src=x onerror=1> PID|1||A123`, source: "a.hl7" }, "a type carrying quotes and markup"],
+    ];
+    for (const [payload, why] of cases) {
+      const b = assertDiscarded(payload, why);
+      // The whole warning is fixed text, so nothing the message carried reaches the console
+      // (BACKLOG #1123).
+      assert.deepStrictEqual(
+        b.warnings,
+        ["MessageFoundry Test Bench: discarded a malformed message of an unknown kind"],
+        `${why}: the discard was not reported with the fixed phrase`,
+      );
+      assert.ok(!b.warnings.some((w) => w.includes(String(payload.type))), `${why}: the type was echoed`);
+    }
   });
 });
 

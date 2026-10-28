@@ -271,10 +271,12 @@ export const SHAPE_HELPERS = `
     }
     function mfShapeOk(d, key, shapes, panel) {
       const k = d[key];
-      const check = typeof k === 'string' && Object.prototype.hasOwnProperty.call(shapes, k) ? shapes[k] : null;
-      if (check && check(d) === true) { return true; }
-      // Named in the webview console, so a host and page that drift apart read as a discard.
-      console.warn('MessageFoundry ' + panel + ': discarded a malformed "' + String(k) + '" message');
+      const known = typeof k === 'string' && Object.prototype.hasOwnProperty.call(shapes, k);
+      if (known && shapes[k](d) === true) { return true; }
+      // Named in the webview console, so a host and page that drift apart read as a discard. Only a
+      // kind this page declares is named; any other is message text, and a discard echoes none of it.
+      console.warn('MessageFoundry ' + panel + ': discarded a malformed ' +
+        (known ? '"' + k + '" message' : 'message of an unknown kind'));
       return false;
     }`;
 
