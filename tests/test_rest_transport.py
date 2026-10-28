@@ -371,15 +371,17 @@ def test_rest_credentials_over_cleartext_http_refused(monkeypatch: pytest.Monkey
         )
 
 
-def test_rest_credentials_over_cleartext_http_allowed_when_accepted(
+def test_rest_credentials_over_cleartext_http_refused_when_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # ADR 0153: the blunt MEFOR_ALLOW_INSECURE_TLS escape no longer influences a cleartext-hop
-    # decision (decision 5). The per-connection declaration is what crosses it now — loudly, and
-    # recorded in the audit trail, instead of a process-wide env var nobody sees in review.
+    # Vault BACKLOG #3533 item 4 (owner ruling 2026-10-26): the ADR 0153 declaration still carries
+    # a credential-less body across, but no longer a credential; ADR 0153's dated amendment says why.
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(HopPosture(enforcing=True)):
-        dest = build_destination(
+    with (
+        active_hop_posture(HopPosture(enforcing=True)),
+        pytest.raises(ValueError, match="cleartext credentials: .*with no escape"),
+    ):
+        build_destination(
             Destination(
                 name="OB",
                 type=ConnectorType.REST,
@@ -389,7 +391,6 @@ def test_rest_credentials_over_cleartext_http_allowed_when_accepted(
             ),
             egress=EgressSettings(deny_by_default=False),
         )
-    assert isinstance(dest, RestDestination)  # built (warns + audits), not refused
 
 
 def test_rest_cleartext_http_without_credentials_is_allowed() -> None:
