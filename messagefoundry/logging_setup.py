@@ -40,7 +40,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TextIO
 
 from messagefoundry.config.tls_policy import (
     HopPosture,
@@ -85,7 +85,7 @@ __all__ = [
     "configure_logging",
     "configure_stderr_logging",
     "ensure_logger_sink",
-    "install_startup_stderr_sink",
+    "install_filtered_last_resort",
     "set_runtime_level",
     "current_log_level",
     "LogLevelRefused",
@@ -813,8 +813,8 @@ def _refuse_forward_revocation(forward: SyslogForward, ctx: ssl.SSLContext) -> N
     **Known limit, recorded rather than left for the next reader to find.** The WARN arm on a
     non-enforcing instance logs *after* ``configure_logging`` has set the root level, so it is
     filtered out at ``[logging].level`` above WARNING -- unlike its #200 sibling, which logs before
-    that and survives on ``serve``'s startup stderr sink (:func:`install_startup_stderr_sink`). The
-    REFUSE arm is unaffected (it raises).
+    that and survives on ``serve``'s filtered ``lastResort`` (:func:`install_filtered_last_resort`).
+    The REFUSE arm is unaffected (it raises).
     Measured 2026-09-22 at ``WARNING`` and ``ERROR``.
 
     Called with the FINISHED context, which is the whole point of ``context=``: a
@@ -1897,9 +1897,10 @@ def ensure_logger_sink(logger: logging.Logger) -> None:
     and ``supervise`` did. Since BACKLOG #1441, ``__main__.main`` gives most subcommands a filtered
     stderr root handler before dispatch (``__main__._CONFIGURES_OWN_LOGGING`` names the exceptions
     and how ``serve`` covers its window), so they normally find a handler and do not build one
-    here. Any process that logs without going through ``main()`` still can. This used to say "only two call sites in the
-    package install a root handler", which was an enumeration over a search that could not see a
-    bare ``root.addHandler`` (the tray entrypoint has one). Read the install sites from the tree.
+    here. Any process that logs without going through ``main()`` still can. This used to say "only
+    two call sites in the package install a root handler", which was an enumeration over a search
+    that could not see a bare ``root.addHandler`` (the tray entrypoint has one). Read the install
+    sites from the tree.
 
     **What it does.** Takes our own handler off ``logger``, then asks ``logging.Logger.hasHandlers``
     whether anything else would receive the record. That predicate is not an approximation of the
@@ -1981,32 +1982,50 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     return handler
 
 
-def install_startup_stderr_sink() -> logging.Handler | None:
-    """Give a process that has no root handler yet a filtered **stderr** sink at ``WARNING``, and
-    return it; return None, and install nothing, where the root already has one (BACKLOG #3768).
+class _FilteredLastResort(logging.StreamHandler[TextIO]):
+    """The standard library's ``logging.lastResort`` with the PHI filter chain added.
 
-    For ``serve``, which calls :func:`configure_logging` only after its settings, key and egress
-    gates have run (``__main__._serve``). With no handler anywhere, the standard library sends a
-    ``WARNING`` or above to ``logging.lastResort``, which carries no filter, and under NSSM that
-    stderr is ``service.err.log``. This handler keeps lastResort's stream and its ``WARNING`` level,
-    so the same records reach the same place, and adds the chain :func:`build_stderr_handler`
-    supplies. What changes is that each such record is redacted, scrubbed and carries the text
-    formatter's prefix.
+    Like the stdlib's own: level ``WARNING``, and ``sys.stderr`` looked up at every emit rather
+    than bound when built, so a later swap of ``sys.stderr`` is followed. ``StreamHandler.__init__``
+    is skipped for that reason, as the stdlib's ``_StderrHandler`` skips it, and the setter
+    ignores the assignment ``setStream`` would make."""
 
-    **No removal step.** :func:`configure_logging` takes every root handler off before it installs
-    its own, this one included, so no record is written by both. A start refused before that leaves
-    this handler on the root until the process exits.
+    def __init__(self) -> None:
+        logging.Handler.__init__(self, logging.WARNING)
+        self.setFormatter(_make_formatter("text"))
+        _install_phi_filters(self)
 
-    **Only on an empty root**, as ``run_cli``'s sink: a host that configured logging first, such as
-    an embedding host or pytest's capture, keeps its own handlers, and filtering them is the
-    host's job."""
-    root = logging.getLogger()
-    if root.handlers:
+    @property
+    def stream(self) -> TextIO:
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, value: TextIO) -> None:
+        pass
+
+
+def install_filtered_last_resort() -> logging.Handler | None:
+    """Replace ``logging.lastResort`` with one carrying the PHI filter chain, and return it; return
+    None, and change nothing, where the root logger already has a handler (BACKLOG #3768).
+
+    The standard library hands a record to ``logging.lastResort`` when no handler took it: no
+    handler on the logger or any ancestor it propagates to. That handler prints ``WARNING`` and
+    above to stderr with no filter, and under NSSM that stderr is ``service.err.log``. ``serve``
+    calls this first, because it calls :func:`configure_logging` only after its settings, key and
+    egress gates run (``__main__._serve``), and until then its root has no handler. Records keep
+    the level gate, the stream and the rule for when they arrive; each is now redacted and
+    scrubbed, and carries the text formatter's prefix. A record a handler took never reaches it,
+    so nothing is written twice. Left in place for the life of the process, it also covers a
+    logger that does not propagate after :func:`configure_logging` has run.
+
+    **Only on an empty root**, as ``run_cli``'s sink: ``lastResort`` is process-wide, and a host
+    that configured logging first, such as an embedding host or pytest's capture, owns that
+    choice. Records logged before the call, such as at module import, meet the stdlib's own."""
+    if logging.getLogger().handlers:
         return None
-    handler = build_stderr_handler()
-    handler.setLevel(logging.WARNING)
-    root.addHandler(handler)
-    return handler
+    if not isinstance(logging.lastResort, _FilteredLastResort):
+        logging.lastResort = _FilteredLastResort()
+    return logging.lastResort
 
 
 def level_refused_on_production(level: str, *, production: bool) -> bool:

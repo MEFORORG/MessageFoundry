@@ -120,39 +120,50 @@ def test_unknown_level_raises() -> None:
         configure_logging("LOUD")
 
 
-def test_the_startup_stderr_sink_redacts_and_configure_logging_replaces_it(
-    capsys: pytest.CaptureFixture[str],
+def test_the_filtered_last_resort_redacts_what_no_handler_takes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #3768: ``serve``'s sink for the window before its handlers. It redacts at WARNING on
-    stderr, and once configure_logging runs it is gone, so a record is never written by both."""
+    """BACKLOG #3768: ``serve``'s ``lastResort`` for the window before its handlers. It redacts at
+    WARNING on whatever ``sys.stderr`` is at the emit, from a logger that does not propagate too,
+    and a record a handler takes never reaches it, so nothing is written twice."""
+    monkeypatch.setattr(logging, "lastResort", logging.lastResort)  # process-wide: put it back
     root = logging.getLogger()
     root.handlers.clear()  # a real CLI process's shape; the autouse fixture puts pytest's back
-    sink = logging_setup.install_startup_stderr_sink()
-    assert sink is not None and root.handlers == [sink]
-    assert sink.level == logging.WARNING
-    assert logging_setup.install_startup_stderr_sink() is None  # a second call adds nothing
+    resort = logging_setup.install_filtered_last_resort()
+    assert resort is not None and logging.lastResort is resort
+    assert resort.level == logging.WARNING and root.handlers == []
+    assert logging_setup.install_filtered_last_resort() is resort  # a second call builds nothing
 
-    log = logging.getLogger("messagefoundry.test_startup_sink")
+    log = logging.getLogger("messagefoundry.test_filtered_last_resort")
     log.warning("early %s", SYNTHETIC_PHI)
-    early = capsys.readouterr()
-    assert "early" in early.err and "[redacted]" in early.err, early.err
-    assert "DOE^JANE" not in early.err and early.out == ""
+    log.info("below the level")
+    quiet = logging.getLogger("messagefoundry.test_filtered_last_resort_nonprop")
+    monkeypatch.setattr(quiet, "propagate", False)
+    quiet.warning("quiet %s", SYNTHETIC_PHI)
+    early = capsys.readouterr()  # capsys swapped sys.stderr after the build: it is followed
+    assert early.err.count("early") == 1 and early.err.count("quiet") == 1, early.err
+    assert "[redacted]" in early.err and "DOE^JANE" not in early.err, early.err
+    assert "below the level" not in early.err and early.out == ""
 
     configure_logging("INFO")
-    assert sink not in root.handlers
     log.warning("late %s", SYNTHETIC_PHI)
     late = capsys.readouterr()
-    assert late.err == "", "the startup sink outlived configure_logging and duplicated a record"
+    assert late.err == "", "a record the root handler took also reached lastResort"
     assert late.out.count("late") == 1 and "DOE^JANE" not in late.out, late.out
 
 
-def test_the_startup_stderr_sink_leaves_a_configured_root_alone() -> None:
-    """A host that configured logging first keeps its handlers, as with ``run_cli``'s sink."""
+def test_the_filtered_last_resort_leaves_a_configured_root_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that configured logging first keeps the stdlib's ``lastResort``, as it keeps its
+    handlers under ``run_cli``'s sink: the choice is process-wide, so it is the host's."""
+    monkeypatch.setattr(logging, "lastResort", logging.lastResort)
+    before = logging.lastResort
     root = logging.getLogger()
     hosts = logging.NullHandler()
     root.handlers[:] = [hosts]
-    assert logging_setup.install_startup_stderr_sink() is None
-    assert root.handlers == [hosts]
+    assert logging_setup.install_filtered_last_resort() is None
+    assert logging.lastResort is before and root.handlers == [hosts]
 
 
 def test_routes_uvicorn_loggers_to_root() -> None:

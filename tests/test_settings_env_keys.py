@@ -297,7 +297,7 @@ def test_a_union_with_a_string_shaped_branch_can_hold_one_string() -> None:
 
 def test_serve_logs_the_warnings_again_after_configure_logging() -> None:
     """``serve`` loads its settings before ``configure_logging``, so the warnings that load logged
-    reached bare stderr only. It logs them again once logging is configured. Read from the source,
+    reached stderr only. It logs them again once logging is configured. Read from the source,
     because running ``serve`` far enough to reach that point starts an engine."""
     import inspect
 
