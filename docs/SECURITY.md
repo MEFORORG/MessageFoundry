@@ -4650,13 +4650,20 @@ on that session, for example) ends it as a revocation would.
   server log carries a WARNING with the counts beside that audit row, not an error with a
   traceback.
 
-  **The stop does not reach the client as a failed download, in the shipped code.** The export
-  raises to abort the transfer, but the engine's `@app.middleware("http")` layers end the
-  response cleanly before that raise leaves them. So a client receives a 200 that ends normally
-  and holds only the rows streamed before the stop, and it cannot tell that file from a complete
-  export. The `messages_export.stopped` row and the server's WARNING record that it is short;
-  the file itself does not. This was
-  found under BACKLOG #3381 and is not fixed there. The same holds for the audit export below.
+  **A stop reaches an HTTP/1.1 client as a failed download.** The 200 has already started, so the
+  export cannot change its status. It raises instead, and the server drops the connection with the
+  chunked body unfinished, so the client sees a transfer that failed rather than a short file that
+  ends normally. `tests/test_export_stop_wire.py` measures both exports that way over cleartext
+  loopback, with uvicorn's stock h11 and httptools protocols. At least these are not measured:
+  the engine's TLS hop, the floored protocol class `serve` runs, a proxy in front, the console's
+  `/ui/audit/export`, and an HTTP/1.0 client. Under h11 an HTTP/1.0 body is framed by the
+  connection close, so a dropped connection can read as a normal end there. The file itself
+  carries no end marker, so a client that writes rows as they arrive (`curl -o`, for one) keeps
+  every row it received and must check that the transfer succeeded. The
+  `messages_export.stopped` row and the server's WARNING record how many rows the engine handed to
+  the server before the stop, which is not proof the client received them. This holds only while
+  every middleware in the engine's response path is pure ASGI; see `ExportStopped`. The same
+  holds for the audit export below.
 
   While rows flow, the export moves the session's idle clock at most every quarter of the idle
   window. So a long download does not end its own session. One stall can, though. If the client
@@ -4670,8 +4677,8 @@ on that session, for example) ends it as a revocation would.
   identity the export started with. A caller that may now read fewer rows, as after losing
   `users:manage`, would still receive the lock rows. So that stops it too, with the reason
   `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
-  the reason, then raises to abort the transfer, which reaches the client as a cleanly ended short
-  file, as the bulk export bullet above says. The idle clock moves as the bulk export's does, at most
+  the reason, then raises to abort the transfer, which reaches the client as a failed download,
+  as the bulk export bullet above says. The idle clock moves as the bulk export's does, at most
   every quarter of the window.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
