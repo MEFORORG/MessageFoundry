@@ -10845,6 +10845,8 @@ def _source_config(
     apply_hop_attestation(
         settings, f"inbound connection {ic.name!r}", ic.tls_hop_attested, ic.tls_hop_attested_reason
     )
+    # Vault BACKLOG #3234: an Ftp poller's env() tls can resolve to plain ftp beside a CA.
+    refuse_resolved_verify_off(ic.spec.type, settings, f"inbound connection {ic.name!r}")
     # Inbound MLLP/TCP/X12 listeners never carry an author-supplied host (wiring rejects one) — they
     # bind to the per-connection bind_address if set, else the service-level [inbound].bind_host. File
     # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's

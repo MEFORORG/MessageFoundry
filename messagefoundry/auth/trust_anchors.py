@@ -214,7 +214,7 @@ from messagefoundry.auth.anchor_path import (
     anchor_path_verdict,
 )
 from messagefoundry.childenv import system_tool_environment
-from messagefoundry.config.models import bool_setting
+from messagefoundry.config.models import bool_setting, remote_file_protocol
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.redaction import codec_safe_str, safe_exc
@@ -1473,9 +1473,9 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     """Why a dialling connection would never read its ``tls_ca_file``, or ``None`` when it reads
     it or the settings cannot tell yet (vault BACKLOG #2371).
 
-    The switches that build no verifying context: ``tls`` or ``use_tls`` off, ``tls_verify`` off,
-    ``ech_egress`` through an ``http://`` sidecar, and on the HTTP family ``verify_tls`` off or an
-    ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes both hops over cleartext
+    The switches that build no verifying context: ``tls`` or ``use_tls`` off, a remote-file
+    ``protocol`` of plain ``ftp``, ``tls_verify`` off, ``ech_egress`` through an ``http://``
+    sidecar, and on the HTTP family ``verify_tls`` off or an ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes both hops over cleartext
     loopback and verifies the server itself (ADR 0139). An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
     check after resolution decides. Each caller refuses a pin beside an unread CA and checks no
     file there: a pin nothing checks reads as pinned while nothing is."""
@@ -1484,6 +1484,11 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     for key, default in (("tls", False), ("use_tls", True)):
         if key in settings and not bool_setting(settings, key, default=default):
             return f"{key} is off, so the hop builds no TLS context"
+    # Ftp() refuses a CA beside a literal tls=False itself. An env() tls resolves only later, into
+    # this protocol (vault BACKLOG #3234), so the resolved check is where that case is caught.
+    protocol = settings.get("protocol")
+    if isinstance(protocol, str) and remote_file_protocol(settings) == "ftp":
+        return "plain FTP (tls=False) builds no TLS context"
     if not bool_setting(settings, "tls_verify", default=True):
         return "tls_verify=False verifies no server certificate"
     if settings.get("ech_egress") and _is_http_url(settings.get("ech_sidecar")):
@@ -1622,6 +1627,7 @@ _CONNECTION_ANCHOR_KEYS = (
     "tls_verify",
     "verify_tls",
     "url",
+    "protocol",
     "ech_egress",
     "ech_sidecar",
     "smart_enabled",

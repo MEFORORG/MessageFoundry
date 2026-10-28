@@ -86,6 +86,7 @@ from messagefoundry.config.models import (
     bool_setting,
     check_db_connect_timeout,
     flag_from_settings,
+    remote_file_protocol,
     require_hop_reason,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
@@ -258,13 +259,11 @@ class EnvRef:
         # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
         # the reason ``_cast_bool`` gives.
         if self.cast is _cast_bool and self.default is not _UNSET and self.default is not None:
-            try:
-                object.__setattr__(self, "default", _cast_bool(self.default))
-            except ValueError:
-                raise WiringError(
-                    f"env reference {self.key!r} with a bool cast: default= is not a boolean "
-                    f"({', '.join(sorted(_BOOL_SPELLINGS))}, or True/False; value withheld)"
-                ) from None
+            object.__setattr__(
+                self,
+                "default",
+                _strict_bool_default(self.default, f"env reference {self.key!r} with a bool cast"),
+            )
 
     def __repr__(self) -> str:
         # The generated repr printed the ``_UNSET`` sentinel and a function cast by address, which
@@ -272,6 +271,20 @@ class EnvRef:
         default = "<unset>" if self.default is _UNSET else repr(self.default)
         cast = None if self.cast is None else _cast_name(self.cast)
         return f"EnvRef(key={self.key!r}, default={default}, cast={cast})"
+
+
+def _strict_bool_default(default: Any, subject: str) -> bool:
+    """An ``env()`` ``default=`` read with the strict spelling cast, or a :class:`WiringError` naming
+    ``subject`` with the value withheld, for the reason ``_cast_bool`` gives. A default is never cast
+    at resolve time, so each place that needs one read strictly reads it here, once, when the
+    reference is made."""
+    try:
+        return _cast_bool(default)
+    except ValueError:
+        raise WiringError(
+            f"{subject}: default= is not a boolean "
+            f"({', '.join(sorted(_BOOL_SPELLINGS))}, or True/False; value withheld)"
+        ) from None
 
 
 def _cast_name(cast: Callable[[Any], Any]) -> str:
@@ -300,10 +313,10 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     resolve time naming the setting and the key. A TOML ``true``/``false`` (or ``1``/``0``) from
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
-    made, and an unreadable one is refused then. Any other callable runs as given. On a setting whose
-    factory parameter is annotated ``bool``, :func:`resolve_env_settings` then reads the result the
-    same strict way, so an uncast or ``str``-cast ``env()`` there cannot hand the connector the text
-    ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
+    made, and an unreadable one is refused then. Any other callable runs as given. On a boolean
+    setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
+    the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
+    hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
     ``cast=lambda s: bool(s)`` still keeps the builtin's trap."""
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
@@ -773,7 +786,18 @@ def refuse_resolved_verify_off(
     read the CA. An ``env()`` reference is truthy there, so it passes. Once it resolves, it can be
     falsy, and more often since vault BACKLOG #3138 made ``cast=bool`` read ``false`` as False. So
     the same test runs here, on the value the connector will read. SOAP needs no copy: its
-    connector refuses a client cert with verification off when it is built."""
+    connector refuses a client cert with verification off when it is built.
+
+    ``Ftp()`` is the other factory with such a refusal: a CA beside a literal ``tls=False``. An
+    ``env()`` ``tls`` resolves into ``protocol`` (vault BACKLOG #3234), so a resolved plain ``ftp``
+    with a CA is refused here, in either direction, with or without a pin."""
+    if type_ is ConnectorType.REMOTEFILE:
+        if remote_file_protocol(settings) == "ftp" and settings.get("tls_ca_file"):
+            raise WiringError(
+                f"{where}: Ftp tls_ca_file would never be read: the protocol resolved to plain "
+                "ftp (tls off), which builds no TLS context."
+            )
+        return
     if type_ is not ConnectorType.DICOMWEB or "verify_tls" not in settings:
         return
     # Read as the connector reads it: an explicit None is the default, on (vault BACKLOG #3230).
@@ -1263,6 +1287,19 @@ _SETTINGS_FACTORY_RETURNS: Final = frozenset(
 )
 _SETTINGS_FACTORY_NAMES: Final = frozenset({"DatabaseLookup"})
 
+#: The boolean settings a ``with_*`` composer in another module writes under a key that is not its
+#: parameter's name (``with_smart_backend(enabled=)`` stores ``smart_enabled``), so the annotation
+#: scan cannot find them (vault BACKLOG #3234), each with what a resolved ``None`` reads as. SMART
+#: and OAuth2 read it as off, not the composer's default of on: their readers' documented rule is
+#: that a falsy flag is off (``smart_auth_configured``, ``oauth2_auth_configured``), and reading a
+#: ``None`` as on would start a token hop the author did not ask for. ``sign_enabled`` keeps
+#: ``None``: its reader, ``OutboundSigning``, refuses it, and off would silently stop signing.
+#: Listed rather than imported, so the first resolve does not load the composers' modules and
+#: ``cryptography``. ``tests/test_env_uncast_bool_setting.py`` pins the key set against the source.
+_COMPOSER_BOOL_SETTINGS: Final[Mapping[str, bool | None]] = MappingProxyType(
+    {"smart_enabled": False, "oauth2_enabled": False, "sign_enabled": None}
+)
+
 
 class _BoolSettings(NamedTuple):
     """What :func:`_bool_settings` found. ``defaults`` maps each strict setting to the default its
@@ -1277,7 +1314,8 @@ class _BoolSettings(NamedTuple):
 
 @cache
 def _bool_settings() -> _BoolSettings:
-    """Every setting name a factory in this module annotates ``bool`` (vault BACKLOG #3234).
+    """Every setting name a factory in this module annotates ``bool``, and every composer flag
+    :data:`_COMPOSER_BOOL_SETTINGS` lists (vault BACKLOG #3234).
 
     :func:`resolve_env_settings` reads these strictly. It sees a settings mapping and not the factory
     that built it, and its callers include lookups, reference sources and trust anchors as well as
@@ -1288,8 +1326,9 @@ def _bool_settings() -> _BoolSettings:
     the connection factories ``connections.toml`` offers, and this needs the lookup and reference
     factories too. The annotation is read the way the ``connections.toml`` type check reads it, through
     the same resolver and classifier, so the two cannot disagree on which settings are boolean.
-    Composers in other modules (``with_smart_backend``'s ``enabled``, stored as ``smart_enabled``)
-    are NOT covered: their parameter names are not their settings keys.
+    A composer in another module writes its flag under a key that is not its parameter's name
+    (``with_smart_backend(enabled=)`` stores ``smart_enabled``), so those are listed in
+    :data:`_COMPOSER_BOOL_SETTINGS`, with what a ``None`` reads as.
     Cached: the key set is closed, and the annotations are fixed once the module is imported."""
     from messagefoundry.config.connections_file import _classify, _factory_signature
 
@@ -1321,6 +1360,8 @@ def _bool_settings() -> _BoolSettings:
                 defaults.setdefault(param.name, set()).add(param.default)
             else:
                 other_names.add(param.name)
+    for key, default in _COMPOSER_BOOL_SETTINGS.items():
+        defaults.setdefault(key, set()).add(default)
     strict: dict[str, bool | None] = {}
     for name, seen in defaults.items():
         if name in other_names:
@@ -1351,7 +1392,7 @@ def resolve_env_settings(
     refused in the same error, naming the setting, the key and ``connection`` when given.
 
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
-    ``default``, else it's *missing*. A setting a factory annotates ``bool`` is then read with the
+    ``default``, else it's *missing*. A setting :func:`_bool_settings` names is then read with the
     strict spelling cast, from either source (vault BACKLOG #3234). Raises a single
     :class:`WiringError` listing **all** problems
     at once — both missing keys and values that fail their ``cast`` (naming the setting and the key,
@@ -4377,11 +4418,63 @@ def Sftp(
     )
 
 
+def _protocol_for_tls(flag: Any) -> str:
+    """``"ftps"`` or ``"ftp"`` for an ``Ftp`` ``env()`` ``tls`` value read strictly. A ``None`` is
+    FTPS, not the literal's default of off: before vault BACKLOG #3234 every ``env()`` ``tls`` meant
+    FTPS, and a ref that resolves to ``None`` must not turn TLS off. Only a false spelling does."""
+    return "ftps" if _read_bool_setting(flag, True) else "ftp"
+
+
+@dataclass(frozen=True)
+class _FtpTlsProtocol:
+    """The cast of the derived ``protocol`` reference :func:`_ftp_protocol` builds: the author's own
+    cast, then the strict boolean read, then the protocol.
+
+    A frozen dataclass rather than a closure, so two loads of one config build EQUAL specs. The
+    reload compares the prior spec with the new one to decide whether a connection changed, and a
+    fresh closure per load would read every ``Ftp(tls=env(...))`` as changed on every reload."""
+
+    inner: Callable[[Any], Any] | None
+
+    #: What a refusal and EnvRef's repr print: "value is not a valid bool for tls".
+    __name__ = "bool for tls"
+
+    def __call__(self, raw: Any) -> str:
+        return _protocol_for_tls(raw if self.inner is None else self.inner(raw))
+
+
+def _ftp_protocol(tls: bool | EnvRef) -> str | EnvRef:
+    """The ``protocol`` setting ``Ftp(tls=...)`` stores: ``"ftps"`` or ``"ftp"``, or for an
+    ``env()`` reference a derived reference that resolves to one of them (vault BACKLOG #3234).
+
+    The factory turns ``tls`` into ``protocol``, so no ``tls`` key ever reaches
+    :func:`resolve_env_settings` and its strict boolean read. A reference passed through as it was
+    is truthy, so ``"ftps" if tls`` chose FTPS whatever the environment said, and a value of
+    ``false`` could not turn TLS off. The derived reference reads the value with the reference's own
+    cast and then strictly, as a ``bool`` setting is read, so ``false`` reads as plain FTP and an
+    unknown spelling is refused with the value withheld. A ``None``, from ``default=None`` or from
+    the author's cast, reads as FTPS (:func:`_protocol_for_tls` says why). A ``default=`` is read
+    here, because :func:`resolve_env_settings` never casts a default.
+
+    A literal is mapped as it always was, with ``bool()``: a code-first literal is outside this
+    item's scope, for the reason the literal arm of :func:`resolve_env_settings` gives."""
+    if not isinstance(tls, EnvRef):
+        return "ftps" if tls else "ftp"
+    default = tls.default
+    if default is not _UNSET:
+        # Not through the ref's own cast: that never touches a default.
+        flag = (
+            None if default is None else _strict_bool_default(default, f"Ftp tls env {tls.key!r}")
+        )
+        default = _protocol_for_tls(flag)
+    return EnvRef(key=tls.key, default=default, cast=_FtpTlsProtocol(tls.cast))
+
+
 def Ftp(
     *,
     host: str | EnvRef,  # the FTP server (may be env())
     port: int | EnvRef = 21,
-    tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
+    tls: bool | EnvRef = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
     # unless a hand-built spec sets tls_check_hostname=False, which a credentialed hop may not.
     tls_allow_expired: bool = False,
@@ -4417,6 +4510,8 @@ def Ftp(
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
+    # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
+    # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
     _check_tls_ca_file(
         "Ftp", tls_ca_file, unread=None if tls else "plain FTP (tls=False) builds no TLS context"
     )
@@ -4424,7 +4519,7 @@ def Ftp(
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
-            "protocol": "ftps" if tls else "ftp",
+            "protocol": _ftp_protocol(tls),
             "host": host,
             "port": port,
             "tls_allow_expired": tls_allow_expired,

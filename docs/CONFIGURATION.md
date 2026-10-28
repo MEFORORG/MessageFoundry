@@ -493,14 +493,19 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   bool cast is read the same way, on both routes. Before vault BACKLOG #3138, a code-first `cast=bool` used
   Python's own `bool`, which reads any non-empty text as true. A `MEFOR_VALUE_*` of `false` would
   then have turned on a loosening such as `tls_allow_expired` or `trust_server_certificate`.
-  Since vault BACKLOG #3234, an `env()` reference on a boolean setting the factory stores under its
-  own name, such as `verify_tls` or `tls_allow_expired`, is read this strict way whatever its cast,
-  and so is its `default=`. An empty value is refused, not read as false, and a `None` default takes
-  the setting's own default (on, for a check such as `verify_tls`). Not every boolean is covered:
-  at least `Ftp(tls=...)`, which the factory turns into a protocol, and the `enabled` flags of the
-  `with_*` composers are not, and a code-first literal is passed as written. A cast you write
-  yourself that returns a boolean is trusted as it is, so `cast=lambda s: bool(s)` still keeps the
-  builtin's trap. Give a boolean `cast=bool`, or a real `True`/`False` literal.
+  Since vault BACKLOG #3234, an `env()` reference on a boolean setting is read this strict way
+  once it resolves, whatever its cast, and so is its `default=`. That covers at least a setting
+  the factory stores under its own name, such as `verify_tls` or `tls_allow_expired`. It covers
+  the `enabled` flag of `with_smart_backend`, `with_oauth2_client_credentials` and `with_signing`.
+  It covers `Ftp(tls=...)` too, which the factory turns into the protocol, so `false` means plain
+  FTP there. An empty value is refused, not read as false. A `None` default takes the setting's
+  own default, such as on for `verify_tls`. On the SMART and OAuth2 composers' `enabled` flag it
+  reads as off, and signing refuses it. On `Ftp(tls=...)` a `None`, from the default or from your
+  own cast, reads as FTPS, as every `env()` there did before: only a false spelling turns TLS off.
+  Not every reading is covered. A code-first literal is passed as written. At least some checks read
+  a setting before `env()` resolves, so they see the reference and not its value. A cast you write
+  yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a boolean
+  `cast=bool`, or a real `True`/`False` literal.
 - **Per-face logic inside a transform:** `env()` is a *deferred reference* resolved only when a
   **connection** spec is built — using it in a handler is an always-truthy object (a bug). To branch a
   Router/Handler on the deployment, read the active environment **name** with
