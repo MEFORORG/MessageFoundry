@@ -628,20 +628,24 @@ _CODED_ELEMENT_TEXT_COMPONENTS = (2, 5, 9)
 _COMPARATOR = r"(?:<=|>=|<>|[<>=])"
 #: An HL7 NM: an optional sign, digits, and at most one decimal point.
 _NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
-#: An HL7 TM, ``HH[MM[SS[.S[S[S[S]]]]]][+/-ZZZZ]``, with every group in range. The ranges matter: an
-#: eight-digit date is not a time of day, and it does not fit.
+#: An HL7 TM, ``HH[MM[SS[.S[S[S[S]]]]]]``, with every group in range. The ranges matter: an
+#: eight-digit date is not a time of day, and it does not fit. A time with an offset is not kept,
+#: as the ``DATE`` and ``DOB`` kinds never keep one (vault BACKLOG #2767): an offset can name a
+#: small region, and a date written ``YYYY-MMDD`` or a phone number written ``NNNNNN-NNNN`` reads as
+#: a time and an offset.
 _TIME_OF_DAY = r"""
     (?:[01][0-9]|2[0-3])                    # hour
     (?:[0-5][0-9]                           # minute
       (?:[0-5][0-9]                         # second
         (?:\.[0-9]{1,4})?                   # fraction, only after the seconds
       )?)?
-    (?:[+-](?:(?:0[0-9]|1[0-3])[0-5][0-9]|1400))?  # offset, no wider than 1400 either way
 """
 #: Every character the three grammars are written in. No numeric value is kept when one of them is
 #: the component, repetition or subcomponent separator: under a repetition separator of ``-``,
 #: ``000-12-3456`` splits into three valid numbers. The field separator is not read.
 _NUMERIC_GRAMMAR_CHARS = frozenset("0123456789+-.:/<>=")
+
+
 #: What each COMPONENT of a preserved numeric value must match, by position. A value with more
 #: components than its type has is refused. ``NM`` takes a leading comparator because ``<5`` under
 #: ``NM`` is a common sender habit and carries no identifier. ``SN`` is comparator, number,
@@ -712,8 +716,9 @@ def preserve_obx5_value(value_type: str | None, value: str | None, seps: Seps) -
     """True if an OBX-5 carrying ``value`` under declared type ``value_type`` may be left INTACT.
 
     The fail-closed half of the OBX-5 free-text rule, shared byte-for-byte by the engine and tee
-    adapters (ADR 0030 §1 parity) so the two can never disagree about a value type. Two gates, and
-    anything that clears neither is redacted:
+    adapters (ADR 0030 §1 parity) so the two can never disagree about a value type. A message whose
+    component, repetition or subcomponent separator is whitespace keeps nothing here. Past that, two
+    gates, and anything that clears neither is redacted:
 
     * the declared type must be on the preserve allowlist above — an absent, empty or unknown OBX-2
       falls straight through to ``False``; and
@@ -730,6 +735,12 @@ def preserve_obx5_value(value_type: str | None, value: str | None, seps: Seps) -
     """
     declared = (value_type or "").strip().upper()
     text = value or ""
+    # A space is how words and digit groups are written apart. Under a whitespace component,
+    # repetition or subcomponent separator, ``000 12 3456`` splits into three valid numbers and a
+    # sentence into bare tokens, so no numeric or coded value is kept. A date type never reaches
+    # this function. The field separator is not read.
+    if any(mark.isspace() for mark in (seps.component, seps.repetition, seps.subcomponent)):
+        return False
     if (grammar := _NUMERIC_OBX_GRAMMAR.get(declared)) is not None:
         return _fits_numeric_grammar(grammar, text, seps)
     if declared in _CODED_OBX_TYPES:
