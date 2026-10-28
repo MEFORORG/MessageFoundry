@@ -201,7 +201,9 @@ async def test_a_stopped_hook_leaves_no_process_behind(tmp_path: Path) -> None:
     hook's tree is known to be running. RED on the code before #2622, which only awaited the
     shell: both markers appeared after the cancel. The ``started`` file is the control: without
     it, a hook that never ran would also leave no marker."""
-    task = asyncio.ensure_future(dr_module._run_command(_tree_hook(tmp_path, 2.0)))
+    task = asyncio.ensure_future(
+        dr_module._run_command(_tree_hook(tmp_path, 2.0), pass_environment=())
+    )
     try:
         await _await_file(tmp_path / "started", within=30.0)
     finally:
@@ -220,7 +222,7 @@ async def test_a_stopped_release_hook_is_left_to_finish(tmp_path: Path) -> None:
     appear. This is also the positive control for the test above: the same hook, not killed,
     does leave survivors."""
     task = asyncio.ensure_future(
-        dr_module._run_command(_tree_hook(tmp_path, 1.0), stop_kills=False)
+        dr_module._run_command(_tree_hook(tmp_path, 1.0), stop_kills=False, pass_environment=())
     )
     try:
         await _await_file(tmp_path / "started", within=30.0)

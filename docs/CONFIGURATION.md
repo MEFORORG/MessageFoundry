@@ -139,6 +139,9 @@ channel config) with one section per group, plus **environment-variable override
 CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 ```
 
+A secret-class setting can also come from a file in a secrets directory, which then wins over its
+environment variable: see [The secrets directory](#the-secrets-directory-mefor_secrets_directory).
+
 - File location: `./messagefoundry.toml` by default, or `--service-config <path>`. **Under the
   Windows service, `serve` and `supervise` refuse to start without an absolute `--service-config`**,
   so the service never reads a settings file from its working directory. A relative one under
@@ -493,14 +496,19 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   bool cast is read the same way, on both routes. Before vault BACKLOG #3138, a code-first `cast=bool` used
   Python's own `bool`, which reads any non-empty text as true. A `MEFOR_VALUE_*` of `false` would
   then have turned on a loosening such as `tls_allow_expired` or `trust_server_certificate`.
-  Since vault BACKLOG #3234, an `env()` reference on a boolean setting the factory stores under its
-  own name, such as `verify_tls` or `tls_allow_expired`, is read this strict way whatever its cast,
-  and so is its `default=`. An empty value is refused, not read as false, and a `None` default takes
-  the setting's own default (on, for a check such as `verify_tls`). Not every boolean is covered:
-  at least `Ftp(tls=...)`, which the factory turns into a protocol, and the `enabled` flags of the
-  `with_*` composers are not, and a code-first literal is passed as written. A cast you write
-  yourself that returns a boolean is trusted as it is, so `cast=lambda s: bool(s)` still keeps the
-  builtin's trap. Give a boolean `cast=bool`, or a real `True`/`False` literal.
+  Since vault BACKLOG #3234, an `env()` reference on a boolean setting is read this strict way
+  once it resolves, whatever its cast, and so is its `default=`. That covers at least a setting
+  the factory stores under its own name, such as `verify_tls` or `tls_allow_expired`. It covers
+  the `enabled` flag of `with_smart_backend`, `with_oauth2_client_credentials` and `with_signing`.
+  It covers `Ftp(tls=...)` too, which the factory turns into the protocol, so `false` means plain
+  FTP there. An empty value is refused, not read as false. A `None` default takes the setting's
+  own default, such as on for `verify_tls`. On the SMART and OAuth2 composers' `enabled` flag it
+  reads as off, and signing refuses it. On `Ftp(tls=...)` a `None`, from the default or from your
+  own cast, reads as FTPS, as every `env()` there did before: only a false spelling turns TLS off.
+  Not every reading is covered. A code-first literal is passed as written. At least some checks read
+  a setting before `env()` resolves, so they see the reference and not its value. A cast you write
+  yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a boolean
+  `cast=bool`, or a real `True`/`False` literal.
 - **Per-face logic inside a transform:** `env()` is a *deferred reference* resolved only when a
   **connection** spec is built — using it in a handler is an always-truthy object (a bug). To branch a
   Router/Handler on the deployment, read the active environment **name** with
@@ -718,7 +726,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `session_idle_timeout_minutes` | | | **→ moved to `[security].sign_out_after_idle_minutes`** (ADR 0118) — set it there; no longer accepted in `[auth]`. |
 | `session_absolute_hours` | | | **→ moved to `[security].max_session_hours`** (ADR 0118) — set it there; no longer accepted in `[auth]`. |
 | `max_sessions_per_user` | int | 5 | cap concurrent sessions per user (ASVS 7.1.2; `0` = unlimited); a login beyond the cap revokes the user's oldest live session; only live sessions count, and the same login revokes the user's sessions already past the idle or absolute limit. Sign-ins that still owe a second factor are counted apart: see the *Concurrent session count* row in `docs/SECURITY.md` |
-| `step_up_max_age_seconds` | int | 300 | **step-up re-verification window** (ASVS 7.5.3): a highly sensitive operation requires the session to have re-verified its credential — at login or via `POST /me/reauth` — within this many seconds. A code accepted at `POST /auth/mfa-verify` (or the console's `POST /ui/mfa`) opens the window too, except on a session the OIDC sign-in minted, whose window opens only at the IdP (BACKLOG #2142). A **local** login that owes no second factor usually counts as the first verification (the sudo-timestamp model). The exception is a sign-in from an address the account's known-address record has not seen in the last 90 days, by an account with a baseline. An account has a baseline once it has finished a sign-in, or once its record holds a row of any age. That session is born with no window, which is the first-seen address challenge (BACKLOG #288). A sign-in that stopped at its factor adds nothing to the record; the *First-seen sign-in address* rows of Table A in [SECURITY.md](SECURITY.md) list the events that do, and a step-up or an enrolment writes only in some cases. A step-up from that address passes the challenge; signing in again does not. The check fails open, and the window opens, when the sign-in carries no client address or the account's known-address record cannot be read. A sign-in that proves the password and a TOTP code in one request counts from any address (ADR 0197). A directory login (Windows SSO by either route, or OIDC) does not: it is born with no window, so its first sensitive action asks for a step-up, or for its second factor where it owes one (BACKLOG #1144). An OIDC session that proves its factor still owes the IdP step-up |
+| `step_up_max_age_seconds` | int | 300 | **step-up re-verification window** (ASVS 7.5.3): a highly sensitive operation requires the session to have re-verified its credential — at login or via `POST /me/reauth` — within this many seconds. A code accepted at `POST /auth/mfa-verify` (or the console's `POST /ui/mfa`) opens the window too, except on a session the OIDC sign-in minted, whose window opens only at the IdP (BACKLOG #2142). A **local** login that owes no second factor usually counts as the first verification (the sudo-timestamp model). The exception is a sign-in from an address the account's known-address record has not seen in the last 90 days, by an account with a baseline. An account has a baseline once it has finished a sign-in, or once its record holds a row of any age. That session is born with no window, which is the first-seen address challenge (BACKLOG #288). A sign-in that stopped at its factor adds nothing to the record; the *First-seen sign-in address* rows of Table A in [SECURITY.md](SECURITY.md) list the events that do, and a step-up or an enrolment writes only in some cases. A step-up from that address passes the challenge; signing in again does not. The check fails open, and the window opens, when the sign-in carries no client address or the account's known-address record cannot be read. A combined sign-in (the password and, in the same request, a TOTP code on an account with TOTP enrolled or a passkey assertion as [SECURITY.md](SECURITY.md#webauthn-passkeys-wp-14b-adr-0068) describes, ADR 0197 Amendment A) counts from any address (ADR 0197). A directory login (Windows SSO by either route, or OIDC) does not: it is born with no window, so its first sensitive action asks for a step-up, or for its second factor where it owes one (BACKLOG #1144). An OIDC session that proves its factor still owes the IdP step-up |
 | `require_action_step_up` | bool | `true` | **action-bound step-up** ([ADR 0077](adr/0077-action-bound-step-up.md); ASVS 7.5.1/8.2.4). On by default: a fixed set of routes, four JSON routes and their console twins only under the condition below, requires a fresh proof **bound to that specific action** (`POST /me/reauth` with a matching `purpose`, single-use) instead of riding the session-wide `step_up_max_age_seconds` window. On the JSON API the set is `POST /me/mfa/enroll`, `POST /me/mfa/confirm`, `DELETE /me/mfa`, `DELETE /me/sessions` and `DELETE /me/sessions/{session_id}`, plus the administrator's `PATCH /users/{user_id}`, `POST /users/{user_id}/reset-password`, `POST /users/{user_id}/reset-mfa`, `PUT /users/{user_id}/federated-identity` and `DELETE /users/{user_id}/federated-identity`. Four group-wide saves join the set conditionally (vault BACKLOG #3401): `PUT /ad-group-map`, `PUT /ad-group-scope-map`, `PUT /roles/custom/{role_id}` and `DELETE /roles/custom/{role_id}` take a proof bound to `save_ends_own_sessions` **only when the save would end the caller's own sessions**, as a map save would for a caller whose account is a directory account, or a role save for a caller who holds that role. Any other save of those four keeps the session-window step-up. Since vault BACKLOG #2625 the set also holds the injection and bulk-export routes: `POST /messages/{message_id}/resend`, `POST /messages/{message_id}/edit-resend`, `POST /uploads/{file_id}/resend`, `GET` and `POST /messages/export`, `POST /connections/{name}/purge` and `POST /config/reload`. The console binds the same actions, and passkey enroll and delete too. It closes the most-exploitable default: a session hijacked inside the 300 s login-seeded window could otherwise bind an attacker's authenticator, deliver a fabricated message to a partner, or export bodies in bulk, with no fresh proof. It changes **only** that set; every other step-up route, the rest of the admin surface and replay among them, keeps the session-window step-up. So `false` takes the bound proof off message injection, bulk export, purge and config reload as well as off the factor and admin routes. `false` reverts to the legacy session-window behaviour (0.2.x semantics), the documented org opt-out. **One refusal survives the opt-out and no setting reaches it:** an MFA-pending session on an account that **already holds** a second factor cannot bind a new one or end sessions, on either surface — it must prove the existing factor first. Without that bound, `false` would turn a config knob into an account-takeover path, because the enrollment ceremonies mark a session MFA-satisfied on success. Enrolling a **first** factor is untouched |
 | `password_min_length` | int | 15 | local-password policy — ASVS 5.0-aligned, length-first |
 | `password_require_uppercase` / `password_require_lowercase` / `password_require_digit` / `password_require_symbol` | bool | `false` | character classes — **opt-in**, each independently (ASVS 5.0 forbids mandatory composition); turn one on only for a legacy standard that still mandates it |
@@ -769,6 +777,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `ad_session_recheck_seconds` | int | `300` | **Directory session reconciliation** ([ADR 0079](adr/0079-kerberos-idp-session-coordination.md) mechanism 2). How often to re-resolve directory principals holding **live** sessions and revoke those AD has disabled or deleted — without it, an AD disable does not take effect until the `[security].max_session_hours` cap (12 h). **`300` (five minutes) is the default** (ADR 0148 GIVEN 1 — the hardened path is the shipped path), floored at **60 s** (a pass costs one LDAP bind per signed-in directory user). `0` disables the loop and is a **loosening** once AD is on — `security_loosenings()` names it. The default is **inert without AD** (`should_reconcile()` also needs an LDAP client), so a non-AD deployment is unaffected; an **explicit** non-zero value without `ad_enabled` is still refused rather than left silently dead. |
 | `ad_session_recheck_strikes` | int | `2` | Consecutive passes a principal must fail to resolve before its sessions are revoked. *The search matched nothing* cannot tell *deleted* from *moved out of the search base*, so a single ambiguous result must never revoke; a set disabled bit and an unreadable `userAccountControl` strike the same way. A wave of unreadable answers is held instead of revoked, with no setting ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)). Range 1–10. |
 | `ad_session_recheck_max_users` | int | `200` | Per-pass bind budget. Beyond this, remaining users are picked up by later passes (least-recently-probed first), so a large estate degrades to a longer effective interval instead of a bind storm. A pass revokes no more accounts than it probed. So at or below `ad_session_revoke_max`, the breaker can never trip. With AD on and a non-zero interval, the engine then logs a **WARNING** at start that names both settings. It still loads, and revocation still works. To arm the breaker, raise this budget above the cap. |
+| `ad_reconcile_outage_passes` | int | `3` | **Lasting directory outage alert** (BACKLOG #3709). A pass on which every probe it asked fails to reach the directory, whatever the cause, is fail-open: it revokes nothing, so a directory disable or deletion reaches no signed-in session while it lasts, and it is audited as `auth.ad_reconcile_skipped`. One such pass pages nobody. Once a run of them is this long, one `ad_reconcile_aborted` alert is raised with reason `directory_unavailable` under its own source, `directory-reconciler-outage`; the passes after it in the same run do not page again. A pass that reaches the directory, including one that judges nothing, ends the run. A pass with nobody signed in asks nothing and leaves the run as it stands. A group search refused for its own deadline or cap reads the same as an unreachable directory here. On by default, and it cannot be turned off: range `2` to `100`, so a single blip never pages. The count is **in memory, per process**: a restart starts it again, so a standing outage pages again after one, and a fresh process does not resolve an outage alert an earlier run left open, which an operator resolves. Each engine process counts and pages on its own. When it resolves itself is under [When the reconciler's alerts resolve themselves](#when-the-reconcilers-alerts-resolve-themselves). |
 | `ad_session_revoke_max` | int | `5` | **Mass-revoke circuit breaker**, absolute half. A search base that names the wrong OU, an OU reorganisation that moves the users out of it, or a service account that lost read rights on the entries while it can still read the base answers "not found" for *every* user — indistinguishable from "everyone was deleted". A base that was deleted or moved, or that the service account may not read at all, usually ends the search with a result code instead: a configuration refusal, which raises its own `ad_reconcile_aborted` instance with reason `directory_misconfigured` on any pass that sees one. The refused account is neither struck nor revoked, but it still counts among the accounts the pass probed, the breaker's denominator. When such a pass aborts and revokes nothing before the breaker runs is stated once in [SECURITY.md](SECURITY.md) (BACKLOG #3010). A lost read right on `userAccountControl` alone is held instead ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)). At `0` the absolute half is gone, so a pass trips once it revokes more than the fraction of the accounts it probed. At or above `ad_session_recheck_max_users`, the breaker can never trip; that row says what the engine does. |
 | `ad_session_revoke_max_fraction` | float | `0.34` | Circuit breaker, proportional half. A pass exceeding **both** thresholds aborts, revokes nothing, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row. Requiring both means it fires only on a change simultaneously *large* and *broad* — the signature of a misconfiguration, not of offboarding (3-of-3 or 50-of-300 still applies). Range >0.0–1.0, but with AD on and a non-zero interval the engine refuses `1.0` at load. At `1.0` this half is never exceeded, for the reason the `ad_session_recheck_max_users` row gives, so the whole breaker would never trip. |
 | `kerberos_enabled` | bool | `false` | Windows SSO (experimental, off by default; needs `ad_enabled`) |
@@ -817,7 +826,8 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 
 The session reconciler's `ad_reconcile_aborted` (the breaker) and `ad_reconcile_held` (the hold)
 alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). So
-does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). This
+does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). The
+lasting outage's instance resolves on its own rule, stated below the list. This
 needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
 this engine process, for every signed-in directory account it did not just revoke.
 
@@ -848,7 +858,7 @@ three on its own, until it restarts again.
   and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
   in at the last referral has since been read in full, present and enabled, on a pass with no
   referral. A pass with any referral, probe fault or configuration refusal (BACKLOG #3010)
-  resolves none of these alerts.
+  resolves none of these three alerts.
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
   held account, a disabled one awaiting its strikes, and one that never answers all do this.
 - An engine gives up resolving the referral when an account signed in at the last referral leaves
@@ -888,6 +898,16 @@ A paging refusal opens one `ad_reconcile_aborted` instance per account, under th
 `directory-reconciler-paging:<username>` (vault BACKLOG #3696). Nothing resolves it automatically.
 Resolve it by hand once that account no longer hits the bound, for example once its sign-in
 succeeds again.
+
+A lasting directory outage opens its own `ad_reconcile_aborted` instance, with reason
+`directory_unavailable` and source `directory-reconciler-outage` (BACKLOG #3709), once a run of
+`ad_reconcile_outage_passes` passes has read the directory unreachable. It resolves on the first
+pass that reaches the directory, if a pass of this engine process paged it. A pass of referrals or
+configuration refusals reached it; a pass whose every probe failed or faulted did not, and neither
+ends the run nor resolves it. A run pages once: an alert resolved by hand while the outage lasts
+stays resolved until a later run pages. Like the others, it is
+not resolved where the alert was already open when the process started, or where another
+reconciler may share the store; resolve those by hand.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
@@ -1769,8 +1789,7 @@ started together, can each raise it; the alert list folds them into one instance
   still compared, on the fingerprint taken after the load. When both cover the same files and still
   differ, `GET /config/provenance` also has no loaded fingerprint to vouch for until the next
   reload, and the flag toggle rows that process writes are marked `baseline_unchecked`. The two
-  reads miss at least an edit that lands and is reverted between them, and a module the loader runs
-  from a still-valid `__pycache__` bytecode file rather than from its source.
+  reads miss at least an edit that lands and is reverted between them.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
   WARNING, and the start goes on.
 - A start that never checked its config, because its read failed or it took no fingerprint,
@@ -2020,10 +2039,29 @@ otherwise (the first bullet below says what that leaves out). The CRL names that
 key identifier. The engine ran the signature check with that key, and the check failed. Where
 several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
-authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
-`CRL signature failure`, an error that does not name the file. The refusal names the setting, the
-file and the CRL. Give the setting the CRL that CA signed. No setting turns this check off, as for
-an expired CRL.
+authority key identifier and that carries the subject key identifier the CRL names. A fitting CA
+with no subject key identifier counts for nothing then, whether its key verifies the CRL, does
+not, or cannot be checked (vault BACKLOG #4159). A handshake whose chain runs through the named CA
+and that OpenSSL judges by such a CRL fails with `CRL signature failure`, an error that does not
+name the file. The refusal names the setting, the file and the CRL. Give the setting the CRL that
+CA signed. No setting turns this check off, as for an expired CRL.
+
+**Why a CA with no subject key identifier counts for nothing there, and where that refuses a CRL a
+handshake could pass.** This paragraph is the one statement of that premise and its residuals;
+the code and the changelog point here. The verifying contexts the engine builds set OpenSSL's
+strict verification, as read from their call sites and measured for at least the outbound one.
+Under it OpenSSL 3 refuses a verified chain of two or more certificates through a CA with no
+subject key identifier, so such a CA cannot make the CRL valid for that chain. At least two cases
+are left where the start refuses a CRL that a handshake could pass:
+
+- OpenSSL skips those strict checks where the chain it verifies is one certificate long. That is
+  the length of the chain it builds, which ends at a listed CA, not the number of certificates the
+  peer sends. So a peer whose own certificate is such a CA, self-signed and listed for the hop,
+  passes. It was measured, on CPython 3.14.7 with OpenSSL 3.5.7, to pass a strict handshake judged
+  by a CRL that CA signed and that names the key of another listed CA of the same name, a CRL the
+  start refuses.
+- An OpenSSL build or a verifying context without the strict check could take such a CA for the
+  CRL's issuer. The engine sets no OpenSSL version floor.
 
 The check reads only the file a CRL setting names. A CRL can also reach a hop through its CA file
 alone, on at least the hops that the paragraph on a CRL inside a CA file, further down, names. The
@@ -2054,9 +2092,30 @@ three cases warn:
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
-- The engine cannot check the signature with the listed CA's key, even where the CRL names that key.
-  Two measured examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature
-  over SHA-1 that the CA did make.
+- The engine cannot check the signature with a fitting listed CA's key, at least where it does
+  not support that algorithm or that pairing of key and signature, or where reading the key or
+  checking with it raises an error. Where the CRL names the key of a listed CA that fits it, only
+  such a CA counts here (the paragraph that starts "Why a CA with no subject key identifier" says
+  why). Where it names no such CA's key, as when it names a key no listed CA carries, every
+  fitting CA counts, one with no subject key identifier included. Two measured examples are an
+  ECDSA signature on a CRL that names an RSA key, and an RSA signature over SHA-1 that the CA did
+  make. The CA's key accepts that second one, and the `cryptography` library's own check refuses
+  its digest, so the engine reads it as one it cannot check.
+
+  **That SHA-1 case is a trade-off (vault BACKLOG #4159).** A start loads such a CRL with the
+  WARNING, and the running-hop reload holds it back, so it is applied at the next restart. The
+  cost falls on a host whose TLS library accepts SHA-1, as OpenSSL 3.5.7 was measured to, judging
+  a peer by such a CRL. There a revocation in a new copy waits for a restart, and if nobody
+  restarts, the copy the hop holds lapses at its next update and the hop then refuses the peers
+  it judges by it, as for any held-back file. What it avoids is applying live, with nobody acting, a CRL on which a
+  host that refuses SHA-1, by its build or its system policy, would fail every handshake through
+  that CA. It does not prevent that failure: on such a host the restart loads the CRL with the
+  WARNING, and the handshakes through that CA then fail. Where the copy the hop holds is itself an
+  earlier SHA-1 CRL from that CA, such a host fails those handshakes already, and holding the new
+  copy back gains nothing there. The engine checks with the
+  `cryptography` library's OpenSSL and the handshake runs on Python's, so it cannot tell which
+  kind of host it is on. A forged SHA-1 signature that names a listed CA's key is still proved
+  bad, and refuses the file.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
 it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
@@ -2348,6 +2407,50 @@ Its text names no part of the proxy URL, and `[security].enforcement` does not r
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
+
+#### The secrets directory, `MEFOR_SECRETS_DIRECTORY`
+
+A secret-class setting can come from a file instead of an environment variable
+([ADR 0214](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md),
+vault BACKLOG #2595). Set `MEFOR_SECRETS_DIRECTORY` to an absolute path. It is a path, not a
+secret. Each file in that directory holds one setting and is named exactly as its variable is:
+`MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_AUTH_OIDC_CLIENT_SECRET`,
+`MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY`, `MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD`,
+`MEFOR_ALERTS_EMAIL_PASSWORD`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_VAULT_TOKEN`,
+`MEFOR_SECRETS_VAULT_TOKEN`, `MEFOR_AI_API_KEY`, or `MEFOR_VALUE_<KEY>` for an `env()` value.
+
+- **A file wins over its variable.** With no file for a setting, the variable is read as before.
+  Unset, no directory is read at all.
+- **The engine refuses, at every `[security].enforcement` setting,** a directory or a file in it
+  that a known broad group (at least Everyone, Authenticated Users and the local Users group; on
+  POSIX, a group or other read or write bit) can read or change, a directory in which such a
+  group may delete a file (Windows `FILE_DELETE_CHILD`), and a link on Windows. It also
+  refuses a relative path, a file that is not a regular file, a file named for no setting above
+  (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
+  whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
+  file whose name starts with `.` is ignored. Every load of the settings, by any command, checks
+  the directory, every file name in it, and every file named for a setting above, even one nothing
+  else reads. A `MEFOR_VALUE_*` file's access and contents are checked only when the `env()` values
+  are read: at a `serve` start and on each reload, by `messagefoundry check`, and by
+  `messagefoundry connection upsert` and `remove`, at least. A command that loads the settings and
+  not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
+  named for no setting is cited by its position, never spelled, since its name may be a value.
+- **The access check is a list of known broad groups.** It does not refuse one named account that
+  can write the directory, the way the config-directory checks do, and it does not read the
+  folders above the directory: a broad group that can write one of those could replace the
+  directory. Restrict the directory, and the folders above it, as below rather than relying on
+  the check.
+- **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
+  [`[store].encryption_key_file`](#store).
+- A trailing line break is dropped; any other character, a space included, is part of the value.
+- The files are plain, protected by their access list alone. Nothing creates the directory for you
+  yet. A variable a library reads for itself, such as `VAULT_TOKEN` or `PGPASSWORD`, is not read
+  from here.
+
+On Windows, create the directory with inheritance off, granting SYSTEM and Administrators full
+control and the service account read, and nothing else. On POSIX, make it mode `0700` and each file
+`0600`, owned by the engine's account.
 
 ### `[secret_rotation]`
 Periodic **secret-rotation reminder** ([ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) §5.1) —
@@ -2652,8 +2755,9 @@ DR box, and a `[dr]` box that is not activated is passive, so as a cluster leade
 | `activate` | bool | `false` | should this box come up **under the DR run-profile** on this boot — the startup activation latch, distinct from the runtime `POST /dr/activate` endpoint. Enabled but `activate = false` is *provisioned-but-passive*: the box binds **no** inbound listener, of any tier (vault BACKLOG #3140). ADR 0048's load balancer moves the VIP to the node that answers, so a passive box must answer on nothing. Each inbound reads `status: "filtered"`, and the start logs one WARNING saying why. The box also delivers nothing (vault BACKLOG #3262). No outbound is started: each reads `status: "filtered"` and holds its rows, and an operator start, stop or restart of one answers `409`. A DR box is seeded from a backup of the primary's store, which can hold rows the primary had not delivered, and the primary may still be alive and delivering them. The router and transform stages still run, so a restored row moves to the outbound stage and waits there. A handler's live lookup therefore still runs on a passive box, and a routing or transform failure still alerts. A reload or dry run still checks the listeners an activation would bind. So a config the activation would refuse is refused before the disaster. At start the box also reads the `tls_ca_file` of each outbound and each FTPS poller an activation would start (it skips at least an outbound another engine shard owns and a listener's client-verification CA), and one that is refused reads `status: "failed"` in place of `"filtered"` (vault BACKLOG #3263). A bind fault that only a bind can find, such as a port in use, shows only when the activation binds, and an outbound's `validate_directory` check runs only then too. Some outbound faults found at the activation fail that outbound only, and others still refuse the activation; the #3263 amendment of [ADR 0048](adr/0048-third-tier-disaster-recovery-standby.md) says which check runs when, and which is which. An operator start of an inbound still binds it, until the next reload parks it again or the close of its schedule window stops it. An alert rule's restart and the scheduler bind nothing. `POST /dr/activate` then turns the run-profile on in place: it re-applies the graph the engine is already running, parks every connection below `priority_threshold` (`status: "filtered"`), and keeps it parked across later reloads. While an outbound is parked, an operator start, stop or restart of it answers `409`. An alert rule's restart of a parked connection does nothing. `POST /dr/release` parks every inbound before it unbinds them and drains. When the drain ends it parks every outbound, so the released box delivers nothing, as on any passive box, closes their connectors, and the next reload starts none of them. A row the drain left, or one held on an outbound the profile parked, stays queued on this box, and the `dr.release` audit row counts them. The next activation delivers the ones on an outbound at or above `priority_threshold`. An `auto_start = false` outbound an operator had started is parked with the rest and then takes its own gate's answer, so only an operator start brings it up again. The others are for the operator to reconcile against the primary, as ADR 0048's fail-back runbook says. A failed release leaves the box active, with the run-profile's parks in place. It also parks a below-threshold inbound an operator had started, when the release stopped it and it is still down. Only an operator start binds that one again. The listeners at or above `priority_threshold` that it unbound stay down. `POST /config/reload` binds them again, and so can their schedule window or an alert rule's restart. A reload skips an `auto_start = false` one. The activation applies nothing from the config dir: it only digests it, for the audit record. If the running config dir on disk no longer matches the running graph, the `dr.activate` audit row records both digests and the engine logs a WARNING; only `POST /config/reload` applies those bytes. A no-op unless `enabled` |
 | `activation_mode` | enum | `manual` | `manual` is the **only built mode** — the DR box promotes solely on the explicit, RBAC-gated operator action. `auto` (the box detects HA-pair loss and self-promotes) is named so a forward-looking config is explicit, but config load **rejects** it with a "not yet supported" error — never a silent no-op |
 | `priority_threshold` | enum | `critical` | start **only** connections whose resolved priority rank is at or above this tier (`[delivery].priority` + a per-connection `priority=`). `critical` (owner-locked default) starts only the critical feeds; `normal` would also start normal-tier ones. A below-threshold connection reports `status: "filtered"` — distinct from ADR 0031's `"failed"`. An unknown value fails config load |
-| `takeover_hook` | str | `""` | **optional** operator command run before binding the priority listeners. Exit 0 means "VIP acquired", and the activation goes on. Any other outcome **aborts activation**, and the `dr_activation_aborted` row says which of three cases it was (vault BACKLOG #3094). **The hook never started:** the engine could not start its process, or on Windows resume it into its job, before an error or the timeout. `vip_hook_ran` is false, and the reason says the VIP was not acquired. **It started and exited non-zero:** `vip_hook_ran` is true, and the reason says the VIP may have moved to this box, because the hook may have moved it before it failed. **It timed out:** it ran past `takeover_timeout_seconds` and was killed. `vip_hook_ran` is true, and the reason again says the VIP may have moved. This row is the source of record for those three cases. For an ADR 0047 load-balancer topology the passive LB is the fence and this is belt-and-braces only. `""` = no hook; a whitespace-only value is rejected at load (it would run an empty shell and "succeed"). **Both hooks run with the engine's environment minus every `MEFOR_*` variable, `VAULT_TOKEN` and `PGPASSWORD`**, so a hook keeps ordinary variables such as `PATH` or a cloud profile and gets none of the engine's own settings. A secret you keep under any other name, such as a `[secrets].provider = "env"` reference that is not named `MEFOR_*`, still reaches the hook. Pass a hook what it needs on its command line or under another name |
+| `takeover_hook` | str | `""` | **optional** operator command run before binding the priority listeners. Exit 0 means "VIP acquired", and the activation goes on. Any other outcome **aborts activation**, and the `dr_activation_aborted` row says which of three cases it was (vault BACKLOG #3094). **The hook never started:** the engine could not start its process, or on Windows resume it into its job, before an error or the timeout. `vip_hook_ran` is false, and the reason says the VIP was not acquired. **It started and exited non-zero:** `vip_hook_ran` is true, and the reason says the VIP may have moved to this box, because the hook may have moved it before it failed. **It timed out:** it ran past `takeover_timeout_seconds` and was killed. `vip_hook_ran` is true, and the reason again says the VIP may have moved. This row is the source of record for those three cases. For an ADR 0047 load-balancer topology the passive LB is the fence and this is belt-and-braces only. `""` = no hook; a whitespace-only value is rejected at load (it would run an empty shell and "succeed"). **Both hooks run with an allowlisted environment**, which `pass_environment` below describes. This is not isolation: a hook runs as the engine's account, so it can still read what that account can, the engine's process and its key and store files among them. Trust a hook's author as you trust the engine's config |
 | `release_hook` | str | `""` | the symmetric command run on `POST /dr/release` to hand the VIP back to the recovered primary. `""` = no hook; whitespace-only rejected at load |
+| `pass_environment` | list of names | `[]` | Environment variable **names** both hooks are given, beyond what a shell needs to start (vault BACKLOG #2587). A hook gets an **allowlist**: the platform's start-up names, such as `PATH`, `SYSTEMROOT`, `TEMP` and `USERPROFILE` on Windows or `PATH`, `HOME` and the locale names on POSIX; on Windows the names that say where programs and shared data are installed, such as `ProgramFiles` and `ALLUSERSPROFILE`; and the names listed here. **No other variable crosses**, so list what the hook's own tools read, such as a cloud CLI's profile or a proxy. `PSModulePath` is not passed: PowerShell builds its own when it is unset. Nor is `PSExecutionPolicyPreference`, the process-scope execution policy a parent shell can set, so a PowerShell **script** hook runs under the execution policy the machine, Group Policy and the engine's account set; where that refuses scripts, give `-ExecutionPolicy` on the hook's command line or list that name here. Names only; the value comes from the engine's own environment when the hook runs, and a listed name that is not set there is logged as a WARNING, by name, when the engine starts with `enabled` and a hook configured, and again each time a hook runs. A hook that exits non-zero names this setting in its reason. A variable a hook needs that you did not list is not reported: the hook's own output is discarded, so test a hook under the service's environment before you need it. **Refused at load** if a name is one of the engine's own: any `MEFOR_*` name, and `VAULT_TOKEN` or `PGPASSWORD`. Under `[secrets].provider = "env"`, a name a secret-reference setting such as `[auth].ad_bind_password_secret` reads is refused too (in `[sandbox].pass_environment` as well). A connection secret a config module reads under another name is not known to the loader, so do not list one. A name you list reaches the hook with its value, so list a credential only when the hook needs it. `messagefoundry/childenv.py` (`hook_environment`) is the source of record for the full lists. Env: `MEFOR_DR_PASS_ENVIRONMENT`, comma-separated. |
 | `takeover_timeout_seconds` | float (>0) | `30.0` | bound on the takeover/release hook **and** on the KeyProvider-reachability check at the DR site: a hook or key probe that doesn't succeed within this **aborts activation closed** — no hang, no silent retry-forever. It also bounds the activation's digest of the running config dir, taken only for the `dr.activate` audit row: a dir that does not answer in time is recorded as `unreadable` and does **not** abort the activation. It also bounds the activation's preflights (the trust anchors and, in `serve`, the connection key files), which **abort** it after the takeover hook when they do not finish in time. What that bound leaves out is in [ADR 0048](adr/0048-third-tier-disaster-recovery-standby.md), the amendment for vault BACKLOG #3094. A **takeover** hook that runs past it is killed, with the processes it started. If the engine cannot put the hook in a Windows job object, or cannot signal its POSIX process group, it logs one WARNING and the kill reaches only the hook's shell. The abort is recorded once the hook has exited, or after at most 5 more seconds (vault BACKLOG #2622). At least these escape that kill: on POSIX a process that leaves the hook's process group (`setsid`, and `sudo` in its default `use_pty` mode) or that the engine's account may not signal; on Windows, work the hook hands to another service, such as WMI or Task Scheduler. A **release** hook that runs past it is left to finish, as before |
 | `seed_archive` | path | `""` | the `.mfbak` archive activation **verifies** the cold seed against. Activation does not load it — on a **SQLite** store, restore it first with `messagefoundry restore <archive> --to <store path>` and name the same archive here, so activation can check the store actually carries it. `""` = the operator supplies the archive path in the `POST /dr/activate` request body instead (the runbook path), which needs `seed_dir` below. A `<scheme>://` URL whose scheme has two or more characters is rejected (a one-letter scheme reads as a drive letter, so `C://x` stays a path) — local/UNC only, like the backup destination. On a **SQLite** store a **config-only** archive cannot be a seed here and is refused: it carries no `store.db`, so nothing could have been restored from it — `messagefoundry restore` rejects one for the same reason. On a server-DB (Postgres/SQL Server) store that refusal does not apply, and **`messagefoundry restore` is not part of the drill** — it rejects a config-only archive on *every* backend, so running it here is a hard error. There the DBA restores the live database natively and the archive named here is the **config bundle**, which by default is all a server-DB backup writes (`[backup].config_only_on_server_db`). Activation instead gates the restored **live database**, not the archive: `POST /dr/activate` must carry `dba_attests_restored=true` **and** the restored database must already carry prior `dr_backup` history, or activation **refuses closed**; `restore_token` below adds an optional vintage floor on top of those two |
 | `seed_dir` | path | `""` | the **one directory** a `POST /dr/activate` request body may name an archive under (vault BACKLOG #2581). `""` (default) = a request may name **no** archive, and activation uses `seed_archive`. Must be an **absolute** path on the DR box; a relative one is rejected at load. A request path is confined to this directory the way `[api].config_reload_roots` confines a reload path, and activation verifies the resolved path. A refusal aborts activation (422) with one generic message that names no part of the path; the `dr_activation_aborted` audit row records the path that was asked for. If this directory itself cannot be resolved within `takeover_timeout_seconds`, activation aborts and says so. `seed_archive` is operator configuration and is not confined by this key. A `<scheme>://` URL whose scheme has two or more characters is rejected (a one-letter scheme reads as a drive letter, so `C://x` stays a path), like `seed_archive` |

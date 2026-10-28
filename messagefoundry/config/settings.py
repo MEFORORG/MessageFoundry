@@ -957,9 +957,9 @@ class StoreSettings(_Section):
     #     CA-bundle pin (chain + hostname still verified).
     #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's OWN certificate
     #     by file (an exact-cert match, brace-quoted STORE-5-safe), so a CA file matches nothing. It goes
-    #     out with `Encrypt=strict`: on the Driver 18.7 build tested, the pin was enforced with strict and
-    #     not with `Encrypt=yes` (vault BACKLOG #2223). Strict is TDS 8.0, so it needs SQL Server 2022 or
-    #     later, the supported floor; an older server refuses the connection. Not a revocation control.
+    #     out with `Encrypt=strict` (vault BACKLOG #2223). Why strict, the server version it needs, and the
+    #     build and platform it was tested on: the `ssl_root_cert` row of docs/CONFIGURATION.md. Not a
+    #     revocation control.
     # REJECTED for SQLite (no TLS at all). A path, not a secret — it may live in the config file /
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
@@ -1519,7 +1519,8 @@ def uvicorn_trusted_hosts(entries: Sequence[str]) -> list[str]:
 
 
 def _split_address_list(v: object) -> object:
-    """Split the env form of a list of addresses or origins on COMMAS, never ``os.pathsep``.
+    """Split the env form of a list (addresses, origins, or the ``pass_environment`` variable names)
+    on COMMAS, never ``os.pathsep``.
     ``os.pathsep`` is ':' on POSIX, which also separates IPv6 groups and an origin's port, so it
     would shred both on the Linux leg (BACKLOG #3042). A list from the file passes through."""
     if isinstance(v, str):
@@ -2349,20 +2350,33 @@ class PipelineSettings(_Section):
     snapshot_on_send: bool = Field(default=True)
 
 
-def _pass_environment_refusal(name: str) -> str | None:
-    """Why ``name`` may not be handed to a sandbox worker, or ``None`` if it may.
+def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -> tuple[str, ...]:
+    """``names``, or a :class:`ValueError` for the first one that may not be handed to ``receiver``.
 
-    The worker runs the code ``[sandbox]`` exists to keep the engine's secrets from, so nothing of
-    the engine's own may be named: no ``MEFOR_*`` variable at all, and no secret a library reads on
-    the engine's behalf. That is the rule the DR hook's environment follows
-    (:func:`messagefoundry.childenv.outside_engine_namespace`), reused so the two cannot drift.
+    For the two ``pass_environment`` settings: ``[sandbox]``'s, read by the sandbox worker, and
+    ``[dr]``'s, read by the DR hooks. Each child gets an allowlist
+    (:mod:`messagefoundry.childenv`), and this keeps the engine's own names off both lists: no
+    ``MEFOR_*`` variable at all, and no secret a library reads on the engine's behalf
+    (:func:`messagefoundry.childenv.outside_engine_namespace`, reused so the two cannot drift).
     Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
-    added. The text never echoes a value, only the name the operator typed."""
-    if not (name.isascii() and name.isidentifier()):
-        return f"{name!r} is not an environment variable name"
-    if not outside_engine_namespace(name):
-        return f"{name} is one of the engine's own variables; it may not be passed to a worker"
-    return None
+    added. The text never echoes an entry that is not a name, since ``NAME=value`` typed by
+    mistake would carry the value (vault BACKLOG #2600). Nor does it number one: the env form drops
+    empty entries before this runs, so a position could point at the wrong one.
+
+    A secret reference under ``[secrets].provider = "env"`` is refused once the model is built,
+    by :func:`_reject_passed_secret_references`, which sees every section."""
+    for name in names:
+        if not (name.isascii() and name.isidentifier()):
+            raise ValueError(
+                f"{key}: an entry is not an environment variable name; "
+                "list names only, never NAME=value"
+            )
+        if not outside_engine_namespace(name):
+            raise ValueError(
+                f"{key}: {name} is one of the engine's own variables; "
+                f"it may not be passed to {receiver}"
+            )
+    return names
 
 
 class SandboxSettings(_Section):
@@ -2432,25 +2446,18 @@ class SandboxSettings(_Section):
     # (messagefoundry/childenv.py). The worker loads the config again under that allowlist, so a
     # config that reads another variable needs it named here, or its worker is refused when the
     # graph it builds differs from the engine's. Names only, and never a MEFOR_* name or another
-    # of the engine's own: see _pass_environment_refusal.
+    # of the engine's own: see _checked_pass_environment.
     pass_environment: tuple[str, ...] = ()
 
     @field_validator("pass_environment", mode="before")
     @classmethod
     def _split_pass_environment(cls, v: object) -> object:
-        # The env layer delivers MEFOR_SANDBOX_PASS_ENVIRONMENT as one string; split on commas.
-        if isinstance(v, str):
-            return [name.strip() for name in v.split(",") if name.strip()]
-        return v
+        return _split_address_list(v)
 
     @field_validator("pass_environment")
     @classmethod
     def _pass_environment_names(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        for name in v:
-            refusal = _pass_environment_refusal(name)
-            if refusal is not None:
-                raise ValueError(f"sandbox.pass_environment: {refusal}")
-        return v
+        return _checked_pass_environment(v, "sandbox.pass_environment", "a worker")
 
 
 class DiagnosticsSettings(_Section):
@@ -3422,6 +3429,14 @@ class AuthSettings(_Section):
     # by the following passes (least-recently-probed first), so a very large estate degrades to a longer
     # effective interval instead of a bind storm against the DC.
     ad_session_recheck_max_users: int = 200
+    # How many CONSECUTIVE passes must read the directory unreachable before the reconciler pages
+    # (BACKLOG #3709). Every such pass is fail-open: it revokes nothing, so a disable or deletion
+    # does not reach a signed-in session while it lasts. One pass is a blip and pages nobody; a run
+    # of them pages once, as `ad_reconcile_aborted` under its own source, and the first pass that
+    # reaches the directory resolves it. 2 to 100: a single blip never pages, and the page cannot
+    # be switched off by a huge value. The count is
+    # process-local, like the strikes, so a restart starts it again.
+    ad_reconcile_outage_passes: int = 3
     # --- mass-revoke circuit breaker ---
     # A search base that names the wrong OU, an OU reorganisation that moves the users out of it, or
     # a service account that lost read rights on the entries while it can still read the base returns
@@ -3958,6 +3973,15 @@ class AuthSettings(_Section):
     def _check_ad_recheck_max_users(cls, value: int) -> int:
         if value < 1:
             raise ValueError("ad_session_recheck_max_users must be >= 1")
+        return value
+
+    @field_validator("ad_reconcile_outage_passes")
+    @classmethod
+    def _check_ad_reconcile_outage_passes(cls, value: int) -> int:
+        # >=2: one unreachable pass is a blip, and paging on it would page on every blip. <=100:
+        # a larger value would switch the page off in all but name.
+        if not 2 <= value <= 100:
+            raise ValueError("ad_reconcile_outage_passes must be between 2 and 100")
         return value
 
     @field_validator("ad_session_revoke_max")
@@ -4748,7 +4772,7 @@ def forwarding_gate_check(log: LoggingSettings) -> tuple[str | None, list[str]]:
     """:func:`forwarding_gate_refusal` for ``log``, plus the fail-open notes it made, as text.
 
     For a caller that runs the gate BEFORE logging is configured, which ``serve`` does. A note
-    logged there would reach bare stderr only, never the log file or the off-box collector, and
+    logged there would reach stderr only, never the log file or the off-box collector, and
     ADR 0200 Amendment A calls that note the record of a fail-open pass. So the notes come back to
     the caller, which writes each where it can be kept, as ``serve`` does with the #1989
     static-credential lines. If the gate raises, the notes are logged at once before the error
@@ -6715,6 +6739,21 @@ class DrSettings(_Section):
     # latest anchor differs → activation refuses closed). "" (the default) = OFF: the #102 gate is
     # byte-unchanged and SQLite is a no-op. A URL is rejected (local/UNC only, like seed_archive).
     restore_token: str = ""
+    # Environment variable NAMES the takeover and release hooks are given, beyond the allowlist
+    # messagefoundry/childenv.py hook_environment builds: a cloud profile, a proxy, a credential
+    # the hook's own tool reads. Names only, and never a MEFOR_* name or another of the engine's
+    # own: see _checked_pass_environment.
+    pass_environment: tuple[str, ...] = ()
+
+    @field_validator("pass_environment", mode="before")
+    @classmethod
+    def _split_pass_environment(cls, v: object) -> object:
+        return _split_address_list(v)
+
+    @field_validator("pass_environment")
+    @classmethod
+    def _pass_environment_names(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        return _checked_pass_environment(v, "dr.pass_environment", "a hook")
 
     @field_validator("takeover_hook", "release_hook")
     @classmethod
@@ -7359,6 +7398,32 @@ def _env_overrides(environ: Mapping[str, str]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _secrets_directory_overrides(environ: Mapping[str, str]) -> dict[str, dict[str, Any]]:
+    """The secret-class settings fields the secrets directory supplies, as ``{section: {key:
+    value}}`` (vault BACKLOG #2595, ADR 0214).
+
+    Merged over the environment layer, so a setting's file wins over its variable, which is the
+    accessor's rule in ``engine_secrets``. Every file the directory holds for a setting is read and
+    checked here, so a load refuses an unusable one even when nothing else would read it, such as a
+    Vault token file on a site with no Vault. Only names that are settings fields are returned: the
+    two Vault tokens are read by their own modules, and the store key is never read from the
+    directory. Raises ``SecretsDirectoryError``, a ``ValueError``, when the directory cannot be
+    used."""
+    from messagefoundry.engine_secrets import DIRECTORY_SETTING_NAMES, open_secrets_directory
+
+    directory = open_secrets_directory(environ)
+    if directory is None:
+        return {}
+    found = {name: directory.read(name) for name in DIRECTORY_SETTING_NAMES}
+    return _env_overrides(
+        {
+            name: value
+            for name, value in found.items()
+            if value is not None and name not in _OUT_OF_BAND_ENV
+        }
+    )
+
+
 def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | None:
     """The active environment ``MEFOR_AI_ENVIRONMENT`` names, or ``None`` when it is unset or blank.
 
@@ -7578,6 +7643,8 @@ _OUT_OF_BAND_ENV: frozenset[str] = frozenset(
         "MEFOR_SECRETS_VAULT_CA_FILE",
         "MEFOR_SECRETS_VAULT_KV_MOUNT",
         "MEFOR_SECRETS_VAULT_TOKEN",
+        # Where the secrets directory is (engine_secrets.py, vault BACKLOG #2595, ADR 0214).
+        "MEFOR_SECRETS_DIRECTORY",
         # The store's Vault KeyProvider and Transit cipher (store/keyprovider_vault.py,
         # store/crypto_transit.py).
         "MEFOR_STORE_TRANSIT_AUDIT_KEY",
@@ -7604,6 +7671,23 @@ _SECRET_REFERENCE_KEYS: tuple[tuple[str, str], ...] = (
     ("auth", "oidc_client_private_key_ref"),
     ("alerts", "email_password_secret"),
 )
+
+
+def _reject_passed_secret_references(settings: ServiceSettings, data: Mapping[str, Any]) -> None:
+    """Refuse a ``pass_environment`` name that a ``[secrets].provider = "env"`` reference reads as
+    a secret, such as ``[auth].ad_bind_password_secret`` (vault BACKLOG #2587). The field
+    validators see one section, so this runs once the model is built. Names only, never a value."""
+    referenced = _env_secret_reference_names(data)
+    for key, names, receiver in (
+        ("sandbox.pass_environment", settings.sandbox.pass_environment, "a worker"),
+        ("dr.pass_environment", settings.dr.pass_environment, "a hook"),
+    ):
+        for name in names:
+            if _env_name_key(name) in referenced:
+                raise ValueError(
+                    f"{key}: {name} is a secret reference under [secrets].provider = 'env'; "
+                    f"it may not be passed to {receiver}"
+                )
 
 
 #: Whether this platform's environment names ignore letter case. On Windows ``os.environ`` holds
@@ -7887,7 +7971,7 @@ def unread_env_warnings(
     """The unread-variable WARNING lines :func:`load_settings` logged for ``settings``, again.
 
     For ``serve``: it loads its settings before ``configure_logging`` runs, so those lines reached
-    bare stderr only, never the log file or the off-box forwarder. It logs these once logging is
+    stderr only, never the log file or the off-box forwarder. It logs these once logging is
     configured, as it does the other pre-logging warnings (BACKLOG #1989). The secret-reference
     spare is read from ``settings``, which holds what ``data`` held at load."""
     environ = os.environ if environ is None else environ
@@ -9970,7 +10054,10 @@ def load_settings(
     environ: Mapping[str, str] | None = None,
     default_file: bool = True,
 ) -> ServiceSettings:
-    """Resolve settings with CLI > env > file > default precedence.
+    """Resolve settings with CLI > secrets directory > env > file > default precedence.
+
+    The secrets directory supplies only the secret-class settings, and only when
+    ``MEFOR_SECRETS_DIRECTORY`` names one (vault BACKLOG #2595, ADR 0214).
 
     ``config_path`` reads that TOML file (error if it's missing); when ``None``, ``./messagefoundry.toml``
     is used **only if it exists**. ``cli`` is a nested ``{section: {key: value}}`` of explicitly-provided
@@ -10015,12 +10102,17 @@ def load_settings(
     # typo that causes a validation error is named. Over `environ` itself, so it reports the
     # variable as the operator spelled it; `data` is read for what the settings name.
     _reject_unknown_env_keys(environ, data)
+    # The secrets directory (vault BACKLOG #2595, ADR 0214), after the unread-variable warnings and
+    # the refusals above, so a directory it refuses does not hide a mistyped variable or key
+    # until the next start. It writes only secret values, which nothing above reads.
+    _merge(data, _secrets_directory_overrides(environ))
     _desugar_security(data)
 
     if cli:
         _merge(data, cli)
 
     settings = ServiceSettings.model_validate(data)
+    _reject_passed_secret_references(settings, data)
     # AFTER the CLI merge, so a `--host` that moved the socket off-box is reported as the posture
     # loosening it is. One-way: it only ever ADDS a loosening. See the helper for why.
     _reconcile_effective_bind(settings)

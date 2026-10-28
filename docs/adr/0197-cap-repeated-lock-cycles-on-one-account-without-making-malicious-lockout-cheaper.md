@@ -1076,7 +1076,13 @@ sign-in lock does not refuse it, just as it does not refuse the TOTP combined si
   deployments, so nothing registered earlier needs migrating (CLAUDE.md section 0).
 - **The challenge store stays bounded and cannot become a new denial lever.** The begin leg is a
   POST that charges control 2 (`allow_login_attempt`) first, and stages the challenge under an opaque
-  random handle it sets as an HttpOnly cookie. It is not keyed by client address: behind an
+  random handle it sets as an HttpOnly cookie. The sign-in POST does not charge control 2 a second
+  time for that challenge; it moves the begin leg's hit to the moment of the sign-in instead
+  (BACKLOG #3937; [SECURITY.md](../SECURITY.md), *The combined passkey sign-in*, states the rule).
+  Why: charging both legs gave the owner's way past half the per-address budget of a password
+  sign-in, and skipping the second charge outright would let begin legs be banked, since a
+  challenge outlives the limiter's window. Moving the hit keeps one charge per sign-in and the
+  per-window bound. It is not keyed by client address: behind an
   undeclared proxy every caller shares one address, so an address key would let one caller cancel
   or crowd out the owner's challenge. The sign-in pops the challenge on any outcome, and checks its
   age on arrival, before the account's queue, as `arrived` does for a TOTP code. Pre-auth
@@ -1317,9 +1323,18 @@ surface and the first sign-in change.
 **Wave 2: N-G.** *Built 2026-10-20 (BACKLOG #3373).* The tests live in
 `tests/test_passkey_way_past.py`, the store contracts in `tests/_webauthn_store_contract.py` and
 `tests/_lockout_store_contract.py`, and the console leg in
-`packaging/messagefoundry-webconsole/tests/test_ui_passkey_sign_in.py`. The rotation gate and the
-last-factor guards count a discoverable passkey under any `rp_id`; only the sign-in path reads the
-request's. The census names passkey-only accounts as information, not as a finding. Planned as:
+`packaging/messagefoundry-webconsole/tests/test_ui_passkey_sign_in.py`. The factor-drop gates, the
+rotation gate among them, count a discoverable passkey as what remains only under the configured
+`rp_id`, and none when no `rp_id` is configured; `docs/SECURITY.md`, *Limits of the passkey way
+past*, states the rule and its limits. The census's `passkey_only` list is information, not a
+finding.
+
+> **Superseded text, kept as a record.** Until BACKLOG #3937 the rotation-gate sentence read: *"The
+> rotation gate and the last-factor guards count a discoverable passkey under any `rp_id`; only the
+> sign-in path reads the request's."* That item narrowed what the factor-drop gates count as what
+> remains to the configured `rp_id`.
+
+Planned as:
 Tests first, in `tests/test_webauthn.py` and `tests/test_mfa.py`: registration
 requests `residentKey` required and sets `discoverable`; the begin leg takes no username, returns
 the same options shape for every caller and charges control 2; a passkey-only account under a live

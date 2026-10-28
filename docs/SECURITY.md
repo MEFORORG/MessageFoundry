@@ -2328,22 +2328,46 @@ it and does not compare against it. Only a committed reload or a flag toggle tha
 fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
 runs just before the write, so a change after it is not caught.
 
-**A released reload loads only the config its approval named (vault BACKLOG #2596, step 3).** When
+**A released reload loads only the config its approval named (vault BACKLOG #2596).** When
 dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 0041 D1 content
-digest of the target directory, taken at request time. An approver sees it in the queue. The
-release checks the directory against it before any config module runs. After a load that
-succeeds, it checks again, before the checks that refuse an invalid graph. It first takes the
-fail-closed digest. Then it compares the digest the `config_reload` row records, if the engine
-took one. After a load that fails as an invalid config, it checks the fail-closed digest once
-more. So an edit that also breaks the graph is recorded as an edit. If any check differs from the
-approved digest, nothing loads past that point and nothing swaps. The running graph keeps the
-environment values it had. A reload applies the values it re-read only with the swap, and a
+digest of the target directory, taken at request time. An approver sees it in the queue. At
+release the config source's trust check runs before the directory is read. It stats paths and
+reads no file's contents. The release then reads the directory once, into a snapshot, and checks
+that snapshot's digest against the approved one before any config module runs. The load compiles
+and runs that same snapshot, and the `config_reload` row records its digest. So the config
+modules, helpers and tables checked are the ones the loader runs, and an edit to them on disk
+during the load is neither run nor recorded. The limits below name at least one import that runs
+from disk instead. Where the environment value file sits in the config directory's
+`environments/` folder, `serve` parses it from the same snapshot, so an edit to it during the load
+does not apply, and a value file created or removed there since the snapshot is refused. Otherwise,
+at least where the value file sits elsewhere or an embedded engine has another value provider, the
+release reads the values from disk and then takes the digest again, which refuses a change made in
+between to a file the digest covers. If the digest differs, nothing loads and nothing swaps. The running graph keeps
+the environment values it had. A reload applies the values it re-read only with the swap, and a
 rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
 approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
 reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold whose
 params carry no digest is refused the same way, with reason `no_approved_digest`. A release that
 cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
 cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
+
+**A release refused before the digest check never reaches it.** At least the settings preflight
+and the config source's trust check run before it. So where the trust check refuses rather than
+warns, a tamper that also loosens the permissions on a file it covers, such as a config module,
+is refused as `invalid_config`, not `digest_mismatch`. A `WiringError` refusal made before the
+check, by those two or another step, writes a row carrying `approved_fingerprint`, the approval's
+digest, and `approval_digest_check` set to `not_reached`, and no `current_fingerprint`, because no
+digest was taken. A missing, unlistable or disallowed directory is refused before the check too,
+with its own reason and neither field. A refusal after the digest check passed carries neither
+field either, whether the approved bytes caused it or an input the digest does not cover, such as
+an environment value file outside the config directory or a connection's CA file. The second
+digest above is the exception: it refuses as `digest_mismatch` with both fields, or as at least
+`digest_unavailable` or `not_found`, as the first check does.
+
+**Every start and reload refuses a config directory holding a file the load reads that the engine
+cannot read, a `_` helper no module imports included.** An unreadable file or folder under
+`environments/` is left out, because the load never reads it. A released reload reads strictly, so
+it refuses that too, as `digest_unavailable`.
 
 This digest fails closed, unlike the provenance fingerprint, which skips what it cannot read. A
 file or folder it covers that cannot be read gives no digest at all, never the digest of the rest.
@@ -2352,7 +2376,7 @@ path too long for the filesystem, or a name Windows refuses. A directory removed
 listing is not refused as missing. The digest covers the files it still finds, down to an empty
 bundle. That digest does not match an approved bundle that held files, so the release is refused
 as `digest_mismatch`. A file that goes between its stat and its read gives `digest_unavailable`
-instead. After the load the release checks this digest first, and then the one the row records.
+instead.
 
 At least these requests file no hold, because their release could only be refused. Each is
 answered and audited at once, as an inline reload's refusal is:
@@ -2371,15 +2395,21 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   integrity seal, so a writer to the `pending_approvals` table who replaces the digest leaves a
   request the gate refuses. The seal does not stop an older sealed copy of the row being put back,
   and a keyless store checks nothing (vault BACKLOG #2592);
-- the digest covers what `config/fingerprint.py` hashes and no more. A planted `__pycache__` file
-  runs under an unchanged digest. So does an edit to an environment value file outside the config
-  directory, or to a `MEFOR_VALUE_*` variable. These gaps are closing step 1 of vault BACKLOG #2596;
-- each check samples the files. An edit that lands after the first check runs its module code
-  before the second check refuses it. An edit reverted while the release loads is not seen at all.
-  Hashing, compiling and running the same bytes is that same step 1;
+- the digest covers what `config/fingerprint.py` hashes and no more. The release reads a value
+  file outside the config directory's `environments/` folder after the digest check, and a
+  `MEFOR_VALUE_*` variable too, so an edit to either changes the values a release applies under an
+  unchanged digest. The second digest samples the files, so where an embedded engine's other value
+  provider reads a value file under the config directory, an edit to it reverted before that digest
+  is not seen. The second digest also refuses an edit to any covered file made after the first,
+  though the load runs the snapshot the first one checked.
+  The loader compiles each config module, and each `_` helper a config module imports with an
+  `import` statement, from the snapshot. A module reached through the ordinary import system runs
+  from disk, a matching `__pycache__` file included, so the bytes that run are not the bytes the
+  digest covers. At least `importlib.import_module`, and a sibling import while the config directory
+  is on `sys.path`, reach it that way;
 - the request-time digest is taken before the route checks its step-up proof;
 - the digest checks that each folder it reads can be listed, and then lists it again. A folder
-  that becomes unlistable between the two is left out of the digest;
+  removed between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
@@ -2749,8 +2779,9 @@ first-seen address challenge (BACKLOG #288). The signal fails open, and the sess
 account's first sign-in, with no client address, or when the account's known-address record
 cannot be read (the *First-seen sign-in address* rows of Table A). An account an administrator
 reset before its first sign-in is the exception: its first sign-in is judged (vault BACKLOG #2946). A **combined** sign-in (password and
-TOTP code in one request, ADR 0197) is seeded from any address, because it proved the code in the same
-request. A local sign-in that still owes a factor is minted with no window, and so is **every
+a TOTP code on an account with TOTP enrolled, or a passkey assertion on a local account holding a discoverable passkey under the request's relying party,
+in one request; ADR 0197 and its Amendment A, and [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068)) is seeded from any
+address, because it proved the second factor in the same request. A local sign-in that still owes a factor is minted with no window, and so is **every
 directory sign-in**: Windows SSO by either route (`GET /ui/sso` and `POST /auth/negotiate`) and the
 OIDC callback (see the Authentication ambience row). `POST /auth/negotiate` stamped the window at
 login until BACKLOG #1144 step 5; the engine now decides this for every directory leg, and no caller
@@ -3262,7 +3293,13 @@ offers every caller a passkey button. `POST /ui/login/passkey` charges the sign-
 2) first, then stages an assertion challenge with **no username and an empty `allowCredentials`
 list**, so the options say nothing about any account. Its handle goes back as an HttpOnly,
 `SameSite=Strict` cookie, never keyed by client address. `POST /ui/login` then carries the password
-and the assertion together; the engine pops the challenge on arrival, whatever the outcome. The path
+and the assertion together. **One passkey sign-in costs one unit of control 2, as a password
+sign-in does** (BACKLOG #3937). The route pops the challenge on arrival, whatever the outcome,
+before it charges the sign-in limiter. Where the begin leg's hit is still in the window, popping
+MOVES that hit to now instead of charging a second one, so the sign-in is counted from the moment
+it is spent and a begin leg's budget cannot be spent in a later window. A challenge outlives the
+window (120 seconds against 60 by default); one whose hit has aged out is charged afresh, and so is
+a forged, expired or absent handle, which finds nothing. The path
 runs only when the account row read before any verify holds a discoverable passkey under the
 request's `rp_id`, and the sign-in lock does not refuse it, as it does not refuse option E's
 combined sign-in. The assertion must come from one of the named account's own passkeys under that
@@ -3309,15 +3346,23 @@ unlock lifted before the write; and, at a `lockout_threshold` of 1, an unlock or
 rotation landing after a read that saw a live lock. So the fixed-length lock beside a refused enrolment holds only for serial failures that no
 write races.
 
-**Two limits of the passkey way past, stated.** At least these:
+**Limits of the passkey way past, stated.** At least these:
 
-- The rotation gate, the removal guards and the census count a discoverable passkey under **any**
-  `rp_id`, while the sign-in accepts only one minted under the request's. After an origin change
+- The factor-drop gates count a discoverable passkey as a way past only under the `rp_id` the
+  configuration names, `[api].public_origin`'s host. At least these ask it: the TOTP removal, the
+  passkey removal, the rotation gate, the store's conditional writes behind them, and the census's
+  `no_way_past` (BACKLOG #3937). The sign-in accepts only a passkey minted under the request's
+  `rp_id`, and outside a request the engine knows no other. **With `public_origin` unset the
+  `rp_id` comes from each request, so no passkey counts as what remains at those gates**: a covered
+  account keeps its TOTP, removing any discoverable passkey needs a TOTP that is a way past, and
+  a passkey-only account must enrol TOTP before it rotates and is named in `no_way_past`. That is
+  the shipped default on a loopback bind. The census's reset warning
+  (`reset_would_remove_a_passkey`) counts a passkey under the configured `rp_id` too, and any
+  discoverable passkey when none is configured, since it asks whether a reset would remove one that
+  may sign the holder in. After a change from one configured origin to another
   ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
-  visibly unusable) an account whose only way past is such a passkey is lockable with no way past
-  until it registers a passkey again or enrols TOTP; the census does not name it.
-- One passkey sign-in charges the sign-in window twice, at the begin leg and at the sign-in, so the
-  owner's way past gets half the per-address budget a password sign-in gets.
+  visibly unusable) a passkey under the old `rp_id` no longer counts at the gates, so the census
+  names an account whose only way past it was.
 - Without the `[webauthn]` extra no passkey is a way past: the gates and the census do not count
   one, and the sign-in treats an assertion as absent. `POST /users/{id}/reset-mfa` clears passkeys alongside TOTP — the
 always-available recovery, because passkeys mint **no recovery codes by design** (codes are phishable
@@ -3331,9 +3376,10 @@ engine, so any refusal or failure of the finish request comes after it. That inc
 factor-binding refusal, the login-to-MFA floor, an expired ceremony, a bad label, a lost session,
 a failed verification, a duplicate, a directory account's directory and lock refusals, and the
 route's own refusals (rate limit, stale step-up window, malformed request). **A failed finish does
-not prove the passkey was not stored.** The store asks nothing of the session, and the re-key
-that follows it is what refuses, so at least a session revoked after the finish's last session
-check and before the re-key stores the passkey and then answers a lost session. So the passkey
+not prove the passkey was not stored.** The store's conditional insert refuses a session that is
+gone by the time it writes (BACKLOG #3690 item 1), but the re-key that follows the insert is what
+refuses after it, so at least a session revoked after the insert commits and before the re-key
+stores the passkey and then answers a lost session. So the passkey
 page tells the user to check the account's Passkeys list first. A passkey listed there is
 registered, and the user keeps it on the authenticator. Only a credential the authenticator shows
 that is not in that list is a stray the user may delete from the browser's or security key's
@@ -3365,7 +3411,10 @@ passkey is then refused with, audited `auth.webauthn_failed`, include at least
 `reason=factor_removed`, `reason=factor_unverified` when the passkey set read after the write fails
 its seal, `reason=session_lost` when the session or the account went with it, and `reason=locked`;
 an MFA reset gives `reason=session_lost` once its revocation has landed, and
-`reason=factor_removed` before.
+`reason=factor_removed` before. A database driver error, a lost connection or a pool acquire timeout
+in the passkey set read after the write, on any sign-count answer, is refused with
+`reason=store_error` and leaves the factor unmarked (BACKLOG #3775); what still raises there is
+listed in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment of 2026-10-17.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). Unless a setting turns it off or loosens it (at least
 `[auth].login_rate_limit_enabled = false`; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced)
@@ -3918,13 +3967,13 @@ slack.
 | Client-address monoculture | the set of distinct observed client addresses | allow-list in use **and** no trusted proxy declared **and** ≥ 50 observations **and** all resolved to the same loopback address | **LOG** — one-shot WARNING + `client_address_monoculture` on `GET /security/posture` | n/a | (derived; no knob) |
 | Login attempt rate, per client IP **and** globally | `api.security.client_ip`, which returns the ASGI `scope["client"][0]` the *Client source network* row evaluates; an attempt with no address is counted under the literal `"unknown"` | > 10 attempts per IP (`login_rate_limit_per_ip`), or > 60 across all clients (`login_rate_limit_global`), in a rolling 60 s window (`login_rate_limit_window_seconds`); a refused attempt is not itself counted | **THROTTLE** — 429 `too many attempts` with **no** `Retry-After` on the three JSON routes; 429 + a `Retry-After` of the whole sign-in window on `POST /ui/login` and on `POST /ui/login/passkey`, the passkey sign-in's begin leg; a **303** redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`) on `GET /ui/sso`, `POST /ui/oidc/start` and `GET /ui/oidc/callback` (a sign-in return; a step-up return draws the ceremony budget, BACKLOG #3374), and on `GET /ui/oidc/start` only when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)). WARNING-logged, deliberately **not** audited | on, 10 / 60 / 60 s | `[auth].login_rate_limit_enabled` |
 | Credential-ceremony rate, per **actor** | `identity.user_id` (**not** an IP); on an IdP step-up's return, which has no session, the user id its staged flow names | > `login_rate_limit_per_ip` (10) ceremonies per actor per 60 s, on each of the actor's keys (the *Credential ceremonies* row of [Business-logic limits](#business-logic-limits-asvs-213) names them); **no** global dimension (`glob=0`, deliberately) | **THROTTLE** 429, logged | on with the row above | *gated by the same* `[auth].login_rate_limit_enabled` |
-| Consecutive credential failures on one account | the account's two failure counters (ADR 0197): the **sign-in** counter and the **second-step** counter | ≥ 5 consecutive failures on one counter locks for 15 minutes, with one exception: while the credential in force is engine-generated (set by an administrator's account creation, `POST /users`, and by both resets), sign-in failures are counted and audited but arm no sign-in lock (`lockout_arms`, ADR 0197 Amendment A); a lapsed window restarts the counter; the second-step lock on a local account, and the sign-in lock on a local account with a TOTP enrolled, unless the engine KNOWS this release refuses that enrolment (a TOTP it cannot judge still escalates, and a known-refused one escalates too in the races listed under [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068), BACKLOG #3422), double per cycle up to 24 hours | **DENY** before any verify on the password and second-factor legs, plus an audit row whose name is leg-specific — on the password path the uniform `auth.login_failed` (`bad_credentials`) row every refused sign-in writes and then `auth.login_locked`, which only `users:manage` reads ([Audit](#audit)), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on at least the TOTP/recovery and assertion legs, and on a directory account's two enrolment legs (the sign-in password path still runs a dummy argon2 verify to keep timing flat). The second-step lock refuses every one of those legs. The sign-in lock has **two** exceptions: it does **not** refuse a combined sign-in (password and TOTP code in one request) on a local account with TOTP enrolled, and it refuses **no** second-factor leg. The Kerberos and OIDC sign-ins also refuse a row under either lock, but only **after** the ticket or token has verified, audited `auth.login_failed` with `reason=locked` (`_directory_login_refusal`, BACKLOG #1638); neither leg feeds the counter. The password legs of the post-session re-proofs, `POST /me/reauth` and `POST /me/password` and their console twins `POST /ui/reauth` and `POST /ui/account/password`, **feed** the sign-in counter but are **not** refused by either lock; the IdP step-up of an `oidc` session checks no engine credential and feeds neither counter; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session, audited as `auth.reauth` with `session_revoked=true` or `auth.password_change_failed` with `reason=session_revoked` | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` |
+| Consecutive credential failures on one account | the account's two failure counters (ADR 0197): the **sign-in** counter and the **second-step** counter | ≥ 5 consecutive failures on one counter locks for 15 minutes, with one exception: while the credential in force is engine-generated (set by an administrator's account creation, `POST /users`, and by both resets), sign-in failures are counted and audited but arm no sign-in lock (`lockout_arms`, ADR 0197 Amendment A); a lapsed window restarts the counter; the second-step lock on a local account, and the sign-in lock on a local account with a TOTP enrolled, unless the engine KNOWS this release refuses that enrolment (a TOTP it cannot judge still escalates, and a known-refused one escalates too in the races listed under [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068), BACKLOG #3422), double per cycle up to 24 hours | **DENY** before any verify on the password and second-factor legs, plus an audit row whose name is leg-specific — on the password path the uniform `auth.login_failed` (`bad_credentials`) row every refused sign-in writes and then `auth.login_locked`, which only `users:manage` reads ([Audit](#audit)), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on at least the TOTP/recovery and assertion legs, and on a directory account's two enrolment legs (the sign-in password path still runs a dummy argon2 verify to keep timing flat). The second-step lock refuses every one of those legs. The sign-in lock has **two** exceptions: it does **not** refuse a combined sign-in, either the password and a TOTP code in one request on a local account with TOTP enrolled, or the password and a passkey assertion in one request on a local account holding a discoverable passkey under the request's relying party ([WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068), ADR 0197 Amendment A wave 2); and it refuses **no** second-factor leg. The Kerberos and OIDC sign-ins also refuse a row under either lock, but only **after** the ticket or token has verified, audited `auth.login_failed` with `reason=locked` (`_directory_login_refusal`, BACKLOG #1638); neither leg feeds the counter. The password legs of the post-session re-proofs, `POST /me/reauth` and `POST /me/password` and their console twins `POST /ui/reauth` and `POST /ui/account/password`, **feed** the sign-in counter but are **not** refused by either lock; the IdP step-up of an `oidc` session checks no engine credential and feeds neither counter; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session, audited as `auth.reauth` with `session_revoked=true` or `auth.password_change_failed` with `reason=session_revoked` | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` |
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (as [Administrative-interface defense-in-depth](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842) defines it) | **CHALLENGE** — force a fresh step-up on a step-up route, a PHI read (`require_phi_read`, a monitoring `reveal`, the console's `phi=True` pages) or a paced write (`require_paced`, the console's writes), since vault BACKLOG #2620 for the last two; the base gate never asks, so the monitoring polls are not refused. A first sighting also writes `auth.new_address_reverify_required` + an out-of-band notice, debounced and capped per session as that section states; repeats WARNING-log only. **Never** an RBAC deny | **on**; `false` is a named loosening | `[auth].admin_new_ip_step_up` |
-| First-seen sign-in address — sign-in owes no second factor (local leg) | the sign-in's client address vs the account's known-address record (the `known_login_addresses` table, vault BACKLOG #2145): one row per host from which the account finished a sign-in, passed a step-up, or confirmed a factor enrolment, keyed on the account id and deleted with the account. An administrator's password reset or MFA reset deletes every address in it (vault BACKLOG #2946). It then writes one marker row stamped at the epoch. No lookback read returns that row, and it still counts as a row of any age. Revoking every session clears nothing. These events write a row: a local sign-in that owed no factor, from a known address or with no baseline yet; a directory sign-in that owes nothing more, whatever the verdict except a failed read, so a first-seen address and an account's first sign-in both write (no directory session is seeded, so there is no challenge to skip); a combined sign-in; a second factor proved (a TOTP or recovery code at the MFA gate, or a passkey assertion), whether it finishes a sign-in or is a step-up on a session that has already met its factor; a factor enrolment confirmed, TOTP or passkey, first or later, from a known address or by an account with no baseline yet (not from a first-seen address, because a holder of the password alone may enrol an authenticator, ADR 0197 Amendment A; this only delays such a holder until a code from that authenticator is proved, and the enrolment sends its own notice); and a step-up, by password or at the IdP, by an account that owes no second factor. That test is asked of the account, not of this session. Under `require_mfa` every directory account owes a factor, so no directory step-up by password or at the IdP writes, even one that re-proved the MFA claim. At the sign-in itself a failed record read writes nothing, on either leg. A combined sign-in is the exception, because it proved its code from that address. A factor proved afterwards still writes. Nothing is written for a request with no client address. A host compares as one key: an IPv4-mapped form is its IPv4 address, and every loopback form is one host. Only a row seen within the lookback (`_LOGIN_ADDRESS_LOOKBACK_SECONDS` in `auth/service.py`, 90 days) counts as a match, and each write prunes the account's older rows. The no-baseline test reads rows of any age, so an account whose only row came from an enrolment and has aged out is still judged, not failed open. Read through the record's primary key at session mint on the local, Kerberos and OIDC legs, after the first credential verified | no known address seen within the lookback is the same host **and** the account has a baseline: it has finished a sign-in before, or holds a row of any age. With neither, no client address, or a failed read, the signal fails open and writes `auth.login_address_unevaluated` with `reason` `no_baseline`, `unknown_address` or `read_failed` | **CHALLENGE** — `auth.login_new_ip` + an out-of-band `login_new_ip` notice (at most one per account and address per 15 minutes; the audit row is written every time), and the session is minted **without** step-up freshness (`seed_reauth=False`), except a combined sign-in (password and TOTP code in one request, ADR 0197), which proved the second factor in the same request and is seeded as `verify_mfa` seeds it. **Never** refuses the login. The challenged sign-in does not make its address known, so a second sign-in from it is challenged again; a step-up from that address passes the challenge and records it (vault BACKLOG #2145) | on | (no knob) |
-| First-seen sign-in address — sign-in owes a second factor, or any directory sign-in | as the row above | as the row above | **LOG** — the same audit row and notice. A directory sign-in that owes nothing more also records the address, so the next one from it is not reported again; nothing else changes. **Under the shipped `require_mfa` a Kerberos sign-in always owes a factor**, and so does an OIDC one while `oidc_require_mfa_claim` is off. Such a sign-in records nothing; the factor leg that finishes it records the address instead: a TOTP or recovery code, a passkey, or a factor enrolment, under the conditions in the row above. So on this leg, as on the local one, every sign-in is unjudged (`no_baseline`) until one finishes, and a sign-in abandoned at the factor prompt records nothing. Under the same default no directory step-up records an address (see the row above). Such a session is born without step-up freshness anyway. A later proof stamps the window, for example a TOTP or recovery code, or a step-up (a passkey alone does not). On an OIDC session only the IdP step-up does (BACKLOG #2142). A Kerberos or password session steps up with the account password; an `oidc` session steps up at the IdP. Under the shipped `require_mfa` scope (`every_local_account`) this is the path every password-only local sign-in takes. A combined sign-in (password and TOTP code in one request) owes nothing more, so it takes the row above instead and is seeded from any address. **Never** refuses the login (BACKLOG #288) | on | (no knob) |
+| First-seen sign-in address — sign-in owes no second factor (local leg) | the sign-in's client address vs the account's known-address record (the `known_login_addresses` table, vault BACKLOG #2145): one row per host from which the account finished a sign-in, passed a step-up, or confirmed a factor enrolment, keyed on the account id and deleted with the account. An administrator's password reset or MFA reset deletes every address in it (vault BACKLOG #2946). It then writes one marker row stamped at the epoch. No lookback read returns that row, and it still counts as a row of any age. Revoking every session clears nothing. These events write a row: a local sign-in that owed no factor, from a known address or with no baseline yet; a directory sign-in that owes nothing more, whatever the verdict except a failed read, so a first-seen address and an account's first sign-in both write (no directory session is seeded, so there is no challenge to skip); a combined sign-in; a second factor proved (a TOTP or recovery code at the MFA gate, or a passkey assertion), whether it finishes a sign-in or is a step-up on a session that has already met its factor; a factor enrolment confirmed, TOTP or passkey, first or later, from a known address or by an account with no baseline yet (not from a first-seen address, because a holder of the password alone may enrol an authenticator, ADR 0197 Amendment A; this only delays such a holder until a code from that authenticator is proved, and the enrolment sends its own notice); and a step-up, by password or at the IdP, by an account that owes no second factor. That test is asked of the account, not of this session. Under `require_mfa` every directory account owes a factor, so no directory step-up by password or at the IdP writes, even one that re-proved the MFA claim. At the sign-in itself a failed record read writes nothing, on either leg. A combined sign-in is the exception, because it proved its second factor from that address. A factor proved afterwards still writes. Nothing is written for a request with no client address. A host compares as one key: an IPv4-mapped form is its IPv4 address, and every loopback form is one host. Only a row seen within the lookback (`_LOGIN_ADDRESS_LOOKBACK_SECONDS` in `auth/service.py`, 90 days) counts as a match, and each write prunes the account's older rows. The no-baseline test reads rows of any age, so an account whose only row came from an enrolment and has aged out is still judged, not failed open. Read through the record's primary key at session mint on the local, Kerberos and OIDC legs, after the first credential verified | no known address seen within the lookback is the same host **and** the account has a baseline: it has finished a sign-in before, or holds a row of any age. With neither, no client address, or a failed read, the signal fails open and writes `auth.login_address_unevaluated` with `reason` `no_baseline`, `unknown_address` or `read_failed` | **CHALLENGE** — `auth.login_new_ip` + an out-of-band `login_new_ip` notice (at most one per account and address per 15 minutes; the audit row is written every time), and the session is minted **without** step-up freshness (`seed_reauth=False`), except a combined sign-in (password and a TOTP code or a passkey assertion in one request, under the conditions of [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753); ADR 0197 and its Amendment A), which proved the second factor in the same request and is seeded as `verify_mfa` seeds it. **Never** refuses the login. The challenged sign-in does not make its address known, so a second sign-in from it is challenged again; a step-up from that address passes the challenge and records it (vault BACKLOG #2145) | on | (no knob) |
+| First-seen sign-in address — sign-in owes a second factor, or any directory sign-in | as the row above | as the row above | **LOG** — the same audit row and notice. A directory sign-in that owes nothing more also records the address, so the next one from it is not reported again; nothing else changes. **Under the shipped `require_mfa` a Kerberos sign-in always owes a factor**, and so does an OIDC one while `oidc_require_mfa_claim` is off. Such a sign-in records nothing; the factor leg that finishes it records the address instead: a TOTP or recovery code, a passkey, or a factor enrolment, under the conditions in the row above. So on this leg, as on the local one, every sign-in is unjudged (`no_baseline`) until one finishes, and a sign-in abandoned at the factor prompt records nothing. Under the same default no directory step-up records an address (see the row above). Such a session is born without step-up freshness anyway. A later proof stamps the window, for example a TOTP or recovery code, or a step-up (a passkey alone does not). On an OIDC session only the IdP step-up does (BACKLOG #2142). A Kerberos or password session steps up with the account password; an `oidc` session steps up at the IdP. Under the shipped `require_mfa` scope (`every_local_account`) this is the path every password-only local sign-in takes. A combined sign-in (password and a TOTP code or a passkey assertion in one request) owes nothing more, so it takes the row above instead and is seeded from any address. **Never** refuses the login (BACKLOG #288) | on | (no knob) |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`; an `oidc` session's JSON refusal names the IdP leg, see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) | 300 s | `[auth].step_up_max_age_seconds` |
 | Action-bound step-up grant | a single-use grant minted only by a successful step-up, on the **monotonic** clock: `reauth(purpose=…)` for the password or re-bind leg (`POST /me/reauth`, `POST /ui/reauth`), and `complete_oidc_step_up` for an `oidc` session's IdP leg, for the action the operator started from. Never by a sign-in or by `verify_mfa` | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind or a session terminate**, see the row below | on | `[auth].require_action_step_up` |
-| Binding a NEW second factor, ending sessions, or changing the password | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`), ends sessions (`session_terminate`, BACKLOG #1951) or changes the password (`POST /me/password` and `/ui/account/password`, BACKLOG #1954) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, `/ui/mfa`, or the code/passkey leg of `/ui/reauth`); the password routes answer 403 + `X-MFA-Required` (console: 303 → `/ui/mfa`, except a covered local account whose passkeys are not discoverable and which has no TOTP, which the console sends to the enrolment page). This refusal never reaches an account with **no** factor, which has nothing to prove: it enrols its first factor and ends its own sessions from a password-only session, which is what the MFA gate's exemptions are for. Two other rules still bind it. Under `[security].require_mfa` a covered local account's first factor must be TOTP or a discoverable passkey: a passkey whose client reports it is not discoverable is refused at the registration finish, and the password change is refused with `enrol an authenticator app first` until such a factor exists (`FactorEnrolmentRequired`, ADR 0197 Amendment A; console: a 303 to the enrolment page). And a must-change session cannot end its sessions at all, because the must-change confinement does not admit those routes. With the requirement off, such an account changes its password as before. The passkey registration **finish** asks the same rule again (`finish_webauthn_registration`, BACKLOG #3014), because its console route rides the action-less gate: a ceremony staged before the account gained a factor is refused with **400** `this account already has a second factor`, its ceremony ended, audited `auth.mfa_denied`. Both enrolment legs, this finish and the TOTP confirm (`confirm_mfa_enrollment`, whose first ask is its route's gate), ask it once more after the login-to-MFA floor and a directory account's directory lookup. A factor bound on another session during either is refused with a 400 `this account already has a second factor`, audited `auth.mfa_denied`. The TOTP confirm refuses this way only for a passkey, before it spends a step or mints a recovery code; a TOTP enabled meanwhile is left to its enable's compare-and-set, which ends the session (BACKLOG #2224). Read-then-act: a factor bound after that second ask, for example while the TOTP confirm hashes its recovery codes, is not caught (BACKLOG #3061) | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
+| Binding a NEW second factor, ending sessions, or changing the password | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`), ends sessions (`session_terminate`, BACKLOG #1951) or changes the password (`POST /me/password` and `/ui/account/password`, BACKLOG #1954) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, `/ui/mfa`, or the code/passkey leg of `/ui/reauth`); the password routes answer 403 + `X-MFA-Required` (console: 303 → `/ui/mfa`, except a covered local account whose passkeys are not discoverable and which has no TOTP, which the console sends to the enrolment page). This refusal never reaches an account with **no** factor, which has nothing to prove: it enrols its first factor and ends its own sessions from a password-only session, which is what the MFA gate's exemptions are for. Two other rules still bind it. Under `[security].require_mfa` a covered local account's first factor must be TOTP or a discoverable passkey: a passkey whose client reports it is not discoverable is refused at the registration finish, and the password change is refused with `enrol an authenticator app first` until such a factor exists (`FactorEnrolmentRequired`, ADR 0197 Amendment A; console: a 303 to the enrolment page). And a must-change session cannot end its sessions at all, because the must-change confinement does not admit those routes. With the requirement off, such an account changes its password as before. The passkey registration **finish** asks the same rule again (`finish_webauthn_registration`, BACKLOG #3014), because its console route rides the action-less gate: a ceremony staged before the account gained a factor is refused with **400** `this account already has a second factor`, its ceremony ended, audited `auth.mfa_denied`. Both enrolment legs, this finish and the TOTP confirm (`confirm_mfa_enrollment`, whose first ask is its route's gate), ask it once more after the login-to-MFA floor and a directory account's directory lookup. A factor bound on another session during either is refused with a 400 `this account already has a second factor`, audited `auth.mfa_denied`. The TOTP confirm refuses this way only for a passkey, before it spends a step or mints a recovery code; a TOTP enabled meanwhile is left to its enable's compare-and-set, which ends the session (BACKLOG #2224). On the passkey finish the insert is conditional too: the store asks the same rule inside the insert's own transaction, so a factor bound on another session after that second ask is refused there, with the same 400 and the same `auth.mfa_denied` row, no passkey stored and the session not stamped (BACKLOG #3690 item 1). The server backends lock the account row for that check, as every factor write there does, and the session row after it. SQLite holds its one writer lock instead, which no other writer in the process passes; a write from another process that commits between the check and the insert fails the finish with an error, storing nothing, rather than the 400. The rule is the same one: a session already stamped MFA-verified, including one a sign-in that owed nothing minted stamped, is not refused. The TOTP confirm is still read-then-act: a factor bound after its second ask, for example while it hashes its recovery codes, is not caught (BACKLOG #3061) | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
 | MFA state | `session.mfa_verified_at` × factor enrollment × account roles | the rule is **provider-blind** (BACKLOG #1144 — an AD account used to be exempt here, on a delegation the directory never asserted): enrolled → always required, whatever the scope says; un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every account despite the value's narrower name, or the Administrator role only under `administrators`. A directory session that was minted without an engine-verified factor stays MFA-pending while the knob is on, whatever the scope (`AuthService._unverified_session_owes_factor`, the one provider-keyed step) | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
 | Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**. Whether the step-up goes to the IdP depends on how the **session** was minted (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)): an `oidc` session steps up at the IdP and is never asked for a password. Otherwise this attribute picks the leg: for an AD identity, a **live directory re-bind** instead of a local hash compare. Both legs refuse a disabled AD account, because the directory lookup each one runs finds no enabled entry. So a disabled AD account cannot refresh its window **by a step-up**. Nor can it with an engine TOTP or recovery code once the directory reports it disabled: `verify_mfa` asks the directory first, by the row's directory id, and refuses an account the directory does not confirm (BACKLOG #2023) or a row with no directory id (BACKLOG #2027). Its passkey cannot clear the MFA gate either, because the passkey leg asks the same (BACKLOG #2239); see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753). The provider does **not** exempt the identity from the engine MFA gate (see the MFA state row): a directory session minted without an engine-verified factor (every Kerberos session, and an OIDC one while `oidc_require_mfa_claim` is off) is refused while `[security].require_mfa` is on, whatever the scope, and with it off is refused only once the account has enrolled a factor. The gate does not fire once the session is MFA-verified: at mint, for an OIDC sign-in whose signed `amr`/`acr` passed the claim gate, or later, once the holder proves the engine factor | n/a | `[auth].ad_enabled` |
 | Authentication ambience | how the session was minted | every directory sign-in -- Kerberos by `GET /ui/sso` or `POST /auth/negotiate`, and the OIDC callback -- mints with `seed_reauth=False`, decided inside `_complete_ad_login` rather than by the caller (BACKLOG #1144 step 5) | **CHALLENGE** — the session is born **without** step-up freshness, so a sensitive action forces an explicit credential step-up. A Kerberos session skips it when its holder has already proved a TOTP or recovery code at the MFA gate, which stamps a window (a passkey does not; see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). An OIDC session never does: a code meets its pending factor but opens no window, so its step-up is always the IdP leg (BACKLOG #2142, ADR 0142 Amendment F, a seat decision under owner delegation 2026-10-08, not an owner ruling) (the *second* signal in this table whose action is a challenge rather than a hard decision) | n/a | (by design) |
@@ -4620,13 +4669,20 @@ on that session, for example) ends it as a revocation would.
   server log carries a WARNING with the counts beside that audit row, not an error with a
   traceback.
 
-  **The stop does not reach the client as a failed download, in the shipped code.** The export
-  raises to abort the transfer, but the engine's `@app.middleware("http")` layers end the
-  response cleanly before that raise leaves them. So a client receives a 200 that ends normally
-  and holds only the rows streamed before the stop, and it cannot tell that file from a complete
-  export. The `messages_export.stopped` row and the server's WARNING record that it is short;
-  the file itself does not. This was
-  found under BACKLOG #3381 and is not fixed there. The same holds for the audit export below.
+  **A stop reaches an HTTP/1.1 client as a failed download.** The 200 has already started, so the
+  export cannot change its status. It raises instead, and the server drops the connection with the
+  chunked body unfinished, so the client sees a transfer that failed rather than a short file that
+  ends normally. `tests/test_export_stop_wire.py` measures both exports that way over cleartext
+  loopback, with uvicorn's stock h11 and httptools protocols. At least these are not measured:
+  the engine's TLS hop, the floored protocol class `serve` runs, a proxy in front, the console's
+  `/ui/audit/export`, and an HTTP/1.0 client. Under h11 an HTTP/1.0 body is framed by the
+  connection close, so a dropped connection can read as a normal end there. The file itself
+  carries no end marker, so a client that writes rows as they arrive (`curl -o`, for one) keeps
+  every row it received and must check that the transfer succeeded. The
+  `messages_export.stopped` row and the server's WARNING record how many rows the engine handed to
+  the server before the stop, which is not proof the client received them. This holds only while
+  every middleware in the engine's response path is pure ASGI; see `ExportStopped`. The same
+  holds for the audit export below.
 
   While rows flow, the export moves the session's idle clock at most every quarter of the idle
   window. So a long download does not end its own session. One stall can, though. If the client
@@ -4640,8 +4696,8 @@ on that session, for example) ends it as a revocation would.
   identity the export started with. A caller that may now read fewer rows, as after losing
   `users:manage`, would still receive the lock rows. So that stops it too, with the reason
   `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
-  the reason, then raises to abort the transfer, which reaches the client as a cleanly ended short
-  file, as the bulk export bullet above says. The idle clock moves as the bulk export's does, at most
+  the reason, then raises to abort the transfer, which reaches the client as a failed download,
+  as the bulk export bullet above says. The idle clock moves as the bulk export's does, at most
   every quarter of the window.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
@@ -4792,8 +4848,10 @@ the right one*:
   set exceeds **both** `ad_session_revoke_max` (5) **and** `ad_session_revoke_max_fraction` (0.34) of
   the probed population **aborts**: nothing is revoked, nothing is written, the engine logs at ERROR
   and audits `auth.ad_reconcile_aborted`, raises the `ad_reconcile_aborted` alert, and the condition
-  latches until a clean pass. A whole-directory outage audits `auth.ad_reconcile_skipped` instead and
-  raises no alert. Both thresholds
+  latches until a clean pass. A whole-directory outage audits `auth.ad_reconcile_skipped` instead, and
+  one such pass raises no alert. A run of `ad_reconcile_outage_passes` of them (3 by default) pages
+  once, and the first pass that reaches the directory resolves it (BACKLOG #3709;
+  [CONFIGURATION.md](CONFIGURATION.md) has the row). Both thresholds
   must be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
 
@@ -4844,7 +4902,8 @@ estate is still reconciled. A pass with any fault logs one ERROR naming no accou
 `probe_fault`, under its own source `directory-reconciler-probe-fault`. If every probe faults or
 fails, at least one a fault, the pass judges no account it asked about and revokes nothing, like an
 outage, but it still pages, and it still strikes an id-less row (BACKLOG #3170). A pass where every
-probe fails and none faults is a plain outage, and pages nobody. A
+probe fails and none faults is a plain outage, and pages nobody until a run of them lasts
+`ad_reconcile_outage_passes` passes (BACKLOG #3709). A
 connection, timeout or name-lookup error that escapes the directory layer is still read as
 unreachable. So is at least an operating-system error saying the network or host is unreachable,
 down or reset. Another network-class error can still read as a probe fault and page.
@@ -4858,7 +4917,7 @@ A search the directory refuses with noSuchObject, invalidDNSyntax or insufficien
 configuration refusal (BACKLOG #3010). A search base that was deleted or moved, or that the service
 account may not read, answers so for every account on every pass. Before #3010 the engine read that
 as "not found", which struck every account and tripped the breaker on a large enough estate. Nor is
-it read as an outage, which would page nobody. The refused account is left unjudged: no strike, no
+it read as an outage, which would page only once the outage lasted. The refused account is left unjudged: no strike, no
 revocation. A pass with any such refusal logs one ERROR naming the code and no account, audits
 `auth.ad_reconcile_misconfigured`, and raises the `ad_reconcile_aborted` alert with reason
 `directory_misconfigured`, under its own source `directory-reconciler-misconfigured`. If every
@@ -5003,8 +5062,8 @@ the console, through `POST /ui/reauth/webauthn`, because the JSON plane has no p
 JSON-only client cannot rotate it. Before this change such a client could rotate it and then do
 nothing else. Its next sign-in was pending, with no way to prove a passkey there. Under
 `[security].require_mfa` a covered passkey-only account rotates only once it holds a way past
-the sign-in lock: `_has_way_past` counts TOTP or a passkey recorded as discoverable (ADR 0197
-Amendment A, wave 2). One whose passkeys are not discoverable must also enrol a factor that is
+the sign-in lock: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
+configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). One whose passkeys are not discoverable must also enrol a factor that is
 before it rotates, so after the passkey it goes to the enrolment page, and only then to the password
 page. Such an account exists only where its passkey came before the requirement covered it, or
 before wave 2: a store from before ADR 0197 Amendment A, a site that turned `require_mfa` on or
@@ -5814,7 +5873,8 @@ ceiling (`glob=0`), where the sign-in window caps all addresses together at 60 a
 
 **What a tripped control looks like (6.1.1's "consequences of these defenses being triggered").**
 Control 1 refuses before checking the presented credential and audits the refusal, with one
-exception: the sign-in lock lets a **combined** sign-in on a local account with TOTP enrolled through
+exception: the sign-in lock lets a **combined** sign-in through, on a local account with TOTP enrolled
+or as the combined passkey sign-in [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068) describes,
 to a check of **both** factors, and refuses it only if they are not both right, in the same answer
 and the same padded time as every other refusal (ADR 0197). (The password path still hashes against
 a dummy value first, so a locked account answers in about the time a real check takes.) The event name differs per leg:
@@ -5867,7 +5927,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /auth/negotiate` | sign-in window | |
 | `POST /auth/mfa-verify` | sign-in window | an **authenticated** route drawing the sign-in budget (it is a mid-login challenge); also feeds the per-account lockout |
 | `POST /ui/login` | sign-in window | 429 carries a `Retry-After` of the whole sign-in window |
-| `POST /ui/login/passkey` | sign-in window | the passkey sign-in's begin leg (ADR 0197 Amendment A wave 2), charged **before** it stages a challenge; one passkey sign-in charges the window twice, here and at `POST /ui/login`. 429 as `POST /ui/login` |
+| `POST /ui/login/passkey` | sign-in window | the passkey sign-in's begin leg (ADR 0197 Amendment A wave 2), charged **before** it stages a challenge; `POST /ui/login` then renews that hit rather than charging again when it is still in the window (`StagedChallenge.paid`), so one passkey sign-in charges the window once. 429 as `POST /ui/login` |
 | `GET /ui/sso` | sign-in window | the token-bearing leg only; the RFC 4559 challenge leg is deliberately unthrottled |
 | `POST /ui/oidc/start`, `GET /ui/oidc/callback` | sign-in window; the callback's step-up return draws the per-actor ceremony budget instead | one browser login charges it **twice**. The callback reads the flow its cookie names first: a live step-up flow's return charges a key of its own for the user that flow names, as the `POST /ui/reauth/oidc` row says, and every other callback charges the sign-in window (BACKLOG #3374). **Note the verb, and the condition on the GET.** The start leg is a **POST** since the ASVS 3.7.3 interstitial. By default `GET /ui/oidc/start` renders the "you are leaving this site" page, stages **no** flow and charges **no** limiter; the flow starts only when the operator confirms with the POST. **The GET skips that page** when `[security].external_link_interstitial` is off, or when the IdP's authorization host is inside `[security].organization_domains` or on `[security].external_link_allowlist` (`_interstitial_needed()` false). It then runs the POST leg itself (`ui_oidc_start`): the same-origin check, this limiter, the `Sec-Fetch-Mode` check and a staged flow, with the same 303 on a throttle. So the GET charges the window and stages a flow exactly when the interstitial is skipped. |
 | `POST /me/password` | per-actor ceremony budget | **not** the sign-in window |

@@ -95,6 +95,7 @@ from messagefoundry.store.store import (
     OperatorAudit,
     OutboxItem,
     OwnedLanes,
+    PasskeyCounts,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -2227,6 +2228,7 @@ class AuthStore(Protocol):
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool: ...
 
@@ -2366,6 +2368,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool: ...
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]: ...
@@ -2377,7 +2380,19 @@ class AuthStore(Protocol):
     async def consume_totp_step(self, user_id: str, step: int) -> bool: ...
 
     # --- MFA: WebAuthn passkeys second factor (local accounts, WP-14b / ADR 0068) ---
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None: ...
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
+        """Persist one passkey and return True. With ``for_session`` (a session's token hash) it
+        is CONDITIONAL (BACKLOG #3014, #3690): inside the insert's own transaction it asks
+        ``session_owes_unproven_factor`` and, when the account now holds a second factor that
+        session has not proven, or the session is gone, writes nothing and returns False. So a
+        factor bound on another session after the service's own check is still refused. How each
+        backend excludes a concurrent writer differs, and each implementation says how: the server
+        backends lock the account and session rows; SQLite holds its one in-process writer lock and
+        a deferred ``BEGIN``, so a write from another process fails the insert with an error.
+        ``None`` keeps the unconditional insert, for callers that bind no factor for a session."""
+        ...
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]: ...
 
@@ -2395,7 +2410,9 @@ class AuthStore(Protocol):
     # ``totp_usable`` (BACKLOG #3422) is the caller's rule for what an OPENED TOTP secret is
     # (``TotpState``); the conditional writes count TOTP as a way past unless it is a KNOWN refusal,
     # so an unknown one counts as the plain enabled-TOTP rule counts it. The same keyword on
-    # ``set_password``.
+    # ``set_password``. ``passkey_counts`` (BACKLOG #3937) is the caller's rule for which passkey
+    # counts, the auth service's narrowing to the configured relying party; ``None`` is
+    # ``passkey_is_way_past`` alone. The same keyword on ``set_password`` and ``disable_totp``.
     async def delete_webauthn_credential(
         self,
         user_id: str,
@@ -2403,6 +2420,7 @@ class AuthStore(Protocol):
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool: ...
 
     async def rehash_webauthn_credential(
