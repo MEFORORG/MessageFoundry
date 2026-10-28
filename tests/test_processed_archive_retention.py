@@ -13,6 +13,7 @@ archived the copy rather than on the drop's own mtime.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -25,13 +26,22 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
 from messagefoundry.config.settings import EgressSettings, RetentionSettings
-from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+from messagefoundry.config.wiring import (
+    ConnectionSpec,
+    InboundConnection,
+    OutboundConnection,
+    Registry,
+)
+from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.retention import RetentionRunner
+from messagefoundry.pipeline.sharding import filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
+from messagefoundry.transports import base as transport_base
 from messagefoundry.transports import file as file_transport
 from messagefoundry.transports.base import (
     ArchiveGuard,
+    ArchiveGuardUnresolved,
     ProcessedArchive,
     build_archive_guard,
     guarded_source_dirs,
@@ -344,6 +354,120 @@ def test_the_registry_runner_guards_an_unbound_file_inbound(tmp_path: Path) -> N
     assert runner.archive_guard_dirs() == (inbox, inbox / ".error")
 
 
+def _runner(reg: Registry) -> RegistryRunner:
+    return RegistryRunner(reg, None, egress=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]
+
+
+def _file_inbound(name: str, inbox: Path, shard: str | None = None) -> InboundConnection:
+    return InboundConnection(
+        name,
+        ConnectionSpec(ConnectorType.FILE, {"directory": str(inbox)}),
+        router="r",
+        shard=shard,
+    )
+
+
+def _file_outbound(name: str, out: Path) -> OutboundConnection:
+    return OutboundConnection(name, ConnectionSpec(ConnectorType.FILE, {"directory": str(out)}))
+
+
+def _refuse_stat_of(monkeypatch: pytest.MonkeyPatch, refused: Path) -> None:
+    """Make `stat` of ``refused`` fail as an unreadable directory would, and nothing else."""
+    real_stat = os.stat
+    target = Path(os.path.realpath(refused))
+
+    def refusing(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if isinstance(path, (str, os.PathLike)) and Path(path) == target:
+            raise PermissionError(errno.EACCES, "refused")
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", refusing)
+
+
+def test_the_guard_names_a_sibling_engine_shards_inbound(tmp_path: Path) -> None:
+    """Under `serve --shard` the runner's registry holds only this shard's inbounds; the guard still
+    names the sibling shard's watch and `.error` directories, from the whole config's specs.
+
+    Mutation: read `self.registry.inbound` in `archive_guard_dirs`, or drop `all_inbound_specs`
+    from the shard filter. Red."""
+    reg = Registry()
+    reg.add_inbound(_file_inbound("IB_MINE", tmp_path / "mine", shard="s1"))
+    reg.add_inbound(_file_inbound("IB_SIBLING", tmp_path / "sibling", shard="s2"))
+    s1 = filter_registry_for_shard(reg, "s1")
+    assert set(s1.inbound) == {"IB_MINE"}  # the precondition the guard must not rely on
+
+    dirs = _runner(s1).archive_guard_dirs()
+
+    assert dirs is not None
+    assert tmp_path / "sibling" in dirs and tmp_path / "sibling" / ".error" in dirs
+    assert tmp_path / "mine" in dirs
+
+
+def test_the_guard_names_every_file_outbound_target_directory(tmp_path: Path) -> None:
+    """A File outbound's target directory holds deliveries awaiting a partner's pickup.
+
+    Mutation: drop the outbound loop in `archive_guard_dirs`. Red."""
+    reg = Registry()
+    reg.add_outbound(_file_outbound("OB_PARTNER", tmp_path / "out"))
+
+    assert _runner(reg).archive_guard_dirs() == (tmp_path / "out",)
+
+
+def test_an_unresolvable_outbound_directory_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An outbound whose settings cannot be resolved makes the guard None, as an inbound's does."""
+    reg = Registry()
+    reg.add_outbound(_file_outbound("OB_PARTNER", tmp_path / "out"))
+    runner = _runner(reg)
+
+    def unresolved(*args: object, **kwargs: object) -> object:
+        raise ValueError("unresolved")
+
+    monkeypatch.setattr(wiring_runner, "resolve_env_settings", unresolved)
+
+    assert runner.archive_guard_dirs() is None
+
+
+def test_a_guarded_directory_whose_identity_cannot_be_read_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A guarded directory that exists but cannot be stat'ed would add no identity, so an alias of it
+    would pass the check once the archive is open. The guard refuses instead.
+
+    Mutation: `continue` on every stat failure in `build_archive_guard`. Red."""
+    guarded = tmp_path / "share"
+    guarded.mkdir()
+    _refuse_stat_of(monkeypatch, guarded)
+
+    with pytest.raises(ArchiveGuardUnresolved):
+        build_archive_guard({guarded})
+
+
+def test_an_unreachable_network_path_is_not_read_as_absent() -> None:
+    """Windows maps ERROR_BAD_NETPATH (53) to ENOENT; only its own not-found codes count as absent.
+
+    Mutation: read `exc.errno` alone in `_is_absent`. Red."""
+
+    class _NetPath(OSError):
+        winerror = 53
+
+    class _NotFound(OSError):
+        winerror = 3
+
+    assert not transport_base._is_absent(_NetPath(errno.ENOENT, "unreachable"))
+    assert transport_base._is_absent(_NotFound(errno.ENOENT, "absent"))
+
+
+def test_a_guarded_directory_not_created_yet_stands_in_by_its_parent(tmp_path: Path) -> None:
+    """A `.error` before the first quarantine does not switch the sweep off: its nearest existing
+    ancestor's identity is recorded instead."""
+    guard = build_archive_guard({tmp_path / "in" / ".error"})
+
+    st = os.stat(tmp_path)
+    assert not st.st_ino or (st.st_dev, st.st_ino) in guard.ids
+
+
 def test_a_missing_archive_directory_is_not_an_error(tmp_path: Path) -> None:
     assert _prune(_source(tmp_path / "in")) == 0
 
@@ -490,6 +614,83 @@ async def test_an_unresolvable_guard_sweeps_nothing(store: MessageStore, tmp_pat
     )
 
     result = await runner.run_once()
+
+    assert result.processed_archives_deleted == 0
+    assert old.exists()
+
+
+async def test_the_pass_spares_a_sibling_shards_drops(store: MessageStore, tmp_path: Path) -> None:
+    """End to end: shard s1's archive directory is shard s2's watch directory. s2's drop survives.
+
+    Mutation: as `test_the_guard_names_a_sibling_engine_shards_inbound`. Red."""
+    sibling = tmp_path / "sibling"
+    reg = Registry()
+    reg.add_inbound(_file_inbound("IB_MINE", tmp_path / "mine", shard="s1"))
+    reg.add_inbound(_file_inbound("IB_SIBLING", sibling, shard="s2"))
+    runner = _runner(filter_registry_for_shard(reg, "s1"))
+    a = _source(tmp_path / "mine", processed_subdir=str(sibling))
+    drop = _aged(sibling / "waiting.hl7", 90)
+    retention = RetentionRunner(
+        store,
+        _settings(processed_archive_days=30),
+        clock=lambda: _NOW,
+        archive_source=lambda: (a,),
+        guard_source=runner.archive_guard_dirs,
+    )
+
+    result = await retention.run_once()
+
+    assert result.processed_archives_deleted == 0
+    assert drop.exists()
+
+
+async def test_the_pass_spares_a_file_outbounds_deliveries(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """End to end: the archive directory is a File outbound's target. The delivery survives.
+
+    Mutation: as `test_the_guard_names_every_file_outbound_target_directory`. Red."""
+    out = tmp_path / "out"
+    reg = Registry()
+    reg.add_inbound(_file_inbound("IB_A", tmp_path / "a"))
+    reg.add_outbound(_file_outbound("OB_PARTNER", out))
+    runner = _runner(reg)
+    a = _source(tmp_path / "a", processed_subdir=str(out))
+    delivered = _aged(out / "for-pickup.hl7", 90)
+    retention = RetentionRunner(
+        store,
+        _settings(processed_archive_days=30),
+        clock=lambda: _NOW,
+        archive_source=lambda: (a,),
+        guard_source=runner.archive_guard_dirs,
+    )
+
+    result = await retention.run_once()
+
+    assert result.processed_archives_deleted == 0
+    assert delivered.exists()
+
+
+async def test_the_pass_sweeps_nothing_when_a_guarded_identity_is_unreadable(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: one guarded directory cannot be stat'ed, so no archive is swept.
+
+    Mutation: as `test_a_guarded_directory_whose_identity_cannot_be_read_fails_closed`. Red."""
+    src = _source(tmp_path / "in")
+    old = _aged(src.processed_dir / "old.hl7", 90)
+    other = tmp_path / "other-share"
+    other.mkdir()
+    _refuse_stat_of(monkeypatch, other)
+    retention = RetentionRunner(
+        store,
+        _settings(processed_archive_days=30),
+        clock=lambda: _NOW,
+        archive_source=lambda: (src,),
+        guard_source=lambda: (other,),
+    )
+
+    result = await retention.run_once()
 
     assert result.processed_archives_deleted == 0
     assert old.exists()

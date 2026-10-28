@@ -2022,8 +2022,9 @@ class Engine:
                     if self._registry_runner is not None
                     else ()
                 ),
-                # Every registry inbound's watch and `.error` directories, bound or not, which that
-                # sweep must never reach (BACKLOG #1188).
+                # Every inbound's watch and `.error` directories on every engine shard, and every
+                # File outbound's target directory, bound or not, which that sweep must never reach
+                # (BACKLOG #1188).
                 guard_source=lambda: (
                     self._registry_runner.archive_guard_dirs()
                     if self._registry_runner is not None

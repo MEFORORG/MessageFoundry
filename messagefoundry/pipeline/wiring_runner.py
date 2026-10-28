@@ -227,7 +227,9 @@ from messagefoundry.transports.base import (
     ReplyBodyDropped,
     SyncReplyResolver,
     check_file_key,
+    declares_guarded_destination_dirs,
     declares_guarded_dirs,
+    guarded_destination_dirs,
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
@@ -3052,32 +3054,52 @@ class RegistryRunner:
         return tuple(s for s in self._sources.values() if isinstance(s, ProcessedArchive))
 
     def archive_guard_dirs(self) -> tuple[Path, ...] | None:
-        """The watch and ``.error`` directories of EVERY registry inbound, bound or not, deployed or
-        not, which the ``.processed`` age sweep must never reach (BACKLOG #1188). Read from the
-        configuration rather than the running sources, so a stopped, failed or DR-parked inbound, or
-        one bound on another engine shard (each loads the whole registry), stays protected. None when
-        one inbound's settings cannot be resolved (a missing env() value, say): the caller then
-        deletes nothing, because a guard that silently drops a directory fails open."""
+        """The directories the ``.processed`` age sweep must never reach (BACKLOG #1188): the watch
+        and ``.error`` directories of EVERY inbound in the deployment, and the target directory of
+        every outbound, bound or not, deployed or not. Read from the configuration rather than the
+        running connections, so a stopped, failed or DR-parked one stays protected. Under
+        ``serve --shard`` this shard's ``inbound`` map holds only its own inbounds, so the inbounds
+        come from :meth:`Registry.inbound_specs`, the whole config's; outbounds are never filtered.
+        None when one connection's settings cannot be resolved (a missing env() value, say): the
+        caller then deletes nothing, because a guard that silently drops a directory fails open."""
         dirs: list[Path] = []
-        for ic in self.registry.inbound.values():
-            if not declares_guarded_dirs(ic.spec.type):
+        for name, spec in self.registry.inbound_specs().items():
+            if not declares_guarded_dirs(spec.type):
                 continue  # a fault in an inbound with no directories cannot hide one
             try:
                 settings = resolve_env_settings(
-                    ic.spec.settings, self._env_values, connection=inbound_record_name(ic.name)
+                    spec.settings, self._env_values, connection=inbound_record_name(name)
                 )
                 dirs.extend(
-                    guarded_source_dirs(Source(type=ic.spec.type, name=ic.name, settings=settings))
+                    guarded_source_dirs(Source(type=spec.type, name=name, settings=settings))
                 )
             except (WiringError, ValueError, TypeError, KeyError) as exc:
-                log.warning(
-                    "inbound connection %r: its directories could not be resolved for the "
-                    "[retention].processed_archive_days guard (%s)",
-                    ic.name,
-                    type(exc).__name__,
+                self._log_unresolved_guard("inbound", name, exc)
+                return None
+        for name, oc in self.registry.outbound.items():
+            if not declares_guarded_destination_dirs(oc.spec.type):
+                continue
+            try:
+                settings = resolve_env_settings(oc.spec.settings, self._env_values, connection=name)
+                dirs.extend(
+                    guarded_destination_dirs(
+                        Destination(type=oc.spec.type, name=name, settings=settings)
+                    )
                 )
+            except (WiringError, ValueError, TypeError, KeyError) as exc:
+                self._log_unresolved_guard("outbound", name, exc)
                 return None
         return tuple(dirs)
+
+    @staticmethod
+    def _log_unresolved_guard(kind: str, name: str, exc: Exception) -> None:
+        log.warning(
+            "%s connection %r: its directories could not be resolved for the "
+            "[retention].processed_archive_days guard (%s)",
+            kind,
+            name,
+            type(exc).__name__,
+        )
 
     async def park_intake(self, standby: Priority, *, keep: frozenset[str] = frozenset()) -> None:
         """Make this box a passive standby for intake and unbind every inbound, in one span of the

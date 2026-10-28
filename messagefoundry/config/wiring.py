@@ -5399,6 +5399,14 @@ class Registry:
     # not-deployed target (ADR 0111) and must decide that identically on every shard. Names and a
     # flag only, not the connections, for the same reason as `all_loopback_inbound`.
     all_pt_inbound: Mapping[str, bool] | None = None
+    # EVERY inbound's transport SPEC in the deployment (NAME -> type + settings, before env()
+    # resolution), pinned beside the shard identity by the same filter (None on an unfiltered graph /
+    # single-shard config, where `inbound` IS the whole config). Read only by the `.processed` archive
+    # sweep's guard (BACKLOG #1188): a sibling shard's watch directory is a fact about the CONFIG, and
+    # an archive directory that overlaps it would otherwise age out that shard's undelivered drops.
+    # Specs, not the connections, for the same reason as `all_loopback_inbound`: every other reader of
+    # `inbound` must keep seeing only this shard's.
+    all_inbound_specs: Mapping[str, ConnectionSpec] | None = None
     # The directory :func:`load_config` read this graph from, or None for a graph built in code. A
     # `[sandbox].mode=subprocess` worker re-loads its Router/Handler functions from here, so after
     # an operator reload from another root the workers load the root the running graph came from,
@@ -5418,6 +5426,15 @@ class Registry:
         if self.all_inbound is not None:
             return self.all_inbound
         return frozenset(self.inbound)
+
+    def inbound_specs(self) -> Mapping[str, ConnectionSpec]:
+        """Every inbound's transport spec in the deployment, NAME -> spec -- the pinned unfiltered map
+        when this is one engine shard's filtered view, else this graph's own inbounds. The source for
+        the ``.processed`` archive sweep's guard (BACKLOG #1188), which must protect a sibling shard's
+        watch and ``.error`` directories as well as this shard's."""
+        if self.all_inbound_specs is not None:
+            return self.all_inbound_specs
+        return {name: ic.spec for name, ic in self.inbound.items()}
 
     def loopback_inbound_names(self) -> frozenset[str]:
         """Every ``Loopback()`` inbound in the deployment — the pinned unfiltered set when this is one

@@ -237,4 +237,8 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
         all_pt_inbound=(
             MappingProxyType(dict(registry.passthrough_inbounds())) if sharded else None
         ),
+        # Pin the UNFILTERED inbound specs for the `.processed` archive sweep's guard (BACKLOG #1188):
+        # an archive directory equal to, or holding, a sibling shard's watch or `.error` directory
+        # would otherwise age out that shard's drops. Derived from the SOURCE registry, as above.
+        all_inbound_specs=(MappingProxyType(dict(registry.inbound_specs())) if sharded else None),
     )

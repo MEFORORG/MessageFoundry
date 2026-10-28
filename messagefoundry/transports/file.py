@@ -465,6 +465,16 @@ class FileDestination(DestinationConnector):
         # Set once a directory fsync has failed here, so it is logged once and not retried (#1618).
         self._dir_fsync_unsupported = False
 
+    @staticmethod
+    def guarded_dirs(config: Destination) -> tuple[Path, ...]:
+        """The target directory ``config`` names, which no ``.processed`` archive sweep may reach
+        (BACKLOG #1188): a delivered file there may still be awaiting the partner's pickup. Computed
+        from the configuration alone, so a stopped or undeployed outbound is protected too."""
+        s = config.settings
+        if "directory" not in s:
+            return ()
+        return (Path(s["directory"]),)
+
     async def _run_fs(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
         """Run a blocking filesystem callable off the event loop — under the alternate credential (on a
         dedicated impersonated thread) when one is configured, else via the shared
@@ -1896,7 +1906,8 @@ class FileSource(SourceConnector):
         logger.warning(
             "file source %s: the [retention].processed_archive_days sweep skips this connection, "
             "because its archive directory is, or contains, a File inbound's watch or error "
-            "directory; set processed_subdir to a directory of its own",
+            "directory or a File outbound's target directory; set processed_subdir to a directory "
+            "of its own",
             self._label,
         )
 
