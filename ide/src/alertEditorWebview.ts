@@ -93,15 +93,12 @@ export function alertEditorScript(
       $('rules').style.display = 'none';
       $('empty').style.display = 'none';
       $('add').disabled = true;
-      // Only a value in the file is the operator's to fix. A list that is not a list, an entry with
-      // no ordinal, or a null (TOML has none) comes from the command that printed it, and no edit to
-      // the file changes it. The quoting hint is given only for the case it fits.
-      const todo = problem.inFile
-        ? ' Fix that value in [[alerts.rules]] of the service-settings file' +
-          (problem.quoted ? ' (a number must not be quoted)' : '') + ', then run the Alert Rules command again.'
-        : ' No edit to the file fixes this: the command that lists the rules printed something this panel' +
-          ' does not expect. Run the Alert Rules command again, and report it if this stays.';
-      show('These rules cannot be shown. The list sent to this panel is malformed: ' + problem.text + '.' + todo +
+      // One fixed advice text for every problem. Choosing between texts would read the bad value
+      // to decide, and so let the message steer what the refusal says (BACKLOG #1123).
+      show('These rules cannot be shown. The list sent to this panel is malformed: ' + problem + '.' +
+        ' If a value in [[alerts.rules]] of the service-settings file is wrong, fix it; otherwise the' +
+        ' command that lists the rules printed something this panel does not expect. Run the Alert' +
+        ' Rules command again, and report it if this stays.' +
         ' Remove and Add are off until a well-formed list arrives.');
     }
 
@@ -158,29 +155,24 @@ export function alertEditorScript(
       ['cooldown_seconds', mfNum, 'a number'], ['transports', (t) => mfArrOf(t, mfStr), 'a list of text'],
     ];
     // What is wrong with the first entry of a 'rules' message that is not a Rule, or null. It names
-    // the rule by its ordinal, the field, and the kind of value found. Never the value. An entry
-    // with no usable ordinal is named by its position, counted from 0 as the ordinals are. inFile
-    // says whether the problem is a value in the file, the only kind the operator can fix; quoted
-    // says it is a string where a number belongs.
+    // the entry by its position in the list, counted from 0 as the ordinals are, the field, and the
+    // kind of value found. Nothing in the text is taken from the message: the position is this
+    // loop's own counter, never the entry's index (BACKLOG #1123); the field name comes from
+    // RULE_FIELDS; the kind is a fixed word from mfKind(). Never the value.
     function rulesProblem(d) {
-      const problem = (text, inFile, quoted) => ({ text: text, inFile: inFile, quoted: quoted });
-      if (!Array.isArray(d.rules)) { return problem('the list is missing or is not a list', false, false); }
+      if (!Array.isArray(d.rules)) { return 'the list is missing or is not a list'; }
       // By index, not for-of or every(): a hole must be seen as an entry that is not a rule.
       for (let i = 0; i < d.rules.length; i++) {
         const r = d.rules[i];
-        if (!mfObj(r)) { return problem('the entry at position ' + i + ' of the list is not a rule', false, false); }
-        if (!mfInt(r.index)) {
-          return problem('the entry at position ' + i + ' of the list has no whole-number index', false, false);
-        }
+        const at = 'the entry at position ' + i + ' of the list';
+        if (!mfObj(r)) { return at + ' is not a rule'; }
+        if (!mfInt(r.index)) { return at + ' has no whole-number index'; }
         for (const [key, ok, want] of RULE_FIELDS) {
           const v = r[key];
           if (!mfOpt(v, ok)) {
             // A list is the right kind for transports, so "got list" would name no difference.
             const got = Array.isArray(v) && key === 'transports' ? 'a list with an entry that is not text' : mfKind(v);
-            // A null did not come from the file, whether it is the value or sits inside a list.
-            const hasNull = v === null || (Array.isArray(v) && v.indexOf(null) !== -1);
-            return problem('rule ' + r.index + ', ' + key + ': expected ' + want + ', got ' + got,
-              !hasNull, want === 'a number' && typeof v === 'string');
+            return at + ', ' + key + ': expected ' + want + ', got ' + got;
           }
         }
       }
