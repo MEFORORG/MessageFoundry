@@ -87,8 +87,9 @@ _SWITCH_LIST_LIMIT: Final = 200
 _DENIAL_ACTIONS: Final = frozenset(
     {"auth.permission_denied", "auth.channel_denied", "auth.mfa_denied"}
 )
-#: The detail of a directory sign-in refused by a live lock. That row is withheld from readers
-#: without ``users:manage`` and has no visible stand-in, so counting it could show a lock. Spelled
+#: The pre-BACKLOG #3726 detail of a directory lock refusal under ``auth.login_failed``, withheld
+#: from readers without ``users:manage``, so it stays uncounted (``DIRECTORY_LOCKED_REFUSAL_DETAIL``
+#: says why it is kept). Such a refusal now has its own action, which no detector reads. Spelled
 #: here rather than imported from ``auth/``; a test pins it to ``DIRECTORY_LOCKED_REFUSAL_DETAIL``.
 _DIRECTORY_LOCKED_DETAIL: Final = json.dumps({"provider": "ad", "reason": "locked"}, sort_keys=True)
 

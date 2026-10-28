@@ -1004,7 +1004,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   that provider really uses with no human step.
 - **Compensating controls:** keep `oidc_callback_min_elapsed_seconds` at its default, so every other
   method stays floored. Each exempted pass records the matched values as `callback_floor_exempt_amr`
-  on its audit rows, failed attempts included except a lock refusal; [SECURITY.md](SECURITY.md), *What these floors do not
+  on its audit rows, failed attempts included, a directory lock refusal too (BACKLOG #3726); [SECURITY.md](SECURITY.md), *What these floors do not
   do*, says which rows. Review those rows. Load refuses a value `oidc_mfa_amr_values` also accepts while the claim gate is
   on, since that value would exempt every token the gate admits by it.
 - **Reversible:** yes, immediately — empty the list (or delete the line) and restart.

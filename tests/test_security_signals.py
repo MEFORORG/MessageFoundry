@@ -19,10 +19,12 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.auth.audit_visibility import DIRECTORY_LOCKED_REFUSAL_DETAIL
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
     _ALERT_EVENT_TYPES,
     AlertsSettings,
+    AuthSettings,
 )
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -289,7 +291,12 @@ def test_a_zero_threshold_switches_a_detector_off() -> None:
 
 def test_unwatched_actions_and_lock_rows_raise_nothing() -> None:
     det, sink, _ = _detector(signin_failures=1, denials=1)
-    for action in ("auth.login_locked", "auth.account_locked", "auth.permission_granted"):
+    for action in (
+        "auth.login_locked",
+        "auth.directory_login_locked",
+        "auth.account_locked",
+        "auth.permission_granted",
+    ):
         _rows(det, action, 5)
     assert sink.signals == []
 
@@ -394,6 +401,36 @@ async def test_rows_reach_the_detector_through_the_store_tee(tmp_path: Path) -> 
         assert len(sink.signals) == 1  # removed: the control
     finally:
         remove()  # idempotent
+        await store.close()
+
+
+async def test_a_marked_directory_lock_refusal_from_the_real_writer_is_not_counted(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #3726: a directory lock refusal is written under its own action, which the sign-in
+    detector does not read, even when the OIDC floor-exempt marker rides it. Counting it would show
+    a lock to a reader without users:manage. The control: the same writer's ``disabled`` refusal,
+    an ordinary ``auth.login_failed``, does count."""
+    sink = _Sink()
+    remove = install_security_signals(
+        sink, _thresholds(signin_failures=3), asyncio.get_running_loop()
+    )
+    store = await MessageStore.open(str(tmp_path / "s.db"))
+    try:
+        service = AuthService(store, AuthSettings())
+        marker = {"callback_floor_exempt_amr": ["wia"]}
+        for _ in range(5):
+            await service._refuse_directory_row("jdoe", "locked", client="192.0.2.9", extra=marker)
+        assert sink.signals == []
+        for _ in range(3):
+            await service._refuse_directory_row(
+                "jdoe", "disabled", client="192.0.2.9", extra=marker
+            )
+        assert [(s, n) for s, n, _c, _d in sink.signals] == [
+            ("signin_failure_burst", "signin:192.0.2.9")
+        ]
+    finally:
+        remove()
         await store.close()
 
 

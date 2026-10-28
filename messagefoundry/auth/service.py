@@ -50,7 +50,7 @@ from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth import channel_scope, oidc, reconcile, totp, webauthn
 from messagefoundry.auth.audit_visibility import (
     ACCOUNT_LOCKED_ACTION,
-    DIRECTORY_LOCKED_REFUSAL_DETAIL,
+    DIRECTORY_LOGIN_LOCKED_ACTION,
     LOCK_NOTICE_ACTION,
     LOCKED_REFUSAL_DETAIL,
     LOGIN_LOCKED_ACTION,
@@ -902,6 +902,12 @@ DIRECTORY_IDENTITY_CONFLICT = "directory_identity_conflict"
 #: The closed-set reason a directory sign-in is refused with when the row it resolves to fails its
 #: integrity seal (BACKLOG #2592). Such a row is never adopted, completed or created over.
 ACCOUNT_REFUSED = "account_refused"
+
+#: The closed-set reason a directory sign-in is refused with when the row it resolves to is under a
+#: live lock (BACKLOG #1638). Named because it also picks that refusal's own audit action, which
+#: readers without ``users:manage`` never read (BACKLOG #3726); a drifted literal would put the row
+#: back under the visible ``auth.login_failed``.
+DIRECTORY_LOCKED = "locked"
 
 #: The code that opens :class:`FederatedBindingChanged`'s message (BACKLOG #2026), so a caller can
 #: tell that refusal from the other 409 on the federated-identity routes without matching prose.
@@ -2081,9 +2087,9 @@ def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -
     # ADR 0197 AC-5: EITHER lock refuses a directory sign-in. The sign-in lock is read first, so a
     # caller holding only that attribute pair (a test's stand-in row) still gets its answer.
     if user.locked_until is not None and now < user.locked_until:
-        return "locked"
+        return DIRECTORY_LOCKED
     if user.second_step_locked_until is not None and now < user.second_step_locked_until:
-        return "locked"
+        return DIRECTORY_LOCKED
     # Last, so a disabled or locked row keeps the reason an operator already acts on.
     if not federated and _holds_federated_binding(user):
         return FEDERATED_SIGN_IN_REQUIRED
@@ -2630,10 +2636,10 @@ def _floor_exempt_marker(floor_exempt_amr: Sequence[str]) -> dict[str, object]:
     apply (BACKLOG #2388).
 
     BACKLOG #3220: the success row carries it, and so does each refusal row written after the
-    exemption applied, except a directory lock refusal (see
-    :meth:`AuthService._refuse_directory_row`). So the review ``docs/SECURITY-LOOSENING.md`` asks
-    for also sees exempted attempts that failed. At least the role-resync and session-rotation rows
-    the attempt writes do not carry it. The values are the CONFIGURED ones the token matched, never
+    exemption applied, a directory lock refusal included since BACKLOG #3726 gave that row its own
+    whole-hidden action (see :meth:`AuthService._refuse_directory_row`). So the review
+    ``docs/SECURITY-LOOSENING.md`` asks for also sees exempted attempts that failed. At least the
+    role-resync and session-rotation rows the attempt writes do not carry it. The values are the CONFIGURED ones the token matched, never
     the token's own."""
     return {"callback_floor_exempt_amr": list(floor_exempt_amr)} if floor_exempt_amr else {}
 
@@ -6518,15 +6524,19 @@ class AuthService:
         ``error`` is the generic string on purpose: an unauthenticated caller learns that the attempt
         failed and nothing about whether the account exists, is disabled, or is locked.
 
-        ``extra`` adds fields to the audit row only, as on :meth:`_directory_reject_audit`, with one
-        exception: a lock refusal takes none. Readers without ``users:manage`` are kept from that
-        row by its exact text, ``DIRECTORY_LOCKED_REFUSAL_DETAIL`` (owner ruling 2026-09-28), so
-        any extra field would show them the lock (BACKLOG #3220).
+        ``extra`` adds fields to the audit row only, as on :meth:`_directory_reject_audit`; the
+        federated leg passes the ``callback_floor_exempt_amr`` marker through it (BACKLOG #3220).
+
+        **A lock refusal is written under its own action,** ``auth.directory_login_locked``, not
+        ``auth.login_failed`` (BACKLOG #3726). Readers without ``users:manage`` read no row under
+        that action (owner ruling 2026-09-28), so ``extra`` cannot show them the lock, and the
+        sign-in burst signal, which counts ``auth.login_failed``, never counts one.
         """
-        detail = _json({"provider": "ad", "reason": reason})
-        if extra and detail != DIRECTORY_LOCKED_REFUSAL_DETAIL:
-            detail = _json({**extra, "provider": "ad", "reason": reason})
-        await self._audit("auth.login_failed", actor=username, detail=detail, client=client)
+        action = (
+            DIRECTORY_LOGIN_LOCKED_ACTION if reason == DIRECTORY_LOCKED else "auth.login_failed"
+        )
+        detail = _json({**(extra or {}), "provider": "ad", "reason": reason})
+        await self._audit(action, actor=username, detail=detail, client=client)
         return LoginOutcome(ok=False, error="invalid credentials", reason=reason)
 
     async def _directory_reject_audit(
@@ -6578,9 +6588,9 @@ class AuthService:
         # federated caller passes it; a Kerberos session has no IdP clock to compare.
         idp_auth_time: float | None = None,
         # BACKLOG #3220: extra fields for the refusal rows this login writes, a lock refusal
-        # excepted (see _refuse_directory_row). The federated caller
-        # passes the callback_floor_exempt_amr marker when the floor exemption let it through, so a
-        # refused exempted attempt carries it as the success row does. Kerberos passes nothing.
+        # included since BACKLOG #3726 (see _refuse_directory_row). The federated caller passes the
+        # callback_floor_exempt_amr marker when the floor exemption let it through, so a refused
+        # exempted attempt carries it as the success row does. Kerberos passes nothing.
         refusal_extra: Mapping[str, object] | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the

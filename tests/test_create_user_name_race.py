@@ -260,7 +260,8 @@ async def test_a_lost_race_to_a_locked_row_of_the_same_account_is_refused_as_loc
         out = await service._complete_ad_login(_principal(), None, mfa_verified=True)
         assert not out.ok and out.token is None
         assert out.reason == "locked"
-        assert await _failed_reasons(store) == ["locked"]
+        # BACKLOG #3726: a directory lock refusal has its own action, never auth.login_failed.
+        assert [r["action"] for r in await store.list_audit()] == ["auth.directory_login_locked"]
         row = await store.get_user("rival")
         assert row is not None and row.email == "kept@example.org"
         assert row.locked_until is not None and row.locked_until > time.time()
