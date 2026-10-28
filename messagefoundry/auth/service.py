@@ -2965,7 +2965,7 @@ def oidc_client_auth_from_settings(
 AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
 
 
-async def _unverifiable(check: Awaitable[bool]) -> bool | None:
+async def _unless_unverifiable(check: Awaitable[bool]) -> bool | None:
     """``check``'s answer, or ``None`` when the seal names a Transit key version below the key's
     ``min_decryption_version`` (BACKLOG #2592). The row may be genuine, so a loader denies it
     without reporting it as a failed seal or ending it, and a scan skips it rather than aborting.
@@ -10034,8 +10034,8 @@ class AuthService:
     async def _session_row_holds(self, session: SessionRecord, sealer: Sealer | None) -> bool:
         """Whether an unrevoked session row's seal verifies; a row that fails is handed to
         :meth:`_session_seal_failed`, which ends it (BACKLOG #2592). A seal Transit can no longer
-        verify (:func:`_unverifiable`) is denied and left alone: not ended, not reported."""
-        held = await _unverifiable(session_seal_ok(sealer, session))
+        verify (:func:`_unless_unverifiable`) is denied and left alone: not ended, not reported."""
+        held = await _unless_unverifiable(session_seal_ok(sealer, session))
         if held is None:
             return False
         if held:
@@ -10193,7 +10193,7 @@ class AuthService:
             if sealer is None or record is None:
                 held: bool | None = sealer is None
             else:
-                held = await _unverifiable(user_seal_ok(sealer, record))
+                held = await _unless_unverifiable(user_seal_ok(sealer, record))
             if held is None:
                 return None  # a seal Transit can no longer verify: denied, not reported
             if held:
@@ -10294,7 +10294,7 @@ class AuthService:
         if found is None:
             return None
         row = RoleRow.from_mapping(found)
-        holds = await _unverifiable(role_seal_ok(self._store.row_sealer(), row))
+        holds = await _unless_unverifiable(role_seal_ok(self._store.row_sealer(), row))
         if holds:
             return row
         if holds is not None:  # None: a seal Transit can no longer verify, denied, not reported
@@ -10311,7 +10311,7 @@ class AuthService:
             row = RoleRow.from_mapping(found)
             if not is_custom_role_id(row.id):
                 continue  # a built-in resolves from code; its row grants nothing
-            checked = await _unverifiable(role_seal_ok(sealer, row))
+            checked = await _unless_unverifiable(role_seal_ok(sealer, row))
             if checked is False:  # None: a seal Transit can no longer verify, not reported
                 await self._role_seal_failed(row.id)
             out.append((row, bool(checked)))
