@@ -31,6 +31,7 @@ import string
 import time
 import urllib.parse
 import urllib.request
+from collections import Counter
 from collections.abc import Awaitable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -157,9 +158,11 @@ _AUTO_RESOLVE: dict[str, str] = {
 #: named, and the start raises ``connection_started``, which resolves that instance. Resetting the
 #: #81 escalation count there would restart a crash loop at the base tier every cycle, so an
 #: ``after_count`` tier would never be reached. So the ``connection_stopped`` count survives a
-#: resolve raised WHILE this sink's own ``restart_inbound`` of that inbound runs, as it does for an
-#: instance nothing resolves. Any other start resets it, as ADR 0133 D1 says, and so does every
-#: other inverse: only this action marks a key (``NotifierAlertSink._restarting``).
+#: resolve raised WHILE the ``restart_inbound`` that a ``connection_stopped`` of that same inbound
+#: dispatched runs, as it does for an instance nothing resolves. Any other start resets it, as ADR
+#: 0133 D1 says, and so does every other inverse: only that dispatch marks a key
+#: (``NotifierAlertSink._restarting``). The mark spans the whole callback, so a start another door
+#: makes while the restart waits for the runner's reload lock keeps the count too.
 _ESCALATION_KEEPING_ACTION = "restart_inbound"
 
 _T = TypeVar("_T")
@@ -834,7 +837,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._occurrences: dict[str, int] = {}
         # BACKLOG #1741: "<type>:<connection>" keys whose escalation-keeping restart is running, with
         # how many such restarts are in flight. _run_control adds and drops them around the callback.
-        self._restarting: dict[str, int] = {}
+        self._restarting: Counter[str] = Counter()
         # #144 (ADR 0128): the injected async connection-control callback (action, target) → awaitable,
         # wired by the api/app.py lifespan to RegistryRunner.restart_inbound/restart_outbound. None = no
         # control wired (a control_action rule then no-ops, logged). The sink NEVER imports the runner.
@@ -1577,7 +1580,17 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     decision.control_action, decision.control_target, default_target=False
                 )
             else:
-                self._dispatch_control(decision.control_action, subject, default_target=True)
+                # BACKLOG #1741: a connection_stopped restarting its own inbound keeps its count.
+                keeps = (
+                    event["type"] == _AUTO_RESOLVE["connection_started"]
+                    and decision.control_action == _ESCALATION_KEEPING_ACTION
+                )
+                self._dispatch_control(
+                    decision.control_action,
+                    subject,
+                    default_target=True,
+                    keep_escalation=key if keeps else None,
+                )
         # #143 (ADR 0044 amendment): the windowed suspend gate — NOTIFICATION-only. The durable instance
         # was already recorded above (AC-3: a suspended alert stays open/counted/visible), and any #144
         # control action already dispatched; a still-active suspend window only mutes the transport enqueue.
@@ -1694,11 +1707,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 
-    def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> None:
+    def _dispatch_control(
+        self,
+        action: str,
+        target: str,
+        *,
+        default_target: bool,
+        keep_escalation: str | None = None,
+    ) -> None:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget
         task, exactly like the ADR 0044 state observer). Synchronous + non-blocking: it only creates the
         task, never awaits the runner, so a slow/hung restart can never stall the worker that emitted the
-        alert. A no-op when no callback is wired (logged once at emit)."""
+        alert. A no-op when no callback is wired (logged once at emit). ``keep_escalation`` is the
+        alert key whose escalation count the restart's own resolve keeps (BACKLOG #1741)."""
         cb = self._control_cb
         if cb is None:
             log.warning(
@@ -1709,7 +1730,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             return
         try:
             task = asyncio.ensure_future(
-                self._run_control(cb, action, target, default_target=default_target)
+                self._run_control(
+                    cb, action, target, default_target=default_target, mark=keep_escalation
+                )
             )
         except RuntimeError:
             # No running loop (e.g. a control emit on a non-async test path) — best-effort, drop it rather
@@ -1719,13 +1742,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         task.add_done_callback(self._control_tasks.discard)
 
     async def _run_control(
-        self, cb: ControlCallback, action: str, target: str, *, default_target: bool
+        self,
+        cb: ControlCallback,
+        action: str,
+        target: str,
+        *,
+        default_target: bool,
+        mark: str | None = None,
     ) -> None:
-        # BACKLOG #1741: the start inside this restart raises connection_started synchronously, so a
-        # key marked for the callback's span is the start this restart made.
-        mark = f"connection_stopped:{target}" if action == _ESCALATION_KEEPING_ACTION else None
+        # BACKLOG #1741: the start inside this restart raises connection_started synchronously, so
+        # the resolve it causes runs while ``mark`` is held (_ESCALATION_KEEPING_ACTION says more).
         if mark is not None:
-            self._restarting[mark] = self._restarting.get(mark, 0) + 1
+            self._restarting[mark] += 1
         try:
             await cb(action, target, default_target=default_target)
         except Exception:
@@ -1734,9 +1762,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             log.warning("alert control_action %s for %r failed", action, target, exc_info=True)
         finally:
             if mark is not None:
-                if (left := self._restarting[mark] - 1) > 0:
-                    self._restarting[mark] = left
-                else:
+                self._restarting[mark] -= 1
+                if self._restarting[mark] <= 0:
                     del self._restarting[mark]
 
     async def _handle(self, event: dict[str, Any]) -> None:

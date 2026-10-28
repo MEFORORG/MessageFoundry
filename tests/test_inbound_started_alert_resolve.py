@@ -412,33 +412,67 @@ async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
         # The tier the durable instance records is the tier the loop has reached.
         assert tiers == [0, 0, 1, 1]
     finally:
-        await runner.stop()
-        await sink.aclose()
+        go.set()
+        try:
+            await runner.stop()
+        finally:
+            await sink.aclose()
     assert [e["severity"] for e in pages.events] == ["warning", "warning", "critical", "critical"]
 
 
 async def test_only_the_rules_own_restart_keeps_the_count() -> None:
-    # The sink-level contract: a connection_started raised while this sink's restart_inbound of the
-    # inbound runs keeps the escalation count; any other start, a restart_outbound and every other
-    # inverse reset it, as ADR 0133 D1 says. The suspend entry is dropped either way.
+    # The sink-level contract, through _emit: only the restart_inbound a connection_stopped of the
+    # same inbound dispatched keeps that count. A restart another alert type drove, an operator start
+    # and every other inverse reset it, as ADR 0133 D1 says. The suspend entry is dropped either way.
     class _Resolve:
+        async def upsert_alert_instance(self, **_kw: object) -> None:
+            return None
+
         async def resolve_alert_instances_for(self, **_kw: object) -> int:
             return 0
 
-    sink = NotifierAlertSink([], store=_Resolve())  # type: ignore[arg-type]
+    rules = [
+        AlertRule(event_type=t, connection="IB", control_action="restart_inbound")
+        for t in ("connection_stopped", "queue_buildup")
+    ]
+    sink = NotifierAlertSink([], rules=rules, store=_Resolve())  # type: ignore[arg-type]
     seen: list[int | None] = []
 
     async def _control(action: str, target: str, *, default_target: bool) -> None:
+        sink._suspended["connection_stopped:IB"] = 1e12
         sink.connection_started(target)  # the start inside the restart
         seen.append(sink._occurrences.get("connection_stopped:IB"))
 
-    for action, kept in (("restart_inbound", 5), ("restart_outbound", None)):
-        sink._occurrences["connection_stopped:IB"] = 5
-        sink._suspended["connection_stopped:IB"] = 1e12
-        await sink._run_control(_control, action, "IB", default_target=True)
-        assert seen.pop() == kept
-        assert "connection_stopped:IB" not in sink._suspended
+    sink.set_control_callback(_control)
+    sink.connection_stopped("IB", detail="router halted")
+    await _settle(sink, sink._control_tasks)
+    assert seen.pop() == 1 and "connection_stopped:IB" not in sink._suspended
+    sink.queue_buildup("IB", depth=10, oldest_age_seconds=1.0)
+    await _settle(sink, sink._control_tasks)
+    assert seen.pop() is None and "connection_stopped:IB" not in sink._suspended
     assert sink._restarting == {}
+
+    # Two restarts of the same key overlap: the first to finish must not drop the other's mark.
+    held = asyncio.Event()
+
+    async def _slow(action: str, target: str, *, default_target: bool) -> None:
+        await held.wait()
+        sink.connection_started(target)
+
+    async def _quick(action: str, target: str, *, default_target: bool) -> None:
+        return
+
+    sink._occurrences["connection_stopped:IB"] = 5
+    mark = "connection_stopped:IB"
+    slow = asyncio.ensure_future(
+        sink._run_control(_slow, "restart_inbound", "IB", default_target=True, mark=mark)
+    )
+    await asyncio.sleep(0)
+    await sink._run_control(_quick, "restart_inbound", "IB", default_target=True, mark=mark)
+    held.set()
+    await slow
+    assert sink._occurrences["connection_stopped:IB"] == 5 and sink._restarting == {}
+
     # A start nobody's rule asked for: an operator start after a fix.
     sink.connection_started("IB")
     assert "connection_stopped:IB" not in sink._occurrences
