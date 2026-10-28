@@ -395,7 +395,7 @@ async def test_ui_logout_clears_the_cookie_when_the_owner_lookup_fails(
     session = hash_token(token)[:12]
     assert _error_lines(caplog) == [
         f"a sign-out ended session {session}, but its owner could not be read; its auth.logout "
-        "row names no actor and its temporary credential is not checked for a lapse"
+        "row names no actor and any temporary credential it holds is not checked for a lapse"
     ]
 
 
@@ -520,7 +520,33 @@ async def test_ui_logout_of_a_disabled_account_writes_no_lapse_row(engine: Engin
     await engine.store.set_user_disabled(user_id, disabled=True)
     out = await _sign_out_with(engine, service, token)
     _assert_signed_out(out)
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "revoked")]
     assert await temp_password_expired_rows(engine.store) == []
+
+
+async def test_ui_logout_counts_a_deadline_that_passes_while_the_revoke_waits(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the sign-out judges the temporary credential at the clock read taken before the
+    revoke. The deadline passes while the revoke runs, as it can while the revoke waits on the
+    store, and the gate would judge it at its own later read, so the sign-out records ``lapsed``
+    and writes the lapse row."""
+    service, user_id, token = await _temporary_credential_session(engine)
+    start = time.time()
+    clock = [start]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    real_supersede = engine.store.supersede_session
+
+    async def _slow_supersede(*args: object, **kwargs: object) -> object:
+        ended = await real_supersede(*args, **kwargs)  # type: ignore[arg-type]
+        clock[0] = start + 31  # the deadline was 30 seconds ahead
+        return ended
+
+    monkeypatch.setattr(engine.store, "supersede_session", _slow_supersede)
+    out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "lapsed")]
+    assert len(await temp_password_expired_rows(engine.store)) == 1
 
 
 async def test_ui_logout_clears_the_cookie_when_the_lapse_row_fails(

@@ -2738,7 +2738,6 @@ LogoutOutcome = Literal["revoked", "lapsed", "nothing_to_revoke"]
 #: another tab that committed while the sign-out was in flight, and no longer. docs/SECURITY.md
 #: states it as a power of its own.
 _LOGOUT_LINEAGE_SECONDS: Final = 5.0
-
 _ISSUE_ROW_EARLY_SECONDS: Final = 5.0
 _ISSUE_ROW_LATE_SECONDS: Final = 60.0
 _ISSUE_ROW_PAGE: Final = 200
@@ -10941,10 +10940,11 @@ class AuthService:
         (``/ui/logout`` has no auth dependency). The outcome is then ``nothing_to_revoke`` rather
         than a revoke that did not happen. ``lapsed`` means :meth:`_was_live_at_revoke` found the
         row ended not live, or found it live while its owner's admin-issued temporary credential
-        was past its deadline (:meth:`_credential_lapsed`, which every gate asks; a disabled account
-        excepted, as there). That second case also writes the gate's ``auth.temp_password_expired``
-        row, with ``"at": "logout"`` and this call's ``client`` (BACKLOG #3749). ``revoked`` means
-        neither held.
+        was past its deadline (:meth:`_credential_lapsed`, as :meth:`identity_for_token` asks it
+        under every gate, a disabled account excepted as there). That second case also writes the
+        gate's ``auth.temp_password_expired`` row, with ``"at": "logout"`` and this call's
+        ``client`` (BACKLOG #3749). ``revoked`` means the row was found live and no lapse was found,
+        which includes an owner that could not be read, so its credential was not checked.
 
         **A rotation that committed first is followed, for a bounded time (BACKLOG #3715).** An
         elevation in another tab can re-key the session while the sign-out is in flight, leaving
@@ -11031,7 +11031,7 @@ class AuthService:
                 consequence
                 for consequence, applies in (
                     ("its auth.logout row names no actor", actor is None),
-                    ("its temporary credential is not checked for a lapse", live),
+                    ("any temporary credential it holds is not checked for a lapse", live),
                 )
                 if applies
             ]
