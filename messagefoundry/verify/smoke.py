@@ -13,8 +13,9 @@
   refuses to create the database file first (BACKLOG #1708): ``open_store``'s schema-ensure created
   whatever path it was handed until BACKLOG #1780, so the check used to PASS against a store it had
   just made and leave the database behind — meaning it could not fail for the reason its title names.
-  Every store open here is also ``read_only=True``, so verify never migrates a store or builds one
-  into a database that is not one.
+  Verify never migrates a store or builds one into a database that is not one: its store opens are
+  read-only, but for ``store.connect`` on a server backend under ``external`` schema management,
+  whose writable open runs no DDL (:func:`connect_opens_read_only`).
 
 Synthetic HL7 only — never real PHI. The smoke message is inlined below rather than generated, so
 the verifier never imports ``messagefoundry.generators`` (BACKLOG #1192 / ASVS 15.2.3).
@@ -27,7 +28,7 @@ import ssl
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_kex_groups,
@@ -377,6 +378,19 @@ IN_MEMORY_SKIP: Final = (
 )
 
 
+def connect_opens_read_only(store: StoreSettings) -> bool:
+    """Whether ``store.connect`` opens ``store`` read-only: everywhere but a server backend under
+    ``[store].schema_management = external`` (BACKLOG #1708, Manager decision 2026-10-27).
+
+    A writable open runs no DDL there: it only reads the ``schema_meta`` marker and refuses a
+    stale one, and it checks the login's runtime grants (PostgreSQL) and the database options (SQL
+    Server). A read-only open skips those checks, so it would PASS a database ``serve`` refuses.
+    Its at-open writes (salt bind, invocation reserve, at-rest sweep, audit genesis row) are
+    unchanged from before #1708. Everywhere else a writable open would run DDL or migrations, so
+    the open stays read-only. SQLite always resolves to ``auto``."""
+    return store.resolved_schema_management() is not SchemaManagement.EXTERNAL
+
+
 def in_memory_store(store: StoreSettings) -> bool:
     """Whether ``store`` is a SQLite ``:memory:`` store, which no other process can open."""
     return store.backend is StoreBackend.SQLITE and store.path == ":memory:"
@@ -397,9 +411,11 @@ def missing_sqlite_store(store: StoreSettings) -> Path | None:
     ``:memory:`` creates nothing on disk and so is outside what this gate exists to stop.
 
     **Scoped to SQLite.** What stops verify building into, or migrating, a database that *does*
-    exist is not this gate but the ``read_only=True`` every verify ``open_store`` call passes
-    (BACKLOG #1708, pinned by a test). ``open_store``'s docstring says what that open does on each
-    backend, and ``docs/testing/VERIFY.md`` says what it leaves a PASS unable to prove.
+    exist is not this gate but the read-only open (BACKLOG #1708, pinned by a test). Every verify
+    ``open_store`` call is read-only except ``store.connect`` on a server backend under
+    ``external`` schema management, where a writable open runs no DDL
+    (:func:`connect_opens_read_only`). ``open_store``'s docstring says what each open does, and
+    ``docs/testing/VERIFY.md`` says what it leaves a PASS unable to prove.
     """
     if store.backend is not StoreBackend.SQLITE or store.path == ":memory:":
         return None
@@ -420,8 +436,10 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     path before the service started under another identity.
 
     The open is read-only (BACKLOG #1708), so against a store that exists it neither migrates it
-    nor builds one into a database that holds none. So a PASS proves the calling user can open and
-    read the store, not that it can write it.
+    nor builds one into a database that holds none, and a PASS proves the calling user can open and
+    read the store, not that it can write it. The one exception is a server backend under
+    ``external`` schema management, which keeps the writable open serve makes; see
+    :func:`connect_opens_read_only`.
     """
     from messagefoundry.last_resort import run_guarded
 
@@ -443,11 +461,12 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     # TYPE_CHECKING block exists to defer. The FAIL above needs one stat, not the store stack.
     from messagefoundry.store.base import open_store
 
+    read_only = connect_opens_read_only(store)
+
     async def _open_close() -> None:
         # Open and close only, so it cannot start an audit chain (BACKLOG #1916). Read-only
-        # (BACKLOG #1708): a writable open would schema-ensure and migrate the store as the
-        # calling user, and would build a whole store into a database that is not one.
-        handle = await open_store(store, read_only=True, keyless_chain_refusal=None)
+        # (BACKLOG #1708) except where :func:`connect_opens_read_only` says otherwise.
+        handle = await open_store(store, read_only=read_only, keyless_chain_refusal=None)
         await handle.close()
 
     try:
@@ -459,12 +478,18 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
             Status.FAIL,
             f"{store.backend.value} store failed to open: {exc}",
         )
+    how = (
+        "opened read-only and closed cleanly as the calling user (NOT proof that this user can "
+        "write it, nor"
+        if read_only
+        else "opened and closed cleanly as the calling user, through the schema-marker and runtime "
+        "checks serve runs (NOT proof"
+    )
     return CheckResult(
         rid,
         title,
         Status.PASS,
-        f"{store.backend.value} store opened read-only and closed cleanly as the calling user "
-        "(NOT proof that this user can write it, nor that the NSSM service account can connect — "
+        f"{store.backend.value} store {how} that the NSSM service account can connect — "
         "confirm the service-identity grants)",
     )
 

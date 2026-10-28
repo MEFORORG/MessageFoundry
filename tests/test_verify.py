@@ -23,7 +23,7 @@ from typing import Final
 import pytest
 
 from messagefoundry.__main__ import main
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.store.base import open_store
 from messagefoundry.store.store import MessageStatus
 from messagefoundry.verify import checks, cipher_policy, smoke
@@ -1127,6 +1127,25 @@ def test_every_open_store_in_verify_goes_through_the_gate() -> None:
     assert sorted({where for where, _, _ in calls}) == _VERIFY_STORE_OPENERS
 
 
+#: The one verify open allowed a computed ``read_only`` (BACKLOG #1708, Manager decision
+#: 2026-10-27): ``store.connect`` keeps main's writable open on a server backend under ``external``
+#: schema management, where it runs no DDL and runs the grant and database-option checks serve
+#: runs. The value must be the local that :func:`smoke.connect_opens_read_only` set.
+_WRITABLE_EXCEPTION: Final = ("smoke.py::check_store_connectivity", "read_only")
+
+
+def _read_only_keyword_allowed(where: str, kw: ast.keyword, called: set[str]) -> bool:
+    """``read_only=True`` literally, or the one exception above, decided by its named helper."""
+    if kw.arg != "read_only":
+        return False
+    if isinstance(kw.value, ast.Constant) and kw.value.value is True:
+        return True
+    return (
+        where,
+        getattr(kw.value, "id", None),
+    ) == _WRITABLE_EXCEPTION and "connect_opens_read_only" in called
+
+
 def test_every_open_store_in_verify_opens_read_only() -> None:
     """#1708's second half: the gate above stops verify CREATING a store, and a writable open of a
     store that does exist still ran the schema-ensure and migrations as the calling user. Every
@@ -1136,17 +1155,73 @@ def test_every_open_store_in_verify_opens_read_only() -> None:
     calls = _open_store_calls_in_verify()
     writable = [
         where
-        for where, call, _ in calls
-        if not any(
-            kw.arg == "read_only" and isinstance(kw.value, ast.Constant) and kw.value.value is True
-            for kw in call.keywords
-        )
+        for where, call, called in calls
+        if not any(_read_only_keyword_allowed(where, kw, called) for kw in call.keywords)
     ]
     assert not writable, (
         f"{writable} open the store without read_only=True, so verify would schema-ensure and "
         "migrate the store it reports on, as the calling user (#1708)"
     )
     assert sorted({where for where, _, _ in calls}) == _VERIFY_STORE_OPENERS
+
+
+@pytest.mark.parametrize(
+    ("backend", "schema_management", "read_only"),
+    [
+        (StoreBackend.SQLITE, None, True),
+        # A server backend with the field unset RESOLVES to external, so it is writable too.
+        (StoreBackend.POSTGRES, None, False),
+        (StoreBackend.POSTGRES, SchemaManagement.EXTERNAL, False),
+        (StoreBackend.POSTGRES, SchemaManagement.AUTO, True),
+        (StoreBackend.SQLSERVER, None, False),
+        (StoreBackend.SQLSERVER, SchemaManagement.EXTERNAL, False),
+        (StoreBackend.SQLSERVER, SchemaManagement.AUTO, True),
+    ],
+)
+def test_store_connect_keeps_the_writable_open_only_for_an_external_server_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: StoreBackend,
+    schema_management: SchemaManagement | None,
+    read_only: bool,
+) -> None:
+    """BACKLOG #1708, Manager decision 2026-10-27. Under ``external`` schema management a server
+    open runs no DDL, and its writable form runs the grant and database-option checks ``serve``
+    runs, so store.connect keeps it. Under ``auto`` a writable open would run DDL, and on SQLite it
+    would migrate, so both open read-only. Keyed on the RESOLVED mode: the field defaults to
+    ``None``, which a server backend resolves to ``external``."""
+    import messagefoundry.store.base as store_base
+
+    seen: list[bool] = []
+
+    class _Handle:
+        async def close(self) -> None:
+            return None
+
+    async def fake_open_store(
+        _settings: StoreSettings, *, read_only: bool = False, **_kw: object
+    ) -> _Handle:
+        seen.append(read_only)
+        return _Handle()
+
+    monkeypatch.setattr(store_base, "open_store", fake_open_store)
+    path = tmp_path / "store.db"
+    path.write_bytes(b"")  # past the absent-file gate; the fake opens nothing
+    settings = StoreSettings(
+        backend=backend,
+        path=str(path),
+        server="db.example.invalid",
+        database="mefor",
+        username="mefor_svc",
+        schema_management=schema_management,
+    )
+
+    assert smoke.connect_opens_read_only(settings) is read_only
+    r = smoke.check_store_connectivity(settings)
+
+    assert r.status is Status.PASS, r.detail
+    assert seen == [read_only]
+    assert ("read-only" in r.detail) is read_only
 
 
 def test_an_in_memory_store_is_a_skip_not_a_failed_open() -> None:
