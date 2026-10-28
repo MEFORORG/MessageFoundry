@@ -107,7 +107,8 @@ export function testBenchScript(token: string): string {
     };
     function shapeOk(m){
       const known = isStr(m.type) && Object.prototype.hasOwnProperty.call(SHAPES, m.type);
-      if (known && SHAPES[m.type](m)) { return true; }
+      const check = known ? SHAPES[m.type] : null;
+      if (typeof check === 'function' && check(m) === true) { return true; }
       // Discarded, not render-escaped: see PAYLOAD SHAPE above. Said in the webview console so a
       // host and page that drift apart read as a named discard, not a button that does nothing.
       // Only a type this page declares is named; any other is message text, and a discard echoes

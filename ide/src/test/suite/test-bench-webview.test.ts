@@ -517,25 +517,26 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
     ]);
   });
 
-  test("an unknown type is discarded, and its warning carries no text from the message", () => {
-    const cases: [Payload, string][] = [
-      [{ type: "nothingWeRender", source: "a.hl7" }, "unknown type"],
-      [{ type: 7 }, "numeric type"],
-      [{ type: "hasOwnProperty" }, "a type naming an Object.prototype member"],
-      [{ type: `"'><img src=x onerror=1> PID|1||A123`, source: "a.hl7" }, "a type carrying quotes and markup"],
-    ];
-    for (const [payload, why] of cases) {
+  // One test per case, so a failure names the case. The whole warning is fixed text, so nothing
+  // the message carried reaches the console (BACKLOG #1123).
+  const unknownTypes: [Payload, string][] = [
+    [{ type: "nothingWeRender", source: "a.hl7" }, "unknown type"],
+    [{ type: 7 }, "numeric type"],
+    [{ type: "hasOwnProperty" }, "a type naming an Object.prototype member"],
+    [{ type: `"'><img src=x onerror=1> PID|1||A123`, source: "a.hl7" }, "a type carrying quotes and markup"],
+    [{ type: ["PID|1||A123"] }, "a list type, which String()s to its text"],
+  ];
+  for (const [payload, why] of unknownTypes) {
+    test(`an unknown type is discarded, and its warning carries no text from the message: ${why}`, () => {
       const b = assertDiscarded(payload, why);
-      // The whole warning is fixed text, so nothing the message carried reaches the console
-      // (BACKLOG #1123).
       assert.deepStrictEqual(
         b.warnings,
         ["MessageFoundry Test Bench: discarded a malformed message of an unknown kind"],
         `${why}: the discard was not reported with the fixed phrase`,
       );
       assert.ok(!b.warnings.some((w) => w.includes(String(payload.type))), `${why}: the type was echoed`);
-    }
-  });
+    });
+  }
 });
 
 suite("Test Bench webview — escaping still applies to a well-formed payload", () => {

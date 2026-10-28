@@ -775,6 +775,17 @@ const wiringMap: Receiver = {
 
 const RECEIVERS: Receiver[] = [alertRules, codeSet, connection, home, security, sourceControl, wiringMap];
 
+// Discriminants no receiver handles. Each is message text, so a discard warning reports it with a
+// fixed phrase and never echoes it (BACKLOG #1123). The hostile one would show quoting or markup if
+// it got through; the number and the list are not strings, and the list String()s to its text.
+const UNKNOWN_KINDS: unknown[] = [
+  "notAType",
+  `"'><img src=x onerror=1> PID|1||A123`,
+  "hasOwnProperty",
+  12345,
+  ["PID|1||A123"],
+];
+
 suite("webview receivers discard a malformed payload and render a well-formed one", () => {
   teardown(closeWindows);
 
@@ -1289,9 +1300,6 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       }
     }
 
-    // An unhandled discriminant is message text, so the warning says so in a fixed phrase and never
-    // echoes it (BACKLOG #1123). The hostile one would show quoting or markup if it got through.
-    const UNKNOWN_KINDS = ["notAType", `"'><img src=x onerror=1> PID|1||A123`, "hasOwnProperty"];
     for (const kind of UNKNOWN_KINDS) {
       test(`${r.panel}: discards a message type it does not handle, without echoing it: ${JSON.stringify(kind)}`, () => {
         const p = r.load();
@@ -1304,7 +1312,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
           [`MessageFoundry ${r.panel}: discarded a malformed message of an unknown kind`],
           `${r.panel}: an unhandled type was not reported with the fixed phrase`,
         );
-        assert.ok(!p.warnings.some((w) => w.includes(kind)), `${r.panel}: the unhandled type was echoed`);
+        assert.ok(!p.warnings.some((w) => w.includes(String(kind))), `${r.panel}: the unhandled type was echoed`);
       });
     }
   }
