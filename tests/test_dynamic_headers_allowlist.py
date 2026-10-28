@@ -335,6 +335,21 @@ def test_a_refused_hop_wins_over_a_held_header(hop: str, monkeypatch: pytest.Mon
 
 
 @pytest.mark.parametrize("hop", list(_CLEARTEXT))
+def test_a_refused_hop_wins_over_an_unsendable_header(
+    hop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 1: every other per-message refusal comes after the hop too. A value
+    http.client cannot encode is a per-message dead-letter, so it must not win either."""
+    dest = _CLEARTEXT[hop]()
+    sent = _wire(dest, monkeypatch)
+    dest._hop_guard = _refusing_guard()
+    with pytest.raises(NegativeAckError) as exc:
+        asyncio.run(dest.send(_PATIENT, metadata=_meta({"X-Note": "cafā"})))
+    assert exc.value.code == INSECURE_HOP_REFUSED_CODE
+    assert sent == []
+
+
+@pytest.mark.parametrize("hop", list(_CLEARTEXT))
 def test_control_a_permitted_hop_still_refuses_the_held_header(
     hop: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

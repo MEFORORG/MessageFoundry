@@ -370,8 +370,9 @@ The test now counts the credentials the `verify_tls = false` refusal counts (`ht
 with `cleartext=True`): every auth setting, a static header the redaction screen would mask, by
 name or by value, and a credential-looking query parameter. A header a Handler stamps per message
 under `dynamic_headers` is judged the same way when the message is sent. One exception: when the
-connection names a `proxy_url`, a static `Proxy-Authorization`, in any spelling, is left to the
-send-time proxy rule.
+request goes to a web proxy, a static `Proxy-Authorization`, in any spelling, is left to the
+send-time proxy rule. A `proxy_url` the hop bypasses does not count: that request goes direct, so
+the header counts as a credential and refuses the hop at build.
 
 **What did not change.** `cleartext_accepted` still carries a body with no credential across, with
 the WARN and the audit record decision 2 describes. That was the case decision 2 was written for.

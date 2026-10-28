@@ -951,7 +951,7 @@ class FhirDestination(DestinationConnector):
                 ConnectorType.FHIR,
                 s,
                 cleartext=True,
-                proxied=hop_reaches_a_proxy(proxy_dest, self.base_url),
+                proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.base_url),
             ),
             connection=config.name,
         )
@@ -1189,17 +1189,17 @@ class FhirDestination(DestinationConnector):
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | ReplyBodyDropped | None:
+        # The hop first (zero I/O; _post repeats it). A hop no longer permitted is the connection's
+        # fault and stops the lane with the row kept. Judged after any per-message refusal below,
+        # it would dead-letter the row instead (Lander finding 6 on engine PR 2576).
+        if self._hop_guard is not None:
+            self._hop_guard.assert_delivery_url(self.base_url, connector="FHIR")
         request = self._resolve_request(payload)
         # #68: fold this message's dynamic http.header.* entries into the per-request headers, MERGED
         # OVER the static ones but UNDER the connector's interaction headers (If-Match/If-None-Exist),
         # which are semantically required and must win. Pure; None → {} → byte-identical.
         dynamic_headers = outbound_headers_from_metadata(metadata)
         if self._header_rule is not None:
-            # The hop first (zero I/O; _post repeats it). A hop no longer permitted is the
-            # connection's fault and stops the lane with the row kept; judged after it, a held
-            # header would dead-letter the row instead (Lander finding 6 on engine PR 2576).
-            if self._hop_guard is not None:
-                self._hop_guard.assert_delivery_url(self.base_url, connector="FHIR")
             # Only the Handler's headers: request.headers are the connector's own interaction headers.
             refuse_held_dynamic_headers(
                 dynamic_headers,
@@ -1757,7 +1757,7 @@ class FhirLookupExecutor:
                     s,
                     lookup=True,
                     cleartext=True,
-                    proxied=hop_reaches_a_proxy(proxy_dest, url),
+                    proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, url),
                 ),
                 connection=label,
             )

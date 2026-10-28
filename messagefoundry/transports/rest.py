@@ -1201,12 +1201,12 @@ def http_credentials_sent(
     ``Proxy-Authorization``, in any spelling. That header is then the proxy's, and the send-time
     proxy rule judges it: it refuses every spelling but the one it admitted for the connection's
     own proxy login (vault BACKLOG #3416, #3457). The caller reads ``proxied`` with
-    :func:`hop_reaches_a_proxy`, from the proxy destination its opener is built with. A
-    ``proxy_url`` alone does not make a hop proxied: ``proxy_no_proxy``, urllib's own bypass list,
-    or ``proxy_url = "default"`` with no system proxy for the scheme sends it direct. On a direct
-    hop the header would go to the destination, and the send-time rule refuses it there each
-    time, retryably, until the message dead-letters. So it counts as the credential it is and
-    refuses the hop at build.
+    :func:`hop_reaches_a_proxy`, from the proxy destination and handlers its opener is built
+    with. A ``proxy_url`` alone does not make a hop proxied: ``proxy_no_proxy``, urllib's own
+    bypass list, or ``proxy_url = "default"`` with no system proxy for the scheme sends it
+    direct. On a direct hop the header would go to the destination, and the send-time rule
+    refuses it there on each send, retryably, until the message dead-letters. So it counts as
+    the credential it is and refuses the hop at build.
 
     Each header key is shown by :func:`_shown_header_key`, never as written, since a credential
     may be typed into a key.
@@ -2058,22 +2058,29 @@ class _HostProxy:
         return dict(self.config.auth_header) if self.credentialed else {}
 
 
-def hop_reaches_a_proxy(proxy_dest: _HostProxy | None, url: str) -> bool:
+def hop_reaches_a_proxy(
+    proxy_dest: _HostProxy | None,
+    handlers: Sequence[urllib.request.BaseHandler],
+    url: str,
+) -> bool:
     """Whether a request to ``url`` goes to a web proxy, not direct, on an opener built with
-    ``proxy_dest`` (vault BACKLOG #3533, Lander finding 2 on engine PR 2576).
+    ``proxy_dest`` and its ``handlers`` (vault BACKLOG #3533, Lander finding 2 on engine PR 2576).
 
-    ``proxy_dest`` is what :meth:`ProxyConfig.for_host` returned for ``url``, which the connector
-    builds its opener with. ``None`` is no proxy, a ``proxy_no_proxy`` match or a loopback host;
-    an uncredentialed one is a host urllib's own bypass list names. All of those go direct. With
-    ``proxy_url = "default"`` the opener's handler holds what ``getproxies()`` returns when it is
-    built, so the hop reaches a proxy only when that names one for ``url``'s scheme; it is read
-    again here, at the same build. An explicit ``proxy_url`` serves both schemes."""
+    ``proxy_dest`` is what :meth:`ProxyConfig.for_host` returned for ``url``, and ``handlers``
+    what its ``opener_handlers()`` built. ``None`` is no proxy, a ``proxy_no_proxy`` match or a
+    loopback host; an uncredentialed one is a host urllib's own bypass list names. All of those
+    go direct. Otherwise the proxy for ``url``'s scheme is read off the built handler, so
+    ``proxy_url = "default"`` with no system proxy for the scheme goes direct too. The handler
+    took the system map when it was built, so this reads the map the opener holds, not a later
+    one. An explicit ``proxy_url`` serves both schemes."""
     if proxy_dest is None or not proxy_dest.credentialed:
         return False
-    if not proxy_dest.config.use_default:
-        return True
     scheme = urllib.parse.urlsplit(url).scheme.lower()
-    return bool(urllib.request.getproxies().get(scheme))
+    for handler in handlers:
+        proxies = getattr(handler, "proxies", None)
+        if isinstance(handler, urllib.request.ProxyHandler) and isinstance(proxies, Mapping):
+            return bool(proxies.get(scheme))
+    return False
 
 
 def proxy_auth_handler_from_settings(
@@ -2509,7 +2516,7 @@ class RestDestination(DestinationConnector):
                 ConnectorType.REST,
                 s,
                 cleartext=True,
-                proxied=hop_reaches_a_proxy(proxy_dest, self.url),
+                proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.url),
             ),
             connection=config.name,
         )
@@ -2692,15 +2699,15 @@ class RestDestination(DestinationConnector):
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | ReplyBodyDropped | None:
+        # The hop first (zero I/O; _post repeats it). A hop no longer permitted is the connection's
+        # fault and stops the lane with the row kept. Judged after any per-message refusal below,
+        # it would dead-letter the row instead (Lander finding 6 on engine PR 2576).
+        if self._hop_guard is not None:
+            self._hop_guard.assert_delivery_url(self.url, connector="REST")
         # #68: build this message's dynamic headers from its user-metadata bag (pure; None → {} → byte-
         # identical). urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         dynamic_headers = outbound_headers_from_metadata(metadata)
         if self._header_rule is not None:
-            # The hop first (zero I/O; _post repeats it). A hop no longer permitted is the
-            # connection's fault and stops the lane with the row kept; judged after it, a held
-            # header would dead-letter the row instead (Lander finding 6 on engine PR 2576).
-            if self._hop_guard is not None:
-                self._hop_guard.assert_delivery_url(self.url, connector="REST")
             refuse_held_dynamic_headers(
                 dynamic_headers,
                 rule=self._header_rule,

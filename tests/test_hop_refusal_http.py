@@ -727,31 +727,7 @@ def test_a_credential_typed_into_a_proxy_authorization_key_is_not_echoed(
     assert "c3ludGhldGljOnB3" not in text
 
 
-def test_control_a_static_proxy_authorization_beside_a_proxy_is_left_to_the_proxy_rule(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """With a ``proxy_url`` the header is the proxy's, so this rule leaves it to the send-time
-    proxy rule, and the connection builds."""
-    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    url = _CLEARTEXT["REST"][2]
-    settings = Rest(
-        url=url, headers={"Proxy-Authorization": "Basic synthetic"}, proxy="http://127.0.0.1:3128"
-    ).settings
-    with active_hop_posture(_PROD):
-        dest = build_destination(
-            Destination(
-                name="OB",
-                type=ConnectorType.REST,
-                settings=settings,
-                cleartext_accepted=True,
-                cleartext_reason="vendor firmware predates TLS",
-            ),
-            egress=EgressSettings(deny_by_default=False, allowed_proxy=["127.0.0.1"]),
-        )
-    assert dest is not None
-
-
-# --- Lander finding 2 on engine PR 2576: a proxy_url that this hop does not use -------------------
+# --- Lander finding 2 on engine PR 2576: a proxy_url this hop does not use -----------------------
 #
 # The static Proxy-Authorization is left to the send-time proxy rule only when the request goes
 # to a proxy. A hop the proxy bypasses goes direct, where that rule refuses the header on every
@@ -781,6 +757,15 @@ def _build_beside_a_proxy(cell: str, **proxy: Any) -> DestinationConnector:
         )
 
 
+def _pin_system_proxy(
+    monkeypatch: pytest.MonkeyPatch, proxies: dict[str, str], *, bypass: bool = False
+) -> None:
+    """Pin the system proxy map and urllib's bypass list, so the host's own proxy settings
+    cannot decide a case."""
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: dict(proxies))
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: bypass)
+
+
 #: Each way a configured proxy_url leaves this hop direct.
 _BYPASSED: dict[str, dict[str, Any]] = {
     "proxy_no_proxy names the host": {"proxy_url": _PROXY, "proxy_no_proxy": ["*"]},
@@ -795,9 +780,7 @@ def test_a_static_proxy_authorization_on_a_bypassed_hop_is_refused_at_build(
     cell: str, case: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    # Pinned, so the host's own proxy settings cannot decide the case.
-    monkeypatch.setattr(urllib.request, "getproxies", dict)
-    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: case.startswith("urllib"))
+    _pin_system_proxy(monkeypatch, {}, bypass=case.startswith("urllib"))
     with pytest.raises(
         InsecureHopRefused, match="HTTP cleartext credentials: .*Proxy-Authorization"
     ) as exc:
@@ -813,8 +796,7 @@ def test_control_a_static_proxy_authorization_on_a_proxied_hop_still_builds(
     """The arm above refuses for the bypass, not for the header: the same header on a hop that
     does reach a proxy, configured or the system's, is left to the send-time proxy rule."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": _PROXY, "https": _PROXY})
-    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+    _pin_system_proxy(monkeypatch, {"http": _PROXY, "https": _PROXY})
     assert _build_beside_a_proxy(cell, proxy_url=proxy_url) is not None
 
 

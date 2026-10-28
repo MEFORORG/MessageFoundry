@@ -411,7 +411,7 @@ class SoapDestination(DestinationConnector):
                 ConnectorType.SOAP,
                 s,
                 cleartext=True,
-                proxied=hop_reaches_a_proxy(proxy_dest, self.url),
+                proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.url),
             ),
             connection=config.name,
         )

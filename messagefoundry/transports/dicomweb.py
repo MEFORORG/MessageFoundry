@@ -260,7 +260,7 @@ class DicomWebDestination(DestinationConnector):
                 ConnectorType.DICOMWEB,
                 s,
                 cleartext=True,
-                proxied=hop_reaches_a_proxy(proxy_dest, self.base_url),
+                proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.base_url),
             ),
             connection=config.name,
         )

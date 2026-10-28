@@ -7,10 +7,11 @@
   credential-shaped value under a neutral name is refused too. It does not take that refusal's
   header-name allowlist, so a neutral header such as `Prefer` still crosses a declared cleartext
   hop; whether it should is an open owner question. A static `Proxy-Authorization` is left to the
-  send-time proxy rule only when the request goes to a proxy. On a hop that goes direct, through
-  `proxy_no_proxy`, urllib's own bypass list, or `proxy_url = "default"` with no system proxy, it
-  counts as a credential and refuses the hop at build. A header key that holds whitespace or is
-  shaped like a credential is withheld from the refusal text. Owner ruling 2026-10-26, recorded as
+  send-time proxy rule only when the request goes to a proxy. A hop can bypass a configured
+  `proxy_url` through `proxy_no_proxy`, urllib's own bypass list, or a `"default"` with no system
+  proxy. That hop goes direct, so the header counts as a credential and refuses it at build. A
+  header key that holds whitespace or is shaped like a credential is withheld from the refusal
+  text. Owner ruling 2026-10-26, recorded as
   a dated amendment to
   [ADR 0153](../docs/adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
   The forward-proxy login stays under the declarations, by the owner's 2026-10-05 ruling on that
