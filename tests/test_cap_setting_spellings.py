@@ -1029,3 +1029,16 @@ def test_the_build_check_refuses_an_env_acquire_timeout_the_sync_would_refuse() 
     with pytest.raises(ValueError, match=_refusal("reference source acquire_timeout")):
         check("nan")
     check("12.5")  # the control: a number passes
+
+
+def test_the_reference_sync_max_rows_reads_zero_text_as_off() -> None:
+    """``DatabaseRef``'s ``max_rows`` (BACKLOG #2617) reads an uncast ``env()`` ``"0"`` as the
+    documented opt-out, exactly as ``0``, and refuses a negative in either spelling."""
+    from messagefoundry.pipeline.reference_sync import reference_max_rows
+
+    for off in (0, "0", " 0 ", 0.0):
+        assert reference_max_rows({"max_rows": off}) is None, repr(off)
+    assert reference_max_rows({"max_rows": " 7 "}) == 7
+    for bad in (-1, "-1"):
+        with pytest.raises(ValueError, match="DATABASE reference source max_rows"):
+            reference_max_rows({"max_rows": bad})

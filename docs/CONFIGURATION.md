@@ -678,6 +678,9 @@ crash-re-run — the same accepted caveat as a code-set hot-reload).
   read-only SQL query on the cadence (SQL Server via the `[sqlserver]` extra, **production / supported**; secrets
   via `env()`; the dial-out is gated by the fail-closed `[egress].allowed_db` allowlist). `key_column`
   is the lookup key; `value_column` (if set) is the value, else the value is a dict of the other columns.
+  The statement must pass the `db_lookup` read-only statement test, so a stored procedure is refused,
+  and `max_rows` (default `100000`, `0` = off) refuses a larger result; see
+  [`CONNECTIONS.md`](CONNECTIONS.md) §*A `DatabaseRef` statement passes the same gate, and a row ceiling*.
 - **Sync.** The engine's `ReferenceSyncRunner` materializes each set once at startup (before listeners
   serve, so `reference(...)` resolves on the first message) and every `refresh_seconds`. A source
   failure is **isolated**: it's logged + alerted and the **last-good snapshot is kept** (the write

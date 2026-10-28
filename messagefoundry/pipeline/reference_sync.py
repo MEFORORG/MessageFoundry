@@ -37,6 +37,7 @@ from typing import Any
 from uuid import uuid4
 
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
+from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import hop_attestation_from_settings
 from messagefoundry.config.settings import (
     EgressSettings,
@@ -44,6 +45,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture, current_hop_posture
 from messagefoundry.config.wiring import (
+    DEFAULT_REFERENCE_MAX_ROWS,
     ReferenceSpec,
     WiringError,
     refuse_unresolved_hop_flags,
@@ -56,13 +58,31 @@ from messagefoundry.store.base import DEFAULT_STORE_ACQUIRE_TIMEOUT, acquire_poo
 from messagefoundry.transports.base import count_setting, float_setting
 from messagefoundry.transports.egress import check_lookup_allowed
 
-__all__ = ["ReferenceSyncRunner", "ReferenceSyncError"]
+__all__ = [
+    "ReferenceRowCeilingExceeded",
+    "ReferenceStatementRefused",
+    "ReferenceSyncError",
+    "ReferenceSyncRunner",
+]
 
 log = logging.getLogger(__name__)
 
 
 class ReferenceSyncError(RuntimeError):
     """A reference set's source could not be materialized (bad source kind, missing file, parse error)."""
+
+
+# The two below are separate classes because the sync's log and alert carry the error's CLASS name
+# only, never its text (a source error can hold a reference key). The class is all an operator gets,
+# so it has to say which control refused the set (BACKLOG #2617).
+
+
+class ReferenceStatementRefused(ReferenceSyncError):
+    """A ``DatabaseRef`` statement failed the read-only statement test that ``db_lookup`` uses."""
+
+
+class ReferenceRowCeilingExceeded(ReferenceSyncError):
+    """A ``DatabaseRef`` statement returned more rows than its ``max_rows``."""
 
 
 @dataclass(frozen=True)
@@ -124,17 +144,91 @@ def reference_acquire_timeout(settings: Mapping[str, Any]) -> float:
     )
 
 
+def reference_max_rows(settings: Mapping[str, Any]) -> int | None:
+    """Read a DATABASE reference source's ``max_rows``: a ceiling, or ``None`` when ``0`` turned it
+    off (BACKLOG #2617). Unset takes :data:`~messagefoundry.config.wiring.DEFAULT_REFERENCE_MAX_ROWS`.
+
+    One reader for the sync and for ``build_check_registry``, as :func:`reference_acquire_timeout` is,
+    so an ``env()`` value the sync would refuse fails ``messagefoundry check`` too. ``DatabaseRef``
+    reads a literal by the same rule when it is declared."""
+    from messagefoundry.transports.database import max_rows_setting
+
+    return max_rows_setting(
+        settings.get("max_rows"),
+        label="DATABASE reference source",
+        default=DEFAULT_REFERENCE_MAX_ROWS,
+    )
+
+
+def reference_statement(settings: Mapping[str, Any], *, name: str | None = None) -> str:
+    """Return a DATABASE reference source's ``statement`` once it passes the read-only statement test,
+    or raise :class:`ReferenceStatementRefused` (BACKLOG #2617).
+
+    The test is ``db_lookup``'s own (``transports.database._require_read_only``), so the two gates
+    cannot drift: the statement must open with ``SELECT`` or ``WITH``, carry no write, ``EXEC`` or DDL
+    keyword outside a literal or comment, and chain no second statement. A stored procedure is
+    therefore refused. ``build_check_registry`` calls this, and so does every sync, as a backstop for a
+    spec that reached the runner some other way.
+
+    It is a shape test on text, not read-only authority, and the sync pool is autocommit, so a write
+    that passed it would commit. The login's privilege is the control (docs/CONNECTIONS.md).
+
+    The refusal is raised outside the handler, so it carries no ``DbLookupError`` chain. Its text is
+    the fixed refusal vocabulary and the set's name, never the statement."""
+    from messagefoundry.transports.database import _require_read_only
+
+    statement = str(settings.get("statement", ""))
+    refusal: str | None = None
+    try:
+        _require_read_only(statement, subject="DatabaseRef statement")
+    except DbLookupError as exc:
+        refusal = str(exc)
+    if refusal is not None:
+        where = "" if name is None else f"reference set {name!r}: "
+        raise ReferenceStatementRefused(f"{where}{refusal}")
+    return statement
+
+
 def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None = None) -> str:
     """Build a DATABASE reference source's DSN, refusing weakened TLS under the AMBIENT hop posture.
 
     The one place both callers build it: the sync, just before it dials, and ``build_check``, so
     weakened TLS that every sync would refuse also fails ``messagefoundry check``, dry-run and
     reload (vault BACKLOG #2354). The source is always the SQL Server preset, since ``DatabaseRef`` takes no
-    ``dialect``. The per-connection attestation is read and validated here too (#200)."""
+    ``dialect``. The per-connection attestation is read and validated here too (#200).
+
+    The DSN advertises ``ApplicationIntent=ReadOnly``, as the ``db_lookup`` DSN does (BACKLOG #2617).
+    Against an Always On listener with read-only routing, the sync then reads a readable secondary,
+    whose data can lag the primary's. Elsewhere the keyword changes nothing."""
     from messagefoundry.transports.database import _build_dsn
 
     attested = hop_attestation_from_settings(settings)
-    return _build_dsn(dict(settings), attested=attested, connection=connection)
+    return _build_dsn(dict(settings), read_only=True, attested=attested, connection=connection)
+
+
+async def _fetch_reference_rows(cur: Any, limit: int | None, name: str | None) -> list[Any]:
+    """Fetch a reference statement's rows, refusing more than ``limit`` (BACKLOG #2617).
+
+    Never ``fetchall`` under a ceiling: the driver is asked for at most ``limit + 1`` rows in all,
+    so a statement that matches far more is refused having buffered one row past the ceiling, not
+    the whole result. The loop is there because a driver may return fewer rows than asked while more
+    remain. ``None`` (``max_rows=0``) is the operator's opt-out, and fetches everything as before."""
+    if limit is None:
+        return list(await cur.fetchall())
+    rows: list[Any] = []
+    while len(rows) <= limit:
+        batch = list(await cur.fetchmany(limit + 1 - len(rows)))
+        if not batch:
+            break
+        rows.extend(batch)
+    if len(rows) > limit:
+        # PHI-free: the set and the ceiling only, never the statement or a row.
+        where = "" if name is None else f"reference set {name!r}: "
+        raise ReferenceRowCeilingExceeded(
+            f"{where}the DatabaseRef statement returned more than max_rows={limit} rows; "
+            "narrow the statement, or raise max_rows on this DatabaseRef"
+        )
+    return rows
 
 
 async def _load_database_source(
@@ -146,10 +240,15 @@ async def _load_database_source(
 ) -> dict[str, Any]:
     """Materialize a SQL-backed reference source (ADR 0006 increment 2) into ``{key: value}``.
 
-    Runs the operator's read-only ``statement``; ``key_column`` is the key; ``value_column`` (if set)
-    is the value, else the value is a dict of the other columns. The dial-out is gated by the
-    fail-closed ``[egress].allowed_db`` allowlist (like a DATABASE poll source). Reuses
-    ``transports/database.py`` for the DSN/pool (the SQL-Server ``[sqlserver]`` extra).
+    Runs the operator's ``statement`` once it passes :func:`reference_statement`; ``key_column`` is the
+    key; ``value_column`` (if set) is the value, else the value is a dict of the other columns. The
+    dial-out is gated by the fail-closed ``[egress].allowed_db`` allowlist (like a DATABASE poll
+    source). Reuses ``transports/database.py`` for the DSN/pool (the SQL-Server ``[sqlserver]`` extra).
+
+    The result is bounded by :func:`reference_max_rows` at the fetch (BACKLOG #2617): the driver is
+    asked for at most ``max_rows + 1`` rows, and one past the ceiling raises
+    :class:`ReferenceRowCeilingExceeded`. The set is never built from a truncated result. The runner
+    then keeps the last-good snapshot, as for any source failure.
 
     ``posture`` is the instance hop posture (vault BACKLOG #2354). A sync runs after start, outside
     every ``active_hop_posture`` scope, so without it the weakened-TLS refusal in ``_build_dsn`` read
@@ -159,7 +258,7 @@ async def _load_database_source(
     honoured only on an instance at ``[security].enforcement = warn``. ``None`` keeps the ambient
     posture, so a caller already inside a scope is unchanged. ``name`` is the reference set, so a
     refusal or an attestation line names it."""
-    from messagefoundry.transports.database import _login_timeout, _make_pool
+    from messagefoundry.transports.database import _close_cursor, _login_timeout, _make_pool
 
     server = str(settings.get("server", ""))
     # `egress` is required (vault BACKLOG #2605): a caller that passed none used to skip this check.
@@ -173,6 +272,9 @@ async def _load_database_source(
     statement = str(settings.get("statement", ""))
     if not key_col or not statement:
         raise ReferenceSyncError("DATABASE reference source requires 'statement' and 'key_column'")
+    # BACKLOG #2617: build_check refuses the statement already; this backstop holds for a spec that
+    # reached the runner without a build check. Before the DSN and the pool, so nothing is dialled.
+    reference_statement(settings, name=name)
     # Fail loud on weakened TLS or bad auth, before dialing; why the posture is stamped is in the
     # docstring. Unlike wiring_runner._build_lookup_executor, a None posture keeps the ambient one.
     with active_hop_posture(posture if posture is not None else current_hop_posture()):
@@ -187,6 +289,7 @@ async def _load_database_source(
     # and alerts, exactly as it does for any other source error.
     # Read before the pool is made, so a refused value leaves no pool unclosed (BACKLOG #3432).
     acquire_timeout = reference_acquire_timeout(settings)
+    limit = reference_max_rows(settings)  # BACKLOG #2617, read early for the same reason
     pool = await _make_pool(
         dsn,
         count_setting(
@@ -197,12 +300,14 @@ async def _load_database_source(
     )
     try:
         conn = await acquire_pooled(pool, timeout=acquire_timeout, backend="reference:database")
+        cur: Any = None
         try:
             cur = await conn.cursor()
             await cur.execute(statement)
             columns = [d[0] for d in cur.description]
-            rows = list(await cur.fetchall())
+            rows = await _fetch_reference_rows(cur, limit, name)
         finally:
+            await _close_cursor(cur)
             await pool.release(conn)
     finally:
         pool.close()

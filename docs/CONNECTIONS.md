@@ -1870,6 +1870,35 @@ table, a synced `Reference(...)` is the better fit. `max_rows=0` removes the cei
 or fractional value stops `serve` building the lookup. `messagefoundry check` refuses it in its build
 leg, which runs when the config has a `messagefoundry.toml`. The ceiling counts rows, not bytes.
 
+#### A `DatabaseRef` statement passes the same gate, and a row ceiling
+
+A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the lookup's controls
+(BACKLOG #2617):
+
+- **The statement gate.** The `statement` goes through the same `_require_read_only` test as a
+  `db_lookup` statement: it must open with `SELECT` or `WITH`, carry no write, `EXEC` or DDL keyword
+  outside a literal or comment, and chain no second statement. **A stored procedure is therefore
+  refused**; read the procedure's tables or a view with a `SELECT` instead. `messagefoundry check`,
+  dry-run and reload refuse a statement that fails, and every sync tests it again before it dials.
+  A sync it refuses fails as `ReferenceStatementRefused`.
+- **Read intent.** The sync's DSN carries `ApplicationIntent=ReadOnly`, as a lookup's does. Against an
+  Always On availability-group listener with read-only routing, the sync then reads a **readable
+  secondary**, whose data can lag the primary's, so a fresh snapshot can trail the primary by the
+  replica's lag. Against any other server the keyword changes nothing.
+- **The row ceiling.** `DatabaseRef(max_rows=…)`, default `100000`, bounds one sync. The driver is asked
+  for at most `max_rows + 1` rows, and a statement that returns more fails that sync as
+  `ReferenceRowCeilingExceeded`: the last-good snapshot keeps serving, the AlertSink fires, and a set
+  that never synced stays unloaded. The set is never built from a truncated result. `max_rows=0`
+  removes the ceiling. A negative or fractional value is refused when the `DatabaseRef` is declared;
+  an `env()` value is refused at `messagefoundry check` and at each sync.
+
+The sync's log line and alert carry the error's class name only, never its text, because a source
+error can hold a reference key. The two class names above are what tell those failures apart.
+
+Neither control is read-only authority, for the reasons in the table above, and the sync pool is
+autocommit. Give the `DatabaseRef` login `SELECT` on what the statement reads, and nothing else. The
+engine does not probe that login's role membership yet.
+
 #### Static credentials on every backend hop
 
 ASVS 13.2.1 asks that every backend hop authenticate with an individual service account, a short-term

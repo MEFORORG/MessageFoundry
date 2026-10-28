@@ -204,10 +204,13 @@ def _build_dsn(
     clamped so it can never relax a production hop; ``attested`` (the per-connection ``tls_hop_attested``)
     is the surgical, audited per-hop opt-in.
 
-    ``read_only`` (only the db_lookup pool sets it; destination/source omit it, keeping their DSN
-    byte-identical) appends ``ApplicationIntent=ReadOnly`` so the connection advertises read-only intent
-    — defense-in-depth for the ADR 0010 read-only carve-out, layered with the statement guard in
-    :func:`_require_read_only`. **Neither layer is read-only authority.** ApplicationIntent is honored
+    ``read_only`` (the db_lookup pool and, since BACKLOG #2617, the ``DatabaseRef`` sync set it;
+    destination/source omit it, keeping their DSN byte-identical) appends ``ApplicationIntent=ReadOnly``
+    so the connection advertises read-only intent. Against an Always On availability-group listener
+    with read-only routing, that intent sends the connection to a readable secondary, whose data can
+    lag the primary's. It is defense-in-depth for the ADR 0010 read-only carve-out, layered with the
+    statement guard in :func:`_require_read_only`. **Neither layer is read-only authority.**
+    ApplicationIntent is honored
     only by a SQL Server Always-On read replica and is a no-op otherwise, and a statement guard is a
     shape test on text. The control that actually refuses a write is the privilege of the account this
     DSN dials, which only the operator can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
@@ -984,13 +987,21 @@ _SQL_WRITE_KEYWORDS = frozenset(
 # the exact shape this gate exists to refuse.
 _SQL_FUNCTION_FORM_KEYWORDS = frozenset({"INSERT", "TRUNCATE"})
 
-_READ_ONLY_MESSAGE = (
-    "db_lookup statement must be a read-only SELECT/WITH query "
-    "(no writes, no EXEC, no multiple statements)"
-)
+
+def _read_only_message(subject: str) -> str:
+    """The refusal :func:`_require_read_only` raises, naming whose statement it refused."""
+    return (
+        f"{subject} must be a read-only SELECT/WITH query "
+        "(no writes, no EXEC, no multiple statements)"
+    )
 
 
-def _scan_sql_tokens(statement: str) -> list[tuple[str, str]]:
+_READ_ONLY_MESSAGE = _read_only_message("db_lookup statement")
+
+
+def _scan_sql_tokens(
+    statement: str, *, subject: str = "db_lookup statement"
+) -> list[tuple[str, str]]:
     """Tokenize ``statement`` into ``(kind, text)`` pairs, dropping comments and the contents of string
     literals and quoted identifiers.
 
@@ -1000,7 +1011,9 @@ def _scan_sql_tokens(statement: str) -> list[tuple[str, str]]:
     token. T-SQL block comments nest, so the scan tracks depth.
 
     An unterminated literal or comment raises :class:`DbLookupError`: the rest of such a statement
-    cannot be read, and guessing at it is how a shape-based gate gets bypassed."""
+    cannot be read, and guessing at it is how a shape-based gate gets bypassed. ``subject`` names
+    whose statement it is in that refusal."""
+    refusal = _read_only_message(subject)
     tokens: list[tuple[str, str]] = []
     i, n = 0, len(statement)
     while i < n:
@@ -1022,14 +1035,14 @@ def _scan_sql_tokens(statement: str) -> list[tuple[str, str]]:
                 else:
                     i += 1
             if depth:
-                raise DbLookupError(f"{_READ_ONLY_MESSAGE}; unterminated block comment")
+                raise DbLookupError(f"{refusal}; unterminated block comment")
             continue
         if ch in "'\"[`":
             closer = "]" if ch == "[" else ch
             i += 1
             while True:
                 if i >= n:
-                    raise DbLookupError(f"{_READ_ONLY_MESSAGE}; unterminated quoted text")
+                    raise DbLookupError(f"{refusal}; unterminated quoted text")
                 if statement[i] == closer:
                     if i + 1 < n and statement[i + 1] == closer:  # doubled = an escaped delimiter
                         i += 2
@@ -1048,9 +1061,12 @@ def _scan_sql_tokens(statement: str) -> list[tuple[str, str]]:
     return tokens
 
 
-def _require_read_only(statement: str) -> None:
+def _require_read_only(statement: str, *, subject: str = "db_lookup statement") -> None:
     """Test a db_lookup statement's shape for the ADR 0010 read-only carve-out. Defence in depth only,
     like ``ApplicationIntent=ReadOnly``. A read-only login is the control (``docs/CONNECTIONS.md``).
+
+    A ``DatabaseRef`` statement goes through the same test (BACKLOG #2617), with ``subject`` naming it
+    in the refusal. So a stored-procedure ``DatabaseRef`` is refused, as a stored-procedure lookup is.
 
     The statement is tokenized (:func:`_scan_sql_tokens`), so comments, string literals and quoted
     identifiers are skipped, and then three rules apply:
@@ -1071,16 +1087,17 @@ def _require_read_only(statement: str) -> None:
     pass-through literal, so the account itself should be read-only (``docs/CONNECTIONS.md``). Raises
     :class:`DbLookupError` on violation. The message stays PHI-free — it never echoes statement text,
     and any keyword it names comes from the fixed vocabulary above, never from operator data."""
-    tokens = _scan_sql_tokens(statement)
+    refusal = _read_only_message(subject)
+    tokens = _scan_sql_tokens(statement, subject=subject)
     if not tokens or tokens[0] not in (("word", "SELECT"), ("word", "WITH")):
-        raise DbLookupError(_READ_ONLY_MESSAGE)
+        raise DbLookupError(refusal)
     last = len(tokens) - 1
     for index, (kind, text) in enumerate(tokens):
         if kind != "word":
             # A ';' is tolerated only as the final token (a statement terminator); anything after one
             # is a second statement, whatever that statement starts with.
             if text == ";" and index != last:
-                raise DbLookupError(_READ_ONLY_MESSAGE)
+                raise DbLookupError(refusal)
             continue
         if text not in _SQL_WRITE_KEYWORDS:
             continue
@@ -1090,7 +1107,7 @@ def _require_read_only(statement: str) -> None:
             and tokens[index + 1] == ("other", "(")
         ):
             continue  # a scalar function call that shares the keyword's name, not a statement
-        raise DbLookupError(f"{_READ_ONLY_MESSAGE}; found a '{text}' keyword")
+        raise DbLookupError(f"{refusal}; found a '{text}' keyword")
     return None
 
 
@@ -2194,16 +2211,28 @@ def _lookup_max_rows(value: Any, connection: str) -> int | None:
     ``0`` opt-out. Unset (``None``) takes :data:`DEFAULT_DB_LOOKUP_MAX_ROWS`.
 
     Anything but a whole, non-negative number is refused at construction, which ``serve`` reaches at
-    start and ``messagefoundry check`` reaches in its build leg. A bool is an ``int`` to Python, so
-    ``max_rows=True`` would otherwise read as a ceiling of one row, and ``int(2.5)`` would quietly
-    read as 2.
+    start and ``messagefoundry check`` reaches in its build leg. The rule is :func:`max_rows_setting`."""
+    return max_rows_setting(
+        value, label=f"DatabaseLookup {connection!r}", default=DEFAULT_DB_LOOKUP_MAX_ROWS
+    )
 
-    The refusals name the connection and the setting, never the value: settings arrive here already
+
+def max_rows_setting(value: Any, *, label: str, default: int) -> int | None:
+    """Read a ``max_rows`` row ceiling: a positive ceiling, or ``None`` for the documented ``0``
+    opt-out. Unset (``None``) takes ``default``. Shared by ``DatabaseLookup`` and ``DatabaseRef``
+    (BACKLOG #1730, #2617), so the two cannot read one spelling two ways.
+
+    Anything but a whole, non-negative number is refused. A bool is an ``int`` to Python, so
+    ``max_rows=True`` would otherwise read as a ceiling of one row, and ``int(2.5)`` would quietly
+    read as 2. Text is read by ``int()``, so an uncast ``env()`` value of ``"0"`` turns the ceiling
+    off exactly as ``0`` does.
+
+    The refusals name ``label`` and the setting, never the value: settings arrive here already
     env()-resolved, and a resolved value stays out of an error the same way ``resolve_env_settings``
     keeps it out (BACKLOG #1183)."""
     if value is None:
-        return DEFAULT_DB_LOOKUP_MAX_ROWS
-    whole = f"DatabaseLookup {connection!r} max_rows must be a whole number (value withheld)"
+        return default
+    whole = f"{label} max_rows must be a whole number (value withheld)"
     if isinstance(value, bool):
         raise ValueError(whole)
     # Raised after the handler ends: int()'s ValueError quotes the value, and ``from None`` would
@@ -2219,8 +2248,8 @@ def _lookup_max_rows(value: Any, connection: str) -> int | None:
         raise ValueError(whole)
     if ceiling < 0:
         raise ValueError(
-            f"DatabaseLookup {connection!r} max_rows must be a positive number of rows, or 0 for "
-            "no ceiling (value withheld)"
+            f"{label} max_rows must be a positive number of rows, or 0 for no ceiling "
+            "(value withheld)"
         )
     return ceiling or None
 

@@ -175,6 +175,8 @@ from messagefoundry.pipeline.reference_sync import (
     database_source_dsn,
     reference_acquire_timeout,
     reference_connection_name,
+    reference_max_rows,
+    reference_statement,
 )
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
@@ -11254,24 +11256,33 @@ def _build_check_connectors(
         DatabaseLookupExecutor(resolved_lookups, egress=egress)  # checks each server first
     # Vault BACKLOG #2354: a DATABASE reference source's DSN, built (and discarded) under this
     # posture, so weakened TLS that every sync would refuse fails check, dry-run and reload rather
-    # than only surfacing as a failed sync after start. TLS and auth only: the egress allowlist and
-    # the statement checks stay at sync. Builds no pool and opens no socket. A source whose env()
-    # values do not resolve here is left to its sync, as before, so one unprovisioned set does not
-    # refuse the whole graph.
+    # than only surfacing as a failed sync after start. The egress allowlist stays at sync; the
+    # read-only statement test runs here and again at sync (BACKLOG #2617). Builds no pool and opens
+    # no socket. A source whose env() values do not resolve here is left to its sync, as before, so
+    # one unprovisioned set does not refuse the whole graph.
     # Every source kind, and before the unresolved-env skip below: this refusal needs no value. The
     # same call Engine.start makes (vault BACKLOG #3139).
     refuse_reference_hop_flags(registry)
     for rname, rspec in registry.references.items():
         if rspec.source.kind != "database":
             continue
+        # BACKLOG #2617: DatabaseRef takes the statement as a literal, so it is tested before the
+        # env() skip below and a set whose server is not provisioned yet is still tested.
+        literal_statement = isinstance(rspec.source.settings.get("statement"), str)
+        if literal_statement:
+            reference_statement(rspec.source.settings, name=rname)
         try:
             rsettings = resolve_env_settings(rspec.source.settings, env_values)
         except WiringError:
             continue
+        if not literal_statement:
+            reference_statement(rsettings, name=rname)
         database_source_dsn(rsettings, connection=reference_connection_name(rname))
         # BACKLOG #3432: the sync reads acquire_timeout by this rule, so an env() value it would
-        # refuse fails check here rather than as a failed sync after start.
+        # refuse fails check here rather than as a failed sync after start. max_rows the same way
+        # (BACKLOG #2617).
         reference_acquire_timeout(rsettings)
+        reference_max_rows(rsettings)
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         resolved_fhir_lookups[fname] = _fhir_lookup_settings(fspec, env_values, egress)
