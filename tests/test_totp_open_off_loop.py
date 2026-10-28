@@ -56,9 +56,10 @@ class _Steps:
 
 async def _totp_admin(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, *, before_confirm: Callable[[], None]
-) -> tuple[AuthService, Identity, str, _Steps]:
+) -> tuple[AuthService, Identity, str, _Steps, list[str]]:
     """An Administrator with TOTP active, and a padding seam that does not wait. ``before_confirm``
-    runs between the enrolment's begin and its confirm, so a spy can see the confirm's open."""
+    runs between the enrolment's begin and its confirm, so a spy can see the confirm's open.
+    Returns the service, the identity, the password, the code stepper and the recovery codes."""
 
     async def no_pad(_deadline: float) -> None:
         return None
@@ -74,8 +75,9 @@ async def _totp_admin(
     enroll = await service.begin_mfa_enrollment(identity)
     steps = _Steps(monkeypatch, enroll.secret)
     before_confirm()
-    assert (await service.confirm_mfa_enrollment(identity, steps.next_code(), token=token)).ok
-    return service, identity, password, steps
+    confirmed = await service.confirm_mfa_enrollment(identity, steps.next_code(), token=token)
+    assert confirmed.ok and confirmed.recovery_codes
+    return service, identity, password, steps, list(confirmed.recovery_codes)
 
 
 def _blocking_cipher(
@@ -131,7 +133,7 @@ async def test_a_combined_sign_in_does_not_stall_the_loop_on_a_blocking_decrypt(
     stub inline, and shows the instrument sees the stall, so the off-loop arm can fail."""
     store = await MessageStore.open(":memory:")
     try:
-        service, _identity, _password, steps = await _totp_admin(
+        service, _identity, _password, steps, _codes = await _totp_admin(
             store, monkeypatch, before_confirm=lambda: None
         )
         loop_thread = threading.current_thread()
@@ -160,12 +162,14 @@ async def test_a_combined_sign_in_does_not_stall_the_loop_on_a_blocking_decrypt(
         await store.close()
 
 
-async def test_every_path_that_opens_the_totp_cell_opens_it_off_the_loop(
+async def test_the_service_paths_that_open_the_totp_cell_open_it_off_the_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Each service path that opens the TOTP cell does so in a worker thread: the enrolment's
-    confirm, the combined sign-in, the two-step verify (its code check and its before-and-after
-    enrolment reads), and the status read where a re-enrolment is possible."""
+    """At least these service paths open the TOTP cell in a worker thread: the enrolment's confirm,
+    the combined sign-in, the two-step verify (its code check and its before-and-after enrolment
+    reads), a replayed code's failed spend (its after-read), a way-past gate (``_totp_state``), and
+    the status read where a re-enrolment is possible. The lockable-account census is not among them:
+    it reads through the store's ``get_totp_secret``, whose decrypt is the store's own."""
     store = await MessageStore.open(":memory:")
     try:
         real_open = store.open_totp_secret
@@ -180,7 +184,7 @@ async def test_every_path_that_opens_the_totp_cell_opens_it_off_the_loop(
             path[0] = "confirm"
             monkeypatch.setattr(store, "open_totp_secret", spy)
 
-        service, identity, password, steps = await _totp_admin(
+        service, identity, password, steps, _codes = await _totp_admin(
             store, monkeypatch, before_confirm=install
         )
         path[0] = "combined"
@@ -188,16 +192,62 @@ async def test_every_path_that_opens_the_totp_cell_opens_it_off_the_loop(
         path[0] = "two-step"
         pending = await service.login(ADMIN_USERNAME, password)
         assert pending.ok and pending.mfa_required and pending.token is not None
-        assert (await service.verify_mfa(pending.token, steps.next_code())).ok
+        code = steps.next_code()
+        assert (await service.verify_mfa(pending.token, code)).ok
+        path[0] = "replayed"
+        again = await service.login(ADMIN_USERNAME, password)
+        assert again.ok and again.token is not None
+        assert not (await service.verify_mfa(again.token, code)).ok  # its step is spent
+        path[0] = "gate"
+        await service.must_enrol_before_rotating(identity)
         path[0] = "status"
         monkeypatch.setattr(totp, "reenrolment_possible", lambda: True)
         await service.mfa_status(identity)
-        assert set(seen) == {"confirm", "combined", "two-step", "status"}, sorted(seen)
-        # The two-step verify opens the cell for the enrolment it checks, for the code, and again
-        # for the enrolment the row holds after the check.
-        assert len(seen["two-step"]) >= 3, len(seen["two-step"])
+        assert set(seen) == {"confirm", "combined", "two-step", "replayed", "gate", "status"}, (
+            sorted(seen)
+        )
+        # A verify opens the cell for the enrolment it checks, for the code, and again for the
+        # enrolment the row holds after the check; the replay's after-read is its third.
+        assert len(seen["two-step"]) >= 3 and len(seen["replayed"]) >= 3, seen
         loop_thread = threading.current_thread()
         on_loop = sorted(p for p, threads in seen.items() if loop_thread in threads)
         assert on_loop == [], f"a TOTP cell was opened on the event loop by: {on_loop}"
     finally:
+        await store.close()
+
+
+async def test_a_cell_that_did_not_open_before_the_check_spends_no_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two-step verify reads the enrolment before the check and compares it after. Where that
+    first open fails and a later one would succeed, as a Transit service that drops one request
+    can do, the verify is refused ``factor_unverified`` BEFORE the check, so a recovery code sent
+    with it is not spent: it still verifies once the cell opens. RED when the code is checked and
+    spent against an enrolment the request can no longer compare, and then refused anyway."""
+    from messagefoundry.store.crypto import CipherError
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _identity, password, _steps, codes = await _totp_admin(
+            store, monkeypatch, before_confirm=lambda: None
+        )
+        real_open = store.open_totp_secret
+        fails = [1]
+
+        def drops_one(user_id: str, cell: str | None) -> str | None:
+            if fails[0]:
+                fails[0] -= 1
+                raise CipherError("synthetic: the cipher service dropped this request")
+            return real_open(user_id, cell)
+
+        monkeypatch.setattr(store, "open_totp_secret", drops_one)
+        pending = await service.login(ADMIN_USERNAME, password)
+        assert pending.ok and pending.token is not None
+        assert not (await service.verify_mfa(pending.token, codes[0])).ok
+        rows = await store.list_audit(action="auth.mfa_failed")
+        assert any((r["detail"] or "").find("factor_unverified") >= 0 for r in rows), rows
+        # The control: the same recovery code was not spent, so it verifies now.
+        assert (await service.verify_mfa(pending.token, codes[0])).ok
+    finally:
+        await store.close()
         await store.close()

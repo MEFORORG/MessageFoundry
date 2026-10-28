@@ -2429,6 +2429,12 @@ def _log_totp_malformed(username: str) -> None:
     )
 
 
+def _totp_columns(user: VerifiedUser) -> tuple[bool, float | None, str | None]:
+    """The columns that name ``user``'s TOTP enrolment as stored: on or off, its stamp and its
+    still-encrypted cell. Equal columns name one enrolment with no cell opened (BACKLOG #3929)."""
+    return user.totp_enabled, user.totp_enrolled_at, user.totp_secret_cell
+
+
 def _same_totp_enrolment(a: _TotpEnrolment, b: _TotpEnrolment) -> bool:
     """Whether two :data:`_TotpEnrolment` readings name one enrolment. The secret digests are
     compared in constant time (ASVS 11.2.4); the stamps are not secret."""
@@ -10269,17 +10275,18 @@ class AuthService:
         return user.totp_enrolled_at, None if secret is None else hash_token(secret)
 
     async def _totp_enrolment_moved(
-        self, verified: _TotpEnrolment | None, current: VerifiedUser
+        self, verified: _TotpEnrolment, current: VerifiedUser
     ) -> _TotpMoved | None:
         """Why the TOTP factor :meth:`verify_mfa` checked a code against is no longer the one row
         ``current`` holds, or ``None`` when it still is: ``"factor_removed"`` (turned off),
-        ``"factor_unverified"`` (either reading's cell does not open, checked first, so an
+        ``"factor_unverified"`` (``current``'s cell does not open, checked first, so an
         unopenable cell is never read as a change) or ``"factor_replaced"`` (enrolled again, told
-        apart by the stamp or the opened secret). BACKLOG #3068, #3780."""
+        apart by the stamp or the opened secret). ``verified`` is the reading taken before the
+        check, which :meth:`verify_mfa` requires to have opened. BACKLOG #3068, #3780."""
         if not current.totp_enabled:
             return "factor_removed"
         enrolment_now = await self._totp_enrolment(current)
-        if verified is None or enrolment_now is None:
+        if enrolment_now is None:
             return "factor_unverified"
         if not _same_totp_enrolment(verified, enrolment_now):
             return "factor_replaced"
@@ -13086,16 +13093,28 @@ class AuthService:
             # compared too, so two enrolments sharing a stamp still differ. Neither moves under a
             # store-key rotation, which re-encrypts the cell, so a rotation refuses nothing.
             verified_enrolment = await self._totp_enrolment(user)
+            if verified_enrolment is None:
+                # The cell did not open (logged by _totp_enrolment), so nothing after the check
+                # could tell whether the code proved the factor the row holds then. Refused before
+                # the check, so no code is spent and nothing is charged, even where a later open
+                # would succeed (BACKLOG #3929 review): a recovery code spent here was lost.
+                await self._audit(
+                    "auth.mfa_failed",
+                    actor=user.username,
+                    detail=_json({"reason": "factor_unverified"}),
+                    client=client,
+                )
+                return Elevation()
             match = _CodeMatch()
             try:
                 proved = await self._verify_second_factor(
                     user, code, client=client, arrived=arrived, match=match
                 )
             except CipherError:
-                # The cell did not open for the check either (logged just above). The check raises
-                # at its TOTP decrypt, before any recovery code is read, so nothing is spent and
-                # nothing is charged. Refused with the reason the after-side gives, rather than
-                # raised past the "never raises" contract.
+                # The cell opened above but not for the check. The check raises at its TOTP
+                # decrypt, before any recovery code is read, so nothing is spent and nothing is
+                # charged. Refused with the reason the after-side gives, rather than raised past
+                # the "never raises" contract.
                 await self._audit(
                     "auth.mfa_failed",
                     actor=user.username,
@@ -13125,6 +13144,23 @@ class AuthService:
                 # A cell that no longer opens proves nothing either way; the proof is spent, so it
                 # is refused and audited too rather than raised past the "never raises" contract.
                 refusal = await self._totp_enrolment_moved(verified_enrolment, fresh)
+                if refusal is None:
+                    # BACKLOG #3929: that comparison opened the cell in a worker thread, so a
+                    # revocation, a disable or a lock can land during it. The holder is read once
+                    # more, so the last read before the write is a store read again, and an
+                    # enrolment that moved meanwhile is compared again.
+                    settled = await self._factor_holder_current(
+                        token,
+                        actor=fresh.username,
+                        event="auth.mfa_failed",
+                        client=client,
+                        report_lock=True,
+                    )
+                    if isinstance(settled, Elevation):
+                        return settled
+                    if _totp_columns(settled) != _totp_columns(fresh):
+                        refusal = await self._totp_enrolment_moved(verified_enrolment, settled)
+                    fresh = settled
                 if refusal is not None:
                     await self._audit(
                         "auth.mfa_failed",
