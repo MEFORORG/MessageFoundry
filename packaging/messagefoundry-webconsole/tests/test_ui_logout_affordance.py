@@ -37,8 +37,9 @@ from messagefoundry.auth.service import _LOGOUT_LINEAGE_SECONDS, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.store import MessageStore
 from messagefoundry_webconsole import pages
-from tests._logout_rows import logout_details, logout_rows
+from tests._logout_rows import logout_details, logout_rows, temp_password_expired_rows
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -421,3 +422,75 @@ async def test_ui_logout_clears_the_cookie_when_a_row_for_nothing_ended_fails(
     assert _error_lines(caplog) == [
         "a sign-out that ended nothing could not write its auth.logout row"
     ]
+
+
+#: The temporary-credential lifetime the tests below configure, in hours.
+_EXPIRY_HOURS = 72
+
+
+async def _temporary_credential_session(engine: Engine) -> tuple[AuthService, str, str]:
+    """A service whose temporary credentials last ``_EXPIRY_HOURS``, an operator holding one,
+    and a session that operator opened before the deadline. Returns the service, the account id
+    and the session token; the deadline is still 30 seconds ahead."""
+    service = AuthService(
+        engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=_EXPIRY_HOURS)
+    )
+    await service.initialize()
+    user_id = await create_local_user_chosen(
+        service,
+        username="temp",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    await _move_deadline_to(engine, user_id, time.time() + 30)
+    outcome = await service.login("temp", PW)
+    assert outcome.ok and outcome.token is not None
+    return service, user_id, outcome.token
+
+
+async def _move_deadline_to(engine: Engine, user_id: str, deadline: float) -> None:
+    """Move the stored ``password_changed_at`` so the temporary credential's deadline lands on
+    ``deadline``: the gate reads the wall clock, so the stamp is what a test can move."""
+    store = engine.store
+    assert isinstance(store, MessageStore)  # a SQLite-specific reach-in
+    await store._db.execute(
+        "UPDATE users SET password_changed_at=? WHERE id=?",
+        (deadline - _EXPIRY_HOURS * 3600, user_id),
+    )
+    await store._db.commit()
+
+
+async def test_ui_logout_after_the_temporary_credential_lapsed_records_lapsed(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3749. The session was opened with an admin-issued temporary credential before its
+    deadline, and the deadline has since passed. Every gate ends such a session as lapsed and
+    audits ``auth.temp_password_expired`` (BACKLOG #2298). ``/ui/logout`` has no gate, so the
+    sign-out applies the same rule itself: its row says ``lapsed``, not ``revoked``, and it writes
+    exactly one ``auth.temp_password_expired`` row, with the fields the gate's row carries and an
+    ``at`` naming this leg."""
+    service, user_id, token = await _temporary_credential_session(engine)
+    await _move_deadline_to(engine, user_id, time.time() - 1)
+    out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    session = await engine.store.get_session(hash_token(token))
+    assert session is not None and session.revoked_at is not None
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "lapsed")]
+    assert await temp_password_expired_rows(engine.store) == [
+        ("temp", PEER_ADDRESS, {"provider": "local", "expiry_hours": _EXPIRY_HOURS, "at": "logout"})
+    ]
+
+
+async def test_ui_logout_before_the_temporary_credential_lapsed_records_revoked(
+    engine: Engine,
+) -> None:
+    """The control for the test above: the deadline is still ahead, so the same sign-out ends a
+    live session, says ``revoked``, and writes no ``auth.temp_password_expired`` row."""
+    service, _, token = await _temporary_credential_session(engine)
+    out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "revoked")]
+    assert await temp_password_expired_rows(engine.store) == []

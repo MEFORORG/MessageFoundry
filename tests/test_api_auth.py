@@ -35,7 +35,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
-from tests._logout_rows import logout_details, logout_rows
+from tests._logout_rows import logout_details, logout_rows, temp_password_expired_rows
 from tests._role_pairing import bypass_view_raw_pairing_rule
 from tests._session_race import rotate_after_first_call
 
@@ -3510,6 +3510,67 @@ async def test_a_session_rotates_the_temporary_credential_before_its_deadline(
         user = await engine.store.get_user(ida_id)
         assert user is not None and user.must_change_password is False
         assert await engine.store.list_audit(action="auth.temp_password_expired") == []
+
+
+async def test_post_logout_past_the_deadline_is_refused_at_the_gate_with_one_row(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3749. ``POST /auth/logout`` passes its gate first, and the gate ends a session whose
+    temporary credential lapsed (BACKLOG #2298), so the route never runs: a 401, one
+    ``auth.temp_password_expired`` row with ``"at": "session"``, and no ``auth.logout`` row. The
+    sign-out's own lapse check (the test below) is not reached, so it adds no second row."""
+    service = await _service(engine, _expiring_service_settings())
+    mo_id = await create_local_user_chosen(
+        service,
+        username="mo",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    await _move_deadline_to(engine, mo_id, time.time() + 30)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "mo")).json()["token"]
+        await _move_deadline_to(engine, mo_id, time.time() - 1)
+        assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 401
+    rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
+    assert len(rows) == 1 and '"at": "session"' in rows[0]["detail"]
+    assert await logout_rows(engine.store) == []
+
+
+async def test_a_logout_whose_credential_lapsed_after_its_gate_records_lapsed(
+    engine: Engine,
+) -> None:
+    """RED when: a sign-out reports ``revoked`` for a session whose temporary credential lapsed, or
+    writes no ``auth.temp_password_expired`` row for it (BACKLOG #3749).
+
+    Called on the service directly, as ``POST /auth/logout`` does once its gate proved the session
+    live, with the deadline passing in between. The sign-out applies the gate's own lapse test, so
+    it records ``lapsed`` and writes the gate's row, once, with ``"at": "logout"``."""
+    service = await _service(engine, _expiring_service_settings())
+    ned_id = await create_local_user_chosen(
+        service,
+        username="ned",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    await _move_deadline_to(engine, ned_id, time.time() + 30)
+    outcome = await service.login("ned", PW)
+    assert outcome.ok and outcome.token is not None
+    assert await service.identity_for_token(outcome.token) is not None
+    await _move_deadline_to(engine, ned_id, time.time() - 1)
+    ended = await service.logout(
+        outcome.token, actor="ned", client="192.0.2.7", proven_at=time.time()
+    )
+    assert ended == "lapsed"
+    assert await logout_rows(engine.store) == [("ned", "192.0.2.7", "lapsed")]
+    assert await temp_password_expired_rows(engine.store) == [
+        ("ned", "192.0.2.7", {"provider": "local", "expiry_hours": _EXPIRY_HOURS, "at": "logout"})
+    ]
 
 
 def test_the_must_change_refusal_states_a_passed_deadline_as_passed() -> None:

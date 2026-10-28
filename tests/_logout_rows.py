@@ -23,6 +23,16 @@ async def logout_rows(
     ]
 
 
+async def temp_password_expired_rows(store: Any) -> list[tuple[object, object, object]]:
+    """Each ``auth.temp_password_expired`` row, newest first, as its actor, client address and
+    whole ``detail``: the row a sign-out writes when it ends a session whose temporary credential
+    lapsed (BACKLOG #3749)."""
+    return [
+        (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")))
+        for row in await store.list_audit(action="auth.temp_password_expired")
+    ]
+
+
 async def logout_details(store: Any) -> list[dict[str, object]]:
     """Each ``auth.logout`` row's whole ``detail``, newest first."""
     return [

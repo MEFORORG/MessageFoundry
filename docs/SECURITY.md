@@ -5189,8 +5189,12 @@ elevations in a row inside it, and a wall clock that stepped between the elevati
 sign-out, which moves the bound by the step. The `auth.logout` row names the
 session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
 was presented. The `outcome` is `lapsed` instead when the session's own clock checks fail at the
-revoke. At least a session over its idle or absolute limit fails them. A `lapsed` row still names
-the owner.
+revoke, or when the owner's admin-issued temporary credential is past its deadline, the test every
+gate applies (a disabled account excepted, as there). At least a session over its idle or absolute
+limit fails the clock checks. The temporary-credential case also writes the gate's
+`auth.temp_password_expired` row, with `"at": "logout"` and the sign-out's client address. A
+`lapsed` row still names the owner. If the owner cannot be read, the temporary credential is not
+checked.
 
 **A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
 clears the cookie. That row is then missing, with an ERROR log line; the line names the session
