@@ -1324,13 +1324,15 @@ surface and the first sign-in change.
 `tests/test_passkey_way_past.py`, the store contracts in `tests/_webauthn_store_contract.py` and
 `tests/_lockout_store_contract.py`, and the console leg in
 `packaging/messagefoundry-webconsole/tests/test_ui_passkey_sign_in.py`. The factor-drop gates, the
-rotation gate among them, count a discoverable passkey only under the configured `rp_id`, and none
-when no `rp_id` is configured; `docs/SECURITY.md`, *Limits of the passkey way past*, states the
-rule and its limits. The census names passkey-only accounts as information, not as a finding.
+rotation gate among them, count a discoverable passkey as what remains only under the configured
+`rp_id`, and none when no `rp_id` is configured; `docs/SECURITY.md`, *Limits of the passkey way
+past*, states the rule and its limits. The census's `passkey_only` list is information, not a
+finding.
 
 > **Superseded text, kept as a record.** Until BACKLOG #3937 the rotation-gate sentence read: *"The
 > rotation gate and the last-factor guards count a discoverable passkey under any `rp_id`; only the
-> sign-in path reads the request's."* That item narrowed the gates to the configured `rp_id`.
+> sign-in path reads the request's."* That item narrowed what the factor-drop gates count as what
+> remains to the configured `rp_id`.
 
 Planned as:
 Tests first, in `tests/test_webauthn.py` and `tests/test_mfa.py`: registration

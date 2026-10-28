@@ -3359,7 +3359,7 @@ write races.
   the shipped default on a loopback bind. The census's reset warning
   (`reset_would_remove_a_passkey`) counts a passkey under the configured `rp_id` too, and any
   discoverable passkey when none is configured, since it asks whether a reset would remove one that
-  may sign the holder in. After an origin change
+  may sign the holder in. After a change from one configured origin to another
   ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
   visibly unusable) a passkey under the old `rp_id` no longer counts at the gates, so the census
   names an account whose only way past it was.
