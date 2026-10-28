@@ -33,7 +33,9 @@ from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.fhir import FhirDestination
 from messagefoundry.transports.rest import (
     DYNAMIC_HEADER_REFUSED_CODE,
+    INSECURE_HOP_REFUSED_CODE,
     VERIFY_OFF_STATIC_HEADER_ALLOWLIST,
+    InsecureHopGuard,
     RestDestination,
 )
 
@@ -292,6 +294,150 @@ async def test_one_bad_message_dead_letters_and_the_lane_delivers_the_next(
         assert outcome[0] is _ItemOutcome.PROCESSED
         assert sent == [{"X-Request-ID": "r1"}]
         assert await status_of(good) == OutboxStatus.DONE.value
+        assert sink.stopped == []
+    finally:
+        await store.close()
+
+
+# --- Lander finding 6 on engine PR 2576: the hop is judged before the headers -------------------
+#
+# A hop that is no longer permitted is the connection's fault, and on main it stopped the lane and
+# kept the row. The per-message header refusal dead-letters one message. Judged first, it turned
+# that lane stop into a dead-letter for any message holding a held header. The guard below is the
+# one the hop would capture with its declaration gone, built as
+# test_digest_refusal_classification builds it.
+
+#: A Handler header each rule holds: a credential by value, so the cleartext rule and the
+#: verify-off rule both refuse it.
+_HELD_HEADER = {"X-Session": "Bearer abc.def.ghi"}
+
+
+def _refusing_guard() -> InsecureHopGuard:
+    return InsecureHopGuard(
+        posture=HopPosture(enforcing=True),
+        attested=False,
+        cell="HTTP cleartext egress",
+        connection="OB_DYN",
+    )
+
+
+@pytest.mark.parametrize("hop", list(_CLEARTEXT))
+def test_a_refused_hop_wins_over_a_held_header(hop: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    dest = _CLEARTEXT[hop]()
+    assert dest._hop_guard is not None  # built permitted, with a guard to re-assert at send
+    sent = _wire(dest, monkeypatch)
+    dest._hop_guard = _refusing_guard()
+    with pytest.raises(NegativeAckError) as exc:
+        asyncio.run(dest.send(_PATIENT, metadata=_meta(_HELD_HEADER)))
+    assert exc.value.code == INSECURE_HOP_REFUSED_CODE
+    assert (exc.value.permanent, exc.value.config_fault) == (True, True)  # stop the lane
+    assert sent == []
+
+
+@pytest.mark.parametrize("hop", list(_CLEARTEXT))
+def test_control_a_permitted_hop_still_refuses_the_held_header(
+    hop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other order: with the guard the hop was built with, the send passes the hop check and
+    the header is what refuses, dead-lettering this message only."""
+    dest = _CLEARTEXT[hop]()
+    sent = _wire(dest, monkeypatch)
+    with pytest.raises(NegativeAckError) as exc:
+        asyncio.run(dest.send(_PATIENT, metadata=_meta(_HELD_HEADER)))
+    assert exc.value.code == DYNAMIC_HEADER_REFUSED_CODE
+    assert exc.value.config_fault is False
+    assert sent == []
+
+
+async def _runner_with(
+    store: Any, dest: _Dest, monkeypatch: pytest.MonkeyPatch, headers: dict[str, dict[str, str]]
+) -> tuple[RegistryRunner, _StopSink]:
+    sink = _StopSink()
+    runner = RegistryRunner(
+        Registry(),
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    runner._destinations["OB_DYN"] = dest
+
+    async def metadata_for(message_id: str) -> dict[str, str]:
+        return _meta(headers[message_id])
+
+    monkeypatch.setattr(runner, "_user_metadata_for", metadata_for)
+    return runner, sink
+
+
+async def _outbound_status(store: Any, mid: str) -> str:
+    cur = await store._db.execute(
+        "SELECT status FROM queue WHERE message_id=? AND stage=?", (mid, Stage.OUTBOUND.value)
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+async def test_a_refused_hop_stops_the_lane_and_keeps_a_held_header_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As on main: a hop refused at send stops the lane and keeps the row, though the message
+    holds a header the per-message rule would dead-letter it for."""
+    store = await MessageStore.open(tmp_path / "dyn.db")
+    try:
+        mid = await _seed_delivery(store, channel="IB_DYN", dest="OB_DYN", control_id="M1")
+        dest = _CLEARTEXT["rest cleartext off-box"]()
+        sent = _wire(dest, monkeypatch)
+        dest._hop_guard = _refusing_guard()
+        runner, sink = await _runner_with(store, dest, monkeypatch, {mid: _HELD_HEADER})
+        item = await store.claim_next_fifo("OB_DYN", now=1.0)
+        assert item is not None and item.message_id == mid
+        outcome = await runner._process_delivery_item("OB_DYN", item)
+        assert outcome[0] is _ItemOutcome.STOPPED
+        assert sink.stopped == ["OB_DYN"]
+        assert await _outbound_status(store, mid) == OutboxStatus.PENDING.value
+        assert sent == []
+    finally:
+        await store.close()
+
+
+#: Per-message headers that only look like a credential (finding 1, shipped fail-closed). Each
+#: must cost its own message and never the lane.
+_FALSE_POSITIVES: dict[str, dict[str, str]] = {
+    "clinical value with a scheme word": {"X-Order-Name": "Basic metabolic panel"},
+    "neutral name holding a credential word": {"X-Token-Count": "3"},
+}
+
+
+@pytest.mark.parametrize("case", list(_FALSE_POSITIVES))
+@pytest.mark.parametrize("hop", ["rest cleartext off-box", "fhir cleartext off-box"])
+async def test_a_false_positive_header_dead_letters_only_its_message(
+    case: str, hop: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Lander's condition on finding 1: a header the name or value heuristic refuses wrongly
+    dead-letters that message, the lane goes on, and the next message is delivered."""
+    store = await MessageStore.open(tmp_path / "dyn.db")
+    try:
+        bad = await _seed_delivery(store, channel="IB_DYN", dest="OB_DYN", control_id="M1")
+        good = await _seed_delivery(store, channel="IB_DYN", dest="OB_DYN", control_id="M2")
+        dest = _CLEARTEXT[hop]()
+        sent = _wire(dest, monkeypatch)
+        headers = {bad: _FALSE_POSITIVES[case], good: {"X-Request-ID": "r1"}}
+        runner, sink = await _runner_with(store, dest, monkeypatch, headers)
+
+        first = await store.claim_next_fifo("OB_DYN", now=1.0)
+        assert first is not None and first.message_id == bad
+        outcome = await runner._process_delivery_item("OB_DYN", first)
+        assert outcome[0] is _ItemOutcome.PROCESSED
+        assert await _outbound_status(store, bad) == OutboxStatus.DEAD.value
+        assert sent == []
+
+        second = await store.claim_next_fifo("OB_DYN", now=2.0)
+        assert second is not None and second.message_id == good
+        outcome = await runner._process_delivery_item("OB_DYN", second)
+        assert outcome[0] is _ItemOutcome.PROCESSED
+        assert await _outbound_status(store, good) == OutboxStatus.DONE.value
+        assert len(sent) == 1
         assert sink.stopped == []
     finally:
         await store.close()

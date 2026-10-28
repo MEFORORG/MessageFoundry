@@ -111,6 +111,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
+    hop_reaches_a_proxy,
     http_credentials_sent,
     http_family_trust_anchor,
     normalize_header_allowlist,
@@ -406,7 +407,12 @@ class SoapDestination(DestinationConnector):
             scheme,
             self._headers,
             self.url,
-            credentials=http_credentials_sent(ConnectorType.SOAP, s, cleartext=True),
+            credentials=http_credentials_sent(
+                ConnectorType.SOAP,
+                s,
+                cleartext=True,
+                proxied=hop_reaches_a_proxy(proxy_dest, self.url),
+            ),
             connection=config.name,
         )
         # ASVS 12.2.1: the SOAP envelope body is PHI, so a cleartext http egress to a non-loopback

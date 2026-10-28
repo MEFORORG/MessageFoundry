@@ -81,7 +81,8 @@ secret under a neutral name, such as `X-Session`, is refused without being recog
 credential-shaped value under an allowlisted name is still refused. A plain `http` hop off this
 machine refuses the credentials only, not a header for its name. A header a Handler stamps per
 message under `dynamic_headers` meets the same rule as the hop's static headers, when the
-message is sent. That refusal dead-letters the one message and names neither the header nor its
+message is sent, after the hop's own send-time check. That refusal dead-letters the one
+message and names neither the header nor its
 value. The HTTP family reads its
 auth-setting credentials from the same reader as the static-credential inventory. That inventory
 does not yet count a static header or a `url` query credential, so for those two kinds this rule is

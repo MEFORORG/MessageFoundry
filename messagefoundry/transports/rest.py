@@ -78,7 +78,7 @@ from messagefoundry.config.tls_policy import (
     urllib_handler_context,
 )
 from messagefoundry.controlchars import strip_control_chars
-from messagefoundry.secretscrub import _display_name, credential_query_params
+from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.base import (
     ECH_UNSUPPORTED_DESTINATION_MSG,
     DeliveryError,
@@ -1024,8 +1024,9 @@ def refuse_cleartext_credentials(
     of what the ``verify_tls = false`` rule counts, without that rule's name allowlist: a static
     header with a neutral name and value, such as ``Prefer``, still crosses a declared cleartext hop.
     Whether the allowlist should apply here too is an open owner question. A static
-    ``Proxy-Authorization``, in any spelling, is left out when the connection names a proxy, since
-    the send-time proxy rule judges it then. An ``Authorization`` header in the built ``headers``,
+    ``Proxy-Authorization``, in any spelling, is left out when the request goes to a proxy
+    (:func:`hop_reaches_a_proxy`), since the send-time proxy rule judges it then; on a hop that
+    goes direct it counts. An ``Authorization`` header in the built ``headers``,
     in any case, counts as well; the bearer re-checks pass one in, as defense in depth should the
     inventory and the bearer providers ever disagree. As for
     :func:`refuse_cleartext_credential_hop`, only a loopback host lifts it. Shared by the REST,
@@ -1123,6 +1124,36 @@ def _header_held(name: str, value: object, *, allowlist: bool) -> str | None:
     return None
 
 
+#: What a refusal shows in place of a static header key it may not echo.
+_HEADER_KEY_WITHHELD = "[a key withheld]"
+
+#: The longest static header key a refusal shows. A real header name is far shorter.
+_HEADER_KEY_SHOWN_MAX = 64
+
+
+def _shown_header_key(key: str) -> str:
+    """A static ``headers`` key as a build refusal may show it (vault BACKLOG #3533).
+
+    An operator may type a credential into a key, as in ``{"Authorization Bearer tok": "x"}``,
+    and the refusal text reaches the log and the operator's screen. So a key is shown only when
+    it is a plain header name: header-token characters only (no whitespace, which a scheme and
+    its token need), at most :data:`_HEADER_KEY_SHOWN_MAX` long, and not itself shaped like a
+    credential value (``config.wiring._looks_like_a_credential_value``: an auth-scheme prefix or
+    a JWT). Any other key shows as :data:`_HEADER_KEY_WITHHELD`. A credential typed into a key
+    that is a plain token with none of those shapes is still shown; nothing can tell it from a
+    header name."""
+    # Lazy: config.wiring is not otherwise loaded by this module.
+    from messagefoundry.config.wiring import _looks_like_a_credential_value
+
+    if (
+        len(key) <= _HEADER_KEY_SHOWN_MAX
+        and _HEADER_NAME_TOKEN.match(key)
+        and not _looks_like_a_credential_value(key)
+    ):
+        return key
+    return _HEADER_KEY_WITHHELD
+
+
 def _describe_sent(credentials: Sequence[str]) -> str:
     """What a hop would send, worded for a refusal: its credentials, then any static headers
     refused only for their names, apart (vault BACKLOG #3533). ``credentials`` is non-empty and
@@ -1144,6 +1175,7 @@ def http_credentials_sent(
     *,
     lookup: bool = False,
     cleartext: bool = False,
+    proxied: bool = False,
 ) -> list[str]:
     """What an HTTP-family hop sends that :func:`refuse_verify_off` refuses on a verify-off hop,
     and :func:`refuse_cleartext_credentials` on an off-box cleartext one, by name (vault BACKLOG
@@ -1164,12 +1196,20 @@ def http_credentials_sent(
     ``cleartext=True`` is the off-box cleartext rule's reading, which differs in two ways. It
     counts credentials only, so a static header is not refused for its name alone (vault BACKLOG
     #3533 item 4; whether the allowlist should apply there is an open owner question). And when
-    the connection names a ``proxy_url``, it leaves out a static header that
+    ``proxied`` says the request goes to a web proxy, it leaves out a static header that
     :func:`~messagefoundry.transports.bounded_read.is_proxy_credential_header_name` reads as
     ``Proxy-Authorization``, in any spelling. That header is then the proxy's, and the send-time
     proxy rule judges it: it refuses every spelling but the one it admitted for the connection's
-    own proxy login (vault BACKLOG #3416, #3457). With no proxy the header would go to the
-    destination, so it counts as the credential it is and refuses the hop at build.
+    own proxy login (vault BACKLOG #3416, #3457). The caller reads ``proxied`` with
+    :func:`hop_reaches_a_proxy`, from the proxy destination its opener is built with. A
+    ``proxy_url`` alone does not make a hop proxied: ``proxy_no_proxy``, urllib's own bypass list,
+    or ``proxy_url = "default"`` with no system proxy for the scheme sends it direct. On a direct
+    hop the header would go to the destination, and the send-time rule refuses it there each
+    time, retryably, until the message dead-letters. So it counts as the credential it is and
+    refuses the hop at build.
+
+    Each header key is shown by :func:`_shown_header_key`, never as written, since a credential
+    may be typed into a key.
 
     It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
     not seen here; :func:`refuse_held_dynamic_headers` judges those at send. Nor is a secret in
@@ -1180,7 +1220,7 @@ def http_credentials_sent(
 
     sent = http_hop_credentials(ctype, settings, lookup=lookup)
     static = settings.get("headers")
-    proxied = cleartext and bool(settings.get("proxy_url"))
+    proxied = cleartext and proxied
     if isinstance(static, Mapping):
         for name, value in static.items():
             key = str(name)
@@ -1193,7 +1233,7 @@ def http_credentials_sent(
                 shown = (
                     proxy_credential_header_name_shown(key)
                     if proxy_spelling
-                    else _display_name(key)
+                    else _shown_header_key(key)
                 )
                 sent.append(f"{shown}{held}")
     url = settings.get("url")
@@ -1330,7 +1370,10 @@ def refuse_held_dynamic_headers(
     configuration fault. So the delivery worker dead-letters this one message and the lane goes on
     to the next, as for the latin-1 refusal in :func:`outbound_headers_from_metadata`. A Handler may
     stamp such a header on some messages only, and a configuration fault would stop the lane and keep
-    the row with its metadata, so even a fixed Handler could not clear it. It names the connection
+    the row with its metadata, so even a fixed Handler could not clear it. The caller runs the
+    hop's send-time guard (:meth:`InsecureHopGuard.assert_delivery_url`) first, so a hop that is no
+    longer permitted still stops the lane and keeps the row, whatever headers the message holds.
+    It names the connection
     and how many headers it refused, and **never a header's name or value**. At send a name is a metadata
     key suffix the Handler may derive from the message, as
     :func:`enforce_send_time_length_limits` records for its own message-derived arm, so it is
@@ -2015,6 +2058,24 @@ class _HostProxy:
         return dict(self.config.auth_header) if self.credentialed else {}
 
 
+def hop_reaches_a_proxy(proxy_dest: _HostProxy | None, url: str) -> bool:
+    """Whether a request to ``url`` goes to a web proxy, not direct, on an opener built with
+    ``proxy_dest`` (vault BACKLOG #3533, Lander finding 2 on engine PR 2576).
+
+    ``proxy_dest`` is what :meth:`ProxyConfig.for_host` returned for ``url``, which the connector
+    builds its opener with. ``None`` is no proxy, a ``proxy_no_proxy`` match or a loopback host;
+    an uncredentialed one is a host urllib's own bypass list names. All of those go direct. With
+    ``proxy_url = "default"`` the opener's handler holds what ``getproxies()`` returns when it is
+    built, so the hop reaches a proxy only when that names one for ``url``'s scheme; it is read
+    again here, at the same build. An explicit ``proxy_url`` serves both schemes."""
+    if proxy_dest is None or not proxy_dest.credentialed:
+        return False
+    if not proxy_dest.config.use_default:
+        return True
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    return bool(urllib.request.getproxies().get(scheme))
+
+
 def proxy_auth_handler_from_settings(
     s: Mapping[str, Any],
     *,
@@ -2444,7 +2505,12 @@ class RestDestination(DestinationConnector):
             scheme,
             self._headers,
             self.url,
-            credentials=http_credentials_sent(ConnectorType.REST, s, cleartext=True),
+            credentials=http_credentials_sent(
+                ConnectorType.REST,
+                s,
+                cleartext=True,
+                proxied=hop_reaches_a_proxy(proxy_dest, self.url),
+            ),
             connection=config.name,
         )
         # ASVS 12.2.1: even without an Authorization header the request body is PHI, so a cleartext
@@ -2630,6 +2696,11 @@ class RestDestination(DestinationConnector):
         # identical). urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         dynamic_headers = outbound_headers_from_metadata(metadata)
         if self._header_rule is not None:
+            # The hop first (zero I/O; _post repeats it). A hop no longer permitted is the
+            # connection's fault and stops the lane with the row kept; judged after it, a held
+            # header would dead-letter the row instead (Lander finding 6 on engine PR 2576).
+            if self._hop_guard is not None:
+                self._hop_guard.assert_delivery_url(self.url, connector="REST")
             refuse_held_dynamic_headers(
                 dynamic_headers,
                 rule=self._header_rule,

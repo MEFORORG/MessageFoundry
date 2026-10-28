@@ -23,6 +23,7 @@ Nothing hits the network: refusals fire at construction, and the one send test u
 from __future__ import annotations
 
 import re
+import urllib.request
 from typing import Any
 
 import pytest
@@ -748,6 +749,116 @@ def test_control_a_static_proxy_authorization_beside_a_proxy_is_left_to_the_prox
             egress=EgressSettings(deny_by_default=False, allowed_proxy=["127.0.0.1"]),
         )
     assert dest is not None
+
+
+# --- Lander finding 2 on engine PR 2576: a proxy_url that this hop does not use -------------------
+#
+# The static Proxy-Authorization is left to the send-time proxy rule only when the request goes
+# to a proxy. A hop the proxy bypasses goes direct, where that rule refuses the header on every
+# send, retryably, until the message dead-letters. So such a hop counts the header and refuses at
+# build, as a hop with no proxy does.
+
+_PROXY = "http://127.0.0.1:3128"
+
+
+def _build_beside_a_proxy(cell: str, **proxy: Any) -> DestinationConnector:
+    spec: tuple[Any, Any, str] = _CLEARTEXT[cell]
+    ctype, factory, url = spec
+    settings = {
+        **factory(url=url, headers={"Proxy-Authorization": "Basic synthetic"}).settings,
+        **proxy,
+    }
+    with active_hop_posture(_PROD):
+        return build_destination(
+            Destination(
+                name="OB",
+                type=ctype,
+                settings=settings,
+                cleartext_accepted=True,
+                cleartext_reason="vendor firmware predates TLS",
+            ),
+            egress=EgressSettings(deny_by_default=False, allowed_proxy=["127.0.0.1"]),
+        )
+
+
+#: Each way a configured proxy_url leaves this hop direct.
+_BYPASSED: dict[str, dict[str, Any]] = {
+    "proxy_no_proxy names the host": {"proxy_url": _PROXY, "proxy_no_proxy": ["*"]},
+    "urllib's own bypass list names the host": {"proxy_url": _PROXY},
+    "default with no system proxy": {"proxy_url": "default"},
+}
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("case", list(_BYPASSED))
+def test_a_static_proxy_authorization_on_a_bypassed_hop_is_refused_at_build(
+    cell: str, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    # Pinned, so the host's own proxy settings cannot decide the case.
+    monkeypatch.setattr(urllib.request, "getproxies", dict)
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: case.startswith("urllib"))
+    with pytest.raises(
+        InsecureHopRefused, match="HTTP cleartext credentials: .*Proxy-Authorization"
+    ) as exc:
+        _build_beside_a_proxy(cell, **_BYPASSED[case])
+    assert "synthetic" not in str(exc.value)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("proxy_url", [_PROXY, "default"])
+def test_control_a_static_proxy_authorization_on_a_proxied_hop_still_builds(
+    cell: str, proxy_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm above refuses for the bypass, not for the header: the same header on a hop that
+    does reach a proxy, configured or the system's, is left to the send-time proxy rule."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": _PROXY, "https": _PROXY})
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+    assert _build_beside_a_proxy(cell, proxy_url=proxy_url) is not None
+
+
+# --- Lander finding 3 on engine PR 2576: a credential typed into a header key -------------------
+
+#: Each a key the refusal must not echo, with the part that would be the credential.
+_KEYS_WITH_A_CREDENTIAL = {
+    "scheme and token": ("Authorization Bearer tok", "tok"),
+    "jwt-shaped key": ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl", "c2lnbmF0dXJl"),
+    "tab inside": ("X-Api-Key\tsekrit", "sekrit"),
+}
+
+
+@pytest.mark.parametrize("case", list(_KEYS_WITH_A_CREDENTIAL))
+@pytest.mark.parametrize("hop", ["cleartext", "verify-off"])
+def test_a_credential_typed_into_a_header_key_is_not_echoed(
+    case: str, hop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    key, secret = _KEYS_WITH_A_CREDENTIAL[case]
+    with active_hop_posture(_PROD), pytest.raises(ValueError) as exc:
+        if hop == "cleartext":
+            _build(_CLEARTEXT["REST"], accepted=True, headers={key: "Bearer v"})
+        else:
+            _build_raw("REST", {"verify_tls": False, "headers": {key: "Bearer v"}})
+    text = str(exc.value)
+    assert secret not in text
+    assert "[a key withheld]" in text
+
+
+@pytest.mark.parametrize("hop", ["cleartext", "verify-off"])
+def test_control_a_plain_header_key_is_still_named(
+    hop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm above withholds the key for its shape: a plain header name is still shown, so the
+    operator can find the header."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD), pytest.raises(ValueError) as exc:
+        if hop == "cleartext":
+            _build(_CLEARTEXT["REST"], accepted=True, headers={"X-Api-Key": "x"})
+        else:
+            _build_raw("REST", {"verify_tls": False, "headers": {"X-Api-Key": "x"}})
+    assert "X-Api-Key header" in str(exc.value)
+    assert "withheld" not in str(exc.value)
 
 
 @pytest.mark.parametrize("declared", ["attested", "accepted"])
