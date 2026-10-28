@@ -1747,13 +1747,36 @@ reads `SERVER` as its target.
 
 An `SSLCA` file whose text names a PEM encryption header (`Proc-Type` or `DEK-Info`) after its
 first `-----BEGIN` is refused when the connection is built (BACKLOG #3090). The driver loads that
-file with its own TLS library, which can wait for a password on an encrypted block. The check
-runs when the connection is built, not at each connect, so a file replaced afterwards is not
-checked. At least these cases are left to the driver unchecked: a file that does not exist, a
-directory (an `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot
-read, or one over 16 MiB, is refused. An `SSLCA` file that names a PEM label ending in
-`PRIVATE KEY` after its first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA
-file is public trust material. An `SSLCERT` file is not checked this way.
+file with its own TLS library, which can wait for a password on an encrypted block. At least
+these cases are left to the driver unchecked: a file that does not exist, a directory (an
+`SSLCAPATH` directory included), and a device or pipe. A file the engine cannot read, or one
+over 1 MiB, is refused. An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
+first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA file is public trust
+material.
+
+An `SSLCA` file is also a trust anchor of the connection's lane, as a `tls_ca_file` is
+(`auth.trust_anchors`, module item 12). When the lane is built, and before a reload that keeps
+it running, the engine checks who can write the file and the folders above it, and audits its
+fingerprint in `auth.trust_anchor` rows. A file another account can replace refuses that lane at
+`[security].enforcement = enforce` and warns at `warn`. A file swapped since the last check is
+audited as `changed`, and refused if it now names an encryption header or a private key. The
+check does not run under `SSLmode=disable` (or `SSLMODE=DISABLED`), where the driver reads no
+CA, and there is no pin for this file. **What it does not cover:** the connections the driver's
+pool opens after the build are not checked again, and any check-then-load leaves a swap window,
+as for `SSLKEY`.
+
+An `SSLCERT` file takes the key-wrap check `SSLKEY` takes (BACKLOG #3090), when the connection
+is built, with `sslpassword` as its passphrase. A key in it with a weak wrap is refused, and so
+is an encrypted key with no `sslpassword`. A legacy `Proc-Type: 4,ENCRYPTED` key is refused even
+with one. A certificate with no key passes, PEM or DER. The file is read the way an `SSLCA` file
+is: a missing file, a directory, a device or a pipe is left to the driver, and a file over 1 MiB
+is refused. Two gaps remain:
+
+- **MySQL's ODBC driver has no passphrase keyword.** An `sslpassword` set beside its `SSLCERT`
+  passes this check, the driver ignores it, and it may still prompt for the key's password.
+- **libpq does not read a key out of `sslcert`.** It reads the key from `sslkey`, or from its own
+  default path, which this check never sees. An encrypted key inside `sslcert` is still refused
+  here, although libpq would not load it.
 
 Any other keyword is refused when the connection is built, and the error names the keyword and
 the connection. That fails `messagefoundry check`, a reload and a `connection` edit. At `serve`
