@@ -44,6 +44,8 @@ from messagefoundry.auth.trust_anchors import (
     AnchorStoreUnavailable,
     LaneAnchorCheck,
     TrustAnchorError,
+    inbound_lane_reads_ca,
+    lane_ca_setting,
     refused_connection_anchor,
 )
 from messagefoundry.config.db_lookup import DbLookupError
@@ -3196,7 +3198,7 @@ class RegistryRunner:
         oc = self.registry.outbound.get(name)
         try:
             if ic is not None:
-                if ic.spec.type is ConnectorType.REMOTEFILE and ic.spec.settings.get("tls_ca_file"):
+                if _inbound_lane_reads_ca(ic):
                     cfg = _source_config(
                         ic, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
                     )
@@ -3635,14 +3637,14 @@ class RegistryRunner:
                     what = _ANCHOR_SETTING_REFUSED
                     advice = "Fix the setting, then reload; the server log says why"
                 elif refused:
-                    what = "tls_ca_file was refused"
+                    what = f"{lane_ca_setting(settings)} was refused"
                     advice = (
                         "Fix the file, then reload; the server log and the auth.trust_anchor "
                         "audit rows say why"
                     )
                 else:
                     # The check did not run, so nothing says the file is at fault.
-                    what = "tls_ca_file could not be checked"
+                    what = f"{lane_ca_setting(settings)} could not be checked"
                     advice = "The server log says why; reload once the cause is fixed"
                 fixed = TrustAnchorError(
                     f"{direction} connection '{name}': its {what} on this passive DR standby, "
@@ -3751,8 +3753,8 @@ class RegistryRunner:
                 f"{_ANCHOR_SETTING_REFUSED}. Fix the setting, then reload and start the "
                 "connection; the server log says why"
                 if isinstance(exc, ValueError)
-                else "tls_ca_file was refused. Fix the file, then start the connection; the "
-                "server log and the auth.trust_anchor audit rows say why"
+                else f"{lane_ca_setting(settings)} was refused. Fix the file, then start the "
+                "connection; the server log and the auth.trust_anchor audit rows say why"
             )
             raise TrustAnchorError(f"{direction} connection '{name}': its {tail}") from exc
         except AnchorStoreUnavailable as exc:
@@ -3765,22 +3767,21 @@ class RegistryRunner:
             # No WARNING here: the check logged the store's error once, and a scheduled poller
             # retries at every in-window tick.
             raise TrustAnchorError(
-                f"{direction} connection '{name}': its tls_ca_file could not be checked, because "
-                "the store refused the trust-anchor audit. Start the connection once the store is "
-                "back; the server log says why"
+                f"{direction} connection '{name}': its {lane_ca_setting(settings)} could not be "
+                "checked, because the store refused the trust-anchor audit. Start the connection "
+                "once the store is back; the server log says why"
             ) from exc
         if fails_lane:
             self._anchor_refused.pop((direction, name), None)
 
     async def _check_inbound_lane_anchor(self, name: str) -> None:
-        """:meth:`_check_lane_anchor` for an inbound ``Ftp`` poller about to bind, the one inbound
-        that dials out. A no-op for any other inbound, a bound one, an unknown name and one not
-        deployed: :meth:`_start_inbound_unsafe` answers those itself."""
+        """:meth:`_check_lane_anchor` for an inbound that dials out and is about to bind: an
+        ``Ftp`` poller or a ``DatabasePoll`` (:func:`_inbound_lane_reads_ca`). A no-op for any
+        other inbound, a bound one, an unknown name and one not deployed: :meth:`_start_inbound_unsafe` answers those itself."""
         ic = self.registry.inbound.get(name)
-        if ic is not None and (
-            ic.spec.type is not ConnectorType.REMOTEFILE or not ic.spec.settings.get("tls_ca_file")
-        ):
-            # An SFTP poller, or FTPS with no CA: nothing to check, so no old refusal stands.
+        if ic is not None and not _inbound_lane_reads_ca(ic):
+            # An SFTP poller, FTPS with no CA, or a DatabasePoll with no sslca: nothing to check,
+            # so no old refusal stands.
             self._anchor_refused.pop(("inbound", name), None)
             return
         if (
@@ -3922,8 +3923,7 @@ class RegistryRunner:
             lanes.append(oc)
         for ic in new.inbound.values():
             if (
-                ic.spec.type is not ConnectorType.REMOTEFILE
-                or not ic.spec.settings.get("tls_ca_file")
+                not _inbound_lane_reads_ca(ic)
                 or self._listener_skip(ic, old_inbound_names, binding_now=False) is not None
                 or self._keeps_anchor_failure("inbound", ic.name, old, ic, bound=old_inbound_names)
             ):
@@ -11415,6 +11415,11 @@ def _anchor_key(settings: Mapping[str, Any]) -> tuple[str, object]:
     """The resolved CA path and pin a lane refusal read (vault BACKLOG #2371). A reload compares a
     lane's new pair with it, so a fixed ``env()`` value ends a kept failure."""
     return (str(settings.get("tls_ca_file") or ""), settings.get("tls_ca_pin"))
+
+
+def _inbound_lane_reads_ca(ic: InboundConnection) -> bool:
+    """:func:`~messagefoundry.auth.trust_anchors.inbound_lane_reads_ca` for inbound ``ic``."""
+    return inbound_lane_reads_ca(ic.spec.type, ic.spec.settings)
 
 
 def _hop_policy(oc: OutboundConnection) -> tuple[object, ...]:
