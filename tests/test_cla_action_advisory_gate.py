@@ -14,8 +14,11 @@ It lives under ``tests/fixtures/cla_action_audit/``. It replaced the 2026-10-24 
 by exactly that one. The report adds seven ``vulnerabilities`` entries, deepmerge and six packages
 that reach it, and the low and total counts rise by seven; every entry the 2026-10-24 reading held
 is unchanged. That reading had itself replaced the 2026-10-07 one, taken with npm 11.5.2, after
-GitHub withdrew two advisories; PR 2516 records how those two readings differ. The live call is
-replaced by an injected runner, so nothing here needs npm.
+GitHub withdrew two advisories. Those two readings' findings differed by exactly the two withdrawn
+ids. Other fields differed too: some followed from the withdrawals, such as the braces and js-yaml
+ranges and js-yaml's ``via``, and the rest, such as some ``effects`` and ``fixAvailable`` values,
+were not traced to a cause. The live call is replaced by an injected runner, so nothing here needs
+npm.
 
 THE FALSE CLEAN IS A RECORDED READING, NOT A GUESS. :data:`_NO_MANIFEST_REPORT` is npm's verbatim
 output with the lockfile and no ``package.json``. The gate must fail it even with an EMPTY baseline,
@@ -384,8 +387,10 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 #: - Packages on the braces and js-yaml chains: what that reading settles is stated in the header
 #:   paragraph "A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT".
 #: - deepmerge, read 2026-10-28: what that reading settles is stated in the triage comment above
-#:   deepmerge's entry. Only names deepmerge alone defines are re-run here. ``isMergeableObject`` is
-#:   not, because the separate is-mergeable-object package exports the same name.
+#:   deepmerge's entry. Only names deepmerge alone defines are re-run here, two of the six it
+#:   measured. The other four are left out because other code uses them too: the
+#:   is-mergeable-object package exports ``isMergeableObject``, ``arrayMerge`` and ``mergeObject``
+#:   are common helper names, and "deepmerge" is in other packages' names, such as deepmerge-ts.
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse
