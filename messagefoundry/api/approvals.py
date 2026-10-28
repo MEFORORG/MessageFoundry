@@ -72,6 +72,7 @@ from messagefoundry.store.row_seal import (
     RowSealError,
     SealFailureThrottle,
     TransitSealUnverifiableError,
+    alert_unverifiable_row,
 )
 from messagefoundry.store.store import ApprovalRow, AuditAppend, approval_seal_ok
 
@@ -2281,7 +2282,8 @@ class ApprovalGate:
         ``integrity.authority_seal_failed`` audit row and an ``integrity_drift`` alert, at most once
         per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` per request, as the auth service reports
         the rows it checks. With ``unverifiable``, a seal Vault transit refused to check, the audit
-        action is ``integrity.authority_seal_unverifiable`` and the sealer, not this, pages. The report
+        action is ``integrity.authority_seal_unverifiable`` and the page, still per request, goes
+        through the sealer under its unverifiable subject. The report
         names the request by its id, never a row value. A failed audit write is logged and paged,
         not raised, so it does not turn a refusal into an error."""
         action, verb, throttle_key = seal_report_text(unverifiable, approval_id)
@@ -2300,7 +2302,9 @@ class ApprovalGate:
             client=None,
             context=f"a request {verb}",
         )
-        if not unverifiable:  # that one pages from the sealer, under its own subject
+        if unverifiable:  # per request too, but under the sealer's unverifiable subject
+            alert_unverifiable_row(self._store.row_sealer(), reason)
+        else:
             authority_seal_alert(self._alert_sink)(reason)
 
     def _label(self, operation: str) -> str:

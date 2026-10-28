@@ -419,7 +419,7 @@ class TransitRowSealer:
     **The cache holds successful checks only**, keyed by a digest of the length-prefixed input and
     the stored Transit string, which carries the version. An entry lives
     :data:`TRANSIT_SEAL_CACHE_TTL_SECONDS`, which also bounds how long a check outlives a version
-    Transit later retires. The cache is emptied when this process first sees a newer key version,
+    Transit later retires. The cache is emptied whenever Transit reports a different latest version,
     and a check that was already waiting on Transit then keeps its answer for its own caller only.
     It holds a result and nothing else; the caller reads the row afresh every time.
 
@@ -434,10 +434,12 @@ class TransitRowSealer:
     :class:`TransitSealUnverifiableError`, reported like an outage under its own throttle and
     cause, and the auth service and approval gate treat the row as a failed seal
     (:meth:`~messagefoundry.store.crypto_transit.TransitCipher.verify_seal_hmac` says why Transit's
-    reply cannot tell a retired version from a lagging node or a planted one). One exception, from
-    this process's own evidence: a refusal of exactly the newest version Transit has named to this
-    process cannot be a retirement, so it is an outage. A node two or more rotations behind still
-    reads as unverifiable.
+    reply cannot tell a retired version from a lagging node or a planted one). One exception: a
+    refusal of exactly the version the refusal's own key probe names as latest cannot be a
+    retirement, so it is an outage. The comparison is against that probe's answer, never a version
+    this process remembers, so it classifies a row as a process started a moment ago would. A seal
+    naming a version the probing node does not hold, a node behind a rotation included, reads as
+    unverifiable.
 
     **The seam (CLAUDE.md section 6).** Each Transit call runs in a worker thread
     (:func:`asyncio.to_thread`), so a seal or a check never blocks the event loop. So only the
@@ -482,12 +484,24 @@ class TransitRowSealer:
         arms it with the engine's alert sink; it is called on the event loop's thread."""
         self._alert = hook
 
-    def _saw_version(self, version: int) -> None:
-        # A newer key version means Transit rotated; no check made before it stays trusted.
-        if version > self._latest_version:
+    def _saw_latest(self, version: int) -> None:
+        """Record ``version`` as the key's latest, as a refused check's key probe just reported it.
+        Set, never maxed, so a latest that goes back (the key recreated, Vault restored from a
+        snapshot) is believed at once and no classification depends on how long this process has
+        run (BACKLOG #2592). Any change means Transit's key moved, so no check made before it stays
+        trusted."""
+        if version != self._latest_version:
             self._cache.clear()
             self._generation += 1
             self._latest_version = version
+
+    def _saw_held(self, version: int) -> None:
+        """Transit just sealed or verified under ``version``, so it holds it: a remembered latest
+        below that is out of date, and is moved up as :meth:`_saw_latest` moves it. Only raised
+        here, so seals answered by nodes on either side of a rotation do not empty the cache in
+        turn; the refusal path alone, through the probe, moves the latest back."""
+        if version > self._latest_version:
+            self._saw_latest(version)
 
     def _report(self, key: str, reason: str, exc: Exception) -> None:
         """Log ``reason`` at ERROR, and pass it to the alert hook, at most once per
@@ -539,7 +553,7 @@ class TransitRowSealer:
         version = _transit_version(mac)
         if version is None:
             raise self._unavailable(CipherError("Transit returned a MAC of an unexpected shape"))
-        self._saw_version(version)
+        self._saw_held(version)
         return f"{SEAL_PREFIX}{self.key_id}:{mac}"
 
     async def verify_async(
@@ -562,15 +576,17 @@ class TransitRowSealer:
         try:
             valid = await asyncio.to_thread(self._backend.verify_seal_hmac, data, mac)
         except RowSealUnverifiableError as exc:
-            # The key probe's MAC names the latest version the probing node holds, so a rotation
-            # this process never sealed under is learned here, before the version is compared.
+            # The key probe's MAC names the latest version the probing node holds right now. It
+            # replaces what this process remembered, so the comparison below rests on Transit's
+            # current answer, as it would in a process started a moment ago.
             probed = _transit_version(exc.probe_mac)
             if probed is not None:
-                self._saw_version(probed)
+                self._saw_latest(probed)
             if version == self._latest_version:
-                # Transit itself named this version to this process, and Vault never lets the
-                # minimum pass the latest version, so a refusal of it cannot be a retirement: the
-                # node that answered lags a rotation. An outage, never a revoked session.
+                # Transit named this version as its latest in this same exchange, and Vault never
+                # lets the minimum pass the latest version, so a refusal of it cannot be a
+                # retirement: the node that refused lags a rotation the probing node has seen. An
+                # outage, never a revoked session.
                 raise self._unavailable(
                     CipherError(
                         "Transit refused to check a seal under the newest key version this process"
@@ -585,7 +601,7 @@ class TransitRowSealer:
         # Another coroutine saw a newer key version, and emptied the cache, while Transit checked
         # this seal: the answer stands for this call, but it is not kept past that rotation.
         stale = self._generation != generation
-        self._saw_version(version)
+        self._saw_held(version)
         if stale:
             return True
         if len(self._cache) >= TRANSIT_SEAL_CACHE_MAX:
@@ -627,6 +643,17 @@ class TransitRowSealer:
 
 #: Either sealer. Every store and service call site takes this and awaits the ``*_async`` methods.
 type Sealer = RowSealer | TransitRowSealer
+
+
+def alert_unverifiable_row(sealer: Sealer | None, reason: str) -> None:
+    """Page one row whose seal Transit refused to check, through ``sealer``'s armed hook under the
+    unverifiable cause, with no throttle here (BACKLOG #2592). The caller throttles per row, under
+    the same per-row key scheme it reports a failed seal with, so one such row never mutes
+    another's page, and the cause keeps a flood of them off a forgery's subject. ``reason`` names
+    the row by an id, never a row value. Nothing for a local sealer, which never refuses a check,
+    or with no hook armed."""
+    if isinstance(sealer, TransitRowSealer) and sealer._alert is not None:
+        sealer._alert(TRANSIT_UNVERIFIABLE_CAUSE, reason)
 
 
 class TransitSealStartRefusedError(RuntimeError):

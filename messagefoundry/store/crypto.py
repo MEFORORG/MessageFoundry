@@ -661,7 +661,8 @@ class RowSealUnverifiableError(CipherError):
     the probe holds; the sealer reads that version, never a row value, from it."""
 
     def __init__(self, probe_mac: str) -> None:
-        super().__init__()
+        # Passed on, so ``args`` rebuilds the error: copy and pickle call ``cls(*args)``.
+        super().__init__(probe_mac)
         self.probe_mac = probe_mac
 
     def __str__(self) -> str:

@@ -16,7 +16,8 @@ import io
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import contextmanager
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -140,6 +141,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     STEP_UP_ACTION_SESSION_TERMINATE,
     USERNAME_TAKEN,
+    AdMapUnverifiableError,
     AuthService,
     ChannelScopeSourceConflict,
     CurrentPasswordCheck,
@@ -494,6 +496,16 @@ _GROUPS_NAMED = 3
 #: the request model's cap (BACKLOG #3187). Canonical form can outgrow what was typed, so the
 #: route checks it again; past this, the store's write would fail with a 500, not a 400.
 _STORED_GROUP_MAX = _GROUP_MAX
+
+
+@contextmanager
+def _ad_map_unverifiable_is_409() -> Iterator[None]:
+    """Answer :class:`AdMapUnverifiableError` with HTTP 409 and its fixed text, which names the
+    recovery, as the custom-role edit answers its own (BACKLOG #2592)."""
+    try:
+        yield
+    except AdMapUnverifiableError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
 def _canonical_group_dns(groups: list[str]) -> list[str]:
@@ -1962,8 +1974,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_MANAGE)),
     ) -> AdGroupMap:
-        # BACKLOG #2592: through the service, which leaves out a map that fails its integrity seal.
-        pairs = await service.list_ad_group_role_map()
+        # BACKLOG #2592: through the service, which leaves out a map that fails its integrity seal
+        # and refuses one Vault transit will not check.
+        with _ad_map_unverifiable_is_409():
+            pairs = await service.list_ad_group_role_map()
         return AdGroupMap(entries=[AdGroupMapEntry(ad_group=g, role=r) for g, r in pairs])
 
     @app.put("/ad-group-map", response_model=SimpleMessage)
@@ -2001,11 +2015,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             }
 
         grants = any(e.role == Role.ADMINISTRATOR.value for e in body.entries)
-        before = await admin_groups() if grants else set()
-        await service.set_ad_group_map(
-            [(g, e.role) for g, e in zip(groups, body.entries, strict=True)],
-            actor=identity.username,
-        )
+        with _ad_map_unverifiable_is_409():
+            before = await admin_groups() if grants else set()
+            await service.set_ad_group_map(
+                [(g, e.role) for g, e in zip(groups, body.entries, strict=True)],
+                actor=identity.username,
+            )
         for group in sorted((await admin_groups() - before) if grants else set()):
             _alert_administrator_granted(
                 app, f"ad-group:{group}", via="ad_group_map", granted_by=identity.username
@@ -2017,8 +2032,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_MANAGE)),
     ) -> AdGroupScopeMap:
-        # BACKLOG #2592: through the service, which leaves out a map that fails its integrity seal.
-        pairs = await service.list_ad_group_scope_map()
+        # BACKLOG #2592: as get_ad_group_map.
+        with _ad_map_unverifiable_is_409():
+            pairs = await service.list_ad_group_scope_map()
         return AdGroupScopeMap(entries=[AdGroupScopeEntry(ad_group=g, channel=c) for g, c in pairs])
 
     @app.put("/ad-group-scope-map", response_model=SimpleMessage)
@@ -2042,10 +2058,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> SimpleMessage:
         """The save past :func:`set_ad_group_scope_map`'s step-up, for the seam."""
         groups = _canonical_group_dns([e.ad_group for e in body.entries])
-        await service.set_ad_group_scope_map(
-            [(g, e.channel) for g, e in zip(groups, body.entries, strict=True)],
-            actor=identity.username,
-        )
+        with _ad_map_unverifiable_is_409():
+            await service.set_ad_group_scope_map(
+                [(g, e.channel) for g, e in zip(groups, body.entries, strict=True)],
+                actor=identity.username,
+            )
         return SimpleMessage(detail="ad-group scope map updated")
 
     # --- audit ---------------------------------------------------------------
