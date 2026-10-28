@@ -79,10 +79,8 @@ from messagefoundry.store.base import (
     resolve_active_key,
     resolve_decrypt_keys,
 )
-from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS
+from messagefoundry.store.cipher_cells import read_cipher_cells
 from messagefoundry.store.crypto import (
-    MARKER_PREFIX,
-    CipherError,
     StoreKeylessError,
     store_data_key_id,
 )
@@ -2576,61 +2574,33 @@ def _decrypt_check(
     the composite-key cells alike (BACKLOG #1719). It is declared beside the store rather than here,
     and a parity test pins it to at least every literal ``cell_aad`` call in ``store.py``. A failure
     names the table, the column and the cell's ``locator``, never a key column that can itself be PHI.
+
+    The walk is :func:`~messagefoundry.store.cipher_cells.read_cipher_cells`, which ``cipher-audit``
+    shares; this pass stops at the first value that does not open.
     """
     import sqlite3
 
+    from messagefoundry.store.store import _sqlite_readonly_uri
+
     cipher = build_store_cipher(settings, posture=posture)
-    # Keylessness is a fact about the CIPHER, never about a plaintext: a decrypted value may itself
-    # begin with the marker (a partner reply, a transformed body), and reading that as "no key" would
-    # send the operator to fix a key configuration that is fine.
-    keyless = not cipher.encrypts
     cells = 0
-    conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+    # The store's own URI builder, not `f"file:{snap}"`: a staging path can hold `#` or `?`.
+    conn = sqlite3.connect(_sqlite_readonly_uri(str(snap.absolute())), uri=True)
     try:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for spec in SQLITE_CIPHER_CELLS:
-            table, column = spec.table, spec.column
-            if table not in tables:
-                continue  # an older snapshot predating the table — not a verify failure
-            names = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}  # constant table
-            needed = {column, *spec.aad_columns, *spec.locator} - {"rowid"}
-            if not names.issuperset(needed):
-                continue
-            # table/column/key names are declared constants; only the marker prefix is a parameter.
-            picked = ", ".join((*spec.locator, *spec.aad_columns, column))
-            rows = conn.execute(
-                f"SELECT {picked} FROM {table} WHERE {column} LIKE ?", (f"{MARKER_PREFIX}%",)
-            )
-            width = len(spec.locator)
-            for *row, stored in rows:
-                where, key = row[:width], row[width:]
-                if keyless:
-                    # LIKE is case-insensitive; the marker is not. A keyless store's plaintext that
-                    # merely resembles it (``MFENC:...``) is not a sealed cell.
-                    if not cipher.is_encrypted(str(stored)):
-                        continue
-                    # The #241 F2 keyless-open trap: the snapshot holds sealed cells and these settings
-                    # resolved no key for them. Nothing could have opened them, so the keyring is
-                    # unambiguously the cause.
-                    return (
-                        "KEY_MISMATCH",
-                        f"{table}.{column} is encrypted at rest but the store settings resolved no key "
-                        "to open it (keyless open of an encrypted snapshot)",
-                        cells,
-                    )
-                try:
-                    cipher.decrypt(str(stored), aad=spec.aad(*key))
-                except CipherError as exc:
-                    # FAIL, not KEY_MISMATCH: CipherError cannot separate a corrupted ciphertext from a
-                    # key that was never supplied, and the keyring here is not empty (the keyless case
-                    # is the branch above). Reporting the softer verdict on a bit-flipped PHI cell is
-                    # the reading that must not be talked down.
-                    return (
-                        "FAIL",
-                        f"{table}.{column} {spec.locate(*where)} did not decrypt: {safe_exc(exc)}",
-                        cells,
-                    )
-                cells += 1
+        for reading in read_cipher_cells(conn, cipher):
+            if reading.kind == "keyless":
+                # The #241 F2 keyless-open trap: the snapshot holds sealed cells and these settings
+                # resolved no key for them. Nothing could have opened them, so the keyring is
+                # unambiguously the cause. Keylessness is the CIPHER's, never a plaintext's: a
+                # decrypted value may itself begin with the marker.
+                return "KEY_MISMATCH", reading.failure(source="snapshot"), cells
+            if reading.kind == "failed":
+                # FAIL, not KEY_MISMATCH: CipherError cannot separate a corrupted ciphertext from a
+                # key that was never supplied, and the keyring here is not empty (the keyless case
+                # is the branch above). Reporting the softer verdict on a bit-flipped PHI cell is
+                # the reading that must not be talked down.
+                return "FAIL", reading.failure(source="snapshot"), cells
+            cells += 1
     except sqlite3.Error as exc:
         return "FAIL", safe_exc(exc), cells
     finally:

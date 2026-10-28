@@ -274,6 +274,7 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_provision_admin.run", "_offline_security_notifier", "posture"),
         ("__main__.py", "_restore", "run_restore", "-"),
         ("__main__.py", "_restore_verify", "run_restore_verify", "-"),
+        ("__main__.py", "_cipher_audit", "build_store_cipher", "-"),
         ("__main__.py", "_provision_admin", "build_store_cipher", "posture"),
         ("__main__.py", "_provision_admin.administrator_exists", "open_store", "posture"),
         ("__main__.py", "_provision_admin.run", "open_store", "posture"),
