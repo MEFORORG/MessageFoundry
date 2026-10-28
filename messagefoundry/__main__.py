@@ -162,7 +162,30 @@ def main(argv: list[str] | None = None) -> int:
         _build_parser,
         configures_own_logging=_CONFIGURES_OWN_LOGGING,
         floor_code=_floor_error_code,
+        refusal_text=_refusal_text,
     )
+
+
+def _refusal_text(exc: Exception) -> str | None:
+    """The one ``error:`` line for an exception that is an operator-facing refusal rather than a
+    defect, or None. run_cli prints it in place of the last-resort report.
+
+    A Transit row seal that could not be made or checked (BACKLOG #2592): Vault did not answer, or
+    Transit refused to check a well-formed stored seal. Looked up in ``sys.modules``, so a command
+    that never loaded the sealer pays no import for it. The text is the sealer's own, which names
+    the cause and Vault's redacted failure text, never row data."""
+    row_seal = sys.modules.get("messagefoundry.store.row_seal")
+    if row_seal is None:
+        return None
+    from messagefoundry.redaction import safe_exc
+
+    if isinstance(exc, row_seal.TransitSealUnverifiableError):
+        return f"the command was refused: {safe_exc(exc)}"
+    if isinstance(exc, row_seal.TransitSealUnavailableError):
+        return (
+            f"the command was refused and nothing was recorded as a seal failure: {safe_exc(exc)}"
+        )
+    return None
 
 
 def _floor_error_code(args: argparse.Namespace) -> str | None:
@@ -6757,11 +6780,27 @@ def _host_gated_store_settings(
     return settings
 
 
-def _seal_refusal(username: str, act: str) -> str:
+def _seal_refusal(username: str, act: str, *, unverifiable: bool = False) -> str:
     """The fixed refusal of a host command whose write the store refused because the account's
     record fails its integrity seal (BACKLOG #3510). Logs it and returns the text, which the caller
     ends by saying what was written. The error carries the record's kind only, so neither names a
-    stored value. A missing key fails the check the same way as a change, so the text names both."""
+    stored value. A missing key fails the check the same way as a change, so the text names both.
+
+    With ``unverifiable``, the error's own flag, Vault transit refused to check the seal (BACKLOG
+    #2592): no evidence of a change, so the text names Vault first and no restore."""
+    if unverifiable:
+        logging.getLogger(__name__).warning(
+            "%s refused for %r: Vault transit refused to check the account's record seal",
+            act,
+            username,
+        )
+        from messagefoundry.auth.service import UNVERIFIABLE_RECOVERY
+
+        return (
+            f"the store refused the {act} for {username!r}: Vault transit refused to check its "
+            f"record's integrity seal. {UNVERIFIABLE_RECOVERY} docs/PHI.md, Recovering an "
+            "unverifiable row, gives the next steps"
+        )
     logging.getLogger(__name__).warning(
         "%s refused for %r: the account's record failed its integrity seal", act, username
     )
@@ -6854,10 +6893,12 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     ) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
-    except RowSealError:
+    except RowSealError as refused:
         # BACKLOG #3510: the store's write helper refused the clear, writing nothing.
         return _emit_error(
-            _seal_refusal(args.username, "unlock") + ". Nothing was written", as_json=args.json
+            _seal_refusal(args.username, "unlock", unverifiable=refused.unverifiable)
+            + ". Nothing was written",
+            as_json=args.json,
         )
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
@@ -8557,7 +8598,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 if not isinstance(exc, store_errors):
                     raise  # not a store refusal but a defect: the dispatch floor reports it
                 if isinstance(exc, RowSealError):  # BACKLOG #3510: re-running cannot help
-                    return ("seal-refused", user.username, logged)
+                    # Its own outcome when Vault transit refused the check (BACKLOG #2592).
+                    seal = "seal-unverifiable" if exc.unverifiable else "seal-refused"
+                    return (seal, user.username, logged)
                 return ("write-failed", user.username, f"{exc}; {logged}")
             return ("set", user.username, store.path)
         finally:
@@ -8586,8 +8629,11 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         # `StoreKeylessError`. Exit 1 stays a refusal about the account.
         _emit_error(f"{_sentence(extra)} Nothing was written", as_json=args.json)
         return 2
-    if outcome == "seal-refused":  # BACKLOG #3510; its own branch, since the text logs a warning
-        refused = _seal_refusal(username, "address write")
+    if outcome in ("seal-refused", "seal-unverifiable"):  # BACKLOG #3510, #2592
+        # Its own branch, since the text logs a warning.
+        refused = _seal_refusal(
+            username, "address write", unverifiable=outcome == "seal-unverifiable"
+        )
         return _emit_error(
             f"{refused}. The audit row for the change was written first; the address is NOT set, "
             f"and {extra}",
@@ -8758,9 +8804,11 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         return 2
 
     async def opened() -> Store:
-        return await open_store(
-            settings.store,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        return _arm_seal_pages(
+            await open_store(
+                settings.store,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
         )
 
     async def refusal_for(store: Store, user: UserRecord) -> str | None:
@@ -8926,7 +8974,11 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                         raise
                     if isinstance(exc, RowSealError):
                         return (
-                            _seal_refusal(user.username, "seed replacement")
+                            _seal_refusal(
+                                user.username,
+                                "seed replacement",
+                                unverifiable=exc.unverifiable,
+                            )
                             + ". Nothing was written."
                             + unused_entry
                         )
@@ -11032,9 +11084,23 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
     never as the bare ``ValueError`` the open raises for other reasons too.
     """
     try:
-        return await opening
+        return _arm_seal_pages(await opening)
     except _key_unresolved() as exc:
         raise _StoreKeyUnresolved(str(exc)) from exc
+
+
+def _arm_seal_pages(store: Store) -> Store:
+    """``store``, with its Transit row sealer's alert hook armed on a logging sink (BACKLOG
+    #2592), so a write a host command's store helper refuses because Vault transit refused to
+    check the row's seal pages per row, as under ``serve``. A command builds no notifier, so the
+    page is the sink's ``ALERT integrity_drift`` log line. Nothing for a store without one."""
+    from messagefoundry.pipeline.alerts import LoggingAlertSink, transit_seal_alert
+    from messagefoundry.store.row_seal import store_transit_sealer
+
+    sealer = store_transit_sealer(store)
+    if sealer is not None:
+        sealer.set_alert_hook(transit_seal_alert(LoggingAlertSink()))
+    return store
 
 
 async def _close_store_quietly(store: Store) -> None:

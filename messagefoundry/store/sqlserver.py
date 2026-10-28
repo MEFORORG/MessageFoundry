@@ -159,11 +159,13 @@ from messagefoundry.store.queue_tag import (
     report_queue_tag_failure,
 )
 from messagefoundry.store.row_seal import (
+    ROLE_KIND,
     SEAL_PREFIX,
     SESSION_KIND,
     USER_KIND,
     RowSealer,
     RowSealError,
+    Sealer,
 )
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
@@ -312,6 +314,7 @@ from messagefoundry.store.store import (
     report_unsealed_users,
     report_user_reseal,
     require_notify_email,
+    require_seal_for_write,
     require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
@@ -319,6 +322,7 @@ from messagefoundry.store.store import (
     scope_if_source,
     scope_withdrawal,
     seal_approval,
+    seal_holds_for_write,
     seal_role,
     seal_session,
     seal_user,
@@ -3056,7 +3060,7 @@ class SqlServerStore:
         self._posture = posture
         self._cipher: Cipher = cipher or IdentityCipher()
         # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
-        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
+        self._row_sealer: Sealer | None = RowSealer.for_cipher(self._cipher)
         # #190 audit-chain HMAC key (HKDF-derived; None, with no MAC provider, is the keyless mode).
         self._audit_mac_key = audit_mac_key
         # ADR 0138: an isolated-module MAC provider (Vault/OpenBao Transit ``generate_hmac``) keying the
@@ -12859,7 +12863,7 @@ class SqlServerStore:
                             # and which is re-entrant per transaction, this read sees every request
                             # committed before it, so two repeats cannot both find none and insert.
                             await cur.execute(match, match_args)
-                            joined = first_sealed_approval(
+                            joined = await first_sealed_approval(
                                 self._row_sealer, await self._fetch_dicts(cur)
                             )
                         if joined is None:
@@ -12886,10 +12890,13 @@ class SqlServerStore:
         transaction. Returns whether a row was written."""
         sealer = self._row_sealer
         if current is None:
-            await cur.execute(_MSSQL_APPROVAL_INSERT, seal_approval(sealer, new).write_params())
+            await cur.execute(
+                _MSSQL_APPROVAL_INSERT, (await seal_approval(sealer, new)).write_params()
+            )
             return True
         await cur.execute(
-            _MSSQL_APPROVAL_UPDATE, approval_update(sealer, current, new).update_params(current)
+            _MSSQL_APPROVAL_UPDATE,
+            (await approval_update(sealer, current, new)).update_params(current),
         )
         return bool(await cur.fetchall())
 
@@ -13169,7 +13176,7 @@ class SqlServerStore:
         # BACKLOG #2592: the whole row, sealed, in one INSERT.
         await self._execute_with_audits(
             _MSSQL_USER_INSERT,
-            user_insert_params(seal_user(self._row_sealer, record)),
+            user_insert_params(await seal_user(self._row_sealer, record)),
             audits,
             now=now,
         )
@@ -13221,8 +13228,9 @@ class SqlServerStore:
         current = await self._read_user_record(cur, user_id)
         if current is None:
             return None
-        if not user_seal_ok(self._row_sealer, current):
-            raise RowSealError(USER_KIND)
+        await require_seal_for_write(
+            user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+        )
         changed = change(current)
         if changed is None:
             return None
@@ -13230,7 +13238,7 @@ class SqlServerStore:
             await cur.execute("SELECT id FROM roles")
             present = [str(r[0]) for r in await cur.fetchall()]
             changed = existing_roles_only(current, changed, present)
-        updated = seal_user(self._row_sealer, changed)
+        updated = await seal_user(self._row_sealer, changed)
         await cur.execute(_MSSQL_USER_RESEAL, user_reseal_params(updated, current))
         if not await cur.fetchall():
             return None
@@ -13275,8 +13283,9 @@ class SqlServerStore:
 
         current = await self._read_user_record(cur, user_id)
         if current is not None:
-            if not user_seal_ok(self._row_sealer, current):
-                raise RowSealError(USER_KIND)
+            await require_seal_for_write(
+                user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+            )
             if (
                 self._row_sealer is not None
                 and not removes_all
@@ -13328,7 +13337,9 @@ class SqlServerStore:
         if sealer is None:
             return 0, 0
         cipher = self._cipher
-        if not isinstance(cipher, AesGcmCipher):  # no in-process keys, so no sealer either
+        # Only an in-process key moves: rotate-key refuses vault_transit before this pass, and
+        # Transit versions its own seal key (BACKLOG #2592).
+        if not isinstance(cipher, AesGcmCipher):
             return 0, 0
         change = rotation_reseal(sealer, cipher.active_marker_prefix, self._reencrypt_value)
         # Only records the pass has work on; store.py's reseal_user_records says why.
@@ -14038,7 +14049,9 @@ class SqlServerStore:
         ``MessageStore._write_role`` states the contract. Call it on ``cur`` inside an open
         transaction. One MERGE under HOLDLOCK (range-locks the key), so two concurrent seeders
         cannot both find the row absent and both INSERT the same key."""
-        await cur.execute(_MSSQL_ROLE_MERGE, seal_role(self._row_sealer, row).write_params())
+        await cur.execute(
+            _MSSQL_ROLE_MERGE, (await seal_role(self._row_sealer, row)).write_params()
+        )
 
     async def list_roles(self) -> list[dict[str, Any]]:
         return await self._fetchall("SELECT * FROM roles ORDER BY id")
@@ -14375,7 +14388,7 @@ class SqlServerStore:
             [(str(r[0]), str(r[1])) for r in await cur.fetchall()],
             str(seal_rows[0][0] or "") if seal_rows else "",
         )
-        new = ad_map_write(self._row_sealer, current, change)
+        new = await ad_map_write(self._row_sealer, current, change)
         if new is None:
             return False
         if new.pairs != current.pairs:
@@ -14418,7 +14431,9 @@ class SqlServerStore:
                     locked = await self._fetch_dicts(cur)
                     if locked:
                         role = RoleRow.from_mapping(locked[0])
-                        if role_seal_ok(sealer, role):
+                        if await seal_holds_for_write(
+                            role_seal_ok(sealer, role), sealer, ROLE_KIND, role.id
+                        ):
                             await self._write_role(cur, role)
                             resealed += 1
                         else:
@@ -14513,7 +14528,7 @@ class SqlServerStore:
                     idp_auth_time=idp_auth_time,
                     user_epoch=0 if not rows else int(rows[0][2]),
                 )
-                record = seal_session(self._row_sealer, record)
+                record = await seal_session(self._row_sealer, record)
                 await cur.execute(_SESSION_INSERT, session_insert_params(record))
                 await self._commit(conn)
             except Exception:
@@ -14542,9 +14557,13 @@ class SqlServerStore:
         current = SessionRecord.from_mapping(dict(zip(columns, rows[0])))  # noqa: B905
         if current.revoked_at is not None:
             return None
-        if not session_seal_ok(self._row_sealer, current):
-            raise RowSealError(SESSION_KIND)
-        updated = seal_session(self._row_sealer, change(current))
+        await require_seal_for_write(
+            session_seal_ok(self._row_sealer, current),
+            self._row_sealer,
+            SESSION_KIND,
+            current.token_hash,
+        )
+        updated = await seal_session(self._row_sealer, change(current))
         await cur.execute(_MSSQL_SESSION_RESEAL, session_reseal_params(updated, current))
         written = await cur.fetchall()
         return updated if written else None
@@ -14573,7 +14592,7 @@ class SqlServerStore:
                 raise
         return updated
 
-    def row_sealer(self) -> RowSealer | None:
+    def row_sealer(self) -> Sealer | None:
         """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
         :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
         return self._row_sealer

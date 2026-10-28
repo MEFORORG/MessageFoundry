@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import OrderedDict
 from collections.abc import Callable
-from typing import Protocol
+from typing import Final, Protocol
 
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.redaction import log_timestamp
@@ -28,10 +30,12 @@ from messagefoundry.redaction import log_timestamp
 __all__ = [
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
+    "MAX_SUBJECT_ALERTS",
     "REMINDER_SECONDS",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
+    "SubjectCap",
     "config_changed_detail",
     "crl_expiry_detail",
     "crl_reload_refused_detail",
@@ -1398,6 +1402,91 @@ def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
             sink.integrity_drift(AUTHORITY_SEAL_SUBJECT, reason=reason, drift_count=1)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning("authority-seal integrity alert could not be delivered")
+
+    return _raise
+
+
+#: The ``integrity_drift`` subject for an authority row seal that could not be made or checked
+#: because Vault transit did not answer (BACKLOG #2592). Its own subject, apart from
+#: :data:`AUTHORITY_SEAL_SUBJECT`, because it is not recorded as a failed seal.
+TRANSIT_SEAL_SUBJECT = "authority-seal-transit"
+#: The subject for a well-formed seal Transit refused to check while its key answers. Apart from
+#: :data:`TRANSIT_SEAL_SUBJECT`, so a passing outage never throttles away this one, which is treated
+#: as a failed seal and needs an operator. Each row's page appends ``":<kind>:<id>"`` to it.
+TRANSIT_SEAL_UNVERIFIABLE_SUBJECT = "authority-seal-transit-unverifiable"
+#: The cause the sealer passes for that case: ``row_seal.TRANSIT_UNVERIFIABLE_CAUSE``, spelled here
+#: so this module imports nothing from the store.
+_TRANSIT_UNVERIFIABLE_CAUSE = "transit-unverifiable"
+
+#: The most alerts one capped family raises under their own subjects in one window. Past it they
+#: raise under one shared ``<prefix>:*`` subject, so a caller that chooses the key, a spread of
+#: addresses or of planted rows, cannot open an alert instance, and send a page, per key. The
+#: security-signal detectors (``security_signals.py``) and the unverifiable-row pages share it.
+MAX_SUBJECT_ALERTS: Final = 5
+#: The window the unverifiable-row cap counts over: the sealer's per-row page interval
+#: (``row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS``), spelled here to import nothing from the
+#: store, so a row that stays unverifiable keeps its own subject for as long as it keeps paging.
+_UNVERIFIABLE_SUBJECT_WINDOW_SECONDS: Final = 300.0
+
+
+class SubjectCap:
+    """Which subjects may raise under their own name in a sliding window: one that already did in
+    the window, or any while fewer than :data:`MAX_SUBJECT_ALERTS` distinct subjects have. The
+    caller raises the rest under a shared subject."""
+
+    __slots__ = ("_named", "window_seconds")
+
+    def __init__(self, window_seconds: float) -> None:
+        self.window_seconds = window_seconds
+        #: Subjects that raised under their own name in the current window, and when.
+        self._named: OrderedDict[str, float] = OrderedDict()
+
+    def named(self, subject: str, now: float) -> bool:
+        """Whether ``subject`` may raise under its own name at ``now``. Records it when it may."""
+        cutoff = now - self.window_seconds
+        while self._named and next(iter(self._named.values())) <= cutoff:
+            self._named.popitem(last=False)
+        if subject in self._named or len(self._named) < MAX_SUBJECT_ALERTS:
+            self._named.pop(subject, None)
+            self._named[subject] = now
+            return True
+        return False
+
+
+def transit_seal_alert(
+    sink: AlertSink, *, clock: Callable[[], float] = time.monotonic
+) -> Callable[[str, str], None]:
+    """An alert hook for :meth:`~messagefoundry.store.row_seal.TransitRowSealer.set_alert_hook`:
+    each call raises ``integrity_drift``, the same method a failed seal raises
+    (:func:`authority_seal_alert`). The sealer pages an outage on its own throttled ERROR path, at
+    most once per throttle window, under :data:`TRANSIT_SEAL_SUBJECT`.
+    ``row_seal.alert_unverifiable_row`` pages once per unverifiable row, throttled per row on the
+    sealer, with a cause of ``"transit-unverifiable:<row>"``; its subject is
+    :data:`TRANSIT_SEAL_UNVERIFIABLE_SUBJECT` with the same ``":<row>"``, so a sink that throttles
+    per subject throttles per row (BACKLOG #2592).
+
+    **Capped, as the security signals are.** Past :data:`MAX_SUBJECT_ALERTS` rows in one window,
+    a row pages under ``"<TRANSIT_SEAL_UNVERIFIABLE_SUBJECT>:*"`` instead, so a flood of planted
+    rows opens one aggregate alert rather than one per row. The cap counts these rows only: a
+    forgery pages through :func:`authority_seal_alert` under its own subject, and an outage under
+    :data:`TRANSIT_SEAL_SUBJECT`, and no number of unverifiable rows reaches either.
+
+    The reason names no row value and never Vault's text. Never raises."""
+    cap = SubjectCap(_UNVERIFIABLE_SUBJECT_WINDOW_SECONDS)
+
+    def _raise(cause: str, reason: str) -> None:
+        if cause.partition(":")[0] == _TRANSIT_UNVERIFIABLE_CAUSE:
+            # "transit-unverifiable:<row>" keeps its ":<row>" on the subject, within the cap.
+            subject = TRANSIT_SEAL_UNVERIFIABLE_SUBJECT + cause[len(_TRANSIT_UNVERIFIABLE_CAUSE) :]
+            if not cap.named(subject, clock()):
+                subject = f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:*"
+                reason += f"; {MAX_SUBJECT_ALERTS} other rows already paged this window"
+        else:
+            subject = TRANSIT_SEAL_SUBJECT
+        try:
+            sink.integrity_drift(subject, reason=reason, drift_count=1)
+        except Exception as exc:  # noqa: BLE001 -- an alert-sink failure must never break a request
+            log.warning("transit row seal alert could not be delivered: %s", type(exc).__name__)
 
     return _raise
 

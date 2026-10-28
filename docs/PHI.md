@@ -86,9 +86,10 @@ same position. The owner named this actor in scope on 2026-10-01 (vault BACKLOG 
 A writer never needs the key to change a plaintext column. Without a seal, on a first deployment,
 one inserted row would give it an administrator session, a role or a channel scope.
 
-**Row seals** need a store key held in the engine's own memory. So the `vault_transit` key provider
-and a keyless store write and check none yet. On any other keyed store, the engine refuses at
-least these changes made outside the store:
+**Row seals** need a store key. A keyless store writes and checks none. Under `vault_transit` the
+seal is Transit's own HMAC and the check is Transit's verify call, so no seal key enters the
+engine's memory. On any keyed store, the engine refuses at least these changes made outside the
+store:
 
 - a session row inserted or edited, in any column but `last_used_at`;
 - an account inserted or edited: its `users` row, its role rows, or its passkey set apart from
@@ -109,7 +110,32 @@ moved message still shows in the other channel's message list by its plaintext c
 encrypted cells withheld. The engine keeps running. A refusal usually writes an `integrity.*`
 audit row and raises an `integrity_drift` alert, with at least these exceptions. Under
 `vault_transit`, a cell that fails its tag keeps the cipher's own error, with no integrity audit
-row or alert. Each process reports a row that keeps failing again only after an interval: five
+row or alert. And under `vault_transit`, a seal Transit cannot make or check because Vault did not
+answer refuses the request or the write with an error log and no integrity audit row: the API
+answers 503 with a `Retry-After`, the CLI prints one error line, and no session is ended. Under
+`vault_transit` a stored seal is read in three ways:
+
+- not a well-formed Transit MAC, or one Transit answers `valid: false` for: a failed seal;
+- well-formed, but Transit refuses to check it while its key still answers: *unverifiable*. The
+  seal names a key version below `min_decryption_version`, one the Vault node that answered does
+  not hold yet, or a planted one, and the reply cannot tell them apart. So a genuine seal checked
+  against a Vault node that lags a rotation reads as unverifiable, and its user signs in again. It
+  is treated as a failed seal, under its own audit action, `integrity.authority_seal_unverifiable`,
+  and paged per row: the row is denied and a session is ended. A directory map grants nothing to a
+  decision that writes nothing; a directory sign-in that would write from it is refused, and a
+  reconcile pass holds that map's diff. The API refuses an edit of a custom role or a directory
+  map whose seal is unverifiable (HTTP 409). Recover as [Recovering an unverifiable
+  row](#recovering-an-unverifiable-row) says, and before raising the minimum, read [Raising the
+  Transit audit key's minimum version](#raising-the-transit-audit-keys-minimum-version);
+- anything else Transit answers: an outage, as above.
+
+The audit row is written wherever the auth service or the approval gate reads the row. An
+`integrity_drift` alert reaches a sink only while `serve` runs, from just
+before it seeds the auth tables; another command logs the error and raises no alert, except
+that a host command's write refused for an unverifiable seal also writes the logging sink's
+`ALERT integrity_drift` line for that row. A write the store refused for an unverifiable seal is
+paged by the store itself, per row, so a refusal no reader reported still pages.
+Each process reports a row that keeps failing again only after an interval: five
 minutes for a sealed row, and an hour for a message or saved-search cell. What each refusal does
 is in the changelog entries for vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the
 next release, then [CHANGELOG.md](../CHANGELOG.md)). The seal format is
@@ -123,8 +149,8 @@ On a first deployment, a writer could still do at least these:
   sends the chain anchors off the host, where a collector could compare them.
 - **Copy sealed rows in from another store** under the same key. The row seal key carries no
   store id yet. That pin is vault BACKLOG #3411.
-- **Change authority rows and approval requests freely on a keyless store or under**
-  **`vault_transit`**, since no row seal is written there.
+- **Change authority rows and approval requests freely on a keyless store**, since no row seal
+  is written there.
 - **Move messages and re-route queue rows on a keyless store, or with `[store].aad_bind` off**,
   since no cell tag is bound there.
 - **Blank an encrypted cell.** An empty value opens on any keyed store, so a writer can erase a
@@ -133,6 +159,39 @@ On a first deployment, a writer could still do at least these:
   the delivered-key rows, which could make a delivery look like a duplicate and skip it; queue
   state and lane order; cluster rows; and `sessions.last_used_at`.
 - **Delete rows.** A delete needs no key, so a writer can always destroy data and stop service.
+
+### Raising the Transit audit key's minimum version
+
+Under `vault_transit`, every authority row seal is an HMAC under the audit key, at the version it
+was made under. **Do not raise the audit key's `min_decryption_version` while rows sealed under
+the older versions remain.** Transit then refuses to check those seals, so each such row is
+*unverifiable* and treated as a failed seal: its session is ended, its account or role grants
+nothing, and its directory map grants nothing, refuses a directory sign-in, and refuses a listing
+or a replacement (HTTP 409) until it verifies again or is cleared ([Recovering an unverifiable
+row](#recovering-an-unverifiable-row)). A row is sealed again only when the engine writes it, and
+no command re-seals rows yet. Lowering the minimum again makes the rows verify again, except a row
+the engine changed without re-sealing while it was unverifiable: deleting a custom role removes
+its holders' and its directory map's rows of it that way, so those records then fail as forged.
+
+### Recovering an unverifiable row
+
+Transit's refusal cannot tell a Vault node that lags a rotation from a retired version or a planted
+one, so take these steps in order, and stop at the first that clears it:
+
+1. **Check Vault first.** Confirm that Vault is healthy and that every node the engine reaches holds
+   the audit key's latest version, then retry. A lagging node clears by itself, and nothing needs
+   re-sealing.
+2. **Re-seal a row under a retired version.** Only if the row was sealed under a version the audit
+   key's `min_decryption_version` has retired: lower the minimum until the row verifies, save it
+   again (a custom role through its edit, a directory map through `PUT /ad-group-map` or
+   `PUT /ad-group-scope-map` with its pairs), which seals it under the latest version, then raise
+   the minimum again.
+3. **Delete or clear it, as the last resort.** A row that still does not verify may be planted.
+   Delete the custom role and create it again, or clear the directory map by saving it with no
+   entries and enter its pairs again. Both replace what the row held.
+
+While a directory map is unverifiable, no directory account can sign in, so take these steps as a
+local Administrator.
 
 ---
 

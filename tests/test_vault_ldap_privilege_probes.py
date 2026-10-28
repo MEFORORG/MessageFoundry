@@ -499,6 +499,12 @@ class _RecordingTransit:
         self.paths.add(f"{mount_point}/hmac/{name}")
         return {"data": {"hmac": "vault:v1:synthetic-mac"}}
 
+    def verify_signed_data(
+        self, *, name: str, mount_point: str = "transit", **_: Any
+    ) -> dict[str, Any]:
+        self.paths.add(f"{mount_point}/verify/{name}")
+        return {"data": {"valid": True}}
+
 
 class _TransitClient:
     def __init__(self, transit: _RecordingTransit) -> None:
@@ -533,6 +539,8 @@ def test_the_transit_paths_are_the_ones_the_cipher_calls(
     aad = cell_aad("messages", "raw", 1)
     cipher.decrypt(cipher.encrypt("synthetic", aad=aad), aad=aad)
     cipher.audit_hmac(b"synthetic row")
+    # BACKLOG #2592: the row seal's two calls, Transit's HMAC and its verify.
+    cipher.verify_seal_hmac(b"synthetic row", cipher.seal_hmac(b"synthetic row"))
     assert transit.paths == set(crypto_transit.transit_cipher_required_capabilities())
 
 

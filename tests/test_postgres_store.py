@@ -5428,6 +5428,49 @@ async def test_approval_seal_contract(store) -> None:
         await keyed.close()
 
 
+_TRANSIT_SEAL_CONTRACTS = ("session", "user", "role", "approval", "control")
+
+
+@pytest.mark.parametrize("contract", _TRANSIT_SEAL_CONTRACTS)
+async def test_transit_row_seal_contracts(store, contract: str, monkeypatch) -> None:
+    """BACKLOG #2592 (ADR-draft decision D14): each seal contract above, on a handle whose only key
+    is in a stand-in for Vault Transit, so every seal is Transit's HMAC and every check its verify
+    call. ``control`` shows a forged session resolves once that check is switched off. The
+    fixture truncates the tables on the next entry, so each contract runs on a clean slate."""
+    import importlib
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.row_seal import TransitRowSealer
+    from tests._session_seal_contract import dollar_placeholders
+    from tests._transit_seal_fake import (
+        FakeTransit,
+        assert_a_forged_session_needs_the_transit_check,
+        transit_cipher,
+    )
+
+    cipher = transit_cipher(FakeTransit())
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store,
+        cipher=cipher,
+        audit_mac_fn=cipher.audit_mac_fn(),
+    )
+    try:
+        assert isinstance(keyed.row_sealer(), TransitRowSealer)
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        if contract == "control":
+            await assert_a_forged_session_needs_the_transit_check(keyed, raw, monkeypatch)
+        else:
+            module = importlib.import_module(f"tests._{contract}_seal_contract")
+            await getattr(module, f"assert_{contract}_seal_contract")(keyed, raw)
+    finally:
+        await keyed.close()
+
+
 async def test_a_role_delete_racing_a_grant_leaves_no_dangling_role_row(store) -> None:
     """BACKLOG #2592: a grant that commits while its custom role is deleted fails the delete on the
     ``user_roles`` role foreign key, rather than leaving a sealed role row with no role behind it.

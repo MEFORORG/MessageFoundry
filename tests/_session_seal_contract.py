@@ -98,7 +98,7 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     token = await _mint(store)
     row = await store.get_session(hash_token(token))
     assert row is not None and row.seal.startswith(SEAL_PREFIX)
-    assert session_seal_ok(sealer, row)
+    assert await session_seal_ok(sealer, row)
     identity = await service.identity_for_token(token)
     assert identity is not None and identity.user_id == "seal-u1"
     assert await service.has_recent_step_up(token)
@@ -186,7 +186,7 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     await store.mark_session_mfa_verified(hash_token(kept))
     stamped = await store.get_session(hash_token(kept))
     assert stamped is not None and stamped.mfa_verified_at is not None
-    assert stamped.client == "192.0.2.11" and session_seal_ok(sealer, stamped)
+    assert stamped.client == "192.0.2.11" and await session_seal_ok(sealer, stamped)
     rotated = mint_token()
     assert await store.rotate_session(hash_token(kept), new_token_hash=hash_token(rotated))
     assert await service.identity_for_token(rotated) is not None
@@ -223,6 +223,8 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
         (copy.seal, hash_token(other)),
     )
     restored = await store.get_session(hash_token(other))
-    assert restored is not None and session_seal_ok(sealer, restored)  # the copy's seal holds...
+    assert restored is not None and await session_seal_ok(
+        sealer, restored
+    )  # the copy's seal holds...
     assert await service.identity_for_token(other) is None  # ...and its epoch is stale
     assert await service.identity_for_token(mine) is not None

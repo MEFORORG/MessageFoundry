@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -83,7 +84,7 @@ async def test_the_contract_fails_when_the_service_checks_no_seal(
     import messagefoundry.auth.service as service_module
 
     store, path = keyed
-    monkeypatch.setattr(service_module, check, lambda sealer, row: True)
+    monkeypatch.setattr(service_module, check, AsyncMock(return_value=True))
     with pytest.raises(AssertionError):
         await assert_role_seal_contract(store, _raw_for(path))
 
@@ -261,9 +262,9 @@ async def test_rotation_leaves_a_failing_role_and_map_as_they_are(
     bad_row = await store.get_role(bad)
     assert bad_row is not None and RoleRow.from_mapping(bad_row).seal == foreign
     for name in (AD_ROLE_MAP, AD_SCOPE_MAP):
-        assert not ad_map_seal_ok(sealer, await store.get_ad_map(name)), name
+        assert not await ad_map_seal_ok(sealer, await store.get_ad_map(name)), name
     good_row = await store.get_role(good)
-    assert good_row is not None and role_seal_ok(sealer, RoleRow.from_mapping(good_row))
+    assert good_row is not None and await role_seal_ok(sealer, RoleRow.from_mapping(good_row))
 
 
 async def test_a_role_written_before_the_seal_is_named_at_open_and_repaired_by_a_save(
@@ -331,12 +332,14 @@ _ROLE_READERS = frozenset(
 )
 #: The service functions allowed to call a raw role or map reader.
 _LOADERS: dict[str, frozenset[str]] = {
-    "_load_role": frozenset({"get_role"}),
+    # _load_role and update_custom_role read through it, for the seal's verdict (BACKLOG #2592).
+    "_checked_role": frozenset({"get_role"}),
     "_load_custom_roles": frozenset({"list_roles"}),
     # An existence question: only a bool leaves it, never the unchecked row.
     "_custom_role_held": frozenset({"get_role"}),
-    # _ad_map reads through it, so a caller can tell a failing map from an empty one (#3082).
-    "_sealed_ad_map": frozenset({"get_ad_map"}),
+    # _sealed_ad_map, _ad_map_for_edit and _refuse_unverifiable_ad_map read through it, for the
+    # seal's verdict (#3082, BACKLOG #2592).
+    "_checked_ad_map": frozenset({"get_ad_map"}),
 }
 
 

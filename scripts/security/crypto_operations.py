@@ -226,6 +226,11 @@ METHOD_RULES: dict[str, str] = {
     "sign_data": "sign_verify",  # hvac Vault Transit
     "verify_signed_data": "sign_verify",  # hvac Vault Transit
     "generate_hmac": "mac",  # hvac Vault Transit
+    # BACKLOG #2592: the awaited row-seal forms every store and service seal site calls
+    # (store/row_seal.py), so a seal check stays visible where it runs.
+    "seal_async": "mac",
+    "verify_async": "sign_verify",
+    "verify_held_async": "sign_verify",
     "derive": "kdf",
     "load_cert_chain": "tls_context",
     "load_verify_locations": "tls_context",

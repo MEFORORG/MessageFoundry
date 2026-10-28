@@ -82,6 +82,15 @@ class _FakeTransit:
         digest = self._hmac.new(secret, base64.b64decode(hash_input), self._hashlib.sha256).digest()
         return {"data": {"hmac": "vault:v1:" + base64.b64encode(digest).decode("ascii")}}
 
+    def verify_signed_data(
+        self, *, name: str, hash_input: str, hmac: str, **_: Any
+    ) -> dict[str, Any]:
+        # Transit's verify for a row seal (BACKLOG #2592): the MAC at the version the string names,
+        # through this fake's own generate_hmac, so a subclass that versions its keys checks the same.
+        version = int(hmac.removeprefix("vault:v").partition(":")[0])
+        expected = self.generate_hmac(name=name, hash_input=hash_input, key_version=version)
+        return {"data": {"valid": self._hmac.compare_digest(expected["data"]["hmac"], hmac)}}
+
     def encrypt_data(
         self, *, name: str, plaintext: str, associated_data: str | None = None, **_: Any
     ) -> dict[str, Any]:

@@ -180,6 +180,9 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     RowSealer,
     RowSealError,
+    Sealer,
+    TransitSealUnverifiableError,
+    alert_unverifiable_write,
     seal_bytes,
 )
 from messagefoundry.store.schema_verify import (
@@ -1341,20 +1344,59 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
     )
 
 
-def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionRecord:
+async def seal_session(sealer: Sealer | None, record: SessionRecord) -> SessionRecord:
     """``record`` with its seal set: the sealer's seal over its sealed fields, or empty on a store
     with no sealer (BACKLOG #2592)."""
-    seal = "" if sealer is None else sealer.seal(SESSION_KIND, record.seal_fields())
+    seal = "" if sealer is None else await sealer.seal_async(SESSION_KIND, record.seal_fields())
     return replace(record, seal=seal)
 
 
-def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
+async def seal_holds_for_write(
+    check: Awaitable[bool], sealer: Sealer | None, kind: str, row_id: str
+) -> bool:
+    """``check``'s answer, with a seal Vault transit refused to check
+    (:class:`~messagefoundry.store.row_seal.TransitSealUnverifiableError`) read as failing
+    (BACKLOG #2592). Every store-side check runs through it, on every backend: a write helper then
+    refuses with :class:`RowSealError`, so each existing fallback for a failing row (a holder's
+    row deleted, an epoch bumped, a guard that skips the holder) covers that seal too. Such a
+    refusal is paged here, under the row's own subject (``kind`` and ``row_id``), because no
+    reader may report it. The auth service's and the approval gate's loaders call the
+    ``*_seal_ok`` helpers directly instead, because they report the two cases under different
+    audit actions."""
+    try:
+        return await check
+    except TransitSealUnverifiableError:
+        alert_unverifiable_write(sealer, kind, row_id)
+        return False
+
+
+async def require_seal_for_write(
+    check: Awaitable[bool], sealer: Sealer | None, kind: str, row_id: str
+) -> None:
+    """Return when ``check`` holds; otherwise raise :class:`RowSealError` for ``kind``, so the
+    write helper writes nothing (BACKLOG #2592). When Vault transit refused to check the seal, the
+    refusal is paged as :func:`seal_holds_for_write` pages it and the error carries
+    ``unverifiable``, taken from the exception itself rather than inferred later, so a caller
+    reports it under the unverifiable action and never as a forgery. A seal that does not verify
+    raises without it."""
+    try:
+        holds = await check
+    except TransitSealUnverifiableError as exc:
+        alert_unverifiable_write(sealer, kind, row_id)
+        raise RowSealError(kind, unverifiable=True) from exc
+    if not holds:
+        raise RowSealError(kind)
+
+
+async def session_seal_ok(sealer: Sealer | None, record: SessionRecord) -> bool:
     """Whether ``record`` carries a valid seal. Always True with no sealer: a store that holds no
     key writes and checks no seals. With one, a missing or empty seal fails like a wrong one."""
-    return sealer is None or sealer.verify(SESSION_KIND, record.seal_fields(), record.seal)
+    return sealer is None or await sealer.verify_async(
+        SESSION_KIND, record.seal_fields(), record.seal
+    )
 
 
-def session_sealed_by_retired_key(sealer: RowSealer | None, record: SessionRecord) -> bool:
+def session_sealed_by_retired_key(sealer: Sealer | None, record: SessionRecord) -> bool:
     """Whether ``record`` carries a genuine seal made under a RETIRED store key: a session minted
     before the key changed and not yet ended by ``rotate-key``. It is refused like any other row
     that fails; this only says the refusal is a key change, not an integrity failure."""
@@ -1810,7 +1852,7 @@ type AdminHolderTest = Callable[[UserRow], bool]
 
 async def admin_guard_counts(
     holders: Iterable[tuple[str, bool]],
-    sealer: RowSealer | None,
+    sealer: Sealer | None,
     read_record: Callable[[str], Awaitable[UserAuthzRecord | None]],
     counts: AdminHolderTest | None = None,
 ) -> tuple[int, int]:
@@ -1826,7 +1868,9 @@ async def admin_guard_counts(
             target += 1
             continue
         record = await read_record(holder_id)
-        if record is None or not user_seal_ok(sealer, record):
+        if record is None or not await seal_holds_for_write(
+            user_seal_ok(sealer, record), sealer, USER_KIND, holder_id
+        ):
             continue
         if counts is None or counts(record.row):
             others += 1
@@ -2451,21 +2495,23 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
 
 
-def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
+async def seal_user(sealer: Sealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
     """``record`` with its seal set: the sealer's seal over it under the active key, or empty on a
     store with no sealer (BACKLOG #2592)."""
-    seal = "" if sealer is None else sealer.seal(USER_KIND, record.seal_fields())
+    seal = "" if sealer is None else await sealer.seal_async(USER_KIND, record.seal_fields())
     return record.changed(authz_seal=seal)
 
 
-def user_seal_ok(sealer: RowSealer | None, record: UserAuthzRecord) -> bool:
+async def user_seal_ok(sealer: Sealer | None, record: UserAuthzRecord) -> bool:
     """Whether ``record`` carries a valid seal under a key this process holds. Always True with no
     sealer: a store that holds no key writes and checks no seals. With one, a missing or empty seal
     fails like a wrong one, and so does a value the encoder cannot read."""
     if sealer is None:
         return True
     try:
-        return sealer.verify_held(USER_KIND, record.seal_fields(), record.row.authz_seal)
+        return await sealer.verify_held_async(
+            USER_KIND, record.seal_fields(), record.row.authz_seal
+        )
     except TypeError:
         return False
 
@@ -3286,7 +3332,7 @@ def report_unsealed_users(count: int) -> None:
 
 
 def rotation_reseal(
-    sealer: RowSealer, active_prefix: str, reencrypt: Callable[[str, bytes], str]
+    sealer: Sealer, active_prefix: str, reencrypt: Callable[[str, bytes], str]
 ) -> UserChange:
     """``rotate-key``'s change to one user record (BACKLOG #2592): the TOTP secret re-encrypted under
     the active key when it is not already, and the record re-sealed under the active key. The seal
@@ -3457,18 +3503,20 @@ class RoleRow:
         return tuple(getattr(self, f.name) for f in _dc_fields(self))
 
 
-def seal_role(sealer: RowSealer | None, row: RoleRow) -> RoleRow:
+async def seal_role(sealer: Sealer | None, row: RoleRow) -> RoleRow:
     """``row`` with its seal set under the active key, or empty with no sealer (BACKLOG #2592)."""
-    return replace(row, seal="" if sealer is None else sealer.seal(ROLE_KIND, row.seal_fields()))
+    return replace(
+        row, seal="" if sealer is None else await sealer.seal_async(ROLE_KIND, row.seal_fields())
+    )
 
 
-def role_seal_ok(sealer: RowSealer | None, row: RoleRow) -> bool:
+async def role_seal_ok(sealer: Sealer | None, row: RoleRow) -> bool:
     """Whether ``row`` carries a valid seal under a key this process holds. Always True with no
     sealer. With one, a missing or empty seal fails like a wrong one."""
     if sealer is None:
         return True
     try:
-        return sealer.verify_held(ROLE_KIND, row.seal_fields(), row.seal)
+        return await sealer.verify_held_async(ROLE_KIND, row.seal_fields(), row.seal)
     except TypeError:
         return False
 
@@ -3547,14 +3595,14 @@ class AdMap:
         return replace(self, pairs=tuple(p for p in self.pairs if p[1] != value))
 
 
-def ad_map_seal_ok(sealer: RowSealer | None, current: AdMap) -> bool:
+async def ad_map_seal_ok(sealer: Sealer | None, current: AdMap) -> bool:
     """Whether the map carries a valid seal under a key this process holds. Always True with no
     sealer, and for an empty map, which grants nothing whatever its seal says. With pairs, a missing
     or empty seal fails like a wrong one."""
     if sealer is None or not current.pairs:
         return True
     try:
-        return sealer.verify_held(ADSET_KIND, current.seal_fields(), current.seal)
+        return await sealer.verify_held_async(ADSET_KIND, current.seal_fields(), current.seal)
     except TypeError:
         return False
 
@@ -3564,7 +3612,7 @@ def ad_map_seal_ok(sealer: RowSealer | None, current: AdMap) -> bool:
 AdMapChange = AdMap | Callable[[AdMap], AdMap]
 
 
-def ad_map_write(sealer: RowSealer | None, current: AdMap, change: AdMapChange) -> AdMap | None:
+async def ad_map_write(sealer: Sealer | None, current: AdMap, change: AdMapChange) -> AdMap | None:
     """What a backend's ``_write_ad_map`` writes over ``current``, the map it read inside its
     transaction: the changed map, sealed, or ``None`` when nothing differs (BACKLOG #2592).
 
@@ -3574,11 +3622,12 @@ def ad_map_write(sealer: RowSealer | None, current: AdMap, change: AdMapChange) 
     """
     if isinstance(change, AdMap):
         changed = replace(change, name=current.name)
-    elif not ad_map_seal_ok(sealer, current):
-        raise RowSealError(ADSET_KIND)
     else:
+        await require_seal_for_write(
+            ad_map_seal_ok(sealer, current), sealer, ADSET_KIND, current.name
+        )
         changed = change(current)
-    seal = "" if sealer is None else sealer.seal(ADSET_KIND, changed.seal_fields())
+    seal = "" if sealer is None else await sealer.seal_async(ADSET_KIND, changed.seal_fields())
     new = replace(changed, seal=seal)
     if new.pairs == current.pairs and new.seal == current.seal:
         return None
@@ -3804,36 +3853,40 @@ def new_approval_row(
     )
 
 
-def seal_approval(sealer: RowSealer | None, row: ApprovalRow) -> ApprovalRow:
+async def seal_approval(sealer: Sealer | None, row: ApprovalRow) -> ApprovalRow:
     """``row`` with its seal set under the active key, or empty with no sealer (BACKLOG #2592)."""
     return replace(
-        row, seal="" if sealer is None else sealer.seal(APPROVAL_KIND, row.seal_fields())
+        row,
+        seal="" if sealer is None else await sealer.seal_async(APPROVAL_KIND, row.seal_fields()),
     )
 
 
-def approval_seal_ok(sealer: RowSealer | None, row: ApprovalRow) -> bool:
+async def approval_seal_ok(sealer: Sealer | None, row: ApprovalRow) -> bool:
     """Whether ``row`` carries a valid seal under a key this process holds. Always True with no
     sealer. With one, a missing or empty seal fails like a wrong one."""
     if sealer is None:
         return True
     try:
-        return sealer.verify_held(APPROVAL_KIND, row.seal_fields(), row.seal)
+        return await sealer.verify_held_async(APPROVAL_KIND, row.seal_fields(), row.seal)
     except TypeError:
         return False
 
 
-def approval_update(
-    sealer: RowSealer | None, current: ApprovalRow, new: ApprovalRow
+async def approval_update(
+    sealer: Sealer | None, current: ApprovalRow, new: ApprovalRow
 ) -> ApprovalRow:
     """What a backend's ``_write_approval`` writes over ``current``, the row it read: ``new``,
     sealed. Raises :class:`RowSealError` when ``current`` fails its seal, because the write keeps
     its stored values, so a change made outside the store must never be sealed in."""
-    if not approval_seal_ok(sealer, current):
-        raise RowSealError(APPROVAL_KIND)
-    return seal_approval(sealer, new)
+    await require_seal_for_write(
+        approval_seal_ok(sealer, current), sealer, APPROVAL_KIND, current.id
+    )
+    return await seal_approval(sealer, new)
 
 
-def first_sealed_approval(sealer: RowSealer | None, rows: Iterable[ByName]) -> ApprovalRow | None:
+async def first_sealed_approval(
+    sealer: Sealer | None, rows: Iterable[ByName]
+) -> ApprovalRow | None:
     """The first of ``rows`` whose seal holds, for a repeat request to join (vault BACKLOG #2445),
     or ``None``. A request that fails is never joined, so a row planted outside the store cannot
     absorb a real request; it is logged, and the caller files the request on its own."""
@@ -3844,7 +3897,8 @@ def first_sealed_approval(sealer: RowSealer | None, rows: Iterable[ByName]) -> A
         except RowSealError:
             failed += 1
             continue
-        if approval_seal_ok(sealer, row):
+        # An unverifiable seal is skipped like a failed one, never joined.
+        if await seal_holds_for_write(approval_seal_ok(sealer, row), sealer, APPROVAL_KIND, row.id):
             return row
         failed += 1
     if failed:
@@ -7962,10 +8016,9 @@ class MessageStore:
         # load — so this is a permanent 0 and there is no increment site in this module.
         self.fenced_writes = 0
         self._cipher: Cipher = cipher or IdentityCipher()
-        # BACKLOG #2592: the row sealer, fixed for the handle's life like the cipher. None when the
-        # cipher holds no in-process authorization root (keyless), and then no seal is written or
-        # checked.
-        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
+        # BACKLOG #2592: the row sealer, fixed for the handle's life like the cipher. None on a
+        # keyless store, and then no seal is written or checked; vault_transit gets a Transit one.
+        self._row_sealer: Sealer | None = RowSealer.for_cipher(self._cipher)
         # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
         # may already count for another store, so close() must not settle its reserve here.
         self._cipher_foreign = False
@@ -8119,7 +8172,7 @@ class MessageStore:
         """This store's LIVE at-rest cipher — see :meth:`messagefoundry.store.base.Store.cipher`."""
         return self._cipher
 
-    def row_sealer(self) -> RowSealer | None:
+    def row_sealer(self) -> Sealer | None:
         """This store's row sealer, or ``None`` on a keyless store. See
         :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
         return self._row_sealer
@@ -14801,7 +14854,7 @@ class MessageStore:
                     + " ORDER BY requested_at ASC",
                     match,
                 )
-                joined = first_sealed_approval(self._row_sealer, await found.fetchall())
+                joined = await first_sealed_approval(self._row_sealer, await found.fetchall())
                 if joined is None:
                     await self._write_approval(row)
                 else:
@@ -14834,10 +14887,10 @@ class MessageStore:
         if current is not None:
             cur = await self._db.execute(
                 _SQLITE_APPROVAL_UPDATE,
-                approval_update(sealer, current, new).update_params(current),
+                (await approval_update(sealer, current, new)).update_params(current),
             )
             return cur.rowcount > 0
-        params = seal_approval(sealer, new).write_params()
+        params = (await seal_approval(sealer, new)).write_params()
         if unless_open is None:
             await self._db.execute(_SQLITE_APPROVAL_INSERT, params)
             return True
@@ -15357,11 +15410,12 @@ class MessageStore:
             directory_object_id=directory_object_id,
             now=now,
         )
+        # BACKLOG #2592: the whole row, sealed, in one INSERT. Sealed before the writer lock, as the
+        # server backends do: under vault_transit the seal is a Vault call, and a new row has no
+        # stored state for the lock to protect while it runs.
+        params = user_insert_params(await seal_user(self._row_sealer, record))
         async with _writer_guard(self._db, self._lock):
-            # BACKLOG #2592: the whole row, sealed, in one INSERT.
-            await self._db.execute(
-                _USER_INSERT, user_insert_params(seal_user(self._row_sealer, record))
-            )
+            await self._db.execute(_USER_INSERT, params)
             # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
             appended = await self._append_audits(audits, now=now)
             await self._commit()
@@ -15410,8 +15464,9 @@ class MessageStore:
         current = await self._read_user_record(user_id)
         if current is None:
             return None
-        if not user_seal_ok(self._row_sealer, current):
-            raise RowSealError(USER_KIND)
+        await require_seal_for_write(
+            user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+        )
         changed = change(current)
         if changed is None:
             return None
@@ -15420,7 +15475,7 @@ class MessageStore:
             changed = existing_roles_only(
                 current, changed, [str(r["id"]) for r in await cur.fetchall()]
             )
-        updated = seal_user(self._row_sealer, changed)
+        updated = await seal_user(self._row_sealer, changed)
         cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
         if cur.rowcount != 1:
             return None
@@ -15457,8 +15512,9 @@ class MessageStore:
         left to seal, so ``admin_reset_mfa`` can still clear a set that fails."""
         current = await self._read_user_record(user_id)
         if current is not None:
-            if not user_seal_ok(self._row_sealer, current):
-                raise RowSealError(USER_KIND)
+            await require_seal_for_write(
+                user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+            )
             if (
                 self._row_sealer is not None
                 and not removes_all
@@ -15485,8 +15541,11 @@ class MessageStore:
         sealer = self._row_sealer
         if sealer is None:
             return 0, 0
-        # A sealer exists only for a cipher that holds its keys in-process, which is AesGcmCipher.
-        cipher = cast("AesGcmCipher", self._cipher)
+        cipher = self._cipher
+        # Only an in-process key moves: rotate-key refuses vault_transit before this pass, and
+        # Transit versions its own seal key (BACKLOG #2592).
+        if not isinstance(cipher, AesGcmCipher):
+            return 0, 0
         change = rotation_reseal(
             sealer,
             cipher.active_marker_prefix,
@@ -16249,7 +16308,9 @@ class MessageStore:
         repaired (the comment above :data:`ROLE_SEAL_EXCLUDED` says why that copies nothing in). A
         caller that builds ``row`` from a stored one checks it first, as
         :meth:`reseal_role_records` does."""
-        await self._db.execute(_ROLE_UPSERT, seal_role(self._row_sealer, row).write_params())
+        await self._db.execute(
+            _ROLE_UPSERT, (await seal_role(self._row_sealer, row)).write_params()
+        )
 
     async def list_roles(self) -> list[aiosqlite.Row]:
         async with self._read() as db:
@@ -16616,7 +16677,7 @@ class MessageStore:
             [(str(r[0]), str(r[1])) for r in await cur.fetchall()],
             "" if seal_row is None else str(seal_row["seal"] or ""),
         )
-        new = ad_map_write(self._row_sealer, current, change)
+        new = await ad_map_write(self._row_sealer, current, change)
         if new is None:
             return False
         if new.pairs != current.pairs:
@@ -16669,7 +16730,9 @@ class MessageStore:
                 if found is None:
                     continue
                 row = RoleRow.from_mapping(found)
-                if not role_seal_ok(sealer, row):
+                if not await seal_holds_for_write(
+                    role_seal_ok(sealer, row), sealer, ROLE_KIND, row.id
+                ):
                     refused += 1
                     continue
                 await self._write_role(row)
@@ -16744,7 +16807,7 @@ class MessageStore:
                 idp_auth_time=idp_auth_time,
                 user_epoch=0 if row is None else int(row["session_epoch"]),
             )
-            record = seal_session(self._row_sealer, record)
+            record = await seal_session(self._row_sealer, record)
             await self._db.execute(_SESSION_INSERT, session_insert_params(record))
             await self._commit()
         return True
@@ -16769,9 +16832,13 @@ class MessageStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        if not session_seal_ok(self._row_sealer, current):
-            raise RowSealError(SESSION_KIND)
-        updated = seal_session(self._row_sealer, change(current))
+        await require_seal_for_write(
+            session_seal_ok(self._row_sealer, current),
+            self._row_sealer,
+            SESSION_KIND,
+            current.token_hash,
+        )
+        updated = await seal_session(self._row_sealer, change(current))
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None
 

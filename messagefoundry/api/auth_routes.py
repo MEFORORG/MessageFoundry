@@ -16,7 +16,8 @@ import io
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import contextmanager
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -140,9 +141,11 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     STEP_UP_ACTION_SESSION_TERMINATE,
     USERNAME_TAKEN,
+    AdMapUnverifiableError,
     AuthService,
     ChannelScopeSourceConflict,
     CurrentPasswordCheck,
+    CustomRoleUnverifiableError,
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
     DirectoryObjectIdMissing,
@@ -160,12 +163,21 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
-from messagefoundry.store.row_seal import RowSealError
+from messagefoundry.store.row_seal import (
+    RowSealError,
+    TransitSealUnavailableError,
+    TransitSealUnverifiableError,
+    alert_unverifiable_row,
+)
 from messagefoundry.store.store import SessionRecord, UserRecord
 
 _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
+
+#: The ``Retry-After`` a request refused for a Vault transit outage carries, in seconds (BACKLOG
+#: #2592). Short, because the sealer asks Vault again on the next request.
+TRANSIT_SEAL_RETRY_AFTER_SECONDS = 30
 
 #: What ``/auth/mfa-verify``, ``/me/reauth`` and ``/me/mfa/confirm`` say when a directory refused
 #: the account: the proof was never checked, or, on a demoted account's re-bind, it was checked and
@@ -487,6 +499,16 @@ _GROUPS_NAMED = 3
 _STORED_GROUP_MAX = _GROUP_MAX
 
 
+@contextmanager
+def _ad_map_unverifiable_is_409() -> Iterator[None]:
+    """Answer :class:`AdMapUnverifiableError` with HTTP 409 and its fixed text, which names the
+    recovery, as the custom-role edit answers its own (BACKLOG #2592)."""
+    try:
+        yield
+    except AdMapUnverifiableError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
 def _canonical_group_dns(groups: list[str]) -> list[str]:
     """Each group map key in canonical form, or a 400 if any is not a full DN (BACKLOG #2610).
 
@@ -567,20 +589,63 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # seal, and wrote nothing. Any route that edits an account or a session can meet it; it is
         # a refused change, so a 409 with a fixed text, never the row and never a 500. Logged with
         # the row's kind, since this path does not pass the service loader that audits and alerts.
+        # A seal Vault transit refused to check is named as such, never as a failed check: the
+        # store helper set the cause, and has already paged the row.
         assert isinstance(exc, RowSealError)
-        _log.warning(
-            "a write to a %s row was refused: its integrity seal does not verify (BACKLOG #2592)",
-            exc.kind,
+        _log.warning("a write to a %s row was refused: %s (BACKLOG #2592)", exc.kind, exc)
+        detail = (
+            f"the {exc.kind} record's integrity seal cannot be verified by Vault transit, so the"
+            " change was refused"
+            if exc.unverifiable
+            else f"the {exc.kind} record fails its integrity check, so the change was refused"
         )
+        return await http_exception_handler(
+            request, HTTPException(status.HTTP_409_CONFLICT, detail)
+        )
+
+    app.add_exception_handler(RowSealError, _row_seal_refused)
+
+    async def _transit_seal_unavailable(request: Request, exc: Exception) -> Response:
+        # BACKLOG #2592: an authority row's seal could not be made or checked through Vault transit.
+        # Not a failed seal, and not a crash: a 503 with a fixed text, never Vault's text or the row.
+        # The sealer has already logged it, throttled, and raised the alert. An outage passes, so it
+        # carries a Retry-After.
+        return await http_exception_handler(
+            request,
+            HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "the integrity check service is unavailable; retry shortly",
+                headers={"Retry-After": str(TRANSIT_SEAL_RETRY_AFTER_SECONDS)},
+            ),
+        )
+
+    app.add_exception_handler(TransitSealUnavailableError, _transit_seal_unavailable)
+
+    async def _transit_seal_unverifiable(request: Request, exc: Exception) -> Response:
+        # BACKLOG #2592: a backstop. The loaders and the store's write helpers catch a seal Vault
+        # transit refused to check, so only a check outside both reaches here. It does not pass by
+        # itself, so a 409 with a fixed text and no Retry-After. The sealer has already logged it;
+        # nothing has paged it, so it pages here, under the row kind the sealer named, since no
+        # row id reaches this far.
+        assert isinstance(exc, TransitSealUnverifiableError)
+        auth = get_auth(request)
+        if auth is not None:
+            kind = exc.kind or "row"
+            alert_unverifiable_row(
+                auth.store.row_sealer(),
+                f"{kind}:unattributed",
+                f"a request was refused: Vault transit refused to check a {kind} row's seal",
+            )
         return await http_exception_handler(
             request,
             HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"the {exc.kind} record fails its integrity check, so the change was refused",
+                "a stored integrity seal cannot be verified by Vault transit; the request was"
+                " refused",
             ),
         )
 
-    app.add_exception_handler(RowSealError, _row_seal_refused)
+    app.add_exception_handler(TransitSealUnverifiableError, _transit_seal_unverifiable)
     # --- authentication ------------------------------------------------------
 
     @app.get("/auth/providers", response_model=ProvidersInfo)
@@ -1249,6 +1314,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         except CustomRoleError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except CustomRoleUnverifiableError as exc:
+            # BACKLOG #2592: a fixed text that names the recovery, Vault first.
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
         return CustomRoleInfo(
@@ -1919,8 +1987,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_MANAGE)),
     ) -> AdGroupMap:
-        # BACKLOG #2592: through the service, which leaves out a map that fails its integrity seal.
-        pairs = await service.list_ad_group_role_map()
+        # BACKLOG #2592: through the service, which leaves out a map that fails its integrity seal
+        # and refuses one Vault transit will not check.
+        with _ad_map_unverifiable_is_409():
+            pairs = await service.list_ad_group_role_map()
         return AdGroupMap(entries=[AdGroupMapEntry(ad_group=g, role=r) for g, r in pairs])
 
     @app.put("/ad-group-map", response_model=SimpleMessage)
@@ -1957,13 +2027,24 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 if r == Role.ADMINISTRATOR.value
             }
 
-        grants = any(e.role == Role.ADMINISTRATOR.value for e in body.entries)
-        before = await admin_groups() if grants else set()
-        await service.set_ad_group_map(
-            [(g, e.role) for g, e in zip(groups, body.entries, strict=True)],
-            actor=identity.username,
-        )
-        for group in sorted((await admin_groups() - before) if grants else set()):
+        requested_admin = {
+            g
+            for g, e in zip(groups, body.entries, strict=True)
+            if e.role == Role.ADMINISTRATOR.value
+        }
+        with _ad_map_unverifiable_is_409():
+            before = await admin_groups() if requested_admin else set()
+            await service.set_ad_group_map(
+                [(g, e.role) for g, e in zip(groups, body.entries, strict=True)],
+                actor=identity.username,
+            )
+        try:
+            after = await admin_groups() if requested_admin else set()
+        except (AdMapUnverifiableError, TransitSealUnavailableError):
+            # BACKLOG #2592: the save landed, but its read-back could not be checked, so every
+            # group it maps to Administrator pages rather than none.
+            after = requested_admin
+        for group in sorted(after - before):
             _alert_administrator_granted(
                 app, f"ad-group:{group}", via="ad_group_map", granted_by=identity.username
             )
@@ -1974,8 +2055,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_MANAGE)),
     ) -> AdGroupScopeMap:
-        # BACKLOG #2592: through the service, which leaves out a map that fails its integrity seal.
-        pairs = await service.list_ad_group_scope_map()
+        # BACKLOG #2592: as get_ad_group_map.
+        with _ad_map_unverifiable_is_409():
+            pairs = await service.list_ad_group_scope_map()
         return AdGroupScopeMap(entries=[AdGroupScopeEntry(ad_group=g, channel=c) for g, c in pairs])
 
     @app.put("/ad-group-scope-map", response_model=SimpleMessage)
@@ -1999,10 +2081,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> SimpleMessage:
         """The save past :func:`set_ad_group_scope_map`'s step-up, for the seam."""
         groups = _canonical_group_dns([e.ad_group for e in body.entries])
-        await service.set_ad_group_scope_map(
-            [(g, e.channel) for g, e in zip(groups, body.entries, strict=True)],
-            actor=identity.username,
-        )
+        with _ad_map_unverifiable_is_409():
+            await service.set_ad_group_scope_map(
+                [(g, e.channel) for g, e in zip(groups, body.entries, strict=True)],
+                actor=identity.username,
+            )
         return SimpleMessage(detail="ad-group scope map updated")
 
     # --- audit ---------------------------------------------------------------

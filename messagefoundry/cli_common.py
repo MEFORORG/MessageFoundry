@@ -43,6 +43,7 @@ def run_cli(
     *,
     configures_own_logging: frozenset[str] = frozenset(),
     floor_code: Callable[[argparse.Namespace], str | None] | None = None,
+    refusal_text: Callable[[Exception], str | None] | None = None,
 ) -> int:
     """Run one command line: harden, install the hooks, parse, dispatch, and return the exit code.
 
@@ -53,6 +54,9 @@ def run_cli(
     subcommands that install their own redacting root handler, so this shell gives them none.
     ``floor_code`` names the ``"code"`` the JSON error floor adds for a subcommand that promises one
     on every failure, or None for no code; the command, not this shared shell, knows which do.
+    ``refusal_text`` turns an exception the command knows to be an operator-facing refusal, not a
+    defect, into one ``error:`` line, or returns None for every other exception, which takes the
+    floor below. The command knows which those are; this shell imports no engine module.
     """
     # Every console entry point hardens its streams first (BACKLOG #1875), and a caller's main()
     # has usually done so already. Doing it here too costs nothing, because the call is idempotent,
@@ -152,12 +156,15 @@ def run_cli(
     try:
         return dispatch[args.command](args)
     except Exception as exc:
+        refused = refusal_text(exc) if refusal_text is not None else None
+        code = floor_code(args) if as_json and floor_code is not None else None
+        if refused is not None:
+            return _emit_error(refused, as_json=as_json, code=code)
         from messagefoundry.last_resort import report_uncaught
 
         text = report_uncaught(exc)
         if not as_json:
             return 1
-        code = floor_code(args) if floor_code is not None else None
         return _emit_error(text, as_json=True, code=code)
 
 

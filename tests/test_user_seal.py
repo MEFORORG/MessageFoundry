@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -93,7 +94,7 @@ async def test_the_contract_fails_when_the_service_checks_no_seal(
     import messagefoundry.auth.service as service_module
 
     store, path = keyed
-    monkeypatch.setattr(service_module, "user_seal_ok", lambda sealer, record: True)
+    monkeypatch.setattr(service_module, "user_seal_ok", AsyncMock(return_value=True))
     with pytest.raises(AssertionError):
         await assert_user_seal_contract(store, _raw_for(path))
 
@@ -581,5 +582,5 @@ async def test_a_record_that_fails_is_not_resealed_by_a_check(
     assert sealer is not None
     row = UserRow(**{f.name: _sample(f.type) for f in fields(UserRow)})
     record = UserAuthzRecord(row=row)
-    assert not user_seal_ok(sealer, record)
-    assert not user_seal_ok(sealer, record)
+    assert not await user_seal_ok(sealer, record)
+    assert not await user_seal_ok(sealer, record)

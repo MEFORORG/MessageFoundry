@@ -623,8 +623,10 @@ class AuditKeyVersionRefusedError(CipherError):
 
     The pinned version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
     So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
-    a walk that could not run. Transit also refuses a version its policy retires, so the break says
-    both."""
+    a walk that could not run. Transit also refuses a version its policy retires, and a version a
+    node that lags a rotation does not hold yet, and its reply cannot tell those apart from a
+    planted version, as :class:`RowSealUnverifiableError` says for a row seal. So the break says
+    all three, and a re-check against a node that holds the latest version is the first step."""
 
     def __init__(self, version: int) -> None:
         # The version alone in ``args``, so a copy or pickle rebuilds the same exception.
@@ -633,9 +635,34 @@ class AuditKeyVersionRefusedError(CipherError):
 
     def __str__(self) -> str:
         return (
-            f"Transit refused audit key version {self.version}: the key does not hold it, or its "
-            "policy retires it"
+            f"Transit refused audit key version {self.version}: its reply cannot tell a retired "
+            "version from a planted one or from a Vault node that lags a rotation"
         )
+
+
+class RowSealUnverifiableError(CipherError):
+    """Transit refused to check a well-formed row seal (HTTP 400) while its key still answers
+    (BACKLOG #2592).
+
+    Transit answers a wrong MAC under a version it holds with ``valid: false``, so this is not
+    that. It is a seal naming a version Transit will not check: one below the key's
+    ``min_decryption_version``, one newer than the Vault node that answered holds, or a planted
+    version. The reply cannot tell those apart, so the sealer denies, and its callers treat the
+    row as they treat a failed seal, under their own audit action. Its text, ``str()``, is fixed,
+    never row data or Vault's text; its ``args``, and so its ``repr()``, carry ``probe_mac``, which
+    is Transit's MAC over the probe's fixed input and holds no row data.
+
+    ``probe_mac`` is the key probe's own MAC, which names the latest version the node that answered
+    the probe holds. The sealer classifies by no version, since the refusal and the probe can
+    reach different nodes; a change in it only empties the sealer's cache."""
+
+    def __init__(self, probe_mac: str) -> None:
+        # Passed on, so ``args`` rebuilds the error: copy and pickle call ``cls(*args)``.
+        super().__init__(probe_mac)
+        self.probe_mac = probe_mac
+
+    def __str__(self) -> str:
+        return "Transit refused to check a well-formed row seal while its key still answers"
 
 
 class StoreKeylessError(RuntimeError):

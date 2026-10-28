@@ -16,6 +16,7 @@ import time
 import urllib.parse
 from dataclasses import replace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -450,7 +451,7 @@ async def test_a_refused_step_up_carries_the_marker_only_when_the_exemption_appl
             ldap: Any = service._ldap
             ldap._principal = replace(ldap._principal, groups=frozenset())
         elif refusal == DIRECTORY_ROLE_MAP_UNSEALED:
-            monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+            monkeypatch.setattr(service_module, "ad_map_seal_ok", AsyncMock(return_value=False))
         else:
             claims["sub"] = "S-1-5-21-someone-else"
         flow_id, _url = await _begin(service, token)

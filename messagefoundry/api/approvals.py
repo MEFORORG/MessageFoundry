@@ -61,7 +61,7 @@ from messagefoundry.api.models import ReleaseBlocked
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
-from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
+from messagefoundry.auth.service import seal_report_text
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, authority_seal_alert
@@ -71,6 +71,8 @@ from messagefoundry.store.row_seal import (
     APPROVAL_KIND,
     RowSealError,
     SealFailureThrottle,
+    TransitSealUnverifiableError,
+    alert_unverifiable_row,
 )
 from messagefoundry.store.store import ApprovalRow, AuditAppend, approval_seal_ok
 
@@ -564,10 +566,10 @@ class ApprovalGate:
                     from_status="executing",
                     audit=AuditAppend("approval.interrupted", actor="system", detail=detail),
                 )
-            except RowSealError:
+            except RowSealError as refused:
                 # Changed outside the store between the read and the move. Nothing re-seals it,
                 # so no later start can move it either (BACKLOG #2592).
-                await self._approval_seal_failed(approval_id)
+                await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
                 continue
             except Exception:  # noqa: BLE001 - every store backend raises its own type
                 log.exception(
@@ -1306,7 +1308,7 @@ class ApprovalGate:
             # The row changed outside the store after it was read, and the store refused the claim
             # (BACKLOG #2592). Nothing ran, and nothing was written. The cause carries the row kind
             # only, never a value.
-            await self._approval_seal_failed(approval_id)
+            await self._approval_seal_failed(approval_id, unverifiable=exc.unverifiable)
             raise ApprovalError(409, _SEAL_REFUSAL) from exc
         except asyncio.CancelledError:
             # Cancelled while claiming. The UPDATE can still commit, and the row would then sit in
@@ -1516,11 +1518,11 @@ class ApprovalGate:
                 from_status="executing",
                 audit=combined,
             )
-        except RowSealError:
+        except RowSealError as refused:
             # The claimed row changed outside the store while the operation ran (BACKLOG #2592).
             # The store wrote nothing and will refuse the status alone too, so the row stays
             # 'executing'. The outcome row below is the record of what happened.
-            await self._approval_seal_failed(approval_id)
+            await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
             moved = None
         except Exception:  # noqa: BLE001 - the outcome stands; see the docstring
             log.exception(
@@ -1581,8 +1583,8 @@ class ApprovalGate:
                 decided_at=self._clock(),
                 from_status="executing",
             )
-        except RowSealError:
-            await self._approval_seal_failed(approval_id)
+        except RowSealError as refused:
+            await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
             return None
         except Exception:  # noqa: BLE001 - the caller's outcome stands either way
             log.exception(
@@ -1610,10 +1612,10 @@ class ApprovalGate:
         it did not commit, the row is still ``pending`` and there is nothing to settle."""
         try:
             claimed = await claim
-        except RowSealError:
+        except RowSealError as refused:
             # The store refused the claim and wrote nothing (BACKLOG #2592), so no audit row was
             # lost: report the failed seal, as the uncancelled path does.
-            await self._approval_seal_failed(approval_id)
+            await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
             return
         except Exception:  # noqa: BLE001 - the caller's cancellation is re-raised either way
             # "Most likely": a COMMIT can land with its reply lost, and then the row and its
@@ -2180,7 +2182,7 @@ class ApprovalGate:
         except RowSealError as exc:
             # The row changed outside the store after it was read (BACKLOG #2592). The store wrote
             # nothing, so the audit row was not lost: this is a refusal, not a fault.
-            await self._approval_seal_failed(approval_id)
+            await self._approval_seal_failed(approval_id, unverifiable=exc.unverifiable)
             raise ApprovalError(409, _SEAL_REFUSAL) from exc
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
             raise self._store_fault(
@@ -2263,36 +2265,47 @@ class ApprovalGate:
         except RowSealError:
             await self._approval_seal_failed(str(found["id"]))
             return None
-        if approval_seal_ok(self._store.row_sealer(), row):
+        try:
+            holds = await approval_seal_ok(self._store.row_sealer(), row)
+        except TransitSealUnverifiableError:
+            # Vault transit refused to check the seal: skipped and reported as a failed seal is,
+            # under its own audit action, rather than aborting the read.
+            await self._approval_seal_failed(row.id, unverifiable=True)
+            return None
+        if holds:
             return row
         await self._approval_seal_failed(row.id)
         return None
 
-    async def _approval_seal_failed(self, approval_id: str) -> None:
+    async def _approval_seal_failed(self, approval_id: str, *, unverifiable: bool = False) -> None:
         """Report a request whose row failed its integrity seal (BACKLOG #2592): a WARNING, an
         ``integrity.authority_seal_failed`` audit row and an ``integrity_drift`` alert, at most once
         per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` per request, as the auth service reports
-        the rows it checks. The report names the request by its id, never a row value. A failed
-        audit write is logged and paged, not raised, so it does not turn a refusal into an error."""
-        if not self._seal_failures_reported.due(approval_id):
+        the rows it checks. With ``unverifiable``, a seal Vault transit refused to check, the audit
+        action is ``integrity.authority_seal_unverifiable`` and the page, still per request, goes
+        through the sealer under its unverifiable subject. The report
+        names the request by its id, never a row value. A failed audit write is logged and paged,
+        not raised, so it does not turn a refusal into an error."""
+        action, verb, throttle_key = seal_report_text(unverifiable, approval_id)
+        if not self._seal_failures_reported.due(throttle_key):
             return
         # The id comes from the row that failed, so it is scrubbed before it reaches a log line or
         # an alert (CodeQL py/log-injection).
         ref = scrub_log_argument(approval_id)
-        reason = (
-            f"an {APPROVAL_KIND} request failed its integrity check and acts on nothing"
-            f" (approval {ref})"
-        )
+        reason = f"an {APPROVAL_KIND} request {verb} and acts on nothing (approval {ref})"
         log.warning("%s", reason)
         await self._record_audit_soft(
             ref,
-            AUTHORITY_SEAL_FAILED_ACTION,
+            action,
             actor="system",
             detail=json.dumps({"kind": APPROVAL_KIND, "approval_id": approval_id}),
             client=None,
-            context="a request failed its integrity seal",
+            context=f"a request {verb}",
         )
-        authority_seal_alert(self._alert_sink)(reason)
+        if unverifiable:  # per request too, but under the sealer's unverifiable subject
+            alert_unverifiable_row(self._store.row_sealer(), f"{APPROVAL_KIND}:{ref}", reason)
+        else:
+            authority_seal_alert(self._alert_sink)(reason)
 
     def _label(self, operation: str) -> str:
         op = self._ops.get(operation)

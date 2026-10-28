@@ -2285,13 +2285,14 @@ async def test_an_unanswered_account_is_marked_by_a_pass_that_raises_after_its_p
         async def _refused(name: str) -> Any:
             raise RuntimeError("synthetic: store read refused")
 
-        healthy = service._ad_map
-        service._ad_map = _refused  # type: ignore[method-assign]
+        # The pass reads its maps through this loader (BACKLOG #2592).
+        healthy = service._ad_map_unless_unverifiable
+        service._ad_map_unless_unverifiable = _refused  # type: ignore[method-assign]
         try:
             with pytest.raises(RuntimeError, match="store read refused"):
                 await _sampled_pass(service, ids, {"alice", "cdoe"})
         finally:
-            service._ad_map = healthy  # type: ignore[method-assign]
+            service._ad_map_unless_unverifiable = healthy  # type: ignore[method-assign]
         assert service._reconcile_unanswered == {ids["cdoe"]}
 
         missed = await _sampled_pass(service, ids, {"alice", "bwong"})

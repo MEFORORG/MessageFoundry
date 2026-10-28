@@ -544,8 +544,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2592: row integrity seals. hmac = HMAC-SHA256 over a typed row encoding under a key
     # derived (HKDF, through the store.crypto seam) from the store key's authorization root; hashlib =
     # the SHA-256 the HMAC runs over; compare_digest for the constant-time verify.
+    # Under vault_transit (ADR-draft decision D14) the seal is Transit's own HMAC, through the
+    # Transit cipher (store.crypto_transit), which row_seal imports lazily to pick that sealer.
     "messagefoundry/store/row_seal.py": frozenset(
-        {"hashlib", "hmac", "messagefoundry.store.crypto"}
+        {"hashlib", "hmac", "messagefoundry.store.crypto", "messagefoundry.store.crypto_transit"}
     ),
     # BACKLOG #2593: builds the AES-GCM associated data a queue payload cell is sealed under (the
     # row's routing fields) and opens the cell through the store cipher seam. No key of its own.
@@ -1076,6 +1078,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
+    # BACKLOG #2592: the approval gate checks each dual-control request's integrity seal
+    # (store.approval_seal_ok) before it acts on the request.
+    "messagefoundry/api/approvals.py": frozenset({"sign_verify:via messagefoundry.store.store"}),
     "messagefoundry/api/security.py": frozenset(
         {"key_cert:via messagefoundry.pipeline.cert_expiry"}
     ),
@@ -1471,19 +1476,30 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt_data()",
             "cipher:.encrypt_data()",
             "mac:.generate_hmac()",
+            # BACKLOG #2592 (ADR-draft decision D14): Transit's verify call checks a row seal's
+            # HMAC inside Vault, at the key version the stored seal names. A MAC check.
+            "sign_verify:.verify_signed_data()",
             "tls_context:via messagefoundry.store.keyprovider_vault",
         }
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"csprng:via messagefoundry.store.crypto"}),
     # BACKLOG #2592: HMAC-SHA256 row seals and their constant-time verify, under a key the
-    # store.crypto seam derives (HKDF) and names by a SHA-256 digest.
+    # store.crypto seam derives (HKDF) and names by a SHA-256 digest. The awaited forms call the
+    # synchronous check (RowSealer.verify). Under vault_transit the MAC and its check run inside
+    # Transit; hashlib.sha256 names the Transit key (the key id) and keys the cache of successful
+    # checks, both non-secret digests.
     "messagefoundry/store/row_seal.py": frozenset(
         {
             "compare:hmac.compare_digest",
+            "hash:hashlib.sha256",
+            "sign_verify:.verify()",
+            "sign_verify:.verify_async()",
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
+            # BACKLOG #2592: the Transit start probe seals fixed input through Transit's HMAC.
+            "mac:.seal_async()",
         }
     ),
     # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the
@@ -1574,8 +1590,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
-            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
-            "sign_verify:.verify()",
+            # BACKLOG #2592: the seal helpers seal and check identity and authorization rows
+            # through the awaited sealer forms (store.row_seal), under a local key or in Transit.
+            "mac:.seal_async()",
+            "sign_verify:.verify_async()",
+            "sign_verify:.verify_held_async()",
         }
     ),
     # BACKLOG #1352 / #1171: the generic dialect checks a driver client key's wrap (libpq sslkey)

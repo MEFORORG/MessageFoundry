@@ -142,12 +142,14 @@ async def assert_approval_seal_contract(store: Any, raw: RawSql) -> None:
     # --- a request the gate filed carries a seal, is listed, and releases ----------------------
     good = await h.request()
     row = await h.row(good)
-    assert row.seal.startswith(SEAL_PREFIX) and approval_seal_ok(sealer, row)
+    assert row.seal.startswith(SEAL_PREFIX) and await approval_seal_ok(sealer, row)
     assert await h.listed(good)
     released = await h.approve(good)
     assert released["result"] == {"ran": True} and len(h.runs) == 1
     settled = await h.row(good)
-    assert settled.status == "approved" and approval_seal_ok(sealer, settled)  # each move re-seals
+    assert settled.status == "approved" and await approval_seal_ok(
+        sealer, settled
+    )  # each move re-seals
     assert h.alerted(good) == 0 and await h.seal_failures(good) == 0  # control
 
     # --- held params changed outside the store run nothing, and the row is not re-sealed -------
@@ -228,7 +230,7 @@ async def assert_approval_seal_contract(store: Any, raw: RawSql) -> None:
         is None
     )
     fresh = await repeat()
-    assert fresh != first and approval_seal_ok(sealer, await h.row(fresh))
+    assert fresh != first and await approval_seal_ok(sealer, await h.row(fresh))
     assert await repeat() == fresh  # and the new request is the one later repeats join
 
     # --- the store's own move refuses a row that fails, and does not re-seal it ----------------
@@ -236,7 +238,7 @@ async def assert_approval_seal_contract(store: Any, raw: RawSql) -> None:
     assert await store.decide_pending_approval(  # control: an untouched row moves, re-sealed
         moved, status="rejected", approver=_APPROVER, decided_at=time.time()
     )
-    assert approval_seal_ok(sealer, await h.row(moved))
+    assert await approval_seal_ok(sealer, await h.row(moved))
     tampered = await h.request()
     await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"x": 1}', tampered))
     before = await h.row(tampered)

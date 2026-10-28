@@ -29,7 +29,7 @@ _FIELDS = (("token_hash", "a" * 64), ("user_id", "u1"), ("created_at", 1.5), ("r
 
 def _sealer(key_b64: str | None = None) -> RowSealer:
     sealer = RowSealer.for_cipher(make_cipher(key_b64 or generate_key()))
-    assert sealer is not None
+    assert isinstance(sealer, RowSealer)
     return sealer
 
 
@@ -146,7 +146,7 @@ def test_a_retired_key_seal_is_recognised_but_never_accepted() -> None:
     old, new = generate_key(), generate_key()
     stored = _sealer(old).seal("session", _FIELDS)
     rekeyed = RowSealer.for_cipher(make_cipher(new, [old]))
-    assert rekeyed is not None
+    assert isinstance(rekeyed, RowSealer)
     assert not rekeyed.verify("session", _FIELDS, stored)
     assert rekeyed.sealed_by_retired_key("session", _FIELDS, stored)
     # Controls: a changed row, or a key the cipher never held, is not a key change.

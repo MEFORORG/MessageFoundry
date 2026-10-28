@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -416,7 +417,7 @@ async def test_a_role_map_that_fails_its_seal_is_not_called_a_demotion(
     # failed directly, as tests/test_role_seal.py does.
     from messagefoundry.auth import service as service_module
 
-    monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+    monkeypatch.setattr(service_module, "ad_map_seal_ok", AsyncMock(return_value=False))
     assert await e.service._ad_roles_for_groups([_OPERATORS]) == set(), "control: it fails"
 
     refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))

@@ -75,7 +75,7 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
     # --- a role the service wrote carries a seal and grants what it says -----------------------
     replay = await _role(h, "contract-replay", ["messages:replay"])
     assert (await _role_row(store, replay)).seal.startswith(SEAL_PREFIX)
-    assert role_seal_ok(sealer, await _role_row(store, replay))
+    assert await role_seal_ok(sealer, await _role_row(store, replay))
     holder = await h.account("role-holder", roles=(Role.VIEWER.value, replay))
     token = await h.token(holder)
     before = await h.service.identity_for_token(token)
@@ -83,7 +83,7 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
     assert not before.has(Permission.AUDIT_READ)
     assert h.alerts == []  # control: a sealed role raises nothing
     # The built-in rows are sealed too, by the role seed; they resolve from code either way.
-    assert role_seal_ok(sealer, await _role_row(store, Role.ADMINISTRATOR.value))
+    assert await role_seal_ok(sealer, await _role_row(store, Role.ADMINISTRATOR.value))
 
     # --- a permission set widened outside the store grants nothing, and is reported ------------
     await raw(
@@ -107,7 +107,7 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
         permissions=["messages:replay", "audit:read"],
         actor="contract",
     )
-    assert role_seal_ok(sealer, await _role_row(store, replay))
+    assert await role_seal_ok(sealer, await _role_row(store, replay))
     repaired = await h.service.identity_for_token(await h.token(holder))
     assert repaired is not None and repaired.has(Permission.AUDIT_READ)
     assert await _listed_permissions(h, replay) == frozenset(
@@ -160,7 +160,7 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
     # --- the AD group-to-role map: the store's own write seals it and it grants ---------------
     await store.set_ad_group_role_map([(_GROUP.upper(), Role.VIEWER.value)])
     current = await store.get_ad_map(AD_ROLE_MAP)
-    assert current.seal.startswith(SEAL_PREFIX) and ad_map_seal_ok(sealer, current)
+    assert current.seal.startswith(SEAL_PREFIX) and await ad_map_seal_ok(sealer, current)
     assert await h.service._ad_roles_for_groups([_GROUP]) == {Role.VIEWER.value}
     alerts_before_map = len(h.alerts)
 
@@ -210,7 +210,7 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
     )
     await h.service.delete_custom_role(mapped, actor="contract")
     kept = await store.get_ad_map(AD_ROLE_MAP)
-    assert ad_map_seal_ok(sealer, kept)  # control: re-sealed without the deleted role
+    assert await ad_map_seal_ok(sealer, kept)  # control: re-sealed without the deleted role
     assert kept.pairs == ((_GROUP, Role.VIEWER.value), (_OTHER_GROUP, Role.OPERATOR.value))
     assert await h.service._ad_roles_for_groups([_OTHER_GROUP]) == {Role.OPERATOR.value}
     doomed = await _role(h, "contract-doomed", ["messages:replay"])
@@ -222,13 +222,13 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
     await h.service.delete_custom_role(doomed, actor="contract")
     left = await store.get_ad_map(AD_ROLE_MAP)
     assert doomed not in {r for _, r in left.pairs}  # the role's own pairs are gone
-    assert not ad_map_seal_ok(sealer, left)  # and the planted pair was not sealed in
+    assert not await ad_map_seal_ok(sealer, left)  # and the planted pair was not sealed in
     assert await h.service._ad_roles_for_groups([_OTHER_GROUP]) == set()
 
     # --- the AD group-to-channel map: the store's own write seals it and it scopes -------------
     await store.set_ad_group_scope_map([(_GROUP.upper(), " IB_A ")])
     scope = await store.get_ad_map(AD_SCOPE_MAP)
-    assert scope.seal.startswith(SEAL_PREFIX) and ad_map_seal_ok(sealer, scope)
+    assert scope.seal.startswith(SEAL_PREFIX) and await ad_map_seal_ok(sealer, scope)
     assert scope.pairs == ((_GROUP, "IB_A"),)
     assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset({"IB_A"})
     assert await h.service.list_ad_group_scope_map() == [(_GROUP, "IB_A")]
@@ -274,7 +274,7 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
     await store.set_ad_group_role_map([(_GROUP, Role.VIEWER.value)])
     await store.set_ad_group_scope_map([(_GROUP, Role.VIEWER.value)])
     role_map = await store.get_ad_map(AD_ROLE_MAP)
-    assert ad_map_seal_ok(sealer, role_map)
+    assert await ad_map_seal_ok(sealer, role_map)
     assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset({Role.VIEWER.value})
     await raw("UPDATE authority_set_seal SET seal=? WHERE name=?", (role_map.seal, AD_SCOPE_MAP))
     assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset()

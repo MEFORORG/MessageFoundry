@@ -160,10 +160,13 @@ from messagefoundry.store.row_seal import (
     ADSET_KIND,
     ROLE_KIND,
     SESSION_KIND,
+    SESSION_REF_LEN,
     USER_KIND,
-    RowSealer,
     RowSealError,
+    Sealer,
     SealFailureThrottle,
+    TransitSealUnverifiableError,
+    alert_unverifiable_row,
 )
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
@@ -937,6 +940,14 @@ DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 #: roles from the same failing map, and the fix is an administrator re-saving the map (BACKLOG
 #: #3082). Audited beside :data:`DIRECTORY_UNCONFIRMED`.
 DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
+
+#: The ``auth.login_failed`` reason for a directory sign-in refused because Vault transit refused to
+#: check the seal of an AD map that sign-in writes from (BACKLOG #2592): the group-to-role map, or,
+#: for an account that is not an Administrator, the group-to-channel map. Refused rather than
+#: signed in with nothing, because a write from a map read as empty would replace the account's
+#: genuine roles or scope while Vault may only lag a rotation. Nothing is written; the map's own
+#: seal report pages, per map.
+DIRECTORY_MAP_UNVERIFIABLE = "directory_map_unverifiable"
 
 
 class DirectoryRefusal(Enum):
@@ -2971,9 +2982,101 @@ def oidc_client_auth_from_settings(
 
 #: The audit action written when an authority row fails its integrity seal (BACKLOG #2592).
 AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
-#: How much of a session's token hash a log line, audit row or alert names. Twelve hex characters, as
-#: the ``auth.session_revoked`` rows already record.
-_SESSION_REF_LEN: Final = 12
+#: The audit action written when Vault transit refused to check an authority row's well-formed seal
+#: (BACKLOG #2592). The row is treated as a failed seal, under its own action, because the reply
+#: cannot tell a retired or lagging key version from a planted one.
+AUTHORITY_SEAL_UNVERIFIABLE_ACTION: Final = "integrity.authority_seal_unverifiable"
+
+
+async def _unless_unverifiable(check: Awaitable[bool]) -> bool | None:
+    """``check``'s answer, or ``None`` when Vault transit refused to check a well-formed seal
+    (:class:`~messagefoundry.store.row_seal.TransitSealUnverifiableError`, BACKLOG #2592). A
+    caller treats ``None`` as a failed seal, reported under
+    :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION`, and a scan skips the row rather than aborting. Any
+    other refusal, an outage included, still propagates."""
+    try:
+        return await check
+    except TransitSealUnverifiableError:
+        return None
+
+
+#: The first step of every unverifiable-seal recovery text (BACKLOG #2592). Transit's refusal cannot
+#: tell a lagging node from a retired version, so the transient cause is ruled out before any act
+#: that would replace or destroy a row that may be genuine. docs/PHI.md states the procedure.
+UNVERIFIABLE_RECOVERY: Final = (
+    "This may be transient: first check that Vault is healthy and that every Vault node holds the"
+    " audit key's latest version, then retry."
+)
+
+
+class CustomRoleUnverifiableError(Exception):
+    """An edit of a custom role whose stored seal Vault transit refused to check (BACKLOG #2592).
+
+    Refused rather than saved: the role is listed with no permissions, so a re-save would replace
+    what it may genuinely hold. The text names the recovery, and nothing from the row."""
+
+    def __str__(self) -> str:
+        # Fixed text rather than an ``__init__`` argument, so ``cls(*args)`` rebuilds it: copy and
+        # pickle call that.
+        return (
+            "this custom role's stored integrity seal cannot be verified by Vault transit, so it"
+            " was not saved: a save would replace the permissions it may still hold."
+            f" {UNVERIFIABLE_RECOVERY} Only if the role was sealed under a key version the audit"
+            " key's min_decryption_version has retired, lower that minimum until the role"
+            " verifies and save it again, which re-seals it; deleting the role and creating it"
+            " again is the last resort"
+        )
+
+
+class AdMapUnverifiableError(Exception):
+    """A read for editing, or a replacement, of an AD directory map whose stored seal Vault transit
+    refused to check (BACKLOG #2592), as :class:`CustomRoleUnverifiableError` is for a role.
+
+    Refused rather than listed empty: an administrator saving from an empty listing would replace
+    pairs the map may genuinely hold. A role or channel decision never raises it: one that writes
+    nothing reads the map as granting nothing, and a sign-in or reconcile pass that writes from it
+    holds instead. The text names the recovery, and nothing from the map."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)  # so ``args`` rebuilds it, for copy and pickle
+        self.name = name
+
+    def __str__(self) -> str:
+        return (
+            f"the {self.name}'s stored integrity seal cannot be verified by Vault transit, so it"
+            " cannot be listed or replaced: an edit would overwrite the pairs it may still hold."
+            f" {UNVERIFIABLE_RECOVERY} Only if the map was sealed under a key version the audit"
+            " key's min_decryption_version has retired, lower that minimum until the map verifies"
+            " and save it again, which re-seals it; clearing the map by saving it with no entries"
+            " (PUT /ad-group-map or /ad-group-scope-map) and entering its pairs again is the last"
+            " resort"
+        )
+
+
+class SealReport(NamedTuple):
+    """What one seal report writes: its audit action, its verb phrase and its throttle key."""
+
+    action: str
+    verb: str
+    throttle_key: str
+
+
+def seal_report_text(unverifiable: bool, key: str = "") -> SealReport:
+    """The report for a failed seal, or with ``unverifiable`` for one Transit refused to check
+    (BACKLOG #2592). The throttle key keeps the two apart for the same row ``key``."""
+    if unverifiable:
+        return SealReport(
+            AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
+            "could not be verified by Vault transit",
+            f"unverifiable:{key}",
+        )
+    return SealReport(AUTHORITY_SEAL_FAILED_ACTION, "failed its integrity check", key)
+
+
+#: How much of a session's token hash a log line, audit row or alert names: the store's own
+#: :data:`~messagefoundry.store.row_seal.SESSION_REF_LEN`, so a session's page subject is one
+#: whichever of the service or the store's write helper reports it (BACKLOG #2592).
+_SESSION_REF_LEN: Final = SESSION_REF_LEN
 #: Vault BACKLOG #3229: the row written when a directory-driven role change (the sign-in role sync
 #: or the reconciler) leaves no enabled Administrator. Its actor is the demoted account and its
 #: detail is ``{"via": ...}``, the role write's ``assigned_by``: ``ad-sync`` or ``ad-reconcile``.
@@ -6794,7 +6897,24 @@ class AuthService:
                 principal.username, "oidc", reason, client=client, extra=refusal_extra
             )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=reason)
-        role_ids = sorted(await self._ad_roles_for_groups(principal.groups))
+        # BACKLOG #2592. Both maps are read before anything is written. A map Vault transit refused
+        # to check refuses the sign-in: read as empty, it would strip the account's genuine roles
+        # or scope while Vault may only lag a rotation. A map that FAILS its seal still reads as
+        # empty and grants nothing, as before. The scope map is not read for an Administrator,
+        # whose groups the scope decision ignores.
+        role_map = await self._ad_map_unless_unverifiable(AD_ROLE_MAP)
+        role_ids = [] if role_map is None else sorted(role_map.values_for(principal.groups))
+        ad_roles = _roles_from_ids(role_ids)
+        administrator = Role.ADMINISTRATOR in ad_roles
+        scope_map = (
+            AdMap(AD_SCOPE_MAP)
+            if administrator or role_map is None
+            else await self._ad_map_unless_unverifiable(AD_SCOPE_MAP)
+        )
+        if role_map is None or scope_map is None:
+            return await self._refuse_directory_row(
+                principal.username, DIRECTORY_MAP_UNVERIFIABLE, client=client, extra=refusal_extra
+            )
         previous = set(user.role_ids)
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
         # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a sync that takes
@@ -6831,9 +6951,14 @@ class AuthService:
                 client=client,
                 detail={"roles": role_ids, "source": "directory"},
             )
-        ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
-        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups, client=client)
+        user = await self._sync_ad_channel_scope(
+            user,
+            ad_roles,
+            principal.groups,
+            mapped=frozenset(scope_map.values_for(principal.groups)),
+            client=client,
+        )
         identity = Identity.build(
             user_id=user.id,
             username=user.username,
@@ -6976,6 +7101,7 @@ class AuthService:
         roles: frozenset[Role],
         groups: Iterable[str],
         *,
+        mapped: frozenset[str] | None = None,
         client: str | None = None,
     ) -> VerifiedUser:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
@@ -6989,14 +7115,22 @@ class AuthService:
 
         History worth keeping: before BACKLOG #1927 this path returned early for every no-match
         login, so a user removed from their last scope-mapped group kept the directory's channels
-        for as long as the account existed."""
+        for as long as the account existed.
+
+        ``mapped``, when given, is what the group-to-channel map gives ``groups``, read by a caller
+        that checked the map before its role write (BACKLOG #2592); otherwise it is read here."""
         administrator = Role.ADMINISTRATOR in roles
+        if administrator:
+            mapped = (
+                frozenset()
+            )  # an administrator's groups are not read: the decision ignores them
+        elif mapped is None:
+            mapped = await self._ad_channels_for_groups(groups)
         decision = channel_scope.decide_ad_channel_scope(
             channel_scope.ScopeInput(
                 stored_scope=user.channel_scope,
                 stored_source=user.channel_scope_source,
-                # An administrator's groups are not read: the decision ignores them.
-                mapped=frozenset() if administrator else await self._ad_channels_for_groups(groups),
+                mapped=mapped,
                 administrator=administrator,
             )
         )
@@ -7943,11 +8077,21 @@ class AuthService:
         target_roles: dict[str, frozenset[str]] = {}
         scopes: dict[str, channel_scope.ScopeInput] = {}
         # Both directory maps read once for the pass, each through its seal check (BACKLOG #2592),
-        # so every account in the pass is judged against one version of each map.
-        role_map = await self._ad_map(AD_ROLE_MAP)
-        scope_map = await self._ad_map(AD_SCOPE_MAP)
+        # so every account in the pass is judged against one version of each map. A map Vault
+        # transit refused to check is None, reported once for the pass, and its diff is HELD for
+        # every account: judged against an empty map, it would revoke for a role or scope change
+        # the directory never made. An unverifiable role map holds the scope diff too, since the
+        # Administrator short-circuit reads the target roles. An absent or disabled account is
+        # still judged on its probe.
+        role_map = await self._ad_map_unless_unverifiable(AD_ROLE_MAP)
+        # Not read when the role map holds every diff anyway.
+        scope_map = (
+            None if role_map is None else await self._ad_map_unless_unverifiable(AD_SCOPE_MAP)
+        )
         for probe in probes:
-            if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
+            if probe.outcome is not reconcile.ProbeOutcome.PRESENT or role_map is None:
+                # plan_pass reads an account missing from both as no role change and no scope
+                # input.
                 continue
             # RE-READ, after the probes, the roles and the row alike. The row listed at the top of
             # the pass can be up to a whole pass of LDAP round trips old, and a login that landed
@@ -7964,6 +8108,8 @@ class AuthService:
             # The TARGET roles decide the Administrator short-circuit, as they do at login, which
             # decides with the roles it is about to write.
             administrator = Role.ADMINISTRATOR.value in target
+            if scope_map is None:
+                continue  # the scope diff is held; the role diff still runs
             scopes[probe.user_id] = channel_scope.ScopeInput(
                 stored_scope=row.channel_scope,
                 stored_source=row.channel_scope_source,
@@ -9885,8 +10031,8 @@ class AuthService:
                 rotated = await self._store.rotate_session(
                     old_hash, new_token_hash=hash_token(new_token)
                 )
-            except RowSealError:  # BACKLOG #2592: the row failed its seal; nothing was written
-                await self._session_seal_failed(old_hash)
+            except RowSealError as refused:  # BACKLOG #2592: nothing was written
+                await self._session_seal_failed(old_hash, unverifiable=refused.unverifiable)
                 return None
             except _session_write_errors() as exc:
                 raise _RotationStoreError(
@@ -10138,25 +10284,34 @@ class AuthService:
             return None
         return session
 
-    async def _session_row_holds(self, session: SessionRecord, sealer: RowSealer | None) -> bool:
+    async def _session_row_holds(self, session: SessionRecord, sealer: Sealer | None) -> bool:
         """Whether an unrevoked session row's seal verifies; a row that fails is handed to
-        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592)."""
-        if session_seal_ok(sealer, session):
+        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592). So is a seal Vault transit
+        refused to check (:func:`_unless_unverifiable`), reported under its own audit action."""
+        held = await _unless_unverifiable(session_seal_ok(sealer, session))
+        if held:
             return True
+        if held is None:
+            await self._session_seal_failed(session.token_hash, unverifiable=True)
+            return False
         await self._session_seal_failed(
             session.token_hash, key_changed=session_sealed_by_retired_key(sealer, session)
         )
         return False
 
-    async def _session_seal_failed(self, token_hash: str, *, key_changed: bool = False) -> None:
+    async def _session_seal_failed(
+        self, token_hash: str, *, key_changed: bool = False, unverifiable: bool = False
+    ) -> None:
         """End a session row that failed its integrity seal, and report it (BACKLOG #2592).
 
         The row is revoked, which blanks its seal and needs no key, so the next presentation is
         refused quietly as a revoked row. With ``key_changed`` the row carries a genuine seal made
         under a retired store key: the store key changed without ``rotate-key`` ending the sessions,
         so it is logged at INFO and nothing more. Otherwise it is an integrity failure: a WARNING,
-        an :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row and an ``integrity_drift`` alert. The
-        caller denies; the engine keeps running.
+        an :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row and an ``integrity_drift`` alert. With
+        ``unverifiable`` Vault transit refused to check the seal: the row is ended and reported the
+        same way, under :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION`. The caller denies; the engine
+        keeps running.
 
         Reports are rate-limited per row, once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`,
         for a row the revoke could not end. Each names the row by a short prefix of its token hash,
@@ -10175,30 +10330,45 @@ class AuthService:
             )
             return
         await self._report_seal_failure(
-            ref,
-            f"a {SESSION_KIND} row failed its integrity check and was ended (session {ref})",
+            f"{SESSION_KIND}:{ref}",
+            f"a {SESSION_KIND} row {seal_report_text(unverifiable).verb} and was ended"
+            f" (session {ref})",
             {"kind": SESSION_KIND, "session": ref},
+            unverifiable=unverifiable,
         )
 
-    async def _report_seal_failure(self, key: str, reason: str, detail: dict[str, str]) -> None:
+    async def _report_seal_failure(
+        self, key: str, reason: str, detail: dict[str, str], *, unverifiable: bool = False
+    ) -> None:
         """Report one authority row that failed its integrity seal (BACKLOG #2592): a WARNING, an
         :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row carrying ``detail``, and an
         ``integrity_drift`` alert, at most once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`
-        per ``key``. ``reason`` and ``detail`` name the row by an id, never a row value. A store
-        refusal of the audit write is logged, not raised, so it does not turn a denial into an
-        error."""
-        if not self._seal_failures_reported.due(key):
+        per ``key``, the row's kind and id. With ``unverifiable``, a seal Vault transit refused to
+        check, the audit row is :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION`, the throttle key is its
+        own, and the page goes through the sealer under the unverifiable subject with ``key``
+        appended, so a sink's per-subject throttle is per row. Neither page is sent when the
+        service was built with no ``integrity_alert``. ``reason`` and ``detail`` name the row by an
+        id, never a row value. A store refusal of the audit write is logged, not raised, so it does
+        not turn a denial into an error."""
+        action, _verb, throttle_key = seal_report_text(unverifiable, key)
+        if not self._seal_failures_reported.due(throttle_key):
             return
         _log.warning("%s", reason)
         await write_audit_soft(
-            lambda: self._audit(AUTHORITY_SEAL_FAILED_ACTION, detail=_json(detail)),
+            lambda: self._audit(action, detail=_json(detail)),
             log=_log,
             message="the %s audit row for a refused authority row could not be written",
-            args=(AUTHORITY_SEAL_FAILED_ACTION,),
+            args=(action,),
             errors=audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
         )
-        if self._integrity_alert is not None:
+        if self._integrity_alert is None:
+            return
+        # An unverifiable seal pages per row too, since a planted version reads as one, but under
+        # its own subject, so a flood of them after a minimum is raised never mutes a forgery's.
+        if unverifiable:
+            alert_unverifiable_row(self._store.row_sealer(), key, reason)
+        else:
             self._integrity_alert(reason)
 
     @asynccontextmanager
@@ -10212,9 +10382,11 @@ class AuthService:
         outcome = _StampOutcome()
         try:
             yield outcome
-        except RowSealError:
+        except RowSealError as refused:
             outcome.refused = True
-            await self._session_seal_failed(token_hash)
+            # Under the refusal's own cause: one Vault transit would not check is not a
+            # forgery, and is filed as unverifiable (BACKLOG #2592).
+            await self._session_seal_failed(token_hash, unverifiable=refused.unverifiable)
 
     # --- the user loader (BACKLOG #2592) -----------------------------------------------------------
 
@@ -10293,7 +10465,16 @@ class AuthService:
         for attempt in range(2):
             grants = await self._store.get_user_role_grants(user.id)
             record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
-            if sealer is None or (record is not None and user_seal_ok(sealer, record)):
+            if sealer is None or record is None:
+                held: bool | None = sealer is None
+            else:
+                held = await _unless_unverifiable(user_seal_ok(sealer, record))
+            if held is None:
+                # Vault transit refused to check the seal: denied and reported, not re-read,
+                # because a re-read asks Transit the same question.
+                await self._user_seal_failed(user.id, unverifiable=True)
+                return None
+            if held:
                 return VerifiedUser.of(user, sorted(g.role_id for g in grants))
             if attempt == 0:
                 reread = await self._store.get_user(user.id)
@@ -10369,47 +10550,67 @@ class AuthService:
         await self._user_seal_failed(user.id, part="passkeys")
         return None
 
-    async def _user_seal_failed(self, user_id: str, *, part: str = USER_KIND) -> None:
+    async def _user_seal_failed(
+        self, user_id: str, *, part: str = USER_KIND, unverifiable: bool = False
+    ) -> None:
         """Report an account whose record (or, with ``part="passkeys"``, whose passkey set) failed
-        its integrity seal (BACKLOG #2592), through :meth:`_report_seal_failure`, keyed per account.
-        The caller denies; the engine keeps running."""
+        its integrity seal, or with ``unverifiable`` whose seal Vault transit refused to check
+        (BACKLOG #2592), through :meth:`_report_seal_failure`, keyed per account. The caller
+        denies; the engine keeps running."""
         await self._report_seal_failure(
             f"{part}:{user_id}",
-            f"a {part} record failed its integrity check and was refused (account {user_id})",
+            f"a {part} record {seal_report_text(unverifiable).verb} and was refused"
+            f" (account {user_id})",
             {"kind": part, "user_id": user_id},
+            unverifiable=unverifiable,
         )
 
     # --- the role and directory-map loaders (BACKLOG #2592) ----------------------------------------
 
     async def _load_role(self, role_id: str) -> RoleRow | None:
-        """The ``roles`` row ``role_id`` names, its integrity seal checked, or ``None``. With
-        :meth:`_load_custom_roles`, :meth:`_custom_role_held` and :meth:`_ad_map`, the ONLY
-        readers of the store's role and AD role-map readers in this service;
+        """The ``roles`` row ``role_id`` names, its integrity seal checked, or ``None``. Through
+        :meth:`_checked_role`, which with :meth:`_load_custom_roles`, :meth:`_custom_role_held` and
+        :meth:`_checked_ad_map` are the ONLY readers of the store's role and AD role-map readers in
+        this service;
         ``tests/test_role_seal.py`` holds that. A row that fails is reported and read as absent, so
         it grants nothing."""
+        checked = await self._checked_role(role_id)
+        if checked is None:
+            return None
+        row, holds = checked
+        if holds:
+            return row
+        await self._role_seal_failed(row.id, unverifiable=holds is None)
+        return None
+
+    async def _checked_role(self, role_id: str) -> tuple[RoleRow, bool | None] | None:
+        """The ``roles`` row ``role_id`` names with its seal's verdict, or ``None`` for no row:
+        ``True`` holds, ``False`` fails and ``None`` is a seal Vault transit refused to check
+        (BACKLOG #2592). It reports nothing: :meth:`_load_role` reports, and
+        :meth:`update_custom_role` reports only an unverifiable row, since its save repairs a
+        failing one."""
         found = await self._store.get_role(role_id)
         if found is None:
             return None
         row = RoleRow.from_mapping(found)
-        if role_seal_ok(self._store.row_sealer(), row):
-            return row
-        await self._role_seal_failed(row.id)
-        return None
+        return row, await _unless_unverifiable(role_seal_ok(self._store.row_sealer(), row))
 
     async def _load_custom_roles(self) -> list[tuple[RoleRow, bool]]:
-        """Every custom role row, each with whether its seal holds. One that fails is reported, and
-        listed with no permissions by the caller, so an administrator can still see it to save it
-        again or delete it, and never sees, or re-saves, a value written outside the store."""
+        """Every custom role row, each with whether its seal holds. One that fails, or whose seal
+        Vault transit refused to check, is reported, and listed with no permissions by the caller,
+        so an administrator can still see it to save it again or delete it, and never sees, or
+        re-saves, a value written outside the store. A scan skips nothing and aborts on nothing
+        for an unverifiable seal."""
         sealer = self._store.row_sealer()
         out: list[tuple[RoleRow, bool]] = []
         for found in await self._store.list_roles():
             row = RoleRow.from_mapping(found)
             if not is_custom_role_id(row.id):
                 continue  # a built-in resolves from code; its row grants nothing
-            holds = role_seal_ok(sealer, row)
-            if not holds:
-                await self._role_seal_failed(row.id)
-            out.append((row, holds))
+            checked = await _unless_unverifiable(role_seal_ok(sealer, row))
+            if not checked:
+                await self._role_seal_failed(row.id, unverifiable=checked is None)
+            out.append((row, bool(checked)))
         return out
 
     async def _custom_role_held(self, role_id: str) -> bool:
@@ -10423,15 +10624,17 @@ class AuthService:
         found = await self._store.get_role(role_id)
         return found is not None and not bool(found["builtin"])
 
-    async def _role_seal_failed(self, role_id: str) -> None:
-        """Report a custom role whose row failed its integrity seal (BACKLOG #2592), through
+    async def _role_seal_failed(self, role_id: str, *, unverifiable: bool = False) -> None:
+        """Report a custom role whose row failed its integrity seal, or with ``unverifiable`` whose
+        seal Vault transit refused to check (BACKLOG #2592), through
         :meth:`_report_seal_failure`, keyed per role. The role grants nothing; its holders keep
         their other roles."""
         await self._report_seal_failure(
             f"{ROLE_KIND}:{role_id}",
-            f"a {ROLE_KIND} definition failed its integrity check and grants nothing"
+            f"a {ROLE_KIND} definition {seal_report_text(unverifiable).verb} and grants nothing"
             f" (role {role_id})",
             {"kind": ROLE_KIND, "role_id": role_id},
+            unverifiable=unverifiable,
         )
 
     async def _ad_map(self, name: str) -> AdMap:
@@ -10446,21 +10649,75 @@ class AuthService:
     async def _sealed_ad_map(self, name: str) -> AdMap | None:
         """:meth:`_ad_map`, but ``None`` rather than an empty map when the seal fails, for a caller
         that must tell a failing map from an honestly empty one. The failure is still reported."""
-        current = await self._store.get_ad_map(name)
-        if ad_map_seal_ok(self._store.row_sealer(), current):
+        current, holds = await self._checked_ad_map(name)
+        if holds:
             return current
+        # A map whose seal Vault transit refused to check is reported and stands in as failing,
+        # so a role or channel decision only ever narrows: every such caller reads None as no pair.
+        await self._ad_map_seal_failed(name, unverifiable=holds is None)
+        return None
+
+    async def _checked_ad_map(self, name: str) -> tuple[AdMap, bool | None]:
+        """The AD map ``name`` with its seal's verdict, as :meth:`_checked_role` gives a role's:
+        ``True`` holds, ``False`` fails and ``None`` is a seal Vault transit refused to check
+        (BACKLOG #2592). It writes no seal-failure audit row and raises no per-map page; each
+        caller decides. The sealer's own throttled ERROR line on a refusal still fires; it pages
+        nothing."""
+        current = await self._store.get_ad_map(name)
+        return current, await _unless_unverifiable(
+            ad_map_seal_ok(self._store.row_sealer(), current)
+        )
+
+    async def _ad_map_seal_failed(self, name: str, *, unverifiable: bool) -> None:
+        """Report AD map ``name`` as failing its seal, or with ``unverifiable`` as one Vault
+        transit refused to check, through :meth:`_report_seal_failure`, keyed per map."""
         await self._report_seal_failure(
             f"{ADSET_KIND}:{name}",
-            f"the {name} failed its integrity check and grants nothing",
+            f"the {name} {seal_report_text(unverifiable).verb} and grants nothing",
             {"kind": ADSET_KIND, "map": name},
+            unverifiable=unverifiable,
         )
-        return None
+
+    async def _ad_map_for_edit(self, name: str) -> AdMap:
+        """The map ``name`` for an administrator to read and edit: empty when it fails its seal, so
+        a save re-seals only what is entered. When Vault transit refused to check it, reported and
+        :class:`AdMapUnverifiableError`: an empty listing would invite a save that replaces pairs
+        that may be genuine (BACKLOG #2592)."""
+        current = await self._ad_map_unless_unverifiable(name)
+        if current is None:
+            raise AdMapUnverifiableError(name)
+        return current
+
+    async def _ad_map_unless_unverifiable(self, name: str) -> AdMap | None:
+        """The map ``name`` for a caller that writes or revokes from it: empty when it fails its
+        seal, so it grants nothing, and ``None`` when Vault transit refused to check it, so the
+        caller holds its write rather than act on an empty map that would replace genuine roles
+        or scope (BACKLOG #2592). Either failure is reported."""
+        current, holds = await self._checked_ad_map(name)
+        if holds:
+            return current
+        await self._ad_map_seal_failed(name, unverifiable=holds is None)
+        return None if holds is None else AdMap(name)
+
+    async def _refuse_unverifiable_ad_map(self, name: str, entries: Sequence[object]) -> None:
+        """Refuse replacing map ``name`` with ``entries`` while Vault transit refuses to check its
+        stored seal: reported, then :class:`AdMapUnverifiableError`. A failing map is not
+        reported, since this save repairs it, as :meth:`update_custom_role` repairs a role.
+        Clearing the map, with no entries, is the recovery and is let through, as deleting is for
+        a role."""
+        if not entries:
+            return
+        _current, holds = await self._checked_ad_map(name)
+        if holds is None:
+            await self._ad_map_seal_failed(name, unverifiable=True)
+            raise AdMapUnverifiableError(name)
 
     async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the AD group-to-role map gives ``groups``; none when the map fails its
-        seal. A directory role decision reads the map through here, through :meth:`_ad_map` once
-        for a whole pass, or through :meth:`_directory_roles_lost`, which tells a failing map from a
-        lost role."""
+        seal. Only for a decision that writes nothing and so only narrows, as the certificate path
+        does. Sign-in and the reconciler, which write or revoke from the map, read it through
+        :meth:`_ad_map_unless_unverifiable`; a step-up reads it through
+        :meth:`_directory_roles_lost`, which tells a failing map from a lost role."""
         return (await self._ad_map(AD_ROLE_MAP)).values_for(groups)
 
     async def _ad_channels_for_groups(self, groups: Iterable[str]) -> frozenset[str]:
@@ -10471,13 +10728,15 @@ class AuthService:
     async def list_ad_group_role_map(self) -> list[tuple[str, str]]:
         """The AD group-to-role map's ``(ad_group, role_id)`` pairs, for an administrator to read and
         edit. None when the map fails its seal: an administrator who saves the map again seals what
-        they enter, and never re-seals a pair written outside the store (BACKLOG #2592)."""
-        return list((await self._ad_map(AD_ROLE_MAP)).pairs)
+        they enter, and never re-seals a pair written outside the store (BACKLOG #2592). Raises
+        :class:`AdMapUnverifiableError` when Vault transit refused to check the seal, since an
+        empty listing would invite a save that destroys pairs that may be genuine."""
+        return list((await self._ad_map_for_edit(AD_ROLE_MAP)).pairs)
 
     async def list_ad_group_scope_map(self) -> list[tuple[str, str]]:
         """:meth:`list_ad_group_role_map`, for the AD group-to-channel map's ``(ad_group, channel)``
         pairs."""
-        return list((await self._ad_map(AD_SCOPE_MAP)).pairs)
+        return list((await self._ad_map_for_edit(AD_SCOPE_MAP)).pairs)
 
     async def identity_for_cert_user_id(self, user_id: str) -> Identity | None:
         """Resolve the users-row id a verified client cert maps to, or ``None`` when that account is
@@ -11021,11 +11280,11 @@ class AuthService:
             revoked = await self._store.revoke_user_sessions(
                 identity.user_id, except_token_hash=current_token_hash
             )
-        except RowSealError:
+        except RowSealError as refused:
             # BACKLOG #2592: the caller's own session failed its seal, so the store wrote nothing.
             # The caller asked to end every other session and its own is suspect: end them all,
             # and audit that scope, since the caller's own session is ended too.
-            await self._session_seal_failed(current_token_hash)
+            await self._session_seal_failed(current_token_hash, unverifiable=refused.unverifiable)
             revoked = await self._store.revoke_user_sessions(identity.user_id)
             scope = "self_all"
         if revoked:
@@ -15172,9 +15431,18 @@ class AuthService:
         an unknown/built-in role and :class:`CustomRoleError` for an invalid permission set.
 
         The whole row is written from these arguments and sealed, so this also repairs a role whose
-        row fails its integrity seal (BACKLOG #2592); nothing is kept from the row it replaces."""
-        if not await self._custom_role_held(role_id):
+        row fails its integrity seal (BACKLOG #2592); nothing is kept from the row it replaces. A
+        role whose seal Vault transit refused to check is NOT re-saved, and raises
+        :class:`CustomRoleUnverifiableError`: it is listed with no permissions, so a re-save from
+        that listing would overwrite the permissions it may genuinely hold."""
+        # One read: the row's own builtin column answers "custom", as _custom_role_held does.
+        checked = await self._checked_role(role_id) if is_custom_role_id(role_id) else None
+        if checked is None or checked[0].builtin:
             raise ValueError("no such custom role")
+        if checked[1] is None:
+            # Reported, and so paged per row, as a read of the role is; nothing was written.
+            await self._role_seal_failed(role_id, unverifiable=True)
+            raise CustomRoleUnverifiableError()
         perms = validate_custom_role_permissions(permissions)  # raises CustomRoleError
         await self._store.upsert_role(
             role_id=role_id,
@@ -16104,7 +16372,10 @@ class AuthService:
         )
 
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
-        """Replace the AD-group → role map (C3). Revokes directory sessions so it applies at once."""
+        """Replace the AD-group → role map (C3). Revokes directory sessions so it applies at once.
+        Raises :class:`AdMapUnverifiableError`, writing nothing, when Vault transit refuses to check
+        the stored map's seal, unless ``entries`` is empty (BACKLOG #2592)."""
+        await self._refuse_unverifiable_ad_map(AD_ROLE_MAP, entries)
         await self._store.set_ad_group_role_map(entries)
         revoked = await self._revoke_ad_sessions()
         await self._audit(
@@ -16118,7 +16389,9 @@ class AuthService:
     ) -> None:
         """Replace the AD-group → channel-scope map (C3). Revokes directory sessions so it applies
         at once. This docstring used to end "Takes effect on each AD user's next login", which was
-        an accurate description of the defect BACKLOG #1154 names and is no longer true."""
+        an accurate description of the defect BACKLOG #1154 names and is no longer true. Refuses an
+        unverifiable stored map as :meth:`set_ad_group_map` does (BACKLOG #2592)."""
+        await self._refuse_unverifiable_ad_map(AD_SCOPE_MAP, entries)
         await self._store.set_ad_group_scope_map(entries)
         revoked = await self._revoke_ad_sessions()
         await self._audit(
