@@ -10468,8 +10468,8 @@ class AuthService:
         """The AD map ``name`` with its seal's verdict, as :meth:`_checked_role` gives a role's:
         ``True`` holds, ``False`` fails and ``None`` is a seal Vault transit refused to check
         (BACKLOG #2592). It writes no seal-failure audit row and raises no per-map page; each
-        caller decides. The sealer's own throttled ERROR line and key-level page on a refusal
-        still fire."""
+        caller decides. The sealer's own throttled ERROR line on a refusal still fires; it pages
+        nothing."""
         current = await self._store.get_ad_map(name)
         return current, await _unless_unverifiable(
             ad_map_seal_ok(self._store.row_sealer(), current)

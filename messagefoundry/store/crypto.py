@@ -659,8 +659,8 @@ class RowSealUnverifiableError(CipherError):
     is Transit's MAC over the probe's fixed input and holds no row data.
 
     ``probe_mac`` is the key probe's own MAC, which names the latest version the node that answered
-    the probe holds. The sealer compares no version: the refusal and the probe can reach different
-    nodes."""
+    the probe holds. The sealer classifies by no version, since the refusal and the probe can
+    reach different nodes; a change in it only empties the sealer's cache."""
 
     def __init__(self, probe_mac: str) -> None:
         # Passed on, so ``args`` rebuilds the error: copy and pickle call ``cls(*args)``.

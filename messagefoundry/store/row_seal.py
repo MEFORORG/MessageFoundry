@@ -420,9 +420,10 @@ class TransitRowSealer:
     **The cache holds successful checks only**, keyed by a digest of the length-prefixed input and
     the stored Transit string, which carries the version. An entry lives
     :data:`TRANSIT_SEAL_CACHE_TTL_SECONDS`, which also bounds how long a check outlives a version
-    Transit later retires. The cache is emptied whenever Transit refuses to check a seal, since a
-    refusal can mean a version was retired, and a check that was already waiting on Transit then
-    keeps its answer for its own caller only. It holds a result and nothing else; the caller reads
+    Transit later retires. The cache is emptied whenever a refused check's key probe names a
+    different latest version than the last one did, since the key moved, and a check that was
+    already waiting on Transit then keeps its answer for its own caller only. That version only
+    empties the cache; no classification reads it. It holds a result and nothing else; the caller reads
     the row afresh every time.
 
     **An outage is not a failed seal.** A call that does not complete raises
@@ -439,7 +440,8 @@ class TransitRowSealer:
     :meth:`~messagefoundry.store.crypto_transit.TransitCipher.verify_seal_hmac` says why Transit's
     reply cannot tell a retired version from a lagging node or a planted one, so a genuine seal
     checked against a node that lags a rotation reads as unverifiable too, and its user signs in
-    again. A 400 the probe cannot clear, a network error and a 5xx are an outage.
+    again. A 400 the probe cannot clear, or clears with a MAC of an unexpected shape, a network
+    error and a 5xx are an outage.
 
     **The seam (CLAUDE.md section 6).** Each Transit call runs in a worker thread
     (:func:`asyncio.to_thread`), so a seal or a check never blocks the event loop. So only the
@@ -455,6 +457,7 @@ class TransitRowSealer:
         "_backend",
         "_cache",
         "_generation",
+        "_probed_version",
         "_prefix",
         "_throttle",
         "key_id",
@@ -469,6 +472,8 @@ class TransitRowSealer:
         # Bumped whenever the cache is emptied, so a check that began before the bump does not
         # store its result after it (see verify_async).
         self._generation = 0
+        # The latest version the last refused check's key probe named; only empties the cache.
+        self._probed_version = 0
         self._throttle = SealFailureThrottle()
         self._alert: TransitSealAlertHook | None = None
 
@@ -478,8 +483,9 @@ class TransitRowSealer:
         return self._backend.seal_key_name
 
     def set_alert_hook(self, hook: TransitSealAlertHook | None) -> None:
-        """Arm, or with ``None`` disarm, the hook the throttled ERROR line also goes to. ``serve``
-        arms it with the engine's alert sink; it is called on the event loop's thread."""
+        """Arm, or with ``None`` disarm, the hook an outage's throttled ERROR line also goes to,
+        and :func:`alert_unverifiable_row` pages through. ``serve`` arms it with the engine's alert
+        sink; it is called on the event loop's thread."""
         self._alert = hook
 
     def _report(self, key: str, reason: str, exc: Exception, *, page: bool = True) -> None:
@@ -554,16 +560,26 @@ class TransitRowSealer:
         try:
             valid = await asyncio.to_thread(self._backend.verify_seal_hmac, data, mac)
         except RowSealUnverifiableError as exc:
-            # A refusal can mean a version was retired, so no earlier yes stays trusted.
-            self._cache.clear()
-            self._generation += 1
+            probed = _transit_version(exc.probe_mac)
+            if probed is None:
+                # The probe did not answer as Transit does, so it did not show the key answers.
+                raise self._unavailable(
+                    CipherError("Transit's key probe returned a MAC of an unexpected shape")
+                ) from exc
+            if probed != self._probed_version:
+                # The key moved, so a version may have been retired: no earlier yes stays trusted.
+                # Not on every refusal, so one row that stays unverifiable never switches the cache
+                # off for every other row.
+                self._probed_version = probed
+                self._cache.clear()
+                self._generation += 1
             raise self._unverifiable(exc) from exc
         except CipherError as exc:
             raise self._unavailable(exc) from exc
         if not valid:
             return False
-        # Another coroutine had a check refused, and emptied the cache, while Transit checked this
-        # seal: the answer stands for this call, but it is not kept past that refusal.
+        # Another coroutine saw the key move, and emptied the cache, while Transit checked this
+        # seal: the answer stands for this call, but it is not kept past that move.
         if self._generation != generation:
             return True
         if len(self._cache) >= TRANSIT_SEAL_CACHE_MAX:

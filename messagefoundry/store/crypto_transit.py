@@ -250,8 +250,8 @@ class TransitCipher(_UnmarkedPolicy):
         below ``min_decryption_version`` or above the latest version the answering node holds, and
         for a missing key. So a 400 raises
         :class:`~messagefoundry.store.crypto.RowSealUnverifiableError` when the key still answers an
-        ``hmac`` call over fixed input (:meth:`_probe_mac`; the error carries that MAC), and is an
-        outage otherwise. No version arithmetic: the verify and a key read can reach different nodes, so the numbers
+        ``hmac`` call over fixed input (:meth:`_probe_mac`; the error carries that MAC, which the
+        sealer checks is well-formed), and is an outage otherwise. No version arithmetic: the verify and a key read can reach different nodes, so the numbers
         would not describe the node that refused.
 
         Any other failure is an outage and raises :class:`CipherError`. Blocking: the sealer calls

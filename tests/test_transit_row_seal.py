@@ -402,12 +402,13 @@ async def test_a_refused_seal_at_any_version_is_unverifiable_while_the_probe_ans
     seal = await sealer.seal_async(SESSION_KIND, fields)
     assert ":vault:v5:" in seal
     seal = seal.replace(":vault:v5:", f":vault:v{5 + offset}:")
-    transit.min_decryption = 5  # v4 is retired
+    transit.min_decryption = 5  # v4 is retired, and the fake refuses v6 as not yet held
+    if offset == 0:  # the fake holds v5, so a lagging node stands in for the refusal
 
-    def refusing_verify(**_: Any) -> dict[str, Any]:
-        raise hvac_exceptions.InvalidRequest("synthetic: refused")
+        def lagging_verify(**_: Any) -> dict[str, Any]:
+            raise hvac_exceptions.InvalidRequest("synthetic: this node does not hold v5 yet")
 
-    transit.verify_signed_data = refusing_verify  # type: ignore[method-assign]
+        transit.verify_signed_data = lagging_verify  # type: ignore[method-assign]
     fresh = TransitRowSealer(transit_cipher(transit))
     for checker in (sealer, fresh):
         for _ in range(2):  # the same answer every time
@@ -630,11 +631,11 @@ async def test_an_unverifiable_directory_map_refuses_a_listing_and_a_replace(
     assert await listing() == [pair]
 
 
-async def test_a_refusal_is_unverifiable_whatever_the_probe_mac_names(
+async def test_a_refusal_whose_probe_mac_is_malformed_is_an_outage(
     transit_store: Opened, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The sealer reads no version from the key probe's MAC, so a refusal is unverifiable whatever
-    that MAC looks like (BACKLOG #2592)."""
+    """A key probe that answers with a MAC of an unexpected shape did not show the key answers, so
+    the refusal is an outage, as a malformed seal reply is (BACKLOG #2592)."""
     store, _path, _transit = transit_store
     sealer = store.row_sealer()
     assert isinstance(sealer, TransitRowSealer)
@@ -646,7 +647,7 @@ async def test_a_refusal_is_unverifiable_whatever_the_probe_mac_names(
         raise RowSealUnverifiableError("not a transit mac")
 
     monkeypatch.setattr(sealer._backend, "verify_seal_hmac", refused)
-    with pytest.raises(TransitSealUnverifiableError):
+    with pytest.raises(TransitSealUnavailableError):
         await sealer.verify_async(SESSION_KIND, fields, seal)
 
 
@@ -767,6 +768,37 @@ async def test_a_check_held_open_across_a_refusal_does_not_refill_the_cache(
     assert await _held_check(sealer, transit, refuse=False) is True
     # A refusal seen while the v1 check waited empties the cache, and the check does not refill it.
     assert await _held_check(sealer, transit, refuse=True) is False
+
+
+async def test_a_row_that_stays_unverifiable_never_empties_the_cache_again(
+    transit_store: Opened,
+) -> None:
+    """Only a key probe naming a different latest version empties the cache, so one row read on
+    every request while it stays unverifiable never sends every other row back to Transit."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, _path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    good = [("token_hash", "good")]
+    seal = await sealer.seal_async(SESSION_KIND, good)
+    bad = [("token_hash", "bad")]
+    planted = (await sealer.seal_async(SESSION_KIND, bad)).replace(":vault:v1:", ":vault:v9:")
+    with pytest.raises(TransitSealUnverifiableError):  # the first refusal learns the probe's v1
+        await sealer.verify_async(SESSION_KIND, bad, planted)
+    assert await sealer.verify_async(SESSION_KIND, good, seal) is True
+    for _ in range(3):
+        with pytest.raises(TransitSealUnverifiableError):
+            await sealer.verify_async(SESSION_KIND, bad, planted)
+    before = transit.verify_calls
+    assert await sealer.verify_async(SESSION_KIND, good, seal) is True
+    assert transit.verify_calls == before  # still served from the cache
+    # Control: a refusal whose probe names a new latest version does empty it.
+    transit.rotate()
+    with pytest.raises(TransitSealUnverifiableError):
+        await sealer.verify_async(SESSION_KIND, bad, planted)
+    assert await sealer.verify_async(SESSION_KIND, good, seal) is True
+    assert transit.verify_calls > before + 1
 
 
 # --- the alert, the start probe and the CLI line -------------------------------------------------
