@@ -59,6 +59,7 @@ from messagefoundry.config.wiring import (
     read_trusted_snapshot,
 )
 from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.engine_secrets import SecretsDirectoryError
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
@@ -1545,13 +1546,15 @@ class Engine:
             self._secret_rotation_settings, self._secret_rotation_stamps
         )
 
-    def _expiry_enforced_held_ids(self) -> frozenset[str]:
+    async def _expiry_enforced_held_ids(self) -> frozenset[str]:
         """The secret-class ids the engine holds AND fingerprints right now, for the opt-in non-DEK
         expiry refusal (BACKLOG #1932). Empty without an opt-in, off ENFORCE, or on a store that cannot
         fingerprint (keyless), where a missing stamp is the ordinary state. Ids only; the values read to
         find them are dropped here and never persisted or logged. Called OUTSIDE the reconcile's
         blanket handler, so a failure here refuses the start: that is the fail-closed direction, and it
-        can only happen for an operator who opted in."""
+        can only happen for an operator who opted in. A secrets directory that cannot be read raises
+        its own ``SecretsDirectoryError`` here, which refuses the start naming the file (vault
+        BACKLOG #2595); the read runs in a worker thread, off the event loop."""
         settings = self._secret_rotation_settings
         if settings is None or not settings.enforce_secret_expiry_classes:
             return frozenset()
@@ -1575,7 +1578,8 @@ class Engine:
                 "for them on this store"
             )
             return frozenset()
-        return frozenset(held_env_secret_values()) | frozenset(self._connector_secret_env_values())
+        held = await asyncio.to_thread(held_env_secret_values)
+        return frozenset(held) | frozenset(self._connector_secret_env_values())
 
     def _connector_secret_env_values(self) -> dict[str, str]:
         """The per-Connection ``env()`` credential VALUES the wired graph holds right now, keyed by their
@@ -2103,7 +2107,8 @@ class Engine:
         # process's own, so a standby reports its own too, and names itself in the alert key as
         # the intake monitor does. Of the commands, only `serve` builds an engine. The count moves
         # only where the guard is in the process: wherever `messagefoundry.__main__` is imported,
-        # or install_remote_debug_guard is called (docs/SECURITY-LOOSENING.md).
+        # the API's create_app runs, or install_remote_debug_guard is called
+        # (docs/SECURITY-LOOSENING.md).
         if self._remote_debug_watch is None:
             self._remote_debug_watch = RemoteDebugRefusalWatch(
                 self.store, alert_sink=self._alert_sink, node=self.instance_identity
@@ -2144,6 +2149,12 @@ class Engine:
                         # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
                         extra_values=self._connector_secret_env_values(),
                     )
+                except SecretsDirectoryError:
+                    # Vault BACKLOG #2595: not a reconcile fault but a secrets directory or file the
+                    # engine must not use. Refused as what it is, naming the file: logged and stepped
+                    # over by the arm below, it would leave the stamps empty and resurface as an
+                    # undetermined DEK age under ENFORCE, pointing the operator at the wrong key.
+                    raise
                 except Exception:
                     # A reconcile failure must never take the engine down — the runner still works off the
                     # operator-configured dates (empty stamps). Logged, not raised.
@@ -2178,7 +2189,7 @@ class Engine:
                     self._secret_rotation_settings,
                     self._secret_rotation_stamps,
                     enforcement=self._security_enforcement,
-                    held=self._expiry_enforced_held_ids(),
+                    held=await self._expiry_enforced_held_ids(),
                     alert_sink=self._alert_sink,
                 )
             self._secret_rotation_runner = SecretRotationRunner(

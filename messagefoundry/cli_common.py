@@ -123,8 +123,9 @@ def run_cli(
     #     `dryrun`/`check`/`validate`, because basicConfig does nothing once the root has a handler.
     #     `serve` already behaves this way. The fix for an operator is a named logger, not basicConfig.
     # The audit tee's INFO records reached stderr through `ensure_logger_sink` (#1199) before this;
-    # that now finds this handler and adds no second one. The exempt subcommands, and the one
-    # residual the exemption leaves, are stated once at `_CONFIGURES_OWN_LOGGING` in `__main__.py`.
+    # that now finds this handler and adds no second one. The exempt subcommands, and how `serve`
+    # covers the window before its own handlers, are stated once at `_CONFIGURES_OWN_LOGGING` in
+    # `__main__.py`.
     #
     # Only when the root has NO handler yet, which is the state a `python -m messagefoundry` process
     # starts in. A caller that configured logging before calling main() owns its own handlers, and

@@ -291,6 +291,7 @@ from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
     MISCONFIGURED_ABORT,
+    OUTAGE_ABORT,
     PAGING_CAP,
     PAGING_DEADLINE,
     PROBE_FAULT_ABORT,
@@ -317,6 +318,7 @@ from messagefoundry.auth.trust_anchors import (
     run_anchor_preflight,
     smtp_hop_anchor_spec,
 )
+from messagefoundry.auth.webauthn import configured_rp_id
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -463,7 +465,11 @@ from messagefoundry.pipeline.wiring_runner import (
     ShardLaneOwnershipError,
 )
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
-from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_posture
+from messagefoundry.remotedebug import (
+    RemoteDebugPosture,
+    install_remote_debug_guard,
+    remote_debug_posture,
+)
 from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
@@ -3808,6 +3814,13 @@ def create_app(
     log_dir: str | None = None,
     configured_log_level: str | None = None,
 ) -> FastAPI:
+    # Vault BACKLOG #3673, defect 3: an application that builds the API without the command line
+    # gets the remote-debugging hook here, rather than late or never. It goes in after the API's
+    # imports, so a script injected while they load still runs. Installing at import would put a
+    # permanent audit hook in every process that imports the package, which this does not.
+    # messagefoundry/remotedebug.py says what the hook does, and why a repeat call adds no copy and
+    # no second unraisable-hook wrapper (the Lander's finding 2 on engine PR 2573).
+    install_remote_debug_guard()
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
     # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
     if allow_no_auth and auth is not None:
@@ -4450,10 +4463,12 @@ def create_app(
         store_privilege = getattr(request.app.state, "store_privilege", None)
         # Vault BACKLOG #2700 / #2701: read off THIS process, which is the engine. Each is read
         # once here, so the loosening list and the `interpreter` block below report one reading.
-        # An app built without `serve` never installed the remote-debugging hook, and the reading
-        # then says so. The start-up reading is the one `serve` took as it started, kept for the
-        # life of the process. An app built without `serve` takes it here, once, and that first
-        # reading reads files, so the call is kept off the event loop.
+        # create_app installed the remote-debugging hook (vault BACKLOG #3673), so a reading that
+        # says it is missing points at another audit hook in the process.
+        #
+        # The start-up reading is the one `serve` took as it started, kept for the life of the
+        # process. An app built without `serve` takes it here, once, and that first reading reads
+        # files, so the call is kept off the event loop.
         remote_debug = remote_debug_posture()
         startup = await asyncio.to_thread(startup_posture)
         # Vault BACKLOG #2595: the service-environment reading `serve` took as it started, kept
@@ -9204,6 +9219,7 @@ def create_app(
                 path=db.path,
                 size_bytes=db.size_bytes,
                 disk_free_bytes=db.disk_free_bytes,
+                disk_free_status=db.disk_free_status.value,
                 journal_mode=db.journal_mode,
                 messages=db.messages,
                 events=db.events,
@@ -10538,6 +10554,16 @@ _MISCONFIGURED_ALERT_SOURCE = "directory-reconciler-misconfigured"
 #: ``ad_session_revoked`` is keyed on the account: a second account entering inside the first's
 #: cooldown still pages.
 _PAGING_ALERT_SOURCE = "directory-reconciler-paging"
+#: The source label of a lasting directory outage's own ``ad_reconcile_aborted`` instance (BACKLOG
+#: #3709), apart from the others for the same reasons.
+_OUTAGE_ALERT_SOURCE = "directory-reconciler-outage"
+#: What the lasting outage tells the operator. Short, for the store's 200-character reason, and
+#: about probes rather than the network: a group search past the engine's own bound reads the same,
+#: and a disable still revokes that account on a pass that reaches its user search.
+_OUTAGE_ALERT_TEXT: Final[str] = (
+    "No directory probe succeeded in {passes} reconcile passes running, so the reconciler revoked "
+    "nothing. Check the directory, the path to it, and any group-search paging alert."
+)
 #: What each paging refusal cause tells the operator. Short, and the consequence first, because
 #: the store keeps only the first 200 characters of an instance's reason; the account is in the
 #: source.
@@ -10557,8 +10583,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_session_revoked`` alert, except a quiet one whose row was written, which the service
     leaves off the returned plan (BACKLOG #3085; ``AuthService._apply_reconcile_revocation`` says
     which are quiet). A whole-directory outage aborts too, but it is audited as
-    ``auth.ad_reconcile_skipped`` and pages nothing: the accounts are fine, the directory is not,
-    and the pass is fail-open.
+    ``auth.ad_reconcile_skipped``: the accounts are fine, the directory is not, and the pass is
+    fail-open. One such pass pages nothing. A run of ``[auth].ad_reconcile_outage_passes`` of them
+    pages once, as ``ad_reconcile_aborted`` with reason ``directory_unavailable`` under its own
+    source label (:data:`_OUTAGE_ALERT_SOURCE`), and the first pass that reaches the directory
+    resolves it (BACKLOG #3709; ``AuthService._note_directory_outage`` says when each is set).
 
     A referral (BACKLOG #2538) is NOT an outage: it recurs until a search base is fixed. Any pass
     with a referred probe is ``auth.ad_reconcile_referred`` and becomes one ``ad_reconcile_aborted``
@@ -10585,7 +10614,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_reconcile_aborted`` alert with reason ``directory_misconfigured``, under its own source
     label (:data:`_MISCONFIGURED_ALERT_SOURCE`). Like the fault's, it has no inverse. Before #3010
     such a base read as "not found" for every account, so it tripped the breaker on an estate
-    large enough; read as an outage, it would page nobody.
+    large enough; read as an outage, it would page only once the outage lasted (BACKLOG #3709).
 
     A paging refusal (vault BACKLOG #3696) pages once per account as it enters that state, after
     the revocations and on an outage-shaped pass too, matching its ``auth.ad_reconcile_paging_refused`` row;
@@ -10610,9 +10639,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     Each standing alert but the probe fault's, the configuration refusal's and a paging refusal's
     also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
     ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
-    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
+    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance, and
+    under the outage's source for the outage's (BACKLOG #3709). The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
-    ``plan.hold_clear``, ``plan.referral_clear``; see ``AuthService._mark_reconcile_clears``), so
+    ``plan.hold_clear``, ``plan.referral_clear``, ``plan.outage_clear``; see
+    ``AuthService._mark_reconcile_clears`` and ``AuthService._note_directory_outage``), so
     the alert and the service read one predicate. An outage or a pass with no signed-in account
     sets none. The inverse is raised on EVERY pass that sets its flag, not once per clear:
     resolving is an idempotent update, and a resolve the notifier failed to write is retried that
@@ -10623,6 +10654,15 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
         _alert_paging_refusals(plan, sink)
+        if plan.outage_page:
+            # BACKLOG #3709. After the paging refusals, which page once per account, so a sink that
+            # raises here cannot cost one.
+            sink.ad_reconcile_aborted(
+                _OUTAGE_ALERT_SOURCE,
+                reason=OUTAGE_ABORT,
+                probed=plan.asked,
+                detail=_OUTAGE_ALERT_TEXT.format(passes=plan.outage_passes),
+            )
         return
     if plan.aborted is not None and not plan.judged_nothing:
         # A breaker trip. A pass that judged nothing is not one: its alerts are the referral's, the
@@ -10680,6 +10720,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_hold_released("directory-reconciler")
     if plan.referral_clear:
         sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
+    if plan.outage_clear:
+        sink.ad_reconcile_breaker_cleared(_OUTAGE_ALERT_SOURCE)
 
 
 def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
@@ -10734,6 +10776,7 @@ _RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
     "breaker_clear": ("directory-reconciler", "ad_reconcile_aborted"),
     "hold_clear": ("directory-reconciler", "ad_reconcile_held"),
     "referral_clear": (_REFERRAL_ALERT_SOURCE, "ad_reconcile_aborted"),
+    "outage_clear": (_OUTAGE_ALERT_SOURCE, "ad_reconcile_aborted"),
 }
 
 
@@ -11738,6 +11781,9 @@ def create_managed_app(
                     admin_grant_alert=administrator_granted_alert(
                         notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
                     ),
+                    # BACKLOG #3937: the relying party a passkey must be under to count as a way
+                    # past the sign-in lock at the factor-drop gates; None counts none.
+                    way_past_rp_id=configured_rp_id(public_origin),
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:

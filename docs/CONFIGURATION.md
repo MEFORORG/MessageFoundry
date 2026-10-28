@@ -139,6 +139,9 @@ channel config) with one section per group, plus **environment-variable override
 CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 ```
 
+A secret-class setting can also come from a file in a secrets directory, which then wins over its
+environment variable: see [The secrets directory](#the-secrets-directory-mefor_secrets_directory).
+
 - File location: `./messagefoundry.toml` by default, or `--service-config <path>`. **Under the
   Windows service, `serve` and `supervise` refuse to start without an absolute `--service-config`**,
   so the service never reads a settings file from its working directory. A relative one under
@@ -767,13 +770,14 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `ad_tls_verify` | bool | `true` | validate the LDAPS certificate. `false` is refused at start, with no escape, because every bind carries a password ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)). For a private CA, set `ad_tls_ca_cert_file` |
 | `ad_tls_ca_cert_file` | str | — | trust an internal CA for LDAPS without disabling verification. Read once at start, and every LDAPS bind trusts those bytes. **A changed file takes effect at the next restart.** The PEM rules, and what a reload does, are under `[api].tls_client_ca_file` (BACKLOG #2185) |
 | `ad_tls_ca_cert_pin` | str | — | optional pin (*Trust-anchor pin syntax* under [`[api]`](#api)) over the corresponding CA anchor PEM (`ad_tls_ca_cert_file`); a mismatch refuses at load + reload (ASVS 6.7.1); unset = no pin (dormant); set but empty or whitespace refuses at load |
-| `ad_allow_insecure_ldap` | bool | `false` | explicit opt-in to a non-`ldaps://` bind (trusted-network dev only). Inert under `[security].enforcement = enforce`; see its [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) entry |
+| `ad_allow_insecure_ldap` | | | **→ REMOVED** (vault BACKLOG #3533). A plain `ldap://` bind would send both AD passwords in cleartext, so it is refused at every posture, with no escape, as `ad_tls_verify = false` is. A config that still sets this key is refused at load, by name |
 | `ad_connect_timeout` | float | `10.0` | seconds — bounds the LDAP/LDAPS **TCP connect** on every `ldap3` `Server` the authenticator builds (ASVS 13.1.3). Must be finite and `> 0`; `0`, negative, `inf` and `NaN` are refused at config load, and so is anything above `3600`. `ldap3`'s own default is `None` (wait forever), so without this an unresponsive DC pinned a thread-pool worker indefinitely |
 | `ad_receive_timeout` | float | `10.0` | seconds — bounds **each socket receive** during an LDAP response (both binds and every search) on every `ldap3` `Connection`. Same validation, up to `3600`. The engine rounds it up to whole seconds before handing it to `ldap3`, so `9.25` acts as `10` |
 | `ad_group_search_deadline` | float | `120.0` | seconds — the one deadline all the pages of the nested group search share (vault BACKLOG #3696). Each page's reads are still bounded by `ad_receive_timeout`, so a directory that stops answering fails at that, unless less than that is left of the deadline; this refuses a search whose pages keep arriving. The first page is never cut short by it. Same validation, up to `3600`, and a value above `120` is a [loosening](SECURITY-LOOSENING.md#authad_connect_timeout-ad_receive_timeout-or-ad_group_search_deadline-above-its-default-with-ad_enabled--a-stalled-directory-call-holds-a-thread-longer). It is not a hard wall-clock bound. A search refused at it fails that directory call, at least a sign-in, a step-up or a session recheck, and the session reconciler pages once for that account; [CONNECTIONS.md](CONNECTIONS.md#table-b--per-service-resource-strategy-asvs-1313), the Active Directory rows, says what it covers and what it does not |
 | `ad_session_recheck_seconds` | int | `300` | **Directory session reconciliation** ([ADR 0079](adr/0079-kerberos-idp-session-coordination.md) mechanism 2). How often to re-resolve directory principals holding **live** sessions and revoke those AD has disabled or deleted — without it, an AD disable does not take effect until the `[security].max_session_hours` cap (12 h). **`300` (five minutes) is the default** (ADR 0148 GIVEN 1 — the hardened path is the shipped path), floored at **60 s** (a pass costs one LDAP bind per signed-in directory user). `0` disables the loop and is a **loosening** once AD is on — `security_loosenings()` names it. The default is **inert without AD** (`should_reconcile()` also needs an LDAP client), so a non-AD deployment is unaffected; an **explicit** non-zero value without `ad_enabled` is still refused rather than left silently dead. |
 | `ad_session_recheck_strikes` | int | `2` | Consecutive passes a principal must fail to resolve before its sessions are revoked. *The search matched nothing* cannot tell *deleted* from *moved out of the search base*, so a single ambiguous result must never revoke; a set disabled bit and an unreadable `userAccountControl` strike the same way. A wave of unreadable answers is held instead of revoked, with no setting ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)). Range 1–10. |
 | `ad_session_recheck_max_users` | int | `200` | Per-pass bind budget. Beyond this, remaining users are picked up by later passes (least-recently-probed first), so a large estate degrades to a longer effective interval instead of a bind storm. A pass revokes no more accounts than it probed. So at or below `ad_session_revoke_max`, the breaker can never trip. With AD on and a non-zero interval, the engine then logs a **WARNING** at start that names both settings. It still loads, and revocation still works. To arm the breaker, raise this budget above the cap. |
+| `ad_reconcile_outage_passes` | int | `3` | **Lasting directory outage alert** (BACKLOG #3709). A pass on which every probe it asked fails to reach the directory, whatever the cause, is fail-open: it revokes nothing, so a directory disable or deletion reaches no signed-in session while it lasts, and it is audited as `auth.ad_reconcile_skipped`. One such pass pages nobody. Once a run of them is this long, one `ad_reconcile_aborted` alert is raised with reason `directory_unavailable` under its own source, `directory-reconciler-outage`; the passes after it in the same run do not page again. A pass that reaches the directory, including one that judges nothing, ends the run. A pass with nobody signed in asks nothing and leaves the run as it stands. A group search refused for its own deadline or cap reads the same as an unreachable directory here. On by default, and it cannot be turned off: range `2` to `100`, so a single blip never pages. The count is **in memory, per process**: a restart starts it again, so a standing outage pages again after one, and a fresh process does not resolve an outage alert an earlier run left open, which an operator resolves. Each engine process counts and pages on its own. When it resolves itself is under [When the reconciler's alerts resolve themselves](#when-the-reconcilers-alerts-resolve-themselves). |
 | `ad_session_revoke_max` | int | `5` | **Mass-revoke circuit breaker**, absolute half. A search base that names the wrong OU, an OU reorganisation that moves the users out of it, or a service account that lost read rights on the entries while it can still read the base answers "not found" for *every* user — indistinguishable from "everyone was deleted". A base that was deleted or moved, or that the service account may not read at all, usually ends the search with a result code instead: a configuration refusal, which raises its own `ad_reconcile_aborted` instance with reason `directory_misconfigured` on any pass that sees one. The refused account is neither struck nor revoked, but it still counts among the accounts the pass probed, the breaker's denominator. When such a pass aborts and revokes nothing before the breaker runs is stated once in [SECURITY.md](SECURITY.md) (BACKLOG #3010). A lost read right on `userAccountControl` alone is held instead ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)). At `0` the absolute half is gone, so a pass trips once it revokes more than the fraction of the accounts it probed. At or above `ad_session_recheck_max_users`, the breaker can never trip; that row says what the engine does. |
 | `ad_session_revoke_max_fraction` | float | `0.34` | Circuit breaker, proportional half. A pass exceeding **both** thresholds aborts, revokes nothing, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row. Requiring both means it fires only on a change simultaneously *large* and *broad* — the signature of a misconfiguration, not of offboarding (3-of-3 or 50-of-300 still applies). Range >0.0–1.0, but with AD on and a non-zero interval the engine refuses `1.0` at load. At `1.0` this half is never exceeded, for the reason the `ad_session_recheck_max_users` row gives, so the whole breaker would never trip. |
 | `kerberos_enabled` | bool | `false` | Windows SSO (experimental, off by default; needs `ad_enabled`) |
@@ -822,7 +826,8 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 
 The session reconciler's `ad_reconcile_aborted` (the breaker) and `ad_reconcile_held` (the hold)
 alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). So
-does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). This
+does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). The
+lasting outage's instance resolves on its own rule, stated below the list. This
 needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
 this engine process, for every signed-in directory account it did not just revoke.
 
@@ -853,7 +858,7 @@ three on its own, until it restarts again.
   and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
   in at the last referral has since been read in full, present and enabled, on a pass with no
   referral. A pass with any referral, probe fault or configuration refusal (BACKLOG #3010)
-  resolves none of these alerts.
+  resolves none of these three alerts.
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
   held account, a disabled one awaiting its strikes, and one that never answers all do this.
 - An engine gives up resolving the referral when an account signed in at the last referral leaves
@@ -893,6 +898,16 @@ A paging refusal opens one `ad_reconcile_aborted` instance per account, under th
 `directory-reconciler-paging:<username>` (vault BACKLOG #3696). Nothing resolves it automatically.
 Resolve it by hand once that account no longer hits the bound, for example once its sign-in
 succeeds again.
+
+A lasting directory outage opens its own `ad_reconcile_aborted` instance, with reason
+`directory_unavailable` and source `directory-reconciler-outage` (BACKLOG #3709), once a run of
+`ad_reconcile_outage_passes` passes has read the directory unreachable. It resolves on the first
+pass that reaches the directory, if a pass of this engine process paged it. A pass of referrals or
+configuration refusals reached it; a pass whose every probe failed or faulted did not, and neither
+ends the run nor resolves it. A run pages once: an alert resolved by hand while the outage lasts
+stays resolved until a later run pages. Like the others, it is
+not resolved where the alert was already open when the process started, or where another
+reconciler may share the store; resolve those by hand.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
@@ -1820,9 +1835,9 @@ path, no git commit and no message content.
 | `email_from` | str | _unset_ | sender address (required for email), and the envelope sender (`MAIL FROM`). It must be one plain `local@domain`; a display name, a group or an encoded word is refused at startup. The full address rule, the domain's shape included, is in the `[egress]` `allowed_recipient_domains` row |
 | `email_to` | list | _unset_ | recipient(s) (required for email). Via env: comma-separated `MEFOR_ALERTS_EMAIL_TO`. Each address, and each rule's `recipients` override, is held to the `email_from` rule after any display name is dropped; `RCPT TO` carries exactly that address |
 | `email_use_tls` | bool | `true` | issue STARTTLS before sending. Selects TLS vs **cleartext** — it does not by itself decide whether the relay is authenticated; that is `email_tls_verify` |
-| `email_tls_verify` | bool | `true` | verify the relay's certificate on that STARTTLS hop — chain + hostname + strict RFC 5280, TLS 1.2 floor ([#323](BACKLOG.md)). `false` keeps the session encrypted but accepts **any** certificate (MITM-able). Both `false` values are **loosenings**: `security_loosenings()` names them, `messagefoundry check`'s `alert-smtp-tls` advisory reports them, and on an enforcing PHI instance `serve` **refuses to start** unless `[security].allow_unverified_alert_smtp_tls` is also set |
+| `email_tls_verify` | bool | `true` | verify the relay's certificate on that STARTTLS hop — chain + hostname + strict RFC 5280, TLS 1.2 floor ([#323](BACKLOG.md)). `false` keeps the session encrypted but accepts **any** certificate (MITM-able). Both `false` values are **loosenings**: `security_loosenings()` names them, `messagefoundry check`'s `alert-smtp-tls` advisory reports them, and on an enforcing PHI instance `serve` **refuses to start** unless `[security].allow_unverified_alert_smtp_tls` is also set. Beside `email_username`, either `false` is refused at load, at every posture, and that switch does not cover it (vault BACKLOG #3533) |
 | `email_tls_ca_file` | str | *(unset)* | PEM bundle of trust anchors for that hop. Unset = `[tls].internal_ca_file` if configured, else the OS trust store. A path, not a secret |
-| `email_username` | str | _unset_ | SMTP login user (omit for unauthenticated relays) |
+| `email_username` | str | _unset_ | SMTP login user (omit for unauthenticated relays). Set, an empty string included, it starts SMTP AUTH, so the load refuses it beside `email_use_tls = false` or `email_tls_verify = false` (vault BACKLOG #3533) |
 | `email_password` | str | _unset_ | **secret** — supply via `MEFOR_ALERTS_EMAIL_PASSWORD`, never the file (or use `email_password_secret`) |
 | `email_password_secret` | str | _unset_ | connector `SecretProvider` reference (ADR 0019 §5) — when set and `[secrets].provider` is configured, the SMTP password is resolved from that backend (e.g. a Vault KV `path#field`) instead of `email_password`. A reference, not a secret. |
 | `email_timeout` | num | 30 | seconds per send |
@@ -1981,8 +1996,9 @@ rule 1 would also stop the engine starting, so fix the file. A file whose CRL fa
 check under rule 2 is held back too. On the signature, a start refuses it only where the engine
 proves the signature bad, so fix that file. Short of that proof the signature does not stop a
 start: unless another rule refuses the file, a start loads it with a warning, and each handshake
-then decides. *A start checks each CRL's signature too*, further down, says what counts as proof,
-and names cases that load.
+then decides. The remedy says what the reload found for the CRL it reports (vault BACKLOG #3506):
+`bad_signature` for a proof, and `unproven_signature` or `uncheckable_signature` short of it. *A start checks each CRL's
+signature too*, further down, says what counts as proof, and names cases that load.
 
 **The private copy is about the temporary directory, not the CRL.** The reload loads a private copy
 of the file, made in the engine's temporary directory. When it cannot make that copy, it refuses with
@@ -2005,10 +2021,29 @@ otherwise (the first bullet below says what that leaves out). The CRL names that
 key identifier. The engine ran the signature check with that key, and the check failed. Where
 several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
-authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
-`CRL signature failure`, an error that does not name the file. The refusal names the setting, the
-file and the CRL. Give the setting the CRL that CA signed. No setting turns this check off, as for
-an expired CRL.
+authority key identifier and that carries the subject key identifier the CRL names. A fitting CA
+with no subject key identifier counts for nothing then, whether its key verifies the CRL, does
+not, or cannot be checked (vault BACKLOG #4159). A handshake whose chain runs through the named CA
+and that OpenSSL judges by such a CRL fails with `CRL signature failure`, an error that does not
+name the file. The refusal names the setting, the file and the CRL. Give the setting the CRL that
+CA signed. No setting turns this check off, as for an expired CRL.
+
+**Why a CA with no subject key identifier counts for nothing there, and where that refuses a CRL a
+handshake could pass.** This paragraph is the one statement of that premise and its residuals;
+the code and the changelog point here. The verifying contexts the engine builds set OpenSSL's
+strict verification, as read from their call sites and measured for at least the outbound one.
+Under it OpenSSL 3 refuses a verified chain of two or more certificates through a CA with no
+subject key identifier, so such a CA cannot make the CRL valid for that chain. At least two cases
+are left where the start refuses a CRL that a handshake could pass:
+
+- OpenSSL skips those strict checks where the chain it verifies is one certificate long. That is
+  the length of the chain it builds, which ends at a listed CA, not the number of certificates the
+  peer sends. So a peer whose own certificate is such a CA, self-signed and listed for the hop,
+  passes. It was measured, on CPython 3.14.7 with OpenSSL 3.5.7, to pass a strict handshake judged
+  by a CRL that CA signed and that names the key of another listed CA of the same name, a CRL the
+  start refuses.
+- An OpenSSL build or a verifying context without the strict check could take such a CA for the
+  CRL's issuer. The engine sets no OpenSSL version floor.
 
 The check reads only the file a CRL setting names. A CRL can also reach a hop through its CA file
 alone, on at least the hops that the paragraph on a CRL inside a CA file, further down, names. The
@@ -2039,9 +2074,30 @@ three cases warn:
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
-- The engine cannot check the signature with the listed CA's key, even where the CRL names that key.
-  Two measured examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature
-  over SHA-1 that the CA did make.
+- The engine cannot check the signature with a fitting listed CA's key, at least where it does
+  not support that algorithm or that pairing of key and signature, or where reading the key or
+  checking with it raises an error. Where the CRL names the key of a listed CA that fits it, only
+  such a CA counts here (the paragraph that starts "Why a CA with no subject key identifier" says
+  why). Where it names no such CA's key, as when it names a key no listed CA carries, every
+  fitting CA counts, one with no subject key identifier included. Two measured examples are an
+  ECDSA signature on a CRL that names an RSA key, and an RSA signature over SHA-1 that the CA did
+  make. The CA's key accepts that second one, and the `cryptography` library's own check refuses
+  its digest, so the engine reads it as one it cannot check.
+
+  **That SHA-1 case is a trade-off (vault BACKLOG #4159).** A start loads such a CRL with the
+  WARNING, and the running-hop reload holds it back, so it is applied at the next restart. The
+  cost falls on a host whose TLS library accepts SHA-1, as OpenSSL 3.5.7 was measured to, judging
+  a peer by such a CRL. There a revocation in a new copy waits for a restart, and if nobody
+  restarts, the copy the hop holds lapses at its next update and the hop then refuses the peers
+  it judges by it, as for any held-back file. What it avoids is applying live, with nobody acting, a CRL on which a
+  host that refuses SHA-1, by its build or its system policy, would fail every handshake through
+  that CA. It does not prevent that failure: on such a host the restart loads the CRL with the
+  WARNING, and the handshakes through that CA then fail. Where the copy the hop holds is itself an
+  earlier SHA-1 CRL from that CA, such a host fails those handshakes already, and holding the new
+  copy back gains nothing there. The engine checks with the
+  `cryptography` library's OpenSSL and the handshake runs on Python's, so it cannot tell which
+  kind of host it is on. A forged SHA-1 signature that names a listed CA's key is still proved
+  bad, and refuses the file.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
 it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
@@ -2064,11 +2120,22 @@ engine can read both that root and the CRL. A CA certificate the engine cannot r
 skipped, as though the hop did not list it.
 
 The reload is stricter than a start. Under rule 2 it holds back every CRL it cannot confirm against
-a listed CA. Where the engine matches the CRL to a listed CA and cannot confirm the signature with
-that CA's key, the remedy is the one the `bad_signature` row below describes. That is so whether or
-not the CRL names a key, and whether the check failed or could not run. After a CA renews its key
-the file can be right, and a restart then loads it with the WARNING above. Where the engine matches
-the CRL to no listed CA, the remedy is the `no_issuer` row's: restart.
+a listed CA, and its remedy says what the check found (vault BACKLOG #3506). Where it has the proof
+described above, the remedy is the `bad_signature` row's below: fix the file, which a start that
+finds the same proof refuses too, at any time. Where it matches the CRL to a listed CA and cannot confirm the signature short of
+that proof, the remedy asks you to check the file, then restart. It is the `unproven_signature`
+row's where the check ran and failed but the CRL names no key of that CA, and the
+`uncheckable_signature` row's where the engine could not check the signature with the key of a CA
+it judges (the paragraph that starts "Why a CA with no subject key identifier" says which). After a CA renews its key the file can be right, and a restart then loads it with the WARNING
+above, unless another CRL in the file or another rule refuses it. Where the engine matches the CRL
+to no listed CA, the remedy is the `no_issuer` row's: restart. For one hop, the reload reads the
+file's CRLs in order and reports the first it matches to a listed CA and cannot confirm. It does
+not judge the CRLs after that one, so a CRL proven badly signed later in the file is not reported,
+and a start refuses the file on it. So check every CRL in the file before a restart. A CRL it matches to no
+listed CA is reported only when it finds no CRL of the first kind. If the check fails on a CRL it
+reaches, even after one it matched to no listed CA, that hop's refusal is `retry`. Where
+the hops holding one file get different signature findings, the reload names the one whose row
+comes first below.
 
 **What a signature refusal stops.** It has the reach of the expired-CRL refusal, because one check
 raises both. This is read from the code, not measured end to end. At `serve`, a refused outbound
@@ -2113,7 +2180,7 @@ transport it is a WARNING in the log, beside the reload's ERROR.
 | `remedy_class` | a short token for what to do next; see the next table |
 | `stale_contexts` | how many running TLS contexts still held the old copy at the last reload pass that reported the refusal. A reminder carries that latest count, so it can differ from the count the alert was first raised with |
 | `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
-| `start_refuses` | `true`, and present only then. The remedy could lead you to restart, by naming a restart or by saying a start can load the file, and a start would refuse the file too at least until one of its CRLs takes effect. Do not restart before then. That time is no promise that a start loads the file: with `bad_signature`, for one, a start refuses it after then too, where it proves the signature bad |
+| `start_refuses` | `true`, and present only then. The remedy names a restart, and a start would refuse the file too at least until one of its CRLs takes effect. Do not restart before then. That time is no promise that a start loads the file: another rule can refuse it after then, such as a private copy a start cannot make. `bad_signature` never carries this flag: it names no restart, and a start that finds the same proof refuses that file at any time |
 
 This event carries no CRL contents. The reason for the refusal quotes CRL issuer names and dates, so
 it is left out of this event. It is in the engine log, in the `crl_reload` ERROR line. Read that
@@ -2121,19 +2188,28 @@ line before you act. That holds for this event only: the CRL expiry alert's `det
 reason, once the held copy nears its `nextUpdate`. The expiry date, `held_copy` and `shared_with`
 belong to the CRL expiry alert too. This event carries none of them.
 
+The rows run in the order the reload ranks the classes. Where one pass records more than one class
+for a file, as when the hops holding it need different things, the event carries the one first in
+this table. A pass does not record every class that would apply. At least `not_provable`, and a
+`retry` because the reload could not stage the file, end the pass for that file before the
+signature check runs, so such a pass never weighs a signature class. And for one hop the signature
+check reports one CRL, which the paragraph on the reload above names.
+
 | `remedy_class` | What to do |
 |---|---|
 | `fix_file` | Fix the file. A start would refuse it too. |
-| `lapses_first` | Fix the file now with a CRL that is in effect. The hop's copy lapses before the file's CRL takes effect, and every peer is refused in between. A restart does not help, and a start can refuse the file too. |
-| `bad_signature` | A CRL in the file fails its signature check under rule 2. The signature paragraphs above say when to fix the file and when a restart loads it. |
+| `bad_signature` | The engine proved a CRL in the file badly signed under rule 2: the CRL names the key of a CA the hop lists, and that key does not verify it. Fix the file. A start that finds the same proof refuses it too, at any time. |
 | `not_provable` | Give the setting a bare CRL. The file carries a certificate the reload cannot prove the hop trusts. |
+| `lapses_first` | Fix the file now with a CRL that is in effect. The hop's copy lapses before the file's CRL takes effect, and every peer is refused in between. A restart does not help, and a start can refuse the file too. |
+| `unproven_signature` | The key of the CA the hop lists for a CRL's issuer does not verify it, but the CRL names no key of that CA, so the engine cannot prove it badly signed. Check the file: after a CA renews its key it can be right. Check the file's other CRLs too: the reload judged none after this one, and a start refuses the file where it proves any of them badly signed. Then restart the engine to apply it. |
+| `uncheckable_signature` | The engine could not check a CRL's signature with the key of the listed CA the CRL names by key identifier or, where it names none, of a listed CA that fits it, as with a signature of another kind than that key, or an RSA signature over SHA-1 that the CA did make. Check the file, and its other CRLs too: the reload judged none after this one, and a start refuses the file where it proves any of them badly signed. Then restart the engine to apply it. |
 | `restart` | Restart the engine to apply the file. |
 | `no_issuer` | Restart the engine to apply the file. Adding the issuing intermediate CA to the hop's own CA file does not apply this file; it lets later reloads verify the CRL without a restart. |
 | `retry` | The engine tries again every pass. A restart applies the file now. |
 | `wait` | Wait. The engine applies the file once its CRL takes effect. Do not restart before then. |
 
-The engine sends at least these eight. A remedy it has no token for would be sent as `other`, with
-no remedy sentence.
+The engine sends at least the classes in this table. A remedy it has no token for would be sent as
+`other`, with no remedy sentence.
 
 **A reminder while the refusal stands (vault BACKLOG #3543).** The engine raises the alert at once
 when it first refuses a version of the file, and at once again when the file's bytes change or the
@@ -2149,7 +2225,9 @@ reminder is still sent for a refusal the engine treats as final, such as `fix_fi
 again every pass gets a reminder only from a reload pass that judged it again, and none while the
 engine cannot read the file. That covers at least `wait`, `lapses_first`, `retry`, `no_issuer` and
 one that carries `start_refuses`: such a refusal can name a time that has passed, or lift on its
-own. A read that hangs
+own. It covers `bad_signature` too while some issuer in the file has no CRL in effect yet. The
+engine judges that refusal again every pass then, so it can report a later refusal for the same
+file, such as `lapses_first`. A read that hangs
 rather than fails, such as on a share that stops answering, holds the whole reload loop, so no
 reminder is sent while it hangs. The notifier's cooldown still applies while the alert is open: a second
 refused version, or a reminder, inside `[alerts].realert_seconds` of the last page updates the open
@@ -2158,9 +2236,10 @@ the next reminder pages. A cooldown longer than five minutes throttles some remi
 engine resolves the alert itself, that ends the cooldown, so it does not hold back a refusal that
 follows a fix. A resolve made by hand in the alert list does not end it.
 
-**Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
-the event carries no `start_refuses`. With any other class a start can refuse the file too, and
-then the engine does not come up. Two more points:
+**Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, or
+`unproven_signature` or `uncheckable_signature` once you have checked the file, and only when the
+event carries no `start_refuses`. With any other class a start can refuse the file too, and then
+the engine does not come up. Two more points:
 
 - A `retry` whose ERROR line says the reload could not stage the file. A start can need the same
   private copy and refuse too, so fix the temporary directory first (*The private copy is about
@@ -2224,7 +2303,9 @@ Where a CRL setting names it too, as `[store].ssl_crl_file` can, the check comes
 restart. A start judges that setting. A hop may still hold a stale copy through a CRL setting.
 Only then does the restart wait for the reload's verdict. So after the CA-file step, `detail` says
 to restart once the reload has applied the file. Or it gives a refused reload's remedy and reason.
-The CA-file hop's restart follows, unless that remedy is itself a restart of the engine. The scan
+The CA-file hop's restart follows, unless that remedy orders a restart of the engine with no
+condition before it. A remedy that restarts only once a check passes, and says to fix the file
+otherwise, is followed by it: the reload applies a fixed file to the CRL-setting hops alone. The scan
 may log a WARNING that it could not check the signature of a later CRL in the CA file. It does so
 only after a CRL that `detail` would ask you to check. Then `detail` does not ask for a check: it
 says to replace the CRL before restarting. Put a CRL in the hop's CRL setting instead to have it
@@ -2333,6 +2414,50 @@ Its text names no part of the proxy URL, and `[security].enforcement` does not r
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
+
+#### The secrets directory, `MEFOR_SECRETS_DIRECTORY`
+
+A secret-class setting can come from a file instead of an environment variable
+([ADR 0214](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md),
+vault BACKLOG #2595). Set `MEFOR_SECRETS_DIRECTORY` to an absolute path. It is a path, not a
+secret. Each file in that directory holds one setting and is named exactly as its variable is:
+`MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_AUTH_OIDC_CLIENT_SECRET`,
+`MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY`, `MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD`,
+`MEFOR_ALERTS_EMAIL_PASSWORD`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_VAULT_TOKEN`,
+`MEFOR_SECRETS_VAULT_TOKEN`, `MEFOR_AI_API_KEY`, or `MEFOR_VALUE_<KEY>` for an `env()` value.
+
+- **A file wins over its variable.** With no file for a setting, the variable is read as before.
+  Unset, no directory is read at all.
+- **The engine refuses, at every `[security].enforcement` setting,** a directory or a file in it
+  that a known broad group (at least Everyone, Authenticated Users and the local Users group; on
+  POSIX, a group or other read or write bit) can read or change, a directory in which such a
+  group may delete a file (Windows `FILE_DELETE_CHILD`), and a link on Windows. It also
+  refuses a relative path, a file that is not a regular file, a file named for no setting above
+  (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
+  whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
+  file whose name starts with `.` is ignored. Every load of the settings, by any command, checks
+  the directory, every file name in it, and every file named for a setting above, even one nothing
+  else reads. A `MEFOR_VALUE_*` file's access and contents are checked only when the `env()` values
+  are read: at a `serve` start and on each reload, by `messagefoundry check`, and by
+  `messagefoundry connection upsert` and `remove`, at least. A command that loads the settings and
+  not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
+  named for no setting is cited by its position, never spelled, since its name may be a value.
+- **The access check is a list of known broad groups.** It does not refuse one named account that
+  can write the directory, the way the config-directory checks do, and it does not read the
+  folders above the directory: a broad group that can write one of those could replace the
+  directory. Restrict the directory, and the folders above it, as below rather than relying on
+  the check.
+- **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
+  [`[store].encryption_key_file`](#store).
+- A trailing line break is dropped; any other character, a space included, is part of the value.
+- The files are plain, protected by their access list alone. Nothing creates the directory for you
+  yet. A variable a library reads for itself, such as `VAULT_TOKEN` or `PGPASSWORD`, is not read
+  from here.
+
+On Windows, create the directory with inheritance off, granting SYSTEM and Administrators full
+control and the service account read, and nothing else. On POSIX, make it mode `0700` and each file
+`0600`, owned by the engine's account.
 
 ### `[secret_rotation]`
 Periodic **secret-rotation reminder** ([ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) §5.1) —
@@ -2828,7 +2953,7 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 | `allow_unencrypted_phi` | bool | `false` | audited escape: start a PHI instance with **no** key |
 | `allow_unencrypted_phi_under_strict_enforcement` | bool | `false` | the **second acknowledgment** required to start a PHI instance keyless under strict enforcement ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)). Under `enforcement = enforce`, `allow_unencrypted_phi = true` on its own is **not** enough — `serve` still refuses to start (exit 2) unless this is also set, so the highest-risk posture (real PHI + strict enforcement) is never one flag away from plaintext at rest. Under `enforcement = warn` the single `allow_unencrypted_phi` flag still governs. With both set the instance starts with PHI bodies, summary/metadata and the error columns **unencrypted at rest**, and the startup AUDIT line names **both** flags. A **loosening** — `security_loosenings()` reports it, so it is never silent |
 | `allow_single_factor_admin_when_exposed` | bool | `false` | permit **single-factor sign-in on an exposed PHI instance** (ADR 0140). With `require_mfa` explicitly off, and the instance exposed — a **non-loopback bind**, a declared TLS-terminating proxy (`[api].tls_terminated_upstream`), **or** a set `[api].trusted_proxies` (a loopback bind behind a proxy re-encrypting to an operator `tls_cert_file`; vault BACKLOG #2251) — a PHI instance under `enforcement = enforce` **refuses to start** (exit 2). Every account with no second factor enrolled, Administrators included, would then sign in over the network with a single factor. The one exception is an OIDC sign-in that carries an amr/acr claim checked while `[auth].oidc_require_mfa_claim` is on. The refusal, its exposure warnings and its AUDIT line name it only when this config has it. The `security_loosenings()` entry describes the switch, not one config, so it always names it. The gate reads at least exposure, `require_mfa` and `enforcement`, and never a tier or account kind. Setting this permits that start; it is recorded in a WARNING-level AUDIT line and the ordinary exposure warning still prints. A **loosening** — `security_loosenings()` reports it. **The exposure test does not consult the browser console** ([BACKLOG #326](BACKLOG.md); ADR 0140 amendment). It did, and that made the arm miss the topology this document recommends: a loopback bind behind a declared terminator with `serve_web_console` left at its default, where the ADR 0143 auto-degrade clears the console flag in place before the gate reads it. The exposed surface that authenticates with one factor is the **JSON operator API**, which the proxy serves whether or not `/ui` is mounted, so the predicate is the bind-and-proxy posture alone and the refusal fires on at least: an off-loopback bind; a declared proxy with the console left default-on; and a declared proxy with `serve_web_console = false`. **This refusal is one of at least two exceptions to the "a new refusal fires only on a new opt-in" scoping rule (another is the ADR 0199 store-login refusal)**, which the `require_memory_encryption_declaration` row below states — by owner ruling of 2026-08-04, recorded in the [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) amendment, which is the single source for why. Nothing new gates it. **One residual is deliberately left open:** an **undeclared** proxy — `web_console_public_address` set with neither `tls_terminated_upstream` nor `trusted_proxies` — does not count as exposed here, because nothing was declared, so exposure would be an *inference*, and an inference must not refuse. It **warns** instead, on its own dedicated arm: on a PHI instance with `require_mfa` explicitly off, startup prints that if that origin is served by an undeclared proxy every account with no second factor enrolled is single-factor over the network, with the same OIDC exception, and this refusal cannot see it. Do **not** read the ADR 0068 §8 undeclared-proxy warning as that control — it is about the `/ui` session cookie and HSTS, and it is suppressed entirely when the ADR 0143 auto-degrade clears the console flag, which the same `web_console_public_address` triggers. **Prefer `require_mfa = true` — and know its scope.** Under the shipped `require_mfa_scope = "every_local_account"` it requires a second factor from **every** account, *not* only Administrators and (since BACKLOG #1144) *not* only local ones, so a non-interactive bearer-token service account becomes MFA-pending and cannot enrol unattended. **With `require_mfa` kept on, there is one remedy.** Set `require_mfa_scope = "administrators"` (itself reported as a loosening, and it leaves every Administrator in scope) — see that row below. **Making it a directory (AD/Kerberos) principal is no longer the other one:** directory identities used to be out of scope under either value, their factor delegated to the directory, and BACKLOG #1144 retired that. **mTLS is not one either.** A `[api].tls_client_cert_identities` mapping does grant a cert-identity that never meets the MFA gate, but that plane is admitted on exactly **one** route (`GET /service/identity`, `require_service_cert`) and carries no session, so an account "moved to mTLS" can read back its own identity and nothing else — it cannot replay, purge, poll status, or do any work a service account exists for. The `[api].tls_client_cert_identities` row above is the authority on that reach. An AD-only deployment is therefore in scope for **all** of its accounts — its directory principals, any local administrator, and any local service accounts |
-| `allow_unverified_alert_smtp_tls` | bool | `false` | the **acknowledgment** required to start an enforcing PHI instance whose `[alerts]` SMTP hop does not authenticate the relay — i.e. `[alerts].email_use_tls = false` (cleartext) or `[alerts].email_tls_verify = false` (encrypted but accepts any certificate) ([#323](BACKLOG.md)). Covers BOTH shapes deliberately: cleartext is strictly worse than unauthenticated TLS, so gating only the second would hand an operator a bypass onto the worse posture. Without it `serve` refuses to start (exit 2); with it the start is permitted and named in a WARNING-level `AUDIT:` line. An **acknowledgment switch rather than the clamped `MEFOR_ALLOW_INSECURE_TLS` escape** the connectors use, because this cell is constructed outside the `active_hop_posture` scope, where that clamp reads no posture and so cannot carry an acknowledgment (since vault BACKLOG #2354 it refuses there; it used to be inert). A **loosening** — `security_loosenings()` reports it, so it is never silent |
+| `allow_unverified_alert_smtp_tls` | bool | `false` | the **acknowledgment** required to start an enforcing PHI instance whose `[alerts]` SMTP hop does not authenticate the relay — i.e. `[alerts].email_use_tls = false` (cleartext) or `[alerts].email_tls_verify = false` (encrypted but accepts any certificate) ([#323](BACKLOG.md)). Covers BOTH shapes deliberately: cleartext is strictly worse than unauthenticated TLS, so gating only the second would hand an operator a bypass onto the worse posture. Without it `serve` refuses to start (exit 2); with it the start is permitted and named in a WARNING-level `AUDIT:` line. An **acknowledgment switch rather than the clamped `MEFOR_ALLOW_INSECURE_TLS` escape** the connectors use, because this cell is constructed outside the `active_hop_posture` scope, where that clamp reads no posture and so cannot carry an acknowledgment (since vault BACKLOG #2354 it refuses there; it used to be inert). A **loosening** — `security_loosenings()` reports it, so it is never silent. It covers a hop with **no login** only: with `[alerts].email_username` set, either shape is refused at load, so the SMTP AUTH password never crosses (vault BACKLOG #3533) |
 | `allow_over_granted_store_principal` | bool | `false` | the **audited opt-out** from the refusal an over-granted store login earns under `enforcement = enforce` ([ADR 0199](adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), ASVS 13.2.2). The startup privilege preflight reads the `[store]` login's effective privileges; when it holds more than [`DEPLOY-SERVER-DB.md` §1.1/§1.2](DEPLOY-SERVER-DB.md) prescribes, `serve` refuses to start unless this is set. With it set the start goes ahead, a WARNING-level `AUDIT:` line names the switch, and the `store_privilege_preflight` audit row carries `over_grant_accepted: true`. It lifts that one refusal only: the warning and the `store_privilege_warning` alert still fire, an unobservable probe needs no opt-out (it only warns), and `[store].require_least_privilege = true` outranks it. SQLite never needs it. A **loosening** — `security_loosenings()` reports it. Env: `MEFOR_SECURITY_ALLOW_OVER_GRANTED_STORE_PRINCIPAL` |
 | `allow_remote_debugging` | bool | `false` | the **named acceptance** that lets `serve` and `supervise` start under `enforcement = enforce` with the interpreter's remote debugging (PEP 768) enabled in their process, which they otherwise refuse (vault BACKLOG #2700). For a developer's console-script start; the shipped service launches pass `-X disable-remote-debug` and need nothing. A **loosening**, reported; a start it lets through writes a WARNING-level AUDIT line. See [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Env: `MEFOR_SECURITY_ALLOW_REMOTE_DEBUGGING` |
 | `require_nonstatic_credentials` | bool | `false` | **opt-in static-credential refusal** (ASVS 13.2.1, [BACKLOG #1182](BACKLOG.md)). Off by default, by owner decision (2026-09-23). When `true`, `serve` refuses to start while any backend hop the engine dials presents an unchanging credential or none and is not named in `static_credential_accepted`. The service-settings hops (`[store]`, `[alerts]`, `[auth]`, `[ai]`, `[secrets]`, `[logging]`) are checked before anything starts, and a refusal there exits 2. The connection graph is checked at the first load, where a refusal fails the server's startup, and at every `/config/reload`, where a refused reload leaves the running graph in place. Read once at start: a `/config/reload` judges the new graph against the value the engine started with, so an edit takes effect on restart. The refuse/warn split is `enforcement`, as for `[store].require_managed_identity`. Several hops have **no** compliant credential kind in the product, so with this on they can only run under an opt-out; the full list is in [`CONNECTIONS.md`](CONNECTIONS.md) §*Static credentials on every backend hop*. Not a loosening: it tightens. Env: `MEFOR_SECURITY_REQUIRE_NONSTATIC_CREDENTIALS` |

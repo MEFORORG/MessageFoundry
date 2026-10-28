@@ -115,9 +115,18 @@ class SlidingWindowRateLimiter:
 
     def allow(self, key: str) -> bool:
         """Record and allow an attempt for ``key``, or return ``False`` if it would exceed a limit."""
+        return self.allow_stamped(key) is not None
+
+    def allow_stamped(self, key: str) -> float | None:
+        """:meth:`allow`, answering the monotonic time of the hit it recorded, or ``None`` when it
+        refused. A caller that may later :meth:`renew` the hit keeps the stamp."""
         now = time.monotonic()
         if not self._has_room(key, now):
-            return False  # a rejected attempt does not count toward the window
+            return None  # a rejected attempt does not count toward the window
+        self._record(key, now)
+        return now
+
+    def _record(self, key: str, now: float) -> None:
         if self._global:  # with the global gate off nothing reads the window, so keep none
             self._global_hits.append(now)
         if self._keeps_buckets:
@@ -127,6 +136,31 @@ class SlidingWindowRateLimiter:
             else:
                 bucket.append(now)
                 self._hits.move_to_end(key)
+
+    def renew(self, key: str, stamp: float) -> bool:
+        """Move the hit :meth:`allow_stamped` recorded for ``key`` at ``stamp`` to now, counting no
+        new attempt, and answer whether it did. ``False`` when that hit has left the window (or was
+        never recorded), and then nothing changes: the caller charges a fresh attempt instead.
+
+        BACKLOG #3937: the passkey sign-in's begin leg is charged, and the sign-in POST it pays for
+        renews that charge rather than taking a second. Moving the hit, rather than skipping the
+        second charge, keeps the bound: a hit taken in one window cannot be spent in the next, since
+        a hit counted once is counted again from the moment it is spent."""
+        now = time.monotonic()
+        if self._aged(stamp, now - self._window):
+            return False
+        bucket = self._hits.get(key) if self._keeps_buckets else None
+        if self._keeps_buckets and (bucket is None or stamp not in bucket):
+            return False
+        if self._global and stamp not in self._global_hits:
+            return False
+        if bucket is not None:
+            bucket.remove(stamp)
+            if not bucket:
+                del self._hits[key]
+        if self._global:
+            self._global_hits.remove(stamp)
+        self._record(key, now)
         return True
 
     def would_allow(self, key: str) -> bool:

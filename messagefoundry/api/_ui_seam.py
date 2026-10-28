@@ -696,12 +696,25 @@ from typing import Any
 #: ea0b48d0bf69ec09; this branch at d3f76a351d8328bd). The value below was re-derived with
 #: ``--write`` on the merged tree, so it covers both.
 #:
+#: BACKLOG #3937 items 1, 2 and 5: ``AuthService`` gained ``take_passkey_challenge`` (returning a
+#: ``StagedChallenge``), ``passkeys_count_as_way_past`` (the enrol-first notice) and ``login`` the
+#: ``passkey_challenge`` keyword. ``POST /ui/login`` pops the staged challenge itself and skips its
+#: own sign-in limiter charge only when the result is ``paid`` (docs/SECURITY.md has the rule). The
+#: console keeps ``must_enrol_before_rotating``'s answer in the request scope for the request, and
+#: ``require_ui``'s body changed, which moved the route-gate lines. An older console on this engine
+#: would charge twice; a newer one on an older engine would raise AttributeError at sign-in. They
+#: force a bump. Re-derived with ``--write`` on this branch's tree (from abc94c8c0254d1ff).
+#:
+#: BACKLOG #3937 merged with main, after BACKLOG #1563 landed there (digest 5c0af7774d52531e;
+#: this branch at 27c38abe54f0ffde). The value below was re-derived with ``--write`` on the merged
+#: tree, so it covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "abc94c8c0254d1ff"
+ENGINE_UI_SEAM: str = "36c5fa9d74fc1625"
 
 
 @dataclass(frozen=True, slots=True)

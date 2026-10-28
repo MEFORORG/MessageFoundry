@@ -648,7 +648,7 @@ def test_a_badly_signed_crl_put_in_the_ca_file_is_not_answered_with_a_restart(
     detail = _bundle_detail(bundle)
 
     assert detail.startswith("Replace the CRL in the CA file with one its CA signed")
-    assert "a handshake OpenSSL judges by it fails" in detail
+    assert _PROVEN_BAD_CLAIM in detail
     assert "Restart the engine" not in detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
@@ -687,6 +687,9 @@ _SCAN_FAILED = "Check the CRL in the CA file before restarting: the scan"
 #: The lead of the remedy for a CRL in a CA file whose signature is proven bad.
 _PROVEN_BAD = "Replace the CRL in the CA file with one its CA signed"
 
+#: The claim the remedy for a proven bad CRL in a CA file makes about handshakes.
+_PROVEN_BAD_CLAIM = "a handshake OpenSSL judges by it through the CA it names fails"
+
 #: The whole line the scan logs, naming no file, when it could not check a CA file's CRL.
 _SCAN_FAILED_LINE = "cert_expiry: could not check the CRL in a CA file"
 
@@ -699,7 +702,7 @@ _SCAN_FAILED_LINE = "cert_expiry: could not check the CRL in a CA file"
         ({"bad", "unproven"}, _PROVEN_BAD),
         ({"unlisted", "verified"}, "Restart the engine to apply the CA file"),
         # A state the scan does not name is never a pass, nor the weaker check beside an
-        # unconfirmed one: pki.crl_signature_refusal flags every state but the passing two.
+        # unconfirmed one.
         ({"not-a-state", "verified"}, _CANNOT_JUDGE),
         ({"not-a-state", "unproven"}, _CANNOT_JUDGE),
         ({"not-a-state", "uncheckable"}, _CANNOT_JUDGE),
@@ -720,7 +723,7 @@ def test_the_ca_file_remedy_follows_the_strongest_signature_state(
     detail = _bundle_detail(bundle)
 
     assert detail.startswith(lead), detail
-    assert ("a handshake OpenSSL judges by it fails" in detail) == ("bad" in states), detail
+    assert (_PROVEN_BAD_CLAIM in detail) == ("bad" in states), detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -1070,6 +1073,12 @@ def test_a_refused_reload_keeps_its_remedy_beside_a_ca_file_fix(ca: _Ca, tmp_pat
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
+#: The reload's remedies that order a plain restart of the engine, so no CA-file restart follows
+#: them (BACKLOG #3512). Spelled out here, not read from cert_expiry, so a change to that set is a
+#: change to this test too.
+_PLAIN_RESTARTS = (crl_reload.RESTART, crl_reload.NO_ISSUER, crl_reload.RETRY)
+
+
 #: The CA-file step for a CRL not yet in effect, word for word as before BACKLOG #3512.
 _NOT_IN_EFFECT_STEP = (
     "Replace the CRL in the CA file with one in effect now, or wait until {when}, before "
@@ -1182,6 +1191,8 @@ def test_the_ca_file_step_survives_the_alert_list_s_cut(
         pytest.param(crl_reload.LAPSES_FIRST, id="lapses-first"),
         pytest.param(crl_reload.RESTART, id="restart"),
         pytest.param(crl_reload.BAD_SIGNATURE, id="bad-signature"),
+        pytest.param(crl_reload.UNPROVEN_SIGNATURE, id="unproven-signature"),
+        pytest.param(crl_reload.UNCHECKABLE_SIGNATURE, id="uncheckable-signature"),
         pytest.param(crl_reload._NOT_PROVABLE, id="not-provable"),
         pytest.param(crl_reload.NO_ISSUER, id="no-issuer"),
         pytest.param(crl_reload.RETRY, id="retry"),
@@ -1218,14 +1229,20 @@ def test_an_unconfirmed_crl_in_a_file_that_is_also_a_crl_setting_restarts_after_
         low.count(o) for o in ("restart the engine", "still needs", "a restart applies the file")
     )
     # _NOT_PROVABLE's own sentence says when a restart applies the file to the CRL-setting hop.
-    # It orders no restart of the CA-file hop, so that hop's restart follows it.
-    assert orders == (2 if remedy == crl_reload._NOT_PROVABLE else 1), detail
+    # It orders no restart of the CA-file hop, so that hop's restart follows it. So does each
+    # signature remedy short of proof (vault BACKLOG #3506), whose restart waits on a check.
+    conditional = (
+        crl_reload._NOT_PROVABLE,
+        crl_reload.UNPROVEN_SIGNATURE,
+        crl_reload.UNCHECKABLE_SIGNATURE,
+    )
+    assert orders == (2 if remedy in conditional else 1), detail
     if remedy is None:
         assert rest.startswith("Restart the engine once the reload has applied the file"), detail
     else:
         assert rest.startswith("The reload refused the file for a hop that loads it"), detail
         assert f"{remedy}. Reason: synthetic reason" in rest, detail
-        if "Restart the engine" not in remedy:
+        if remedy not in _PLAIN_RESTARTS:
             # The fix or the wait comes first, then the CA-file hop's restart.
             assert rest.index(remedy) < rest.index("still needs a restart"), detail
         else:
@@ -1287,6 +1304,9 @@ def test_every_reload_remedy_gets_the_ca_file_restart_main_gave_it(ca: _Ca, tmp_
     # engine"; cert_expiry now names the set, and this pins it to main's choice for every remedy.
     # An earlier repair read crl_reload._SAYS_RESTART instead, and dropped the CA-file hop's
     # restart after _NOT_PROVABLE, whose restart is conditional on the CRL-setting hop's trust.
+    # Vault BACKLOG #3506 split main's BAD_SIGNATURE into three remedies. The two short of proof
+    # name a restart only once a check passes, so they keep the step main gave BAD_SIGNATURE, and
+    # the substring no longer tells the set.
     hops, both = _shared_as_crl_and_ca_file(ca, tmp_path)
     fp = crl_fingerprint(both.read_bytes())
     for remedy in crl_reload._PRECEDENCE:
@@ -1295,7 +1315,7 @@ def test_every_reload_remedy_gets_the_ca_file_restart_main_gave_it(ca: _Ca, tmp_
             detail = _row_detail(both)
         finally:
             clear_reload_refusal(both)
-        restarts = "Restart the engine" in remedy
+        restarts = remedy in _PLAIN_RESTARTS
         assert ("still needs a restart" in detail) is not restarts, (remedy, detail)
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
@@ -1326,6 +1346,33 @@ def test_a_not_provable_refusal_keeps_the_ca_file_hop_s_restart(ca: _Ca, tmp_pat
         assert f"{remedy}. Reason: why. {_CA_FILE_HOP_RESTARTS}. Held by: " in detail, detail
     assert ca_step.startswith("Check that the CRL in the CA file is one its CA signed")
     assert all(h.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for h in (*hops, *unconfirmed_hops))
+
+
+@pytest.mark.parametrize(
+    "remedy",
+    [
+        pytest.param(crl_reload.UNPROVEN_SIGNATURE, id="unproven-signature"),
+        pytest.param(crl_reload.UNCHECKABLE_SIGNATURE, id="uncheckable-signature"),
+    ],
+)
+def test_a_signature_remedy_short_of_proof_keeps_the_ca_file_hop_s_restart(
+    ca: _Ca, tmp_path: Path, remedy: str
+) -> None:
+    # Vault BACKLOG #3506 code review: each remedy short of proof orders a restart only once its
+    # check passes, and says to fix the file otherwise. The reload applies a fixed file to the
+    # CRL-setting hops alone, so the CA-file hop's restart must follow, as it follows
+    # BAD_SIGNATURE, the remedy these states read before #3506. Before this repair cert_expiry
+    # counted both as plain restarts and dropped that step.
+    hops, both = _shared_as_crl_and_ca_file(ca, tmp_path)
+    assert "If the file is wrong, fix it" in remedy  # the branch that orders no restart
+    record_reload_refusal(both, ReloadRefusal(crl_fingerprint(both.read_bytes()), "why", remedy))
+    try:
+        detail = _row_detail(both)
+    finally:
+        clear_reload_refusal(both)
+
+    assert f"{remedy}. Reason: why. {_CA_FILE_HOP_RESTARTS}. Held by: " in detail, detail
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
 # --- BACKLOG #3176: a failure grouping the rows, or recording a CA-file CRL -------------------------

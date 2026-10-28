@@ -626,6 +626,14 @@ SITES: dict[str, Site] = {
         "The module stem from an export's inbound name is folded through the guard (BACKLOG #1130).",
         "messagefoundry/corepoint_import.py::_sanitize",
     ),
+    "messagefoundry/engine_secrets.py::SecretsDirectory._read_file": Site(
+        1,
+        GUARDED,
+        "A name from the secrets directory's own listing that the open accepted: one of the fixed "
+        "setting names, or the value prefix then ASCII letters, digits and underscores. No separator "
+        "can reach the join (vault BACKLOG #2595).",
+        "messagefoundry/engine_secrets.py::open_secrets_directory",
+    ),
     "messagefoundry/generators/_core.py::write_corpus": Site(
         2,
         OPERATOR,
