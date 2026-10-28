@@ -610,20 +610,6 @@ def test_without_credentials_in_the_environment_both_connectors_fail_isolated(
     assert rows[("destination", _database.OUTBOUND_NAME)] == "failed"
 
 
-class _MislabelledAlert(AssertionError):
-    """The one failure the xfail below is about; any other failure reports as a real failure."""
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=_MislabelledAlert,
-    reason=(
-        "engine defect: LoggingAlertSink.connection_stopped (messagefoundry/pipeline/alerts.py) "
-        "words every alert 'outbound %r halted', and RegistryRunner._record_failed calls it for an "
-        "INBOUND that failed to start too, whose detail ('failed to start: ...') names no direction "
-        "-- so an inbound startup failure would be alerted to an operator as an outbound"
-    ),
-)
 def test_an_inbound_that_fails_to_start_is_not_alerted_as_an_outbound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -640,8 +626,7 @@ def test_an_inbound_that_fails_to_start_is_not_alerted_as_an_outbound(
         if "connection_stopped" in r.getMessage() and repr(_database.INBOUND_NAME) in r.getMessage()
     ]
     assert alerts, "control: the inbound's failed start raised no connection_stopped alert"
-    if any(f"outbound {_database.INBOUND_NAME!r}" in line for line in alerts):
-        raise _MislabelledAlert(alerts[0])
+    assert not any(f"outbound {_database.INBOUND_NAME!r}" in line for line in alerts), alerts[0]
 
 
 # --- live: a real SQL Server, gated -------------------------------------------------------------------
