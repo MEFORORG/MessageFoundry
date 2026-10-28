@@ -29,6 +29,7 @@ __all__ = [
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
     "REMINDER_SECONDS",
+    "START_FAILURE_DETAIL",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
@@ -54,6 +55,10 @@ INTAKE_DISK_REASON = "disk_floor"
 #: cooldown, ``[alerts].realert_seconds``, which an operator can raise; a cooldown longer than this
 #: throttles some reminders, by that operator's choice.
 REMINDER_SECONDS = 300.0
+
+#: How a ``connection_stopped`` detail for a start failure begins (ADR 0031). The runner writes it,
+#: and the notifier reads it to tell a start failure from a halt (BACKLOG #1741).
+START_FAILURE_DETAIL = "failed to start:"
 
 
 def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str) -> str:
@@ -234,9 +239,11 @@ class AlertSink(Protocol):
         bare inbound name, so it never resolves a prefixed stand-in instance. At least these
         starts never raise it: an outbound's own start; a start where the runner cannot see every
         cause (on a clustered node, or on an engine shard that does not own the outbound
-        namesake); and the start inside a ``restart_inbound`` that a ``connection_stopped`` rule
-        dispatched for its own inbound, so a rule-driven crash loop keeps one open instance. A
-        pause or park of the outbound namesake does not hold it back. ``RegistryRunner._emit_inbound_started`` holds the
+        namesake); a start while the outbound namesake is under an operator-style pause, which a
+        log-write halt's pause looks like; and the start inside a ``restart_inbound`` that a
+        ``connection_stopped`` rule dispatched for its own inbound's halt (not its start failure),
+        so a rule-driven crash loop keeps one open instance. A park the engine or the calendar made
+        of the outbound namesake does not hold it back. ``RegistryRunner._emit_inbound_started`` holds the
         checks. ``name`` is the connection label only (no PHI)."""
         ...
 

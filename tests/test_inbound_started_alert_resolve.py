@@ -38,7 +38,7 @@ from messagefoundry.config.wiring import (
     env,
 )
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
-from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.alerts import START_FAILURE_DETAIL, LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 
@@ -163,7 +163,8 @@ async def test_a_held_outbound_halt_keeps_the_inbound_namesake_from_resolving(
 ) -> None:
     # The outbound halted at run time: a STOP site raises connection_stopped and records the hold,
     # which is what _hold_for_operator does at every outbound STOP. A restart of the inbound of the
-    # same name must leave that alert open. A pause alone is no cause, so it does not.
+    # same name must leave that alert open, and so must an operator-style pause, which is what a
+    # #122 halt's pause of the outbound looks like.
     reg = Registry()
     reg.add_inbound(build_inbound_connection("SHARED", MLLP(port=0), router="r"))
     reg.add_router("r", lambda m: [])
@@ -183,6 +184,9 @@ async def test_a_held_outbound_halt_keeps_the_inbound_namesake_from_resolving(
         assert sink.started == ["SHARED"]
         runner._release_operator_hold("SHARED", "outbound")
         await runner.stop_outbound("SHARED")
+        await runner.restart_inbound("SHARED", operator=True)
+        assert sink.started == ["SHARED"]
+        await runner.start_outbound("SHARED")
         await runner.restart_inbound("SHARED", operator=True)
         assert sink.started == ["SHARED", "SHARED"]
         # A build that failed as the outbound left the DR park is a cause.
@@ -465,6 +469,13 @@ async def test_only_the_rules_own_restart_is_flagged_a_self_restart() -> None:
     sink.queue_buildup("IB", depth=10, oldest_age_seconds=1.0)
     await _settle(sink, sink._control_tasks)
     assert flags == [True, False]
+    # A start failure is no crash loop: the restart that recovers it resolves. A fresh sink, so
+    # the cooldown on the first connection_stopped does not swallow this one.
+    other = NotifierAlertSink([], rules=rules)
+    other.set_control_callback(_control)
+    other.connection_stopped("IB", detail=f"{START_FAILURE_DETAIL} port in use")
+    await _settle(other, other._control_tasks)
+    assert flags == [True, False, False]
 
     # A connection_started reaching the sink always resolves, dropping the count (ADR 0133 D1).
     sink.connection_started("IB")
@@ -589,11 +600,11 @@ async def test_a_start_another_door_makes_while_the_rules_restart_waits_resolves
         await runner.stop()
 
 
-@pytest.mark.parametrize("park", ["deployed", "paused"])
+@pytest.mark.parametrize("park", ["deployed", "auto_start"])
 async def test_a_deliberately_parked_outbound_namesake_does_not_block_the_resolve(
     store: MessageStore, held_port: tuple[int, socket.socket], tmp_path: Path, park: str
 ) -> None:
-    # A pause or a deployed=False park of the outbound of the same name raises no
+    # A deployed=False or auto_start=False park of the outbound of the same name raises no
     # connection_stopped, so it is no cause, and must not hold the inbound's bind-failure alert open.
     port, blocker = held_port
     reg = _registry(port)
@@ -602,14 +613,13 @@ async def test_a_deliberately_parked_outbound_namesake_does_not_block_the_resolv
             "SHARED",
             ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "out")}),
             deployed=park != "deployed",
+            auto_start=park != "auto_start",
         )
     )
     sink = NotifierAlertSink([], store=store)
     runner = _runner(reg, store, sink)
     await runner.start()
     try:
-        if park == "paused":
-            await runner.stop_outbound("SHARED")
         assert runner.inbound_failed("SHARED") and not runner.outbound_running("SHARED")
         await _settle(sink)
         assert await _open(store) == {("connection_stopped", "SHARED")}

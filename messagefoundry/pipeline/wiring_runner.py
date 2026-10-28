@@ -139,7 +139,12 @@ from messagefoundry.parsing.sniff import (
     b64_head,
     text_sniff_head,
 )
-from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import (
+    REMINDER_SECONDS,
+    START_FAILURE_DETAIL,
+    AlertSink,
+    LoggingAlertSink,
+)
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
 from messagefoundry.pipeline.ingress_guards import (
@@ -4428,12 +4433,13 @@ class RegistryRunner:
         store every process shares, so a clustered node, or an engine shard that does not own the
         outbound namesake, cannot see every cause and resolves nothing. A pooled lane a dispatcher
         STOPPED on its own account without a hold (a leadership-loss STOP) counts as a cause too, and
-        so does an outbound namesake whose build failed as it left the DR park. A pause or a park of
-        the outbound namesake (an operator or schedule stop, ``deployed=False``, ``auto_start=False``)
-        is not a cause: it raises no ``connection_stopped``, and a halt that pauses a lane is caught
-        by its own record above. A skipped resolve leaves an alert open for an operator, which is the
-        safe direction, and nothing retries it. Never raises: an alert failure must not break a start
-        or the tail of a committed reload."""
+        so does an outbound namesake whose build failed as it left the DR park. A park the ENGINE or
+        the calendar made (``deployed=False``, ``auto_start=False``, a schedule park) raises no
+        ``connection_stopped`` and is not a cause. An operator-style pause still is: a #122 log-write
+        halt pauses an outbound through the same door and leaves no other record once an inbound
+        start's own probe clears the latch, so the two cannot be told apart here. A skipped resolve
+        leaves an alert open for an operator, which is the safe direction, and nothing retries it.
+        Never raises: an alert failure must not break a start or the tail of a committed reload."""
         try:
             blocked = (
                 not self.inbound_running(name)
@@ -4445,6 +4451,11 @@ class RegistryRunner:
                 or self.outbound_failed(name) is not None
                 or ("outbound", name) in self._stop_held
                 or self.outbound_dr_failed(name)
+                or (
+                    name in self._outbound_paused
+                    and name not in self._gate_parked
+                    and name not in self._schedule_parked
+                )
                 or any(d.stopped(name) for d in self._dispatchers.values())
             )
             if not blocked:
@@ -4737,7 +4748,9 @@ class RegistryRunner:
             exc_info=exc,
         )
         try:
-            self._alert_sink.connection_stopped(alert_name, detail=f"failed to start: {reason}")
+            self._alert_sink.connection_stopped(
+                alert_name, detail=f"{START_FAILURE_DETAIL} {reason}"
+            )
         except Exception:
             log.exception("alert sink raised on connection_stopped for %r", alert_name)
 

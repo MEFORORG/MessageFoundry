@@ -56,6 +56,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
+    START_FAILURE_DETAIL,
     config_changed_detail,
     crl_expiry_detail,
     crl_reload_refused_detail,
@@ -166,7 +167,8 @@ _AUTO_RESOLVE: dict[str, str] = {
 #: the start it makes inside its reload lock. The instance stays open, so its #81 occurrence count,
 #: its tier and any suspend entry carry on, and a rule-driven crash loop still reaches its
 #: ``after_count`` tier; ADR 0133 D1's reset-on-auto-resolve stays true. A start another door makes,
-#: even while that restart waits for the lock, still resolves.
+#: even while that restart waits for the lock, still resolves, and so does the restart that answers
+#: a start failure (``START_FAILURE_DETAIL``): a failed restart raises no new alert, so it is no loop.
 _SELF_RESTART_ACTION = "restart_inbound"
 
 _T = TypeVar("_T")
@@ -1578,11 +1580,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             else:
                 target = decision.control_target
                 # BACKLOG #1741: a connection_stopped restarting its own inbound, by default or by
-                # naming it, is not resolved by that restart's start.
+                # naming it, is not resolved by that restart's start. A start failure is not a
+                # crash loop (a failed restart raises no new alert), so its recovery resolves.
                 own = (
                     event["type"] == "connection_stopped"
                     and decision.control_action == _SELF_RESTART_ACTION
                     and target in (None, subject)
+                    and not str(event.get("detail", "")).startswith(START_FAILURE_DETAIL)
                 )
                 self._dispatch_control(
                     decision.control_action,

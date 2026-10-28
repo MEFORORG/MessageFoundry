@@ -615,8 +615,8 @@ def test_an_inbound_that_fails_to_start_is_not_alerted_as_an_outbound(
 ) -> None:
     """RegistryRunner._record_failed routes an INBOUND's start failure through
     ``connection_stopped`` too, and LoggingAlertSink once worded every such alert ``outbound %r
-    halted``, so an inbound that failed to start was alerted to an operator as an outbound (BACKLOG
-    #1741). Pin the direction-neutral wording on the end-to-end path, every line, not one old
+    halted``, so an inbound that failed to start would have been alerted to an operator as an
+    outbound (BACKLOG #1741). Pin the direction-neutral wording on the end-to-end path, every line, not one old
     substring."""
     for name in _database.REQUIRED_ENV:
         monkeypatch.delenv(name, raising=False)
