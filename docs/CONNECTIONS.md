@@ -145,8 +145,9 @@ transport = "mllp"
   the type it wanted. A quoted TOML value is always a string, so write the number or `true`/`false`
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
   an environment value arrives as text and an **uncast** ref hands the connector that text. A
-  boolean setting is mostly the exception: it is read strictly whatever the cast (vault BACKLOG
-  #3234; [CONFIGURATION.md](CONFIGURATION.md) gives the spellings and the settings it misses). An inline
+  boolean setting is mostly the exception: once resolved, it is read strictly whatever the cast,
+  `ftp`'s `tls` included (vault BACKLOG #3234; [CONFIGURATION.md](CONFIGURATION.md) gives the
+  spellings and what it misses). An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
   The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
@@ -1747,13 +1748,47 @@ reads `SERVER` as its target.
 
 An `SSLCA` file whose text names a PEM encryption header (`Proc-Type` or `DEK-Info`) after its
 first `-----BEGIN` is refused when the connection is built (BACKLOG #3090). The driver loads that
-file with its own TLS library, which can wait for a password on an encrypted block. The check
-runs when the connection is built, not at each connect, so a file replaced afterwards is not
-checked. At least these cases are left to the driver unchecked: a file that does not exist, a
-directory (an `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot
-read, or one over 16 MiB, is refused. An `SSLCA` file that names a PEM label ending in
-`PRIVATE KEY` after its first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA
-file is public trust material. An `SSLCERT` file is not checked this way.
+file with its own TLS library, which can wait for a password on an encrypted block. At least
+these cases are left to the driver unchecked: a file that does not exist, a directory (an
+`SSLCAPATH` directory included), and a device or pipe. A file the engine cannot read, or one
+over 1 MiB, is refused. That includes a share Windows cannot reach when the connection is
+built, however it fails. One case is left to the driver instead: under the TLS-off modes the lane
+check below names, a share Windows reports as not found because it could not reach it (errors
+53 and 67). An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
+first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA file is public trust
+material.
+
+An `SSLCA` file is also a trust anchor of the connection's lane, as a `tls_ca_file` is
+(`auth.trust_anchors`, module item 12). The engine checks who can write the file and the folders
+above it, audits its fingerprint in `auth.trust_anchor` rows, and runs the content checks above
+again. A file another account can replace, or whose content now fails, refuses the lane when it
+is built or an operator starts it, at `[security].enforcement = enforce`; `warn` warns about the
+ACL and path instead. Before a reload, the same check on a lane the reload keeps running refuses
+the whole reload, and the running lane is not stopped. A file swapped since the last check is
+audited as `changed`. The check does not run under `SSLmode=disable` (or `SSLMODE=DISABLED`),
+where the driver reads no CA, and there is no pin for this file. A missing file or a directory
+is left to the driver here too, and a pipe or device is refused unread. **What it does not
+cover**, at least: a running lane's pool goes on reading the file at each new connect until the
+lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
+for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all.
+
+An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-wrap check
+(BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key
+with a weak wrap is refused, and so is an encrypted key with no `sslpassword`. A legacy
+`Proc-Type: 4,ENCRYPTED` key is refused even with one. A certificate with no key passes, PEM or
+DER. With `SSLKEY` set, the key comes from that file, so `SSLCERT` is not read; a blank `SSLKEY`
+counts as unset, since a driver may trim it. Each file is read
+the way an `SSLCA` file is: a missing file is left to the driver, a padded value is checked as a
+driver may trim it, and a file over 1 MiB is refused. A directory, a device or a pipe is left to
+the driver as `SSLCERT`, and refused unread as `SSLKEY`. At least these gaps remain:
+
+- **MySQL's ODBC driver has no passphrase keyword.** An `sslpassword` set beside its `SSLCERT`
+  passes this check, the driver ignores it, and it may still prompt for the key's password.
+- **libpq does not read a key out of `sslcert`.** It reads the key from `sslkey`, or from its own
+  default path, which this check never sees. With no `sslkey` set, an encrypted key inside
+  `sslcert` is still refused here, although libpq would not load it.
+- **The key and certificate files are checked only when the connection is built.** Neither is a
+  lane trust anchor, so a file swapped afterwards is not checked.
 
 Any other keyword is refused when the connection is built, and the error names the keyword and
 the connection. That fails `messagefoundry check`, a reload and a `connection` edit. At `serve`
@@ -3297,7 +3332,7 @@ outbound(
 | Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
 | What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane, except on `FhirLookup()`, where it refuses the start. At a reload it refuses the reload, if the reload builds or keeps that lane running. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
 | What if it is blank? | On these six factories, and on `Email()` and `Direct()`, a blank literal is refused at load. A blank `env()` value is refused when it resolves, naming the setting, the connection and the environment key (vault BACKLOG #2370). |
-| When is it refused as unread? | On `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. On the others, a token hop can still read it. |
+| When is it refused as unread? | At least on `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. An `Ftp(tls=env(...))` whose value is a false spelling is refused the same way once it resolves, at start, check and reload (vault BACKLOG #3234). One that resolves to `None` is FTPS and reads the CA. On the others, a token hop can still read it. |
 | What if it is unset? | The hop is built exactly as before, from the instance `[tls]` block or the OS store. |
 
 **It is opt-in.** Every default still trusts the OS store, so an internal hop without it is verified

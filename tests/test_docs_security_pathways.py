@@ -57,7 +57,7 @@ from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
 from tests._ast_sites import call_sites
-from tests._sign_in_claim import SIGN_IN_ANY_TENSE, SIGN_IN_CLAIM
+from tests._sign_in_claim import SIGN_IN_CLAIM
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -519,10 +519,19 @@ def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> N
     )
 
 
+def _provider_reads(tree: ast.AST) -> int:
+    """How many provider branches ``tree`` holds: each ``.auth_provider`` read and each call of
+    ``_is_directory_account``, the service's shared reading (BACKLOG #3117, #3780). Docstrings are
+    constants, so they never match."""
+    attrs = sum(
+        1 for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
+    )
+    return attrs + len(call_sites(tree, "_is_directory_account", bare_only=True))
+
+
 def _reads_auth_provider(func: Callable[..., Any]) -> bool:
-    """True when ``func``'s body reads ``.auth_provider``. Docstrings are constants, so they never match."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
-    return any(isinstance(n, ast.Attribute) and n.attr == "auth_provider" for n in ast.walk(tree))
+    """True when ``func``'s body holds a provider branch (:func:`_provider_reads`)."""
+    return _provider_reads(ast.parse(textwrap.dedent(inspect.getsource(func)))) > 0
 
 
 def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> None:
@@ -552,20 +561,22 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     """
 
     # Since BACKLOG #3068 the one provider branch lives in the shared helper both second-factor legs
-    # call, so verify_mfa reads no provider itself and the helper reads it exactly once.
-    def _attrs(func: object) -> list[str]:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
+    # call, so verify_mfa reads no provider itself and the helper reads it exactly once (through
+    # _is_directory_account since BACKLOG #3780; _provider_reads counts either form).
+    def _tree(func: object) -> ast.AST:
+        return ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
+
+    def _attrs(tree: ast.AST) -> list[str]:
         return [n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)]
 
-    verify_attrs = _attrs(AuthService.verify_mfa)
-    helper_attrs = _attrs(AuthService._directory_vouches_for_factor)
-    reread_attrs = _attrs(AuthService._factor_holder_current)
+    verify_tree = _tree(AuthService.verify_mfa)
+    helper_tree = _tree(AuthService._directory_vouches_for_factor)
     assert (
-        verify_attrs.count("auth_provider") == 0
-        and reread_attrs.count("auth_provider") == 0
-        and "_directory_vouches_for_factor" in verify_attrs
-        and helper_attrs.count("auth_provider") == 1
-        and "_directory_step_up_refusal" in helper_attrs
+        _provider_reads(verify_tree) == 0
+        and _provider_reads(_tree(AuthService._factor_holder_current)) == 0
+        and "_directory_vouches_for_factor" in _attrs(verify_tree)
+        and _provider_reads(helper_tree) == 1
+        and "_directory_step_up_refusal" in _attrs(helper_tree)
     ), (
         "verify_mfa grew a provider branch beyond the BACKLOG #2023 directory check; re-derive the "
         "pathway rows, which say a directory account's TOTP leg feeds and meets the lockout."
@@ -580,10 +591,9 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
         AuthService.finish_webauthn_registration,
     ):
         assert not _reads_auth_provider(func), (
-            f"{func.__qualname__} now reads auth_provider. The pathway rows say a directory account "
+            f"{func.__qualname__} now branches on the provider. The pathway rows say a directory account "
             "can enrol TOTP or a passkey and that its TOTP leg feeds the lockout; re-derive both."
         )
-    verify_tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService.verify_mfa)))
     assert any(
         isinstance(n, ast.Attribute) and n.attr == "_register_failure"
         for n in ast.walk(verify_tree)
@@ -4216,22 +4226,27 @@ def test_the_thirteenth_sweep_deployment_states_the_built_intake_auth(scope: str
         ), "the caveat must say the allow-list is not consulted once intake_auth names a mode"
 
 
-def test_the_thirteenth_sweep_loosening_note_binds_no_user_at_sign_in() -> None:
-    """docs/SECURITY-LOOSENING.md said the password of every user who signs in crosses a plain
-    `ldap://` hop. Simple-bind sign-in is retired; the step-up re-bind is the only user bind left
-    (the probe above)."""
+def test_the_loosening_guide_lists_a_plain_ldap_bind_as_refused_not_as_a_loosening() -> None:
+    """Vault BACKLOG #3533 item 1 removed ``[auth].ad_allow_insecure_ldap``. Its loosening entry,
+    which this test once read for a sign-in claim, went with it. The guide must not describe the
+    plain bind as a lever any more, and its credential-refusal table must name it."""
     doc = _doc("docs/SECURITY-LOOSENING.md")
-    start = doc.index("### `[auth].ad_allow_insecure_ldap = true`")
-    section = doc[start : doc.index("\n### ", start + 1)]
-    clauses = [c for c in _clauses(section) if "password" in c]
-    assert clauses, "the cleartext-LDAP section names no password, so this check reads nothing"
-    # The shared pattern in every tense, so "sign-in", "login", "signed in" and "logged on" are read.
-    at_sign_in = [c for c in clauses if SIGN_IN_ANY_TENSE.search(c)]
-    assert not at_sign_in, (
-        f"docs/SECURITY-LOOSENING.md says a user's sign-in binds a password again: {at_sign_in}"
+    assert "### `[auth].ad_allow_insecure_ldap" not in doc, (
+        "docs/SECURITY-LOOSENING.md still has a loosening entry for the removed opt-in"
     )
-    assert any(re.search(r"\bstep(?:s|-)? ?up\b", c) for c in clauses), (
-        "the cleartext-LDAP section must say the step-up re-bind carries the user's password"
+    start = doc.index("## No escape sends a credential to an unverified peer")
+    section = doc[start : doc.index("\n## ", start + 1)]
+    table, _, rest = section.partition("**The rule does not reach every hop yet.**")
+    assert re.search(r"^\| `\[auth\]` AD binds \| `ad_server` is a plain `ldap://`", table, re.M), (
+        "the refusal table does not name the plain ldap:// AD bind"
+    )
+    end = rest.find("\nAn SFTP login")
+    bullets = [
+        line for line in rest[: end if end != -1 else None].splitlines() if line.startswith("- ")
+    ]
+    assert bullets, "found no bullets under the not-reached heading, so this check reads nothing"
+    assert not [b for b in bullets if "ldap://" in b], (
+        "the not-reached list still names the plain ldap:// bind"
     )
 
 
@@ -4685,13 +4700,10 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
     )
     # Since BACKLOG #3068 the branch is the shared helper's: the leg reads no provider itself.
     provider_reads = sum(
-        1
-        for fn in (assertion, helper, _service_func("_factor_holder_current"))
-        for n in ast.walk(fn)
-        if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
+        _provider_reads(fn) for fn in (assertion, helper, _service_func("_factor_holder_current"))
     )
     assert provider_reads == 1, (
-        f"finish_webauthn_assertion and its two helpers read auth_provider {provider_reads} "
+        f"finish_webauthn_assertion and its two helpers branch on the provider {provider_reads} "
         "times; the lockout paragraph says each second-factor leg has ONE provider branch, the "
         "directory check."
     )

@@ -111,6 +111,15 @@ def _edit(cfg: Path) -> None:
         fh.write("# an edit nobody reloaded\n")
 
 
+def _covered_file(cfg: Path, name: str) -> None:
+    """A file the fingerprint covers and no load reads, for a partial digest. Since vault BACKLOG
+    #2596 a load reads every module from the one snapshot the fingerprint folds, so a module the
+    digest cannot read is a load that refuses, not a partial digest; only a covered-only file can
+    be left out of a digest while the graph still loads."""
+    (cfg / "environments").mkdir(exist_ok=True)
+    (cfg / "environments" / name).write_text('X = "1"\n', encoding="utf-8")
+
+
 # --- the store read ------------------------------------------------------------------------------
 
 
@@ -774,7 +783,7 @@ async def test_a_convergence_row_with_no_digest_is_passed_over(
     async with app.router.lifespan_context(app):
         engine: Engine = app.state.engine
 
-        async def _no_digest(self: Engine, path: Path) -> tuple[None, str]:
+        async def _no_digest(self: Engine, path: Path, *_snapshot: object) -> tuple[None, str]:
             return None, "synthetic: unreadable bundle"
 
         with monkeypatch.context() as patch:
@@ -1288,12 +1297,13 @@ async def test_a_file_locked_at_one_start_pages_on_the_same_bytes_with_the_marke
     """Item 4, as the Lander's send-back of engine PR 2370 left it (vault BACKLOG #3765): a file an
     antivirus lock holds at one start and not at the next gives two digests for the same bytes.
     main pages on both, and so does this; the marker says why, and nothing is passed over."""
+    _covered_file(cfg, "dev.toml")
     await _start(tmp_path, cfg)
     with monkeypatch.context() as m:
-        _unreadable(m, "cfg.py")
+        _unreadable(m, "dev.toml")
         partial = await _start(tmp_path, cfg)
     assert [a["comparison"] for a in alerts] == ["partial_start_digest"]
-    assert partial[-1][UNREADABLE_FILES_KEY] == ["cfg.py"]
+    assert partial[-1][UNREADABLE_FILES_KEY] == ["environments/dev.toml"]
     assert partial[-1]["comparison"] == "partial_start_digest"
     assert "baseline_unchecked" not in partial[-1]
     # The next start, with the file readable again, compares against the partial row and pages.
@@ -1431,9 +1441,9 @@ async def test_two_digests_that_left_out_the_same_file_are_compared(
 ) -> None:
     """Item 4, review round 1: a file that stays unreadable must not turn the check off. Digests
     that left out the same files cover the same files, so they compare like for like."""
-    (cfg / "_locked.py").write_text("LOCKED = 1\n", encoding="utf-8")
+    _covered_file(cfg, "locked.toml")
     with monkeypatch.context() as m:
-        _unreadable(m, "_locked.py")
+        _unreadable(m, "locked.toml")
         first = await _start(tmp_path, cfg)
         assert first[-1]["comparison"] == "no_baseline"
         rows = await _start(tmp_path, cfg)
@@ -1451,16 +1461,19 @@ async def test_a_convergence_row_with_a_partial_digest_is_a_baseline(
     """A partial convergence digest is a baseline, as any digest is on main: a whole start compares
     against it and pages (vault BACKLOG #3765, item 15). Passing over it would let a start whose
     bytes match an older row adopt whatever the convergence reload loaded."""
+    _covered_file(cfg, "dev.toml")
     await _start(tmp_path, cfg)
     app = _app(tmp_path, cfg)
     async with app.router.lifespan_context(app):
         engine: Engine = app.state.engine
         with monkeypatch.context() as m:
-            _unreadable(m, "cfg.py")
+            _unreadable(m, "dev.toml")
             await engine._converge_reload(1)
         reload_rows = await engine.store.list_audit(action="config_reload")
     row = json.loads(reload_rows[0]["detail"])
-    assert row[UNREADABLE_FILES_KEY] == ["cfg.py"] and "baseline_unchecked" not in row
+    assert (
+        row[UNREADABLE_FILES_KEY] == ["environments/dev.toml"] and "baseline_unchecked" not in row
+    )
     rows = await _start(tmp_path, cfg)
     assert rows[-1]["comparison"] == "partial_baseline"
     assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == row["fingerprint"]
@@ -1473,11 +1486,11 @@ async def test_a_failed_digest_before_the_load_never_blocks_the_start(
     real = Engine.fingerprint_bundle
     calls: list[Path] = []
 
-    async def _first_raises(self: Engine, path: Path) -> Any:
+    async def _first_raises(self: Engine, path: Path, *snapshot: Any) -> Any:
         calls.append(path)
         if len(calls) == 1:
             raise RuntimeError("synthetic")
-        return await real(self, path)
+        return await real(self, path, *snapshot)
 
     with monkeypatch.context() as m:
         m.setattr(Engine, "fingerprint_bundle", _first_raises)
@@ -1495,10 +1508,10 @@ async def test_a_partial_start_whose_digest_differs_pages_and_is_the_baseline(
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:
     """Item 15: an edit made while a file is unreadable pages at that start, as main does."""
-    (cfg / "_locked.py").write_text("LOCKED = 1\n", encoding="utf-8")
+    _covered_file(cfg, "locked.toml")
     await _start(tmp_path, cfg)
     with monkeypatch.context() as m:
-        _unreadable(m, "_locked.py")
+        _unreadable(m, "locked.toml")
         _edit(cfg)
         rows = await _start(tmp_path, cfg)
         assert len(alerts) == 1, "main pages on this digest change"
@@ -1516,9 +1529,9 @@ async def test_a_whole_start_after_a_partial_baseline_pages(
 ) -> None:
     """Item 16: the first whole start after a partial baseline compares and pages; it does not
     adopt the edits made since then as a new baseline."""
-    (cfg / "_locked.py").write_text("LOCKED = 1\n", encoding="utf-8")
+    _covered_file(cfg, "locked.toml")
     with monkeypatch.context() as m:
-        _unreadable(m, "_locked.py")
+        _unreadable(m, "locked.toml")
         await _start(tmp_path, cfg)
     _edit(cfg)
     rows = await _start(tmp_path, cfg)
@@ -1591,9 +1604,9 @@ async def test_a_partial_digest_whose_fold_equals_the_baseline_still_pages(
     while the start digested it folds to the baseline's value. Coverage is compared too."""
     before = config_fingerprint(cfg)
     await _start(tmp_path, cfg)
-    (cfg / "_new.py").write_text("NEW = 1\n", encoding="utf-8")
+    _covered_file(cfg, "new.toml")
     with monkeypatch.context() as m:
-        _unreadable(m, "_new.py")
+        _unreadable(m, "new.toml")
         assert config_fingerprint(cfg) == before, "control: the fold matches the baseline's"
         rows = await _start(tmp_path, cfg)
     assert len(alerts) == 1 and alerts[0]["comparison"] == "partial_start_digest"

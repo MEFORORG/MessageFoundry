@@ -31,6 +31,26 @@
 
 ---
 
+## Amendment 2026-10-27: a login never crosses an unauthenticated `[alerts]` hop
+
+The 2026-08-02 amendment below says `[security].allow_unverified_alert_smtp_tls` lets an enforcing
+instance start with an `[alerts]` hop that does not authenticate the relay. That switch also let the
+SMTP AUTH password cross such a hop. It no longer does.
+
+- With `[alerts].email_username` set, `email_use_tls = false` or `email_tls_verify = false` is
+  refused when settings load, at every posture, with no escape. An empty username counts, because
+  the sender runs AUTH whenever a username is set.
+- The switch still permits an unauthenticated hop with **no** login, at the serve gate, with its
+  AUDIT line. Alert bodies and notice email still cross that hop.
+- The refusal lives in `AlertsSettings`, not the serve gate. The section alone decides the shape,
+  so `serve`, `check`, a reload and every CLI command that loads settings refuse it the same way.
+
+This matches the EMAIL and DIRECT connectors, which refuse a credential over such a hop with no
+escape. The batch 342 Manager decided it on 2026-10-26, under the owner's driver rule, after an
+adversarial review affirmed it. [vault BACKLOG #3533](../BACKLOG.md) item 3 records it.
+
+---
+
 ## Amendment 2026-10-10: the sender's domain is gated by the same list
 
 The 2026-10-02 amendment below left one question open: should `[egress].allowed_recipient_domains`
