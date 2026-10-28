@@ -638,7 +638,7 @@ def test_a_failing_tee_is_reported_again_after_the_interval_and_never_counts_row
             tee(n)
     lines = [r.getMessage() for r in caplog.records if r.name == audit_tee.log.name]
     assert len(within) == 1 and "tee failed" in within[0], within  # five failures, one line
-    assert len(lines) == 2 and "still failing" in lines[1], lines  # three more, one more line
+    assert len(lines) == 2 and "failed again" in lines[1], lines  # three more, one more line
     for line in lines:
         assert "auth." not in line and "account_locked" not in line, line
         assert not any(ch.isdigit() for ch in line.replace("300", "")), line  # no row count

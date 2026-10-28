@@ -13,6 +13,7 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import re
 import sys
 import threading
@@ -1372,8 +1373,35 @@ def test_a_general_log_flood_does_not_cost_an_audit_line(
 
     assert fwd.dropped > 0, "the flood never overflowed the general lane, so it tested nothing"
     delivered = [r.getMessage() for r in target.seen]
-    audit = [line for line in expected for m in delivered if m.endswith(line)]
+    # Walk what was DELIVERED, so a lane that re-ordered its own lines goes red here.
+    audit = [line for m in delivered for line in expected if m.endswith(line)]
     assert audit == expected  # every audit line, once each, in the order it was logged
+
+
+def test_the_drop_report_names_dropped_audit_lines_without_counting_them(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A count of dropped audit tee lines counts the audit rows written, the hidden lock rows
+    included, and the drop report reaches ``GET /logs/tail`` (BACKLOG #1131, #2612). So the report
+    names an audit drop and puts no number on it. The status counter still counts it."""
+    from messagefoundry.store import audit_tee
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_QUEUE_MAXSIZE", 2)
+    target = _CapturingHandler()
+    fwd = _build_queued_forwarder(target, fmt="text")
+    assert fwd._listener.stop_within(1.0)  # nothing drains, so the lane fills
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        for i in range(7):
+            fwd.handle(
+                logging.LogRecord(
+                    audit_tee.audit_logger.name, logging.INFO, __file__, 1, f"row {i}", None, None
+                )
+            )
+    assert fwd.audit_dropped == 5 and fwd.dropped == 5  # counted for the status surface
+    reports = [r.getMessage() for r in caplog.records if "audit tee lines" in r.getMessage()]
+    assert len(reports) == 1, reports
+    assert not any(ch.isdigit() for ch in reports[0]), reports[0]  # named, never counted
 
 
 def test_the_drop_report_does_not_recurse_on_the_root_logger(
@@ -1512,6 +1540,33 @@ def test_a_full_queue_still_accepts_the_stop_sentinel(
     finally:
         gate.set()
     assert fwd._stopped
+
+
+def test_a_plain_bounded_queue_makes_room_for_the_stop_sentinel() -> None:
+    """``enqueue_sentinel``'s discard loop, on the plain bounded queue it is kept for. The shipped
+    :class:`_ForwardLanes` always takes the sentinel (BACKLOG #2612), so the test above no longer
+    reaches the loop; this one goes red if the stdlib ``enqueue_sentinel`` is restored, because
+    ``put_nowait`` on a full queue raises ``queue.Full``."""
+    records: queue.Queue[Any] = queue.Queue(maxsize=2)
+    records.put_nowait("a")
+    records.put_nowait("b")
+    listener = logging_setup._ForwardQueueListener(records, _CapturingHandler())
+    listener.enqueue_sentinel()
+    assert listener._sentinel_queued
+    assert [records.get_nowait(), records.get_nowait()] == ["b", None]  # oldest made room
+
+
+def test_the_lanes_always_take_the_stop_sentinel() -> None:
+    """The shipped queue exempts the sentinel from both bounds, so a full lane neither refuses it
+    nor discards a record for it (BACKLOG #2612)."""
+    lanes = logging_setup._ForwardLanes(1, 1)
+    lanes.put_nowait("general")
+    with pytest.raises(queue.Full):
+        lanes.put_nowait("one too many")
+    listener = logging_setup._ForwardQueueListener(lanes, _CapturingHandler())
+    listener.enqueue_sentinel()
+    assert lanes.qsize() == 2
+    assert [lanes.get_nowait(), lanes.get_nowait()] == ["general", None]
 
 
 def test_a_broken_stream_forwarder_reconnects_on_the_next_record(

@@ -6123,10 +6123,19 @@ directory's `size_bytes` and the database's `audit` row count as null to a calle
 `users:manage`: the first counted the tee's copies of the hidden rows, and the second minus the
 rows `GET /audit` returns was their exact number. Four rarer log lines no longer carry the bit: a
 failed lock-notice throttle read names neither the account nor the notice; a broken tee sink is
-logged once per process without the row's action; SMTP with `tls_verify = false` is logged once per
+logged without the row's action; SMTP with `tls_verify = false` is logged once per
 process for each relay, by the security notifier when it is built rather than at its first send; and
-a failed TLS key-exchange pin is logged once per process. **The cost of the tee line:** a sink that
-stays broken, or recovers and breaks again, is reported only by that first line.
+a failed TLS key-exchange pin is logged once per process.
+
+**CHANGED by vault BACKLOG #2612: the tee-failure line is rate limited, not once per process.** The
+first failure is logged with its traceback; a later one at most once per
+`TEE_FAILURE_REPORT_INTERVAL` (300 seconds), with no row, no count and no exception type
+(`_report_tee_failure` in `messagefoundry/store/audit_tee.py`). **The residual:** each line is
+written in the second an audit row's tee failed, so a `logs:view` reader without `users:manage` who
+finds a line with no visible `GET /audit` row in that second learns that a hidden row was written
+then, at most once per interval. The 2026-09-28 decision above accepted the opposite cost, a sink
+that stays broken reported only by its first line; the off-box forwarder's drop report names
+dropped audit tee lines without counting them, for the same reason.
 
 **A notice the relay loses is audited (BACKLOG #2383).** The `auth.lock_notice` row is written
 when the notice is handed to the relay. It reads `mailed: true` only when the relay queued the

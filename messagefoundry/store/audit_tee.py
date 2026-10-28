@@ -22,7 +22,9 @@ installed a handler for it to propagate to, which is a property of the *process*
 transmits nothing itself. The copy reaches every handler the process installed. The one built to
 ship it off the host is the syslog forwarder that :mod:`messagefoundry.logging_setup` installs when
 forwarding is configured and the forwarder comes up. That forwarder carries the copy in its own lane
-of the hand-off queue, so a flood of general log lines cannot drop it (vault BACKLOG #2612); no
+of the in-memory hand-off queue, so a flood of general log lines cannot drop it from that queue
+(vault BACKLOG #2612). The on-disk spool behind the queue is shared and size-capped, so a flood
+there can still cost audit lines; `docs/CONFIGURATION.md` says how. No
 handler is attached to the ``messagefoundry.audit`` logger for that, so each sink still sees the
 copy once, through propagation. Its protocol is whatever
 ``[logging].forward_protocol`` says: TLS is ADR 0080, and the on-disk spool for a collector that is
@@ -105,7 +107,8 @@ def _report_tee_failure() -> None:
     this log to ``logs:view``, which the Operator holds without ``users:manage``, and a count of
     failed tees counts the rows written, the hidden lock rows included. A later line says only that
     a tee failed again, so it tells a reader at most that an audit row was written, once per
-    interval. The first line carries the traceback; later ones carry none."""
+    interval. That timing is the residual ``docs/SECURITY.md`` names. The first line carries the
+    traceback; later ones carry none, not even the exception type, which could differ by row kind."""
     global _tee_failure_reported_at
     now = time.monotonic()
     with _tee_failure_lock:
@@ -122,7 +125,7 @@ def _report_tee_failure() -> None:
         )
     else:
         log.warning(
-            "off-box audit tee is still failing; the rows are still in the audit_log table",
+            "off-box audit tee failed again; the rows are still in the audit_log table",
         )
 
 

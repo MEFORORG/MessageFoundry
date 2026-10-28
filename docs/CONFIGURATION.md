@@ -1069,19 +1069,22 @@ applies, and the alert item above says what the suffix holds. The count in the a
 different number: how many times the engine has raised that alert.
 
 `queued` is how many records sit on the in-memory hand-off queue right now. It does not count
-records waiting in the on-disk spool, and no field does.
+records waiting in the on-disk spool, and no field does. Every other count runs from the start of
+the process. While the state is `not_installed`, every count reads zero, whatever was counted
+before. Each engine process has
+its own forwarder and watches its own: every engine shard, and a cluster standby too.
 
 **Audit tee lines have their own lane of that queue** (vault BACKLOG #2612). Each lane holds up
 to 10,000 records, so a flood of general log lines against a collector that is not taking them
 fills the general lane and leaves the audit lane room. The forwarder sends the next audit line
 before the next general one, so an audit line can reach the collector ahead of a general line
-logged before it; order the two by their timestamps. `queue_dropped` counts drops from both
-lanes, and `lost` counts each once. The audit lane fills on audit traffic alone, and the alert
-reason above says when it has. Both lanes share one sending thread, one connection and one
-on-disk spool, so a full spool refuses audit lines as it refuses general ones. Every other count runs from the start of
-the process. While the state is `not_installed`, every count reads zero, whatever was counted
-before. Each engine process has
-its own forwarder and watches its own: every engine shard, and a cluster standby too.
+logged before it. The line's own time stamp has whole seconds only, so it cannot restore the
+order of two lines logged in the same second; an audit line's JSON body carries a `ts` with
+fractions of a second, and a general line has nothing like it. `queue_dropped` counts drops from
+both lanes, and `lost` counts each once. The audit lane fills on audit traffic alone, and the
+alert reason above says when it has. The drop warning in the engine log names dropped audit
+lines without counting them. Both lanes share one sending thread, one connection and one on-disk
+spool, so a full spool refuses audit lines as it refuses general ones.
 `GET /status` reports the process that answered.
 
 ### `[retention]`

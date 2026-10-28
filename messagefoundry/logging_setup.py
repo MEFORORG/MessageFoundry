@@ -1459,24 +1459,34 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
                 audit_total,
             )
             self._dropped_since_report = 0
-        # Named only when there is one: the audit lane fills on audit traffic alone, so this is rare.
+        # The numbers in this line count GENERAL records only. A count of dropped audit tee lines
+        # counts the audit rows written, the hidden lock rows included, and this line reaches
+        # ``GET /logs/tail`` (BACKLOG #1131). So an audit drop is named, never counted.
+        general_batch, general_total = batch - audit_batch, total - audit_total
         audit_note = (
-            f" {audit_batch} of them were audit tee lines, whose own lane (depth "
-            f"{_FORWARD_AUDIT_QUEUE_MAXSIZE}) was full; {audit_total} audit line(s) dropped so far."
+            " Audit tee lines were dropped as well, because their own lane of the queue is full."
             if audit_batch
             else ""
         )
         self._reporting.active = True
         try:
-            _log.warning(
-                "off-box log forwarding dropped %d record(s): the hand-off queue is full (depth %d) "
-                "because the collector is not draining it; %d dropped since this process started. "
-                "Evidence for this window does not reach the collector.%s",
-                batch,
-                _FORWARD_QUEUE_MAXSIZE,
-                total,
-                audit_note,
-            )
+            if general_batch:
+                _log.warning(
+                    "off-box log forwarding dropped %d record(s) of general log traffic: the hand-off "
+                    "queue is full (depth %d) because the collector is not draining it; %d dropped "
+                    "since this process started, audit tee lines not counted. Evidence for this "
+                    "window does not reach the collector.%s",
+                    general_batch,
+                    _FORWARD_QUEUE_MAXSIZE,
+                    general_total,
+                    audit_note,
+                )
+            else:
+                _log.warning(
+                    "off-box log forwarding dropped audit tee lines: their lane of the hand-off "
+                    "queue is full because the collector is not draining it. Evidence for this "
+                    "window does not reach the collector."
+                )
         finally:
             self._reporting.active = False
 
@@ -1746,6 +1756,9 @@ def forwarder_status() -> ForwarderStatus:
             configured=True, start_failure=start_failure, delivery_confirmed=confirmed
         )
     spool = listener.spool
+    # One read under the lock _count_drop holds, so the audit part never reads ahead of its total.
+    with handler._counter_lock:
+        queue_dropped, audit_queue_dropped = handler.dropped, handler.audit_dropped
     return ForwarderStatus(
         configured=True,
         installed=True,
@@ -1753,8 +1766,8 @@ def forwarder_status() -> ForwarderStatus:
         send_failing=listener.send_failing,
         send_failures=listener.send_failures,
         queued=handler._records.qsize(),
-        queue_dropped=handler.dropped,
-        audit_queue_dropped=handler.audit_dropped,
+        queue_dropped=queue_dropped,
+        audit_queue_dropped=audit_queue_dropped,
         unsent=listener.unsent,
         undeliverable=listener.undeliverable,
         spool_dropped=spool.dropped if spool is not None else 0,
