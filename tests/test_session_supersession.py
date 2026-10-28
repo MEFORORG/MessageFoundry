@@ -15,6 +15,7 @@ end. These pin what a route test cannot see:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -26,11 +27,21 @@ import pytest
 from messagefoundry.auth import Role
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.oidc import FederatedPrincipal
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import (
+    _LOGOUT_LINEAGE_SECONDS,
+    AuthService,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._logout_rows import (
+    logout_details,
+    logout_rows,
+    seal_failed_details,
+    temp_password_expired_rows,
+)
+from tests._session_cap_contract import _revoked
 from tests._session_race import rotate_after_first_call
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
@@ -305,22 +316,14 @@ async def test_a_logout_records_whether_it_ended_a_session(store: MessageStore) 
     # The return value is the same outcome the row records, in both cases.
     service = await _service(store)
     token = await _token(service)
-    first = await service.logout(token, actor="op", client=None)
-    replay = await service.logout(token, actor="op", client=None)
+    first = await service.logout(token, actor="op", client=None, proven_at=None)
+    replay = await service.logout(token, actor="op", client=None, proven_at=None)
     assert not await _live(service, token)
     assert [first, replay] == ["revoked", "nothing_to_revoke"]
-    assert await _logouts(store) == [
-        {"outcome": "nothing_to_revoke", "actor": "op"},
-        {"outcome": "revoked", "actor": "op"},
+    assert await logout_rows(store) == [
+        ("op", None, "nothing_to_revoke"),
+        ("op", None, "revoked"),
     ], "newest first: the replay, then the logout"
-
-
-async def _logouts(store: MessageStore) -> list[dict[str, object]]:
-    """Each ``auth.logout`` row, newest first, as its ``outcome`` plus the row's ``actor``."""
-    return [
-        {"outcome": json.loads(str(row["detail"] or "{}")).get("outcome"), "actor": row["actor"]}
-        for row in await store.list_audit(action="auth.logout")
-    ]
 
 
 async def test_a_logout_with_no_actor_names_the_owner_of_the_session_it_ended(
@@ -332,25 +335,23 @@ async def test_a_logout_with_no_actor_names_the_owner_of_the_session_it_ended(
     # matching a default of "op".
     service = await _service(store)
     token = await _token(service, "other")
-    first = await service.logout(token, client="203.0.113.5")
-    replay = await service.logout(token, client="203.0.113.6")
+    first = await service.logout(token, client="203.0.113.5", proven_at=None)
+    replay = await service.logout(token, client="203.0.113.6", proven_at=None)
     assert [first, replay] == ["revoked", "nothing_to_revoke"]
-    assert await _logouts(store) == [
-        {"outcome": "nothing_to_revoke", "actor": None},
-        {"outcome": "revoked", "actor": "other"},
-    ]
     # BACKLOG #3339: each row records the address that call passed, on both branches.
-    rows = await store.list_audit(action="auth.logout")
-    assert [row["client"] for row in rows] == ["203.0.113.6", "203.0.113.5"]
+    assert await logout_rows(store) == [
+        (None, "203.0.113.6", "nothing_to_revoke"),
+        ("other", "203.0.113.5", "revoked"),
+    ]
 
 
 async def test_a_logout_with_no_token_returns_nothing_to_revoke_and_writes_no_row(
     store: MessageStore,
 ) -> None:
     service = await _service(store)
-    assert await service.logout(None, client=None) == "nothing_to_revoke"
-    assert await service.logout("", client=None) == "nothing_to_revoke"
-    assert await _logouts(store) == []
+    assert await service.logout(None, client=None, proven_at=None) == "nothing_to_revoke"
+    assert await service.logout("", client=None, proven_at=None) == "nothing_to_revoke"
+    assert await logout_rows(store) == []
 
 
 async def test_a_rotation_racing_a_self_revoke_is_not_reported_as_a_revoke(
@@ -362,8 +363,8 @@ async def test_a_rotation_racing_a_self_revoke_is_not_reported_as_a_revoke(
     # test_a_rotation_racing_the_supersession_cannot_keep_the_session_live: the rotation runs right
     # after the FIRST store call naming the target's hash, which is the read, so the rotation always
     # lands and the session lives on under its new token. The call must then return False and write
-    # no row. Ending it under its rotated token is not this call's to do; that is BACKLOG #3028. The
-    # branch where the revoke lands is test_api_auth.py::test_list_and_revoke_own_session.
+    # no row. Ending it under its rotated token is the self-revoke half of BACKLOG #3715, still
+    # open. The branch where the revoke lands is test_api_auth.py::test_list_and_revoke_own_session.
     service = await _service(store)
     target = await _token(service)
     target_hash = hash_token(target)
@@ -416,7 +417,7 @@ async def test_the_no_op_inputs_revoke_nothing_and_write_no_row(
 ) -> None:
     service = await _service(store)
     dead = await _token(service)
-    await service.logout(dead, client=None)
+    await service.logout(dead, client=None, proven_at=None)
     prior: str | None = {
         "none": None,
         "empty": "",
@@ -546,3 +547,216 @@ async def test_the_callback_supersedes_only_after_the_proof_succeeds(
     assert outcome.ok is ok, outcome
     assert await _live(service, prior) is not ok
     assert len(await _superseded(store)) == (1 if ok else 0)
+
+
+# --- BACKLOG #3715, #3749: the lineage a logout follows, a lapsed row, every miss writes ---
+
+
+async def _rotated(service: AuthService, token: str) -> str:
+    """Re-key ``token``'s session, as an elevation in another tab does, and return the new token."""
+    new = await service._rotate_session_token(token)
+    assert new is not None, "the rotation failed closed"
+    return new
+
+
+async def test_a_lapsed_session_is_recorded_as_lapsed_and_names_its_owner(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3749 item 4. The revoke still ends a row over its idle limit, but the row used to
+    # say "revoked", which put the end of a live session in the owner's feed. It is judged as the
+    # sign-in supersession judges it, and the owner stays the actor so the user still sees it.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    token = await _token(service)
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 40 * 60)  # idle 40 min, limit 30: lapsed
+    assert await service.logout(token, client=None, proven_at=None) == "lapsed"
+    assert await logout_rows(store) == [("op", None, "lapsed")]
+
+
+async def test_a_logout_follows_no_rotation_older_than_its_bound_before_proven_at(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3715. POST /auth/logout passes the moment its request arrived as proven_at, and a
+    # link retired more than _LOGOUT_LINEAGE_SECONDS before that is not followed. The clock steps
+    # past the bound, so the rotation lands strictly before it.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    token = await _token(service)
+    successor = await _rotated(service, token)
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + _LOGOUT_LINEAGE_SECONDS + 1.0)
+    outcome = await service.logout(token, client=None, actor="op", proven_at=time.time())
+    assert outcome == "nothing_to_revoke"
+    assert await _live(service, successor), "a link older than the bound was followed"
+
+
+async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(
+    store: MessageStore,
+) -> None:
+    # The positive control for the test above: proven before the rotation, the retired token
+    # ends its successor, and the row names both hashes.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    token = await _token(service)
+    proven = time.time()
+    successor = await _rotated(service, token)
+    outcome = await service.logout(token, client=None, actor="op", proven_at=proven)
+    assert outcome == "revoked"
+    assert not await _live(service, successor)
+    assert await logout_details(store) == [
+        {
+            "outcome": "revoked",
+            "session": hash_token(successor)[:12],
+            "presented": hash_token(token)[:12],
+        }
+    ]
+
+
+async def test_every_sign_out_that_ends_nothing_writes_its_row(store: MessageStore) -> None:
+    # BACKLOG #3749: no budget drops these rows. A sign-out that presents a token writes its
+    # auth.logout row, so 150 misses from one client with nothing proven write 150 rows. A later
+    # bound on this flood would change this test on purpose; docs/SECURITY.md names the gap.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    count = 150
+    for n in range(count):
+        assert (
+            await service.logout(f"no-such-token-{n}", client="203.0.113.9", proven_at=None)
+            == "nothing_to_revoke"
+        )
+    rows = await logout_rows(store, limit=count * 2)
+    assert len(rows) == count, "a sign-out that ended nothing wrote no row"
+    assert set(rows) == {(None, "203.0.113.9", "nothing_to_revoke")}
+
+
+# --- BACKLOG #3749: a session the gate would refuse is not recorded as the end of a live one ---
+
+_EXPIRY_HOURS = 72
+
+
+async def _lapse_the_credential(store: MessageStore, username: str) -> None:
+    """Give ``username`` an admin-issued temporary credential whose deadline passed a minute ago."""
+    await store._db.execute(
+        "UPDATE users SET must_change_password=1, password_changed_at=? WHERE username=?",
+        (time.time() - _EXPIRY_HOURS * 3600 - 60, username),
+    )
+    await store._db.commit()
+
+
+async def _stale_the_epoch(store: MessageStore, username: str) -> None:
+    """Raise ``username``'s session epoch outside the store's own revoke, so a session sealed under
+    the old epoch stays unrevoked: the row the gate refuses as one that fails its seal (#2592)."""
+    await store._db.execute(
+        "UPDATE users SET session_epoch=session_epoch+1 WHERE username=?", (username,)
+    )
+    await store._db.commit()
+
+
+async def test_a_superseded_prior_whose_temporary_credential_lapsed_writes_the_gates_row(
+    store: MessageStore,
+) -> None:
+    """RED when: a sign-in that ends a prior session whose owner's temporary credential lapsed
+    audits it as the end of a live session (``auth.session_revoked``), or writes no
+    ``auth.temp_password_expired`` row for it (BACKLOG #3749). The gate would refuse that session
+    and write that row, so the supersession records what the gate would, naming the session."""
+    service = await _service(store, initial_password_expiry_hours=_EXPIRY_HOURS)
+    prior = await _token(service, "op")
+    await _lapse_the_credential(store, "op")
+    outcome = await service.login("other", PW, client="192.0.2.4", supersedes=prior)
+    assert outcome.ok
+    assert await _revoked(store, hash_token(prior))
+    assert await _superseded(store) == [], "a session the gate refuses was recorded as live"
+    assert await temp_password_expired_rows(store) == [
+        (
+            "op",
+            "192.0.2.4",
+            {
+                "provider": "local",
+                "expiry_hours": _EXPIRY_HOURS,
+                "at": "superseded",
+                "session": hash_token(prior)[:12],
+            },
+        )
+    ]
+
+
+async def test_a_lapse_row_reached_through_a_followed_link_names_both_hashes(
+    store: MessageStore,
+) -> None:
+    """RED when: the lapse row a supersession writes in place of ``auth.session_revoked`` drops
+    the references that row carries, so a followed link, the retired token's power, leaves no
+    trace (BACKLOG #3749, ADR 0210)."""
+    service = await _service(store, initial_password_expiry_hours=_EXPIRY_HOURS)
+    prior = await _token(service, "op")
+    successor = await _rotated(service, prior)
+    await _lapse_the_credential(store, "op")
+    assert (await _token(service, "other", supersedes=prior)) is not None
+    assert await _revoked(store, hash_token(successor))
+    assert await _superseded(store) == []
+    rows = await temp_password_expired_rows(store)
+    assert [detail for _, _, detail in rows] == [
+        {
+            "provider": "local",
+            "expiry_hours": _EXPIRY_HOURS,
+            "at": "superseded",
+            "session": hash_token(successor)[:12],
+            "presented": hash_token(prior)[:12],
+        }
+    ]
+
+
+async def test_a_lapse_row_that_fails_is_logged_and_the_sign_in_still_succeeds(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RED when: a refused ``auth.temp_password_expired`` row raises out of the supersession, which
+    runs after the new session was minted and the prior one ended, so the sign-in would fail with
+    a session already live (BACKLOG #3749). It is logged instead, naming the session."""
+    service = await _service(store, initial_password_expiry_hours=_EXPIRY_HOURS)
+    prior = await _token(service, "op")
+    await _lapse_the_credential(store, "op")
+    real_record = store.record_audit
+
+    async def _refuse_lapse_row(action: str, **kwargs: object) -> None:
+        if action == "auth.temp_password_expired":
+            raise OSError("the audit store refused the row")
+        await real_record(action, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "record_audit", _refuse_lapse_row)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+        outcome = await service.login("other", PW, supersedes=prior)
+    assert outcome.ok and outcome.token is not None
+    assert await _revoked(store, hash_token(prior))
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == [
+        f"a sign-in's supersession ended session {hash_token(prior)[:12]}, whose temporary"
+        " credential had lapsed, but its auth.temp_password_expired row failed"
+    ]
+
+
+# An epoch-stale session is one a gate would end (BACKLOG #2592), but a sign-out and a supersession
+# read the account after their own revoke, so a whole-account revoke landing between the two would
+# make a live session look stale. They record it as they record a live session, and write no
+# integrity report. These two pin that decision; see AuthService._gate_refusal.
+
+
+async def test_a_superseded_prior_from_a_stale_epoch_is_recorded_as_superseded(
+    store: MessageStore,
+) -> None:
+    service = await _service(store)
+    prior = await _token(service, "op")
+    await _stale_the_epoch(store, "op")
+    assert (await _token(service, "other", supersedes=prior)) is not None
+    assert await _revoked(store, hash_token(prior))
+    assert await _superseded(store) == [
+        {"scope": "superseded", "session": hash_token(prior)[:12], "actor": "op"}
+    ]
+    assert await seal_failed_details(store) == []
+    assert await temp_password_expired_rows(store) == []
+
+
+async def test_a_logout_of_a_session_from_a_stale_epoch_records_revoked(
+    store: MessageStore,
+) -> None:
+    service = await _service(store)
+    token = await _token(service, "op")
+    await _stale_the_epoch(store, "op")
+    assert await service.logout(token, client="192.0.2.5", proven_at=None) == "revoked"
+    assert await logout_rows(store) == [("op", "192.0.2.5", "revoked")]
+    assert await seal_failed_details(store) == []
+    assert await temp_password_expired_rows(store) == []
