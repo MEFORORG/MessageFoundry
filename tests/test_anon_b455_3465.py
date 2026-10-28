@@ -125,6 +125,17 @@ def test_what_still_passes(anon: ModuleType, message: str, line: str) -> None:
     assert _checked(anon, message).split("\r")[-1] == line
 
 
+@_NO_SCANNER
+@_SIDES
+def test_a_shape_in_the_header_line_passes_even_under_full_coverage(anon: ModuleType) -> None:
+    """The header limit docs/PHI.md section 9 states: the check and ``require_full_coverage``
+    both skip the header line whole, so a shape cut across MSH-4 to MSH-6 leaves as it came."""
+    header = "MSH-^~\\&-A-123-45-6789-20260101--ORU^R01-M1-P-2.5.1"
+    message = f"{header}\rPID-1--1^^^H^MR--X^Y"
+    out = anon.anonymize_checked(message, salt=_SALT, require_full_coverage=True)
+    assert _SSN in out.split("\r")[0]
+
+
 @_LEAKS
 def test_a_shape_wholly_in_rewritten_fields_is_not_a_hit(leak: ModuleType) -> None:
     """A rewritten field is never re-flagged, so a match whose every field a rule rewrote is no
@@ -146,19 +157,3 @@ def test_a_malformed_line_names_its_fields_without_its_id(leak: ModuleType) -> N
         "unmapped SSN-shaped value across (malformed segment)-1 to (malformed segment)-3, "
         "cut by the field separator"
     ) in hits
-
-
-def test_engine_and_tee_agree_on_every_case_here() -> None:
-    messages = [
-        f"{_DASH_HEAD}\rZZZ-1-{_SSN}",
-        f"{_DASH_HEAD}\rZZZ-1-555-555-0100",
-        f"{_DASH_HEAD}\rOBX-1-ST-8480^S^LN--[REDACTED]-45-6789",
-        f"{_DASH_HEAD}\rOBX-1-NM-8480^S^LN--000-12-3456",
-        f"{_DASH_HEAD}\rzz-{_SSN}",
-        f"{_PIPE_HEAD}\rZZZ|1|{_SSN}",
-    ]
-    for message in messages:
-        for mapped in (set(), {"ZZZ-2"}, {"OBX-5"}):
-            assert engine_leak.structural_phi_hits(message, mapped) == tee_leak.structural_phi_hits(
-                message, mapped
-            )

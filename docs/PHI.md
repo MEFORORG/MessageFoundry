@@ -2204,12 +2204,13 @@ these still get through, on both anonymizers:
   such a rest too.
 - A shape whose separators the sender escaped, as HL7 asks: `123\F\45\F\6789`. No detector
   decodes an escape.
-- A shape cut by a digit field separator, such as `4`. The detectors read the separator at either
-  end as part of a longer number.
+- A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
+  it. The detectors read that digit as part of a longer number.
 - A shape in the header line, which the check skips whole.
 
 With `require_full_coverage` on, such a message is refused for as long as nobody decides the
-fields that carry the rest of the shape. A `keep` on each of them would let it through.
+fields that carry the rest of the shape. A `keep` on each of them would let it through. That
+switch skips the header line too, so it does not refuse a shape there.
 
 **A wrapped line can still look like a segment, but its id is never printed.** A line such as
 `KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id

@@ -21,8 +21,9 @@ already-pseudonymized field is never re-flagged:
 * **high-precision structural PHI-shape detectors** over those unmapped values (dashed SSN,
   punctuated NANP phone, CX ``MR``/``MRN``-typed identifier, and a line whose segment id is
   malformed), plus a dashed SSN or punctuated phone that the message's own field separator cut
-  across fields, when at least one of them is unmapped (BACKLOG #3465) — narrow by design to avoid the mass false-positives a broad digit-run search would
-  produce on HL7 bodies (ADR 0030 §5). A name, an undashed number or a date in an unmapped field
+  across fields, when at least one of them is unmapped (BACKLOG #3465) — narrow by design to
+  avoid the mass false-positives a broad digit-run search would produce on HL7 bodies (ADR 0030
+  §5). A name, an undashed number or a date in an unmapped field
   is NOT detected; the coverage report is the only record of it (BACKLOG #1710).
 
 The token-floor signal (``token_floor_failure``) is recorded in every report
@@ -38,6 +39,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -96,6 +98,15 @@ _SPLITTABLE_SHAPES: tuple[tuple[re.Pattern[str], str], ...] = (
     (_PHONE_DASHED, _PHONE_REASON),
     (_PHONE_PAREN, _PHONE_REASON),
 )
+
+
+def _can_cut_a_shape(field_sep: str) -> bool:
+    """True if ``field_sep`` is a character some :data:`_SPLITTABLE_SHAPES` match can hold: a
+    digit, whitespace, ``-``, ``(`` or ``)``. Under any other, ``|`` among them, no line can hold
+    a cut shape, so the walk skips the line scan."""
+    return field_sep.isdigit() or field_sep.isspace() or field_sep in "-()"
+
+
 #: HL7 CX id-type codes that mark a component as a medical-record number.
 _MRN_TYPES: frozenset[str] = frozenset({"MR", "MRN"})
 #: A well-formed HL7 segment id: a capital letter, then two capitals or digits (``PID``, ``ZPD``).
@@ -382,6 +393,7 @@ def _walk(
     seps, field_sep, lines, header_at = found
     out: list[tuple[str, str]] = []
     split_hits: list[str] = []
+    split = split and _can_cut_a_shape(field_sep)
     if version is None:
         version = _header_version(lines[header_at].split(field_sep), seps)
     nameable = known_segments(version) | {path.split("-", 1)[0] for path in mapped_paths}
@@ -396,11 +408,11 @@ def _walk(
         # by line.
         if n == header_at and is_msh:
             continue
+        # One address per split index; None for a field the check does not judge.
+        addresses: list[str | None]
         # An MSH line ahead of the header is refused whatever it holds. The tee adapter takes
         # the FIRST line whose id reads MSH as its header, so with one here an MSH rule would
         # miss the real header, which this walk never checks.
-        # One address per split index; None for a field the check does not judge.
-        addresses: list[str | None]
         if _line_is_malformed(fields, nameable) or (n < header_at and is_msh):
             # Index 0 is _MALFORMED_LINE, recorded even when empty.
             addresses = [f"{MALFORMED_SEGMENT}-{i}" for i in range(len(fields))]
@@ -438,21 +450,20 @@ def _split_shape_hits(line: str, field_sep: str, addresses: Sequence[str | None]
     ``addresses`` names each split index of the line, ``None`` for a field the check does not
     judge. A match is a hit when at least one field it reaches has an address, and the hit names
     the first and last of those. So a match that starts in a field a rule rewrote is a hit when it
-    runs on into a field no rule rewrites: the shape reached the output whole.
-
-    At least these pass: the rest of a shape whose first or last part a rule scrubbed, such as
-    ``45-6789``, which is no shape; a shape the sender escaped, such as ``123\\F\\45``, since no
-    detector decodes an escape; and a shape cut by a digit separator, which the shapes' digit
-    boundaries read as part of the number. docs/PHI.md section 9 lists them."""
+    runs on into a field no rule rewrites: the shape reached the output whole. What still passes
+    is listed once, in docs/PHI.md section 9."""
     hits: list[str] = []
+    cuts = [i for i, c in enumerate(line) if c == field_sep]
     for pattern, reason in _SPLITTABLE_SHAPES:
         for match in pattern.finditer(line):
             if field_sep not in match.group():
                 continue
-            # The fields that hold a character of the match. A separator at its first character
-            # belongs to no field, so counting through that character starts at the next field.
-            first = line.count(field_sep, 0, match.start() + 1)
-            last = line.count(field_sep, 0, match.end() - 1)
+            # The fields that hold a character of the match: the separators at or before its first
+            # character, and those before its last. A separator at its first character belongs
+            # to no field, so counting it starts at the next field. Positions are found once per
+            # line, so a long line costs a search per match, not a rescan.
+            first = bisect_right(cuts, match.start())
+            last = bisect_left(cuts, match.end() - 1)
             named = [a for a in addresses[first : last + 1] if a is not None]
             if named:
                 span = named[0] if len(named) == 1 else f"{named[0]} to {named[-1]}"
@@ -488,7 +499,7 @@ def structural_phi_hits(
     """Structural PHI-shape hits over the fields no rule matched — reasons name the shape + field
     ADDRESS only (e.g. ``"unmapped SSN-shaped value in ZPD-4"``), never the offending value, so the
     result is safe to raise/log. Empty when the message has no parseable MSH. ``version`` is
-    handed to :func:`unmapped_field_values`.
+    handed to the walk behind :func:`unmapped_field_values`.
 
     A line no rule can reach (a malformed segment id, or a short header line; see
     :func:`_line_is_malformed`) is a hit by itself, whatever it holds: the anonymizer passed it
