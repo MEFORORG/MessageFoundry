@@ -250,4 +250,71 @@ async def test_a_cell_that_did_not_open_before_the_check_spends_no_code(
         assert (await service.verify_mfa(pending.token, codes[0])).ok
     finally:
         await store.close()
+
+
+async def test_a_cell_that_opens_before_the_check_but_not_for_it_spends_no_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other order: the enrolment read before the check opens, the check's own open does not.
+    The check raises at its TOTP decrypt, before any recovery code is read, so the verify is refused
+    ``factor_unverified``, never raised, and the recovery code still verifies afterwards."""
+    from messagefoundry.store.crypto import CipherError
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _identity, password, _steps, codes = await _totp_admin(
+            store, monkeypatch, before_confirm=lambda: None
+        )
+        real_open = store.open_totp_secret
+        opens = [0]
+
+        def second_fails(user_id: str, cell: str | None) -> str | None:
+            opens[0] += 1
+            if opens[0] == 2:
+                raise CipherError("synthetic: the cipher service dropped this request")
+            return real_open(user_id, cell)
+
+        monkeypatch.setattr(store, "open_totp_secret", second_fails)
+        pending = await service.login(ADMIN_USERNAME, password)
+        assert pending.ok and pending.token is not None
+        assert not (await service.verify_mfa(pending.token, codes[0])).ok
+        assert opens[0] == 2, "the verify did not reach the check's own open"
+        rows = await store.list_audit(action="auth.mfa_failed")
+        assert any((r["detail"] or "").find("factor_unverified") >= 0 for r in rows), rows
+        assert (await service.verify_mfa(pending.token, codes[0])).ok
+    finally:
+        await store.close()
+
+
+async def test_a_disable_during_the_after_check_comparison_stops_the_factor_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The after-check comparison opens the cell in a worker thread, so a self-service disable,
+    which takes no account queue, can land during it. The holder is read again after it, so the
+    disable is seen: the verify is refused ``factor_removed`` and the session's factor is not
+    marked. RED when the factor is written after the comparison with no read of the holder."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, steps, _codes = await _totp_admin(
+            store, monkeypatch, before_confirm=lambda: None
+        )
+        real_moved = service._totp_enrolment_moved
+        landed: list[bool] = []
+
+        async def disable_lands_meanwhile(*args: Any, **kwargs: Any) -> Any:
+            moved = await real_moved(*args, **kwargs)
+            if not landed:
+                landed.append(True)
+                await store.disable_totp(identity.user_id)
+            return moved
+
+        monkeypatch.setattr(service, "_totp_enrolment_moved", disable_lands_meanwhile)
+        pending = await service.login(ADMIN_USERNAME, password)
+        assert pending.ok and pending.token is not None
+        assert not (await service.verify_mfa(pending.token, steps.next_code())).ok
+        assert landed, "the comparison never ran, so nothing landed during it"
+        assert not await service.mfa_satisfied(pending.token)
+        rows = await store.list_audit(action="auth.mfa_failed")
+        assert any((r["detail"] or "").find("factor_removed") >= 0 for r in rows), rows
+    finally:
         await store.close()

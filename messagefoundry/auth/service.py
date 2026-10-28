@@ -2429,10 +2429,16 @@ def _log_totp_malformed(username: str) -> None:
     )
 
 
-def _totp_columns(user: VerifiedUser) -> tuple[bool, float | None, str | None]:
-    """The columns that name ``user``'s TOTP enrolment as stored: on or off, its stamp and its
-    still-encrypted cell. Equal columns name one enrolment with no cell opened (BACKLOG #3929)."""
-    return user.totp_enabled, user.totp_enrolled_at, user.totp_secret_cell
+def _same_totp_columns(a: VerifiedUser, b: VerifiedUser) -> bool:
+    """Whether ``a`` and ``b`` store one TOTP enrolment: on or off, its stamp and its cell, so no
+    cell is opened to tell (BACKLOG #3929). The cells are compared in constant time (ASVS 11.2.4):
+    on a keyless store a cell is the secret itself."""
+    if (a.totp_enabled, a.totp_enrolled_at) != (b.totp_enabled, b.totp_enrolled_at):
+        return False
+    cell_a, cell_b = a.totp_secret_cell, b.totp_secret_cell
+    if (cell_a is None) != (cell_b is None):
+        return False
+    return constant_time_equal(cell_a or "", cell_b or "")
 
 
 def _same_totp_enrolment(a: _TotpEnrolment, b: _TotpEnrolment) -> bool:
@@ -13144,11 +13150,11 @@ class AuthService:
                 # A cell that no longer opens proves nothing either way; the proof is spent, so it
                 # is refused and audited too rather than raised past the "never raises" contract.
                 refusal = await self._totp_enrolment_moved(verified_enrolment, fresh)
-                if refusal is None:
-                    # BACKLOG #3929: that comparison opened the cell in a worker thread, so a
-                    # revocation, a disable or a lock can land during it. The holder is read once
-                    # more, so the last read before the write is a store read again, and an
-                    # enrolment that moved meanwhile is compared again.
+                # BACKLOG #3929: each comparison opens the cell in a worker thread, so a revocation,
+                # a disable or a lock can land during it. The holder is read again after each one
+                # until a read finds the stored enrolment the comparison judged, so the last read
+                # before the write is a store read, and the write is for the enrolment compared.
+                while refusal is None:
                     settled = await self._factor_holder_current(
                         token,
                         actor=fresh.username,
@@ -13158,9 +13164,11 @@ class AuthService:
                     )
                     if isinstance(settled, Elevation):
                         return settled
-                    if _totp_columns(settled) != _totp_columns(fresh):
-                        refusal = await self._totp_enrolment_moved(verified_enrolment, settled)
+                    unmoved = _same_totp_columns(settled, fresh)
                     fresh = settled
+                    if unmoved:
+                        break
+                    refusal = await self._totp_enrolment_moved(verified_enrolment, fresh)
                 if refusal is not None:
                     await self._audit(
                         "auth.mfa_failed",
