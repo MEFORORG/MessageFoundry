@@ -4009,8 +4009,8 @@ def test_the_logging_exemption_covers_only_subcommands_that_configure_their_own(
     cannot be used as a way to skip the chain.
 
     What this does NOT prove is that the call comes before the subcommand's first log record. It
-    does not for ``serve``, whose pre-configure window is the residual named at
-    ``_CONFIGURES_OWN_LOGGING``."""
+    does not for ``serve``, whose pre-configure window ``_CONFIGURES_OWN_LOGGING`` describes. The
+    ``serve`` startup-sink tests below cover that window (BACKLOG #3768)."""
     assert cli_module._CONFIGURES_OWN_LOGGING == _SELF_CONFIGURING
     # Both controls read THIS test: it calls `_calls`, and it names configure_logging only in its
     # docstring and a message string, which must not count as a call.
@@ -4038,6 +4038,118 @@ def test_main_really_consults_the_exemption(command: str, monkeypatch: pytest.Mo
     with _handlerless_root():
         assert main([command]) == 0
     assert seen["handlers"] == [], f"main() installed a sink for exempt `{command}`"
+
+
+# --- BACKLOG #3768: `serve` filters the window before configure_logging -------------------------
+#
+# `serve` is exempt from main()'s sink and installs its handlers only after its settings, key and
+# egress gates. Before #3768 a WARNING in that window went to `logging.lastResort`, unfiltered, and
+# under NSSM into `service.err.log`. These tests log one in that window and read stderr. The window
+# is entered for real: `suppress_crash_dumps` is the first call `_serve` makes after its imports, and
+# a `--service-config` naming a directory refuses the start before configure_logging runs.
+
+
+def _warn_in_serve_window(monkeypatch: pytest.MonkeyPatch, seen: dict[str, object]) -> None:
+    """Make ``_serve``'s ``suppress_crash_dumps`` call log the synthetic segment at WARNING, with a
+    traceback carrying it, plus one INFO record on a logger whose own level lets INFO through."""
+    import messagefoundry.crashdump as crashdump
+
+    def probe() -> None:
+        seen["handlers"] = list(logging.getLogger().handlers)
+        log = logging.getLogger("messagefoundry.store")
+        try:
+            raise ValueError(f"row rejected: {_SYNTHETIC_PID}")
+        except ValueError:
+            log.warning("probe: could not persist %s", _SYNTHETIC_PID, exc_info=True)
+        chatty = logging.getLogger("messagefoundry.test_serve_window_info")
+        chatty.setLevel(logging.INFO)
+        try:
+            chatty.info("probe-info-line")
+        finally:
+            chatty.setLevel(logging.NOTSET)
+
+    monkeypatch.setattr(crashdump, "suppress_crash_dumps", probe)
+
+
+def test_serve_redacts_a_warning_logged_before_its_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A WARNING in ``serve``'s pre-configure window reaches stderr redacted, through one handler,
+    at lastResort's level: the INFO record a lowered logger lets through is still not printed."""
+    seen: dict[str, object] = {}
+    _warn_in_serve_window(monkeypatch, seen)
+    with _handlerless_root():
+        assert main(["serve", "--service-config", str(tmp_path)]) == 2
+    captured = capsys.readouterr()
+    err = captured.err
+    # The control: the record DID reach stderr, message and traceback, exactly once.
+    assert err.count("probe: could not persist") == 1, err
+    assert "row rejected" in err, err
+    for fragment in _PID_FRAGMENTS:
+        assert fragment not in err, f"the synthetic PID segment reached stderr unredacted:\n{err}"
+    assert "[redacted]" in err
+    assert "probe-info-line" not in err, "the window printed below WARNING, as lastResort did not"
+    assert "error: " in err  # the refusal: the run entered the window and left it before logging
+    assert captured.out == ""
+    handlers = seen["handlers"]
+    assert isinstance(handlers, list) and len(handlers) == 1, handlers
+    assert handlers[0].level == logging.WARNING
+
+
+def test_serve_window_without_the_startup_sink_leaks_the_same_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the test above, through the same instrument. With the sink taken out, the
+    same record goes to ``logging.lastResort`` and the synthetic segment reaches stderr whole, so
+    the absence the test above asserts is the filter's doing and not a record that never arrived.
+    The INFO record is absent here too, which is the level the startup sink keeps."""
+    seen: dict[str, object] = {}
+    _warn_in_serve_window(monkeypatch, seen)
+    monkeypatch.setattr(cli_module, "install_startup_stderr_sink", lambda: None)
+    with _handlerless_root():
+        assert main(["serve", "--service-config", str(tmp_path)]) == 2
+    err = capsys.readouterr().err
+    assert seen["handlers"] == []
+    assert "probe: could not persist" in err, err
+    assert all(fragment in err for fragment in _PID_FRAGMENTS), err
+    assert "probe-info-line" not in err
+    assert "error: " in err  # the refusal, so the run left the window the same way
+
+
+def test_a_real_serve_process_redacts_a_warning_before_its_handlers(tmp_path: Path) -> None:
+    """The premise the in-process tests stand on, measured in a child: a real process reaches
+    ``_serve`` with no root handler, so the startup sink is the one handler in the window, and
+    the WARNING reaches stderr redacted. The child exits 2 on the directory ``--service-config``."""
+    import subprocess
+    import sys
+
+    driver = tmp_path / "warn_in_the_serve_window.py"
+    driver.write_text(
+        "import logging\n"
+        "import messagefoundry.__main__ as m\n"
+        "import messagefoundry.crashdump as crashdump\n"
+        "def _probe():\n"
+        "    print('handlers-in-window', len(logging.getLogger().handlers), flush=True)\n"
+        f"    logging.getLogger('messagefoundry.store').warning('probe: %s', {_SYNTHETIC_PID!r})\n"
+        "crashdump.suppress_crash_dumps = _probe\n"
+        "print('handlers-before-main', len(logging.getLogger().handlers), flush=True)\n"
+        f"raise SystemExit(m.main(['serve', '--service-config', {str(tmp_path)!r}]))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(driver)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 2, f"rc={proc.returncode}\n{proc.stderr}"
+    assert "handlers-before-main 0" in proc.stdout, proc.stdout
+    assert "handlers-in-window 1" in proc.stdout, proc.stdout
+    assert "probe: PID|" in proc.stderr, f"the WARNING never reached stderr: {proc.stderr!r}"
+    assert proc.stderr.count("probe: PID|") == 1, proc.stderr
+    for fragment in _PID_FRAGMENTS:
+        assert fragment not in proc.stderr + proc.stdout, proc.stderr
 
 
 def test_a_real_cli_process_starts_with_no_root_handler_and_redacts(tmp_path: Path) -> None:

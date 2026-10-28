@@ -85,6 +85,7 @@ __all__ = [
     "configure_logging",
     "configure_stderr_logging",
     "ensure_logger_sink",
+    "install_startup_stderr_sink",
     "set_runtime_level",
     "current_log_level",
     "LogLevelRefused",
@@ -812,7 +813,8 @@ def _refuse_forward_revocation(forward: SyslogForward, ctx: ssl.SSLContext) -> N
     **Known limit, recorded rather than left for the next reader to find.** The WARN arm on a
     non-enforcing instance logs *after* ``configure_logging`` has set the root level, so it is
     filtered out at ``[logging].level`` above WARNING -- unlike its #200 sibling, which logs before
-    that and survives on the root ``lastResort`` handler. The REFUSE arm is unaffected (it raises).
+    that and survives on ``serve``'s startup stderr sink (:func:`install_startup_stderr_sink`). The
+    REFUSE arm is unaffected (it raises).
     Measured 2026-09-22 at ``WARNING`` and ``ERROR``.
 
     Called with the FINISHED context, which is the whole point of ``context=``: a
@@ -1894,8 +1896,8 @@ def ensure_logger_sink(logger: logging.Logger) -> None:
     **Which processes still reach that shape.** When #1199 landed, every CLI subcommand but ``serve``
     and ``supervise`` did. Since BACKLOG #1441, ``__main__.main`` gives most subcommands a filtered
     stderr root handler before dispatch (``__main__._CONFIGURES_OWN_LOGGING`` names the exceptions
-    and their residual), so they normally find a handler and do not build one here. Any process that
-    logs without going through ``main()`` still can. This used to say "only two call sites in the
+    and how ``serve`` covers its window), so they normally find a handler and do not build one
+    here. Any process that logs without going through ``main()`` still can. This used to say "only two call sites in the
     package install a root handler", which was an enumeration over a search that could not see a
     bare ``root.addHandler`` (the tray entrypoint has one). Read the install sites from the tree.
 
@@ -1976,6 +1978,34 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
         root.removeHandler(existing)
     root.addHandler(handler)
     root.setLevel(level)
+    return handler
+
+
+def install_startup_stderr_sink() -> logging.Handler | None:
+    """Give a process that has no root handler yet a filtered **stderr** sink at ``WARNING``, and
+    return it; return None, and install nothing, where the root already has one (BACKLOG #3768).
+
+    For ``serve``, which calls :func:`configure_logging` only after its settings, key and egress
+    gates have run (``__main__._serve``). With no handler anywhere, the standard library sends a
+    ``WARNING`` or above to ``logging.lastResort``, which carries no filter, and under NSSM that
+    stderr is ``service.err.log``. This handler keeps lastResort's stream and its ``WARNING`` level,
+    so the same records reach the same place, and adds the chain :func:`build_stderr_handler`
+    supplies. What changes is that each such record is redacted, scrubbed and carries the text
+    formatter's prefix.
+
+    **No removal step.** :func:`configure_logging` takes every root handler off before it installs
+    its own, this one included, so no record is written by both. A start refused before that leaves
+    this handler on the root until the process exits.
+
+    **Only on an empty root**, as ``run_cli``'s sink: a host that configured logging first, such as
+    an embedding host or pytest's capture, keeps its own handlers, and filtering them is the
+    host's job."""
+    root = logging.getLogger()
+    if root.handlers:
+        return None
+    handler = build_stderr_handler()
+    handler.setLevel(logging.WARNING)
+    root.addHandler(handler)
     return handler
 
 

@@ -4748,7 +4748,7 @@ def forwarding_gate_check(log: LoggingSettings) -> tuple[str | None, list[str]]:
     """:func:`forwarding_gate_refusal` for ``log``, plus the fail-open notes it made, as text.
 
     For a caller that runs the gate BEFORE logging is configured, which ``serve`` does. A note
-    logged there would reach bare stderr only, never the log file or the off-box collector, and
+    logged there would reach stderr only, never the log file or the off-box collector, and
     ADR 0200 Amendment A calls that note the record of a fail-open pass. So the notes come back to
     the caller, which writes each where it can be kept, as ``serve`` does with the #1989
     static-credential lines. If the gate raises, the notes are logged at once before the error
@@ -7887,7 +7887,7 @@ def unread_env_warnings(
     """The unread-variable WARNING lines :func:`load_settings` logged for ``settings``, again.
 
     For ``serve``: it loads its settings before ``configure_logging`` runs, so those lines reached
-    bare stderr only, never the log file or the off-box forwarder. It logs these once logging is
+    stderr only, never the log file or the off-box forwarder. It logs these once logging is
     configured, as it does the other pre-logging warnings (BACKLOG #1989). The secret-reference
     spare is read from ``settings``, which holds what ``data`` held at load."""
     environ = os.environ if environ is None else environ

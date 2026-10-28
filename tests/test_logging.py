@@ -120,6 +120,41 @@ def test_unknown_level_raises() -> None:
         configure_logging("LOUD")
 
 
+def test_the_startup_stderr_sink_redacts_and_configure_logging_replaces_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #3768: ``serve``'s sink for the window before its handlers. It redacts at WARNING on
+    stderr, and once configure_logging runs it is gone, so a record is never written by both."""
+    root = logging.getLogger()
+    root.handlers.clear()  # a real CLI process's shape; the autouse fixture puts pytest's back
+    sink = logging_setup.install_startup_stderr_sink()
+    assert sink is not None and root.handlers == [sink]
+    assert sink.level == logging.WARNING
+    assert logging_setup.install_startup_stderr_sink() is None  # a second call adds nothing
+
+    log = logging.getLogger("messagefoundry.test_startup_sink")
+    log.warning("early %s", SYNTHETIC_PHI)
+    early = capsys.readouterr()
+    assert "early" in early.err and "[redacted]" in early.err, early.err
+    assert "DOE^JANE" not in early.err and early.out == ""
+
+    configure_logging("INFO")
+    assert sink not in root.handlers
+    log.warning("late %s", SYNTHETIC_PHI)
+    late = capsys.readouterr()
+    assert late.err == "", "the startup sink outlived configure_logging and duplicated a record"
+    assert late.out.count("late") == 1 and "DOE^JANE" not in late.out, late.out
+
+
+def test_the_startup_stderr_sink_leaves_a_configured_root_alone() -> None:
+    """A host that configured logging first keeps its handlers, as with ``run_cli``'s sink."""
+    root = logging.getLogger()
+    hosts = logging.NullHandler()
+    root.handlers[:] = [hosts]
+    assert logging_setup.install_startup_stderr_sink() is None
+    assert root.handlers == [hosts]
+
+
 def test_routes_uvicorn_loggers_to_root() -> None:
     configure_logging("INFO")
     uvicorn_logger = logging.getLogger("uvicorn.error")
