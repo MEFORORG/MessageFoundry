@@ -184,6 +184,17 @@ async def _assert_webauthn_conditional_bind_contract(store: Any) -> None:
         is False
     )
     assert await store.get_webauthn_credential("cb-h4") is None
+    # The control for the three refusals: a live pending session of the same account binds now,
+    # so they were refused for the session, not because the account still read as holding a factor.
+    assert await store.create_session(
+        token_hash="cb-e", user_id="wa-c1", expires_at=10_000_000_000.0, now=105.0
+    )
+    assert (
+        await store.add_webauthn_credential(
+            _cred("wa-c1", "k", id_hash="cb-h4"), for_session="cb-e"
+        )
+        is True
+    )
 
     # A missing account is left to the foreign key, as the unconditional insert leaves it.
     await _assert_integrity_refused(

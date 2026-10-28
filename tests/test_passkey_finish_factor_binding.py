@@ -334,6 +334,35 @@ async def test_a_stamped_session_still_binds_when_a_factor_lands_during_the_writ
     assert len(await store.list_webauthn_credentials(identity.user_id)) == 2
 
 
+async def test_a_session_revoked_inside_the_store_call_is_lost_not_owing_a_factor(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The conditional insert fails closed on a dead session too, and returns only whether it
+    bound. RED when: the service answers that refusal "already has a second factor" for an
+    account that holds none, and writes an ``auth.mfa_denied`` row for it."""
+    service = await _service(store, require_mfa=False)
+    identity, token, _password = await login_admin(service)
+    response = await _stage_passkey(service, identity, token)
+    real_add = store.add_webauthn_credential
+    revoked: list[bool] = []
+
+    async def _add_after_a_revoke(cred: WebAuthnCredential, **kwargs: Any) -> bool:
+        await store.revoke_session(hash_token(token))
+        revoked.append(True)
+        return await real_add(cred, **kwargs)
+
+    monkeypatch.setattr(store, "add_webauthn_credential", _add_after_a_revoke)
+
+    lost = await _finish(service, identity, token, response)
+
+    assert len(revoked) == 1  # the revoke ran inside the store call, after both service asks
+    assert lost.session_lost is True and lost.ok is False
+    assert await store.list_webauthn_credentials(identity.user_id) == []
+    rows = await store.list_audit(action="auth.webauthn_failed")
+    assert {"reason": "session_lost", "phase": "enroll"} in [json.loads(r["detail"]) for r in rows]
+    assert await store.list_audit(action="auth.mfa_denied") == []
+
+
 # --- the TOTP mirror: confirm_mfa_enrollment ---------------------------------------------------
 
 

@@ -2438,13 +2438,14 @@ def session_owes_unproven_factor(
     unproven factor", never "zero factors". Each factor term can only add a factor, as
     ``_second_factor_enrolled`` reads them: TOTP, a sealed passkey digest, or any passkey row.
 
-    Fails closed (True) on a missing, revoked, foreign or unsealed session, and on an unsealed
-    account: nothing there can be shown to owe nothing. A missing account is the caller's to
-    handle: the insert's foreign key already refuses it (BACKLOG #1807)."""
+    Fails closed (True) on a missing, revoked, foreign, stale-epoch or unsealed session, and on an
+    unsealed account: nothing there can be shown to owe nothing. A missing account is the caller's
+    to handle: the insert's foreign key already refuses it (BACKLOG #1807)."""
     if (
         session is None
         or session.revoked_at is not None
         or session.user_id != record.row.id
+        or session.user_epoch != record.row.session_epoch
         or not session_seal_ok(sealer, session)
         or not user_seal_ok(sealer, record)
     ):
@@ -15886,18 +15887,21 @@ class MessageStore:
         ``for_session``: here the check and the insert share one ``BEGIN``, under the writer lock,
         so no writer of this process runs between them, and a writer in another process that
         commits between them fails this transaction's write rather than going unseen."""
-        async with _writer_txn(self._db, self._lock):
-            record = None if for_session is None else await self._read_user_record(cred.user_id)
-            # No account: the insert below meets the foreign key, as it always did (BACKLOG #1807).
-            if (
-                for_session is not None
-                and record is not None
-                and session_owes_unproven_factor(
-                    self._row_sealer,
-                    await self._read_session_row(for_session),
-                    record,
-                    await self._account_passkeys(cred.user_id),
+        if for_session is None:
+            async with _writer_guard(self._db, self._lock):
+                await self._write_passkeys(
+                    cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred)
                 )
+                await self._commit()
+            return True
+        async with _writer_txn(self._db, self._lock):
+            record = await self._read_user_record(cred.user_id)
+            # No account: the insert below meets the foreign key, as it always did (BACKLOG #1807).
+            if record is not None and session_owes_unproven_factor(
+                self._row_sealer,
+                await self._read_session_row(for_session),
+                record,
+                await self._account_passkeys(cred.user_id),
             ):
                 await self._db.rollback()  # only read; this closes the transaction
                 return False

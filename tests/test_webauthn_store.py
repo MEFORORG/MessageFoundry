@@ -10,9 +10,11 @@ The ceremony/verify tests (which DO need the ``[webauthn]`` extra) live in ``tes
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
+from typing import Any, cast
 
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, session_owes_unproven_factor
 
 
 async def test_webauthn_store_contract_sqlite(tmp_path: Path) -> None:
@@ -41,6 +43,48 @@ async def test_webauthn_conditional_bind_contract_sqlite(tmp_path: Path) -> None
         from tests._webauthn_store_contract import _assert_webauthn_conditional_bind_contract
 
         await _assert_webauthn_conditional_bind_contract(store)
+    finally:
+        await store.close()
+
+
+class _Sealer:
+    """A stand-in row sealer whose session and user verdicts the test sets."""
+
+    def __init__(self, *, session_ok: bool, user_ok: bool) -> None:
+        self.session_ok, self.user_ok = session_ok, user_ok
+
+    def verify(self, kind: str, fields: object, seal: str) -> bool:
+        return self.session_ok
+
+    def verify_held(self, kind: str, fields: object, seal: str) -> bool:
+        return self.user_ok
+
+
+async def test_the_conditional_bind_predicate_fails_closed_on_seals_and_epochs(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #3014, #3690 item 1: the branches a keyless contract store cannot reach. RED when
+    ``session_owes_unproven_factor`` trusts a session or account row whose seal fails, or a
+    session minted under an older account epoch, which ``identity_for_token`` ends."""
+    store = await MessageStore.open(tmp_path / "pred.db")
+    try:
+        await store.create_user(
+            user_id="p1", username="p1", auth_provider="local", now=1.0, password_generated=False
+        )
+        assert await store.create_session(token_hash="ps", user_id="p1", expires_at=1e10, now=1.0)
+        await store.mark_session_mfa_verified("ps", now=2.0)
+        session = await store.get_session("ps")
+        record = await store._read_user_record("p1")
+        assert session is not None and record is not None
+        sound = cast(Any, _Sealer(session_ok=True, user_ok=True))
+        # The control: a stamped, sealed, current session owes nothing.
+        assert session_owes_unproven_factor(sound, session, record, []) is False
+        bad_session = cast(Any, _Sealer(session_ok=False, user_ok=True))
+        assert session_owes_unproven_factor(bad_session, session, record, []) is True
+        bad_user = cast(Any, _Sealer(session_ok=True, user_ok=False))
+        assert session_owes_unproven_factor(bad_user, session, record, []) is True
+        stale = dataclasses.replace(session, user_epoch=record.row.session_epoch + 1)
+        assert session_owes_unproven_factor(sound, stale, record, []) is True
     finally:
         await store.close()
 
