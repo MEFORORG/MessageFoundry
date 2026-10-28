@@ -453,7 +453,10 @@ class CrlSignature:
       and its key does not verify the CRL. The CRL names that key, and that key did not sign it.
     * ``uncheckable``: no judged CA verifies, and some judged CA could not be checked: one the CRL
       names, or, where it names none, any fitting CA. "Cannot check" is not "does not verify"
-      (:func:`_verifies`).
+      (:func:`_verifies`). It covers a signature over SHA-1 that a judged CA did make, which a
+      start loads with a warning and the reload holds back until a restart; a forged one is
+      ``bad``. ``docs/CONFIGURATION.md`` states that trade-off, in the bullet on a signature the
+      engine cannot check.
     * ``unproven``: every fitting CA was checked and none verifies, but the CRL names none of them
       by key identifier. A CRL with no key identifier fits every CA of that name. So a CA that
       renewed its key reads this way, while the peer's own chain may still carry the CA that
@@ -919,7 +922,8 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     **The flag is wider than what a start refuses (vault BACKLOG #2905).** It is True for every
     :class:`CrlSignature` state but ``verified`` and ``unlisted``. A start refuses only ``bad``,
     the proven case, and loads the other two with a warning. So the reload holds back some files
-    that a start would load.
+    that a start would load, at least a genuine SHA-1 CRL from a judged CA, whose revocations
+    then wait for a restart (the ``uncheckable`` state says why).
 
     A CA that does not parse is ignored. ``pem`` must be bytes :func:`judge_every_crl` accepted;
     a block that does not parse raises ``ValueError``."""
@@ -981,20 +985,18 @@ def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
     ``is_signature_valid`` answers False for a signature it cannot check as well as for one that
     fails, because it turns every error inside its own verification into False. So a False from
     it is not proof. The key is then asked directly (:func:`_verify_with`), and only its
-    ``InvalidSignature`` counts as proof. ``None`` is only what the key cannot be asked: a key or
-    an algorithm ``cryptography`` does not support, a key of another kind than the signature, and
-    a ``ValueError`` or ``TypeError`` from either call.
+    ``InvalidSignature`` counts as proof. Everything else is ``None``, "cannot check": a key or an
+    algorithm ``cryptography`` does not support, a key of another kind than the signature, and a
+    ``ValueError`` or ``TypeError`` from either call.
 
-    **A signature the key accepts is True, even where ``is_signature_valid`` refused it** (vault
-    BACKLOG #4159). The key's own check passed, so the key made the signature, and a verdict that
-    followed the refusal would differ for one signer by digest alone. Measured 2026-10-27
-    with ``cryptography`` 50.0.2 and OpenSSL 3.5.7: ``is_signature_valid`` refuses an RSA PKCS1v15
-    signature over SHA-1 that the CA did make, and a handshake takes that CRL and judges the peer
-    by it. Before #4159 such a signature read ``None``. A forged one reads False.
-
-    True says the CA's key made the signature, not that every TLS library or policy takes it;
-    ``docs/CONFIGURATION.md`` states that residual, in the bullet on a signature the engine
-    cannot check."""
+    **So is a signature the key accepts after ``is_signature_valid`` refused it**: the key accepts
+    it, and the library's digest policy refuses it. Measured 2026-10-27 with ``cryptography``
+    50.0.2 and OpenSSL 3.5.7: an RSA PKCS1v15 signature over SHA-1 that the CA did make reads
+    ``None`` that way, and a forged one reads False. So a genuine SHA-1 CRL from a judged CA
+    (:class:`CrlSignature`) reads ``uncheckable``: a start warns, and the running-hop reload
+    holds it back. A forged one that names the CA's key still reads ``bad``. That is a
+    trade-off; its cost and what it avoids are in ``docs/CONFIGURATION.md``, in the bullet on a
+    signature the engine cannot check (vault BACKLOG #4159)."""
     try:
         key = ca.public_key()
         if crl.is_signature_valid(key):  # type: ignore[arg-type]
@@ -1004,7 +1006,7 @@ def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
         return False
     except (ValueError, TypeError, UnsupportedAlgorithm):
         return None
-    return True  # the key accepts what ``is_signature_valid`` refused, as for SHA-1 above
+    return None  # the key accepts what ``is_signature_valid`` refused, as for SHA-1 above
 
 
 _DSA_SIGNATURES = frozenset(

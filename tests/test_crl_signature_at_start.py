@@ -1038,14 +1038,17 @@ def _resigned(
     return x509.load_der_x509_crl(der[: -len(signature)] + signature).public_bytes(_PEM)
 
 
-def test_an_rsa_sha1_crl_the_ca_signed_is_verified_and_a_forged_one_is_bad(
+def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A CRL that names the CA's key, signed over SHA-1. ``cryptography``'s own check refuses it
-    and the CA's key accepts it, so since vault BACKLOG #4159 it is ``verified``. It read
-    ``uncheckable`` before: a start warned, and the reload held it back. The premise is OpenSSL's:
-    it takes that CRL and judges the peer by it. The SHA-384 CRL is the control for the hand-made
-    encoding: the same swap under a digest the library accepts reads ``verified`` too."""
+    and the CA's key accepts it, so it reads ``uncheckable``: a start loads it with the warning,
+    and the reload holds it back. That is the trade-off ``docs/CONFIGURATION.md`` states in the
+    bullet on a signature the engine cannot check (vault BACKLOG #4159). The handshake below is
+    its cost on this host: OpenSSL takes the CRL and judges the peer by it, so the reload held
+    back a CRL this host could use. The SHA-384 CRL is the control for the hand-made encoding:
+    the same swap under a digest the library accepts reads ``verified``. So ``uncheckable`` is
+    about SHA-1, not about the swap."""
     key = _rsa_key(0)
     other = _rsa_key(1)
     ca = _ca(key, key)
@@ -1055,25 +1058,26 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_verified_and_a_forged_one_is_bad(
     forged = _resigned(_crl(other, names=key), other, _SHA1_WITH_RSA, hashes.SHA1())
     control = _resigned(_crl(key, names=key), key, _SHA384_WITH_RSA, hashes.SHA384())
 
-    # The premise on the library's side: its own check refuses the CRL the CA made.
-    assert x509.load_pem_x509_crl(good).is_signature_valid(key.public_key()) is False
+    # The premise on the library's side: its own check refuses the CRL the CA made, and the
+    # CA's key accepts it, so the engine cannot check it rather than proving it bad.
+    good_crl = x509.load_pem_x509_crl(good)
+    assert good_crl.is_signature_valid(key.public_key()) is False
+    assert pki_module._verifies(good_crl, ca) is None
     assert [s.state for s in judge_crl_signatures(control, ders)] == ["verified"]
-    assert [s.state for s in judge_crl_signatures(good, ders)] == ["verified"]
     assert [s.state for s in judge_crl_signatures(forged, ders)] == ["bad"]
-    assert crl_signature_refusal(good, ders) is None  # the reload applies it
+    verdict = crl_signature_refusal(good, ders)
+    assert verdict is not None and verdict[1] is True  # the reload holds it back
 
     ca_file, crl_file = tmp_path / "ca.pem", tmp_path / "crl.pem"
     ca_file.write_bytes(ca.public_bytes(_PEM))
     crl_file.write_bytes(good)
-    with caplog.at_level("WARNING"):
-        hop = _hop(ca_file, crl_file)
-    assert _warnings(caplog) == []
+    _assert_uncheckable_and_the_start_warns(tmp_path, good, caplog)
 
-    # The premise on OpenSSL's side: it judges a peer under this CA by the SHA-1 CRL. Control:
-    # the same CRL with the peer's serial listed refuses the handshake.
+    # The cost, on this host: OpenSSL judges a peer under this CA by the SHA-1 CRL the start
+    # loaded. Control: the same CRL with the peer's serial listed refuses the handshake.
     leaf, leaf_key = _leaf(_NAME, key)
     server = _server(tmp_path, leaf.public_bytes(_PEM), leaf_key)
-    _handshake(hop, server)  # raises if refused
+    _handshake(_hop(ca_file, crl_file), server)  # raises if refused
     crl_file.write_bytes(
         _resigned(
             _crl(key, names=key, revoke=leaf.serial_number), key, _SHA1_WITH_RSA, hashes.SHA1()
@@ -1087,51 +1091,72 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_verified_and_a_forged_one_is_bad(
         _hop(ca_file, crl_file)
 
 
-#: The digests :func:`test_one_signer_gets_one_verdict_under_sha256_and_sha1` signs with.
+#: The digests :func:`test_sha1_moves_a_signers_verdict_only_from_verified_to_uncheckable` signs
+#: with: the OID, the digest, and which verdict of a row applies.
 _SHA256_AND_SHA1 = [
-    pytest.param(_SHA256_WITH_RSA, hashes.SHA256(), id="sha256"),
-    pytest.param(_SHA1_WITH_RSA, hashes.SHA1(), id="sha1"),
+    pytest.param(_SHA256_WITH_RSA, hashes.SHA256(), 0, id="sha256"),
+    pytest.param(_SHA1_WITH_RSA, hashes.SHA1(), 1, id="sha1"),
 ]
 
 #: (the CAs the hop lists, in order, the CA whose key signs, the CA whose key the CRL names, the
-#: verdict). "named" carries a Subject Key Identifier, and "no-ski" carries none.
+#: verdicts over SHA-256 and over SHA-1). "named" carries a Subject Key Identifier, and "no-ski"
+#: carries none. The test's docstring says why the verdicts differ where they do.
 _ONE_SIGNER = [
-    pytest.param(("named",), "named", "named", "verified", id="the-named-ca-signs"),
-    pytest.param(("named",), "named", None, "verified", id="the-crl-names-no-key"),
-    pytest.param(("no-ski",), "no-ski", "no-ski", "verified", id="a-lone-ca-with-no-ski-signs"),
     pytest.param(
-        ("named", "no-ski"), "no-ski", "named", "bad", id="no-ski-ca-signs-after-the-named-ca"
+        ("named",), "named", "named", ("verified", "uncheckable"), id="the-named-ca-signs"
+    ),
+    pytest.param(("named",), "named", None, ("verified", "uncheckable"), id="the-crl-names-no-key"),
+    pytest.param(
+        ("no-ski",),
+        "no-ski",
+        "no-ski",
+        ("verified", "uncheckable"),
+        id="a-lone-ca-with-no-ski-signs",
     ),
     pytest.param(
-        ("no-ski", "named"), "no-ski", "named", "bad", id="no-ski-ca-signs-before-the-named-ca"
+        ("named", "no-ski"),
+        "no-ski",
+        "named",
+        ("bad", "bad"),
+        id="no-ski-ca-signs-after-the-named-ca",
+    ),
+    pytest.param(
+        ("no-ski", "named"),
+        "no-ski",
+        "named",
+        ("bad", "bad"),
+        id="no-ski-ca-signs-before-the-named-ca",
     ),
 ]
 
 
-@pytest.mark.parametrize(("oid", "digest"), _SHA256_AND_SHA1)
-@pytest.mark.parametrize(("listed", "signer", "names", "state"), _ONE_SIGNER)
-def test_one_signer_gets_one_verdict_under_sha256_and_sha1(
+@pytest.mark.parametrize(("oid", "digest", "column"), _SHA256_AND_SHA1)
+@pytest.mark.parametrize(("listed", "signer", "names", "states"), _ONE_SIGNER)
+def test_sha1_moves_a_signers_verdict_only_from_verified_to_uncheckable(
     listed: tuple[str, ...],
     signer: str,
     names: str | None,
-    state: str,
+    states: tuple[str, str],
     oid: bytes,
     digest: hashes.HashAlgorithm,
+    column: int,
 ) -> None:
-    """Finding 2 of the Lander's covering review on engine PR 2585. A ``None`` from
-    :func:`messagefoundry.pki._verifies` meant either a key the engine cannot check or a signature
-    the key accepts that ``cryptography``'s own check refused, and SHA-1 is refused there. So one
-    signer's verdict could differ by digest alone. On main, a CA with no SKI signing beside the
-    named CA read ``verified`` over SHA-256 and ``uncheckable`` over SHA-1, and so did the named
-    CA signing; the head the review read gave ``bad`` over SHA-1 for the first. Each row now
-    gives one verdict for both digests."""
+    """Finding 2 of the Lander's covering review on engine PR 2585: one signer's verdict differed
+    by digest alone. On main, a CA with no SKI signing beside the named CA read ``verified`` over
+    SHA-256 and ``uncheckable`` over SHA-1, and the head the review read gave ``bad`` over SHA-1.
+    The named-CA filter (pki.CrlSignature) makes that signer ``bad`` under both digests: only the
+    named CA is judged, and its key is proven not to verify under either. Where the signer is
+    judged, SHA-1 still moves its verdict, but only to ``uncheckable``, never to ``bad``: its key
+    accepts the signature, ``cryptography``'s own check refuses the digest, and pki._verifies
+    reads that as "cannot check". That difference is the trade-off docs/CONFIGURATION.md states
+    in the bullet on a signature the engine cannot check."""
     keys = {"named": _rsa_key(0), "no-ski": _rsa_key(1)}
     cas = {"named": _ca(keys["named"], keys["named"]), "no-ski": _ca_without_ski(keys["no-ski"])}
     shape = _crl(keys[signer], names=None if names is None else keys[names])
     pem = _resigned(shape, keys[signer], oid, digest)
     ders = [cas[who].public_bytes(serialization.Encoding.DER) for who in listed]
 
-    assert [s.state for s in judge_crl_signatures(pem, ders)] == [state]
+    assert [s.state for s in judge_crl_signatures(pem, ders)] == [states[column]]
 
 
 def test_a_version_that_logs_nothing_in_between_does_not_reset_the_record(

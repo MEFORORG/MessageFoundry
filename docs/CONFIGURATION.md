@@ -2059,14 +2059,20 @@ three cases warn:
   checking with it raises an error. Where the CRL names the key of a listed CA that fits it, only
   such a CA counts here (the paragraph that starts "Why a CA with no subject key identifier" says
   why). Where it names no such CA's key, as when it names a key no listed CA carries, every
-  fitting CA counts, one with no subject key identifier included. A measured example is an ECDSA signature on a CRL
-  that names an RSA key. A signature the CA's key accepts is verified even where the
-  `cryptography` library's own check refuses it, as for an RSA signature over SHA-1 that the CA
-  did make; OpenSSL 3.5.7 was measured to judge a peer by such a CRL (vault BACKLOG #4159).
-  Verified means the CA's key made the signature, not that every TLS library takes it: the
-  engine checks with the `cryptography` library's OpenSSL, the handshake runs on Python's, and a
-  build or system policy that refuses the digest, such as SHA-1, fails the handshake on a CRL
-  that started with no warning and that a reload applies.
+  fitting CA counts, one with no subject key identifier included. Two measured examples are an
+  ECDSA signature on a CRL that names an RSA key, and an RSA signature over SHA-1 that the CA did
+  make. The CA's key accepts that second one, and the `cryptography` library's own check refuses
+  its digest, so the engine reads it as one it cannot check.
+
+  **That SHA-1 case is a trade-off (vault BACKLOG #4159).** A start loads such a CRL with the
+  WARNING, and the running-hop reload holds it back, so it is applied at the next restart. The
+  cost is revocation freshness: on a host whose TLS library accepts SHA-1, as OpenSSL 3.5.7 was
+  measured to, judging a peer by such a CRL, a revocation in a new copy of it waits for a
+  restart. What it avoids is applying live a CRL on which a host that refuses SHA-1, by its build
+  or its system policy, would fail every handshake through that CA. The engine checks with the
+  `cryptography` library's OpenSSL and the handshake runs on Python's, so it cannot tell which
+  kind of host it is on. A forged SHA-1 signature that names a listed CA's key is still proved
+  bad, and refuses the file.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
 it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
