@@ -379,7 +379,8 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 #: Identifiers of at least these packages on the braces and js-yaml chains, measured ABSENT from the
 #: bundle. What the reading settles is stated once, in cla-action-advisories.toml, in the header
 #: paragraph "A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT". Each must count 0 in ``dist/index.js``. Removing one
-#: needs that reading redone, not just this edit.
+#: needs that reading redone, not just this edit. The two deepmerge probes come from a later
+#: reading, taken 2026-10-28, which that file states in the triage comment above deepmerge's entry.
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse
@@ -387,6 +388,8 @@ _ABSENT_FROM_BUNDLE = (
     re.compile("Toolkit"),  # actions-toolkit
     re.compile("CHAR_ZERO_WIDTH_NOBREAK_SPACE"),  # braces (and picomatch)
     re.compile("toRegexRange"),  # fill-range
+    re.compile("isMergeableObject"),  # deepmerge
+    re.compile("cloneUnlessOtherwiseSpecified"),  # deepmerge
 )
 
 #: The control: two @actions/core functions the bundle does carry, so the probes can find code.
@@ -394,7 +397,9 @@ _PRESENT_IN_BUNDLE = re.compile("function getInput|function setFailed")
 
 
 def test_the_recorded_bundle_reading_still_holds() -> None:
-    """The baseline's recorded bundle reading of the braces and js-yaml chains still holds.
+    """The baseline's recorded bundle readings, of the braces and js-yaml chains, still hold.
+
+    So does the later reading of deepmerge, taken 2026-10-28.
 
     The provenance gate lets ``dist/index.js`` change whenever its record changes with it, so a
     re-vendored bundle could carry that code while the baseline still said it was absent. This reds
