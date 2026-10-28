@@ -221,8 +221,18 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "queue.Empty carries nothing",
     ),
     _Allowed(
-        "messagefoundry/pipeline/sandbox.py::SandboxSession.dispatch::Empty::SandboxError",
+        "messagefoundry/pipeline/sandbox.py::SandboxSession._await_answer::Empty::SandboxError",
         _SAFE + "queue.Empty carries nothing",
+    ),
+    _Allowed(
+        "messagefoundry/pipeline/_sandbox_worker.py::_Broker._ask::SandboxError::error",
+        _SAFE + "the lookup error quotes the codec refusal, which names a slot, a type or a size "
+        "and never a value; the cause is dropped so the Handler sees the mode=off error type alone",
+    ),
+    _Allowed(
+        "messagefoundry/pipeline/_sandbox_worker.py::_Broker._ask::(OSError, SandboxError)::error",
+        _SAFE + "the lookup error quotes the pipe or frame refusal, which names a frame and never "
+        "its content (decode_frame keeps only safe_exc text)",
     ),
     _Allowed(
         "messagefoundry/store/store.py::parse_audit_anchor::ValueError::AuditAnchorError",

@@ -5483,7 +5483,7 @@ class RegistryRunner:
 
     async def _close_sandbox_sessions(self) -> None:
         """Drop every sandbox session and close its worker, off the loop: each ``close()`` waits on
-        a process. A no-op unless ``[sandbox].mode=subprocess`` spawned any. The next dispatch on an
+        a process. A no-op unless a worker sandbox mode spawned any. The next dispatch on an
         inbound makes a fresh session, whose worker loads the config as it is then. A dispatch already
         holding a closed session is retried or re-pended by :meth:`_off_loop_sandboxed`, never
         dead-lettered as a Router or Handler fault."""
@@ -9896,10 +9896,11 @@ class RegistryRunner:
                         lookup_stack.enter_context(db_lookup_activated(self._run_lookup))
                     if self._fhir_lookup_executor is not None:
                         lookup_stack.enter_context(fhir_lookup_activated(self._run_fhir_lookup))
-                    # ADR 0087 (#197): sandbox=subprocess marshals the Handler to the per-inbound
-                    # worker (transform_rc travels with it); a db_lookup/fhir_lookup inside a
-                    # sandboxed Handler fails closed there (they can't bridge across the process
-                    # boundary in this PR). sandbox=None is the byte-identical in-process path.
+                    # ADR 0087 (#197): a worker sandbox mode marshals the Handler to the per-inbound
+                    # worker (transform_rc travels with it). A db_lookup/fhir_lookup inside it fails
+                    # closed at mode=subprocess, and at mode=isolated is brokered back to this
+                    # thread, which is why the runners above are published either way (ADR 0147).
+                    # sandbox=None is the byte-identical in-process path.
                     outcome = await self._off_loop_sandboxed(
                         name,
                         transform_one,

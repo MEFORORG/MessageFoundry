@@ -84,6 +84,7 @@ __all__ = [
     "LOOKUP_DB",
     "LOOKUP_FHIR",
     "LookupRequest",
+    "PreparedLookup",
     "Request",
     "Response",
     "build_payload",
@@ -99,9 +100,11 @@ __all__ = [
     "encode_fail",
     "encode_frame",
     "encode_lookup",
+    "encode_prepared_lookup",
     "encode_lookup_fail",
     "encode_lookup_ok",
     "encode_ok",
+    "prepare_lookup",
     "encode_ready",
     "encode_request",
     "enc_value",
@@ -112,7 +115,7 @@ __all__ = [
 class SandboxError(RuntimeError):
     """A sandboxed Router/Handler was denied, timed out, crashed, or could not be marshalled.
 
-    Raised only on the ``subprocess`` path (``off`` never raises this). The caller treats it exactly
+    Raised only in a worker mode, ``subprocess`` or ``isolated`` (``off`` never raises this). The caller treats it exactly
     like any other post-ACK router/transform failure: ``ERROR``/dead-letter, no NAK.
 
     Defined **here**, not in :mod:`messagefoundry.pipeline.sandbox`, only because
@@ -1423,20 +1426,24 @@ def _dec_fhir_params(node: Any, reader: _Reader) -> dict[str, Any] | None:
     return out
 
 
-def encode_lookup(
-    *,
-    request_id: str,
-    phase: str,
-    name: str,
-    seq: int,
-    kind: str,
-    connection: object,
-    target: object,
-    params: object,
-) -> bytes:
-    """A ``lookup`` frame (child side). ``target`` is the statement of a db lookup or the query of a
-    fhir one. Raises :class:`SandboxCodecError` for an argument outside the grammar, which the worker
-    turns into the lookup's own error type, as the in-process call would fail on a bad argument."""
+@dataclass(frozen=True)
+class PreparedLookup:
+    """A ``lookup`` frame's arguments, described but not yet framed. Describing them runs the
+    Handler's own code (a ``Mapping`` it passed is read), so the worker does it before it takes its
+    broker lock; :func:`encode_prepared_lookup` then frames it with no user code at all."""
+
+    kind: str
+    slots: dict[str, Any]
+    blobs: tuple[str, ...]
+
+
+def prepare_lookup(
+    *, kind: str, connection: object, target: object, params: object
+) -> PreparedLookup:
+    """Describe one lookup's arguments. ``target`` is the statement of a db lookup or the query of
+    a fhir one. Raises :class:`SandboxCodecError` for an argument outside the grammar, which the
+    worker turns into the lookup's own error type, as the in-process call would fail on a bad
+    argument."""
     blobs = _Blobs()
     # Segment order IS walk order (see _Reader): connection, then target, then params, the order
     # decode_answer reads them in. Building params first would number its segments ahead of the
@@ -1453,20 +1460,45 @@ def encode_lookup(
         enc_params = _enc_fhir_params(params, blobs)
     else:
         raise SandboxCodecError(f"unknown lookup kind {kind!r}")
+    return PreparedLookup(
+        kind=kind,
+        slots={"connection": conn_ref, "target": target_ref, "params": enc_params},
+        blobs=tuple(blobs.items),
+    )
+
+
+def encode_prepared_lookup(
+    prepared: PreparedLookup, *, request_id: str, phase: str, name: str, seq: int
+) -> bytes:
+    """Frame a :class:`PreparedLookup` for the dispatch in flight (child side)."""
     header = _envelope(
         {
             "id": request_id,
             "phase": phase,
             "name": name,
             "seq": seq,
-            "kind": kind,
-            "connection": conn_ref,
-            "target": target_ref,
-            "params": enc_params,
+            "kind": prepared.kind,
+            **prepared.slots,
         },
         "lookup",
     )
-    return encode_frame(header, blobs.items)
+    return encode_frame(header, prepared.blobs)
+
+
+def encode_lookup(
+    *,
+    request_id: str,
+    phase: str,
+    name: str,
+    seq: int,
+    kind: str,
+    connection: object,
+    target: object,
+    params: object,
+) -> bytes:
+    """:func:`prepare_lookup` and :func:`encode_prepared_lookup` in one call."""
+    prepared = prepare_lookup(kind=kind, connection=connection, target=target, params=params)
+    return encode_prepared_lookup(prepared, request_id=request_id, phase=phase, name=name, seq=seq)
 
 
 def decode_answer(

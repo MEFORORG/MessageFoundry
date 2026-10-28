@@ -49,6 +49,7 @@ RAW = "MSH|^~\\&|SEND|F|RECV|F|20240101120000||ADT^A01|MSG00001|P|2.3\rPID|1||90
 
 _GRAPH = """
 import os
+from collections.abc import Mapping
 
 from messagefoundry import (
     inbound, outbound, router, handler, MLLP, Send, db_lookup, fhir_lookup, FhirToken, FhirRaw,
@@ -105,6 +106,24 @@ def h_db_caught(msg):
     except DbLookupError as exc:
         return Send("OB_I", "caught:" + str(exc))
     return Send("OB_I", "not refused")
+
+
+class _LazyParams(Mapping):
+    # A Mapping whose values come from another lookup, read while the outer call describes it.
+    def __iter__(self):
+        return iter(["k"])
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, key):
+        return db_lookup("LK", "SELECT inner", {})[0]["v"]
+
+
+@handler("h_db_nested")
+def h_db_nested(msg):
+    rows = db_lookup("LK", "SELECT outer", _LazyParams())
+    return Send("OB_I", rows[0]["v"])
 
 
 @handler("h_fhir")
@@ -658,7 +677,7 @@ def test_an_oversized_lookup_fails_the_call_and_keeps_the_pipe_in_step(
     req = SimpleNamespace(request_id="a", phase="transform", name="h")
     broker.begin(req)
     db, _ = broker.runners(req)
-    with pytest.raises(DbLookupError, match="cannot cross the sandbox"):
+    with pytest.raises(DbLookupError, match="too large for the sandbox"):
         db("LK", "SELECT 1", {"k": "x" * 4096})
     assert out.getvalue() == b"" and not broker.broken
 
@@ -715,3 +734,86 @@ def h_forge_lookup(msg):
     time.sleep(60)  # never reads the reply
     return Send("OB_I", "unreachable")
 """
+
+
+# --- 6. round-two review fixes ---------------------------------------------------------------------
+
+
+def test_a_lookup_with_no_runner_is_not_told_to_edit_egress(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    # No runner and an empty list, as a site with no database has: the mode=off error, no WARNING.
+    registry, config_dir = graph
+    session = _session(config_dir, SandboxMode.ISOLATED, allowed_db=())
+    try:
+        with (
+            caplog.at_level("WARNING", logger="messagefoundry.pipeline.sandbox"),
+            pytest.raises(SandboxError, match="unavailable here") as raised,
+        ):
+            _bodies(registry, "h_db", session)
+    finally:
+        session.close()
+    assert "allowed_db" not in str(raised.value)
+    assert not [r for r in caplog.records if "was refused" in r.getMessage()]
+
+
+def test_a_slow_lookup_is_cut_off_by_the_wall_cap(graph: tuple[Registry, str]) -> None:
+    def slow(connection: str, statement: str, params: Any) -> list[dict[str, Any]]:
+        time.sleep(20)
+        return [{"v": "late", "d": Decimal(0)}]
+
+    registry, config_dir = graph
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.ISOLATED, wall_seconds=2.0, lookup_allowed_db=("db",)),
+        inbound="IB_I",
+        config_dir=config_dir,
+        env=None,
+        graph=None,
+    )
+    try:
+        # Warm the worker first, so the timing below measures the cap rather than a cold start.
+        _bodies(registry, "h_parent", session)
+        started = time.monotonic()
+        with db_lookup_mod.activated(slow), pytest.raises(SandboxError, match="wall cap"):
+            _bodies(registry, "h_db", session)
+        assert time.monotonic() - started < 15
+    finally:
+        session.close()
+
+
+def test_a_lookup_made_while_describing_another_does_not_deadlock(
+    graph: tuple[Registry, str],
+) -> None:
+    calls: list[str] = []
+
+    def runner(connection: str, statement: str, params: Any) -> list[dict[str, Any]]:
+        calls.append(statement)
+        return [{"v": "INNER" if statement == "SELECT inner" else f"OUTER:{params['k']}"}]
+
+    registry, config_dir = graph
+    session = _session(config_dir, SandboxMode.ISOLATED)
+    try:
+        with db_lookup_mod.activated(runner):
+            assert _bodies(registry, "h_db_nested", session) == ["OUTER:INNER"]
+    finally:
+        session.close()
+    assert calls == ["SELECT inner", "SELECT outer"]
+
+
+def test_a_short_write_is_completed() -> None:
+    from messagefoundry.pipeline.sandbox import _write_frame
+
+    class Trickle:
+        def __init__(self) -> None:
+            self.data = bytearray()
+
+        def write(self, chunk: Any) -> int:
+            self.data.extend(bytes(chunk)[:3])
+            return min(3, len(chunk))
+
+        def flush(self) -> None:
+            pass
+
+    out = Trickle()
+    _write_frame(out, b"0123456789")
+    assert bytes(out.data) == (10).to_bytes(4, "big") + b"0123456789"

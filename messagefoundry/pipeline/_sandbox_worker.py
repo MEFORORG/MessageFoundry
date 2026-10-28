@@ -9,7 +9,7 @@ would. It speaks the length-prefixed **MFW2** codec
 decode path cannot name a type, import a module, or reach ``__reduce__``. Nothing is pickled in either
 direction, in either process.
 
-1. **Bootstrap** — reads one ``boot`` frame ``{snapshot, forbidden, mem_mb, code_sets}``, loads
+1. **Bootstrap** — reads one ``boot`` frame ``{snapshot, forbidden, mem_mb, code_sets, broker}``, loads
    the message :class:`~messagefoundry.config.wiring.Registry` from the engine's config snapshot
    (``load_snapshot``, the loader the engine uses, over the bytes the engine loaded and checked; the
    worker never reads the config directory, vault BACKLOG #2596),
@@ -247,7 +247,6 @@ class _Broker:
         """The ``(db_lookup, fhir_lookup)`` runners for dispatch ``req`` alone."""
         from messagefoundry.config.db_lookup import DbLookupError
         from messagefoundry.config.fhir_lookup import FhirLookupError
-        from messagefoundry.fhirsearch import resolve_search_pairs
         from messagefoundry.pipeline._sandbox_codec import LOOKUP_DB, LOOKUP_FHIR
 
         def db(connection: str, statement: str, params: Any = None) -> Any:
@@ -256,14 +255,8 @@ class _Broker:
             )
 
         def fhir(connection: str, query: str, params: Any = None) -> Any:
-            if params is not None:
-                # fhirsearch's own check, so a value of the wrong kind or carrying a separator fails
-                # with the words the engine's executor would give it at mode=off. The engine checks
-                # again on its side.
-                try:
-                    resolve_search_pairs(params)
-                except ValueError as exc:
-                    raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from None
+            # The engine's executor screens each search value, as at mode=off, and after its own
+            # "unavailable here" check, so that is the error a call with no runner gets.
             return self._ask(
                 req, LOOKUP_FHIR, FhirLookupError, "fhir_lookup", connection, query, params
             )
@@ -284,36 +277,40 @@ class _Broker:
         from messagefoundry.pipeline._sandbox_codec import MAX_FRAME, SandboxError
         from messagefoundry.pipeline.sandbox import _read_frame_bytes, _write_frame
 
+        try:
+            # Before the lock: describing the arguments reads the Handler's own Mapping, whose code
+            # could call a lookup itself, and the lock is not re-entrant.
+            prepared = codec.prepare_lookup(
+                kind=kind, connection=connection, target=target, params=params
+            )
+        except SandboxError as exc:
+            # A bad argument fails as the call would in-process: the lookup's own error. Nothing is
+            # written, so the pipe stays in step.
+            raise error(f"{fn}: its arguments cannot cross the sandbox: {exc}") from None
         with self._lock:
-            if self._req is not req or self.broken:
+            if self.broken:
+                raise error(f"{fn}: an earlier lookup in this dispatch broke the sandbox pipe")
+            if self._req is not req:
                 raise error(f"{fn}: called outside the Handler dispatch it was published for")
-            self._seq += 1
-            seq = self._seq
-            try:
-                frame = codec.encode_lookup(
-                    request_id=req.request_id,
-                    phase=req.phase,
-                    name=req.name,
-                    seq=seq,
-                    kind=kind,
-                    connection=connection,
-                    target=target,
-                    params=params,
+            frame = codec.encode_prepared_lookup(
+                prepared,
+                request_id=req.request_id,
+                phase=req.phase,
+                name=req.name,
+                seq=self._seq + 1,
+            )
+            if len(frame) > MAX_FRAME:
+                raise error(
+                    f"{fn}: its arguments are too large for the sandbox ({len(frame)} bytes)"
                 )
-                if len(frame) > MAX_FRAME:
-                    raise SandboxError(f"the lookup frame is {len(frame)} bytes, over the cap")
-            except SandboxError as exc:
-                # A bad or oversized argument fails as the call would in-process: the lookup's own
-                # error. Nothing was written, so the pipe is still in step; the next call reuses seq.
-                self._seq -= 1
-                raise error(f"{fn}: its arguments cannot cross the sandbox: {exc}") from None
+            self._seq += 1
             try:
                 _write_frame(self._stdout, frame)
                 body = _read_frame_bytes(self._stdin)
                 if body is None:
                     raise SandboxError("the engine closed the pipe")
                 ok, result, reason = codec.decode_lookup_reply(
-                    body, request_id=req.request_id, phase=req.phase, name=req.name, seq=seq
+                    body, request_id=req.request_id, phase=req.phase, name=req.name, seq=self._seq
                 )
             except (OSError, SandboxError) as exc:
                 # A pipe the parent abandoned, or a reply that does not answer this call: the pipe no

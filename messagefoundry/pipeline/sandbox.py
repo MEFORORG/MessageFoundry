@@ -92,6 +92,7 @@ imports. It depends only on ``config`` (the :class:`RunContext` shape), its own 
 
 from __future__ import annotations
 
+import contextvars
 import enum
 import logging
 import queue
@@ -110,7 +111,9 @@ from messagefoundry import proctree
 from messagefoundry.childenv import python_child_argv, worker_environment
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.db_lookup import DbLookupError, db_lookup
+from messagefoundry.config.db_lookup import is_available as db_lookup_available
 from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
+from messagefoundry.config.fhir_lookup import is_available as fhir_lookup_available
 from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.settings import (
     INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
@@ -192,8 +195,8 @@ class SandboxPolicy:
     ``mode=off`` (the shipped default) is the zero-overhead, byte-identical parity mode.
     ``wall_seconds`` is the
     **authoritative** cap on every platform — the parent kills a worker that overruns it (so a
-    pathological busy-loop Router/Handler can never wedge intake), and it is enforced **only** at
-    ``mode=subprocess``: the in-process path has no timeout at all. There is no ``RLIMIT_CPU``, so
+    pathological busy-loop Router/Handler can never wedge intake), and it is enforced **only** in
+    a worker mode (``subprocess``, ``isolated``): the in-process path has no timeout at all. There is no ``RLIMIT_CPU``, so
     CPU that admin code spends outside a call has no bound (ADR 0087, amendment of 2026-10-07).
     ``mem_mb`` adds a POSIX memory backstop *inside* the child where the ``resource`` module exists
     (a no-op on Windows). On Linux it is headroom above the loaded graph: ``RLIMIT_DATA`` at the
@@ -276,7 +279,7 @@ _NAMES_SHOWN: Final = 3
 def _shown(names: set[str] | frozenset[str]) -> str:
     """Up to :data:`_NAMES_SHOWN` names for an error text. Half of them come from the worker, so
     each is scrubbed and cut before it reaches a log line."""
-    listed = [scrub_control_chars(name)[:80] for name in sorted(names)[:_NAMES_SHOWN]]
+    listed = [_shown_name(name) for name in sorted(names)[:_NAMES_SHOWN]]
     more = len(names) - len(listed)
     return ", ".join(listed) + (f" and {more} more" if more > 0 else "")
 
@@ -513,9 +516,21 @@ def _write_frame(stream: Any, body: bytes) -> None:
     pipe; the caller maps either to :class:`SandboxError`."""
     if len(body) > _MAX_FRAME:
         raise SandboxError(f"sandbox frame too large: {len(body)} bytes")
-    stream.write(_LEN.pack(len(body)))
-    stream.write(body)
+    _write_all(stream, _LEN.pack(len(body)))
+    _write_all(stream, body)
     stream.flush()
+
+
+def _write_all(stream: Any, data: bytes) -> None:
+    """Write every byte of ``data``. The parent's end of the worker pipe is unbuffered
+    (``bufsize=0``), and a raw ``write`` may return a short count, as a large one interrupted by a
+    signal can; dropping the remainder would hand the worker a torn frame."""
+    view = memoryview(data)
+    while view:
+        written = stream.write(view)
+        if not written:  # None is a non-blocking raw stream with no room; the pipes here block
+            raise OSError("sandbox pipe accepted no bytes")
+        view = view[written:]
 
 
 def _read_exact(stream: Any, n: int) -> bytes | None:
@@ -1023,12 +1038,9 @@ class SandboxSession:
         :func:`codec.decode_response`, which refuses a ``lookup`` frame, so only an isolated session
         ever brokers a lookup and no worker can ask another session to.
 
-        ``wall_seconds`` counts the lookups the parent serves for the dispatch, so the cap stays the
-        bound it is at ``mode=subprocess``, and a feed whose lookups are slow needs a larger cap. A
-        lookup the parent is serving is not interrupted when the cap runs out: its own bound (the
-        runner's result timeout) ends it, and the dispatch then fails on the cap. So one dispatch can
-        outlast ``wall_seconds`` by at most one lookup's bound. The reply write is bounded by the cap
-        too (:meth:`_write_reply`)."""
+        ``wall_seconds`` bounds the whole dispatch, the lookups the parent serves for it included
+        (:meth:`_serve_bounded`), so the cap stays the bound it is at ``mode=subprocess`` and a feed
+        whose lookups are slow needs a larger cap."""
         brokered = self.policy.mode is SandboxMode.ISOLATED
         deadline = time.monotonic() + self.policy.wall_seconds
         expected_seq = 1
@@ -1044,7 +1056,9 @@ class SandboxSession:
                 ) from None
             if frame is _EOF:
                 self._kill(proc)
-                raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}")
+                served = expected_seq - 1
+                after = f", after {served} brokered lookup(s)" if served else ""
+                raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}{after}")
             try:
                 # Decoding happens HERE, on the dispatch thread, inside this try — not on the daemon
                 # reader thread, where a rejection would be a silent reader death and a wall-cap hang.
@@ -1067,38 +1081,53 @@ class SandboxSession:
             if isinstance(answer, codec.Response):
                 return answer
             expected_seq += 1
-            reply = self._lookup_reply(request_id, phase, name, answer)
-            if not self._write_reply(proc, reply, deadline) or time.monotonic() > deadline:
+            if not self._serve_bounded(proc, request_id, phase, name, answer, deadline):
                 self._kill(proc)
                 raise SandboxError(
                     f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap, "
                     "which counts the lookups the engine served for it"
                 )
 
-    def _write_reply(self, proc: subprocess.Popen[bytes], body: bytes, deadline: float) -> bool:
-        """Write one lookup reply, bounded by the dispatch's wall cap; ``False`` if the cap ran out.
+    def _serve_bounded(
+        self,
+        proc: subprocess.Popen[bytes],
+        request_id: str,
+        phase: str,
+        name: str,
+        lookup: codec.LookupRequest,
+        deadline: float,
+    ) -> bool:
+        """Serve one lookup and write its reply, within the dispatch's wall cap; ``False`` if the
+        cap ran out first, and the caller then kills the worker.
 
-        On its own thread, because a reply can be larger than the pipe's buffer, and a worker that
-        sent a ``lookup`` frame and then stopped reading stdin would otherwise block this thread for
-        good while it holds the session lock: no wall cap, and a reload's ``close`` waiting behind it.
-        The caller kills the worker when the cap runs out, which closes the pipe and ends the write.
-        A broken pipe raises :class:`SandboxError` after the worker is killed."""
+        Both halves run on a helper thread, because either can block past the cap while this thread
+        holds the session lock, and a reload's ``close`` waits on that lock. The lookup can wait on
+        its runner for the runner's own result timeout, longer than the default cap. The reply can
+        be larger than the pipe's buffer, and a worker that sent a ``lookup`` frame and then stopped
+        reading stdin would hold the write for good. The thread runs in a copy of this thread's
+        context, so it sees the lookup runner the transform worker published. A lookup still running
+        when the cap ends is left to finish on its own bound; the kill closes the pipe, which ends a
+        blocked write. A broken pipe raises :class:`SandboxError` after the worker is killed."""
         assert proc.stdin is not None
         stdin = proc.stdin
         failure: list[BaseException] = []
 
-        def write() -> None:
+        def serve() -> None:
             try:
-                _write_frame(stdin, body)
+                _write_frame(stdin, self._lookup_reply(request_id, phase, name, lookup))
             except (OSError, ValueError, SandboxError) as exc:  # ValueError: a pipe closed under it
                 failure.append(exc)
 
-        writer = threading.Thread(
-            target=write, name=f"mf-sandbox-reply-{self._inbound}", daemon=True
+        context = contextvars.copy_context()
+        helper = threading.Thread(
+            target=context.run,
+            args=(serve,),
+            name=f"mf-sandbox-lookup-{self._inbound}",
+            daemon=True,
         )
-        writer.start()
-        writer.join(max(0.0, deadline - time.monotonic()))
-        if writer.is_alive():
+        helper.start()
+        helper.join(max(0.0, deadline - time.monotonic()))
+        if helper.is_alive():
             return False
         if failure:
             self._kill(proc)
@@ -1132,18 +1161,21 @@ class SandboxSession:
         """Answer one brokered lookup in the parent: ``(ok, result, error)``.
 
         The answer comes from the same ``db_lookup``/``fhir_lookup`` accessor a Handler calls at
-        ``mode=off``, on this dispatch thread, so it resolves the runner the transform worker
+        ``mode=off``, in this dispatch's context, so it resolves the runner the transform worker
         published for this transform and nothing else (ADR 0147 AC-2). Where none is published, as on
-        a Router, in a dry run, on the inline fast path or in a graph that declares no lookup, it
-        raises exactly what it raises at ``mode=off``. The executor behind the runner was built
+        a Router, in a dry run, on the inline fast path or in a graph that declares no lookup, the call
+        raises exactly what it raises at ``mode=off``, and it is made before any refusal of the
+        broker's own, so that is the error the Handler sees. The executor behind the runner was built
         against ``[egress]`` and runs its own statement test and row ceiling, so each applies here as
         in-process. The slice-B seam: a broker-only check of a lookup's own arguments goes between the
         refusal below and the call."""
-        refusal = self._lookup_refusal(phase, lookup)
+        is_db = lookup.kind == codec.LOOKUP_DB
+        available = db_lookup_available() if is_db else fhir_lookup_available()
+        refusal = self._lookup_refusal(phase, lookup) if available else None
         if refusal is not None:
             return False, None, refusal
         try:
-            if lookup.kind == codec.LOOKUP_DB:
+            if is_db:
                 return True, db_lookup(lookup.connection, lookup.target, lookup.params), ""
             return True, fhir_lookup(lookup.connection, lookup.target, lookup.params), ""
         except (DbLookupError, FhirLookupError) as exc:
@@ -1158,7 +1190,8 @@ class SandboxSession:
         A lookup is answered only for a Handler, so one bound to a Router or an ``accepts=`` dispatch
         is refused even if a worker sends it; the child has no lookup runner in those phases either.
         And one whose ``[egress]`` list is empty is refused, under the ruling ``docs/CONFIGURATION.md``
-        states in section ``[sandbox]``, *``mode="isolated"``* (vault BACKLOG #3131)."""
+        states in section ``[sandbox]``, *``mode="isolated"``* (vault BACKLOG #3131). The first such
+        refusal per session and list logs a WARNING."""
         fn = _LOOKUP_FN[lookup.kind]
         shown = _shown_name(lookup.connection)
         if phase != "transform":
@@ -1173,8 +1206,7 @@ class SandboxSession:
         if allowed:
             return None
         if key not in self._lookup_refusals_logged:
-            # Once per session and list: the cause is the empty list, whatever connection a worker
-            # names, so the set holds at most two entries. Each refused call still fails.
+            # Keyed by the list, whatever connection a worker names, so it holds at most two entries.
             self._lookup_refusals_logged.add(key)
             log.warning(
                 "inbound %r: a brokered %s on %r was refused: [egress].%s is empty "

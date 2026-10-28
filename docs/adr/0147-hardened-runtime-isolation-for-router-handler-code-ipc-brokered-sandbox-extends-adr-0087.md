@@ -193,9 +193,9 @@ worker, whose lane the session already is). The parent answers it on the dispatc
 same accessor and runner the in-process path uses (AC-1, AC-2), refuses one bound to a Router or
 `accepts=` dispatch, and refuses one whose `[egress].allowed_db` or `[egress].allowed_http` is empty.
 A refused or failed lookup is the Handler's error, routed to `ERROR`/dead-letter post-ACK (AC-5, for
-the broker). `wall_seconds` counts the brokered lookups, and the parent's write of each reply is
-bounded by it, but a lookup the parent is serving is not interrupted: one dispatch can outlast the
-cap by up to one lookup's own timeout before it fails on the cap.
+the broker). `wall_seconds` bounds the whole dispatch, the brokered lookups and the writes of their
+replies included; a lookup the cap cuts off runs on to its own timeout in the parent, and its result
+is discarded.
 
 **Not built:** decision (2), the OS confinement: AC-3 (Landlock and seccomp), AC-4 (the AppContainer
 token), and AC-7 (no opening or signalling the parent or a sibling). The first two open boxes above,

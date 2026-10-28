@@ -1261,10 +1261,10 @@ matters most in the other direction: setting `mode="off"` because one Handler ne
 takes every other Router and Handler out of the sandbox too. To isolate some feeds and not others you
 need separate engine processes.
 
-**`mode="isolated"` is `subprocess` plus a lookup broker, and nothing more yet** ([ADR
+**`mode="isolated"` is `subprocess` plus a lookup broker** ([ADR
 0147](adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md),
-vault BACKLOG #3131). It runs the same per-inbound worker, under the same caps and the same codec, and
-everything this section says about `subprocess` holds for it except the lookups:
+vault BACKLOG #3131). It runs the same per-inbound worker, under the same caps and the same codec.
+It differs from `subprocess` in at least these ways:
 
 - **A Handler's `db_lookup`/`fhir_lookup` works.** The worker sends the call to the engine over the
   worker pipe, and the engine answers it with the same lookup runner it uses at `mode="off"`, against
@@ -1278,15 +1278,16 @@ everything this section says about `subprocess` holds for it except the lookups:
   `[egress].allowed_http` for `fhir_lookup`. **That holds under the audited opt-out
   `[security].block_unlisted_outbound = false` too,** where an empty list would otherwise mean
   unrestricted, so the opt-out cannot open a lookup from the worker to an unlisted host. The first
-  refusal per inbound and connection logs a `WARNING`; each refused call fails like any lookup
-  error.
+  refusal per inbound and list logs a `WARNING`; each refused call fails like any lookup error.
+  A call made where no lookup runner exists fails with the `mode="off"` error first, so a graph
+  that declares no `DatabaseLookup` is never told to edit `[egress]`.
 - **It is still a Handler-only call.** A Router or an `accepts=` predicate that calls either lookup
   fails as it does at `mode="off"`, and the engine refuses a brokered call bound to either of them.
   The dry run has no lookup runner, so it fails there as in every mode.
 - **`wall_seconds` counts the lookups.** The cap bounds the whole call, including the time the engine
-  spends serving its lookups, so raise it for a feed whose lookups are slow. A lookup the engine is
-  serving finishes or times out on its own bound before the cap is checked, so one call can outrun
-  the cap by up to one lookup's timeout.
+  spends serving its lookups, so raise it for a feed whose lookups are slow. When the cap runs out
+  during a lookup, the call fails at once and its worker is recycled; the lookup itself runs on to
+  its own timeout in the engine, and its result is discarded.
 - **It needs a config directory.** A graph built in code with none cannot start a worker. Under
   `subprocess` such a graph quietly runs in-process; under `isolated` the runner refuses to be built
   instead, because in-process its lookups would not go through the broker.
