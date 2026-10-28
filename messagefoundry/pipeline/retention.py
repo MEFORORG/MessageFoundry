@@ -818,8 +818,8 @@ class RetentionRunner:
         whole sweep is skipped: the guard is only as good as its list. A guarded directory whose
         identity cannot be read is read again by each archive under its own identity, and an archive
         that still cannot read it is not swept (:class:`ArchiveGuard`), nor is one whose opened
-        directory has no readable identity. A directory two connections share is swept once. A fault in one connection
-        is logged and the others still run, because a sweep must never stop the pass: a pass that
+        directory has no readable identity. A directory two connections share is swept once. A
+        fault in one connection is logged and the others still run, because a sweep must never stop the pass: a pass that
         raised here would lose the audit row for what it had already purged."""
         # Everything up to the sweep itself is contained: a fault here, a connector's declared
         # directories raising say, must not escape the pass and lose its audit row.

@@ -3070,14 +3070,15 @@ class RegistryRunner:
         dirs: list[Path] = []
         for outbound, name, spec, record in connections:
             keys = guarded_setting_keys(spec.type, outbound=outbound)
-            if not keys:
+            if keys == ():
                 continue  # a fault in a connection with no directories cannot hide one
+            declared = (
+                spec.settings
+                if keys is None  # directories declared, their settings not: resolve them all
+                else {k: spec.settings[k] for k in keys if k in spec.settings}
+            )
             try:
-                settings = resolve_env_settings(
-                    {k: spec.settings[k] for k in keys if k in spec.settings},
-                    self._env_values,
-                    connection=record,
-                )
+                settings = resolve_env_settings(declared, self._env_values, connection=record)
                 dirs.extend(
                     guarded_destination_dirs(
                         Destination(type=spec.type, name=name, settings=settings)

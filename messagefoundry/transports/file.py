@@ -1847,9 +1847,9 @@ class FileSource(SourceConnector):
           logged: a drop's name can carry an identifier.
         * Nothing at all when ``processed_dir`` is, or holds, this connection's watch directory or
           ``.error``, or any directory ``protected`` guards, or when one of those exists but its
-          identity cannot be read under this connection's identity. A ``processed_subdir`` of ``"."`` or
-          ``".."`` would otherwise age out undelivered drops, and ``.error`` deletion is unruled
-          (#3335). The directory is compared by resolved, case-folded path before it is opened, and
+          identity cannot be read under this connection's identity. A ``processed_subdir`` of
+          ``"."`` or ``".."`` would otherwise age out undelivered drops, and ``.error`` deletion is
+          unruled (#3335). The directory is compared by resolved, case-folded path before it is opened, and
           by identity once it is (:class:`ArchiveGuard`).
         * The directory is opened as an archive move opens it (:func:`_open_dest`), so below the
           watch root a link or junction put where ``.processed`` was is refused, not swept through.
@@ -1862,15 +1862,22 @@ class FileSource(SourceConnector):
         # This connection's own directories, and every guarded directory the pass could not read,
         # read again here, under this connection's identity: an alternate credential may reach a
         # share the engine's own account cannot. One it still cannot read refuses the sweep.
-        own = build_archive_guard((self.directory, self.error_dir, *protected.unresolved))
-        if own.unresolved:
+        # Without an alternate credential this runs as the pass did, so a re-read cannot succeed:
+        # refuse without stat'ing a dead share once per archive.
+        own = build_archive_guard(
+            (self.directory, self.error_dir)
+            if self._cred_ctx is None
+            else (self.directory, self.error_dir, *protected.unresolved)
+        )
+        unreadable = own.unresolved | (protected.unresolved if self._cred_ctx is None else set())
+        if unreadable:
             logger.warning(
                 "file source %s: the [retention].processed_archive_days sweep skips this connection "
                 "this pass, because %d directory(ies) it must not reach exist, or may, but their "
                 "identity could not be read under this connection's identity, so an alias of one "
                 "would not be recognised",
                 self._label,
-                len(own.unresolved),
+                len(unreadable),
             )
             return 0
         guard = ArchiveGuard(protected.keys | own.keys, protected.ids | own.ids)
@@ -1902,8 +1909,8 @@ class FileSource(SourceConnector):
                 logger.warning(
                     "file source %s: the [retention].processed_archive_days sweep skips this "
                     "connection this pass, because the identity of its archive directory %s could "
-                    "not be read, so it cannot be checked against the File inbounds' watch and "
-                    "error directories",
+                    "not be read, so it cannot be checked against the directories the sweep "
+                    "must not reach",
                     self._label,
                     self.processed_dir.name,
                 )

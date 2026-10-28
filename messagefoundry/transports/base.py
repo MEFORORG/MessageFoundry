@@ -647,8 +647,8 @@ class ProcessedArchive(Protocol):
     target directory (:func:`guarded_destination_dirs`), bound or not, so one whose archive directory
     is, or holds, any of those deletes nothing: a misconfigured ``processed_subdir`` must never let an
     age sweep reach undelivered drops, files awaiting a partner's pickup, or the ``.error`` copies,
-    whose deletion nobody has ruled on (#3335). ``archiving`` says whether this source writes the archive at all; one that
-    does not is protected but never swept."""
+    whose deletion nobody has ruled on (#3335). ``archiving`` says whether this source writes the
+    archive at all; one that does not is protected but never swept."""
 
     directory: Path
     processed_dir: Path
@@ -691,11 +691,6 @@ class ArchiveGuard:
     ids: frozenset[tuple[int, int]] = frozenset()
     unresolved: frozenset[Path] = frozenset()
 
-    def __or__(self, other: ArchiveGuard) -> ArchiveGuard:
-        return ArchiveGuard(
-            self.keys | other.keys, self.ids | other.ids, self.unresolved | other.unresolved
-        )
-
 
 def archive_dir_key(path: Path) -> str:
     """The form in which an archive sweep compares directories (BACKLOG #1188): links resolved, and
@@ -727,10 +722,11 @@ def build_archive_guard(dirs: Iterable[Path]) -> ArchiveGuard:
     each directory above it, is recorded for the check once the archive is open. A directory that
     does not exist yet stands in by its nearest existing ancestor. A directory whose identity cannot
     be read for any other reason goes into :attr:`ArchiveGuard.unresolved`, and so does one none of
-    whose path can be read. An ancestor above a readable directory that cannot itself be read (a
-    traverse-only parent) is passed over. An identity of inode 0, which some file systems report for
-    every directory and which would otherwise match them all, is not recorded; the sweep refuses an
-    opened archive directory of inode 0 instead. Each directory is stat'ed once per call."""
+    whose path can be read, and so does one whose stat reports inode 0: Windows answers a refused
+    directory from its parent's listing with inode 0 rather than raising, and some file systems
+    report 0 for every directory. An ancestor above a readable directory that cannot itself be read
+    (a traverse-only parent) is passed over, and an ancestor's inode 0 is not recorded, since it
+    would match every directory so reported. Each directory is stat'ed once per call."""
     keys: set[str] = set()
     ids: set[tuple[int, int]] = set()
     unresolved: set[Path] = set()
@@ -754,6 +750,8 @@ def build_archive_guard(dirs: Iterable[Path]) -> ArchiveGuard:
                 if isinstance(exc, OSError) and _is_absent(exc):
                     continue  # not created yet; the nearest existing ancestor stands in for it
                 break  # the guarded directory exists, or may, and cannot be read
+            if not st.st_ino and not found:
+                break  # no identity for the guarded directory (or its stand-in): unresolved
             found = True
             seen.add(candidate)
             if st.st_ino:
@@ -763,15 +761,18 @@ def build_archive_guard(dirs: Iterable[Path]) -> ArchiveGuard:
     return ArchiveGuard(frozenset(keys), frozenset(ids), frozenset(unresolved))
 
 
-def guarded_setting_keys(kind: ConnectorType, *, outbound: bool = False) -> tuple[str, ...]:
+def guarded_setting_keys(kind: ConnectorType, *, outbound: bool = False) -> tuple[str, ...] | None:
     """The settings the connector registered for ``kind`` reads its guarded directories from
-    (:func:`guarded_source_dirs`, :func:`guarded_destination_dirs`), or none when it declares no
-    directories. Only these are resolved for the guard, so another setting's ``env()`` value, a
+    (:func:`guarded_source_dirs`, :func:`guarded_destination_dirs`): ``()`` when it declares no
+    directories, and None when it declares directories but not the settings they come from, so
+    the caller resolves every setting rather than hand ``guarded_dirs`` a partial view. Only the
+    declared settings are resolved for the guard, so another setting's ``env()`` value, a
     not-deployed connection's secret say, is neither read nor able to switch the sweep off."""
     builder = (_DESTINATIONS if outbound else _SOURCES).get(kind)
     if not callable(getattr(builder, "guarded_dirs", None)):
         return ()
-    return tuple(getattr(builder, "guarded_setting_keys", ()))
+    keys = getattr(builder, "guarded_setting_keys", None)
+    return None if keys is None else tuple(keys)
 
 
 def guarded_source_dirs(config: Source) -> tuple[Path, ...]:

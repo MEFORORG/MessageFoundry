@@ -2882,8 +2882,9 @@ class RetentionSettings(_Section):
     # is the full clear-text inbound payload, a second PL-1 copy beside the stored body, so it is
     # auto-bounded at the body window (owner ruling A2 of 2026-10-08, BACKLOG #1188). One level, regular
     # files only, never through a link; `.error` is NOT swept. Only a running File inbound's directory is
-    # swept, and one that overlaps any File inbound's watch or `.error` directory is refused. 0 = keep
-    # forever, which an enforcing PHI instance refuses unless `allow_unbounded_phi` is set.
+    # swept, and one that overlaps a directory it must not reach is refused (the list is
+    # docs/CONFIGURATION.md, `processed_archive_days`). 0 = keep forever, which an enforcing PHI
+    # instance refuses unless `allow_unbounded_phi` is set.
     processed_archive_days: int = 0
     # Past N HOURS, DELETE connection_event rows (#46) — the Corepoint-style transport/lifecycle log can
     # be high-volume (a connect-per-message sender, a probe storm), so it has its own short window in

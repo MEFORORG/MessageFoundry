@@ -443,13 +443,23 @@ def test_a_guarded_directory_whose_identity_cannot_be_read_is_recorded(
     assert build_archive_guard({guarded}).unresolved == {guarded}
 
 
-def test_an_archive_that_cannot_read_an_unresolved_directory_sweeps_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The archive reads the unresolved directory again under its own identity and still cannot.
+def _as_credentialed(src: FileSource, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mark ``src`` as running under an alternate credential, so it re-reads unresolved directories.
+    The blocking half under test runs on the calling thread either way."""
+    monkeypatch.setattr(src, "_cred_ctx", object())
 
-    Mutation: drop the `own.unresolved` refusal in `_prune_processed`. Red."""
+
+@pytest.mark.parametrize("credentialed", [False, True])
+def test_an_archive_that_cannot_read_an_unresolved_directory_sweeps_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credentialed: bool
+) -> None:
+    """Without a credential the archive refuses outright; with one it reads the unresolved directory
+    again under its own identity and still cannot.
+
+    Mutation: drop the `unreadable` refusal in `_prune_processed`. Red."""
     src = _source(tmp_path / "in")
+    if credentialed:
+        _as_credentialed(src, monkeypatch)
     copy = _aged(src.processed_dir / "done.hl7", 90)
     other = tmp_path / "share"
     other.mkdir()
@@ -459,10 +469,13 @@ def test_an_archive_that_cannot_read_an_unresolved_directory_sweeps_nothing(
     assert copy.exists()
 
 
-def test_an_archive_that_can_read_an_unresolved_directory_sweeps(tmp_path: Path) -> None:
-    """A directory the pass could not read, which this archive's identity can (an alternate
-    credential reaching a share, say), does not stop this archive's sweep: its identity is used."""
+def test_an_archive_that_can_read_an_unresolved_directory_sweeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory the pass could not read, which this archive's alternate credential can reach,
+    does not stop this archive's sweep: its identity is used."""
     src = _source(tmp_path / "in")
+    _as_credentialed(src, monkeypatch)
     copy = _aged(src.processed_dir / "done.hl7", 90)
     other = tmp_path / "share"
     other.mkdir()
@@ -472,12 +485,13 @@ def test_an_archive_that_can_read_an_unresolved_directory_sweeps(tmp_path: Path)
 
 
 def test_an_unreadable_directory_that_is_the_archive_is_refused_once_reread(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The pass could not read B's watch directory; A's archive re-reads it, finds it is its own
-    archive directory, and refuses by identity."""
+    archive directory, and refuses (here by the resolved path; identity covers an alias)."""
     shared = tmp_path / "shared"
     a = _source(tmp_path / "a", processed_subdir=str(shared))
+    _as_credentialed(a, monkeypatch)
     drop = _aged(shared / "waiting.hl7", 90)
     guard = ArchiveGuard(keys=frozenset({"unrelated"}), unresolved=frozenset({shared}))
 
@@ -525,8 +539,32 @@ def test_a_guarded_directory_not_created_yet_stands_in_by_its_parent(tmp_path: P
     ancestor's identity is recorded instead."""
     guard = build_archive_guard({tmp_path / "in" / ".error"})
 
+    assert not guard.unresolved
     st = os.stat(tmp_path)
     assert not st.st_ino or (st.st_dev, st.st_ino) in guard.ids
+
+
+def test_a_guarded_directory_of_inode_zero_is_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows answers a refused directory's stat from its parent's listing, with inode 0, rather
+    than raising. That is no identity, so the directory is unresolved, not silently passed.
+
+    Mutation: drop the `not st.st_ino and not found` check in `build_archive_guard`. Red."""
+    guarded = tmp_path / "share"
+    guarded.mkdir()
+    real_stat = os.stat
+    target = Path(os.path.realpath(guarded))
+
+    def listing_answer(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        st = real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+        if isinstance(path, (str, os.PathLike)) and Path(path) == target:
+            return os.stat_result((st.st_mode, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return st
+
+    monkeypatch.setattr(os, "stat", listing_answer)
+
+    assert build_archive_guard({guarded}).unresolved == {guarded}
 
 
 def test_a_missing_archive_directory_is_not_an_error(tmp_path: Path) -> None:
@@ -737,7 +775,8 @@ async def test_the_pass_sweeps_nothing_when_a_guarded_identity_is_unreadable(
 ) -> None:
     """End to end: one guarded directory cannot be stat'ed, so no archive is swept.
 
-    Mutation: as `test_a_guarded_directory_whose_identity_cannot_be_read_fails_closed`. Red."""
+    Mutation: as `test_an_archive_that_cannot_read_an_unresolved_directory_sweeps_nothing`.
+    Red."""
     src = _source(tmp_path / "in")
     old = _aged(src.processed_dir / "old.hl7", 90)
     other = tmp_path / "other-share"
