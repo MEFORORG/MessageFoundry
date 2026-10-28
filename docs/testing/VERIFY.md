@@ -65,7 +65,7 @@ these things still write:
 |---|---|---|
 | `host.writable` | every host run | a probe temp file in the store dir, deleted immediately |
 | `host.ciphers` | a host run where `pyodbc` is installed, on Windows or Linux (DEPLOY-SERVER-DB.md section 5.4 says what it reads) | nothing of its own. Its hop census loads the `--config` graph, which can leave Python's `__pycache__` files in that folder, as the self smoke can. On Windows, the PowerShell it starts may write that program's own per-account files, such as its module analysis cache, as any PowerShell start can |
-| `store.connect` | `--section store`, store **already exists** | no schema-ensure and no migration. On SQLite, the `-wal`/`-shm` sidecars of a WAL store, as any reader creates them, as the calling user. A read-only close does not remove them, so with the engine stopped they stay after `verify` exits, owned by the calling user. On PostgreSQL or SQL Server under `schema_management = external` (the server default), the at-open writes any non-read-only open makes, as the calling user: the store salt bind, the invocation reserve, the at-rest sweep and, on a keyed store with an empty log, the audit genesis row |
+| `store.connect` | `--section store`, store **already exists** | no schema DDL. On SQLite, the `-wal`/`-shm` sidecars of a WAL store, as any reader creates them, as the calling user. A read-only close does not remove them, so with the engine stopped they stay after `verify` exits, owned by the calling user. On PostgreSQL or SQL Server under `schema_management = external` (the server default), the at-open writes any non-read-only open makes, as the calling user. At least: the store salt bind, the invocation reserve, the at-rest sweep, which seals any legacy plaintext under the key this shell holds, and on a keyed store with an empty log the audit genesis row |
 | `smoke.live` | `--smoke live` only | one synthetic message, persisted by the engine |
 
 `tests/test_verify.py` pins which `open_store` calls in `verify` are read-only (BACKLOG #1708). At
@@ -76,10 +76,15 @@ least the `auth.lockable_accounts` census and both `--check-disposition` reads a
   not a MessageFoundry store, such as a sibling application's database, `store.connect` FAILs and
   nothing is built into it.
 - **PostgreSQL and SQL Server under `schema_management = external`**, which is what an unset
-  setting resolves to on a server. `store.connect` makes the same writable open `serve` makes. It
-  runs no DDL there: it reads the `schema_meta` marker and refuses one that is missing or not current,
-  and checks the login's runtime grants (PostgreSQL) and the database options (SQL Server), so a
-  PASS covers those. The census and the disposition reads stay read-only.
+  setting resolves to on a server. `store.connect` makes a writable open, as before BACKLOG #1708.
+  It runs no DDL there: it reads the `schema_meta` marker and refuses one that is missing or not
+  current, and checks the login's runtime grants (PostgreSQL) and the database options (SQL
+  Server), so a PASS covers those. It is not `serve`'s own open: it passes no keyless-chain verdict
+  and no hop posture, so `serve` can still refuse a store this PASSes. Its at-open writes are in
+  the table above. **Do not run it between changing `[store].encryption_key` and restarting
+  `serve`:** its at-rest sweep seals legacy plaintext under the key this shell holds, which a
+  running engine still on the previous key settings cannot read. The census and the disposition
+  reads stay read-only.
 - **PostgreSQL and SQL Server under `schema_management = auto`.** A writable open would run DDL, so
   every open is read-only. It runs no DDL and no `ALTER DATABASE`. A wrong database *name* fails at
   connect. A database that exists but has no `schema_meta` table this login can see, such as

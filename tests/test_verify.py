@@ -1130,39 +1130,96 @@ def test_every_open_store_in_verify_goes_through_the_gate() -> None:
 #: The one verify open allowed a computed ``read_only`` (BACKLOG #1708, Manager decision
 #: 2026-10-27): ``store.connect`` keeps main's writable open on a server backend under ``external``
 #: schema management, where it runs no DDL and runs the grant and database-option checks serve
-#: runs. The value must be the local that :func:`smoke.connect_opens_read_only` set.
+#: runs. The value is the local ``read_only``, which only :func:`smoke.connect_opens_read_only`
+#: may bind (:func:`_bound_only_by_the_helper`).
 _WRITABLE_EXCEPTION: Final = ("smoke.py::check_store_connectivity", "read_only")
 
 
-def _read_only_keyword_allowed(where: str, kw: ast.keyword, called: set[str]) -> bool:
+def _bound_only_by_the_helper(fn: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> bool:
+    """Whether ``name`` is bound in ``fn``, nested functions included, by exactly one plain
+    assignment from a call to ``connect_opens_read_only`` and in no other way: no second
+    assignment, no augmented or annotated one, no loop or ``with`` target, no parameter."""
+    from_helper = 0
+    for sub in ast.walk(fn):
+        if isinstance(sub, ast.arg) and sub.arg == name:
+            return False
+        if (
+            isinstance(sub, ast.Name)
+            and sub.id == name
+            and isinstance(sub.ctx, ast.Store | ast.Del)
+        ):
+            parent_ok = any(
+                isinstance(a, ast.Assign)
+                and a.targets == [sub]
+                and isinstance(a.value, ast.Call)
+                and _callee(a.value) == "connect_opens_read_only"
+                for a in ast.walk(fn)
+            )
+            if not parent_ok:
+                return False
+            from_helper += 1
+    return from_helper == 1
+
+
+def _read_only_keyword_allowed(
+    where: str, kw: ast.keyword, fn: ast.FunctionDef | ast.AsyncFunctionDef
+) -> bool:
     """``read_only=True`` literally, or the one exception above, decided by its named helper."""
     if kw.arg != "read_only":
         return False
     if isinstance(kw.value, ast.Constant) and kw.value.value is True:
         return True
-    return (
-        where,
-        getattr(kw.value, "id", None),
-    ) == _WRITABLE_EXCEPTION and "connect_opens_read_only" in called
+    if not isinstance(kw.value, ast.Name) or (where, kw.value.id) != _WRITABLE_EXCEPTION:
+        return False
+    return _bound_only_by_the_helper(fn, kw.value.id)
 
 
 def test_every_open_store_in_verify_opens_read_only() -> None:
     """#1708's second half: the gate above stops verify CREATING a store, and a writable open of a
     store that does exist still ran the schema-ensure and migrations as the calling user. Every
-    verify open passes the literal ``read_only=True``, as the support bundle's census open does,
-    so it can neither build nor migrate what it reports on. A computed value would let a later
-    change pass ``False`` through a variable, so only the constant counts."""
+    verify open passes the literal ``read_only=True``, as the support bundle's census open does, so
+    it can neither build nor migrate what it reports on, with ONE exception: the
+    ``_WRITABLE_EXCEPTION`` above, whose value only ``connect_opens_read_only`` may bind. Any other
+    computed value would let a later change pass ``False`` through a variable."""
+    functions = dict(_verify_functions())
     calls = _open_store_calls_in_verify()
-    writable = [
+    refused = [
         where
-        for where, call, called in calls
-        if not any(_read_only_keyword_allowed(where, kw, called) for kw in call.keywords)
+        for where, call, _ in calls
+        if not any(_read_only_keyword_allowed(where, kw, functions[where]) for kw in call.keywords)
     ]
-    assert not writable, (
-        f"{writable} open the store without read_only=True, so verify would schema-ensure and "
-        "migrate the store it reports on, as the calling user (#1708)"
+    assert not refused, (
+        f"{refused} open the store neither with read_only=True nor through the one allowed "
+        "exception, so verify could schema-ensure and migrate the store it reports on (#1708)"
     )
     assert sorted({where for where, _, _ in calls}) == _VERIFY_STORE_OPENERS
+
+
+def test_the_writable_exception_pin_refuses_a_rebound_or_shadowed_value() -> None:
+    """Positive controls for :func:`_bound_only_by_the_helper`: the shipped shape passes, and a
+    second binding, a shadowing parameter or a value from elsewhere each fail."""
+    shipped = """
+def check_store_connectivity(store):
+    read_only = connect_opens_read_only(store)
+    async def _open_close():
+        await open_store(store, read_only=read_only)
+"""
+    rebound = shipped.replace("    async def", "    read_only = False\n    async def", 1)
+    shadowed = shipped.replace(
+        "async def _open_close():", "async def _open_close(read_only=False):"
+    )
+    elsewhere = shipped.replace("connect_opens_read_only(store)", "bool(store)")
+    verdicts = {}
+    for label, source in {
+        "shipped": shipped,
+        "rebound": rebound,
+        "shadowed": shadowed,
+        "elsewhere": elsewhere,
+    }.items():
+        fn = ast.parse(source).body[0]
+        assert isinstance(fn, ast.FunctionDef)
+        verdicts[label] = _bound_only_by_the_helper(fn, "read_only")
+    assert verdicts == {"shipped": True, "rebound": False, "shadowed": False, "elsewhere": False}
 
 
 @pytest.mark.parametrize(

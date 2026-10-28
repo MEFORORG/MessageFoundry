@@ -13,9 +13,8 @@
   refuses to create the database file first (BACKLOG #1708): ``open_store``'s schema-ensure created
   whatever path it was handed until BACKLOG #1780, so the check used to PASS against a store it had
   just made and leave the database behind — meaning it could not fail for the reason its title names.
-  Verify never migrates a store or builds one into a database that is not one: its store opens are
-  read-only, but for ``store.connect`` on a server backend under ``external`` schema management,
-  whose writable open runs no DDL (:func:`connect_opens_read_only`).
+  Verify's store opens are read-only but one, which runs no DDL; :func:`connect_opens_read_only`
+  says which and what it still writes.
 
 Synthetic HL7 only — never real PHI. The smoke message is inlined below rather than generated, so
 the verifier never imports ``messagefoundry.generators`` (BACKLOG #1192 / ASVS 15.2.3).
@@ -382,12 +381,14 @@ def connect_opens_read_only(store: StoreSettings) -> bool:
     """Whether ``store.connect`` opens ``store`` read-only: everywhere but a server backend under
     ``[store].schema_management = external`` (BACKLOG #1708, Manager decision 2026-10-27).
 
-    A writable open runs no DDL there: it only reads the ``schema_meta`` marker and refuses a
+    A writable open runs no DDL there: it reads the ``schema_meta`` marker and refuses a missing or
     stale one, and it checks the login's runtime grants (PostgreSQL) and the database options (SQL
     Server). A read-only open skips those checks, so it would PASS a database ``serve`` refuses.
-    Its at-open writes (salt bind, invocation reserve, at-rest sweep, audit genesis row) are
-    unchanged from before #1708. Everywhere else a writable open would run DDL or migrations, so
-    the open stays read-only. SQLite always resolves to ``auto``."""
+    It still makes every at-open write a non-read-only open makes, unchanged from before #1708;
+    ``open_store``'s docstring and ``docs/testing/VERIFY.md`` name them, the at-rest sweep that
+    seals legacy plaintext among them. Everywhere else a writable open would run DDL or migrations,
+    so the open stays read-only. Keyed on the RESOLVED mode: an unset setting is ``external`` on a
+    server backend, and SQLite always resolves to ``auto``."""
     return store.resolved_schema_management() is not SchemaManagement.EXTERNAL
 
 
@@ -411,11 +412,8 @@ def missing_sqlite_store(store: StoreSettings) -> Path | None:
     ``:memory:`` creates nothing on disk and so is outside what this gate exists to stop.
 
     **Scoped to SQLite.** What stops verify building into, or migrating, a database that *does*
-    exist is not this gate but the read-only open (BACKLOG #1708, pinned by a test). Every verify
-    ``open_store`` call is read-only except ``store.connect`` on a server backend under
-    ``external`` schema management, where a writable open runs no DDL
-    (:func:`connect_opens_read_only`). ``open_store``'s docstring says what each open does, and
-    ``docs/testing/VERIFY.md`` says what it leaves a PASS unable to prove.
+    exist is not this gate but the read-only open (BACKLOG #1708, pinned by a test), with the one
+    exception :func:`connect_opens_read_only` names.
     """
     if store.backend is not StoreBackend.SQLITE or store.path == ":memory:":
         return None
@@ -435,11 +433,9 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     running ``verify`` elevated on a fresh box left an administrator-owned store at the configured
     path before the service started under another identity.
 
-    The open is read-only (BACKLOG #1708), so against a store that exists it neither migrates it
-    nor builds one into a database that holds none, and a PASS proves the calling user can open and
-    read the store, not that it can write it. The one exception is a server backend under
-    ``external`` schema management, which keeps the writable open serve makes; see
-    :func:`connect_opens_read_only`.
+    The open is read-only (BACKLOG #1708) but in the case :func:`connect_opens_read_only` names, so
+    it neither migrates a store nor builds one into a database that holds none. A PASS proves the
+    calling user can open and read the store, not that it can write it.
     """
     from messagefoundry.last_resort import run_guarded
 
@@ -464,8 +460,10 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     read_only = connect_opens_read_only(store)
 
     async def _open_close() -> None:
-        # Open and close only, so it cannot start an audit chain (BACKLOG #1916). Read-only
-        # (BACKLOG #1708) except where :func:`connect_opens_read_only` says otherwise.
+        # Open and close only, appending nothing itself. Read-only (BACKLOG #1708) except where
+        # connect_opens_read_only says otherwise. That writable open, as before #1708, writes the
+        # genesis row of a KEYED store whose log is empty, and on a keyless store writes no row,
+        # so it starts no keyless chain (BACKLOG #1916).
         handle = await open_store(store, read_only=read_only, keyless_chain_refusal=None)
         await handle.close()
 
@@ -478,20 +476,18 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
             Status.FAIL,
             f"{store.backend.value} store failed to open: {exc}",
         )
-    how = (
-        "opened read-only and closed cleanly as the calling user (NOT proof that this user can "
-        "write it, nor"
-        if read_only
-        else "opened and closed cleanly as the calling user, through the schema-marker and runtime "
-        "checks serve runs (NOT proof"
+    caveat = (
+        "NOT proof that this user can write it, that serve will accept it, or that the NSSM "
+        "service account can connect — confirm the service-identity grants"
     )
-    return CheckResult(
-        rid,
-        title,
-        Status.PASS,
-        f"{store.backend.value} store {how} that the NSSM service account can connect — "
-        "confirm the service-identity grants)",
-    )
+    if read_only:
+        detail = f"opened read-only and closed cleanly as the calling user ({caveat})"
+    else:
+        detail = (
+            "opened and closed cleanly as the calling user, through the schema-marker, grant and "
+            f"database-option checks an external-mode open runs ({caveat})"
+        )
+    return CheckResult(rid, title, Status.PASS, f"{store.backend.value} store {detail}")
 
 
 def newest_message_id(store: StoreSettings, control_id: str) -> str | None:

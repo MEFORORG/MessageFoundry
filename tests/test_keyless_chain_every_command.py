@@ -1294,7 +1294,10 @@ def test_a_service_config_that_cannot_be_read_exits_2(
 _MAY_PASS_NONE = {
     # read-only: db_status() for the support bundle
     ("messagefoundry/support/bundle.py", "_db_info"),
-    # read-only: open and close, or list_messages, for the deployment verifier
+    # read-only: open and close, or list_messages, for the deployment verifier. One exception:
+    # store.connect's open is writable on a server under external schema management (BACKLOG
+    # #1708). It appends nothing itself; that open writes a KEYED store's genesis row into an empty
+    # log, and no row on a keyless store, so it starts no keyless chain.
     ("messagefoundry/verify/smoke.py", "check_store_connectivity._open_close"),
     ("messagefoundry/verify/smoke.py", "newest_message_id._newest"),
     ("messagefoundry/verify/smoke.py", "check_smoke_disposition._poll"),
