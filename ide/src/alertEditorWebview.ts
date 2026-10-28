@@ -97,9 +97,10 @@ export function alertEditorScript(
       // (BACKLOG #1123). The problem text before it does vary with the message: it names a
       // position, a field and a fixed kind word, and copies no value in (see rulesProblem()).
       show('These rules cannot be shown. The list sent to this panel is malformed: ' + problem + '.' +
-        ' If a value in [[alerts.rules]] of the service-settings file is wrong, fix it; otherwise the' +
-        ' command that lists the rules printed something this panel does not expect. Run the Alert' +
-        ' Rules command again, and report it if this stays.' +
+        ' If a value in [[alerts.rules]] of the service-settings file is wrong, fix it (a number there' +
+        ' must not be in quotes), then run the Alert Rules command again. Otherwise the command that' +
+        ' lists the rules printed something this panel does not expect: run the Alert Rules command' +
+        ' again, and report it if this stays.' +
         ' Remove and Add are off until a well-formed list arrives.');
     }
 
@@ -161,8 +162,10 @@ export function alertEditorScript(
     // counter, never the entry's index (BACKLOG #1123), the field name comes from RULE_FIELDS, and
     // the kind is a fixed word from mfKind() or this function. Which of those words appear does
     // depend on the message.
-    const at = (i) => 'the entry at position ' + i + ' of the list (counted from 0)';
     function rulesProblem(d) {
+      // Local, not a script-level const: a top-level binding shares the global lexical scope with
+      // every other classic script in the webview, and a clash would stop the page loading.
+      const at = (i) => 'the entry at position ' + i + ' of the list (counted from 0)';
       if (!Array.isArray(d.rules)) { return 'the list is missing or is not a list'; }
       // By index, not for-of or every(): a hole must be seen as an entry that is not a rule.
       for (let i = 0; i < d.rules.length; i++) {

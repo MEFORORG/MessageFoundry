@@ -1046,6 +1046,13 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       "the entry at position 0 of the list (counted from 0), min_depth: expected a number, got string. ";
     assert.ok(shown.startsWith(want), `the refusal does not name position 0 alone: "${shown}"`);
     assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "rules"')), "console.warn was dropped");
+    // Past the first entry too: index 5 at position 1, behind a well-formed entry.
+    const q = alertRules.load();
+    q.deliver({ command: "rules", rules: [{ index: 0 }, { connection: 3, index: 5 }] });
+    assert.ok(
+      refusalShown(q).includes("malformed: the entry at position 1 of the list (counted from 0), connection: expected text, got number. "),
+      `the refusal does not name position 1 alone: "${refusalShown(q)}"`,
+    );
   });
 
   test("Alert Rules: a well-formed list after a refusal brings back the table, Remove and Add", () => {
