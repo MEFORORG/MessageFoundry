@@ -1082,10 +1082,10 @@ general line logged before it. The line's own time stamp has whole seconds only,
 order of two lines logged in the same second; an audit line's JSON body carries a `ts` with
 fractions of a second, and a general line has nothing like it. `queue_dropped` counts drops from
 both lanes, and `lost` counts each once. **The drop warning in the engine log and the `dropping`
-alert read the same whichever lane dropped.** The warning carries at least the combined batch,
-one capacity figure (the general lane's) and the combined total, as the single queue's did; the
-alert carries at least the `queue_full` reason and `lost`. Neither names a lane or gives a count
-for one lane alone. What these counts and `queued` tell a reader about audit rows is in
+alert word themselves the same whichever lane dropped.** The warning carries at least the
+combined batch, one capacity figure (the general lane's) and the combined total, as the single
+queue's did; the alert carries at least the `queue_full` reason and `lost`. Neither names a lane
+or gives a count for one lane alone. The counts themselves can still differ by lane. What these counts and `queued` tell a reader about audit rows is in
 [SECURITY.md](SECURITY.md), beside the other audit-row residuals of the log channel. No field gives the audit lane's depth. A collector
 whose sends fail shows as `send_failing` and the `degraded` state, and a lane that fills shows as
 the `queue_full` alert reason and a rise in `queue_dropped`. A collector that is

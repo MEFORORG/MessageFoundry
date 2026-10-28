@@ -1471,6 +1471,10 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
             self._last_drop_report = now
             batch, total = self._dropped_since_report, self.dropped
             self._dropped_since_report = 0
+            if not batch:
+                # A nested count on this thread (the lock is re-entrant) reported the batch
+                # first, between our read of ``last`` and our stamp. Nothing is left to report.
+                return
         records = self._records
         depth = records.lane_maxsize if isinstance(records, _ForwardLanes) else records.maxsize
         # The line names no lane and prints the general lane's depth whichever lane dropped, so

@@ -1445,9 +1445,11 @@ def test_a_drop_counted_by_the_thread_already_holding_the_counter_lock_does_not_
     worker.start()
     worker.join(5.0)
     if worker.is_alive():
-        # The stuck worker holds the lock for good, and close() and the interpreter's logging
-        # shutdown would both block on it. A fresh lock lets the run fail rather than hang.
+        # The stuck worker holds the counter lock and the handler's own lock for good, and close()
+        # and the interpreter's logging shutdown would block on them. Fresh locks let the run
+        # fail rather than hang.
         fwd._counter_lock = threading.RLock()
+        fwd.lock = threading.RLock()
         fwd.close()
         pytest.fail("the nested drop count deadlocked on the counter lock")
     fwd.close()
