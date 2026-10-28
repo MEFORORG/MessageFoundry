@@ -2692,18 +2692,6 @@ LogoutOutcome = Literal["revoked", "lapsed", "nothing_to_revoke"]
 #: another tab that committed while the sign-out was in flight, and no longer. docs/SECURITY.md
 #: states it as a power of its own.
 _LOGOUT_LINEAGE_SECONDS: Final = 5.0
-#: BACKLOG #3749 item 6: the budget on ``auth.logout`` rows for a sign-out that ended nothing.
-#: ``/ui/logout`` has no auth dependency, so without it anyone could append such rows without
-#: limit. Per client address, with a global ceiling so a flood from many addresses is bounded too.
-#: The sign-out itself is never throttled (BACKLOG #287), and a sign-out that ended a session
-#: always writes its row.
-_LOGOUT_MISS_ROWS_PER_CLIENT: Final = 10
-_LOGOUT_MISS_ROWS_GLOBAL: Final = 100
-_LOGOUT_MISS_WINDOW_SECONDS: Final = 60.0
-#: The row that counts ``auth.logout`` rows the budget above dropped. Its detail's ``dropped`` is
-#: the number dropped since the previous such row, across all clients; at most one is written per
-#: window (``AuthService._admit_logout_miss_row``).
-LOGOUT_ROWS_DROPPED_ACTION: Final = "auth.logout_rows_dropped"
 _ISSUE_ROW_EARLY_SECONDS: Final = 5.0
 _ISSUE_ROW_LATE_SECONDS: Final = 60.0
 _ISSUE_ROW_PAGE: Final = 200
@@ -3223,16 +3211,6 @@ class AuthService:
             if settings.login_rate_limit_enabled
             else None
         )
-        # BACKLOG #3749 item 6: bounds the auth.logout rows a sign-out that ended nothing writes.
-        # In-process, as every limiter here is. See _LOGOUT_MISS_ROWS_PER_CLIENT.
-        self._logout_miss_limiter = SlidingWindowRateLimiter(
-            per_key=_LOGOUT_MISS_ROWS_PER_CLIENT,
-            glob=_LOGOUT_MISS_ROWS_GLOBAL,
-            window_seconds=_LOGOUT_MISS_WINDOW_SECONDS,
-        )
-        self._logout_misses_dropped = 0
-        # Monotonic time of the last LOGOUT_ROWS_DROPPED_ACTION row, which is written once a window.
-        self._logout_dropped_row_at: float | None = None
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # bounded host keys (_bounded_address_text(_host_key(...)), BACKLOG #3772) already flagged since the session's last re-verification (BACKLOG #2159). Every
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
@@ -10816,12 +10794,6 @@ class AuthService:
         characters of its id and, when a link was followed, of the hash presented. With no token
         there is nothing to look up, so this returns ``nothing_to_revoke`` and writes no row.
 
-        **A sign-out with no ``proven_at`` that ended nothing writes its row within a budget
-        (BACKLOG #3749 item 6).** :meth:`_admit_logout_miss_row` says how. A caller that proved the
-        token was authenticated, so its rows are bounded by its sessions and are never budgeted.
-        The sign-out itself runs and answers as before (BACKLOG #287), and a sign-out that ended a
-        session always attempts its row.
-
         **A fault in the owner lookup or an audit write is logged, not raised (BACKLOG #3884 item
         1).** Once a session ended, a raise would report a sign-out that already happened as a
         failure, and ``/ui/logout`` answered 500 without clearing the cookie. A failed owner lookup
@@ -10847,20 +10819,19 @@ class AuthService:
         ended = await self._store.supersede_session(presented, now=before, lineage_since=since)
         if ended is None:
             # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
-            # ended, so the trail still records the sign-out request, within the budget.
-            if proven_at is not None or await self._admit_logout_miss_row(client):
-                await write_audit_soft(
-                    lambda: self._audit(
-                        "auth.logout",
-                        actor=actor,
-                        detail=_json({"outcome": "nothing_to_revoke"}),
-                        client=client,
-                    ),
-                    log=_log,
-                    message="a sign-out that ended nothing could not write its auth.logout row",
-                    # A raise would fail a sign-out the caller is owed (see below).
-                    defects=(),
-                )
+            # ended, so the trail still records the sign-out request.
+            await write_audit_soft(
+                lambda: self._audit(
+                    "auth.logout",
+                    actor=actor,
+                    detail=_json({"outcome": "nothing_to_revoke"}),
+                    client=client,
+                ),
+                log=_log,
+                message="a sign-out that ended nothing could not write its auth.logout row",
+                # A raise would fail a sign-out the caller is owed (see below).
+                defects=(),
+            )
             return "nothing_to_revoke"
         outcome: LogoutOutcome = (
             "revoked" if self._was_live_at_revoke(ended, before, time.time()) else "lapsed"
@@ -10892,41 +10863,6 @@ class AuthService:
             defects=(),
         )
         return outcome
-
-    async def _admit_logout_miss_row(self, client: str | None) -> bool:
-        """Whether a sign-out with no ``proven_at`` that ended nothing may write its ``auth.logout``
-        row now (BACKLOG #3749 item 6). ``/ui/logout`` has no auth dependency, so without a bound
-        anyone could append such rows.
-
-        :data:`_LOGOUT_MISS_ROWS_PER_CLIENT` rows per client address, under the global ceiling
-        :data:`_LOGOUT_MISS_ROWS_GLOBAL`, per :data:`_LOGOUT_MISS_WINDOW_SECONDS`. A client with no
-        address shares one bucket. Past the budget the row is dropped and counted. The count is
-        written as a :data:`LOGOUT_ROWS_DROPPED_ACTION` row, at most one per window: the first drop
-        after a quiet window writes one at once, and later drops are written by the first miss,
-        admitted or not, a window after that. The row names no client, because its count spans
-        clients. The count lives in this process only: drops after the last such row are not
-        written if no miss follows, and a restart loses them."""
-        admitted = self._logout_miss_limiter.allow(client or "")
-        if not admitted:
-            self._logout_misses_dropped += 1
-        now = time.monotonic()
-        last = self._logout_dropped_row_at
-        if self._logout_misses_dropped and (
-            last is None or now - last >= _LOGOUT_MISS_WINDOW_SECONDS
-        ):
-            dropped, self._logout_misses_dropped = self._logout_misses_dropped, 0
-            self._logout_dropped_row_at = now
-            written = await write_audit_soft(
-                lambda: self._audit(LOGOUT_ROWS_DROPPED_ACTION, detail=_json({"dropped": dropped})),
-                log=_log,
-                message="%d dropped auth.logout rows could not be counted; the count is kept",
-                args=(dropped,),
-                # A raise would fail the sign-out the caller is owed, and lose the count.
-                defects=(),
-            )
-            if not written:
-                self._logout_misses_dropped += dropped
-        return admitted
 
     async def _owner_name(self, user_id: str) -> str | None:
         """The username of the account ``user_id`` names, or ``None`` when there is none: the actor

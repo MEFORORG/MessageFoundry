@@ -26,11 +26,3 @@ async def logout_details(store: Any) -> list[dict[str, object]]:
         json.loads(str(row["detail"] or "{}"))
         for row in await store.list_audit(action="auth.logout")
     ]
-
-
-async def logout_rows_dropped(store: Any) -> list[int]:
-    """Each ``auth.logout_rows_dropped`` row's ``dropped`` count, newest first (BACKLOG #3749)."""
-    return [
-        int(json.loads(str(row["detail"]))["dropped"])
-        for row in await store.list_audit(action="auth.logout_rows_dropped")
-    ]

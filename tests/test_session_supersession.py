@@ -26,19 +26,15 @@ import pytest
 from messagefoundry.auth import Role
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.oidc import FederatedPrincipal
-from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.service import (
     _LOGOUT_LINEAGE_SECONDS,
-    _LOGOUT_MISS_ROWS_GLOBAL,
-    _LOGOUT_MISS_ROWS_PER_CLIENT,
-    _LOGOUT_MISS_WINDOW_SECONDS,
     AuthService,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
-from tests._logout_rows import logout_details, logout_rows, logout_rows_dropped
+from tests._logout_rows import logout_details, logout_rows
 from tests._session_race import rotate_after_first_call
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
@@ -546,7 +542,7 @@ async def test_the_callback_supersedes_only_after_the_proof_succeeds(
     assert len(await _superseded(store)) == (1 if ok else 0)
 
 
-# --- BACKLOG #3715, #3749: the lineage a logout follows, a lapsed row, the row budget ---
+# --- BACKLOG #3715, #3749: the lineage a logout follows, a lapsed row, every miss writes ---
 
 
 async def _rotated(service: AuthService, token: str) -> str:
@@ -607,54 +603,19 @@ async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(
     ]
 
 
-async def _misses(service: AuthService, client: str, count: int) -> None:
+async def test_every_sign_out_that_ends_nothing_writes_its_row(store: MessageStore) -> None:
+    # BACKLOG #3749: no budget drops these rows. Every sign-out that presents a token writes its
+    # auth.logout row, as on main, so 150 misses from one client with nothing proven write 150
+    # rows. Bounding an audit flood is a separate concern from this item.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    count = 150
     for n in range(count):
         assert (
-            await service.logout(f"no-such-token-{n}", client=client, proven_at=None)
+            await service.logout(f"no-such-token-{n}", client="203.0.113.9", proven_at=None)
             == "nothing_to_revoke"
         )
-
-
-async def test_sign_outs_that_end_nothing_write_rows_within_a_budget(
-    store: MessageStore,
-) -> None:
-    # BACKLOG #3749 item 6. /ui/logout has no auth dependency, so anyone could append auth.logout
-    # rows. Past the per-client budget the row is dropped and counted, in at most one count row a
-    # window: the first drop writes one at once, and the rest wait for a miss a window later.
-    service = await _service(store, session_idle_timeout_minutes=30)
-    budget = _LOGOUT_MISS_ROWS_PER_CLIENT
-    await _misses(service, "203.0.113.9", budget + 3)
-    assert len(await logout_rows(store)) == budget, "the budget did not bound the rows"
-    assert await logout_rows_dropped(store) == [1], "the trip wrote no counted row"
-    # Another client still has its own budget, and inside the window writes no second count row.
-    await _misses(service, "203.0.113.10", 1)
-    assert await logout_rows_dropped(store) == [1], "a second count row inside one window"
-    assert len(await logout_rows(store)) == budget + 1
-    # A window later the budget has room again, and the next miss first writes the rest. The
-    # window's passing is set on the service's own state, not by moving time.monotonic, which the
-    # event loop's clock reads too.
-    service._logout_miss_limiter = SlidingWindowRateLimiter(
-        per_key=budget, glob=_LOGOUT_MISS_ROWS_GLOBAL, window_seconds=_LOGOUT_MISS_WINDOW_SECONDS
-    )
-    assert service._logout_dropped_row_at is not None
-    service._logout_dropped_row_at -= _LOGOUT_MISS_WINDOW_SECONDS + 1.0
-    await _misses(service, "203.0.113.9", 1)
-    assert await logout_rows_dropped(store) == [2, 1], "newest first: the rest, then the trip"
-    assert len(await logout_rows(store)) == budget + 2
-    # An authenticated caller's miss is never budgeted: its gate proved the token.
-    for n in range(budget + 1):
-        await service.logout(f"gone-{n}", client="203.0.113.9", actor="op", proven_at=time.time())
-    assert len(await logout_rows(store)) == 2 * budget + 3
-    # A sign-out that ends a session always writes, from the tripped client too.
-    token = await _token(service)
-    assert await service.logout(token, client="203.0.113.9", proven_at=None) == "revoked"
-    assert (await logout_rows(store))[0] == ("op", "203.0.113.9", "revoked")
-
-
-async def test_sign_outs_that_end_nothing_inside_the_budget_all_write(store: MessageStore) -> None:
-    # The control for the test above: at the budget exactly, every row is written and no count is.
-    service = await _service(store, session_idle_timeout_minutes=30)
-    budget = _LOGOUT_MISS_ROWS_PER_CLIENT
-    await _misses(service, "203.0.113.9", budget)
-    assert await logout_rows(store) == [(None, "203.0.113.9", "nothing_to_revoke")] * budget
-    assert await logout_rows_dropped(store) == []
+    rows = await store.list_audit(action="auth.logout", limit=count * 2)
+    assert len(rows) == count, "a sign-out that ended nothing wrote no row"
+    assert {(row["client"], json.loads(str(row["detail"]))["outcome"]) for row in rows} == {
+        ("203.0.113.9", "nothing_to_revoke")
+    }
