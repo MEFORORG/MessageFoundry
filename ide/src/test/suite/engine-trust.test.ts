@@ -342,8 +342,8 @@ suite("the registered anchor reaches the TLS layer", () => {
   });
 
   test("with no anchor registered the request carries only the floors and the suite pin", () => {
-    // BACKLOG #300 added `ciphers` and the DHE group floor; the anchor is still absent, which is
-    // what this test is about.
+    // BACKLOG #300 added `ciphers` and `minDHSize`; the anchor is still absent, which is what this
+    // test is about.
     assert.deepStrictEqual(tlsOptions(new URL("https://127.0.0.1:8765")), {
       minVersion: "TLSv1.2",
       ciphers: TLS_CIPHERS,
@@ -351,7 +351,7 @@ suite("the registered anchor reaches the TLS layer", () => {
     });
   });
 
-  test("a registered anchor keeps the 2048-bit DHE group floor (BACKLOG #300)", () => {
+  test("a registered anchor keeps the 2048-bit Diffie-Hellman group floor (BACKLOG #300)", () => {
     setEngineTrustAnchor("https://127.0.0.1:8765", PEM);
     assert.strictEqual(tlsOptions(new URL("https://127.0.0.1:8765")).minDHSize, 2048);
   });

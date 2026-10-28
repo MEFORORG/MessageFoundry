@@ -2297,6 +2297,9 @@ _LIT = r"""(?:\s*['"`](?P<alg>[\w.-]+)['"`])?"""
 #: An identifier is captured as a reference (``ciphers[=TLS_CIPHERS]``), so swapping the constant a
 #: pin names changes the token even when no literal moved.
 _CIPHER_LIT = r"""(?:\s*(?:['"`](?P<alg>[^'"`\n]+)['"`]|(?P<ref>[A-Za-z_$][\w$.]*)))?"""
+#: A numeric option value (BACKLOG #300, ``minDHSize``): a number literal is captured as the value,
+#: so lowering it changes the token; a name is captured as a reference, as ``_CIPHER_LIT`` does.
+_NUMBER_LIT = r"""(?:\s*(?:(?P<alg>[0-9][0-9_]*)|(?P<ref>[A-Za-z_$][\w$.]*)))?"""
 #: One cipher SUITE NAME in a string literal, OpenSSL style (``ECDHE-RSA-AES256-GCM-SHA384``) or IANA
 #: style (``TLS_AES_256_GCM_SHA384``, ``TLS_DH_anon_WITH_AES_128_CBC_SHA``). BACKLOG #2020. It must
 #: sit between quotes, colons, commas or whitespace, so each suite of a joined list is its own
@@ -2392,6 +2395,8 @@ NON_PYTHON_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
     # A floor and a cap are different decisions, so they are different tokens.
     "minVersion": (re.compile(_B + r"minVersion\s*:" + _LIT), "tls_context"),
     "maxVersion": (re.compile(_B + r"maxVersion\s*:" + _LIT), "tls_context"),
+    # The smallest DHE group a client accepts. A floor on the key exchange, not on the protocol.
+    "minDHSize": (re.compile(_B + r"minDHSize\s*:" + _NUMBER_LIT), "tls_context"),
     "rejectUnauthorized": (re.compile(_B + r"rejectUnauthorized\s*:"), "tls_context"),
     "checkServerIdentity": (re.compile(_B + r"checkServerIdentity\s*:"), "tls_context"),
     "secureProtocol": (
@@ -2423,9 +2428,11 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # arm's row for the same file, which is where the entropy argument lives).
     "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),
     # The TLS floor and suite pin the extension applies to every https request it makes to the engine:
-    # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS }`, plus the pinned
-    # engine CA as `ca` when one is configured. Certificate verification is never switched off. The
-    # floor is a named constant, not a literal, so the token does not carry it. `ciphers` is the
+    # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS, minDHSize: 2048 }`,
+    # plus the pinned engine CA as `ca` when one is configured. Certificate verification is never
+    # switched off. The protocol floor is a named constant, not a literal, so the token does not
+    # carry it. The DHE group floor is a literal, so `minDHSize[2048]` does: lowering it, or
+    # dropping it, reds the gate (BACKLOG #300). `ciphers` is the
     # BACKLOG #300 suite pin; `TLS_12_SUITES` in that file says which suites and what holds them.
     # The `ciphers` token names the constant the pin uses, `TLS_CIPHERS`. The seven `suite` tokens
     # are the literals of `TLS_12_SUITES` and `TLS_13_SUITES`, so this row pins WHICH suites the file
@@ -2439,6 +2446,7 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "ide/src/engineClient.ts": frozenset(
         {
             "tls_context:minVersion",
+            "tls_context:minDHSize[2048]",
             "tls_context:ciphers[=TLS_CIPHERS]",
             "tls_context:suite[ECDHE-ECDSA-AES256-GCM-SHA384]",
             "tls_context:suite[ECDHE-RSA-AES256-GCM-SHA384]",
@@ -2453,7 +2461,32 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # the options object `tlsOptions` returns. Listed rather than excluded, because pruning test
     # directories from the walk would be a scope cut the randomness arm does not make either.
     "ide/src/test/suite/engine-trust.test.ts": frozenset(
-        {"tls_context:minVersion[TLSv1.2]", "tls_context:ciphers[=TLS_CIPHERS]"}
+        {
+            "tls_context:minVersion[TLSv1.2]",
+            "tls_context:minDHSize[2048]",
+            "tls_context:ciphers[=TLS_CIPHERS]",
+        }
+    ),
+    # Not a TLS use the product makes: the extension test that measures the DHE group floor above
+    # with real handshakes (BACKLOG #300). It mints a throwaway RSA key and self-signed certificate in
+    # memory, serves the one DHE suite over a 1536-bit or 2048-bit group with the SERVER's level
+    # lowered to 0 so it will serve the small group, and lowers the CLIENT's level to 1 in two
+    # handshakes, so the refusal it asserts is the `minDHSize` floor's and not OpenSSL's. The
+    # `minDHSize[1024]` is the control arm, Node's own default. `DH` is the PEM label of the
+    # parameter block.
+    "ide/src/test/suite/engine-client-dh.test.ts": frozenset(
+        {
+            "key_cert:createKey",
+            "tls_context:cipher_string[@SECLEVEL=0]",
+            "tls_context:cipher_string[@SECLEVEL=1]",
+            "tls_context:cipher_string[DH]",
+            "tls_context:ciphers[${DHE_SUITE}:@SECLEVEL=0]",
+            "tls_context:ciphers[=lowered]",
+            "tls_context:maxVersion[TLSv1.2]",
+            "tls_context:minDHSize[1024]",
+            "tls_context:minVersion[TLSv1.2]",
+            "tls_context:suite[DHE-RSA-AES256-GCM-SHA384]",
+        }
     ),
     # The operator console's WebAuthn ceremonies (ADR 0068): navigator.credentials.create enrolls a
     # passkey and navigator.credentials.get asks the authenticator to SIGN the server's challenge.

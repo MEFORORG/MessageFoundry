@@ -11,10 +11,8 @@
 //   1536 bit   shipped ciphers + @SECLEVEL=1, minDHSize 1024 handshake completes
 //   1536 bit   shipped ciphers + @SECLEVEL=1, minDHSize 2048 ERR_TLS_DH_PARAM_SIZE
 //   2048 bit   shipped ciphers, minDHSize 2048               handshake completes
-// So on this runtime OpenSSL's default security level already refuses under 2048. `minDHSize` is what
-// holds the floor where that level is 1: OpenSSL before 3.2 defaults to it, and a system OpenSSL
-// configuration can lower it. The tests below therefore lower the level themselves, to show the
-// option does the refusing.
+// `tlsOptions` in engineClient.ts says why the floor matters where OpenSSL's level is lower. The tests
+// below lower the level themselves, to show the option does the refusing.
 import * as assert from "assert";
 import * as crypto from "crypto";
 import * as https from "https";
@@ -51,8 +49,13 @@ function der(tag: number, body: Buffer): Buffer {
 const sequence = (...parts: Buffer[]): Buffer => der(0x30, Buffer.concat(parts));
 const integer = (value: Buffer): Buffer =>
   der(0x02, value[0] & 0x80 ? Buffer.concat([Buffer.from([0]), value]) : value);
-const utcTime = (at: Date): Buffer =>
-  der(0x17, Buffer.from(`${at.toISOString().replace(/[-:T]/g, "").slice(2, 14)}Z`));
+/** A certificate validity time: UTCTime before 2050 and GeneralizedTime after, as RFC 5280 requires. */
+function certTime(at: Date): Buffer {
+  const digits = at.toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  return at.getUTCFullYear() < 2050
+    ? der(0x17, Buffer.from(`${digits.slice(2)}Z`))
+    : der(0x18, Buffer.from(`${digits}Z`));
+}
 
 function toPem(label: string, body: Buffer): string {
   const lines = body.toString("base64").match(/.{1,64}/g) ?? [];
@@ -81,7 +84,7 @@ function mintCertificate(): { key: string; cert: string } {
     integer(Buffer.from([1])),
     sha256WithRsa,
     name,
-    sequence(utcTime(new Date(now - 86_400_000)), utcTime(new Date(now + 86_400_000))),
+    sequence(certTime(new Date(now - 86_400_000)), certTime(new Date(now + 86_400_000))),
     name,
     publicKey.export({ type: "spki", format: "der" }),
     der(0xa3, sequence(ipSan)),
@@ -100,13 +103,14 @@ function dhParams(group: "modp5" | "modp14"): string {
   return toPem("DH PARAMETERS", sequence(integer(dh.getPrime()), integer(dh.getGenerator())));
 }
 
-/** Whether this runtime's TLS library can negotiate the DHE suite at all. BoringSSL, under VS Code's
- *  desktop Electron, is taken to have none, so the floor has nothing to act on there. */
+/** Whether this runtime's TLS library lists the DHE suite at all. BoringSSL, under VS Code's desktop
+ *  Electron, is taken to have none. Asked of the library rather than assumed from the runtime, so a
+ *  build that does list it runs these tests instead of skipping them. */
 function runtimeSpeaksDhe(): boolean {
-  return process.versions.electron === undefined && tls.getCiphers().includes(DHE_SUITE.toLowerCase());
+  return tls.getCiphers().includes(DHE_SUITE.toLowerCase());
 }
 
-suite("the IDE refuses a DHE group under 2048 bits (BACKLOG #300)", function () {
+suite("the IDE refuses a Diffie-Hellman group under 2048 bits (BACKLOG #300)", function () {
   this.timeout(20_000);
   let material: { key: string; cert: string };
   const servers: https.Server[] = [];
@@ -165,7 +169,7 @@ suite("the IDE refuses a DHE group under 2048 bits (BACKLOG #300)", function () 
           const info = (res.socket as tls.TLSSocket).getEphemeralKeyInfo();
           res.resume();
           const size = info !== null && "size" in info ? info.size : "none";
-          res.on("end", () => resolve(`completed DH ${size}`));
+          res.on("end", () => resolve(`completed over ${size} bits`));
         },
       );
       req.on("error", (err: NodeJS.ErrnoException) => resolve(err.code ?? err.message));
@@ -180,7 +184,7 @@ suite("the IDE refuses a DHE group under 2048 bits (BACKLOG #300)", function () 
     // negotiable and the refusal below is the floor's, not the server's or OpenSSL's.
     assert.strictEqual(
       await handshake(base, { ...tlsOptions(new URL(base)), ciphers: lowered, minDHSize: 1024 }),
-      "completed DH 1536",
+      "completed over 1536 bits",
     );
     assert.strictEqual(
       await handshake(base, { ...tlsOptions(new URL(base)), ciphers: lowered }),
@@ -196,7 +200,7 @@ suite("the IDE refuses a DHE group under 2048 bits (BACKLOG #300)", function () 
     assert.deepStrictEqual(await getJson(base, "/health"), {});
     assert.strictEqual(
       await handshake(base, tlsOptions(new URL(base))),
-      "completed DH 2048",
+      "completed over 2048 bits",
     );
   });
 
@@ -205,9 +209,11 @@ suite("the IDE refuses a DHE group under 2048 bits (BACKLOG #300)", function () 
     // is lower), the request the extension makes must fail.
     const base = await serve("modp5");
     setEngineTrustAnchor(base, material.cert);
+    // Tied to the DH cause: a lost DHE suite would also fail, as EPROTO "no shared cipher".
     await assert.rejects(getJson(base, "/health"), (err: NodeJS.ErrnoException) => {
       assert.ok(
-        err.code === "ERR_TLS_DH_PARAM_SIZE" || err.code === "EPROTO",
+        err.code === "ERR_TLS_DH_PARAM_SIZE" ||
+          (err.code === "EPROTO" && /dh key too small/i.test(err.message)),
         `unexpected failure ${err.code}: ${err.message}`,
       );
       return true;

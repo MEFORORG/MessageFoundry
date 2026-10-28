@@ -180,23 +180,6 @@ export const TLS_13_SUITES: readonly string[] = [
 export const TLS_CIPHERS = TLS_12_SUITES.concat(TLS_13_SUITES).join(":");
 
 /**
- * The smallest DHE group, in bits, this client accepts from a server (BACKLOG #300). Node's own
- * default is 1024.
- *
- * {@link TLS_12_SUITES} names one DHE suite, `DHE-RSA-AES256-GCM-SHA384`, and keeps it: the floor
- * bounds the group that suite may run over, rather than dropping the suite. The engine's own
- * listener was measured accepting `ffdhe2048` and `ffdhe3072` (`harden_kex_groups` in
- * `messagefoundry/config/tls_policy.py`), and both pass this floor.
- *
- * OpenSSL 3.2 and later already refuse a group under 2048 bits at their default security level
- * (measured on Node 24.20.0 / OpenSSL 3.5.7: "dh key too small"). This option holds the same floor
- * where that level is lower: OpenSSL before 3.2 defaults to level 1, which admits 1024, and a
- * system OpenSSL configuration can lower it. VS Code's desktop runtime, Electron with BoringSSL, is
- * taken to negotiate no DHE suite, so there the option has nothing to act on.
- */
-export const TLS_MIN_DH_SIZE = 2048;
-
-/**
  * What {@link tlsOptions} returns. `https.request` hands its options to `tls.connect`, which reads
  * `minDHSize`, but `@types/node` does not list that field on `https.RequestOptions`.
  */
@@ -405,8 +388,17 @@ async function withRenewalRetry<T>(
  * fail the handshake, and the fix is on that terminator. The list names TLS 1.3 suites too, which
  * take effect on plain Node and not under the desktop's Electron; {@link TLS_13_SUITES} says more.
  *
- * `minDHSize` is {@link TLS_MIN_DH_SIZE}, so the one DHE suite in the list never runs over a group
- * under 2048 bits.
+ * `minDHSize` is 2048 (BACKLOG #300), where Node's default is 1024. It bounds the group the one DHE
+ * suite in {@link TLS_12_SUITES} may run over, rather than dropping that suite (owner ruling of
+ * 2026-10-27). The engine's own listener was measured accepting `ffdhe2048` and `ffdhe3072`
+ * (`harden_kex_groups` in `messagefoundry/config/tls_policy.py`), and both pass. OpenSSL 3.2 and
+ * later already refuse a group under 2048 bits at their default security level; the option holds
+ * the floor where that level is lower, as it is by default before 3.2 or under a system OpenSSL
+ * configuration that lowers it. `test/suite/engine-client-dh.test.ts` measures both. Node checks it
+ * on each full handshake. A pooled socket or a resumed session reuses an earlier handshake, which
+ * this client also made with the floor. VS Code's desktop runtime, Electron with
+ * BoringSSL, is taken to negotiate no DHE suite, so there the option has nothing to act on. The
+ * value is a literal so the crypto inventory's token carries it.
  */
 export function tlsOptions(url: URL): EngineTlsOptions {
   if (url.protocol !== "https:") {
@@ -418,7 +410,7 @@ export function tlsOptions(url: URL): EngineTlsOptions {
   const base: EngineTlsOptions = {
     minVersion: TLS_MIN_VERSION,
     ciphers: TLS_CIPHERS,
-    minDHSize: TLS_MIN_DH_SIZE,
+    minDHSize: 2048,
   };
   return ca === undefined ? base : { ...base, ca };
 }
@@ -594,7 +586,7 @@ function postReply(
       headers["Authorization"] = `Bearer ${token}`;
     }
     const transport = url.protocol === "https:" ? https : http;
-    const options: https.RequestOptions = { method: "POST", headers, ...tlsOptions(url) };
+    const options: EngineTlsOptions = { method: "POST", headers, ...tlsOptions(url) };
     const req = transport.request(url, options, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => chunks.push(c));
@@ -674,7 +666,7 @@ function getOnce<T>(
     }
     const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
     const transport = url.protocol === "https:" ? https : http;
-    const options: https.RequestOptions = { method: "GET", headers, ...tlsOptions(url) };
+    const options: EngineTlsOptions = { method: "GET", headers, ...tlsOptions(url) };
     const req = transport.request(url, options, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => chunks.push(c));
