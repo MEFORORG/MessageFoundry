@@ -2259,8 +2259,11 @@ class PipelineSettings(_Section):
     # InternalErrorPolicy.STOP muscle (STOPPED phase + connection_stopped alert + reload/notify_work
     # re-arm), never dead-lettering the good message. "retry_forever" never STOPs — it retries the head
     # at capped backoff forever and emits a throttled lane_stuck alert once the horizon is crossed (for
-    # a deliberately-unattended flaky-infra site). Reliability-core + read ONCE at construction (a
-    # /config/reload does NOT re-read it — restart to change, exactly like claim_mode).
+    # a deliberately-unattended flaky-infra site). A pooled lane whose T17 re-pend itself fails HOLDS
+    # and retries it (BACKLOG #1611). Under "stop" the hold ends at infra_fault_stop_after failed
+    # re-pends and the lane STOPs as above; under "retry_forever" it holds on and raises one
+    # lane_stuck there. Reliability-core + read ONCE at construction (a /config/reload does NOT
+    # re-read it — restart to change, like claim_mode).
     infra_fault_policy: Literal["stop", "retry_forever"] = Field(default="stop")
     # Consecutive zero-progress T17 faults before a "stop"-policy lane transitions to STOPPED. Also the
     # "retry_forever" stuck horizon at which the throttled lane_stuck alert first fires. Under the
@@ -5149,7 +5152,9 @@ _ALERT_EVENT_TYPES = frozenset(
         "gcm_invocations",
         "update_available",  # #30: a newer MessageFoundry version is pinned than is running (ADR 0026)
         "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
-        "lane_stuck",  # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever)
+        # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever), or is
+        # held retrying a failed re-pend of its claimed rows under it (BACKLOG #1611).
+        "lane_stuck",
         # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
         # over-granted, or could not read it, at start.
         "store_privilege_warning",
