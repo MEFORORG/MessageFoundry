@@ -902,11 +902,10 @@ out of the next pass's brief.
 [`scripts/coord/owed_ledger_acts.py`](../scripts/coord/owed_ledger_acts.py) reads the comments on
 pull requests merged in a window (engine and korus by default) and, through `git` only, a vault
 checkout's ledger at `origin/main`. It prints each ask the ledger has not acted on: `OWED`,
-`MISSING` (the row is in neither ledger file) or `READ` (prose it could not parse). An ask is done
-when the row's banner block changed after the later of the merge and the ask, and now cites the PR
-more often than before. It always exits 0, and a failed read prints an `ERROR` line, never an empty
-report. It does not fetch, so fetch the vault first if its `origin/main` is old; the header prints
-the ref's date.
+`MISSING` (the row is in neither ledger file) or `READ` (prose it could not parse). When an ask
+counts as done is stated once, in the script's docstring. A failed read prints an `ERROR` line and
+exits 0, never an empty report; only a bad command line exits non-zero. It does not fetch, so fetch
+the vault first if its `origin/main` is old; the header prints the ref's date.
 
 ```powershell
 python scripts\coord\owed_ledger_acts.py --vault <vault checkout>          # last 14 days
