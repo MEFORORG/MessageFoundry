@@ -5130,6 +5130,10 @@ class AuthService:
             # BACKLOG #3422: the sign-in lock keeps its fixed length beside a TOTP the store KNOWS
             # is refused, judged on the locked row's cell; otherwise totp_enabled decides, as before.
             totp_usable=_opened_totp_state,
+            # BACKLOG #3937 item 8: a discoverable passkey the owner may sign in with is a way past
+            # the sign-in lock too, so that lock escalates beside one, as the lock notice names it.
+            # Without the [webauthn] extra no passkey can sign in, so none counts.
+            passkey_escalates=self._way_past_counts() if webauthn.available() else None,
             counter=counter,
             threshold=self._policy.lockout_threshold,
             lockout_seconds=self._policy.lockout_minutes * 60,

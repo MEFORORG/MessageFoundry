@@ -2104,13 +2104,16 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     assert set(counters) == {"sign_in", "second_step"}
     for counter in counters:
         for provider in ("local", "ad"):
-            for totp in (False, True):
-                want = provider == "local" and (counter == "second_step" or totp)
-                got = lockout_escalates(counter, auth_provider=provider, totp_enabled=totp)
+            for totp, passkey in itertools.product((False, True), repeat=2):
+                want = provider == "local" and (counter == "second_step" or totp or passkey)
+                got = lockout_escalates(
+                    counter, auth_provider=provider, totp_enabled=totp, passkey_way_past=passkey
+                )
                 assert got is want, (
-                    f"lockout_escalates({counter!r}, {provider!r}, totp={totp}) is now {got}; the "
-                    "Local row, control 1 and Table A say only the second-step lock on a local "
-                    "account and the sign-in lock on a local account with TOTP double."
+                    f"lockout_escalates({counter!r}, {provider!r}, totp={totp}, passkey={passkey}) "
+                    f"is now {got}; the Local row, control 1 and Table A say only the second-step "
+                    "lock on a local account and the sign-in lock on a local account with TOTP or "
+                    "a discoverable passkey double (BACKLOG #3937)."
                 )
 
     security = " ".join(_doc_text().split())
@@ -2163,7 +2166,9 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
         "The second-step lock doubles per cycle up to `lockout_max_minutes` on every local "
         "account, and the sign-in lock does so on a local account with a TOTP enrolled unless "
         "the engine KNOWS this release refuses that enrolment: a TOTP whose cell does not open, "
-        "or whose value will not compute, still escalates. Every other lock keeps "
+        "or whose value will not compute, still escalates. It does so too on a local account "
+        "holding a discoverable passkey under the configured relying party, or any discoverable "
+        "one where none is configured (BACKLOG #3937). Every other lock keeps "
         "`lockout_minutes`. A local account whose enrolment is known to be refused keeps it for "
         "serial failures only: a race listed under [WebAuthn passkeys]"
     )

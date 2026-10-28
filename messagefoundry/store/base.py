@@ -2484,6 +2484,9 @@ class AuthStore(Protocol):
         # never None, so no caller can omit it and lose the refused-TOTP rule: the sign-in lock
         # keeps its fixed length only where it KNOWS the account's TOTP is refused.
         totp_usable: TotpUsable,
+        # BACKLOG #3937 item 8: which passkey makes the SIGN-IN lock escalate, asked of the set read
+        # in the increment's own transaction (``store.lockout_increment``). ``None`` counts none.
+        passkey_escalates: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> LockoutIncrement: ...
 

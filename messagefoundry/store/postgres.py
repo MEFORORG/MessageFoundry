@@ -288,6 +288,7 @@ from messagefoundry.store.store import (
     load_audit_chain,
     lockout_clear,
     lockout_increment,
+    lockout_reads_passkeys,
     mfa_stamp,
     new_approval_row,
     new_session_record,
@@ -9593,6 +9594,7 @@ class PostgresStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
+        passkey_escalates: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -9609,24 +9611,39 @@ class PostgresStore:
         unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
-        change = lockout_increment(
+        totp_counts = await escalation_verdict(
+            self.get_user,
+            self.open_totp_secret,
+            user_id,
             counter,
+            totp_usable=totp_usable,
             threshold=threshold,
-            lockout_seconds=lockout_seconds,
-            max_lockout_seconds=max_lockout_seconds,
             now=now,
-            out=out,
-            totp_counts=await escalation_verdict(
-                self.get_user,
-                self.open_totp_secret,
-                user_id,
-                counter,
-                totp_usable=totp_usable,
-                threshold=threshold,
-                now=now,
-            ),
         )
         async with self._timed_acquire() as conn, conn.transaction():
+            # The passkey set the escalation reads is read in the write's own transaction, after
+            # the account row is locked, so a concurrent passkey write waits (BACKLOG #3937 item 8).
+            read_passkeys = lockout_reads_passkeys(
+                counter,
+                await self._read_user_record(conn, user_id)
+                if passkey_escalates is not None
+                else None,
+                passkey_escalates=passkey_escalates,
+                threshold=threshold,
+                now=now,
+            )
+            change = lockout_increment(
+                counter,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+                max_lockout_seconds=max_lockout_seconds,
+                now=now,
+                out=out,
+                totp_counts=totp_counts,
+                passkeys=await self._account_passkeys(conn, user_id) if read_passkeys else None,
+                sealed=self._row_sealer is not None,
+                passkey_escalates=passkey_escalates,
+            )
             written = await self._write_user(conn, user_id, change)
         return out[0] if written is not None else LockoutIncrement(0, False, 0)
 

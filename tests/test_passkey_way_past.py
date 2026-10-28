@@ -44,12 +44,14 @@ ORIGIN = "http://t"
 _NEW_PASSWORD = "a-brand-new-chosen-passphrase-9"
 
 
-def _service(store: MessageStore, **settings: Any) -> AuthService:
+def _service(
+    store: MessageStore, *, way_past_rp_id: str | None = RP, **settings: Any
+) -> AuthService:
     """``require_mfa`` stays at its shipped default (on) unless an arm says otherwise, so the test
     administrator is covered by the requirement."""
     settings.setdefault("mfa_verify_min_elapsed_seconds", 0)
     settings.setdefault("login_rate_limit_enabled", False)
-    return AuthService(store, AuthSettings(**settings), way_past_rp_id=RP)
+    return AuthService(store, AuthSettings(**settings), way_past_rp_id=way_past_rp_id)
 
 
 async def _register(
@@ -1741,5 +1743,70 @@ async def test_with_no_configured_rp_id_the_last_discoverable_passkey_still_need
         assert await gate.delete_webauthn_credential(
             identity, by_label["resident"].credential_id_hash
         )
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #3937 item 8: the sign-in lock escalates beside a discoverable passkey ---------------
+
+
+async def _two_sign_in_cycles(service: AuthService, user_id: str) -> float:
+    """Lock the sign-in counter twice through the service's failure seam; return the second lock's
+    length."""
+    user = await service._load_user(user_id)
+    assert user is not None
+    start = 1_000_000.0
+    for cycle in range(2):
+        at = start + cycle * 10_000.0
+        for i in range(_LOCK_THRESHOLD):
+            await service._register_failure(user, at + i, counter="sign_in")
+    row = await service._store.get_user(user_id)
+    assert row is not None and row.locked_until is not None and row.lock_cycles == 2
+    return float(row.locked_until - (start + 10_000.0 + _LOCK_THRESHOLD - 1))
+
+
+@pytest.mark.parametrize(
+    ("configured", "escalates"), [(RP, True), (None, True), ("elsewhere.example", False)]
+)
+async def test_the_sign_in_lock_escalates_beside_a_discoverable_passkey(
+    configured: str | None, escalates: bool
+) -> None:
+    """A passkey-only account's sign-in lock doubles per cycle as a TOTP account's does, because
+    the combined passkey sign-in passes it. Which passkey counts is the lock notice's rule: under
+    the configured relying party where there is one, any discoverable one where there is none. A
+    passkey under another relying party is no way past, so its lock keeps the fixed length."""
+    store = await MessageStore.open(":memory:")
+    try:
+        _, identity, _, _ = await _passkey_owner(store)
+        service = _lock_service(store, way_past_rp_id=configured)
+        length = await _two_sign_in_cycles(service, identity.user_id)
+        assert length == (1800.0 if escalates else 900.0), length
+    finally:
+        await store.close()
+
+
+async def test_a_password_only_account_keeps_the_fixed_sign_in_lock() -> None:
+    """The control: no TOTP and no passkey, so no way past, and the second lock is the base."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _lock_service(store)
+        identity, _token, _ = await login_admin(service)
+        assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
+    finally:
+        await store.close()
+
+
+async def test_without_the_webauthn_extra_a_passkey_does_not_escalate_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the extra no passkey can sign in, so none is a way past, and the lock keeps the
+    fixed length beside one."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, _, _ = await _passkey_owner(store)
+        monkeypatch.setattr(wa, "available", lambda: False)
+        assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
     finally:
         await store.close()
