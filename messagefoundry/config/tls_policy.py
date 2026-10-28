@@ -1795,7 +1795,7 @@ def assert_ldap3_tls_suites(
     ca_certs_data: str | None,
     connector: str,
     crl_file: str | None = None,
-) -> Callable[[], ssl.SSLContext]:
+) -> Ldap3ContextFactory:
     """Build and assert the LDAPS hop's TLS context; return the factory that builds it.
 
     The LDAPS sibling of :func:`assert_hvac_tls_suites`, and the same shape since BACKLOG #2494.
@@ -1850,8 +1850,25 @@ def assert_ldap3_tls_suites(
         _hold_to_approved_list(ctx, connector=connector, hop="the LDAPS TLS context")
         return ctx
 
-    narrowed_context()  # fail at construction, not on the first bind
-    return narrowed_context
+    return Ldap3ContextFactory(narrowed_context)
+
+
+class Ldap3ContextFactory:
+    """The LDAPS context factory :func:`assert_ldap3_tls_suites` returns: call it for a fresh
+    context, as every bind does.
+
+    Building it runs the recipe once, so a context that cannot be built fails at construction, not
+    on the first bind. That first context is kept as :attr:`constructed` rather than thrown away,
+    and no bind handshakes on it: the LDAPS revocation guard (BACKLOG #2193) reads it, so the guard
+    judges the recipe without a second build at start."""
+
+    def __init__(self, build: Callable[[], ssl.SSLContext]) -> None:
+        self._build = build
+        #: The context built at construction, for a reader that must not handshake on it.
+        self.constructed = build()
+
+    def __call__(self) -> ssl.SSLContext:
+        return self._build()
 
 
 #: The ``hvac.Client`` keyword arguments :func:`assert_hvac_tls_suites` admits UNCONDITIONALLY.

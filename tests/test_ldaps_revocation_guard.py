@@ -137,7 +137,7 @@ def test_an_off_box_ldaps_bind_is_refused_when_it_checks_no_revocation() -> None
     with pytest.raises(InsecureHopRefused, match="revocation") as exc:
         _authenticator(ENFORCING)
     text = str(exc.value)
-    assert "[auth] AD LDAPS bind" in text
+    assert "[auth] LDAPS bind to AD" in text
     # The refusal offers this hop's own lever, not the connection-shaped one it cannot use.
     assert "[auth].ad_tls_crl_file" in text
     assert "[tls].crl_file" not in text
@@ -179,7 +179,7 @@ def test_an_ldaps_bind_on_loopback_still_crosses() -> None:
 def test_an_ldaps_bind_warns_but_builds_when_not_enforcing() -> None:
     with _guard_log() as log:
         _authenticator(NOT_ENFORCING)
-    assert log.has("revocation") and log.has("[auth] AD LDAPS bind"), log.state()
+    assert log.has("revocation") and log.has("[auth] LDAPS bind to AD"), log.state()
 
 
 def test_an_ldaps_bind_built_with_no_posture_is_unchanged() -> None:
@@ -189,7 +189,7 @@ def test_an_ldaps_bind_built_with_no_posture_is_unchanged() -> None:
         _authenticator(None)
         _authenticator(NOT_ENFORCING)
     assert len(log.messages) >= 1, log.state()
-    assert sum("[auth] AD LDAPS bind" in m for m in log.messages) == 1, log.state()
+    assert sum("[auth] LDAPS bind to AD" in m for m in log.messages) == 1, log.state()
 
 
 @pytest.mark.parametrize(
@@ -329,7 +329,7 @@ async def test_auth_service_passes_its_posture_to_the_guard() -> None:
     builds, so the refusal is the guard and not the harness."""
     store = await MessageStore.open(":memory:")
     try:
-        with pytest.raises(InsecureHopRefused, match=r"\[auth\] AD LDAPS bind"):
+        with pytest.raises(InsecureHopRefused, match=r"\[auth\] LDAPS bind to AD"):
             AuthService(store, _ad_settings(), hop_posture=ENFORCING)
         AuthService(store, _ad_settings(ad_server=LOOPBACK_DC), hop_posture=ENFORCING)
     finally:

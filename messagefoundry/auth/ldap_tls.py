@@ -93,11 +93,13 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
         super().__init__(validate=validate, ca_certs_data=ca_certs_data)
 
     def handshake_context(self) -> ssl.SSLContext:
-        """A context built exactly as :meth:`wrap_socket` builds one for each bind.
+        """The context built and asserted at construction, from the recipe :meth:`wrap_socket`
+        runs for each bind. No bind handshakes on it.
 
         The LDAPS revocation guard reads it (BACKLOG #2193), so the guard judges what a bind's
-        handshake really loads, ``[auth].ad_tls_crl_file`` included, and never the setting."""
-        return self._context_factory()
+        handshake really loads, ``[auth].ad_tls_crl_file`` included, and never the setting, with no
+        second build at start."""
+        return self._context_factory.constructed
 
     def wrap_socket(self, connection: Any, do_handshake: bool = False) -> None:
         """ldap3's wrap step on a fresh engine context; ldap3 calls this for LDAPS and StartTLS.

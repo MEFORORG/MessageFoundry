@@ -126,7 +126,7 @@ def _refuse_ad_revocation(
         )
     RevocationHopGuard.capture(
         host=host,
-        cell="[auth] AD LDAPS bind (verified TLS, no revocation check)",
+        cell="[auth] LDAPS bind to AD (verified TLS, no revocation check)",
         description=(
             "carries the AD service-account and user passwords over verified LDAPS but performs "
             "no certificate revocation checking"
