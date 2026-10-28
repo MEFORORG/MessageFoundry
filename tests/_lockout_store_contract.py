@@ -64,6 +64,7 @@ _PK_RESIDENT = credential_id_hash(b"rot-pk-resident")
 _PK_AGAIN = credential_id_hash(b"rot-pk-again")
 _RF_RESIDENT = credential_id_hash(b"rot-rf-resident")
 _LOCK_PK = credential_id_hash(b"lock-pk-resident")
+_LOCK_PK_PLAIN = credential_id_hash(b"lock-pk-plain")
 _LOCK_PK_AD = credential_id_hash(b"lock-pk-ad-resident")
 
 #: Small so the arithmetic below is readable; the shipped default is 5.
@@ -322,10 +323,17 @@ async def _assert_passkey_escalates_the_sign_in_lock(store: Any) -> None:
         now=1.0,
         password_generated=False,
     )
-    # Not discoverable: no way past under any rule, so the fixed length.
-    await store.add_webauthn_credential(_cred("lock-pk", "plain", id_hash="lock-pk-plain"))
+    # Not discoverable: no way past under any rule, so the fixed length. Well formed in every other
+    # respect (today's id-hash scheme, the relying party the rule names), so discoverable=False is
+    # the only thing standing between it and an escalation, and this arm tests that check.
+    await store.add_webauthn_credential(
+        _cred("lock-pk", "plain", id_hash=_LOCK_PK_PLAIN, rp_id="t", discoverable=False)
+    )
     assert await lengths_of("lock-pk", passkey_is_way_past, 4) == fixed, (
         "the sign-in lock escalated beside a passkey that is not discoverable"
+    )
+    assert await lengths_of("lock-pk", under("t"), 4) == fixed, (
+        "the sign-in lock escalated beside a passkey under the rule's rp_id that is not discoverable"
     )
     await store.add_webauthn_credential(
         _cred("lock-pk", "resident", id_hash=_LOCK_PK, rp_id="t", discoverable=True)

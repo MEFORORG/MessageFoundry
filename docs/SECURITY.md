@@ -5669,7 +5669,8 @@ changed is what a campaign costs, and whom:
   neither the counts nor the rows show which password was right; the cost is a lost signal, since a
   right password beside a junk assertion no longer tells the owner the password is known. That lock
   escalates on such an account, as it does beside TOTP, where the passkey is under the
-  configured relying party (BACKLOG #3937). With no relying party configured it keeps the fixed
+  configured relying party and the `[webauthn]` extra is installed (BACKLOG #3937). With no
+  relying party configured it keeps the fixed
   length, since a passkey pinned to another hostname may not sign the owner in.
 - **A caller holding one factor** (the password, the TOTP device, a passkey, or a directory sign-in)
   feeds the second-step counter. That lock refuses every sign-in, and on a local account it doubles per cycle

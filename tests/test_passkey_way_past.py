@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import time
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -441,6 +442,15 @@ async def _passkey_owner(
     identity, token, password = await login_admin(service)
     auth, _ = await _register(service, identity, token)
     return service, identity, password, auth
+
+
+async def _corrupt_passkey_rows(store: MessageStore, user_id: str, transports: str) -> None:
+    """Write a ``transports`` value into every passkey row of ``user_id`` that does not parse, as
+    a row written outside the store might hold."""
+    await store._db.execute(
+        "UPDATE webauthn_credentials SET transports=? WHERE user_id=?", (transports, user_id)
+    )
+    await store._db.commit()
 
 
 def _proof(service: AuthService, auth: SoftAuthenticator) -> PasskeyProof:
@@ -1823,11 +1833,72 @@ async def test_a_passkey_row_that_does_not_parse_still_lets_the_lock_arm() -> No
     store = await MessageStore.open(":memory:")
     try:
         service, identity, _, _ = await _passkey_owner(store)
-        await store._db.execute(
-            "UPDATE webauthn_credentials SET transports='not json' WHERE user_id=?",
-            (identity.user_id,),
-        )
-        await store._db.commit()
+        await _corrupt_passkey_rows(store, identity.user_id, "not json")
         assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("malformed", ["not json", "5"])
+async def test_a_passkey_row_that_does_not_parse_is_the_uniform_refusal_on_the_login_route(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, malformed: str
+) -> None:
+    """The real sign-in route, not the failure seam alone. The failure that sets the lock also
+    writes the lock notice, which asks whether the account holds a discoverable passkey. A passkey
+    row that does not parse must leave that the 401 every wrong password gets, never a 500 that
+    would name the account as one holding a passkey. The failure is still counted: the lock arms,
+    with the fixed length, and a warning names the account. ``5`` parses as JSON but is no list,
+    the TypeError arm. RED when: the notice's passkey read lets the parse error out."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import Engine
+
+    engine = await Engine.create(
+        tmp_path / "pk.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    try:
+        store = engine.store
+        assert isinstance(store, MessageStore)
+        service, identity, password, _ = await _passkey_owner(store)
+        await _corrupt_passkey_rows(store, identity.user_id, malformed)
+        transport = httpx.ASGITransport(
+            app=create_app(engine, auth=service), raise_app_exceptions=False
+        )
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            for _ in range(_LOCK_THRESHOLD):
+                r = await c.post(
+                    "/auth/login",
+                    json={"username": identity.username, "password": "wrong-" + password},
+                )
+                assert r.status_code == 401, (r.status_code, r.text)
+                assert r.json() == {"detail": "invalid credentials"}
+        row = await engine.store.get_user(identity.user_id)
+        assert row is not None and row.locked_until is not None, "the failure was not counted"
+        assert row.lock_cycles == 1 and row.failed_attempts == _LOCK_THRESHOLD
+        assert any(
+            identity.user_id in rec.getMessage() and rec.levelname == "WARNING"
+            for rec in caplog.records
+        ), "no warning named the account"
+    finally:
+        await engine.stop()
+
+
+async def test_a_passkey_row_that_does_not_parse_refuses_the_combined_passkey_sign_in() -> None:
+    """The combined passkey sign-in reads the account's set before it verifies anything. A row that
+    does not parse leaves no passkey to sign in with, so the request is the password sign-in: the
+    assertion satisfies nothing and the session still owes its second factor, and under a live
+    sign-in lock it is refused like any other. Never raised. RED when: the set read lets the parse
+    error out."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store)
+        await _corrupt_passkey_rows(store, identity.user_id, "not json")
+        out = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert out.ok and out.mfa_required is True, "the unreadable passkey satisfied a factor"
+        await _set_sign_in_lock(store, identity.user_id)
+        out = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert not out.ok and out.token is None, "the lock was passed"
     finally:
         await store.close()

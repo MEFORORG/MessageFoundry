@@ -2214,23 +2214,35 @@ class WebAuthnCredential:
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> WebAuthnCredential:
+        """The passkey ``d`` holds, or :class:`PasskeyRowMalformed` for a row that does not parse,
+        so a caller that must survive one (the sign-in lock's escalation and its notice, BACKLOG
+        #3937) catches that alone and not every ``TypeError`` or ``KeyError`` beside it."""
         transports = d.get("transports")
-        return cls(
-            credential_id_hash=d["credential_id_hash"],
-            credential_id=d["credential_id"],
-            user_id=d["user_id"],
-            rp_id=d["rp_id"],
-            public_key=d["public_key"],
-            sign_count=int(d["sign_count"]),
-            transports=[str(t) for t in json.loads(transports)] if transports else None,
-            device_type=d["device_type"],
-            backed_up=bool(d["backed_up"]),
-            label=d["label"],
-            aaguid=d.get("aaguid"),
-            created_at=float(d["created_at"]),
-            last_used_at=_opt_float(d.get("last_used_at")),
-            discoverable=bool(d.get("discoverable", False)),
-        )
+        try:
+            return cls(
+                credential_id_hash=d["credential_id_hash"],
+                credential_id=d["credential_id"],
+                user_id=d["user_id"],
+                rp_id=d["rp_id"],
+                public_key=d["public_key"],
+                sign_count=int(d["sign_count"]),
+                transports=[str(t) for t in json.loads(transports)] if transports else None,
+                device_type=d["device_type"],
+                backed_up=bool(d["backed_up"]),
+                label=d["label"],
+                aaguid=d.get("aaguid"),
+                created_at=float(d["created_at"]),
+                last_used_at=_opt_float(d.get("last_used_at")),
+                discoverable=bool(d.get("discoverable", False)),
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            raise PasskeyRowMalformed(type(exc).__name__) from exc
+
+
+class PasskeyRowMalformed(ValueError):
+    """A ``webauthn_credentials`` row that does not parse into a :class:`WebAuthnCredential`. A
+    ``ValueError``, so a caller that caught the parse error before still does. The argument is the
+    underlying error's class name, never the row's content."""
 
 
 # --- the sealed user record (BACKLOG #2592) ----------------------------------------------------
@@ -2935,11 +2947,11 @@ async def escalation_passkeys(
         return None
     try:
         return await read_passkeys()
-    except (ValueError, TypeError, KeyError) as exc:
+    except PasskeyRowMalformed as exc:
         log.warning(
             "a passkey row of user %s did not parse (%s); its sign-in lock keeps its fixed length",
             record.row.id,
-            type(exc).__name__,
+            exc,
         )
         return None
 
@@ -16362,7 +16374,10 @@ class MessageStore:
         from ``auth_provider`` read in the SAME locked ``SELECT``; for the SIGN-IN lock a refused
         TOTP is judged by ``totp_usable`` before the lock, only for a failure that would set a
         later-cycle lock, on a cell the locked row must still hold (:func:`escalation_verdict`,
-        BACKLOG #3422). The count itself stays atomic.
+        BACKLOG #3422). A passkey that ``passkey_escalates`` counts escalates the SIGN-IN lock too,
+        asked of the set read in this same transaction after the account row
+        (:func:`escalation_passkeys`, BACKLOG #3937 item 8); a passkey row that does not parse
+        counts none, and the count still lands. The count itself stays atomic.
 
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""

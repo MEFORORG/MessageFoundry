@@ -268,3 +268,42 @@ async def test_a_staged_challenge_is_popped_by_the_sign_in_post_even_without_an_
     # The begin leg, the first POST waived by the staged challenge, the second charged.
     assert _left(service) == 3
     assert len(service._preauth_challenges) == 0
+
+
+async def test_a_passkey_row_that_does_not_parse_is_the_uniform_refusal_on_ui_login(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3937: the console sign-in rides the same ``auth.login`` seam, so the failure that
+    sets the lock writes the lock notice, which asks whether the account holds a discoverable
+    passkey. A passkey row that does not parse must leave that the redirect every wrong password
+    gets, never a 500, and the failure is still counted. RED when: the notice's passkey read lets
+    the parse error out."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0,
+            login_rate_limit_enabled=False,
+            admin_write_min_interval_seconds=0,
+            lockout_threshold=3,
+        ),
+    )
+    await service.initialize()
+    user_id, _ = await _passkey_only_operator(service)
+    from messagefoundry.store.store import MessageStore
+
+    store = engine.store
+    assert isinstance(store, MessageStore)
+    db = store._db
+    await db.execute(
+        "UPDATE webauthn_credentials SET transports='not json' WHERE user_id=?", (user_id,)
+    )
+    await db.commit()
+    app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        for _ in range(3):
+            r = await c.post("/ui/login", data={"username": "op", "password": "wrong-" + PW})
+            assert r.status_code == 303, (r.status_code, r.text)
+            assert r.headers["location"] == "/ui/login?e=bad"
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.locked_until is not None, "the failure was not counted"

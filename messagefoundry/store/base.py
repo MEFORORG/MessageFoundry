@@ -2468,7 +2468,9 @@ class AuthStore(Protocol):
     # feeds (ADR 0197), and only that counter's three columns are written. The same locked SELECT
     # reads ``auth_provider`` for whether the lock escalates (``store.lockout_escalates``); for the
     # SIGN-IN lock the TOTP's usability is judged before the lock, on a cell the locked row must
-    # still hold (``store.escalation_verdict``, BACKLOG #3422). Returns ``(attempts, just_locked,
+    # still hold (``store.escalation_verdict``, BACKLOG #3422), and a passkey the caller's
+    # ``passkey_escalates`` counts escalates it too, from the set read in the same transaction
+    # (``store.escalation_passkeys``, BACKLOG #3937 item 8). Returns ``(attempts, just_locked,
     # cycles)``; ``just_locked`` is decided INSIDE that atomic section and must not be recomputed
     # outside it, where it is only the stale read again. See ``store.next_lockout_state`` for the
     # policy.

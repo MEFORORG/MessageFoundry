@@ -180,6 +180,7 @@ from messagefoundry.store.store import (
     LockoutCounter,
     LockoutIncrement,
     PasskeyCounts,
+    PasskeyRowMalformed,
     RoleRow,
     SessionRecord,
     TotpState,
@@ -10442,14 +10443,27 @@ class AuthService:
         """The account's passkeys, or ``None`` when they do not match the digest its seal covers
         (BACKLOG #2592), which is reported like a failing record and denies every passkey
         ceremony. On a keyless store there is no digest to check. A mismatch is read once more,
-        account and passkeys, before it is reported, for the reason :meth:`_verified` gives."""
-        creds = await self._store.list_webauthn_credentials(user.id)
-        if self._store.row_sealer() is None or passkey_digest(creds) == user.cred_digest:
-            return creds
-        fresh = await self._load_user(user.id)
-        if fresh is None:
-            return None  # gone, or failing its own seal, which _verified has reported
-        creds = await self._store.list_webauthn_credentials(user.id)
+        account and passkeys, before it is reported, for the reason :meth:`_verified` gives.
+
+        A passkey row that does not parse is ``None`` too, logged with the account, never an
+        exception: every caller already denies on ``None``, and several answer a caller who has
+        proved nothing (the sign-in and its lock notice, BACKLOG #3937), where a 500 would name the
+        account as one holding a passkey. It is not a seal failure, so it is not reported as one."""
+        try:
+            creds = await self._store.list_webauthn_credentials(user.id)
+            if self._store.row_sealer() is None or passkey_digest(creds) == user.cred_digest:
+                return creds
+            fresh = await self._load_user(user.id)
+            if fresh is None:
+                return None  # gone, or failing its own seal, which _verified has reported
+            creds = await self._store.list_webauthn_credentials(user.id)
+        except PasskeyRowMalformed as exc:
+            _log.warning(
+                "a passkey row of user %s did not parse (%s); no passkey of it is used",
+                user.id,
+                exc,
+            )
+            return None
         if passkey_digest(creds) == fresh.cred_digest:
             return creds
         await self._user_seal_failed(user.id, part="passkeys")
