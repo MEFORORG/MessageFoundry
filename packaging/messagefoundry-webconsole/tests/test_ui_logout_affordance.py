@@ -395,7 +395,7 @@ async def test_ui_logout_clears_the_cookie_when_the_owner_lookup_fails(
     session = hash_token(token)[:12]
     assert _error_lines(caplog) == [
         f"a sign-out ended session {session}, but its owner could not be read; its auth.logout "
-        "row names no actor and any temporary credential it holds is not checked for a lapse"
+        "row names no actor and it is not checked for what a gate would refuse"
     ]
 
 

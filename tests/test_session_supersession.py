@@ -34,7 +34,13 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
-from tests._logout_rows import logout_details, logout_rows
+from tests._logout_rows import (
+    logout_details,
+    logout_rows,
+    seal_failed_details,
+    temp_password_expired_rows,
+)
+from tests._session_cap_contract import _revoked
 from tests._session_race import rotate_after_first_call
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
@@ -617,3 +623,94 @@ async def test_every_sign_out_that_ends_nothing_writes_its_row(store: MessageSto
     rows = await logout_rows(store, limit=count * 2)
     assert len(rows) == count, "a sign-out that ended nothing wrote no row"
     assert set(rows) == {(None, "203.0.113.9", "nothing_to_revoke")}
+
+
+# --- BACKLOG #3749: a session the gate would refuse is not recorded as the end of a live one ---
+
+_EXPIRY_HOURS = 72
+
+
+async def _lapse_the_credential(store: MessageStore, username: str) -> None:
+    """Give ``username`` an admin-issued temporary credential whose deadline passed a minute ago."""
+    await store._db.execute(
+        "UPDATE users SET must_change_password=1, password_changed_at=? WHERE username=?",
+        (time.time() - _EXPIRY_HOURS * 3600 - 60, username),
+    )
+    await store._db.commit()
+
+
+async def _stale_the_epoch(store: MessageStore, username: str) -> None:
+    """Raise ``username``'s session epoch outside the store's own revoke, so a session sealed under
+    the old epoch stays unrevoked: the row the gate refuses as one that fails its seal (#2592)."""
+    await store._db.execute(
+        "UPDATE users SET session_epoch=session_epoch+1 WHERE username=?", (username,)
+    )
+    await store._db.commit()
+
+
+async def test_a_superseded_prior_whose_temporary_credential_lapsed_writes_the_gates_row(
+    store: MessageStore,
+) -> None:
+    """RED when: a sign-in that ends a prior session whose owner's temporary credential lapsed
+    audits it as the end of a live session (``auth.session_revoked``), or writes no
+    ``auth.temp_password_expired`` row for it (BACKLOG #3749). The gate would refuse that session
+    and write that row, so the supersession records what the gate would."""
+    service = await _service(store, initial_password_expiry_hours=_EXPIRY_HOURS)
+    prior = await _token(service, "op")
+    await _lapse_the_credential(store, "op")
+    outcome = await service.login("other", PW, client="192.0.2.4", supersedes=prior)
+    assert outcome.ok
+    assert await _revoked(store, hash_token(prior))
+    assert await _superseded(store) == [], "a session the gate refuses was recorded as live"
+    assert await temp_password_expired_rows(store) == [
+        (
+            "op",
+            "192.0.2.4",
+            {"provider": "local", "expiry_hours": _EXPIRY_HOURS, "at": "superseded"},
+        )
+    ]
+
+
+async def test_a_superseded_prior_from_a_stale_epoch_is_reported_as_the_gate_reports_it(
+    store: MessageStore,
+) -> None:
+    """RED when: a sign-in that ends a prior session minted under an older session epoch than its
+    account's audits it as the end of a live session (BACKLOG #3749, #2592). The gate ends such a
+    session and reports it as a row that failed its integrity seal, so the supersession does too."""
+    service = await _service(store)
+    prior = await _token(service, "op")
+    await _stale_the_epoch(store, "op")
+    assert (await _token(service, "other", supersedes=prior)) is not None
+    assert await _revoked(store, hash_token(prior))
+    assert await _superseded(store) == [], "a session the gate refuses was recorded as live"
+    ref = hash_token(prior)[:12]
+    assert await seal_failed_details(store) == [{"kind": "session", "session": ref}]
+    assert await temp_password_expired_rows(store) == []
+
+
+async def test_a_logout_of_a_session_from_a_stale_epoch_records_lapsed(
+    store: MessageStore,
+) -> None:
+    """RED when: a sign-out of a session minted under an older session epoch than its account's
+    records ``revoked`` (BACKLOG #3749, #2592). The gate refuses that session and reports it as a
+    row that failed its integrity seal; the sign-out records ``lapsed`` and writes that report,
+    and no ``auth.temp_password_expired`` row, as the gate writes none for it."""
+    service = await _service(store)
+    token = await _token(service, "op")
+    await _stale_the_epoch(store, "op")
+    assert await service.logout(token, client="192.0.2.5", proven_at=None) == "lapsed"
+    assert await logout_rows(store) == [("op", "192.0.2.5", "lapsed")]
+    assert await seal_failed_details(store) == [
+        {"kind": "session", "session": hash_token(token)[:12]}
+    ]
+    assert await temp_password_expired_rows(store) == []
+
+
+async def test_a_logout_of_a_live_session_writes_no_seal_report(store: MessageStore) -> None:
+    """The control for the test above: a session under the account's current epoch is
+    ``revoked`` and reported as nothing else."""
+    service = await _service(store)
+    token = await _token(service, "op")
+    assert await service.logout(token, client=None, proven_at=None) == "revoked"
+    assert await seal_failed_details(store) == []
+    assert await temp_password_expired_rows(store) == []

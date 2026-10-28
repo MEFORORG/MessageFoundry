@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
+
 
 async def logout_rows(
     store: Any, *, limit: int | None = None
@@ -30,6 +32,16 @@ async def temp_password_expired_rows(store: Any) -> list[tuple[object, object, o
     return [
         (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")))
         for row in await store.list_audit(action="auth.temp_password_expired")
+    ]
+
+
+async def seal_failed_details(store: Any) -> list[dict[str, object]]:
+    """Each integrity-failure report row's whole ``detail``, newest first: the row a gate writes
+    when it ends a session that fails its seal or its account's epoch, and the row a sign-out or a
+    sign-in's supersession writes for the second (BACKLOG #2592, #3749)."""
+    return [
+        json.loads(str(row["detail"] or "{}"))
+        for row in await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)
     ]
 
 
