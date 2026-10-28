@@ -250,6 +250,15 @@ _LOG = logging.getLogger(__name__)
 RETARGET_ACKNOWLEDGED = "retarget_acknowledged"
 
 
+#: The most retargets an unlisted-retarget refusal names one by one. The rest are counted, so the
+#: refusal stays one bounded line however many default fields an overlay retargets.
+_RETARGETS_NAMED = 3
+
+#: The ``[hl7]`` keys an overlay can write by mistake under ``[hl7.fields]``: in TOML, a key after
+#: that header belongs to it. Each is named with a hint rather than refused as a bad field path.
+_HL7_LIST_KEYS = frozenset({"keep", "drop", RETARGET_ACKNOWLEDGED})
+
+
 def _shown(overlay: Path) -> str:
     """The overlay's file path for a refusal or a warning, with each character that does not print
     written as its escape, so a NUL or a newline in a path a caller built reaches the console as
@@ -416,6 +425,13 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     fields = hl7.get("fields", {})
     if not isinstance(fields, dict):
         raise RuleError("anon overlay [hl7.fields] must be a table of path = kind")
+    misplaced = sorted(_HL7_LIST_KEYS.intersection(fields))
+    if misplaced:
+        raise RuleError(
+            f"anon overlay [hl7.fields] holds {', '.join(misplaced)}, which belongs under [hl7]. "
+            "In TOML a key written after the [hl7.fields] header is part of that table, so move "
+            "it above that header"
+        )
     effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     for path, raw_kind in fields.items():
         effective[_validate_path(path)] = _coerce_kind(path, raw_kind)
@@ -449,10 +465,12 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         )
     unlisted = [(default, now) for default, now in retargeted if default.path not in acknowledged]
     if unlisted:
+        named = [_retarget_phrase(default, now) for default, now in unlisted[:_RETARGETS_NAMED]]
+        if len(unlisted) > _RETARGETS_NAMED:
+            named.append(f"and {len(unlisted) - _RETARGETS_NAMED} more default field(s)")
         raise RuleError(
-            f"anon overlay {shown} retargets "
-            + ", ".join(_retarget_phrase(default, now) for default, now in unlisted)
-            + ": a different kind can leave part of the field as captured. Point it at drop or "
+            f"anon overlay {shown} retargets {', '.join(named)}: a different kind can leave "
+            "part of the field as captured. Point each back at its default kind, or at drop or "
             f"freetext, or list it under [hl7].{RETARGET_ACKNOWLEDGED} to load it anyway"
         )
     # Field addresses and kinds only, never a value.

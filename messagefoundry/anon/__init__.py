@@ -21,7 +21,8 @@ Public surface:
   can reach (a malformed segment id). ``anonymize_checked`` refuses the same way, first.
 * :func:`anonymize_checked` — :func:`anonymize` + a **fail-closed** :func:`leak_report`; raises
   :class:`LeakError` (token categories + PHI shapes/addresses only, never a value) if any known
-  partner/site token survives or a structural PHI shape sits in a field no rule mapped.
+  partner/site token survives or a structural PHI shape sits in a field no rule mapped, or a
+  dashed SSN or punctuated phone sits in what a retarget of a default field left (BACKLOG #3493).
   By default it does **not** refuse a name, an undashed number or a
   date in an unmapped field: those pass, and only the coverage report records the field. The
   opt-in ``require_full_coverage`` refuses a field no rule or ``keep`` decided. Read the report
@@ -128,8 +129,9 @@ def anonymize_checked(
 
     Use this whenever the output may be persisted/shared — a silently-missed token is worse than no
     anonymization (ADR 0030 §5). The verification is now two-layered (BACKLOG #331): the known-token
-    denylist **and** high-precision structural PHI-shape detectors over the fields no rule matched,
-    scoped by the same ``rules`` the anonymizer applied. The raised error names token *categories* and
+    denylist **and** high-precision structural PHI-shape detectors over the fields no rule matched
+    and over what a retarget of a default field left past its first component, scoped by the same
+    ``rules`` the anonymizer applied. The raised error names token *categories* and
     field *shapes/addresses* only, never a value, and carries a coverage clause (the count + addresses
     of the unmapped fields, whether the denylist tables were live) so a refusal is legible.
 

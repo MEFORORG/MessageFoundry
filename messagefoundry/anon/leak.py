@@ -22,7 +22,9 @@ already-pseudonymized field is never re-flagged:
   punctuated NANP phone, CX ``MR``/``MRN``-typed identifier, and a line whose segment id is
   malformed) — narrow by design to avoid the mass false-positives a broad digit-run search would
   produce on HL7 bodies (ADR 0030 §5). A name, an undashed number or a date in an unmapped field
-  is NOT detected; the coverage report is the only record of it (BACKLOG #1710).
+  is NOT detected; the coverage report is the only record of it (BACKLOG #1710). The dashed SSN
+  and punctuated phone detectors also scan what a retarget of a default field left past its
+  first component (:func:`retarget_residue_hits`, BACKLOG #3493).
 
 The token-floor signal (``token_floor_failure``) is recorded in every report
 (``token_floor_reason``/``token_tables_live``) and folded into the fail-closed decision when
@@ -314,7 +316,11 @@ def message_version(text: str) -> str | None:
 
 
 def unmapped_field_values(
-    text: str, mapped_paths: set[str], *, version: str | None = None
+    text: str,
+    mapped_paths: set[str],
+    *,
+    version: str | None = None,
+    named_by: Iterable[str] | None = None,
 ) -> list[tuple[str, str]]:
     """Every ``(address, value)`` in ``text`` whose whole-field ``SEG-i`` address is **not** in
     ``mapped_paths`` and whose value is non-empty — the fields the rule map never touched. One
@@ -355,6 +361,10 @@ def unmapped_field_values(
     A well-formed id that the header's MSH-12 version does not define, is not a Z-segment and no
     rule names is addressed as :data:`UNKNOWN_SEGMENT`: its fields are still checked, but the id
     itself, which may be a wrapped name, is never printed.
+
+    ``named_by`` is the rule paths whose segment ids count as named, ``mapped_paths`` when left
+    out. :func:`retarget_residue_hits` walks with fewer paths mapped than the rules name, and
+    passes every rule's path here so a segment only a retarget names keeps its address.
     """
     found = _split_at_header(text)
     if found is None:
@@ -363,7 +373,8 @@ def unmapped_field_values(
     out: list[tuple[str, str]] = []
     if version is None:
         version = _header_version(lines[header_at].split(field_sep), seps)
-    nameable = known_segments(version) | {path.split("-", 1)[0] for path in mapped_paths}
+    naming = mapped_paths if named_by is None else named_by
+    nameable = known_segments(version) | {path.split("-", 1)[0] for path in naming}
     for n, seg in enumerate(lines):
         if all(c.isspace() or not c.isprintable() for c in seg):
             continue
@@ -456,19 +467,24 @@ def retarget_residue_hits(
     A rule that points a default field at a different kind (:func:`.rules.retargeted_defaults`)
     maps the field, so :func:`structural_phi_hits` never scans it. ``id``, ``mrn`` and ``ssn``
     rewrite component 1 only, and the rest of the captured value stays. So each repetition of
-    such a field is scanned here with its component 1 left out. The kinds that rewrite a whole
-    repetition write it from fixed pools or as one component, and
-    ``tests/test_anon_overlay_retarget_warning.py`` pins that no pool value has one of these
-    shapes, so this adds no hit for them. With component 1 left out, a CX never reads as
-    MRN-typed, which is right: its id is the surrogate."""
+    such a field is scanned here with its component 1 left out, for the dashed SSN and the
+    punctuated phone. The MRN-typed shape needs a component 1, so it never fires here, which is
+    right: the id there is the surrogate. The other kinds add no hit: ``name``, ``address`` and
+    ``provider`` write values from fixed pools, and ``tests/test_anon_overlay_retarget_warning.py``
+    pins that no pool value has one of these shapes; ``phone`` and ``dob`` write one component;
+    ``date`` writes component 1 and keeps after it only a known TS.2 precision code.
+
+    The walk names a segment by every rule's path, so a segment only the retarget names keeps
+    its address in a message whose HL7 version does not define it."""
     retargeted = {default.path for default, _ in retargeted_defaults(rules)}
     parsed = read_message_seps(text)
     if not retargeted or parsed is None:
         return []
     seps = parsed[0]
-    mapped = {r.path for r in rules if r.kind != SurrogateKind.KEEP} - retargeted
+    rewritten = {r.path for r in rules if r.kind != SurrogateKind.KEEP}
     hits: list[str] = []
-    for address, value in unmapped_field_values(text, mapped, version=version):
+    walk = unmapped_field_values(text, rewritten - retargeted, version=version, named_by=rewritten)
+    for address, value in walk:
         if address not in retargeted:
             continue
         rest = seps.repetition.join(
@@ -560,7 +576,8 @@ def leak_report(
     Token hits use the guard's substring + estate-token mode (ADR 0030 §5) plus a field-anchored
     site-code check. Structural detection engages **only when ``rules`` is supplied** — the address
     of every unmapped field is derived from ``{r.path for r in rules}`` and the high-precision
-    detectors run over those fields. With ``rules is None`` (a direct/legacy call over a bare string)
+    detectors run over those fields, and over what a retarget of a default field left past its
+    first component (:func:`retarget_residue_hits`). With ``rules is None`` (a direct/legacy call over a bare string)
     structural detection is skipped and the result is byte-for-byte the legacy token-only behaviour.
 
     ``version`` is the HL7 version a bare line is judged by. A caller that checks the OUTPUT of
@@ -617,7 +634,7 @@ def leak_check(
 ) -> list[str]:
     """Forbidden-token + structural PHI hits in ``text`` (empty list = clean) — a thin wrapper over
     :func:`leak_report`. ``rules`` scopes the structural PHI-shape detectors to the fields no rule
-    matched; omitting it (a bare-string call) runs the legacy token-only check. A caller that
+    matched and to what a retarget left; omitting it (a bare-string call) runs the legacy token-only check. A caller that
     ran ``anonymize`` itself passes ``version=message_version(raw)``, as :func:`leak_report` says.
     """
     return leak_report(text, rules=rules, version=version).hits

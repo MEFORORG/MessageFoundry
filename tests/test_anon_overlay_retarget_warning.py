@@ -186,6 +186,33 @@ def test_every_unlisted_retarget_is_named(anon: ModuleType, tmp_path: Path) -> N
     assert "PID-5 from its default name scrub to id" in message
     assert "PID-13 from its default phone scrub to ssn" in message
     assert "PID-11" not in message  # listed, so not the cause
+    assert "Point each back at its default kind, or at drop or freetext" in message
+
+
+@_BOTH
+def test_a_refusal_naming_many_retargets_is_bounded(anon: ModuleType, tmp_path: Path) -> None:
+    # Every default field whose kind is not id, pointed at id.
+    rules = anon.rules
+    body = "[hl7.fields]\n" + "".join(
+        f'"{r.path}" = "id"\n' for r in rules.DEFAULT_RULES if r.kind.value != "id"
+    )
+    message = _refusal(rules, _overlay(tmp_path, body))
+
+    assert message.count("from its default") == rules._RETARGETS_NAMED
+    assert "more default field(s)" in message
+    assert len(message) <= len(str(tmp_path)) + _MESSAGE_BOUND
+
+
+@_BOTH
+@pytest.mark.parametrize("key", [_ACK, "keep", "drop"])
+def test_a_list_key_written_under_fields_gets_a_hint(
+    anon: ModuleType, tmp_path: Path, key: str
+) -> None:
+    # In TOML a key after the [hl7.fields] header belongs to that table.
+    body = f'[hl7.fields]\n"PID-5" = "id"\n{key} = ["PID-5"]\n'
+    message = _refusal(anon.rules, _overlay(tmp_path, body))
+    assert f"[hl7.fields] holds {key}, which belongs under [hl7]" in message
+    assert "not a whole-field HL7 address" not in message
 
 
 @_BOTH
@@ -390,6 +417,26 @@ def test_no_pool_value_has_a_shape_the_residue_scan_looks_for(anon: ModuleType) 
     ]
     assert len(values) > 50  # the pools were read, not an empty walk
     assert [value for value in values if anon.leak._structural_reasons(value, seps)] == []
+
+
+@_BOTH
+@pytest.mark.parametrize("version", ["2.2", "2.5.1"])
+def test_a_segment_the_version_does_not_define_is_still_scanned(
+    anon: ModuleType, version: str
+) -> None:
+    # HL7 2.2 has no PD1, so only the retarget's own rule names the segment. The walk used to
+    # address it as an unknown segment and skip it there; 2.5.1 is the control (BACKLOG #3493).
+    rules = (
+        *(r for r in anon.DEFAULT_RULES if r.path != "PD1-4"),
+        anon.FieldRule("PD1-4", "id"),
+    )
+    message = (
+        f"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|{version}\r"
+        "PD1||||1234^ZZDOC^ZZ^^^^^^^^^^(555) 555-0199"
+    )
+    assert anon.leak.retarget_residue_hits(message, rules) == [
+        "phone-shaped value left by a retarget in PD1-4"
+    ]
 
 
 @_BOTH

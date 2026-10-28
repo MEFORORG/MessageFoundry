@@ -14,7 +14,8 @@ Public surface (same shape as the engine's):
   no parseable MSH, or with a line no rule can reach (a malformed segment id).
 * :func:`anonymize_checked` — :func:`anonymize` + a fail-closed :func:`leak_report`; raises
   :class:`LeakError` (token categories + PHI shapes/addresses only) on any surviving token or a
-  structural PHI shape in a field no rule mapped. A name, an undashed number or a date in an
+  structural PHI shape in a field no rule mapped, or a dashed SSN or punctuated phone in what a
+  retarget of a default field left (BACKLOG #3493). A name, an undashed number or a date in an
   unmapped field passes; only the coverage report records it.
 * :func:`leak_check` / :func:`leak_report` — token hits + structural PHI-shape detection over the
   unmapped fields + the unmapped-field coverage report (vendored twin of the engine's; BACKLOG #331).
@@ -110,7 +111,8 @@ def anonymize_checked(
     """:func:`anonymize`, then a fail-closed :func:`leak_report`; raise :class:`LeakError` on any hit.
 
     Two-layered like the engine's (BACKLOG #331): the known-token denylist plus high-precision
-    structural PHI-shape detectors over the fields no rule matched. ``require_live_denylist`` (default
+    structural PHI-shape detectors over the fields no rule matched and over what a retarget of a
+    default field left past its first component. ``require_live_denylist`` (default
     off) makes a non-live token source a refusal cause; ``require_full_coverage`` (default off)
     refuses any present field no rule scrubs and no ``keep`` names, other than set ids, PID-8 and
     PV1-2, and a kept field is still scanned; a line that is a bare segment id and passed is in

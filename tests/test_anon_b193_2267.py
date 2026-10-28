@@ -212,6 +212,50 @@ def test_retargeting_a_default_scrubbed_field_is_printed(
     assert "JOHN" not in line
 
 
+@pytest.mark.parametrize("with_residue", [True, False], ids=["residue", "control"])
+def test_a_residue_refusal_is_not_told_to_add_a_keep(
+    with_residue: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # An acknowledged retarget of PID-13 to id leaves XTN.9, which here holds a punctuated phone
+    # number, so the leak-check refuses the row. A keep would leave the whole field, so the run
+    # line names the right fix first (BACKLOG #3493). The control row carries a dashed SSN in an
+    # unmapped field instead, and gets the advice it always had.
+    path = str(tmp_path / "residue.db")
+    pid = (
+        "PID|1||999^^^H^MR||DOE^JOHN||19800101|M|||||5550100^PRN^PH^^^^^^(555) 555-0199"
+        if with_residue
+        else "PID|1||999^^^H^MR||DOE^JOHN||19800101|M\rZPD|123-45-6789"
+    )
+    raw = f"MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|R1|P|2.5.1\r{pid}".encode("latin-1")
+
+    async def seed() -> None:
+        store = await RelayStore.open(path)
+        try:
+            await store.record_capture(direction="corepoint_copy", control_id="R1", raw=raw)
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+    overlay = _overlay(
+        tmp_path, '[hl7]\nretarget_acknowledged = ["PID-13"]\n[hl7.fields]\n"PID-13" = "id"\n'
+    )
+
+    assert _run(path, tmp_path / "ds.jsonl", "--overlay", overlay) == 1
+
+    (error,) = [line for line in capsys.readouterr().err.splitlines() if line.startswith("error:")]
+    told = "point each retargeted field back at its default kind, or at drop or freetext"
+    assert (told in error) is with_residue
+    assert ("A keep would leave the whole field. For any other, extend the rule map" in error) is (
+        with_residue
+    )
+    assert ("Extend the rule map or add a keep" in error) is not with_residue
+    assert "555-0199" not in error
+
+
 def test_a_keep_and_a_retarget_each_get_a_line(
     db: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

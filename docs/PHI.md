@@ -2177,8 +2177,8 @@ both are described below:
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IP address, survives | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
-| A dashed SSN (`NNN-NN-NNNN`) appears whole inside one field | Fields no rule maps |
-| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears whole inside one field | Fields no rule maps |
+| A dashed SSN (`NNN-NN-NNNN`) appears whole inside one field | Fields no rule maps, and what a retarget of a default field leaves past its first component |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears whole inside one field | Fields no rule maps, and what a retarget of a default field leaves past its first component |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it as `PV2 (line with no fields)` | Every line but the header. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
@@ -2451,9 +2451,9 @@ field with no default rule logs nothing. `python -m tee anonymize-captures` also
 field as captured.** The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn`
 rewrite the first component only, so `PID-5` pointed at `id` leaves the given name. `date` keeps
 the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check scans what such a
-field has left past its first component for the shapes in the table above, so a punctuated phone
-number left there refuses. A name, a city or a year left there passes, so a clean return does not
-clear it.
+field has left past its first component for a dashed SSN and a punctuated phone number, as the
+table above says, and refuses either. A name, a city or a year left there passes, and so does a
+year left in the first component, so a clean return does not clear it.
 
 **`load_rules` refuses such a retarget unless the overlay lists the field under
 `retarget_acknowledged`** (vault BACKLOG #3000):

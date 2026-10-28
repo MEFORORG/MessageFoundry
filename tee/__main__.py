@@ -48,7 +48,7 @@ from pathlib import Path
 from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
-from tee.anon.leak import CoverageTally
+from tee.anon.leak import RETARGET_RESIDUE, CoverageTally, LeakReport
 from tee.anon.rules import (
     RETARGET_ACKNOWLEDGED,
     AnonError,
@@ -715,6 +715,16 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     lines: list[str] = []
     coverage = CoverageTally(full_coverage=args.require_full_coverage)
     failed = 0
+    # Reports with a shape a retarget left (BACKLOG #3493). A keep is the wrong advice for one:
+    # it would leave the whole field. The row's own refusal text is never printed, so the run
+    # line below is the only place to say so.
+    residue_reports = 0
+
+    def _tally(report: LeakReport) -> None:
+        nonlocal residue_reports
+        coverage.add(report)
+        residue_reports += any(RETARGET_RESIDUE in hit for hit in report.structural_hits)
+
     for row in rows:
         text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
         try:
@@ -723,7 +733,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 salt=salt,
                 rules=rules,
                 require_full_coverage=args.require_full_coverage,
-                on_report=coverage.add,
+                on_report=_tally,
             )
         except AnonError:
             # Counted apart from the rest: anonymize refused the message before the leak-check
@@ -764,11 +774,19 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             if coverage.refused
             else ""
         )
+        first_step = (
+            f"{residue_reports} of them carried a PHI shape that a retarget of a default field "
+            "left past its first component: point each retargeted field back at its default "
+            "kind, or at drop or freetext. A keep would leave the whole field. For any other, "
+            "extend"
+            if residue_reports
+            else "Extend"
+        )
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "
             "forbidden token or had a field nobody decided — refusing to write a dataset (fail "
-            f"closed). {before_check}Extend the rule map or add a keep in an anon.toml overlay, "
-            "or repair each line no rule can reach (a malformed segment id, or a header line "
+            f"closed). {before_check}{first_step} the rule map or add a keep in an anon.toml "
+            "overlay, or repair each line no rule can reach (a malformed segment id, or a header line "
             "with no separator after its encoding characters), then retry.",
             file=sys.stderr,
         )
