@@ -6,6 +6,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
+  engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
+  other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or
+  its name is listed in the new `[dr].pass_environment`, so a hook that reads a cloud profile, a
+  proxy or a credential of its own needs that name listed. The `pass_environment` row of the
+  `[dr]` section of [CONFIGURATION.md](docs/CONFIGURATION.md) says what crosses and what the
+  setting refuses. (`BACKLOG #2587`)
+
 ## [0.5.2] — 2026-10-20 — Early Access
 
 This engine pairs with web console 0.5.0, which is published after it under its own

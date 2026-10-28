@@ -39,6 +39,13 @@ this line.**
   console passes `AuthService.logout`'s new required `proven_at` and pins that engine seam.
   (BACKLOG #3715, #3749, #3884)
 
+- **The message-export script reports a stopped export as unfinished.** The engine now ends a
+  stopped export as a failed transfer. Once a download has started, the `[data-mf-msg-export]`
+  script in `static/app.js` now says the export did not finish after N messages, that the engine
+  stopped it or the connection failed, and that nothing was saved, rather than "Network error
+  during export.". No console page renders that control today, so no operator sees this message
+  yet; the change keeps the script from reporting a partial file as saved if a page wires it up.
+  No seam change. (BACKLOG #3907)
 - **An IdP step-up's return is charged to the operator's own re-authentication budget, not the
   sign-in budget.** `GET /ui/oidc/callback` now reads the user its staged step-up flow names and
   charges a key of its own for that user in the per-actor limiter `POST /ui/reauth/oidc` already
