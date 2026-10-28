@@ -30,7 +30,9 @@ nothing, and be usable for nothing but the lookup that ends its successor.
 ## Decision
 
 **A rotation records a link from the hash it retired to its successor, and the login supersession,
-and only it, follows those links for a bounded time to the live end and revokes that.**
+and only it, follows those links for a bounded time to the live end and revokes that.** Amendment A
+adds the sign-out as a second reader, so "only" here and in item 5, AC-5 and option 1 held when
+this was accepted.
 
 1. **A separate table, `session_lineage`** (`retired_hash` primary key, `successor_hash`,
    `retired_at`, an index on `retired_at`), on SQLite, Postgres and SQL Server. `rotate_session`
@@ -52,7 +54,7 @@ and only it, follows those links for a bounded time to the live end and revokes 
 5. **No session read consults the table.** `get_session`, `list_sessions` and the service's session
    loader read `sessions` only. A test pins, per backend, that only `rotate_session`,
    `supersede_session` and `purge_expired_sessions` name the table or a statement on it, and that
-   only `_supersede_session_hash` passes a window.
+   only `_supersede_session_hash` passes a window (Amendment A adds `logout`).
 6. **The links are not sealed** (BACKLOG #2592). A seal stops a database writer forging authority,
    and a link carries none: the most a forged link can do is direct a revoke at a live row, and a
    revoke needs no key on any backend, so that writer could revoke the row directly.

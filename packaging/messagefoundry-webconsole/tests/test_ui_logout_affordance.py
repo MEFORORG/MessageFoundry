@@ -22,6 +22,7 @@ Three layers, because pinning the five fixed pages cannot catch a SIXTH bare pag
 from __future__ import annotations
 
 import ast
+import logging
 import time
 from pathlib import Path
 
@@ -246,7 +247,8 @@ async def test_ui_logout_with_a_cookie_naming_no_session_still_records_the_addre
 
 
 async def _signed_in_operator(engine: Engine) -> tuple[AuthService, str]:
-    """A service with one operator, and a console session cookie for it, minted from LOGIN_PEER."""
+    """A service with one operator, and a console session cookie for it, minted by a direct
+    ``login`` call that names no client address."""
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     user_id = await create_local_user_chosen(
@@ -324,7 +326,7 @@ async def test_ui_logout_with_a_cookie_retired_past_the_window_ends_nothing(
 
 
 async def test_ui_logout_clears_the_cookie_when_the_row_fails_after_the_revoke(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #3884 item 1. Once the session ended, a refused ``auth.logout`` row used to raise
     through the route, which answered 500 and never cleared the cookie or sent Clear-Site-Data.
@@ -332,17 +334,86 @@ async def test_ui_logout_clears_the_cookie_when_the_row_fails_after_the_revoke(
     service, token = await _signed_in_operator(engine)
     real_record = engine.store.record_audit
 
-    async def _refuse_logout_row(action: str, **kwargs: object) -> object:
+    async def _refuse_logout_row(action: str, **kwargs: object) -> None:
         if action == "auth.logout":
             raise OSError("the audit store refused the row")
-        return await real_record(action, **kwargs)  # type: ignore[arg-type]
+        await real_record(action, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(engine.store, "record_audit", _refuse_logout_row)
-    out = await _sign_out_with(engine, service, token)
+    with caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
+        out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await service.identity_for_token(token, activity=False) is None
+    assert _error_lines(caplog) == [
+        f"a sign-out ended session {hash_token(token)[:12]}, but its auth.logout row failed"
+    ]
+
+
+#: The logger :meth:`AuthService.logout` writes its fail-soft ERROR lines to.
+_SERVICE_LOGGER = "messagefoundry.auth.service"
+
+
+def _assert_signed_out(out: httpx.Response) -> None:
+    """The route finished the sign-out: it redirected, sent Clear-Site-Data and expired the cookie."""
     assert out.status_code == 303
     assert "clear-site-data" in out.headers
     assert any(
         "mf_session=" in header and "max-age=0" in header.lower()
         for header in out.headers.get_list("set-cookie")
     ), out.headers.get_list("set-cookie")
+
+
+def _error_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _SERVICE_LOGGER and r.levelno == logging.ERROR
+    ]
+
+
+async def test_ui_logout_clears_the_cookie_when_the_owner_lookup_fails(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3884 item 1, the owner-lookup branch. The session ended, then reading its owner
+    failed: the route still finishes the sign-out, the row is written with no actor, and the ERROR
+    line names the session."""
+    service, token = await _signed_in_operator(engine)
+
+    async def _refuse_owner(user_id: str) -> object:
+        raise OSError("the user store refused the read")
+
+    monkeypatch.setattr(engine.store, "get_user", _refuse_owner)
+    with caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
+        out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
     assert await service.identity_for_token(token, activity=False) is None
+    assert await logout_rows(engine.store) == [(None, PEER_ADDRESS, "revoked")]
+    session = hash_token(token)[:12]
+    assert _error_lines(caplog) == [
+        f"a sign-out ended session {session}, but its owner could not be read; its auth.logout "
+        "row names no actor"
+    ]
+
+
+async def test_ui_logout_clears_the_cookie_when_a_row_for_nothing_ended_fails(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3884 item 1, the ``nothing_to_revoke`` branch. The cookie names no session, and
+    the row recording that is refused: the route still finishes the sign-out and logs an ERROR
+    line. No session ended, so the line has none to name."""
+    service = await _service(engine)
+    real_record = engine.store.record_audit
+
+    async def _refuse_logout_row(action: str, **kwargs: object) -> None:
+        if action == "auth.logout":
+            raise OSError("the audit store refused the row")
+        await real_record(action, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(engine.store, "record_audit", _refuse_logout_row)
+    with caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
+        out = await _sign_out_with(engine, service, "a-token-that-names-no-session")
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == []
+    assert _error_lines(caplog) == [
+        "a sign-out that ended nothing could not write its auth.logout row"
+    ]

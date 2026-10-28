@@ -676,6 +676,47 @@ async def test_a_logout_raced_by_a_rotation_ends_the_session_under_its_new_token
     ]
 
 
+async def test_logout_passes_a_proven_at_read_before_its_gate(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3715. ``POST /auth/logout`` bounds the lineage walk from the moment its request
+    arrived, which must be read BEFORE its gate proves the token live, so any link followed was
+    written after that proof. The clock ticks on every read, so "before" is a strict order rather
+    than a tie, and ``proven_at=None`` (the credential-free bound) fails here."""
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "u")).json()["token"]
+
+    start = time.time()
+    ticks = iter(range(1, 10**9))
+    monkeypatch.setattr(time, "time", lambda: start + next(ticks) * 0.001)
+    gate_reads: list[float] = []
+    real_get_session = engine.store.get_session
+
+    async def _timed_get_session(*args: Any, **kwargs: Any) -> Any:
+        gate_reads.append(time.time())
+        return await real_get_session(*args, **kwargs)
+
+    monkeypatch.setattr(engine.store, "get_session", _timed_get_session)
+    proven: list[float | None] = []
+    real_logout = service.logout
+
+    async def _spy_logout(token: str | None, **kwargs: Any) -> Any:
+        proven.append(kwargs["proven_at"])
+        return await real_logout(token, **kwargs)
+
+    monkeypatch.setattr(service, "logout", _spy_logout)
+    async with _client(engine, service) as c:
+        assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
+    assert gate_reads, "the gate never read the session, so this measured nothing"
+    assert len(proven) == 1
+    assert proven[0] is not None, (
+        "the route passed no proven_at, so it took the credential-free bound"
+    )
+    assert proven[0] < gate_reads[0], "proven_at was read after the gate proved the token"
+
+
 async def test_a_logout_audit_row_names_the_caller_and_the_client_address(engine: Engine) -> None:
     """BACKLOG #3339. ``POST /auth/logout`` passes the signed-in caller and the address from
     ``client_ip``, and the ``auth.logout`` row records both. The peer is pinned, so the ``client``

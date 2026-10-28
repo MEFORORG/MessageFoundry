@@ -2728,7 +2728,8 @@ CREDENTIAL_ISSUE_REFUSED_ACTION: Final = "auth.credential_issue_refused"
 #: The ``op`` values that row carries, one per issuing operation.
 CredentialIssueOp = Literal["create", "password_reset", "mfa_reset"]
 #: What :meth:`AuthService.logout` reports, and what its ``auth.logout`` row's ``outcome`` records.
-#: ``lapsed`` is a revoke of a row that was already over its idle or absolute limit (BACKLOG #3749).
+#: ``lapsed`` is a revoke of a row that was no longer live, for example one over its idle or
+#: absolute limit (BACKLOG #3749).
 LogoutOutcome = Literal["revoked", "lapsed", "nothing_to_revoke"]
 #: BACKLOG #3715, #3749: how far before the moment a sign-out's token was proven live, or before
 #: the call when nothing proved it, the sign-out follows the session lineage. ``/ui/logout``
@@ -10919,8 +10920,8 @@ class AuthService:
         longer ago than the lineage bound below, or the token was stale or never valid
         (``/ui/logout`` has no auth dependency). The outcome is then ``nothing_to_revoke`` rather
         than a revoke that did not happen. ``revoked`` means a session that was still live ended.
-        ``lapsed`` means the row ended was already over its idle or absolute limit (BACKLOG #3749),
-        judged as :meth:`_supersede_session_hash` judges it.
+        ``lapsed`` means the row ended was no longer live, for example over its idle or absolute
+        limit (BACKLOG #3749), judged by :meth:`_was_live_at_revoke`, as the supersession judges it.
 
         **A rotation that committed first is followed, for a bounded time (BACKLOG #3715).** An
         elevation in another tab can re-key the session while the sign-out is in flight, leaving
