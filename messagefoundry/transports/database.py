@@ -696,20 +696,29 @@ def _driver_file_spellings(
 ) -> Iterator[tuple[str, bytes]]:
     """``(setting, bytes)`` for each spelling of the ``keyword`` file
     (:func:`driver_file_spellings`) that :func:`_read_driver_file` reads, for the caller to check.
-    Nothing when the keyword is unset."""
+    Nothing when the keyword is unset, and nothing more once a spelling is left to the driver as
+    an unreached share: another spelling of it would wait out the same network timeout."""
     setting = f"{hop_name_prefix(connection)}DATABASE odbc_params {keyword}"
     for path in driver_file_spellings(named.get(keyword)):
-        data = _read_driver_file(
-            path,
-            setting,
-            what,
-            checked_for,
-            error=error,
-            leave_irregular=leave_irregular,
-            leave_unreachable=leave_unreachable,
-        )
+        try:
+            data = _read_driver_file(
+                path,
+                setting,
+                what,
+                checked_for,
+                error=error,
+                leave_irregular=leave_irregular,
+                leave_unreachable=leave_unreachable,
+            )
+        except _UnreachedShare:
+            return
         if data is not None:
             yield setting, data
+
+
+class _UnreachedShare(Exception):
+    """:func:`_read_driver_file` could not reach the share a spelling names, and its caller said
+    the driver will not read the file, so no spelling of it is read."""
 
 
 def _read_driver_file(
@@ -734,7 +743,7 @@ def _read_driver_file(
     because a file the check cannot read is one it cannot clear, and so is a file past
     :data:`_MAX_DRIVER_CA_FILE_BYTES`. That includes a share Windows could not reach
     (:func:`_names_no_file`), unless ``leave_unreachable`` says the driver will not read the file
-    either.
+    either: then :class:`_UnreachedShare` is raised.
 
     The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says
     how a device or pipe is judged without being read, or waited on."""
@@ -747,16 +756,23 @@ def _read_driver_file(
     except OSError as exc:
         # read_if_regular returns None for a directory it stats. One swapped in after that stat
         # can fail the open instead, as PermissionError on Windows, so the path is looked at
-        # again here, but never after a FileNotFoundError: on a share Windows could not reach,
-        # a second look waits out the same network timeout again, on the event loop. A path
-        # through a file names no file either; keywrap refused both, so sslkey still does.
-        missing = isinstance(exc, FileNotFoundError)
-        if isinstance(exc, NotADirectoryError) or (not missing and os.path.isdir(path)):
+        # again after that failure alone: on a share Windows could not reach, a second look would
+        # wait out the same network timeout again, on the event loop. A path through a file names
+        # no file either. POSIX reports it as NotADirectoryError, which keywrap refused, so sslkey
+        # still does; Windows reports it as a missing name, left to the driver.
+        if isinstance(exc, NotADirectoryError) or (
+            isinstance(exc, (PermissionError, IsADirectoryError)) and os.path.isdir(path)
+        ):
             _irregular(setting, what, checked_for, error, leave_irregular)
             return None
-        if _names_no_file(exc) or (missing and leave_unreachable):
-            logger.debug("%s: no file the driver reads at this spelling, so no check", setting)
+        if _names_no_file(exc):
+            logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
             return None
+        if leave_unreachable and isinstance(exc, FileNotFoundError):
+            logger.debug(
+                "%s: the share was not reached, and the driver reads no such file", setting
+            )
+            raise _UnreachedShare from exc
         raise error(
             f"{setting}: the {what} could not be read to check {checked_for}: "
             f"{exc.strerror or type(exc).__name__}"

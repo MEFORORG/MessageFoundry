@@ -281,28 +281,48 @@ def test_a_read_failure_that_names_no_file_is_the_only_one_left_to_the_driver(
         assert f"sslkey={{{path}}}" in _build(plain, extra={"sslkey": path})
 
 
-@pytest.mark.parametrize(("shape", "refused"), [("notfound:53", True), ("notfound", False)])
-def test_a_missing_name_is_judged_from_the_first_error_with_no_second_stat(
+def _record_looks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The paths anything stats, through the ``os`` and ``os.path`` calls that look at a path."""
+    looked: list[str] = []
+    for owner, name in (
+        (os, "stat"),
+        (os, "lstat"),
+        (os.path, "exists"),
+        (os.path, "lexists"),
+        (os.path, "isdir"),
+        (os.path, "isfile"),
+    ):
+        real = getattr(owner, name)
+
+        def look(target: Any, *args: Any, _real: Any = real, **kwargs: Any) -> Any:
+            if isinstance(target, (str, os.PathLike)):
+                looked.append(os.fspath(target))
+            return _real(target, *args, **kwargs)
+
+        monkeypatch.setattr(owner, name, look)
+    return looked
+
+
+@pytest.mark.parametrize(
+    ("shape", "refused"),
+    [("notfound:53", True), ("notfound", False), ("einval:1231", True)],
+)
+def test_a_failed_read_is_judged_from_the_first_error_with_no_second_stat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str, refused: bool
 ) -> None:
-    """A FileNotFoundError says what it says, so the path is not looked at again. On a share
-    Windows could not reach, a second look waits out the same network timeout on the event loop.
-    Red with ``os.path.isdir`` asked before the error is read: it is called for the path."""
+    """Only a failure a directory swapped in can cause is looked at again. On a share Windows
+    could not reach, a second look waits out the same network timeout on the event loop, whether
+    the share's failure arrives as a missing name or as an EINVAL (1231,
+    ERROR_NETWORK_UNREACHABLE). Red with ``os.path.isdir`` asked after every failure: it is called
+    for the path."""
     path = _write(tmp_path, b"unread")
     error = _read_failure(shape)
 
     def failing(*_args: Any) -> bytes | None:
         raise error
 
-    looked: list[str] = []
-    real_isdir = os.path.isdir
-
-    def isdir(target: Any) -> bool:
-        looked.append(os.fspath(target))
-        return real_isdir(target)
-
     monkeypatch.setattr(database, "read_if_regular", failing)
-    monkeypatch.setattr(os.path, "isdir", isdir)
+    looked = _record_looks(monkeypatch)
     if refused:
         with pytest.raises(ValueError, match="could not be read"):
             _build(path, spelling="sslca")
@@ -329,6 +349,55 @@ def test_an_unreachable_sslca_the_driver_never_reads_does_not_fail_the_build(
     assert f"sslca={{{path}}}" in _build(path, spelling="sslca", extra={"SSLmode": mode})
     with pytest.raises(ValueError, match="could not be read"):
         _build(path, spelling="sslca")
+
+
+def test_an_unreachable_sslca_under_tls_off_is_read_at_one_spelling_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A padded value has two spellings on one share. Once the first is left to the driver as
+    unreached, the trimmed one is not read, since it would wait out the same timeout again. Red
+    with the loop going on to the next spelling: two reads."""
+    path = _write(tmp_path, b"unread")
+    error = _read_failure("notfound:53")
+    reads: list[str] = []
+
+    def failing(target: str, *_args: Any) -> bytes | None:
+        reads.append(target)
+        raise error
+
+    monkeypatch.setattr(database, "read_if_regular", failing)
+    padded = path + "  "
+    assert "sslca=" in _build(padded, spelling="sslca", extra={"SSLmode": "disable"})
+    assert reads == [padded]
+
+
+@pytest.mark.parametrize(
+    ("spelling", "shape", "refusal"),
+    [
+        ("sslkey", "notfound:53", KeyWrapRefused),
+        ("sslcert", "notfound:67", KeyWrapRefused),
+        ("sslca", "einval:1920", ValueError),
+    ],
+)
+def test_tls_off_leaves_only_an_unreached_sslca_to_the_driver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spelling: str,
+    shape: str,
+    refusal: type[ValueError],
+) -> None:
+    """The carve-out is the CA's alone, and only for a share that was not reached: an unreached
+    ``sslkey`` or ``sslcert``, and a CA that failed to read in any other way, are still refused
+    under ``disable``. Red with the carve-out widened to either."""
+    path = _write(tmp_path, b"unread")
+    error = _read_failure(shape)
+
+    def failing(*_args: Any) -> bytes | None:
+        raise error
+
+    monkeypatch.setattr(database, "read_if_regular", failing)
+    with pytest.raises(refusal, match="could not be read"):
+        _build(path, spelling=spelling, extra={"SSLmode": "disable"})
 
 
 def test_a_readable_sslca_is_still_checked_when_tls_is_off(tmp_path: Path) -> None:
