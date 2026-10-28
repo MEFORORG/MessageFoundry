@@ -430,8 +430,9 @@ false premise.
   (vault BACKLOG #2600), so the serve-time warning, `messagefoundry security show` and
   `GET /security/posture` list it. A value of `0` or less ends every session at once, which is
   stricter, and is not named. The registry reads the value the load copied into `[auth]`, so the
-  preview `messagefoundry security set` prints does not show a new value yet; the next
-  `security show` does, when it can load the whole file.
+  preview `messagefoundry security set` prints reflects the value from before the edit, and can
+  miss a new loosening or keep one just removed. The next `security show` is right, when it can
+  load the whole file.
 
 ### `block_unlisted_outbound = false` — allow-any outbound egress
 - **What you lose:** deny-by-default egress; a transform may send to **any** destination (PHI exfiltration
@@ -779,12 +780,15 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `ad_session_recheck_seconds` is above `300` s, when `ad_session_recheck_strikes` is above `2` (a pass
   revokes only after that many in a row find the account absent or disabled), or when
   `ad_session_recheck_max_users` is below `200` (a larger estate takes more passes to cover). The
-  strike count delays only an account found absent or disabled; a role or scope change revokes on
-  the first pass. The mass-revoke circuit breaker aborts a pass that would revoke more than **both**
-  `ad_session_revoke_max` accounts and `ad_session_revoke_max_fraction` of the accounts it probed,
-  and an aborted pass revokes nothing. A value below either default aborts a smaller wave of
-  genuine offboarding or demotions, and keeps aborting while those accounts stay as they are. Each
-  abort writes an ERROR and an audit row.
+  strike count delays at least an account found absent or disabled, or one whose account control
+  cannot be read; a role or scope change revokes on the first pass. The mass-revoke circuit breaker
+  aborts a pass that would revoke more than **both** `ad_session_revoke_max` accounts and
+  `ad_session_revoke_max_fraction` of the accounts it probed, and an aborted pass revokes nothing.
+  A value below either default aborts a smaller wave of genuine offboarding or demotions, and keeps
+  aborting while those accounts stay as they are. So does a smaller per-pass budget, since fewer
+  accounts probed is a smaller denominator. Each abort writes an ERROR and an audit row. The two
+  breaker thresholds are named only while the budget is above the cap, since otherwise the breaker
+  cannot trip at all.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
   sooner or ends more of them, and none keeps a session the directory withdrew. A higher brake
   threshold costs availability instead: a misconfigured search base, or a lost read right, signs out

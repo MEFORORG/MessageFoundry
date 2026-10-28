@@ -27,7 +27,7 @@ import re
 from collections.abc import Collection
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 import httpx
 import pytest
@@ -875,30 +875,81 @@ def test_a_password_floor_of_zero_says_there_is_none() -> None:
 
 
 def test_the_strike_entry_does_not_claim_to_delay_a_role_change() -> None:
-    """``plan_pass`` counts strikes only for an absent or disabled account."""
+    """``plan_pass`` strikes only the outcomes in ``REVOKE_REASONS``; a role change revokes at once."""
     risk = _risk(_ad(ad_session_recheck_strikes=5), "ad_session_recheck_strikes")
     assert risk is not None
-    assert "groups" not in risk and "disabled or deleted" in risk
+    assert "groups" not in risk and "at least one absent, disabled" in risk
 
 
-#: Every numeric [auth] field, and where its looser direction is decided. A new numeric field reds
-#: here until someone reads its consumer and adds it, to the registry or to the exempt set with a
-#: reason. The bool floor below cannot see these: it iterates booleans.
-_NUMERIC_AUTH_NAMED = {
-    "session_idle_timeout_minutes", "session_absolute_hours", "max_sessions_per_user",
-    "step_up_max_age_seconds", "totp_skew_steps", "mfa_recovery_code_count",
-    "mfa_verify_min_elapsed_seconds", "password_min_length", "lockout_threshold",
-    "lockout_minutes", "lockout_max_minutes", "initial_password_expiry_hours",
-    "ad_connect_timeout", "ad_receive_timeout", "ad_group_search_deadline",
-    "ad_session_recheck_seconds", "ad_session_recheck_strikes", "ad_session_recheck_max_users",
-    "ad_session_revoke_max", "ad_session_revoke_max_fraction", "oidc_clock_skew_seconds",
-    "oidc_jwks_ttl_seconds", "oidc_jwks_min_refetch_seconds", "oidc_flow_ttl_seconds",
-    "oidc_callback_min_elapsed_seconds", "oidc_flow_cache_max", "oidc_max_age_seconds",
-    "login_rate_limit_per_ip", "login_rate_limit_global", "login_rate_limit_window_seconds",
-    "phi_read_rate_limit_per_actor", "phi_read_rate_limit_window_seconds",
-    "admin_write_rate_limit_per_actor", "admin_write_rate_limit_window_seconds",
-    "admin_write_min_interval_seconds",
-}  # fmt: skip
+def test_a_breaker_threshold_is_not_named_while_the_breaker_cannot_trip() -> None:
+    """A budget at or below the cap disarms the breaker, so a low share aborts nothing. The control:
+    the same share with an armed breaker is named."""
+    dead = _ad(ad_session_revoke_max=1000, ad_session_revoke_max_fraction=0.01)
+    assert _names(auth=dead) == []
+    assert _names(auth=_ad(ad_session_revoke_max_fraction=0.01)) == [
+        "ad_session_revoke_max_fraction"
+    ]
+
+
+def _ad_grouped(**over: object) -> AuthSettings:
+    """AD with a paged nested-group search, the only case that reads its deadline."""
+    return _ad(ad_group_search_base="OU=Groups,DC=test,DC=invalid", **over)
+
+
+def _oidc_on(**over: object) -> AuthSettings:
+    """:func:`_oidc`, which is defined further down, looked up when called."""
+    return _oidc(**over)
+
+
+#: Every numeric [auth] field the registry names: field -> (settings builder, a value looser than
+#: the default, the switch it is named under). A new numeric field reds the census below until
+#: someone reads its consumer and adds it here, with a looser value the registry must report, or
+#: to the exempt set with a reason. The bool floor cannot see these: it iterates booleans.
+_NUMERIC_AUTH_NAMED: dict[str, tuple[Any, object, str]] = {
+    "session_idle_timeout_minutes": (AuthSettings, 31, "sign_out_after_idle_minutes"),
+    "session_absolute_hours": (AuthSettings, 13, "max_session_hours"),
+    "max_sessions_per_user": (AuthSettings, 6, "max_sessions_per_user"),
+    "step_up_max_age_seconds": (AuthSettings, 301, "step_up_max_age_seconds"),
+    "totp_skew_steps": (AuthSettings, 1, "totp_skew_steps"),
+    "mfa_recovery_code_count": (AuthSettings, 11, "mfa_recovery_code_count"),
+    "mfa_verify_min_elapsed_seconds": (AuthSettings, 0.5, "mfa_verify_min_elapsed_seconds"),
+    "password_min_length": (AuthSettings, 14, "password_min_length"),
+    "lockout_threshold": (AuthSettings, 6, "lockout_threshold"),
+    "lockout_minutes": (AuthSettings, 14, "lockout_minutes"),
+    "lockout_max_minutes": (AuthSettings, 1439, "lockout_max_minutes"),
+    "initial_password_expiry_hours": (AuthSettings, 73, "initial_password_expiry_hours"),
+    "ad_connect_timeout": (_ad, 11.0, "ad_connect_timeout"),
+    "ad_receive_timeout": (_ad, 11.0, "ad_receive_timeout"),
+    "ad_group_search_deadline": (_ad_grouped, 121.0, "ad_group_search_deadline"),
+    "ad_session_recheck_seconds": (_ad, 301, "ad_session_recheck_seconds"),
+    "ad_session_recheck_strikes": (_ad, 3, "ad_session_recheck_strikes"),
+    "ad_session_recheck_max_users": (_ad, 199, "ad_session_recheck_max_users"),
+    "ad_session_revoke_max": (_ad, 4, "ad_session_revoke_max"),
+    "ad_session_revoke_max_fraction": (_ad, 0.33, "ad_session_revoke_max_fraction"),
+    "oidc_clock_skew_seconds": (_oidc_on, 61, "oidc_clock_skew_seconds"),
+    "oidc_jwks_ttl_seconds": (_oidc_on, 3601, "oidc_jwks_ttl_seconds"),
+    "oidc_jwks_min_refetch_seconds": (_oidc_on, 299, "oidc_jwks_min_refetch_seconds"),
+    "oidc_flow_ttl_seconds": (_oidc_on, 301, "oidc_flow_ttl_seconds"),
+    "oidc_callback_min_elapsed_seconds": (_oidc_on, 0.5, "oidc_callback_min_elapsed_seconds"),
+    "oidc_flow_cache_max": (_oidc_on, 513, "oidc_flow_cache_max"),
+    "oidc_max_age_seconds": (_oidc_on, 43_201, "oidc_max_age_seconds"),
+    "login_rate_limit_per_ip": (AuthSettings, 11, "login_rate_limit_per_ip"),
+    "login_rate_limit_global": (AuthSettings, 61, "login_rate_limit_global"),
+    "login_rate_limit_window_seconds": (AuthSettings, 59.0, "login_rate_limit_window_seconds"),
+    "phi_read_rate_limit_per_actor": (AuthSettings, 121, "phi_read_rate_limit_per_actor"),
+    "phi_read_rate_limit_window_seconds": (
+        AuthSettings,
+        59.0,
+        "phi_read_rate_limit_window_seconds",
+    ),
+    "admin_write_rate_limit_per_actor": (AuthSettings, 13, "admin_write_rate_limit_per_actor"),
+    "admin_write_rate_limit_window_seconds": (
+        AuthSettings,
+        14.0,
+        "admin_write_rate_limit_window_seconds",
+    ),
+    "admin_write_min_interval_seconds": (AuthSettings, 0.1, "admin_write_min_interval_seconds"),
+}
 _NUMERIC_AUTH_EXEMPT = {
     # Only lowers a session's end: the sign-in takes the earlier of it and the token's expiry.
     "oidc_session_max_hours": "never looser",
@@ -907,14 +958,24 @@ _NUMERIC_AUTH_EXEMPT = {
 }
 
 
+def _is_numeric(annotation: object) -> bool:
+    """An int or a float, alone or in a union (``int | None``, ``int | float``). bool is its own
+    annotation, so the bool floor's fields stay out."""
+    return annotation in (int, float) or any(a in (int, float) for a in get_args(annotation))
+
+
 def test_every_numeric_auth_field_is_named_or_exempt() -> None:
-    numeric = {
-        name
-        for name, field in AuthSettings.model_fields.items()
-        if field.annotation in (int, float, int | None, float | None)
-    }
-    assert numeric == _NUMERIC_AUTH_NAMED | set(_NUMERIC_AUTH_EXEMPT)
-    assert not _NUMERIC_AUTH_NAMED & set(_NUMERIC_AUTH_EXEMPT)
+    numeric = {n for n, f in AuthSettings.model_fields.items() if _is_numeric(f.annotation)}
+    assert numeric == set(_NUMERIC_AUTH_NAMED) | set(_NUMERIC_AUTH_EXEMPT)
+    assert not set(_NUMERIC_AUTH_NAMED) & set(_NUMERIC_AUTH_EXEMPT)
+
+
+@pytest.mark.parametrize("field", sorted(_NUMERIC_AUTH_NAMED))
+def test_each_census_field_is_named_at_its_looser_value(field: str) -> None:
+    """The behavioural arm: a field listed as named must really be named at its looser value, so
+    adding a name to the census without a registry entry still reds."""
+    build, value, switch = _NUMERIC_AUTH_NAMED[field]
+    assert switch in _names(auth=build(**{field: value}))
 
 
 def _jwk(kid: str) -> dict[str, str]:
