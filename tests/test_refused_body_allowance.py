@@ -39,6 +39,7 @@ from messagefoundry.pipeline.refused_body import (
     RefusedBodyPolicy,
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.redaction import safe_text
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.metadata import user_metadata
 
@@ -287,15 +288,51 @@ async def test_every_refusal_phase_stores_a_head_and_the_body_record_once_spent(
 # --- the allowance itself --------------------------------------------------------------------------
 
 
-def test_a_body_no_larger_than_a_head_is_stored_whole_and_charges_nothing() -> None:
+async def test_a_body_whose_head_is_the_whole_body_is_stored_whole_and_charges_nothing() -> None:
     allowance = RefusedBodyAllowance(
         RefusedBodyPolicy(allowance_bytes=2000, window_seconds=60.0, head_bytes=1000)
     )
-    for _ in range(100):
-        assert allowance.admit("IB_A", 1000)
+    small_text = "x" * 1000
+    small_carried = b"\x00\x01" * 400  # 800 bytes, stored as byte carriage of about 1080 characters
+    for _ in range(50):
+        for wire, text in ((small_text.encode(), small_text), (small_carried, None)):
+            bounded = await allowance.bound("IB_A", wire, text, ContentType.TEXT.value, "e")
+            assert json.loads(bounded.metadata)[METADATA_KEY]["stored"] == "whole"
+            assert bounded.error == "e"
     # The 100 small bodies charged nothing, so a body the allowance covers is still admitted.
     assert allowance.admit("IB_A", 2000)
-    assert not allowance.admit("IB_A", 1001)
+    assert not allowance.admit("IB_A", 1)
+
+
+async def test_the_charge_is_the_utf8_the_store_writes_not_the_characters() -> None:
+    # A decode failure stores the latin-1 view, which writes two UTF-8 bytes for each high byte. So
+    # a 1500-byte body of high bytes costs 3000, and an allowance of 2999 cannot store it whole.
+    allowance = RefusedBodyAllowance(
+        RefusedBodyPolicy(allowance_bytes=2999, window_seconds=60.0, head_bytes=1000)
+    )
+    wire = b"\xff" * 1500
+    bounded = await allowance.bound("IB_A", wire, None, ContentType.HL7V2.value, "decode error")
+    assert json.loads(bounded.metadata)[METADATA_KEY]["stored"] == "head"
+    assert len(bounded.raw.encode()) <= 1000
+    # The refusal above charged nothing, so a body costing 2998 still fits the 2999.
+    fits = await allowance.bound("IB_A", b"\xff" * 1499, None, ContentType.HL7V2.value, "e")
+    assert json.loads(fits.metadata)[METADATA_KEY]["stored"] == "whole"
+
+
+async def test_the_note_survives_the_stores_own_bound_on_the_error() -> None:
+    allowance = RefusedBodyAllowance(
+        RefusedBodyPolicy(allowance_bytes=0, window_seconds=60.0, head_bytes=256)
+    )
+    long_reason = "strict-validation failed: " + "PID.3 bad; " * 40
+    wire = b"A" * 20_000_000
+    bounded = await allowance.bound("IB_A", wire, None, ContentType.TEXT.value, long_reason)
+    assert len(bounded.error) <= 200
+    # The store runs safe_text again; the stored text must come through it unchanged.
+    assert safe_text(bounded.error) == bounded.error
+    assert bounded.error.endswith(
+        "[refused-body allowance spent: stored only the head of a 20,000,000-byte body]"
+    )
+    assert bounded.error.startswith("strict-validation failed:")
 
 
 def test_the_allowance_refills_evenly_and_never_past_its_capacity() -> None:

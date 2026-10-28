@@ -2101,11 +2101,11 @@ class InboundSettings(_Section):
     # [retention].min_free_disk_mb, because that one number also gates `serve`.
     max_staged_depth: int = 0
 
-    # Vault BACKLOG #2608: the per-inbound refused-body allowance. A body refused before ingress
-    # (decode, NUL, size, declared type, parse, strict validation, streaming detach) is still
+    # Vault BACKLOG #2608: the per-inbound refused-body allowance. A body a listener refuses before
+    # ingress (at least decode, NUL, size, declared type, parse, strict validation, streaming detach) is
     # recorded as an ERROR row, and its length and SHA-256 always are. The WHOLE body is stored only
     # while its inbound's rolling byte allowance covers it; past that, the first
-    # refused_body_head_bytes of it are. A body no larger than a head is always stored whole. This
+    # refused_body_head_bytes of it are. A body whose head is the whole of it is stored whole. This
     # bounds the bytes a reject flood stores, never the count of refusals, and never pauses intake, so
     # it ships on and has no off value: 0 stores only heads. The allowance refills evenly over the
     # window. Held per engine process; an inbound lives on one engine shard. docs/CONFIGURATION.md
