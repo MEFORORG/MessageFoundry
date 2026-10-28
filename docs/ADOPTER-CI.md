@@ -235,7 +235,9 @@ that package's build code may run in CI:
     after 0.5.2, name such a package with `--skip-private <name>` before `requirements.lock` on the
     audit line: that one pin is left out of the audit and printed as not audited, and every other
     pin is still looked up. The dry-run still downloads it, so pip must be configured with the
-    index that serves it. It refuses the engine's own name.
+    index that serves it. It refuses the engine's own name, and the name of each other MessageFoundry
+    package your engine release records as published: at least `messagefoundry-webconsole`,
+    `messagefoundry-harness` and `messagefoundry-toolkit`.
   - It refuses a lock with pip option lines, such as an index URL, `--trusted-host` or `--find-links`.
     `uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock` writes none
     by default and writes every platform's pins. `pip-compile` needs its `--no-emit-*` flags for each

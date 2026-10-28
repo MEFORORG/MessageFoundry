@@ -45,8 +45,9 @@ and prints it as not audited (vault BACKLOG #3786 finding 1). It is for a packag
 database can look up, such as an adopter's private one: ``--strict`` fails such a pin, and
 ``--ignore-vuln`` cannot clear that, since it names an advisory, not a package. Every other pin is
 still looked up under ``--strict``, and step 1 still checks the named one's hashes, so it must be
-downloadable from the index pip is configured with. Nothing checks that the named package is in
-fact private: like ``--ignore-vuln``, it is the adopter's recorded decision.
+downloadable from the index pip is configured with. Past refusing the engine and the MessageFoundry
+packages this release knows to be published, nothing checks that the named package is in fact
+private: like ``--ignore-vuln``, it is the adopter's recorded decision.
 
 WHY STRIPPING IS SOUND HERE. Every pin in a uv export is a version that uv resolved for some
 environment. The engine sets no ``[tool.uv] environments``, so that includes environments nobody
@@ -64,9 +65,10 @@ never writes and which would resolve against the temporary copy's directory, or 
 rather than audit what it names (``uv export --no-emit-project`` writes none; a lock tool can
 write at least an index URL, ``--trusted-host`` and ``--find-links`` lines unless told not to); and
 a requirement that continues onto a line other than a hash, option or comment, where a marker
-would stay in place; and a ``--skip-private`` that names the engine, a package the lock does not
-pin, or every pin, or that comes after the lock as a word of its own (the ``=`` form or an
-abbreviation there reaches pip-audit, which fails on it as an unknown option). It does not judge
+would stay in place; and a ``--skip-private`` that names the engine or another published
+MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
+as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
+as an unknown option). It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
@@ -226,8 +228,19 @@ def drop_requirements(text: str, names: Collection[str]) -> tuple[str, list[tupl
     return "".join(out), dropped
 
 
+#: Distribution names this repo's release workflow publishes to PyPI, beside the engine's own.
+#: The repository's one record of them: its install-instruction provenance test reads it, and keeps
+#: the dated PyPI probe that classified each name.
+PUBLISHED_DISTRIBUTIONS: frozenset[str] = frozenset(
+    {"messagefoundry-harness", "messagefoundry-toolkit", "messagefoundry-webconsole"}
+)
+
 #: The engine is the pin the adopter's tripwire exists to audit, so it is never skipped as private.
-_NEVER_PRIVATE = frozenset({"messagefoundry"})
+#: Nor is a MessageFoundry package this release knows to be published (``PUBLISHED_DISTRIBUTIONS``):
+#: an advisory database can look each one up, so skipping it would only hide an advisory against it
+#: (BACKLOG #3786). A name published after this release is not in the set.
+#: Folded as the requested names are, so a spelling added to the record still matches.
+_NEVER_PRIVATE = frozenset(canonical_name(n) for n in {"messagefoundry", *PUBLISHED_DISTRIBUTIONS})
 
 
 def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str]) -> str | None:
@@ -237,7 +250,11 @@ def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str
         # names neither the flag's position nor this module.
         return "--skip-private goes before the lock, not after it"
     named = sorted(_NEVER_PRIVATE.intersection(private))
-    return f"--skip-private may not name the engine: {named}" if named else None
+    return (
+        f"--skip-private may not name the engine or a published MessageFoundry package: {named}"
+        if named
+        else None
+    )
 
 
 def _run(cmd: list[str]) -> int:

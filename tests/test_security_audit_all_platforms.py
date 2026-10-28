@@ -22,7 +22,9 @@ import pytest
 
 from messagefoundry.childenv import python_module_argv
 from messagefoundry.security.audit_all_platforms import (
+    PUBLISHED_DISTRIBUTIONS,
     _run,
+    _skip_private_refusal,
     continued_requirement_lines,
     main,
     option_lines,
@@ -248,6 +250,30 @@ def test_a_skip_private_that_is_stale_total_or_the_engine_is_refused(
     status, seen = _seen_by(tmp_path, argv)
     assert (status, seen) == (2, [])
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(PUBLISHED_DISTRIBUTIONS | {"MessageFoundry_WebConsole", "MESSAGEFOUNDRY.harness"}),
+)
+def test_a_skip_private_naming_a_published_package_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    """A published MessageFoundry package is no private package: an advisory can name it (BACKLOG
+    #3786). The two mixed spellings check the PEP 503 fold. The install-instruction provenance
+    test keeps the set honest: a ``packaging/<name>/`` must be classified published or not."""
+    status, seen = _seen_by(tmp_path, ["--skip-private", name])
+    assert (status, seen) == (2, [])
+    assert "may not name the engine or a published MessageFoundry package" in (
+        capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("name", ["messagefoundry-acme-plugins", "acme-messagefoundry", "idna"])
+def test_a_private_name_beside_the_published_ones_is_not_refused_as_published(name: str) -> None:
+    """The control: the refusal is the record, not a prefix, so an adopter's own
+    ``messagefoundry-*`` package may still be skipped as private."""
+    assert _skip_private_refusal({name}, []) is None
 
 
 def test_a_skip_private_after_the_lock_is_refused_by_name(

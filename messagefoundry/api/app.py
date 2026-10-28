@@ -10081,8 +10081,9 @@ def create_app(
             # this project's own wheel, which is what takes it out of dependency-confusion territory.
             # The previous wording here said to "point at the path install" while the string beneath it
             # already named the distribution; the comment is corrected rather than the string (BACKLOG
-            # #1193). tests/test_install_instruction_provenance.py holds that classification and fails
-            # if this drifts back to an extra that does not exist or a name nobody has claimed.
+            # #1193). messagefoundry/security/audit_all_platforms.py holds that classification
+            # (PUBLISHED_DISTRIBUTIONS), and tests/test_install_instruction_provenance.py fails if
+            # this drifts back to an extra that does not exist or a name nobody has claimed.
             raise RuntimeError(
                 "serve_ui requires the web console, which is not installed. It ships as a separate "
                 "distribution: `pip install messagefoundry-webconsole`, or set "
