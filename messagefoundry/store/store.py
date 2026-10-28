@@ -2214,23 +2214,52 @@ class WebAuthnCredential:
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> WebAuthnCredential:
-        transports = d.get("transports")
-        return cls(
-            credential_id_hash=d["credential_id_hash"],
-            credential_id=d["credential_id"],
-            user_id=d["user_id"],
-            rp_id=d["rp_id"],
-            public_key=d["public_key"],
-            sign_count=int(d["sign_count"]),
-            transports=[str(t) for t in json.loads(transports)] if transports else None,
-            device_type=d["device_type"],
-            backed_up=bool(d["backed_up"]),
-            label=d["label"],
-            aaguid=d.get("aaguid"),
-            created_at=float(d["created_at"]),
-            last_used_at=_opt_float(d.get("last_used_at")),
-            discoverable=bool(d.get("discoverable", False)),
-        )
+        """The passkey ``d`` holds, or :class:`PasskeyRowMalformed` for a row that does not parse,
+        so a caller that must survive one (the sign-in lock's escalation and its notice, BACKLOG
+        #3937) catches that alone and not every ``TypeError`` or ``KeyError`` beside it. A
+        ``transports`` value that is JSON but not a list does not parse either."""
+        try:
+            raw = d.get("transports")
+            transports = json.loads(raw) if raw else None
+            if raw and not isinstance(transports, list):  # ``null`` included
+                raise TypeError("transports is not a list")
+            cred = cls(
+                credential_id_hash=d["credential_id_hash"],
+                credential_id=d["credential_id"],
+                user_id=d["user_id"],
+                rp_id=d["rp_id"],
+                public_key=d["public_key"],
+                sign_count=int(d["sign_count"]),
+                transports=None if transports is None else [str(t) for t in transports],
+                device_type=d["device_type"],
+                backed_up=bool(d["backed_up"]),
+                label=d["label"],
+                aaguid=d.get("aaguid"),
+                created_at=float(d["created_at"]),
+                last_used_at=_opt_float(d.get("last_used_at")),
+                discoverable=bool(d.get("discoverable", False)),
+            )
+        # OverflowError (int() of an infinite REAL) and RecursionError (deeply nested JSON) are
+        # parse failures too, as they are for the other JSON columns this module reads.
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError) as exc:
+            # Keep only the class name, and raise once the handler has ended. The caught error can
+            # quote the row's value (``JSONDecodeError.doc`` holds the whole ``transports`` text,
+            # ``int()`` and ``float()`` quote theirs), and ``from None`` would only set
+            # ``__suppress_context__``: ``__context__`` would still hold it. Raised here, the caught
+            # error is on neither chain (tests/test_from_none_is_not_redaction.py). Two things this
+            # does not do: a caller that calls this inside its own handler still gets ITS error on
+            # ``__context__``, and the traceback's frame still holds ``d``, the whole row.
+            failure = type(exc).__name__
+        else:
+            return cred
+        raise PasskeyRowMalformed(failure)
+
+
+class PasskeyRowMalformed(Exception):
+    """A ``webauthn_credentials`` row that does not parse into a :class:`WebAuthnCredential`.
+    Not a ``ValueError``: the routes answer a ``ValueError`` as the client's fault, and a row the
+    store did not write is the server's. The argument is the underlying error's class name, never
+    the row's content."""
 
 
 # --- the sealed user record (BACKLOG #2592) ----------------------------------------------------
@@ -2887,19 +2916,63 @@ async def escalation_verdict(
     if counter != "sign_in":
         return None
     pre = await get_user(user_id)
-    if (
-        pre is None
-        or pre.auth_provider != "local"
-        or not pre.totp_enabled
-        or pre.password_generated
-        or pre.sign_in_locked(now)
-    ):
-        return None
-    # The count this failure would reach, as next_lockout_state computes it: a lapsed lock restarts it.
-    reaches = (0 if pre.locked_until is not None else pre.failed_attempts) + 1
-    if reaches < threshold or pre.lock_cycles < 1:
+    if pre is None or not pre.totp_enabled or not sets_a_later_sign_in_lock(pre, threshold, now):
         return None
     return await judge_totp(opener, totp_usable, pre)
+
+
+def sets_a_later_sign_in_lock(row: UserRecord | UserRow, threshold: int, now: float) -> bool:
+    """Whether one more SIGN-IN failure on ``row`` sets a lock whose length an escalation can
+    change: a local account whose lock can arm (:func:`lockout_arms`) and is not live, a count that
+    reaches ``threshold`` as :func:`next_lockout_state` computes it (a lapsed lock restarts it), on
+    a later cycle, since a first lock has the base length either way. The gate both halves of the
+    escalation ask before paying for their input: the TOTP judgement (:func:`escalation_verdict`)
+    and the passkey read (:func:`escalation_passkeys`)."""
+    if row.auth_provider != "local" or not lockout_arms(
+        "sign_in", password_generated=row.password_generated
+    ):
+        return False
+    if row.locked_until is not None and now < row.locked_until:
+        return False  # a live lock is never re-escalated (next_lockout_state)
+    reaches = (0 if row.locked_until is not None else row.failed_attempts) + 1
+    return reaches >= threshold and row.lock_cycles >= 1
+
+
+async def escalation_passkeys(
+    counter: LockoutCounter,
+    *,
+    passkey_escalates: PasskeyCounts | None,
+    threshold: int,
+    now: float,
+    read_record: Callable[[], Awaitable[UserAuthzRecord | None]],
+    read_passkeys: Callable[[], Awaitable[list[WebAuthnCredential]]],
+) -> list[WebAuthnCredential] | None:
+    """The passkey set a SIGN-IN failure's escalation reads (BACKLOG #3937 item 8), or ``None``
+    where it cannot matter. Every backend calls it inside the increment's own transaction:
+    ``read_record`` locks the account row there (the writer lock on SQLite, ``FOR UPDATE``,
+    ``UPDLOCK``), and only where :func:`sets_a_later_sign_in_lock` holds on THAT row does
+    ``read_passkeys`` run, so a racing failure cannot make the gate stale, a passkey write waits,
+    and a wrong password below the threshold costs no passkey read.
+
+    A passkey row that does not parse answers ``None``, logged: the lock then keeps the fixed
+    length, and the count still lands. Raising here would roll the count back, and a malformed row
+    would then stop the account ever locking. ``ValueError`` is caught beside
+    :class:`PasskeyRowMalformed` for a value the driver cannot decode while fetching, before any
+    row is parsed (a ``UnicodeDecodeError`` on SQL Server)."""
+    if counter != "sign_in" or passkey_escalates is None:
+        return None
+    record = await read_record()
+    if record is None or not sets_a_later_sign_in_lock(record.row, threshold, now):
+        return None
+    try:
+        return await read_passkeys()
+    except (PasskeyRowMalformed, ValueError) as exc:
+        log.warning(
+            "a passkey row of user %s did not parse (%s); its sign-in lock keeps its fixed length",
+            record.row.id,
+            type(exc).__name__,
+        )
+        return None
 
 
 @dataclass(frozen=True)
@@ -3074,14 +3147,32 @@ def lockout_increment(
     now: float,
     out: list[LockoutIncrement],
     totp_counts: TotpCounts | None = None,
+    passkeys: Sequence[WebAuthnCredential] | None = None,
+    sealed: bool = False,
+    passkey_escalates: PasskeyCounts | None = None,
 ) -> UserChange:
     """One failed credential attempt on ``counter``, with the lockout policy applied
     (:func:`next_lockout_state`). The answer is appended to ``out``. The SIGN-IN lock escalates as
     the plain ``totp_enabled`` rule says on the locked row, EXCEPT where ``totp_counts`` holds a
     KNOWN refusal of that exact cell (BACKLOG #3422): an enrolment this release refuses gives the
     owner no way past, so its lock keeps the fixed length. An unknown verdict, a cell that moved,
-    and no verdict at all leave the plain rule standing."""
+    and no verdict at all leave the plain rule standing.
+
+    It also escalates where ``passkeys``, the account's set read in the same transaction as the
+    write, hold one that ``passkey_escalates`` counts (:func:`discoverable_way_past`, trusted only
+    where it matches the locked row's digest on a ``sealed`` store; BACKLOG #3937 item 8). The
+    backend reads the set only where :func:`escalation_passkeys` says it can matter, and passes
+    ``None`` otherwise; ``None`` for either counts no passkey, the fixed length callers had before."""
     attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
+
+    def passkey_way_past(r: UserAuthzRecord) -> bool:
+        return (
+            passkeys is not None
+            and passkey_escalates is not None
+            and discoverable_way_past(
+                passkeys, r.row.cred_digest, sealed=sealed, passkey_counts=passkey_escalates
+            )
+        )
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord:
         state = next_lockout_state(
@@ -3101,6 +3192,7 @@ def lockout_increment(
                     and isinstance(totp_counts, TotpJudgement)
                     and totp_counts.refuses(r)
                 ),
+                passkey_way_past=passkey_way_past(r),
             ),
             lockable=lockout_arms(counter, password_generated=r.row.password_generated),
         )
@@ -7008,7 +7100,13 @@ LOCKOUT_COLUMNS: Mapping[LockoutCounter, tuple[str, str, str]] = MappingProxyTyp
 _MAX_ESCALATION_EXPONENT = 64
 
 
-def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabled: bool) -> bool:
+def lockout_escalates(
+    counter: LockoutCounter,
+    *,
+    auth_provider: str,
+    totp_enabled: bool,
+    passkey_way_past: bool = False,
+) -> bool:
     """Whether ``counter``'s lock doubles per cycle on this account (ADR 0197 Decision item 5).
 
     Escalate only where the owner has a way past the lock, so a longer lock costs the owner little:
@@ -7017,21 +7115,22 @@ def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabl
       device, so one of the owner's two factors is already lost. On a directory account the first
       step is a Kerberos ticket or an OIDC session, which anyone in the owner's signed-in desktop or
       browser holds, so it keeps the fixed length there;
-    * the SIGN-IN lock on a local account with a TOTP enrolled, because that owner can use
-      the combined sign-in to pass it. Every other sign-in lock keeps the fixed length, a directory
-      account with TOTP enrolled included: it has no combined sign-in to get past its lock. A local
-      account whose way past is a discoverable passkey (ADR 0197 Amendment A, wave 2) can pass it
-      too, and still keeps the fixed length: escalating would need the passkey set inside this
-      atomic increment. ADR 0197 names that as a residual (about 480 password guesses a day).
+    * the SIGN-IN lock on a local account with a TOTP enrolled, or with a discoverable passkey
+      (``passkey_way_past``; ADR 0197 Amendment A, wave 2), because that owner can use the combined
+      sign-in or the combined passkey sign-in to pass it. Every other sign-in lock keeps the fixed
+      length, a directory account with TOTP enrolled included: it has no combined sign-in to get
+      past its lock.
 
     Read by every backend inside its atomic increment, from ``auth_provider`` on the row it locked.
     For the SIGN-IN lock ``totp_enabled`` is the row's flag, cleared only by a KNOWN refusal of the
     TOTP (BACKLOG #3422) judged before the lock on a cell the locked row still holds
     (:func:`escalation_verdict`); an unknown verdict, a cell that moved meanwhile, or no verdict at
-    all leave the flag standing, as before that rule. The count itself stays atomic."""
+    all leave the flag standing, as before that rule. ``passkey_way_past`` is asked of the passkey
+    set read in the same transaction as the write (:func:`lockout_increment`, BACKLOG #3937 item
+    8). The count itself stays atomic."""
     if auth_provider != "local":
         return False
-    return counter == "second_step" or totp_enabled
+    return counter == "second_step" or totp_enabled or passkey_way_past
 
 
 def lockout_arms(counter: LockoutCounter, *, password_generated: bool) -> bool:
@@ -16281,6 +16380,7 @@ class MessageStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -16293,30 +16393,45 @@ class MessageStore:
         from ``auth_provider`` read in the SAME locked ``SELECT``; for the SIGN-IN lock a refused
         TOTP is judged by ``totp_usable`` before the lock, only for a failure that would set a
         later-cycle lock, on a cell the locked row must still hold (:func:`escalation_verdict`,
-        BACKLOG #3422). The count itself stays atomic.
+        BACKLOG #3422). The passkey half of the escalation is :func:`escalation_passkeys`
+        (BACKLOG #3937 item 8). The count itself stays atomic.
 
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
-        change = lockout_increment(
+        totp_counts = await escalation_verdict(
+            self.get_user,
+            self.open_totp_secret,
+            user_id,
             counter,
+            totp_usable=totp_usable,
             threshold=threshold,
-            lockout_seconds=lockout_seconds,
-            max_lockout_seconds=max_lockout_seconds,
             now=now,
-            out=out,
-            totp_counts=await escalation_verdict(
-                self.get_user,
-                self.open_totp_secret,
-                user_id,
-                counter,
-                totp_usable=totp_usable,
-                threshold=threshold,
-                now=now,
-            ),
         )
         async with _writer_guard(self._db, self._lock):
+            # The passkey set the escalation reads is read under the same writer lock as the write
+            # (BACKLOG #3937 item 8), so a passkey added or removed meanwhile cannot slip between.
+            passkeys = await escalation_passkeys(
+                counter,
+                passkey_escalates=passkey_escalates,
+                threshold=threshold,
+                now=now,
+                read_record=lambda: self._read_user_record(user_id),
+                read_passkeys=lambda: self._account_passkeys(user_id),
+            )
+            change = lockout_increment(
+                counter,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+                max_lockout_seconds=max_lockout_seconds,
+                now=now,
+                out=out,
+                totp_counts=totp_counts,
+                passkeys=passkeys,
+                sealed=self._row_sealer is not None,
+                passkey_escalates=passkey_escalates,
+            )
             written = await self._write_user(user_id, change)
             await self._commit()
         return out[0] if written is not None else LockoutIncrement(0, False, 0)

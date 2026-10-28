@@ -50,8 +50,14 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.keywrap import der_children, read_der_tlv
 from messagefoundry.pipeline import cert_expiry, crl_reload
-from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE, FIX, reload_replaced_crls
-from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
+from messagefoundry.pipeline.crl_reload import (
+    BAD_SIGNATURE,
+    FIX,
+    UNCHECKABLE_SIGNATURE,
+    UNPROVEN_SIGNATURE,
+    reload_replaced_crls,
+)
+from messagefoundry.pki import crl_signature_finding, judge_crl_signatures
 from tests.test_crl_bundle_anchors import _ku
 from tests.test_crl_held_copy_alert import _bundle_scan
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
@@ -317,15 +323,13 @@ def test_two_cas_with_one_subject(
 
 
 @pytest.mark.parametrize(("listed", "signer", "names", "state"), _TWIN_CASES)
-def test_the_reload_flag_follows_the_states(
+def test_the_reload_finding_follows_the_states(
     twins: _Twins, listed: str, signer: str, names: str | None, state: str
 ) -> None:
-    # The reload's flag is wider than what a start refuses, on purpose. This pins the flag to
-    # the states. That it equals what the reload returned before this change rests on the
-    # older tests in tests/test_crl_reload.py, which pass unchanged.
-    verdict = crl_signature_refusal(twins.write_crl(signer, names), _ders(twins.ca_file(listed)))
-    expected = {"verified": None, "unlisted": False}.get(state, True)
-    assert (verdict if verdict is None else verdict[1]) == expected
+    # The reload holds back more than a start refuses, on purpose: every state but ``verified``.
+    # This pins the reload's finding to the states, one for one (vault BACKLOG #3506).
+    finding = crl_signature_finding(twins.write_crl(signer, names), _ders(twins.ca_file(listed)))
+    assert (None if finding is None else finding.state) == (None if state == "verified" else state)
 
 
 # --- what OpenSSL does with those files ----------------------------------------------------------
@@ -380,12 +384,14 @@ def test_a_key_of_another_kind_than_the_signature_is_cannot_check_not_bad(tmp_pa
     hop = _hop(tmp_path / "ca.pem", tmp_path / "crl.pem")
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
-    # Vault BACKLOG #3506. The reload holds this file back with BAD_SIGNATURE, and a start has
-    # just loaded it, though the CRL names the CA's key. So that remedy may promise a start
-    # refusal for the proven case only.
-    verdict = crl_signature_refusal(pem, [der])
-    assert verdict is not None and verdict[1] is True
-    assert "only where it proves the signature bad" in BAD_SIGNATURE
+    # Vault BACKLOG #3506. A start has just loaded this file, though the CRL names the CA's key.
+    # So the reload holds it back as a signature it could not check, whose remedy names a
+    # restart, and not with BAD_SIGNATURE, which says a start refuses the file. Item 8: before,
+    # the folded flag gave BAD_SIGNATURE here, and that remedy then had to hedge for every state.
+    finding = crl_signature_finding(pem, [der])
+    assert finding is not None and finding.state == "uncheckable"
+    assert crl_reload._SIGNATURE_REMEDY[finding.state] == UNCHECKABLE_SIGNATURE
+    assert "Restart the engine" in UNCHECKABLE_SIGNATURE
     assert "names that CA's key, a start refuses" not in BAD_SIGNATURE
 
 
@@ -512,9 +518,10 @@ def test_a_crl_its_named_ca_proves_bad_refuses_beside_an_unchecked_ca_with_no_sk
     assert verdict_of_scan is not None
     assert verdict_of_scan[1].startswith("Replace the CRL in the CA file with one its CA signed")
 
-    # The running-hop reload is unchanged: it held this file back before and still does.
-    verdict = crl_signature_refusal(pem, _ders(mixed))
-    assert verdict is not None and verdict[1] is True
+    # The running-hop reload held this file back before and still does, now as proven bad rather
+    # than ``uncheckable``, so its remedy is ``bad_signature``.
+    finding = crl_signature_finding(pem, _ders(mixed))
+    assert finding is not None and finding.state == "bad"
 
     # Control: OpenSSL itself fails this chain's handshake on this CRL, in either listing order.
     # One chain shape only, a leaf under the named CA, with a no-SKI CA whose key is of another
@@ -548,8 +555,8 @@ def test_a_crl_its_named_ca_proves_bad_refuses_beside_a_ca_with_no_ski_that_veri
     with pytest.raises(ValueError, match="does not verify the CRL's signature"):
         _hop(mixed, twins.crl)
     # The running-hop reload holds it back now too: it loaded it live before, as ``verified``.
-    verdict = crl_signature_refusal(pem, _ders(mixed))
-    assert verdict is not None and verdict[1] is True
+    finding = crl_signature_finding(pem, _ders(mixed))
+    assert finding is not None and finding.state == "bad"
     # The CA-file monitor gives the proven remedy, where it raised no alert before.
     verdict_of_scan = cert_expiry._ca_file_crl_refusal(
         mixed.read_bytes() + pem,
@@ -910,7 +917,7 @@ def test_a_crl_under_the_listed_cas_name_in_other_ascii_case_is_judged_by_that_c
 
     pem = _named_crl(twins, twins.new_key, _NAME_IN_OTHER_CASE)
     assert [s.state for s in judge_crl_signatures(pem, _ders(twins.new_ca))] == ["verified"]
-    assert crl_signature_refusal(pem, _ders(twins.new_ca)) is None
+    assert crl_signature_finding(pem, _ders(twins.new_ca)) is None
     with caplog.at_level("WARNING"):
         hop = twins.hop("new")
     assert _warnings(caplog) == []
@@ -929,8 +936,8 @@ def test_a_crl_under_the_listed_cas_name_in_other_ascii_case_is_judged_by_that_c
         _handshake(_raw_hop(twins.new_ca, twins.crl), server)
     with pytest.raises(ValueError, match="does not verify the CRL's signature"):
         twins.hop("new")
-    verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
-    assert verdict is not None and verdict[1] is True  # the reload's BAD_SIGNATURE case
+    finding = crl_signature_finding(pem, _ders(twins.new_ca))
+    assert finding is not None and finding.state == "bad"  # the reload's BAD_SIGNATURE case
 
 
 def test_an_akid_issuer_name_in_other_ascii_case_still_fits_the_ca(twins: _Twins) -> None:
@@ -987,9 +994,9 @@ def test_a_name_that_genuinely_differs_is_still_unlisted(
         hop = twins.hop("new")  # loads: no proof
     (line,) = _warnings(caplog)
     assert pki_module.UNLISTED_SIGNATURE in line
-    verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
-    assert verdict is not None and verdict[1] is False  # the reload's NO_ISSUER case
-    assert pki_module.UNLISTED_SIGNATURE in verdict[0]  # one sentence for both
+    finding = crl_signature_finding(pem, _ders(twins.new_ca))
+    assert finding is not None and finding.state == "unlisted"  # the reload's NO_ISSUER case
+    assert pki_module.UNLISTED_SIGNATURE in finding.why  # one sentence for both
     # The premise: OpenSSL finds no CRL for the leaf's issuer in this file, so it does not judge
     # the peer by it, and a leaf-checking hop fails for want of one, not on the signature.
     with pytest.raises(ssl.SSLError, match="unable to get certificate CRL"):
@@ -1065,8 +1072,12 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
     assert pki_module._verifies(good_crl, ca) is None
     assert [s.state for s in judge_crl_signatures(control, ders)] == ["verified"]
     assert [s.state for s in judge_crl_signatures(forged, ders)] == ["bad"]
-    verdict = crl_signature_refusal(good, ders)
-    assert verdict is not None and verdict[1] is True  # the reload holds it back
+    # The reload's own reading keeps them apart (vault BACKLOG #3506): the good one could not be
+    # checked, and only the forged one is proven bad.
+    assert (finding := crl_signature_finding(good, ders)) is not None
+    assert finding.state == "uncheckable"
+    assert (finding := crl_signature_finding(forged, ders)) is not None
+    assert finding.state == "bad"
 
     ca_file, crl_file = tmp_path / "ca.pem", tmp_path / "crl.pem"
     ca_file.write_bytes(ca.public_bytes(_PEM))
@@ -1163,6 +1174,136 @@ def test_sha1_moves_a_signers_verdict_only_from_verified_to_uncheckable(
     ders = [cas[who].public_bytes(serialization.Encoding.DER) for who in listed]
 
     assert [s.state for s in judge_crl_signatures(pem, ders)] == [states[column]]
+
+
+def test_the_reload_s_finding_keeps_the_three_states_apart(twins: _Twins) -> None:
+    """Vault BACKLOG #3506 item 8. The reload's check used to fold ``bad``, ``unproven`` and
+    ``uncheckable`` into one flag, so the reload could not tell a renewed CA key from a forgery.
+    ``crl_signature_finding`` keeps the state of the block it reports. Which block that is stays
+    main's: the first a listed CA fits and does not verify, and the first ``unlisted`` block only
+    when the file holds none of those."""
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ders = _ders(twins.new_ca)
+    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-unlisted")])
+    unlisted = _crl(twins.stranger, names=None, name=other)
+    unproven = _crl(twins.stranger, names=None)  # names no key, and another key signed it
+    uncheckable = _crl(rsa_key, names=twins.new_key)  # an RSA signature, an EC key
+    bad = _crl(twins.stranger, names=twins.new_key)
+    good = _crl(twins.new_key, names=twins.new_key)
+    states = [s.state for s in judge_crl_signatures(unproven + uncheckable + bad, ders)]
+    assert states == ["unproven", "uncheckable", "bad"]  # the premise: each block reads its state
+
+    cases = [
+        (good, None),
+        (unlisted, ("unlisted", 1)),
+        (unlisted + uncheckable, ("uncheckable", 2)),
+        (unlisted + bad, ("bad", 2)),
+        (good + unlisted + unproven, ("unproven", 3)),
+        (uncheckable + unproven, ("uncheckable", 1)),
+        (bad + unproven, ("bad", 1)),
+        (unproven + unproven, ("unproven", 1)),
+    ]
+    for pem, expected in cases:
+        finding = crl_signature_finding(pem, ders)
+        if expected is None:
+            assert finding is None
+            continue
+        state, block = expected
+        assert finding is not None and finding.state == state, (expected, finding)
+        assert finding.why.startswith(f"CRL block {block} of "), (expected, finding.why)
+    # The words of each state are the start's own, so the two cannot drift apart.
+    for pem, state in ((unproven, "unproven"), (uncheckable, "uncheckable")):
+        finding = crl_signature_finding(pem, ders)
+        assert finding is not None and finding.state == state
+        assert pki_module.UNCONFIRMED_SIGNATURE[finding.state] in finding.why
+    finding = crl_signature_finding(unlisted, ders)
+    assert finding is not None and pki_module.UNLISTED_SIGNATURE in finding.why
+
+
+def _counting_check(
+    monkeypatch: pytest.MonkeyPatch, *, fails_at: int | None = None
+) -> list[x509.CertificateRevocationList]:
+    """Record each CRL the signature check judges, in order. With ``fails_at``, the check of that
+    CRL, counted from 1, raises a RuntimeError instead."""
+    real = pki_module._signature_state
+    judged: list[x509.CertificateRevocationList] = []
+
+    def counting(crl: x509.CertificateRevocationList, cas: list[pki_module._ListedCa]) -> str:
+        judged.append(crl)
+        if len(judged) == fails_at:
+            raise RuntimeError("a defect in the check")
+        return real(crl, cas)
+
+    monkeypatch.setattr(pki_module, "_signature_state", counting)
+    return judged
+
+
+def test_the_reload_s_finding_is_the_first_block_main_stopped_at(
+    twins: _Twins, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3506 code review, round 3. An unproven CRL before a proven bad one reports
+    unproven, and the bad one is not judged at all: the reload looks at exactly the blocks main's
+    check looked at, and only the words of the remedy differ. Round 2 read on for the strongest
+    block, and reported the bad one."""
+    ders = _ders(twins.new_ca)
+    unproven = _crl(twins.stranger, names=None)
+    bad = _crl(twins.stranger, names=twins.new_key)
+    judged = _counting_check(monkeypatch)
+
+    finding = crl_signature_finding(unproven + bad, ders)
+
+    assert finding is not None and finding.state == "unproven", finding
+    assert finding.why.startswith("CRL block 1 of 2"), finding.why
+    assert len(judged) == 1  # the bad block was never judged
+    # Control: the same bad block, first, is found and reported, so the order decides.
+    judged.clear()
+    finding = crl_signature_finding(bad + unproven, ders)
+    assert finding is not None and finding.state == "bad" and len(judged) == 1
+
+    # A start judges every CRL, so it refuses these bytes on the block the reload left unjudged.
+    # Both remedies short of proof must therefore send the operator to the other CRLs before a
+    # restart, not promise that a start loads the file (round 3 review, finding 1).
+    twins.crl.write_bytes(unproven + bad)
+    with pytest.raises(ValueError, match="CRL block 2 of 2"):
+        twins.hop("new")
+    for remedy in (UNPROVEN_SIGNATURE, UNCHECKABLE_SIGNATURE):
+        assert "the reload judged none after this one" in remedy
+        assert "proves any CRL in it badly signed" in remedy
+
+
+@pytest.mark.parametrize("before", ["verified", "unlisted", "unproven"])
+def test_a_failure_in_the_reload_s_check_is_raised_as_main_raised_it(
+    twins: _Twins,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    before: str,
+) -> None:
+    """Vault BACKLOG #3506 code review, round 3. Where main's check raised, this raises the same
+    way, so the reload's own handling applies: ``retry``, judged again next pass. Where main
+    returned at an earlier block, this returns there too and never reaches the failure. Round 2
+    instead logged an ERROR from ``pki`` and kept an unproven finding with the words "not
+    judged" added, which the reload then treated as final."""
+    ders = _ders(twins.new_ca)
+    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-unlisted")])
+    first = {
+        "verified": _crl(twins.new_key, names=twins.new_key),
+        "unlisted": _crl(twins.stranger, names=None, name=other),
+        "unproven": _crl(twins.stranger, names=None),
+    }[before]
+    judged = _counting_check(monkeypatch, fails_at=2)
+    pem = first + _crl(twins.new_key, names=twins.new_key)
+
+    with caplog.at_level("DEBUG", logger="messagefoundry.pki"):
+        if before == "unproven":
+            finding = crl_signature_finding(pem, ders)
+            assert finding is not None and finding.state == "unproven", finding
+            assert "not judged" not in finding.why
+            assert len(judged) == 1  # main returned at block 1, so the failure is not reached
+        else:
+            with pytest.raises(RuntimeError, match="a defect in the check"):
+                crl_signature_finding(pem, ders)
+            assert len(judged) == 2
+    assert [r for r in caplog.records if r.name == "messagefoundry.pki"] == []
 
 
 def test_a_version_that_logs_nothing_in_between_does_not_reset_the_record(
@@ -1677,8 +1818,10 @@ _WITHDRAWN_FROM_THE_CODE = (
 def test_the_withdrawn_sentences_stay_out_of_the_code() -> None:
     texts = [
         BAD_SIGNATURE,
+        UNPROVEN_SIGNATURE,
+        UNCHECKABLE_SIGNATURE,
         pki_module.UNLISTED_SIGNATURE,
-        *tls_policy._UNCONFIRMED_SIGNATURE.values(),
+        *pki_module.UNCONFIRMED_SIGNATURE.values(),
     ]
     # Control: the texts searched are the ones those sentences sat in.
     assert any("a start refuses the file too" in text for text in texts)

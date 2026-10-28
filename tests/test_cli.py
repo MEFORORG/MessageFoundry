@@ -3414,6 +3414,7 @@ def _seed_both_locks(db: Path) -> None:
                             # The first cycle is set well in the past so it has lapsed by the second.
                             now=now - 5_000.0 if cycle == 0 and cycles > 1 else now,
                             totp_usable=_opened_totp_state,
+                            passkey_escalates=None,
                         )
         finally:
             await s.close()

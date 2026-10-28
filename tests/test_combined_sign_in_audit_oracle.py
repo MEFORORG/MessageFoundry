@@ -897,6 +897,7 @@ async def test_the_visible_rows_timestamp_does_not_tell_a_lock_refusal_from_a_ve
                         max_lockout_seconds=86_400.0,
                         now=time.time(),
                         totp_usable=_opened_totp_state,
+                        passkey_escalates=None,
                     )
 
             async def fixed_wrong(fn: Any, *args: Any) -> Any:

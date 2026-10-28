@@ -465,7 +465,11 @@ from messagefoundry.pipeline.wiring_runner import (
     ShardLaneOwnershipError,
 )
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
-from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_posture
+from messagefoundry.remotedebug import (
+    RemoteDebugPosture,
+    install_remote_debug_guard,
+    remote_debug_posture,
+)
 from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
@@ -3810,6 +3814,13 @@ def create_app(
     log_dir: str | None = None,
     configured_log_level: str | None = None,
 ) -> FastAPI:
+    # Vault BACKLOG #3673, defect 3: an application that builds the API without the command line
+    # gets the remote-debugging hook here, rather than late or never. It goes in after the API's
+    # imports, so a script injected while they load still runs. Installing at import would put a
+    # permanent audit hook in every process that imports the package, which this does not.
+    # messagefoundry/remotedebug.py says what the hook does, and why a repeat call adds no copy and
+    # no second unraisable-hook wrapper (the Lander's finding 2 on engine PR 2573).
+    install_remote_debug_guard()
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
     # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
     if allow_no_auth and auth is not None:
@@ -4452,10 +4463,12 @@ def create_app(
         store_privilege = getattr(request.app.state, "store_privilege", None)
         # Vault BACKLOG #2700 / #2701: read off THIS process, which is the engine. Each is read
         # once here, so the loosening list and the `interpreter` block below report one reading.
-        # An app built without `serve` never installed the remote-debugging hook, and the reading
-        # then says so. The start-up reading is the one `serve` took as it started, kept for the
-        # life of the process. An app built without `serve` takes it here, once, and that first
-        # reading reads files, so the call is kept off the event loop.
+        # create_app installed the remote-debugging hook (vault BACKLOG #3673), so a reading that
+        # says it is missing points at another audit hook in the process.
+        #
+        # The start-up reading is the one `serve` took as it started, kept for the life of the
+        # process. An app built without `serve` takes it here, once, and that first reading reads
+        # files, so the call is kept off the event loop.
         remote_debug = remote_debug_posture()
         startup = await asyncio.to_thread(startup_posture)
         # Vault BACKLOG #2595: the service-environment reading `serve` took as it started, kept
