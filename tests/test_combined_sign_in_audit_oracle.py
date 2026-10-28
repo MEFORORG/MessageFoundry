@@ -1059,7 +1059,9 @@ def test_a_broken_tee_sink_logs_once_and_names_no_action(
     control is that first line: a broken sink is still reported."""
     from messagefoundry.store import audit_tee
 
-    monkeypatch.setattr(audit_tee, "_TEE_FAILURE_LOGGED", False, raising=False)
+    # No raising=False: if the flag is ever renamed, this reset must fail rather than set a new,
+    # unread attribute and leave the test depending on whether an earlier test logged first.
+    monkeypatch.setattr(audit_tee, "_TEE_FAILURE_LOGGED", False)
 
     def broken(*_: Any, **__: Any) -> None:
         raise OSError("sink down")
