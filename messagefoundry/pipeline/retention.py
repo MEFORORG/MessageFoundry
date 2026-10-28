@@ -37,7 +37,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from messagefoundry.config.settings import RetentionSettings, StoreBackend
@@ -50,6 +50,7 @@ from messagefoundry.store import Store, StripResult
 from messagefoundry.transports.base import (
     ArchiveGuard,
     ProcessedArchive,
+    archive_dir_key,
     build_archive_guard,
 )
 
@@ -347,8 +348,15 @@ class RetentionRunner:
         log_dir: str | None = None,
         archive_source: Callable[[], Sequence[ProcessedArchive]] | None = None,
         guard_source: Callable[[], Iterable[Path] | None] | None = None,
+        engine_dirs: Iterable[Path] = (),
+        engine_trees: Iterable[Path] = (),
     ) -> None:
         self._store = store
+        # The engine's own directories (store, keys, TLS pair, config) and trees (backup destination,
+        # log directory), which no archive sweep may reach either (BACKLOG #1188): an archive that is
+        # or holds one is refused, and so is one inside a tree.
+        self._engine_dirs = tuple(engine_dirs)
+        self._engine_trees = tuple(engine_trees)
         # The bound inbounds whose `.processed` archive the `processed_archive_days` sweep ages out
         # (BACKLOG #1188), read from the LIVE graph each pass like the registry. None (embedding,
         # tests) = nothing to sweep.
@@ -838,8 +846,10 @@ class RetentionRunner:
                     )
                     return 0
                 guarded.extend(extra)
+            guarded.extend(self._engine_dirs)
+            guarded.extend(self._engine_trees)
             protected, keys = await asyncio.to_thread(
-                _archive_keys, guarded, [a.processed_dir for a in archives]
+                _archive_keys, guarded, [a.processed_dir for a in archives], self._engine_trees
             )
         except (OSError, ValueError, TypeError, KeyError) as exc:
             log.warning(
@@ -864,9 +874,8 @@ class RetentionRunner:
             # source sharing a directory with a move source does not shadow it.
             if not archive.archiving or key in swept:
                 continue
-            swept.add(key)
             try:
-                deleted += await archive.prune_processed_archive(
+                outcome = await archive.prune_processed_archive(
                     older_than, protected=protected, deadline_hit=stop_hit
                 )
             except asyncio.CancelledError:
@@ -883,6 +892,12 @@ class RetentionRunner:
                     archive.processed_dir.name,
                     safe_exc(exc),
                 )
+                continue
+            # Only a sweep that ran claims the directory: one refused (an unreadable guarded
+            # directory under its identity, say) or failed leaves it to a sibling that shares it.
+            if outcome is not None:
+                swept.add(key)
+                deleted += outcome
         return deleted
 
     # --- per-connection retention overrides (#34, ADR 0027) ------------------
@@ -1424,7 +1439,7 @@ class RetentionRunner:
 
 
 def _archive_keys(
-    guarded: Iterable[Path], archives: Sequence[Path]
+    guarded: Iterable[Path], archives: Sequence[Path], trees: Iterable[Path] = ()
 ) -> tuple[ArchiveGuard, list[str]]:
     """Build the guard over the protected directories once per pass, and each archive directory's
     key for sweeping a shared directory once (BACKLOG #1188). Blocking: run off the loop.
@@ -1437,4 +1452,11 @@ def _archive_keys(
             keys.append(os.path.normcase(os.path.realpath(path)))
         except (OSError, ValueError):
             keys.append(os.path.normcase(os.path.abspath(path)))
-    return build_archive_guard(guarded), keys
+    tree_keys = set()
+    for tree in trees:
+        try:
+            tree_keys.add(archive_dir_key(tree))
+        except (OSError, ValueError):
+            tree_keys.add(os.path.normcase(os.path.abspath(tree)).casefold())
+    guard = build_archive_guard(guarded)
+    return replace(guard, trees=frozenset(tree_keys)), keys

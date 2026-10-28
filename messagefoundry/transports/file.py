@@ -1807,7 +1807,7 @@ class FileSource(SourceConnector):
         *,
         protected: ArchiveGuard,
         deadline_hit: Callable[[], bool],
-    ) -> int:
+    ) -> int | None:
         """Delete files in ``processed_dir`` archived before ``older_than``; return how many went.
 
         The ``[retention].processed_archive_days`` sweep (owner ruling A2 of 2026-10-08, BACKLOG
@@ -1830,7 +1830,7 @@ class FileSource(SourceConnector):
 
     def _prune_processed(
         self, older_than: float, protected: ArchiveGuard, deadline_hit: Callable[[], bool]
-    ) -> int:
+    ) -> int | None:
         """Blocking half of :meth:`prune_processed_archive`.
 
         What it deletes, and what it never does:
@@ -1856,7 +1856,9 @@ class FileSource(SourceConnector):
 
         Re-reads ``deadline_hit`` before each file, so a large directory releases the pass between
         files. Never raises for a filesystem fault: what it cannot read or remove stays for the next
-        pass, and how many it could not remove is logged."""
+        pass, and how many it could not remove is logged. Returns how many went, or None when the
+        sweep was refused or could not open the directory, so a connection sharing the directory
+        may still sweep it."""
         if not self.archiving:
             return 0
         # This connection's own directories, and every guarded directory the pass could not read,
@@ -1879,15 +1881,17 @@ class FileSource(SourceConnector):
                 self._label,
                 len(unreadable),
             )
-            return 0
-        guard = ArchiveGuard(protected.keys | own.keys, protected.ids | own.ids)
+            return None
+        guard = ArchiveGuard(
+            protected.keys | own.keys, protected.ids | own.ids, trees=protected.trees
+        )
         try:
             mine = archive_dir_key(self.processed_dir)
         except (OSError, ValueError):
             mine = os.path.normcase(os.path.abspath(self.processed_dir)).casefold()
-        if _archive_overlaps(mine, guard.keys):
+        if _archive_overlaps(mine, guard.keys) or _archive_inside(mine, guard.trees):
             self._log_prune_refusal()
-            return 0
+            return None
         try:
             dest = _open_dest(self.processed_dir, self.directory, self._root_real)
         except FileNotFoundError:
@@ -1900,7 +1904,7 @@ class FileSource(SourceConnector):
                 self.processed_dir.name,
                 _describe_os_error(exc),
             )
-            return 0
+            return None
         with dest:
             opened = _opened_id(dest)
             if opened is None or not opened[1]:
@@ -1914,10 +1918,10 @@ class FileSource(SourceConnector):
                     self._label,
                     self.processed_dir.name,
                 )
-                return 0
+                return None
             if opened in guard.ids:
                 self._log_prune_refusal()
-                return 0
+                return None
             deleted, failed = _prune_entries(dest, older_than, deadline_hit)
         if failed:
             logger.warning(
@@ -1934,10 +1938,22 @@ class FileSource(SourceConnector):
         logger.warning(
             "file source %s: the [retention].processed_archive_days sweep skips this connection, "
             "because its archive directory is, or contains, a File inbound's watch or error "
-            "directory or a File outbound's target directory; set processed_subdir to a directory "
-            "of its own",
+            "directory, a File outbound's target directory or one of the engine's own "
+            "directories; set processed_subdir to a directory of its own",
             self._label,
         )
+
+
+def _archive_inside(archive: str, trees: frozenset[str]) -> bool:
+    """Whether the archive directory key ``archive`` is inside any engine-owned tree key in
+    ``trees`` (both from :func:`archive_dir_key`)."""
+    for tree in trees:
+        try:
+            if os.path.commonpath([archive, tree]) == tree:
+                return True
+        except ValueError:
+            continue  # another Windows drive
+    return False
 
 
 def _archive_overlaps(archive: str, protected: frozenset[str]) -> bool:

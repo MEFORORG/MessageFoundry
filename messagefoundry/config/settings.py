@@ -44,7 +44,7 @@ import os
 import re
 import string
 import tomllib
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
@@ -10187,3 +10187,77 @@ def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) ->
     ):
         return KEYLESS_REFUSED_BY_NO_STRICT_ACK
     return None
+
+
+#: Directory settings whose WHOLE tree the engine owns (BACKLOG #1188): an archive inside one is
+#: refused as well as one that is or holds it. ``base_dir`` is the config-repo root, which commonly
+#: holds watch directories, so it is guarded as a directory only.
+_OWNED_TREE_NAMES: frozenset[str] = frozenset({"destination"})
+_NOT_A_TREE: frozenset[str] = frozenset({"base_dir"})
+
+
+def engine_owned_dirs(
+    models: Iterable[object],
+    *,
+    dirs: Iterable[str | Path | None] = (),
+    trees: Iterable[str | Path | None] = (),
+    files: Iterable[str | Path | None] = (),
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """The engine's own directories, which no ``.processed`` archive sweep may reach (BACKLOG #1188),
+    as ``(dirs, trees)``: an archive directory that is, or holds, any of either is refused, and one
+    inside a tree is refused too.
+
+    Read from every settings model given, recursively, by field name, so a setting added later is
+    covered without a list to keep: at least a ``*_file``, ``*_files`` or ``*_path`` setting (and the
+    store's ``path``) contributes its parent directory, and a ``*_dir`` setting or the backup
+    ``destination`` contributes a tree (``base_dir``, the config-repo root, only a directory). A value
+    that names a URL is skipped. ``dirs``, ``trees`` and ``files`` add paths the settings models do
+    not hold, the config directory or the served TLS certificate say. Relative paths are taken
+    against the working directory, as the engine opens them."""
+    out_dirs: list[Path] = []
+    out_trees: list[Path] = []
+
+    def usable(value: object) -> str | None:
+        if isinstance(value, Path):
+            value = str(value)
+        if not isinstance(value, str) or not value.strip() or "://" in value:
+            return None
+        return value
+
+    def add_file(value: object) -> None:
+        if (v := usable(value)) is not None:
+            out_dirs.append(Path(os.path.abspath(v)).parent)
+
+    def walk(model: object, seen: set[int]) -> None:
+        if not isinstance(model, BaseModel) or id(model) in seen:
+            return
+        seen.add(id(model))
+        for name in type(model).model_fields:
+            value = getattr(model, name, None)
+            if isinstance(value, BaseModel):
+                walk(value, seen)
+            elif name.endswith("_url") or "redirect" in name:
+                continue
+            elif name.endswith("_files") and isinstance(value, list | tuple):
+                for item in value:
+                    add_file(item)
+            elif name.endswith(("_file", "_path")) or name == "path":
+                add_file(value)
+            elif (name.endswith("_dir") or name in _OWNED_TREE_NAMES) and (
+                v := usable(value)
+            ) is not None:
+                target = out_dirs if name in _NOT_A_TREE else out_trees
+                target.append(Path(os.path.abspath(v)))
+
+    seen: set[int] = set()
+    for model in models:
+        walk(model, seen)
+    for d in dirs:
+        if (v := usable(d)) is not None:
+            out_dirs.append(Path(os.path.abspath(v)))
+    for d in trees:
+        if (v := usable(d)) is not None:
+            out_trees.append(Path(os.path.abspath(v)))
+    for f in files:
+        add_file(f)
+    return tuple(dict.fromkeys(out_dirs)), tuple(dict.fromkeys(out_trees))

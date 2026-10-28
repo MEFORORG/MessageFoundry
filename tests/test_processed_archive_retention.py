@@ -18,14 +18,22 @@ import json
 import os
 import stat
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterable
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
-from messagefoundry.config.settings import EgressSettings, RetentionSettings
+from messagefoundry.config.settings import (
+    ApiSettings,
+    BackupSettings,
+    EgressSettings,
+    LoggingSettings,
+    RetentionSettings,
+    StoreSettings,
+    engine_owned_dirs,
+)
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -73,7 +81,7 @@ def _never() -> bool:
     return False
 
 
-def _prune(src: FileSource, protected: frozenset[Path] = frozenset()) -> int:
+def _prune(src: FileSource, protected: frozenset[Path] = frozenset()) -> int | None:
     return src._prune_processed(_CUTOFF, build_archive_guard(protected), _never)
 
 
@@ -163,7 +171,7 @@ def test_a_linked_archive_directory_below_the_watch_root_is_refused(tmp_path: Pa
         pytest.skip(f"cannot create a symbolic link here: {exc}")
     src = _source(inbox)
 
-    assert _prune(src) == 0
+    assert _prune(src) is None
     assert outside.exists()
 
 
@@ -179,8 +187,8 @@ def test_an_archive_directory_holding_the_watch_directory_is_refused(
     src = _source(inbox, processed_subdir=subdir)
     drop = _aged(inbox / "waiting.hl7", 90)
 
-    assert _prune(src) == 0
-    assert _prune(src) == 0
+    assert _prune(src) is None
+    assert _prune(src) is None
     assert drop.exists()
     refusals = [r for r in caplog.records if "skips this connection" in r.getMessage()]
     assert len(refusals) == 2
@@ -193,7 +201,7 @@ def test_an_archive_directory_shared_with_error_is_refused(tmp_path: Path) -> No
     src = _source(inbox, processed_subdir="quarantine", error_subdir="quarantine")
     quarantined = _aged(src.error_dir / "bad.hl7", 90)
 
-    assert _prune(src) == 0
+    assert _prune(src) is None
     assert quarantined.exists()
 
 
@@ -207,7 +215,7 @@ def test_another_connections_watch_directory_is_protected(tmp_path: Path, nested
     b_drop = _aged(b_inbox / "waiting.hl7", 90)
     a_copy = _aged(a.processed_dir / "done.hl7", 90)
 
-    assert _prune(a, frozenset({b_inbox})) == 0
+    assert _prune(a, frozenset({b_inbox})) is None
     assert b_drop.exists() and a_copy.exists()
 
 
@@ -220,7 +228,7 @@ def test_the_overlap_guard_folds_case(tmp_path: Path) -> None:
     a = _source(tmp_path / "a", processed_subdir=str(shared))
     a_copy = _aged(a.processed_dir / "done.hl7", 90)
 
-    assert _prune(a, frozenset({tmp_path / "shared"})) == 0
+    assert _prune(a, frozenset({tmp_path / "shared"})) is None
     assert a_copy.exists()
 
 
@@ -305,7 +313,7 @@ def test_an_aliased_protected_directory_is_refused_once_opened(tmp_path: Path) -
     a_copy = _aged(real / "done.hl7", 90)
     guard = ArchiveGuard(keys=frozenset({"unrelated"}), ids=build_archive_guard({alias}).ids)
 
-    assert a._prune_processed(_CUTOFF, guard, _never) == 0
+    assert a._prune_processed(_CUTOFF, guard, _never) is None
     assert a_copy.exists()
 
 
@@ -321,7 +329,7 @@ def test_an_archive_directory_with_no_readable_identity_is_not_swept(
     copy = _aged(src.processed_dir / "done.hl7", 90)
     monkeypatch.setattr(file_transport, "_opened_id", lambda dest: opened)
 
-    assert _prune(src) == 0
+    assert _prune(src) is None
     assert copy.exists()
 
 
@@ -490,7 +498,9 @@ def test_an_archive_that_cannot_read_an_unresolved_directory_sweeps_nothing(
     other.mkdir()
     _refuse_stat_of(monkeypatch, other)
 
-    assert src._prune_processed(_CUTOFF, ArchiveGuard(unresolved=frozenset({other})), _never) == 0
+    assert (
+        src._prune_processed(_CUTOFF, ArchiveGuard(unresolved=frozenset({other})), _never) is None
+    )
     assert copy.exists()
 
 
@@ -520,7 +530,7 @@ def test_an_unreadable_directory_that_is_the_archive_is_refused_once_reread(
     drop = _aged(shared / "waiting.hl7", 90)
     guard = ArchiveGuard(keys=frozenset({"unrelated"}), unresolved=frozenset({shared}))
 
-    assert a._prune_processed(_CUTOFF, guard, _never) == 0
+    assert a._prune_processed(_CUTOFF, guard, _never) is None
     assert drop.exists()
 
 
@@ -843,6 +853,108 @@ async def test_the_pass_sweeps_nothing_when_a_guarded_identity_is_unreadable(
 
     assert result.processed_archives_deleted == 0
     assert old.exists()
+
+
+def test_the_engines_own_directories_are_read_from_its_settings(tmp_path: Path) -> None:
+    """A file setting gives its parent directory, a directory setting a tree.
+
+    Mutation: skip `_file` settings, or `destination`, in `engine_owned_dirs`. Red."""
+    dirs, trees = engine_owned_dirs(
+        (
+            StoreSettings(path=str(tmp_path / "data" / "mf.db")),
+            ApiSettings(tls_cert_file=str(tmp_path / "tls" / "c.pem")),
+            BackupSettings(destination=str(tmp_path / "bak")),
+            LoggingSettings(log_dir=str(tmp_path / "logs")),
+        ),
+        dirs=(tmp_path / "config",),
+    )
+
+    assert {tmp_path / "data", tmp_path / "tls", tmp_path / "config"} <= set(dirs)
+    assert {tmp_path / "bak", tmp_path / "logs"} <= set(trees)
+
+
+@pytest.mark.parametrize("where", ["equal", "holds", "inside-tree"])
+async def test_the_pass_spares_the_engines_own_directories(
+    store: MessageStore, tmp_path: Path, where: str
+) -> None:
+    """An archive directory that is, or holds, an engine directory, or sits inside an engine tree,
+    deletes nothing there.
+
+    Mutation: drop `engine_dirs`/`engine_trees` from the guard, or the `_archive_inside` check. Red."""
+    data = tmp_path / "eng" / "data"
+    backups = tmp_path / "eng" / "backups"
+    archive = {"equal": data, "holds": tmp_path / "eng", "inside-tree": backups / "x"}[where]
+    a = _source(tmp_path / "a", processed_subdir=str(archive))
+    victim = _aged(archive / "engine-owned.bin", 90)
+    retention = RetentionRunner(
+        store,
+        _settings(processed_archive_days=30),
+        clock=lambda: _NOW,
+        archive_source=lambda: (a,),
+        engine_dirs=(data,),
+        engine_trees=(backups,),
+    )
+
+    result = await retention.run_once()
+
+    assert result.processed_archives_deleted == 0
+    assert victim.exists()
+
+
+class _InlineCredential:
+    """Stands in for an alternate-credential context: runs the call on the calling thread."""
+
+    async def run(self, fn: Callable[..., object], *args: object, **kwargs: object) -> object:
+        return fn(*args, **kwargs)
+
+
+async def test_a_refused_sharer_leaves_the_directory_to_a_sibling(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A and B share one archive directory. A, with no credential, cannot read a guarded directory
+    and refuses; B's credential can read it, so B still sweeps the shared directory.
+
+    Mutation: mark the directory swept before the sweep runs. Red."""
+    shared = tmp_path / "shared-archive"
+    a = _source(tmp_path / "a", processed_subdir=str(shared))
+    b = _source(tmp_path / "b", processed_subdir=str(shared))
+    monkeypatch.setattr(b, "_cred_ctx", _InlineCredential())
+    old = _aged(shared / "old.hl7", 90)
+    other = tmp_path / "partner-share"
+    other.mkdir()
+    readable = {"now": False}
+    real_stat = os.stat
+    target = Path(os.path.realpath(other))
+
+    def refusing(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if not readable["now"] and isinstance(path, str | os.PathLike) and Path(path) == target:
+            raise PermissionError(errno.EACCES, "refused")
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    real_build = build_archive_guard
+
+    def build(dirs: Iterable[Path]) -> ArchiveGuard:
+        dirs = tuple(dirs)
+        readable["now"] = other in dirs  # only B's credentialed re-read can reach the share
+        try:
+            return real_build(dirs)
+        finally:
+            readable["now"] = False
+
+    monkeypatch.setattr(os, "stat", refusing)
+    monkeypatch.setattr(file_transport, "build_archive_guard", build)
+    retention = RetentionRunner(
+        store,
+        _settings(processed_archive_days=30),
+        clock=lambda: _NOW,
+        archive_source=lambda: (a, b),
+        guard_source=lambda: (other,),
+    )
+
+    result = await retention.run_once()
+
+    assert result.processed_archives_deleted == 1
+    assert not old.exists()
 
 
 async def test_a_zero_window_sweeps_nothing(store: MessageStore, tmp_path: Path) -> None:

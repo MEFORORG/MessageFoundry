@@ -664,10 +664,11 @@ class ProcessedArchive(Protocol):
         *,
         protected: ArchiveGuard,
         deadline_hit: Callable[[], bool],
-    ) -> int:
+    ) -> int | None:
         """Delete archived files whose archive time is before ``older_than`` (epoch seconds), and
-        return how many went. A file it cannot remove is skipped and tried again next pass. Only an
-        ``OSError`` may escape, and the caller contains it."""
+        return how many went, or None when this archive refused or could not open its directory,
+        which leaves a directory it shares to a sibling. A file it cannot remove is skipped and
+        tried again next pass. Only an ``OSError`` may escape, and the caller contains it."""
         ...
 
 
@@ -691,6 +692,10 @@ class ArchiveGuard:
     keys: frozenset[str] = frozenset()
     ids: frozenset[tuple[int, int]] = frozenset()
     unresolved: frozenset[Path] = frozenset()
+    #: The :func:`archive_dir_key` of each engine-owned tree (the backup destination, the log
+    #: directory, say): an archive directory INSIDE one is refused too, not only one that is or holds
+    #: it. Compared by resolved path only.
+    trees: frozenset[str] = frozenset()
 
 
 def archive_dir_key(path: Path) -> str:
