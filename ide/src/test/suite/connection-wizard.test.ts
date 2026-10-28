@@ -12,6 +12,7 @@ import {
   connectionServiceConfig,
   connectionUpsertArgs,
   planWizardSave,
+  settingIsSet,
   settingKeysFor,
   shouldSaveConnection,
   validateName,
@@ -252,50 +253,51 @@ suite("connectionWizardModel — upsert argv", () => {
 });
 
 suite("connectionServiceConfig — which settings file a connection edit names", () => {
-  const WS = path.resolve("ws-root");
-  const FALLBACK = path.join(WS, "messagefoundry.toml");
-  const PROD = path.join(WS, "env", "prod.toml");
-  // An existence probe that reports only the listed absolute paths as present.
-  const present =
-    (...paths: string[]) =>
-    (p: string): boolean =>
-      paths.includes(p);
-
-  test("the setting is passed when the file it names exists", () => {
-    assert.strictEqual(connectionServiceConfig(WS, "messagefoundry.toml", present(FALLBACK)), "messagefoundry.toml");
-    assert.strictEqual(connectionServiceConfig(WS, "env/prod.toml", present(PROD)), "env/prod.toml");
+  test("a set setting is passed whether or not its file exists", () => {
+    // The function probes nothing, so a missing file is passed and the CLI refuses it by name,
+    // rather than checking the edit against ./messagefoundry.toml, which the setting did not name.
+    assert.strictEqual(connectionServiceConfig("env/prod.toml", true), "env/prod.toml");
+    assert.strictEqual(connectionServiceConfig("messagefoundry.toml", true), "messagefoundry.toml");
   });
 
-  test("the flag is left off when no settings file exists at all (the CLI then reads none either)", () => {
-    assert.strictEqual(connectionServiceConfig(WS, "messagefoundry.toml", present()), undefined);
-    assert.strictEqual(connectionServiceConfig(WS, "env/prod.toml", present()), undefined);
-    // An absolute or differently-spelt name for the default file needs no path comparison.
-    assert.strictEqual(connectionServiceConfig(WS, FALLBACK.toUpperCase(), present()), undefined);
+  test("an absolute or differently-spelt name for the default file is passed as written", () => {
+    // An implementation that compared the setting to the CLI's fallback name, and dropped the flag
+    // on a match, would return undefined here.
+    const absolute = path.resolve("ws-root", "messagefoundry.toml");
+    assert.strictEqual(connectionServiceConfig(absolute, true), absolute);
+    assert.strictEqual(connectionServiceConfig("MESSAGEFOUNDRY.TOML", true), "MESSAGEFOUNDRY.TOML");
+    assert.strictEqual(connectionServiceConfig("./messagefoundry.toml", true), "./messagefoundry.toml");
   });
 
-  test("a missing named file is still passed when the CLI would fall back to another file", () => {
-    // Leaving the flag off here would check the edit against ./messagefoundry.toml, a file the
-    // setting does not name; passing it makes the CLI say the named file is missing.
-    assert.strictEqual(connectionServiceConfig(WS, "env/prod.toml", present(FALLBACK)), "env/prod.toml");
+  test("an unset setting leaves the flag off, so the CLI reads its default file where one exists", () => {
+    assert.strictEqual(connectionServiceConfig("messagefoundry.toml", false), undefined);
+    assert.strictEqual(connectionServiceConfig("env/prod.toml", false), undefined);
   });
 
-  test("the existence probes are asked about workspace-resolved paths", () => {
-    const asked: string[] = [];
-    connectionServiceConfig(WS, "env/prod.toml", (p) => {
-      asked.push(p);
-      return false;
-    });
-    assert.deepStrictEqual(asked, [PROD, FALLBACK]);
+  test("a blank setting is passed as it is, as the alert and security editors pass it", () => {
+    // The CLI refuses an empty or blank --service-config, so the edit is refused rather than
+    // checked against the fallback file.
+    assert.strictEqual(connectionServiceConfig("", true), "");
+    assert.strictEqual(connectionServiceConfig("   ", true), "   ");
   });
 
-  test("a blank setting names no file", () => {
-    assert.strictEqual(connectionServiceConfig(WS, "", present(FALLBACK)), undefined);
-    assert.strictEqual(connectionServiceConfig(WS, "   ", present(FALLBACK)), undefined);
+  test("settingIsSet reads a user or workspace value, never the default or a folder value", () => {
+    const def = { key: "messagefoundry.serviceConfig", defaultValue: "messagefoundry.toml" };
+    assert.strictEqual(settingIsSet(undefined), false);
+    assert.strictEqual(settingIsSet(def), false);
+    // The setting is window-scoped, so VS Code ignores a folder value; so does settingIsSet.
+    assert.strictEqual(settingIsSet({ ...def, workspaceFolderValue: "env/prod.toml" }), false);
+    assert.strictEqual(settingIsSet({ ...def, globalValue: "env/prod.toml" }), true);
+    assert.strictEqual(settingIsSet({ ...def, workspaceValue: "env/prod.toml" }), true);
+    // The default name, set explicitly, and a hand-written null both count as set.
+    assert.strictEqual(settingIsSet({ ...def, workspaceValue: "messagefoundry.toml" }), true);
+    assert.strictEqual(settingIsSet({ ...def, globalValue: null }), true);
   });
 
-  test("a non-string setting from a hand-edited settings.json names no file and does not throw", () => {
-    for (const bad of [null, undefined, 123]) {
-      assert.strictEqual(connectionServiceConfig(WS, bad as unknown as string, present(FALLBACK)), undefined);
+  test("a non-string setting from a hand-edited settings.json is passed as empty and does not throw", () => {
+    for (const bad of [null, undefined, 123, {}]) {
+      assert.strictEqual(connectionServiceConfig(bad, true), "");
+      assert.strictEqual(connectionServiceConfig(bad, false), undefined);
     }
   });
 });
@@ -303,8 +305,8 @@ suite("connectionServiceConfig — which settings file a connection edit names",
 // The builders above pin the argv, but only if every writer uses them. Read the extension source and
 // pin that (1) no file but the model spells a `connection upsert|remove` argv by hand, and (2) every
 // call to a builder passes `serviceConfig()`, the workspace setting the alert, security and trust
-// editors pass, through connectionServiceConfig. A source scan, because the callers import `vscode`
-// and cannot run under plain mocha.
+// editors pass, and `serviceConfigIsSet()` through connectionServiceConfig. A source scan, because
+// the callers import `vscode` and cannot run under plain mocha.
 suite("connection writers — every upsert and remove names the service settings (BACKLOG #2908)", () => {
   const SRC = path.join(__dirname, "..", "..", "..", "src");
   // Every extension source file, subdirectories included, but not the test tree.
@@ -319,7 +321,7 @@ suite("connection writers — every upsert and remove names the service settings
     assert.deepStrictEqual(spellers, ["connectionWizardModel.ts"]);
   });
 
-  test("every builder call passes serviceConfig() through connectionServiceConfig", () => {
+  test("every builder call passes serviceConfig() and serviceConfigIsSet() through connectionServiceConfig", () => {
     // Each call's opening text, long enough to hold its first two arguments over any line breaks.
     const call = /connection(?:Upsert|Remove)Args\(/g;
     const calls = sources
@@ -333,7 +335,8 @@ suite("connection writers — every upsert and remove names the service settings
     for (const f of ["connectionEditor.ts", "configEditors.ts", "connectionQuickInput.ts"]) {
       assert.ok(callers.has(f), `${f} no longer calls a connection argv builder`);
     }
-    const flagged = /^connection(?:Upsert|Remove)Args\([^,]+,\s*connectionServiceConfig\(\s*\w+\s*,\s*serviceConfig\(\)\s*\)/;
+    const flagged =
+      /^connection(?:Upsert|Remove)Args\([^,]+,\s*connectionServiceConfig\(\s*serviceConfig\(\)\s*,\s*serviceConfigIsSet\(\)\s*\)/;
     const unflagged = calls.filter((c) => !flagged.test(c.call));
     assert.deepStrictEqual(unflagged, []);
   });

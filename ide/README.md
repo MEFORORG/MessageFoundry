@@ -190,10 +190,15 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 - `messagefoundry.configDir` (default `samples/config`) — config modules directory.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. Connection edits
-  are checked against this file, at least its `[egress]` allowlist, by passing it as
-  `--service-config`. The flag is left off only where neither this file nor a workspace
-  `messagefoundry.toml` exists. Where this file is missing but that one exists, a connection edit
-  fails with "service config not found" rather than be checked against the other file.
+  are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
+  user or workspace settings (a folder value is ignored), every connection edit passes it as
+  `--service-config`, whether or not the file exists, so a missing file fails the edit with
+  `service config not found` rather than letting it be checked against another file. A blank
+  setting is passed too, and `connection` refuses it as blank. Setting it to the default name, in
+  user settings too, counts as set, so a workspace without that file cannot save a connection edit
+  until the file exists or the setting is cleared. The flag is left off at least when
+  the setting is unset; the engine CLI then reads the workspace's `messagefoundry.toml` if there is
+  one, the file this setting's default names, and no file if not.
 - `messagefoundry.engineUrl` (default `https://127.0.0.1:8765`) — engine API URL used by
   *Stage → Promote* when no named environments are configured. **Machine-scoped** (a workspace file
   cannot retarget a promote, and with it your credentials, at another host). https by default

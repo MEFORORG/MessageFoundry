@@ -7,7 +7,7 @@
 // answer→ConnObj mapping, argv, and validators live in the vscode-free connectionWizardModel (tested
 // node-side); this file is just the Extension-Host plumbing.
 import * as vscode from "vscode";
-import { configDir, runJson, serviceConfig, workspaceDir } from "./cli";
+import { configDir, runJson, serviceConfig, serviceConfigIsSet, workspaceDir } from "./cli";
 import { type ConnObj, nameCollisionError } from "./connectionMerge";
 import {
   WIZARD_TRANSPORTS,
@@ -245,7 +245,7 @@ async function saveConnection(
     return;
   }
   try {
-    await runJson(connectionUpsertArgs(configDir(), connectionServiceConfig(ws, serviceConfig()), conn), ws);
+    await runJson(connectionUpsertArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), conn), ws);
   } catch (e) {
     void vscode.window.showErrorMessage(
       `MessageFoundry: could not save ${conn.name} — ${e instanceof Error ? e.message : String(e)}`,
