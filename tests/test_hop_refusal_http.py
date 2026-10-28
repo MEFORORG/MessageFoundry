@@ -636,7 +636,7 @@ def test_soap_ws_username_cleartext_refused_whatever_the_declaration(
         )
 
 
-# --- vault BACKLOG #3533 item 4: no declaration carries a recognized credential across http -----
+# --- vault BACKLOG #3533 item 4: no declaration carries a recognized credential across plain http
 #
 # Owner ruling 2026-10-26: a recognized credential is refused across an off-box cleartext hop that
 # tls_hop_attested or cleartext_accepted would otherwise let through, and the credential test
@@ -677,9 +677,9 @@ def test_a_declared_cleartext_hop_carries_a_neutral_static_header(
     cell: str, declared: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The verify-off header allowlist does not apply to a declared cleartext hop: the owner's
-    ruling on item 4 refuses recognized credentials only, so any header with a neutral name crosses,
-    even one holding a secret. That is an accepted limit, decided 2026-10-27;
-    docs/SECURITY-LOOSENING.md says why."""
+    ruling on item 4 refuses recognized credentials only, so a header with a neutral name crosses.
+    So does a secret in it that is not credential-shaped (no auth-scheme prefix, not a JWT). That
+    is an accepted limit (owner ruling 2026-10-28); docs/SECURITY-LOOSENING.md says why."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_PROD):
         dest = _build(

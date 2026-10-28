@@ -356,8 +356,8 @@ the construction gate reports them separately (it does, moments later, per conne
 ## Amendment 2026-10-27: no declaration carries a recognized credential across cleartext http
 
 *Heading changed 2026-10-28. It read "no declaration carries a credential across cleartext http".
-The rule refuses only a credential it recognizes, so a secret under a neutral header name still
-crosses.*
+The rule refuses only a credential it recognizes. A secret that is not credential-shaped, under a
+neutral header name, still crosses.*
 
 **Owner ruling 2026-10-26** (vault BACKLOG #3533 item 4). The batch 342 Manager asked the owner
 whether a credential should still cross a cleartext hop that `cleartext_accepted` or
@@ -384,14 +384,12 @@ the header counts as a credential and refuses the hop at build.
 
 **What did not change.** `cleartext_accepted` still carries a body with no credential across, with
 the WARN and the audit record decision 2 describes. That was the case decision 2 was written for.
-A header with a neutral name, static or per message, still crosses with that body, whatever its
-value, a secret included. The verify-off rule's header-name allowlist (owner ruling 2026-10-26 on
-item 7) is not applied to cleartext hops. The owner's ruling here named credentials only. On
-2026-10-27 it was decided, under the owner's delegation, not to extend the allowlist to these hops.
-The decision and its reasons are stated once, in
-[SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer),
-*Accepted limit: a neutral header crosses plain `http` off this machine*. Earlier versions of this
-paragraph called it an open owner question.
+A header with a neutral name, static or per message, still crosses with that body. So does a
+secret in it that is not credential-shaped (no auth-scheme prefix, not a JWT). The verify-off
+rule's header-name allowlist (owner ruling 2026-10-26 on item 7) is not applied to cleartext hops.
+The owner ruled on 2026-10-28 to keep it that way. The ruling and its reasons are stated once, in
+[SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine).
+Earlier versions of this paragraph called it an open owner question.
 
 **Why build note 3's argument no longer holds.** It said that refusing a credential would push an
 operator with a legacy Basic-auth peer into writing a false `tls_hop_attested`. The attestation no

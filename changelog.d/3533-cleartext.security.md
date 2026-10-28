@@ -5,10 +5,10 @@
   SOAP WS-Security as well. Its credential test now counts the credentials the
   `verify_tls = false` refusal counts, header names in any case, so a static API-key header or a
   credential-shaped value under a neutral name is refused too. It does not take that refusal's
-  header-name allowlist, so any header with a neutral name, such as `Prefer` or `X-Session`, still
-  crosses a declared cleartext hop, whatever its value, a secret included. That is an accepted
-  limit, decided on 2026-10-27, and
-  [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
+  header-name allowlist. So a header with a neutral name, such as `X-Session`, still crosses a
+  declared cleartext hop. That includes a secret in it that is not credential-shaped (no
+  auth-scheme prefix, not a JWT). The owner ruled on 2026-10-28 to accept that limit, and
+  [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine)
   says why. A static `Proxy-Authorization` is left to the
   send-time proxy rule only when the request goes to a proxy. A hop can bypass a configured
   `proxy_url` through `proxy_no_proxy`, urllib's own bypass list, or a `"default"` with no system
@@ -22,7 +22,7 @@
 - **A Handler's per-message headers meet the hop's header rule at send.** On a
   `verify_tls = false` hop, a header stamped under `dynamic_headers` must be `Accept`,
   `Content-Type`, `User-Agent` or `X-Request-ID` with no credential in it. Over plain `http` off
-  this machine, it must hold no credential. Otherwise that one message is refused permanently and
+  this machine, it must hold no credential the refusal recognizes. Otherwise that one message is refused permanently and
   dead-lettered, and the lane goes on. The send-time hop check runs first, so a hop that is no
   longer permitted still stops the lane and keeps the row. The refusal names the connection and
   how many headers it refused, never a header's name or value. (`BACKLOG #3533`)

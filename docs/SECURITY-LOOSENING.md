@@ -39,9 +39,10 @@ section reference.
 
 On the hops in the table below, the engine will not send a credential to a peer whose identity it
 has not checked. The rule does not yet reach every hop or every kind of credential: at least the
-cases in *The rule does not reach every hop yet*, below, still cross. So does a secret in a header
-with a neutral name, over plain `http` off this machine. The *Accepted limit* after that list says
-why. This section is the one statement of that rule; other pages link here.
+cases in *The rule does not reach every hop yet*, below, still cross. So does a secret that is not
+credential-shaped under a neutral header name, over plain `http` off this machine. That is an
+[accepted limit](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine), at the end
+of this section. This section is the one statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
 or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
@@ -114,31 +115,6 @@ engine has not verified, when the lever named beside each is set:
 - a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
   `[security].enforcement = warn`.
 
-**Accepted limit: a neutral header crosses plain `http` off this machine.** An HTTP-family static
-or per-message header with a neutral name, such as `X-Session`, still crosses that hop. It crosses
-even when its value is a secret. The hop itself crosses only under its own levers, such as
-`cleartext_accepted` or `tls_hop_attested`. On that hop the no-escape rule refuses only the
-credentials it recognizes, described above (vault BACKLOG #3533 item 4). The header allowlist
-applies on `verify_tls = false` hops only. This limit is accepted, with no fix planned. It was
-decided on 2026-10-27, under the owner's delegation, as decision `d20261027T133708514-b8b2ed`
-([record](https://github.com/MEFORORG/MessageFoundry/pull/2576#issuecomment-6443284239)).
-
-The reason differs by declaration. Under either one, a secret under a neutral name such as
-`X-Session` still crosses.
-
-- Under `cleartext_accepted`, the declaration says the hop is not secure.
-  [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
-  decision 2 accepts that. So the hop's body and headers are readable on the path. Refusing
-  neutral headers would add little protection to a hop whose body is already exposed.
-- Under `tls_hop_attested`, the declaration says the hop is secure by means the engine cannot see
-  (the table in ADR 0153 decision 2). The engine trusts that declaration for the body and every
-  header. The exception is a credential the refusal recognizes. The owner's ruling of 2026-10-26
-  refuses that whatever the hop declares. A secret under a neutral name is covered only by the
-  declaration. If the declaration is false, that secret crosses in the clear.
-
-Earlier versions of this guide said the question awaited an owner ruling. The 2026-10-27 decision
-answers it.
-
 **The forward-proxy login is judged by a different owner ruling.** A `proxy_user` login rides the
 leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
 #3416). The owner's ruling of 2026-10-05 (vault BACKLOG #3007) refuses it there unless the
@@ -147,6 +123,37 @@ connection declares `cleartext_accepted` with a reason. The engine also lets it 
 
 An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
 leaves the engine.
+
+### Accepted limit: a neutral header crosses plain `http` off this machine
+
+Over plain `http` to a host off this machine, an HTTP-family header with a neutral name, such as
+`X-Session`, still crosses. That holds for a static header and for one a Handler stamps per
+message. It crosses even when its value is a secret, if that secret is not credential-shaped (no
+auth-scheme prefix, not a JWT). On that hop the no-escape rule refuses only the credentials it
+recognizes, described above (vault BACKLOG #3533 item 4). A credential-shaped value is refused
+under any name. The header allowlist applies on `verify_tls = false` hops only. The hop itself
+crosses only under its own levers, such as `cleartext_accepted` or `tls_hop_attested`.
+
+This limit is accepted, with no fix planned (owner ruling 2026-10-28). The owner was asked whether
+the allowlist should also apply to declared plain-`http` hops. The answer was *"No, keep it as
+decided"*. That confirmed decision `d20261027T133708514-b8b2ed`, made on 2026-10-27 under the
+owner's delegation ([record](https://github.com/MEFORORG/MessageFoundry/pull/2576#issuecomment-6443284239)).
+
+The reason differs by declaration.
+
+- Under `cleartext_accepted`, the declaration says the hop is not secure.
+  [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
+  decision 2 accepts that declaration. The hop's body and headers are then readable on the path,
+  by the operator's own choice. Refusing neutral headers would not protect the body, which that
+  declaration already exposes.
+- Under `tls_hop_attested`, the declaration says the hop is secure by means the engine cannot see
+  (the table in ADR 0153 decision 2). The engine trusts that declaration for the body and the
+  headers, except a credential the refusal recognizes. The owner's ruling of 2026-10-26 refuses
+  that credential whatever the hop declares. A secret that is not credential-shaped, under a
+  neutral name, rests on the declaration alone. If the declaration is false, that secret crosses
+  in the clear.
+
+Earlier versions of this guide called this an open owner question. The 2026-10-28 ruling answers it.
 
 ---
 
@@ -1359,8 +1366,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   **unencrypted and unauthenticated**, readable and modifiable by anything on the path. There is no
   partial protection here: it is plaintext PHI on the wire for that connection. The exception is an
   HTTP-family credential the refusal recognizes, to a host off this machine. It is refused whatever
-  this says (vault BACKLOG #3533 item 4). A secret under a neutral header name still crosses, an
-  [accepted limit](#no-escape-sends-a-credential-to-an-unverified-peer). A forward-proxy login is
+  this says (vault BACKLOG #3533 item 4). A secret that is not credential-shaped, under a neutral
+  header name, still crosses: an
+  [accepted limit](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine). A forward-proxy login is
   not in that exception: it crosses its cleartext leg under this declaration, as the
   [credential rule](#no-escape-sends-a-credential-to-an-unverified-peer) says.
 - **When acceptable:** a peer that genuinely cannot do TLS — vendor firmware that predates it, or a
@@ -1420,8 +1428,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   clear, and nothing about the hop looks wrong afterwards. The exception is an HTTP-family
   credential the refusal recognizes, other than a forward-proxy login, over cleartext `http` to a
   host off this machine. It stays refused, attested or not (vault BACKLOG #3533 item 4). A secret
-  under a neutral header name rests on the attestation alone, an
-  [accepted limit](#no-escape-sends-a-credential-to-an-unverified-peer).
+  that is not credential-shaped, under a neutral header name, rests on the attestation alone: an
+  [accepted limit](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine).
 - **When acceptable:** the hop really is secure, and the engine cannot see why. A TLS-terminating proxy or
   sidecar in front of the connection is the usual case. An isolated, point-to-point segment with its
   own link-layer encryption is the other.
