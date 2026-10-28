@@ -584,6 +584,21 @@ def test_bytes_renders_an_unmeasured_value_as_words_not_a_quantity() -> None:
     assert _bytes(10 * 1024**3) == "10.0 GiB"
 
 
+def test_db_disk_free_names_a_status_that_arrived_around_validation() -> None:
+    """BACKLOG #1563. ``DbInfo`` refuses an unknown ``disk_free_status``, but one built around
+    validation must still be named, warn-styled, in the words ``_derive_health`` uses, rather than
+    read as observed, not-applicable or a failed probe. The three real statuses are pinned through
+    the whole page in test_webui_monitoring.py."""
+    from messagefoundry.api.models import DbInfo
+    from messagefoundry_webconsole.pages.monitoring import _db_disk_free
+
+    db = _sysinfo(None).db
+    odd = DbInfo.model_construct(**{**db.model_dump(), "disk_free_status": "remote"})
+    assert str(_db_disk_free(odd)) == (
+        '<span class="health-warn">db disk status not recognised: &#x27;remote&#x27;</span>'
+    )
+
+
 def test_derive_health_down_when_store_unreachable() -> None:
     from messagefoundry_webconsole.routes.status import _derive_health
 

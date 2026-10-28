@@ -22,6 +22,7 @@ from messagefoundry.api.models import (
     ClusterNodeList,
     ClusterStatus,
     ConnectionEventList,
+    DbInfo,
     DrStatus,
     GraphResponse,
     IntegrityResult,
@@ -165,6 +166,25 @@ def _bytes(n: int | None) -> str:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{n} B"  # pragma: no cover - unreachable (loop always returns)
+
+
+def _db_disk_free(db: DbInfo) -> object:
+    """Render the store's "Disk free" row by what the backend STATES about it (BACKLOG #1563).
+
+    A null figure has two causes, and they must not read alike: a server backend's disk is on the
+    database host, out of this engine's sight, which is nothing wrong; a failed probe of the
+    engine's own DB directory is something wrong, so it renders warn-styled with the very reason
+    ``_derive_health`` warns on, keeping this row and the nav heart in one sentence."""
+    status = db.disk_free_status
+    if status == "observed":
+        return _bytes(db.disk_free_bytes)
+    if status == "not_applicable":
+        return "not measured by this engine (server backend; the disk is on the database host)"
+    if status == "unobservable":
+        return el("span", "db directory missing or unreadable", class_="health-warn")
+    # DbInfo refuses any other value at validation; one that arrives around it is named, matching
+    # _derive_health, rather than read as either case above.
+    return el("span", f"db disk status not recognised: {status!r}", class_="health-warn")
 
 
 def _suspend_form(a: AlertInstanceInfo) -> Markup:
@@ -635,7 +655,7 @@ def status(
             ],
             ["Path", db.path],
             ["Size", _bytes(db.size_bytes)],
-            ["Disk free", _bytes(db.disk_free_bytes)],
+            ["Disk free", _db_disk_free(db)],
             ["Journal mode", db.journal_mode],
             ["Messages", db.messages],
             ["Events", db.events],
