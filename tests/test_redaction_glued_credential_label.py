@@ -56,8 +56,11 @@ _LABELS = ("password", "token", "client_secret")
 _ENCODED_PHI = "q=ZQDOE%5EZQJANE%5E4455667"
 _PHI = ("ZQDOE", "ZQJANE", "4455667")
 
+#: Only an assertion counts as the expected failure, so a pin whose code raises goes red. Each
+#: residual's control is also asserted outside the mark (``test_every_residual_control_is_read``).
 _RESIDUAL = pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="BACKLOG #2968 residual: the rule leaves this shape as it was, and its value prints",
 )
 
@@ -218,6 +221,46 @@ def test_the_glued_label_spells_the_credential_ahead_vocabulary() -> None:
         assert not redaction._GLUED_CREDENTIAL_LABEL.search(f"a|b;{tail}"), tail
 
 
+def test_the_keyword_screen_is_the_pattern_vocabulary() -> None:
+    """The cheap screen in front of the label search holds exactly the pattern's keywords, which are
+    ``secretscrub``'s, so it never skips a label the pattern reads."""
+    assert set(redaction._GLUED_CREDENTIAL_WORDS) == set(_SCRUB_WORDS)
+
+
+#: A PHI value whose rest holds a credential label: the PHI arm masks it to its terminator, and the
+#: credential arm must not take that over. Found by code review round 1: each printed the patient
+#: name on the head before that repair.
+_PHI_HOLDING_A_LABEL = (
+    '{"name":"x|y|z,password: Vandtjane"}',
+    "<name>x|y|z;token: Vandtjane</name>",
+    '{"family":"A^B^C;secret= Vandtjane"}',
+    '{"given":"A^B^C;pwd: Vandtjane","x":1}',
+    '{"name":"x|y|z,password: zq9 Vandtjane"}',
+)
+
+
+@pytest.mark.parametrize("text", _PHI_HOLDING_A_LABEL)
+def test_a_phi_arm_answers_before_the_credential_arm(text: str) -> None:
+    assert not _all_paths_keeping(text, "Vandtjane")
+    with _rule_off():
+        main = _all_paths(text)
+    assert _all_paths(text) == main
+
+
+def test_a_caller_cannot_complete_a_date_from_a_digit_led_value() -> None:
+    """Found by code review round 1: ``19800505T`` ends the answer and a caller glues ``1230``. The
+    rule-off answer reads one date and hides the caller's digits; a mask would not."""
+    for value in ("19800505T", "20261027t", "1980zq"):
+        composed = _through_the_chain(
+            safe_exc(ValueError(f"bad x|y|z;password: {value}")) + "1230 retry"
+        )
+        with _rule_off():
+            main = _through_the_chain(
+                safe_exc(ValueError(f"bad x|y|z;password: {value}")) + "1230 retry"
+            )
+        assert composed == main, value
+
+
 def test_the_value_is_masked_in_place() -> None:
     """Every answer is the rule-off answer with letters and digits masked to their class."""
     assert redact(f"bad x|y|z;password: {_VALUE} ok") == "bad [redacted] xx0xxxxxx0x ok"
@@ -334,6 +377,29 @@ _REFUSED_VALUES = {
         _VALUE,
         f"x ;password:\n{_VALUE}",
     ),
+    # Found by code review round 1: the value must be followed by a space or the text's end.
+    "a-line-break-after-the-value": (
+        f"x|y|z;password: {_VALUE}\nTraceback (most recent call last)",
+        _VALUE,
+        f"x ;password: {_VALUE}\nTraceback (most recent call last)",
+    ),
+    "a-tab-after-the-value": (
+        f"x|y|z;password: {_VALUE}\tretry",
+        _VALUE,
+        f"x ;password: {_VALUE}\tretry",
+    ),
+    # The label arm starts at a word boundary only; secretscrub also starts one after an escape.
+    "a-percent-escape-glue": (
+        f"x|y|z%2Cpassword: {_VALUE}",
+        _VALUE,
+        f"x %2Cpassword: {_VALUE}",
+    ),
+    # A value that opens with a digit and ends the text: a caller's digits could complete a date.
+    "a-digit-led-value-at-the-end": (
+        "x|y|z;password: 1980zqpw",
+        "1980zqpw",
+        "x ;password: 1980zqpw",
+    ),
 }
 
 
@@ -347,15 +413,34 @@ def test_a_value_the_mask_refuses_still_prints(text: str, value: str, control: s
     assert not _all_paths_keeping(text, value)
 
 
+#: The separators of the residual arms of the first test above.
+_RESIDUAL_SEPARATORS = (":\t", ":\n  ")
+
+
 def _residual_texts() -> list[str]:
     """Every text a residual arm above plants."""
     texts = [
-        text for run in _RUNS.values() for sep in (":\t", ":\n  ") for text in _glued(run, sep)
+        text for run in _RUNS.values() for sep in _RESIDUAL_SEPARATORS for text in _glued(run, sep)
     ]
     texts += [str(param.values[0]) for param in _OTHER_SHAPES if param.marks]
     texts += [f"x|y|z;password=\n {_VALUE} {_ENCODED_PHI}"]
     texts += [text for text, _, _ in _REFUSED_VALUES.values()]
     return texts
+
+
+def test_every_residual_control_is_read() -> None:
+    """The controls of the residual arms, outside the xfail mark, so a control the credential stage
+    stops reading fails here instead of passing as an expected failure."""
+    controls = [
+        (f"x w{glue}{label}{sep}{_VALUE}", _VALUE)
+        for sep in _RESIDUAL_SEPARATORS
+        for glue in _GLUE
+        for label in _LABELS
+    ]
+    controls += [(str(param.values[1]), _VALUE) for param in _OTHER_SHAPES if param.marks]
+    controls += [(control, value) for _, value, control in _REFUSED_VALUES.values()]
+    assert len(controls) == 2 * 78 + 8 + len(_REFUSED_VALUES)
+    assert not [shape for shape, value in controls if not _the_credential_stage_reads(shape, value)]
 
 
 def test_each_residual_prints_as_the_rule_off_redactor_does() -> None:
@@ -496,11 +581,19 @@ def test_a_second_call_changes_nothing(text: str) -> None:
 
 # --- A label-dense sweep: every route answers the rule-off redactor, masked ---------------------
 
-_SWEEP_RUNS = ("x|y|z", "A^B^C", "http://h.example/p?a=1&b=2&c=3", "MSH*$~\\&*A\rx$y$z")
+#: Field runs, two of them opened inside a PHI value, which the PHI arms answer first.
+_SWEEP_RUNS = (
+    "x|y|z",
+    "A^B^C",
+    "http://h.example/p?a=1&b=2&c=3",
+    "MSH*$~\\&*A\rx$y$z",
+    '{"name":"x|y|z',
+    "<name>A^B^C",
+)
 _SWEEP_GLUE = ("", ";", ",", '"', "'", "}", ")", "_", ".", "=", "\\", "|")
 _SWEEP_LABELS = ("password", "db_password", "Token", "api-key", "MEFOR_DB_PW", "'secret'")
 _SWEEP_SEPARATORS = (": ", "= ", "=  ")
-_SWEEP_VALUES = ("zq9hunter2z", "zqpw84", "Zqhunter", "ZQHUNTER7")
+_SWEEP_VALUES = ("zq9hunter2z", "zqpw84", "Zqhunter", "ZQHUNTER7", "19800505T")
 _SWEEP_TAILS = (
     "",
     " rest",
@@ -510,10 +603,18 @@ _SWEEP_TAILS = (
     f" {_ENCODED_PHI}",
     "'",
     ' "',
+    '"}',
+    "</name>",
 )
 #: Text a caller writes around an answer: an open quoted credential value before it, a word a name
 #: run could join after it, and digits a date arm could join.
-_SWEEP_AROUND = (("", ""), ("password: '", "' x"), ("", " Plantsuf x"), ("", "0505 retry"))
+_SWEEP_AROUND = (
+    ("", ""),
+    ("password: '", "' x"),
+    ("", " Plantsuf x"),
+    ("", "0505 retry"),
+    ("", "1230 retry"),
+)
 _SWEEP_PLANTED = ("zq9hunter2z", "zqpw84", "Zqhunter", "ZQHUNTER7", "zqlater", "Plant", "ZQDOE")
 
 
@@ -547,7 +648,7 @@ def test_every_route_of_the_sweep_answers_the_rule_off_redactor_masked() -> None
     rather than by a list of values. It also counts the routes the rule fixed, so a sweep it never
     touched cannot pass."""
     texts = list(_sweep())
-    assert len(texts) == len(_SWEEP_RUNS) * len(_SWEEP_GLUE) * len(_SWEEP_LABELS) * 3 == 864
+    assert len(texts) == len(_SWEEP_RUNS) * len(_SWEEP_GLUE) * len(_SWEEP_LABELS) * 3 == 1296
     broken: list[str] = []
     fixed = 0
     afters = [_sweep_routes(text) for text in texts]
