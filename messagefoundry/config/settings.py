@@ -8487,6 +8487,12 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       many per pass, and the smaller sample is the breaker's denominator too). Each makes a
       revocation arrive later. The strike count delays every outcome in ``REVOKE_REASONS``, and a
       role or scope change on a present account revokes on the first pass.
+      ``ad_reconcile_outage_passes`` above its default (BACKLOG #3709): the service pages a
+      directory outage only once that many passes have read it unreachable, and each such pass
+      revokes nothing, so the page about a revocation gap arrives later. The load bounds it to 2 to
+      100, inside which a larger value is still looser. ``run - 1`` intervals after the first such
+      pass is the least delay, not an estimate (each pass's own run adds to it), and the
+      interval's entry says so too.
       ``ad_session_revoke_max`` and ``ad_session_revoke_max_fraction`` feed ``breaker_tripped``,
       which aborts a pass that would revoke more than both, and an aborted pass revokes nothing.
       Below the default a smaller wave of genuine revocations aborts, so that is named, as the 0
@@ -9029,12 +9035,37 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             "live engine sessions for longer before they are revoked"
         )
         interval = auth.ad_session_recheck_seconds
+        # A directory outage pages on the pass that brings the count of passes reading it unreachable
+        # to this many (BACKLOG #3709), and every such pass revokes nothing. Passes are an interval
+        # apart plus each pass's own run, and a pass that asks nothing, or whose every probe failed
+        # or faulted with one fault at least (``probe_fault``), neither counts nor ends the run. So
+        # (run - 1) intervals after the first such pass is the least time to the page, never its
+        # estimate.
+        run = auth.ad_reconcile_outage_passes
+        floor = (
+            f"at least {run} passes that read it unreachable, no sooner than "
+            f"{(run - 1) * interval} s after the first of them"
+        )
         if interval > _auth_default("ad_session_recheck_seconds"):
             out.append(
                 (
                     "ad_session_recheck_seconds",
                     f"the directory reconciler runs every {interval} s, less often than the "
-                    f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}",
+                    f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
+                    f"interval also delays the page about a directory outage, which comes after "
+                    f"{floor}",
+                )
+            )
+        if run > _auth_default("ad_reconcile_outage_passes"):
+            out.append(
+                (
+                    "ad_reconcile_outage_passes",
+                    "the reconciler revokes nothing while the directory is unreachable, and the "
+                    "page about that outage waits for more passes than the default of "
+                    f"{_auth_default('ad_reconcile_outage_passes')}: it comes after {floor} at the "
+                    "configured interval. Until it does, a directory account disabled or deleted "
+                    "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
+                    "per pass to show for it",
                 )
             )
         strikes = auth.ad_session_recheck_strikes

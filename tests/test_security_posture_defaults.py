@@ -755,6 +755,11 @@ def test_a_session_limit_set_in_security_reaches_the_registry(
         ("ad_session_revoke_max_fraction", 0.99, False),  # the load refuses 1.0 while it runs
         ("ad_session_revoke_max_fraction", 0.33, True),
         ("ad_session_revoke_max_fraction", 0.01, True),
+        # BACKLOG #3709's page on a run of unreachable passes: a longer run pages later.
+        ("ad_reconcile_outage_passes", 3, False),
+        ("ad_reconcile_outage_passes", 2, False),
+        ("ad_reconcile_outage_passes", 4, True),
+        ("ad_reconcile_outage_passes", 100, True),  # the load refuses anything above
     ],
 )
 def test_a_reconciler_knob_is_named_only_in_its_looser_direction(
@@ -771,6 +776,7 @@ def test_a_reconciler_knob_is_named_only_in_its_looser_direction(
         ("ad_session_recheck_max_users", 6),
         ("ad_session_revoke_max", 0),
         ("ad_session_revoke_max_fraction", 0.01),
+        ("ad_reconcile_outage_passes", 100),
     ],
 )
 def test_a_reconciler_knob_is_not_named_while_no_reconciler_runs(field: str, value: float) -> None:
@@ -880,6 +886,24 @@ def test_the_strike_entry_does_not_claim_to_delay_a_role_change() -> None:
     assert "groups" not in risk and "at least one absent, disabled" in risk
 
 
+def test_the_interval_entry_says_it_delays_the_outage_page_too() -> None:
+    """A run of ``ad_reconcile_outage_passes`` unreachable passes pages, so the interval multiplies
+    that page's delay as well as a revocation's (BACKLOG #3709)."""
+    risk = _risk(_ad(ad_session_recheck_seconds=600), "ad_session_recheck_seconds")
+    assert risk is not None
+    assert "at least 3 passes" in risk and "no sooner than 1200 s after the first" in risk
+
+
+def test_the_outage_entry_quotes_the_run_and_its_delay() -> None:
+    """The run length, the default, and the least the run costs at the configured interval: the
+    page comes on the tenth pass, nine intervals after the first, and each pass's own run adds to
+    that, so the text gives a floor."""
+    risk = _risk(_ad(ad_reconcile_outage_passes=10), "ad_reconcile_outage_passes")
+    assert risk is not None
+    assert "at least 10 passes" in risk and "default of 3" in risk
+    assert "no sooner than 2700 s after the first" in risk
+
+
 def test_a_breaker_threshold_is_not_named_while_the_breaker_cannot_trip() -> None:
     """A budget at or below the cap disarms the breaker, so a low share aborts nothing. The control:
     the same share with an armed breaker is named."""
@@ -925,6 +949,7 @@ _NUMERIC_AUTH_NAMED: dict[str, tuple[Any, object, str]] = {
     "ad_session_recheck_max_users": (_ad, 199, "ad_session_recheck_max_users"),
     "ad_session_revoke_max": (_ad, 4, "ad_session_revoke_max"),
     "ad_session_revoke_max_fraction": (_ad, 0.33, "ad_session_revoke_max_fraction"),
+    "ad_reconcile_outage_passes": (_ad, 4, "ad_reconcile_outage_passes"),
     "oidc_clock_skew_seconds": (_oidc_on, 61, "oidc_clock_skew_seconds"),
     "oidc_jwks_ttl_seconds": (_oidc_on, 3601, "oidc_jwks_ttl_seconds"),
     "oidc_jwks_min_refetch_seconds": (_oidc_on, 299, "oidc_jwks_min_refetch_seconds"),

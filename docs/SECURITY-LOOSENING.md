@@ -154,6 +154,7 @@ leaves the engine.
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`; `0` turns the reconciler off, and an interval above `300` s is named) |
 | | `[auth].ad_session_recheck_strikes`, `ad_session_recheck_max_users` | `2` / `200` (*conditional* — a loosening only while the reconciler runs; more strikes, or a smaller per-pass budget, is named) |
 | | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` | `5` / `0.34` (*conditional* — a loosening only while the reconciler runs; a value below its default aborts smaller waves of revocations, and is named. A higher one ends more sessions and keeps none, and is not named) |
+| | `[auth].ad_reconcile_outage_passes` | `3` (*conditional* — a loosening only while the reconciler runs; a longer run before a directory outage pages is named. The load refuses a value outside `2` to `100`) |
 | | `[auth].ad_connect_timeout`, `ad_receive_timeout`, `ad_group_search_deadline` | `10` s / `10` s / `120` s (*conditional* — a loosening only once `ad_enabled`; a value above its default is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
 | | `[auth].admin_new_ip_step_up` | `true` |
 | | `[auth].require_action_step_up` | `true` (`false` lets the action-bound step-up routes accept the session-wide step-up window) |
@@ -204,7 +205,7 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[auth].step_up_max_age_seconds`, `[auth].totp_skew_steps`, `[auth].initial_password_expiry_hours`,
 `[auth].mfa_recovery_code_count`, `[auth].password_min_length`, the four other
-`[auth].ad_session_*` reconciler keys, the five `[auth].oidc_*` lifetime and skew keys,
+`[auth].ad_session_*` reconciler keys, `[auth].ad_reconcile_outage_passes`, the five `[auth].oidc_*` lifetime and skew keys,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
@@ -782,8 +783,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** a revocation the directory calls for arrives later when
   `ad_session_recheck_seconds` is above `300` s, when `ad_session_recheck_strikes` is above `2` (a pass
   revokes only after that many in a row find the account absent or disabled), or when
-  `ad_session_recheck_max_users` is below `200` (a larger estate takes more passes to cover). The
-  strike count delays at least an account found absent or disabled, or one whose account control
+  `ad_session_recheck_max_users` is below `200` (a larger estate takes more passes to cover). A
+  longer interval also delays the outage page, in the next bullet. The strike count delays at least an account found absent or disabled, or one whose account control
   cannot be read; a role or scope change revokes on the first pass. The mass-revoke circuit breaker
   aborts a pass that would revoke more than **both** `ad_session_revoke_max` accounts and
   `ad_session_revoke_max_fraction` of the accounts it probed, and an aborted pass revokes nothing.
@@ -792,15 +793,31 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   accounts probed is a smaller denominator. Each abort writes an ERROR and an audit row. The two
   breaker thresholds are named only while the budget is above the cap, since otherwise the breaker
   cannot trip at all.
+- **What you lose, the outage page:** every pass that reads the directory unreachable revokes nothing,
+  so while an outage lasts no directory disable or deletion reaches a signed-in session. The engine
+  pages on the pass that brings the count of such passes to `ad_reconcile_outage_passes` (vault
+  BACKLOG #3709); a pass that asks nothing, or whose every probe failed or faulted with one fault at
+  least, neither counts nor ends the run. A value above `3` delays that page. One less than the
+  value, times `ad_session_recheck_seconds`, after the first outage pass is only the least delay:
+  the passes are an interval apart plus each pass's own run, and an outage pass waits out a directory
+  timeout for each account it probes, so a larger estate, a larger per-pass budget or a longer
+  `ad_connect_timeout` stretches it too. Each outage pass still logs a WARNING and writes an
+  `auth.ad_reconcile_skipped` audit row; only the page waits. The table row above gives the load's
+  bound.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
-  sooner or ends more of them, and none keeps a session the directory withdrew. A higher brake
+  sooner or ends more of them, and none keeps a session the directory withdrew, though a larger
+  budget can stretch the outage page, as the bullet above says. Nor is a shorter
+  outage run: it pages sooner and changes no revocation. A higher brake
   threshold costs availability instead: a misconfigured search base, or a lost read right, signs out
   a wider wave before the brake holds. Load refuses a fraction of `1.0` while the reconciler runs,
   and warns of a budget at or below the cap (BACKLOG #3085).
 - **When acceptable:** a directory that cannot absorb the bind load of the defaults, or an estate whose
-  ordinary offboarding waves trip the default brake.
+  ordinary offboarding waves trip the default brake. For a longer outage run: a directory whose
+  routine maintenance makes it unreachable for longer than the default run, where the page would
+  otherwise fire on every window.
 - **Compensating controls:** keep `[security].max_session_hours` and `sign_out_after_idle_minutes`
-  short, and revoke sessions by hand on offboarding.
+  short, and revoke sessions by hand on offboarding. Against a longer outage run, alert on the
+  per-pass `auth.ad_reconcile_skipped` audit rows or their WARNING instead of waiting for the page.
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[auth].ad_connect_timeout`, `ad_receive_timeout` or `ad_group_search_deadline` above its default **with `ad_enabled`** — a stalled directory call holds a thread longer
@@ -2210,6 +2227,7 @@ chapter was not part of the verification above.
 | `[auth].initial_password_expiry_hours` (life of an administrator-issued temporary password) | V6 Authentication (6.4.1, 6.4.5) | **IA-5(1)** Authenticator Management | §164.308(a)(5)(ii)(D) Password Management |
 | `[auth].mfa_recovery_code_count`, `[auth].password_min_length` (recovery codes minted, local password floor) | V6 Authentication | **IA-5(1)** Authenticator Management | §164.308(a)(5)(ii)(D) Password Management |
 | `[auth].ad_session_recheck_strikes`, `ad_session_recheck_max_users`, `ad_session_revoke_max`, `ad_session_revoke_max_fraction` (directory revocation pace and its brake) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.308(a)(3)(ii)(C) Termination Procedures |
+| `[auth].ad_reconcile_outage_passes` (the page on a directory outage, while revocation stops) | V7 Session Management · V16 Security Logging and Error Handling | **AC-2(3)** Disable Accounts · **SI-4(5)** System-Generated Alerts | §164.308(a)(3)(ii)(C) Termination Procedures · §164.312(b) Audit Controls |
 | `[auth].oidc_clock_skew_seconds`, `oidc_jwks_ttl_seconds`, `oidc_jwks_min_refetch_seconds`, `oidc_flow_ttl_seconds`, `oidc_max_age_seconds` (federated token acceptance) | V6 Authentication (6.8) | **IA-2** Identification and Authentication · **IA-8** Identification and Authentication (Non-Organizational Users) | §164.312(d) Person or Entity Authentication |
 | `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, `[[alerts.rules]]` (credential reminders off, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
 | `[api].trusted_proxies` (forwarded header trusted from a multi-address range, up to every peer) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
