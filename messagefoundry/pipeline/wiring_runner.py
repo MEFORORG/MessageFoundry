@@ -190,7 +190,7 @@ from messagefoundry.pipeline.sandbox import (
     graph_shape,
 )
 from messagefoundry.pipeline.saturation import SaturationDetector
-from messagefoundry.pipeline.sharding import owner_shard_of_destination
+from messagefoundry.pipeline.sharding import inbound_guard_settings, owner_shard_of_destination
 from messagefoundry.pipeline.stage_dispatcher import (
     LaneItemResult,
     LaneResultKind,
@@ -229,8 +229,8 @@ from messagefoundry.transports.base import (
     ReplyBodyDropped,
     SyncReplyResolver,
     check_file_key,
+    guard_dir_settings,
     guarded_destination_dirs,
-    guarded_setting_keys,
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
@@ -3060,33 +3060,36 @@ class RegistryRunner:
         every outbound, bound or not, deployed or not. Read from the configuration rather than the
         running connections, so a stopped, failed or DR-parked one stays protected. Under
         ``serve --shard`` this shard's ``inbound`` map holds only its own inbounds, so the inbounds
-        come from :meth:`Registry.inbound_specs`, the whole config's; outbounds are never filtered.
-        Only the settings a connector declares its directories from are resolved
-        (:func:`guarded_setting_keys`). None when one of those cannot be resolved (a missing env()
-        value, say): the caller then deletes nothing, because a guard that silently drops a directory
-        fails open."""
+        come from :func:`inbound_guard_settings`, the whole config's; outbounds are never
+        filtered. Only the settings a connector declares its directories from are resolved
+        (:func:`guard_dir_settings`). None when one of those cannot be resolved (a missing env()
+        value, or a connector that declares directories but not their settings): the caller then
+        deletes nothing, because a guard that silently drops a directory fails open."""
         connections = [
-            (False, name, spec, inbound_record_name(name))
-            for name, spec in self.registry.inbound_specs().items()
-        ] + [(True, name, oc.spec, name) for name, oc in self.registry.outbound.items()]
-        dirs: list[Path] = []
-        for outbound, name, spec, record in connections:
-            keys = guarded_setting_keys(spec.type, outbound=outbound)
-            if keys == ():
-                continue  # a fault in a connection with no directories cannot hide one
-            declared = (
-                spec.settings
-                if keys is None  # directories declared, their settings not: resolve them all
-                else {k: spec.settings[k] for k in keys if k in spec.settings}
+            (False, name, kind, declared, inbound_record_name(name))
+            for name, (kind, declared) in inbound_guard_settings(self.registry).items()
+        ] + [
+            (
+                True,
+                name,
+                oc.spec.type,
+                guard_dir_settings(oc.spec.type, oc.spec.settings, outbound=True),
+                name,
             )
+            for name, oc in self.registry.outbound.items()
+        ]
+        dirs: list[Path] = []
+        for outbound, name, kind, declared, record in connections:
             try:
+                if declared is None:
+                    raise TypeError("directories declared without the settings they come from")
+                if not declared:
+                    continue  # a fault in a connection with no directories cannot hide one
                 settings = resolve_env_settings(declared, self._env_values, connection=record)
                 dirs.extend(
-                    guarded_destination_dirs(
-                        Destination(type=spec.type, name=name, settings=settings)
-                    )
+                    guarded_destination_dirs(Destination(type=kind, name=name, settings=settings))
                     if outbound
-                    else guarded_source_dirs(Source(type=spec.type, name=name, settings=settings))
+                    else guarded_source_dirs(Source(type=kind, name=name, settings=settings))
                 )
             except (WiringError, ValueError, TypeError, KeyError) as exc:
                 log.warning(

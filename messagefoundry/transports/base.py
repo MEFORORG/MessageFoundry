@@ -65,6 +65,7 @@ __all__ = [
     "archive_dir_key",
     "build_archive_guard",
     "guarded_destination_dirs",
+    "guard_dir_settings",
     "guarded_setting_keys",
     "guarded_source_dirs",
     "FILE_KEY_SCHEME",
@@ -766,15 +767,28 @@ def build_archive_guard(dirs: Iterable[Path]) -> ArchiveGuard:
 def guarded_setting_keys(kind: ConnectorType, *, outbound: bool = False) -> tuple[str, ...] | None:
     """The settings the connector registered for ``kind`` reads its guarded directories from
     (:func:`guarded_source_dirs`, :func:`guarded_destination_dirs`): ``()`` when it declares no
-    directories, and None when it declares directories but not the settings they come from, so
-    the caller resolves every setting rather than hand ``guarded_dirs`` a partial view. Only the
-    declared settings are resolved for the guard, so another setting's ``env()`` value, a
-    not-deployed connection's secret say, is neither read nor able to switch the sweep off."""
+    directories, and None when it declares directories but not the settings they come from."""
     builder = (_DESTINATIONS if outbound else _SOURCES).get(kind)
     if not callable(getattr(builder, "guarded_dirs", None)):
         return ()
     keys = getattr(builder, "guarded_setting_keys", None)
     return None if keys is None else tuple(keys)
+
+
+def guard_dir_settings(
+    kind: ConnectorType, settings: Mapping[str, Any], *, outbound: bool = False
+) -> dict[str, Any] | None:
+    """Only the settings a connection of ``kind`` reads its guarded directories from, copied out of
+    ``settings`` before ``env()`` resolution (:func:`guarded_setting_keys`): empty when it declares no
+    directories, and None when it declares directories but not their settings, which the guard
+    treats as unresolvable (fail closed) rather than handing ``guarded_dirs`` every setting. Nothing
+    else is carried, so a credential setting never travels with the guard, and another setting's
+    ``env()`` value, a not-deployed connection's secret say, is neither read nor able to switch the
+    sweep off (BACKLOG #1188)."""
+    keys = guarded_setting_keys(kind, outbound=outbound)
+    if keys is None:
+        return None
+    return {k: settings[k] for k in keys if k in settings}
 
 
 def guarded_source_dirs(config: Source) -> tuple[Path, ...]:

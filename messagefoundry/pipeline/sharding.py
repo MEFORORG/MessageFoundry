@@ -54,11 +54,14 @@ event loop and no process state, so they are safe to call from the loader, the e
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from types import MappingProxyType
+from typing import Any
 
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import Registry
+from messagefoundry.transports.base import guard_dir_settings
 
 #: The implicit shard every ``shard=None`` (untagged) inbound connection belongs to. A config with no
 #: shard tags at all is therefore a single-shard deployment named ``"default"`` — ``supervise`` spawns
@@ -169,6 +172,21 @@ def owned_destination_set(registry: Registry, shard: str, ids: Sequence[str]) ->
     )
 
 
+def inbound_guard_settings(
+    registry: Registry,
+) -> dict[str, tuple[ConnectorType, Mapping[str, Any] | None]]:
+    """Every deployment inbound's directory settings for the ``.processed`` archive sweep's guard
+    (BACKLOG #1188), NAME -> (type, :func:`guard_dir_settings`): the pinned unfiltered map when
+    ``registry`` is one engine shard's filtered view, else derived from its own inbounds. Only the
+    directory settings, never a whole spec, so no credential setting travels with it."""
+    if registry.all_inbound_guard_settings is not None:
+        return dict(registry.all_inbound_guard_settings)
+    return {
+        name: (ic.spec.type, guard_dir_settings(ic.spec.type, ic.spec.settings))
+        for name, ic in registry.inbound.items()
+    }
+
+
 def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
     """A :class:`Registry` exposing ONLY ``shard``'s inbound connections, sharing everything else.
 
@@ -239,8 +257,11 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
         all_pt_inbound=(
             MappingProxyType(dict(registry.passthrough_inbounds())) if sharded else None
         ),
-        # Pin the UNFILTERED inbound specs for the `.processed` archive sweep's guard (BACKLOG #1188):
-        # an archive directory equal to, or holding, a sibling shard's watch or `.error` directory
-        # would otherwise age out that shard's drops. Derived from the SOURCE registry, as above.
-        all_inbound_specs=(MappingProxyType(dict(registry.inbound_specs())) if sharded else None),
+        # Pin the UNFILTERED inbounds' directory settings for the `.processed` archive sweep's guard
+        # (BACKLOG #1188): an archive directory equal to, or holding, a sibling shard's watch or
+        # `.error` directory would otherwise age out that shard's drops. Derived from the SOURCE
+        # registry, as above.
+        all_inbound_guard_settings=(
+            MappingProxyType(inbound_guard_settings(registry)) if sharded else None
+        ),
     )

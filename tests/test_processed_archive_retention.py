@@ -388,7 +388,8 @@ def test_the_guard_names_a_sibling_engine_shards_inbound(tmp_path: Path) -> None
     """Under `serve --shard` the runner's registry holds only this shard's inbounds; the guard still
     names the sibling shard's watch and `.error` directories, from the whole config's specs.
 
-    Mutation: read `self.registry.inbound` in `archive_guard_dirs`, or drop `all_inbound_specs`
+    Mutation: read `self.registry.inbound` in `archive_guard_dirs`, or drop
+    `all_inbound_guard_settings`
     from the shard filter. Red."""
     reg = Registry()
     reg.add_inbound(_file_inbound("IB_MINE", tmp_path / "mine", shard="s1"))
@@ -401,6 +402,30 @@ def test_the_guard_names_a_sibling_engine_shards_inbound(tmp_path: Path) -> None
     assert dirs is not None
     assert tmp_path / "sibling" in dirs and tmp_path / "sibling" / ".error" in dirs
     assert tmp_path / "mine" in dirs
+
+
+def test_the_shard_pin_carries_only_directory_settings(tmp_path: Path) -> None:
+    """The pinned sibling-shard view holds the directory settings, never a credential setting.
+
+    Mutation: pin each inbound's whole settings in `inbound_guard_settings`. Red."""
+    reg = Registry()
+    reg.add_inbound(_file_inbound("IB_MINE", tmp_path / "mine", shard="s1"))
+    reg.add_inbound(
+        InboundConnection(
+            "IB_SIBLING",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "sib"), "credential_password": env("NOT_SET_HERE")},
+            ),
+            router="r",
+            shard="s2",
+        )
+    )
+
+    pinned = filter_registry_for_shard(reg, "s1").all_inbound_guard_settings
+
+    assert pinned is not None
+    assert pinned["IB_SIBLING"] == (ConnectorType.FILE, {"directory": str(tmp_path / "sib")})
 
 
 def test_the_guard_names_every_file_outbound_target_directory(tmp_path: Path) -> None:
