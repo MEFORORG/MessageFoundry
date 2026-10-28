@@ -91,15 +91,18 @@ so the task cannot hang a lane.
 
 The action fires on the **same throttle gate** as the notification — at most once per `realert_seconds`
 (or the rule's `cooldown_seconds`) per `(event_type, connection)` — so a flapping lane cannot trigger a
-restart storm. **Amendment (BACKLOG #1741):** an auto-resolve by `connection_started`, which the runner
-raises only once an inbound genuinely comes up, ends the `connection_stopped` window, so a later stop is a
-new incident that pages and acts at once. The start inside a `connection_stopped` rule's restart of its own
-inbound raises no `connection_started`, so a loop that rule drives keeps the bound. A loop driven by some
-other door that starts the inbound is bounded by that door's own cadence instead. It is **independent of transport suppression**: a rule may set `transports=[]` to
+restart storm. It is **independent of transport suppression**: a rule may set `transports=[]` to
 auto-remediate **quietly** (restart, no page) or fire alongside a page. The control action requires the
 **notifier** to be active (≥1 transport configured), since it is a notifier outcome; a deployment that
 wants transportless remediation configures at least one transport (documented; a transportless-notifier
 mode is a possible follow-up).
+
+**Amendment (BACKLOG #1741).** One event ends a window early. When alert-state is wired, a
+`connection_started` that the runner raises once an inbound genuinely comes up resolves the open
+`connection_stopped` instance and ends that key's window, so a later stop is a new incident that pages and
+acts at once. A start an alert rule's `restart_inbound` makes never ends a window, whichever rule
+dispatched it, so a loop of rule restarts, including two rules restarting each other's inbound, keeps the
+bound above. An operator's resolve by hand does not end the window.
 
 ## Options considered
 

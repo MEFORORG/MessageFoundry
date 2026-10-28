@@ -844,6 +844,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # control wired (a control_action rule then no-ops, logged). The sink NEVER imports the runner.
         self._control_cb: ControlCallback | None = None
         self._control_tasks: set[asyncio.Task[None]] = set()
+        # BACKLOG #1741: inbound name -> restart_inbound control actions in flight for it. The runner
+        # raises connection_started inside that restart, and such a start must not end a cooldown.
+        self._control_starts: dict[str, int] = {}
 
     # --- AlertSink emit methods (sync, non-blocking) -------------------------
 
@@ -1500,11 +1503,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def connection_started(self, name: str) -> None:
         """The inverse of ``connection_stopped`` (BACKLOG #1741; the Protocol says when it fires). No
-        notification; auto-resolves the open instance when alert-state is wired. It also ends the
-        cooldown, as ``crl_reload_applied`` does, so a stop that follows inside it is a new incident
-        that pages and dispatches its rule's control action. A rule's own self-restart raises no
-        start, so a crash loop it drives stays throttled."""
-        self._last_sent.pop(f"connection_stopped:{name}", None)
+        notification; auto-resolves the open instance when alert-state is wired. That resolve also
+        ends the cooldown, as ``crl_reload_applied`` does, so a stop that follows inside it is a new
+        incident that pages and dispatches its rule's control action. A start an alert control action
+        is making for ``name`` keeps the cooldown, so rules restarting each other's inbound, or any
+        rule-driven loop, stay at one page and one restart per cooldown (ADR 0128 section 4)."""
+        if self._store is not None and name not in self._control_starts:
+            self._last_sent.pop(f"connection_stopped:{name}", None)
         self._record_state({"type": "connection_started", "connection": name}, "info")
 
     @staticmethod
@@ -1746,8 +1751,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._control_tasks.add(task)
         task.add_done_callback(self._control_tasks.discard)
 
-    @staticmethod
     async def _run_control(
+        self,
         cb: ControlCallback,
         action: str,
         target: str,
@@ -1755,12 +1760,23 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         default_target: bool,
         self_restart: bool,
     ) -> None:
+        # Any rule's restart_inbound, not only a self-restart (BACKLOG #1741, see connection_started).
+        marked = action == "restart_inbound"
+        if marked:
+            self._control_starts[target] = self._control_starts.get(target, 0) + 1
         try:
             await cb(action, target, default_target=default_target, self_restart=self_restart)
         except Exception:
             # NEVER-RAISE (ADR 0128 §3): a rejected/hung restart (unknown / not-deployed / shard-not-owner
             # connection) must never break alerting or delivery. Swallow + log metadata only (no PHI).
             log.warning("alert control_action %s for %r failed", action, target, exc_info=True)
+        finally:
+            if marked:
+                left = self._control_starts[target] - 1
+                if left:
+                    self._control_starts[target] = left
+                else:
+                    del self._control_starts[target]
 
     async def _handle(self, event: dict[str, Any]) -> None:
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)

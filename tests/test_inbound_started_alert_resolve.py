@@ -632,18 +632,22 @@ async def test_a_deliberately_parked_outbound_namesake_does_not_block_the_resolv
         await runner.stop()
 
 
-async def test_a_stop_after_an_auto_resolve_pages_and_acts_inside_the_cooldown() -> None:
+async def test_a_stop_after_an_auto_resolve_pages_and_acts_inside_the_cooldown(
+    store: MessageStore,
+) -> None:
     # A stop that returns after connection_started resolved the last one is a new incident, so it
-    # pages and dispatches its rule's restart at once, as a first occurrence does. A repeat while the
-    # instance is still open stays throttled for the cooldown, as before.
+    # pages and dispatches its rule's restart at once, at the base tier, as a first occurrence
+    # does. A repeat while the instance is still open stays throttled for the cooldown, as before.
     rule = AlertRule(
         event_type="connection_stopped",
         connection="IB",
         severity=AlertSeverity.WARNING,
         control_action="restart_inbound",
+        control_target="OTHER",  # a restart that makes no start for IB
+        escalate=[EscalationTier(after_count=2, severity=AlertSeverity.CRITICAL)],
     )
     pages = _RecordingTransport()
-    sink = NotifierAlertSink([pages], realert_seconds=3600.0, rules=[rule])
+    sink = NotifierAlertSink([pages], realert_seconds=3600.0, rules=[rule], store=store)
     restarts: list[str] = []
 
     async def _control(
@@ -656,10 +660,54 @@ async def test_a_stop_after_an_auto_resolve_pages_and_acts_inside_the_cooldown()
     try:
         sink.connection_stopped("IB", detail="router halted on internal error")
         sink.connection_stopped("IB", detail="router halted on internal error")  # still open
+        await _settle(sink, sink._control_tasks)
         sink.connection_started("IB")
         sink.connection_stopped("IB", detail="router halted on internal error")  # new incident
         await _settle(sink, sink._control_tasks)
+        await _settle(sink)
+        assert await _open(store) == {("connection_stopped", "IB")}
     finally:
         await sink.aclose()
-    assert restarts == ["IB", "IB"]
-    assert [e["type"] for e in pages.events] == ["connection_stopped"] * 2
+    assert restarts == ["OTHER", "OTHER"]
+    assert [e["severity"] for e in pages.events] == ["warning", "warning"]
+
+
+async def test_rules_restarting_each_others_inbound_keep_the_cooldown(
+    store: MessageStore,
+) -> None:
+    # Two connection_stopped rules that restart each other's inbound. Neither restart is a
+    # self-restart, so the start each makes raises connection_started for its target, as the runner
+    # does inside restart_inbound. A start an alert control action makes must not end a cooldown,
+    # or the pair would page and restart at the halt cadence (ADR 0128 section 4).
+    rules = [
+        AlertRule(
+            event_type="connection_stopped",
+            connection=src,
+            control_action="restart_inbound",
+            control_target=dst,
+        )
+        for src, dst in (("IB_A", "IB_B"), ("IB_B", "IB_A"))
+    ]
+    pages = _RecordingTransport()
+    sink = NotifierAlertSink([pages], realert_seconds=3600.0, rules=rules, store=store)
+    restarts: list[str] = []
+
+    async def _control(
+        action: str, target: str, *, default_target: bool, self_restart: bool = False
+    ) -> None:
+        assert not self_restart
+        restarts.append(target)
+        sink.connection_started(target)
+
+    sink.set_control_callback(_control)
+    sink.start()
+    try:
+        for name in ("IB_A", "IB_B", "IB_A", "IB_B"):
+            sink.connection_stopped(name, detail="router halted on internal error")
+            await _settle(sink, sink._control_tasks)
+        await _settle(sink)
+        assert sink._control_starts == {}
+    finally:
+        await sink.aclose()
+    assert restarts == ["IB_B", "IB_A"]
+    assert [e["connection"] for e in pages.events] == ["IB_A", "IB_B"]
