@@ -36,10 +36,7 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
     env,
 )
-from messagefoundry.pipeline.alert_sinks import (
-    _AUTO_RESOLVE,
-    NotifierAlertSink,
-)
+from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -420,20 +417,32 @@ async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
     assert [e["severity"] for e in pages.events] == ["warning", "warning", "critical", "critical"]
 
 
-async def test_an_operator_resolve_still_restarts_the_count() -> None:
-    # Only the connection_started inverse keeps the count; forget() (an operator resolve) and every
-    # other inverse still clear it, as ADR 0133 D1 says.
-    sink = NotifierAlertSink([])
-    sink._occurrences["connection_stopped:IB"] = 5
-    sink._occurrences["connection_error:OB"] = 5
-    sink.forget("connection_stopped", "IB")
-    assert "connection_stopped:IB" not in sink._occurrences
-
+async def test_only_the_rules_own_restart_keeps_the_count() -> None:
+    # The sink-level contract: a connection_started raised while this sink's restart_inbound of the
+    # inbound runs keeps the escalation count; any other start, a restart_outbound and every other
+    # inverse reset it, as ADR 0133 D1 says. The suspend entry is dropped either way.
     class _Resolve:
         async def resolve_alert_instances_for(self, **_kw: object) -> int:
             return 0
 
-    sink.set_store(_Resolve())  # type: ignore[arg-type]
+    sink = NotifierAlertSink([], store=_Resolve())  # type: ignore[arg-type]
+    seen: list[int | None] = []
+
+    async def _control(action: str, target: str, *, default_target: bool) -> None:
+        sink.connection_started(target)  # the start inside the restart
+        seen.append(sink._occurrences.get("connection_stopped:IB"))
+
+    for action, kept in (("restart_inbound", 5), ("restart_outbound", None)):
+        sink._occurrences["connection_stopped:IB"] = 5
+        sink._suspended["connection_stopped:IB"] = 1e12
+        await sink._run_control(_control, action, "IB", default_target=True)
+        assert seen.pop() == kept
+        assert "connection_stopped:IB" not in sink._suspended
+    assert sink._restarting == {}
+    # A start nobody's rule asked for: an operator start after a fix.
+    sink.connection_started("IB")
+    assert "connection_stopped:IB" not in sink._occurrences
+    sink._occurrences["connection_error:OB"] = 5
     sink.connection_restored("OB")
     assert "connection_error:OB" not in sink._occurrences
     await _settle(sink)

@@ -153,14 +153,14 @@ _AUTO_RESOLVE: dict[str, str] = {
     "crl_reload_applied": "crl_reload_refused",
 }
 
-#: Inverses whose auto-resolve keeps the #81 escalation occurrence count (BACKLOG #1741).
-#: ``connection_started`` fires after every successful start, and a ``restart_inbound`` rule
-#: restarts the connection its own ``connection_stopped`` named. Resetting the count there would
-#: restart a crash loop at the base tier every cycle, so an ``after_count`` tier would never be
-#: reached; keeping it escalates the loop exactly as an instance nothing resolves does. Only an
-#: operator resolve (:meth:`NotifierAlertSink.forget`) clears the count for these. Every other
-#: inverse resets the count, as ADR 0133 D1 states.
-_AUTO_RESOLVE_KEEPS_ESCALATION: frozenset[str] = frozenset({"connection_started"})
+#: BACKLOG #1741: a ``restart_inbound`` rule restarts the inbound its own ``connection_stopped``
+#: named, and the start raises ``connection_started``, which resolves that instance. Resetting the
+#: #81 escalation count there would restart a crash loop at the base tier every cycle, so an
+#: ``after_count`` tier would never be reached. So the ``connection_stopped`` count survives a
+#: resolve raised WHILE this sink's own ``restart_inbound`` of that inbound runs, as it does for an
+#: instance nothing resolves. Any other start resets it, as ADR 0133 D1 says, and so does every
+#: other inverse: only this action marks a key (``NotifierAlertSink._restarting``).
+_ESCALATION_KEEPING_ACTION = "restart_inbound"
 
 _T = TypeVar("_T")
 
@@ -828,9 +828,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #81 (ADR 0133): per-(type:connection) OCCURRENCE counter driving occurrence-based escalation.
         # Mirrors the store's `count` (both increment once per emit) but read SYNCHRONOUSLY in _emit to
         # pick the escalation tier. In-memory + per-node (advisory, like _last_sent); reset on auto-resolve
-        # (except _AUTO_RESOLVE_KEEPS_ESCALATION) + operator resolve (the durable count/escalation_tier
-        # is the cross-restart record).
+        # + operator resolve (the durable count/escalation_tier is the cross-restart record). Not reset by
+        # the resolve a rule's own restart causes (_ESCALATION_KEEPING_ACTION), so for that key it can
+        # run ahead of the reopened instance's durable count.
         self._occurrences: dict[str, int] = {}
+        # BACKLOG #1741: "<type>:<connection>" keys whose escalation-keeping restart is running, with
+        # how many such restarts are in flight. _run_control adds and drops them around the callback.
+        self._restarting: dict[str, int] = {}
         # #144 (ADR 0128): the injected async connection-control callback (action, target) → awaitable,
         # wired by the api/app.py lifespan to RegistryRunner.restart_inbound/restart_outbound. None = no
         # control wired (a control_action rule then no-ops, logged). The sink NEVER imports the runner.
@@ -1627,9 +1631,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
             # re-open of the SAME key starts un-suspended at the base tier (the durable suspended_until /
             # escalation_tier were on the now-resolved row and never return via list_active).
-            # The count survives for the inverses in _AUTO_RESOLVE_KEEPS_ESCALATION (BACKLOG #1741).
+            # BACKLOG #1741: except the count, when a rule's own restart raised this inverse.
             self._suspended.pop(key, None)
-            if etype not in _AUTO_RESOLVE_KEEPS_ESCALATION:
+            if key not in self._restarting:
                 self._occurrences.pop(key, None)
             coro = store.resolve_alert_instances_for(
                 event_type=inverse_of, connection=connection, now=now
@@ -1714,16 +1718,26 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._control_tasks.add(task)
         task.add_done_callback(self._control_tasks.discard)
 
-    @staticmethod
     async def _run_control(
-        cb: ControlCallback, action: str, target: str, *, default_target: bool
+        self, cb: ControlCallback, action: str, target: str, *, default_target: bool
     ) -> None:
+        # BACKLOG #1741: the start inside this restart raises connection_started synchronously, so a
+        # key marked for the callback's span is the start this restart made.
+        mark = f"connection_stopped:{target}" if action == _ESCALATION_KEEPING_ACTION else None
+        if mark is not None:
+            self._restarting[mark] = self._restarting.get(mark, 0) + 1
         try:
             await cb(action, target, default_target=default_target)
         except Exception:
             # NEVER-RAISE (ADR 0128 §3): a rejected/hung restart (unknown / not-deployed / shard-not-owner
             # connection) must never break alerting or delivery. Swallow + log metadata only (no PHI).
             log.warning("alert control_action %s for %r failed", action, target, exc_info=True)
+        finally:
+            if mark is not None:
+                if (left := self._restarting[mark] - 1) > 0:
+                    self._restarting[mark] = left
+                else:
+                    del self._restarting[mark]
 
     async def _handle(self, event: dict[str, Any]) -> None:
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)
