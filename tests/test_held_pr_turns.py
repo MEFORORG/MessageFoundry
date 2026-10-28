@@ -735,6 +735,29 @@ def test_a_page_that_cannot_say_it_is_the_last_is_a_read_failure(
         assert rows[0]["error"].startswith("read failed")
 
 
+@pytest.mark.parametrize(
+    "page_info",
+    [{"endCursor": None}, {"hasNextPage": None}, {"hasNextPage": "false"}, {"hasNextPage": 0}],
+)
+def test_a_has_next_page_that_is_not_a_bool_is_a_read_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], page_info: dict[str, Any]
+) -> None:
+    # Reading a missing or non-bool flag as "no next page" would print a partial list as whole.
+    page = _page([_pr(77)])
+    page["data"]["repository"]["pullRequests"]["pageInfo"] = page_info
+    code, rows = _run(tmp_path, {KORUS: {"pages": [page]}}, capsys, "--repo", KORUS)
+    assert code == 0
+    assert [r["turn"] for r in rows] == ["ERROR"]
+    assert rows[0]["error"].startswith("read failed") and "hasNextPage" in rows[0]["error"]
+
+    def gh(args: list[str], stdin: str | None) -> str:
+        return json.dumps(page)
+
+    assert hpt.main(["--repo", KORUS, "--json"], gh=gh, now=lambda: NOW) == 0
+    live = json.loads(capsys.readouterr().out)
+    assert [r["turn"] for r in live] == ["ERROR"] and "hasNextPage" in live[0]["error"]
+
+
 def test_input_file_with_a_bom_is_read(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = tmp_path / "bom.json"
     doc = {KORUS: {"pages": [_page([_pr(78)])]}}

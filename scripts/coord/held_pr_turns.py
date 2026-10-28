@@ -474,8 +474,12 @@ def _take_page(read: RepoRead, conn: object) -> str | None:
         and isinstance(conn.get("nodes"), list)
     ):
         raise ReadError("a page has no pullRequests connection with pageInfo and nodes")
+    has_next = page.get("hasNextPage")
+    if not isinstance(has_next, bool):
+        # A missing or non-bool flag is no proof that this is the last page.
+        raise ReadError(f"pageInfo.hasNextPage is not a bool: {has_next!r}"[:200])
     read.prs.extend(conn["nodes"])
-    if not page.get("hasNextPage"):
+    if not has_next:
         return None
     cursor = page.get("endCursor")
     if not cursor:
