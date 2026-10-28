@@ -657,8 +657,9 @@ def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | N
     :func:`~messagefoundry.auth.trust_anchors.has_private_key_label_bytes` (BACKLOG #3745).
 
     :func:`_driver_file_spellings` says which paths are left to the driver, and which spellings
-    are read. A share Windows cannot reach is refused, unless ``sslmode`` turns TLS off
-    (:func:`generic_odbc_tls_off`): then the driver reads no CA, so it never meets that file.
+    are read. A share Windows reports as not found because it could not reach it is refused,
+    unless ``sslmode`` turns TLS off (:func:`generic_odbc_tls_off`): then the driver reads no CA,
+    so it never meets that file.
 
     **It runs when the connection is built, not at each connect.** What checks the file after
     that, and what does not, is ``auth.trust_anchors`` module item 12."""
@@ -768,7 +769,7 @@ def _read_driver_file(
         if _names_no_file(exc):
             logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
             return None
-        if leave_unreachable and isinstance(exc, FileNotFoundError):
+        if leave_unreachable and getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
             logger.debug(
                 "%s: the share was not reached, and the driver reads no such file", setting
             )

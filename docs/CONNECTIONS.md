@@ -1751,9 +1751,10 @@ first `-----BEGIN` is refused when the connection is built (BACKLOG #3090). The 
 file with its own TLS library, which can wait for a password on an encrypted block. At least
 these cases are left to the driver unchecked: a file that does not exist, a directory (an
 `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot read, or one
-over 1 MiB, is refused. So is a file on a share Windows cannot reach when the connection is
-built, except under `SSLmode=disable` (or `SSLMODE=DISABLED`), where the driver reads no CA and
-the file is left to it. An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
+over 1 MiB, is refused. That includes a share Windows cannot reach when the connection is
+built, however it fails. One case is left to the driver instead: under the TLS-off modes the lane
+check below names, a share Windows reports as not found because it could not reach it (errors
+53 and 67). An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
 first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA file is public trust
 material.
 

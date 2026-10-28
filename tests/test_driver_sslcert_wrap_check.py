@@ -351,6 +351,28 @@ def test_an_unreachable_sslca_the_driver_never_reads_does_not_fail_the_build(
         _build(path, spelling="sslca")
 
 
+@pytest.mark.parametrize(("spelling", "left"), [("sslca", True), ("sslkey", False)])
+def test_a_directory_swapped_in_that_fails_the_open_is_judged_as_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str, left: bool
+) -> None:
+    """On Windows a directory swapped in after the stat fails the open with PermissionError, so
+    that failure alone is looked at again: a directory is left to the driver, and refused unread
+    as ``sslkey``. Red with ``PermissionError`` dropped from the failures re-checked: the CA
+    directory is refused as unreadable, and the key as unreadable rather than as no file."""
+    folder = tmp_path / "swapped"
+    folder.mkdir()
+
+    def failing(*_args: Any) -> bytes | None:
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(database, "read_if_regular", failing)
+    if left:
+        assert f"{spelling}={{{folder}}}" in _build(str(folder), spelling=spelling)
+    else:
+        with pytest.raises(KeyWrapRefused, match="not a regular file"):
+            _build(_write(tmp_path, b"plain"), extra={spelling: str(folder)})
+
+
 def test_an_unreachable_sslca_under_tls_off_is_read_at_one_spelling_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
