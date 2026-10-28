@@ -5134,12 +5134,16 @@ recorded as `lapsed`, not `revoked`, and still names the owner.
 
 **A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
 clears the cookie. That row is then missing, with an ERROR log line; the line names the session
-when the sign-out ended one.
+when the sign-out ended one. A failed owner lookup writes the row with no actor, so it does not
+reach that user's security-events feed.
 
-A sign-out that presents a token and ends nothing also writes an `auth.logout` row, with `outcome`
-`nothing_to_revoke`. `/ui/logout` has no sign-in check and charges no budget, so nothing in the
-engine bounds how many such rows an unauthenticated caller can append: on a deployment, a proxy
-limiter in front of `/ui/logout` is the only bound. That is an open gap, not a control.
+**Open gap: nothing in the engine bounds sign-outs that end nothing.** Such a sign-out still
+writes an `auth.logout` row, with `outcome` `nothing_to_revoke`. `/ui/logout` has no sign-in
+check and charges no budget. So an unauthenticated caller could append these rows without limit
+on a deployment. Each one is also a write transaction on the shared store, competing with message
+intake for the writer. This is an exception to the abuse-protection inventory below. At least
+these narrow it: the default `127.0.0.1` bind, `[security].allowed_client_networks`, and a proxy
+limiter in front of `/ui/logout`. `[retention].audit_log_warn_rows` warns as `audit_log` grows.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
