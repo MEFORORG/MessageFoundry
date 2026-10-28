@@ -8,6 +8,7 @@ import * as path from "path";
 import { nonce } from "../../cspNonce";
 import { assertBrowsableUrl, assertTargetAllowed } from "../../engineTarget";
 import { getJson, postJson } from "../../engineClient";
+import type { EngineTlsOptions } from "../../engineClient";
 import { WEBVIEW_GUARD_NOTE } from "../../webviewMessaging";
 
 // Four hardening properties of the extension, asserted against the SOURCE as well as against
@@ -310,8 +311,22 @@ suite("https requests carry a pinned TLS floor", () => {
     assert.strictEqual(captured!.minVersion, "TLSv1.2");
   });
 
+  // Node's own default is 1024. engine-client-dh.test.ts shows the value refusing a real handshake.
+  // `@types/node` leaves `minDHSize` off `https.RequestOptions`, though `tls.connect` reads it.
+  test("getJson over https pins the DHE group floor to 2048 bits (BACKLOG #300)", async () => {
+    await assert.rejects(getJson("https://engine.example.com", "/health"));
+    assert.ok(captured, "the interceptor never ran — the test proves nothing");
+    assert.strictEqual((captured as EngineTlsOptions).minDHSize, 2048);
+  });
+
+  test("postJson over https pins the DHE group floor to 2048 bits (BACKLOG #300)", async () => {
+    await assert.rejects(postJson("https://engine.example.com", "/promote", { a: 1 }));
+    assert.ok(captured, "the interceptor never ran — the test proves nothing");
+    assert.strictEqual((captured as EngineTlsOptions).minDHSize, 2048);
+  });
+
   test("a plain-http request does not go through the https transport at all", async () => {
-    // NEGATIVE CONTROL. If the interceptor fired here, the previous two assertions would not be
+    // NEGATIVE CONTROL. If the interceptor fired here, the assertions above would not be
     // telling us anything about scheme-conditional behaviour.
     await assert.rejects(getJson("http://127.0.0.1:1/health", "/health", undefined, 50));
     assert.strictEqual(captured, undefined, "an http:// URL must not reach https.request");

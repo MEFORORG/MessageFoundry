@@ -5,6 +5,7 @@
 // the Node built-ins (no global `fetch` dependency, no npm deps) — same zero-dep style as cli.ts.
 import * as http from "node:http";
 import * as https from "node:https";
+import type * as tls from "node:tls";
 
 import { serveCommandLine } from "./engineControlModel";
 import {
@@ -177,6 +178,29 @@ export const TLS_13_SUITES: readonly string[] = [
 
 /** Both suite lists as the one OpenSSL cipher string Node's `ciphers` option takes. */
 export const TLS_CIPHERS = TLS_12_SUITES.concat(TLS_13_SUITES).join(":");
+
+/**
+ * The smallest DHE group, in bits, this client accepts from a server (BACKLOG #300). Node's own
+ * default is 1024.
+ *
+ * {@link TLS_12_SUITES} names one DHE suite, `DHE-RSA-AES256-GCM-SHA384`, and keeps it: the floor
+ * bounds the group that suite may run over, rather than dropping the suite. The engine's own
+ * listener was measured accepting `ffdhe2048` and `ffdhe3072` (`harden_kex_groups` in
+ * `messagefoundry/config/tls_policy.py`), and both pass this floor.
+ *
+ * OpenSSL 3.2 and later already refuse a group under 2048 bits at their default security level
+ * (measured on Node 24.20.0 / OpenSSL 3.5.7: "dh key too small"). This option holds the same floor
+ * where that level is lower: OpenSSL before 3.2 defaults to level 1, which admits 1024, and a
+ * system OpenSSL configuration can lower it. VS Code's desktop runtime, Electron with BoringSSL, is
+ * taken to negotiate no DHE suite, so there the option has nothing to act on.
+ */
+export const TLS_MIN_DH_SIZE = 2048;
+
+/**
+ * What {@link tlsOptions} returns. `https.request` hands its options to `tls.connect`, which reads
+ * `minDHSize`, but `@types/node` does not list that field on `https.RequestOptions`.
+ */
+export type EngineTlsOptions = https.RequestOptions & Pick<tls.ConnectionOptions, "minDHSize">;
 
 /**
  * Extra trust anchors, keyed by `host:port` (see {@link engineHostKey}) — BACKLOG #1695.
@@ -380,15 +404,22 @@ async function withRenewalRetry<T>(
  * and now paid on purpose: a TLS terminator in front of the engine that speaks only CBC suites will
  * fail the handshake, and the fix is on that terminator. The list names TLS 1.3 suites too, which
  * take effect on plain Node and not under the desktop's Electron; {@link TLS_13_SUITES} says more.
+ *
+ * `minDHSize` is {@link TLS_MIN_DH_SIZE}, so the one DHE suite in the list never runs over a group
+ * under 2048 bits.
  */
-export function tlsOptions(url: URL): https.RequestOptions {
+export function tlsOptions(url: URL): EngineTlsOptions {
   if (url.protocol !== "https:") {
     return {};
   }
   // engineHostKey on BOTH sides of the Map (via anchorFor). Spelling the normalization inline here
   // would let a later change to one side make every lookup silently miss.
   const ca = anchorFor(url.href);
-  const base: https.RequestOptions = { minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS };
+  const base: EngineTlsOptions = {
+    minVersion: TLS_MIN_VERSION,
+    ciphers: TLS_CIPHERS,
+    minDHSize: TLS_MIN_DH_SIZE,
+  };
   return ca === undefined ? base : { ...base, ca };
 }
 
