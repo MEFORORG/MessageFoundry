@@ -201,6 +201,9 @@ class CellReading:
     kind: ReadingKind
     values: tuple[object, ...]
     error: CipherError | None = None
+    #: A failed value whose marker names a key the cipher's keyring does not hold. Still a
+    #: failure: a damaged key id reads the same way, and corruption must not be talked down.
+    foreign_key: bool = False
 
     @property
     def where(self) -> str:
@@ -218,6 +221,11 @@ class CellReading:
                 f"to open it (keyless open of an encrypted {source})"
             )
         reason = safe_exc(self.error) if self.error is not None else self.kind
+        if self.foreign_key:
+            reason += (
+                "; its marker names a key these settings do not hold, so a shell without the "
+                "service's key, or a damaged key id, reads this way"
+            )
         return f"{name} {self.where} did not decrypt: {reason}"
 
 
@@ -274,14 +282,16 @@ def read_cipher_cells(
     A cell :func:`cell_present` says the store lacks is skipped: an older store predates it.
 
     A value is sealed when SQLite's ``LIKE 'mfenc:%'`` matches it, the test the restore-verify has
-    always selected with. That match ignores case, and the cipher then refuses ``MFENC:``, so a
-    value with a damaged marker case fails rather than passing.
+    always selected with. That match ignores case and reads a BLOB as text, so a sealed value that
+    is a BLOB, or whose marker is in another case, fails without a decrypt (see :func:`_open`).
 
     The rows of each cell are read in ``rowid`` order, ``chunk_rows`` at a time. Each chunk is one
     statement, read one row at a time and opened as it is read, and its readings are yielded only
-    once the statement is done. So no read transaction stays open while the caller works, a writer
-    on a live store waits on at most one chunk, and memory holds one stored value at a time. The
-    schema version is read after every chunk; a change raises :class:`CipherWalkInterrupted`.
+    once the statement is closed. So no read transaction stays open while the caller works, a
+    writer on a live store waits on at most one chunk's decrypts, and memory holds one stored value
+    at a time. The schema version is read after every chunk; a change raises
+    :class:`CipherWalkInterrupted`. A decrypt that failed because the key service did
+    (:func:`_is_outage`) ends the walk after its reading is yielded.
 
     ``unmarked`` also yields every non-blank value with no marker, in a keyed store only, as
     ``"unmarked"`` or ``"legacy"`` by whether the store has sealed that surface (see
@@ -318,41 +328,101 @@ def read_cipher_cells(
         while True:
             readings: list[CellReading] = []
             count = 0
+            outage = False
             bound = (chunk_rows,) if last is None else (last, chunk_rows)
-            for rowid, sealed, *row in conn.execute(
-                first if last is None else after, params + bound
-            ):
+            cursor = conn.execute(first if last is None else after, params + bound)
+            for rowid, sealed, *row in cursor:
                 count, last = count + 1, int(rowid)
-                where, key, stored = tuple(row[:width]), row[width:-1], str(row[-1])
+                where, key, stored = tuple(row[:width]), row[width:-1], row[-1]
                 if not sealed:
                     readings.append(CellReading(spec, unsealed_kind, where))
                 elif keyless:
                     # LIKE ignores case; the marker does not. A keyless store's plaintext that only
                     # resembles it is not a sealed cell.
-                    if cipher.is_encrypted(stored):
+                    text = _as_text(stored)
+                    if text is not None and cipher.is_encrypted(text):
                         readings.append(CellReading(spec, "keyless", where))
                 else:
-                    readings.append(_open(spec, cipher, stored, key, where))
+                    reading = _open(spec, cipher, stored, key, where)
+                    readings.append(reading)
+                    if reading.error is not None and _is_outage(reading.error):
+                        # One timeout is the evidence; every later value would wait out its own and
+                        # then read as damaged. Stop, and let the caller say which it was.
+                        outage = True
+                        break
+            cursor.close()  # ends the chunk's read transaction even when the loop broke early
             if _schema_version(conn) != version:
                 raise CipherWalkInterrupted(
                     f"the store's schema changed while {table}.{column} was read (a VACUUM or a "
                     "migration), so its rowid chunks no longer line up"
                 )
             yield from readings
+            if outage:
+                return
             if count < chunk_rows:
                 break
 
 
+def _as_text(stored: object) -> str | None:
+    """A stored value as the text the store's reader would see: a ``str`` as it is, a UTF-8 BLOB
+    decoded, anything else ``None``."""
+    if isinstance(stored, str):
+        return stored
+    if isinstance(stored, bytes):
+        try:
+            return stored.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return None
+
+
+def _is_outage(error: CipherError) -> bool:
+    """Whether a failed decrypt was the key service failing rather than the value. The Transit
+    cipher raises :class:`CipherError` for both, from the client's own error: an ``OSError`` for
+    an unreachable Vault (a ``requests`` connection error or timeout is one), and an ``hvac``
+    error for a reply. Vault answers a value it cannot authenticate with HTTP 400, which ``hvac``
+    raises as ``InvalidRequest``; any other ``hvac`` error (a sealed Vault, a token refused, a
+    5xx) is the service. At least those shapes; a cause of any other kind counts as the value's."""
+    cause = error.__cause__
+    if isinstance(cause, OSError):
+        return True
+    return (
+        cause is not None
+        and type(cause).__module__.split(".")[0] == "hvac"
+        and type(cause).__name__ != "InvalidRequest"
+    )
+
+
 def _open(
-    spec: CipherCell, cipher: Cipher, stored: str, key: list[object], where: tuple[object, ...]
+    spec: CipherCell,
+    cipher: Cipher,
+    stored: object,
+    key: list[object],
+    where: tuple[object, ...],
 ) -> CellReading:
-    """Open one sealed value and run its cell's check; the plaintext goes no further."""
+    """Open one value the marker test called sealed, and run its cell's check; the plaintext goes
+    no further. A value the store's reader could not take as a sealed cell fails here without a
+    decrypt: a BLOB, or a marker in another case, which the cipher would otherwise hand to its
+    unmarked-value rule and, under ``allow_unmarked_ciphertext``, return with no tag checked."""
+    if not isinstance(stored, str):
+        return CellReading(
+            spec, "failed", where, CipherError("the sealed value is stored as a BLOB, not text")
+        )
+    if not stored.startswith(MARKER_PREFIX):
+        return CellReading(
+            spec,
+            "failed",
+            where,
+            CipherError(f"the value's at-rest marker is not spelled {MARKER_PREFIX!r}"),
+        )
     try:
         opened = cipher.decrypt(stored, aad=spec.aad(*key))
         if spec.check is not None:
             spec.check(opened, *key)
     except CipherError as exc:
-        return CellReading(spec, "failed", where, exc)
+        holds = getattr(cipher, "holds_key_for", None)
+        foreign = callable(holds) and not holds(stored)
+        return CellReading(spec, "failed", where, exc, foreign_key=foreign)
     return CellReading(spec, "opened", where)
 
 
@@ -405,14 +475,6 @@ class CipherAudit:
         return [t.name for t in self.tallies if not t.present]
 
 
-def _is_outage(error: CipherError) -> bool:
-    """Whether a failed decrypt was the key service unreachable rather than the value: the
-    Transit cipher raises :class:`CipherError` for both, from the transport error, and a
-    ``requests`` connection error or timeout is an ``OSError``. At least that shape; a refusal
-    Vault itself returns while unhealthy is not told apart here."""
-    return isinstance(error.__cause__, OSError)
-
-
 def audit_cipher_cells(
     conn: sqlite3.Connection,
     cipher: Cipher,
@@ -432,6 +494,18 @@ def audit_cipher_cells(
     audit = CipherAudit(
         [CellTally(c.table, c.column, present=cell_present(conn, c, tables)) for c in wanted]
     )
+    if not cipher.encrypts and "keyed_surface" in tables:
+        # A store a keyed open has recorded, read with no key. It may hold no sealed value just
+        # now (purged to ''), and then the walk below would find nothing to object to.
+        keyed = conn.execute(
+            "SELECT surface_table, surface_column FROM keyed_surface ORDER BY 1, 2 LIMIT 1"
+        ).fetchone()
+        if keyed is not None:
+            audit.key_mismatch = (
+                f"{keyed[0]}.{keyed[1]} is recorded as keyed in this store, but the store "
+                "settings resolved no key to read it (keyless open of a keyed store)"
+            )
+            return audit
     tally = {(t.table, t.column): t for t in audit.tallies}
     for reading in read_cipher_cells(
         conn, cipher, cells=wanted, chunk_rows=chunk_rows, unmarked=True

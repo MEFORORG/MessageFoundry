@@ -1196,8 +1196,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "cipher-audit",
         help="read every sealed value in the LIVE SQLite store back through the store cipher, "
         "read-only, and report per-cell counts and the first failing row, never a value. Exit 0 "
-        "PASS, 1 FAIL (a value that does not decrypt, or in a keyed store a non-blank value with no "
-        "at-rest marker), 2 could not start, 3 NOT COVERED (a PostgreSQL or SQL Server store: this "
+        "PASS, 1 FAIL (a value that does not decrypt, a non-blank value with no at-rest marker on a "
+        "surface the keyed store has sealed, or a walk stopped part way, by a VACUUM, a lock, an "
+        "unreadable row or the key service), 2 could not start, 3 NOT COVERED (a PostgreSQL or SQL "
+        "Server store: this "
         "command reads SQLite only), 4 KEY_MISMATCH. Run it with the service's own key: a shell "
         "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
         "'vault_transit' every value is one Transit request (BACKLOG #1719)",
@@ -10009,7 +10011,9 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         CipherAudit,
         CipherWalkInterrupted,
         audit_cipher_cells,
+        cell_present,
         connect_readonly,
+        store_tables,
     )
     from messagefoundry.store.crypto import CipherError
 
@@ -10065,7 +10069,11 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     try:
         cipher = build_store_cipher(store, posture=posture)
     except _key_unresolved() as exc:
-        _emit_error(f"the store key could not be resolved: {exc}", as_json=as_json)
+        # Through `codec_safe_str`, as rotate-key prints it: a DPAPI key file that unprotects to
+        # bytes that are not ASCII raises a decode error whose text quotes a byte of the key.
+        from messagefoundry.redaction import codec_safe_str
+
+        _emit_error(f"the store key could not be resolved: {codec_safe_str(exc)}", as_json=as_json)
         return 2
     try:
         conn = connect_readonly(path, busy_timeout=args.busy_timeout)
@@ -10077,9 +10085,18 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     try:
         try:
             # A file that is not a database fails here, before any cell is read: could not start.
-            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            tables = store_tables(conn)
         except sqlite3.Error as exc:
             return _emit_store_open_error(exc, path, as_json=as_json)
+        if not any(cell_present(conn, c, tables) for c in cells):
+            # An empty file is a valid SQLite database, so a typo'd --db or a failed copy would
+            # otherwise read every cell as absent and PASS: a store this command cannot read.
+            _emit_error(
+                f"{path} holds none of the cipher-covered tables asked for, so it is not a "
+                "MessageFoundry store this command can audit (check --db / [store].path)",
+                as_json=as_json,
+            )
+            return 2
         audit = audit_cipher_cells(conn, cipher, cells=cells, chunk_rows=chunk_rows)
     except sqlite3.Error as exc:
         # Part way: a lock held past --busy-timeout, a disk error, a value the driver cannot read.
@@ -10140,8 +10157,9 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         if audit.absent:
             reason += f"; not in this store, so not read: {', '.join(audit.absent)}"
 
-    # A walk that stopped has no counts worth printing: zeros would read as an empty store.
-    counted = stopped is None
+    # A walk that stopped, on an error or on the key mismatch, has no counts worth printing: zeros
+    # would read as an empty store.
+    counted = stopped is None and audit.key_mismatch is None
     cell_rows = audit.tallies if counted else []
     if as_json:
         _print_json(

@@ -43,6 +43,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -2561,6 +2562,14 @@ def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str
     )
 
 
+def _sqlite_error_reason(exc: sqlite3.Error) -> str:
+    """A SQLite error as a FAIL reason that quotes no row. Its decode error quotes the column's
+    bytes (``... with text '...'``), which are a row's content and which ``safe_exc`` keeps, so
+    that tail is cut, as ``cipher-audit``'s report cuts it."""
+    text = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
+    return safe_text(f"{type(exc).__name__}: {text}")
+
+
 #: sqlite3's own default. Nothing else writes the extracted snapshot, so it never waits.
 _SNAPSHOT_BUSY_TIMEOUT = 5.0
 
@@ -2610,7 +2619,7 @@ def _decrypt_check(
             if reading.kind == "opened":
                 cells += 1
     except sqlite3.Error as exc:
-        return "FAIL", safe_exc(exc), cells
+        return "FAIL", _sqlite_error_reason(exc), cells
     except CipherWalkInterrupted as exc:  # nothing else writes a snapshot, but never PASS a part
         return "FAIL", str(exc), cells
     finally:
