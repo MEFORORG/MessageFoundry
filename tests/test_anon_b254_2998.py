@@ -303,7 +303,7 @@ def _anonymizers(side: Any) -> tuple[Callable[..., str], ...]:
 
 
 #: Every short line in both places, but for one: a leading ``MSH|^~\&`` IS the message header,
-#: which this check does not walk. That line is the parser's to refuse, not the anonymizer's.
+#: which this check does not walk. The parser reads that line in shape (BACKLOG #2589).
 _SHORT_CASES = [
     pytest.param(line, place, id=f"{name}-{place}")
     for name, line in _SHORT_LINES.items()

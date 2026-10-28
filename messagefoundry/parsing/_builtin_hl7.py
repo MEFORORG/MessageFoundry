@@ -137,13 +137,16 @@ class ParsedMessage(TypedDict):
 def _extract_separators(msh_line: str) -> tuple[str, str, str, str, str]:
     """Read ``(field, component, repetition, subcomponent, escape)`` from an MSH/BHS/FHS line.
 
-    Replicates ``hl7.create_parse_plan`` exactly: ``sep0 = line[3]``; the encoding chars are
-    ``line[3:line.find(sep0, 4)]`` (note python-hl7's ``find`` may return ``-1`` on a malformed MSH-2,
-    slicing to ``[:-1]`` — that quirk is preserved for byte-parity). Defaults fill any missing slot:
+    Replicates ``hl7.create_parse_plan``: ``sep0 = line[3]``; the encoding chars run from there to
+    the next ``sep0``. A header with no separator after MSH-2 (``MSH|^~\\&`` and nothing more, legal
+    since trailing empty fields may be omitted) reads MSH-2 to the end of the line. python-hl7's
+    ``find`` returned ``-1`` there and sliced the last character off; that quirk is gone (BACKLOG
+    #2589), and no case in the parity oracle has that shape. Defaults fill any missing slot:
     repetition ``~``, component ``^``, subcomponent ``&``, escape ``\\``.
     """
     sep0 = msh_line[3]
-    seps = list(msh_line[3 : msh_line.find(sep0, 4)])
+    end = msh_line.find(sep0, 4)
+    seps = list(msh_line[3:end] if end != -1 else msh_line[3:])
     field = seps[0]
     component = seps[1] if len(seps) > 1 else "^"
     repetition = seps[2] if len(seps) > 2 else "~"
@@ -158,16 +161,23 @@ def _parse_msh(msh_line: str, seps: tuple[str, str, str, str, str]) -> Segment:
     Mirrors ``hl7._split``'s special-casing: field 0 = the segment id, field 1 = the field separator
     char (MSH-1, returned raw), field 2 = the encoding-characters string (MSH-2, returned raw), and
     the *rest* come from splitting the remainder on the field separator. So ``fields[1]`` is MSH-1,
-    ``fields[2]`` is MSH-2, ``fields[3]`` is the first real field (MSH-3).
+    ``fields[2]`` is MSH-2, ``fields[3]`` is the first real field (MSH-3). That numbering is the
+    standard's for all three: HL7 v2 defines BHS-1 and FHS-1 as the batch and file field separator and
+    BHS-2 and FHS-2 as their encoding characters, as MSH-1 and MSH-2 are (hl7apy's 2.3 and 2.5
+    tables name them so), and the anonymizers' rules and leak check number them the same (BACKLOG
+    #2998).
+
+    A line with no separator after its encoding characters (``BHS|^~\\&``) keeps exactly those three
+    entries, and one that ends in that separator (``BHS|^~\\&|``) gets an empty fourth, so
+    :func:`_encode_segment` writes each back as it came (BACKLOG #2589, #2998).
     """
     field_sep = seps[0]
     sep0 = msh_line[3]
     sep_end = msh_line.find(sep0, 4)
-    enc_chars = msh_line[4:sep_end]
-    rest = msh_line[sep_end + 1 :]
-    fields: list[str | FieldEntry] = [msh_line[:3], sep0, enc_chars]
-    if rest:
-        fields.extend(rest.split(field_sep))
+    if sep_end == -1:
+        return {"id": msh_line[:3], "fields": [msh_line[:3], sep0, msh_line[4:]]}
+    fields: list[str | FieldEntry] = [msh_line[:3], sep0, msh_line[4:sep_end]]
+    fields.extend(msh_line[sep_end + 1 :].split(field_sep))
     return {"id": msh_line[:3], "fields": fields}
 
 
@@ -697,18 +707,16 @@ _ESCAPE_DEFAULT = "\\"
 def message_escape_char(norm: str) -> str:
     """Best-effort read of a raw message's OWN escape character (MSH-2's 4th encoding char).
 
-    Reproduces :func:`_extract_separators` **exactly** (including python-hl7's ``find`` -> ``-1``
-    slice quirk), so the budget and the **built-in** parser can never disagree about which character
-    escapes a given message — a disagreement would let a payload hide its escapes from the pre-parse
-    budget. It differs only in being defensive: this runs *before* any parse, on bytes that may not be
+    Calls :func:`_extract_separators` itself, so the budget and the **built-in** parser can never
+    disagree about which character escapes a given message — a disagreement would let a payload
+    hide its escapes from the pre-parse budget. It differs only in being defensive: this runs *before* any parse, on bytes that may not be
     HL7 at all, so a short/malformed header falls back to HL7's default ``\\`` rather than indexing off
     the end. Never hardcodes the escape character for a well-formed message (CLAUDE.md §8).
     """
     line = norm.lstrip().split("\r", 1)[0]
     if len(line) < 4:
         return _ESCAPE_DEFAULT
-    seps = line[3 : line.find(line[3], 4)]
-    return seps[3] if len(seps) > 3 else _ESCAPE_DEFAULT
+    return _extract_separators(line)[4]
 
 
 @lru_cache(maxsize=8)
@@ -980,9 +988,21 @@ def _encode_segment(
     field_sep = seps[0]
     texts = [_field_text(f) if not isinstance(f, str) else f for f in fields]
     if seg["id"] in ("MSH", "BHS", "FHS") and len(texts) >= 3:
-        # texts: [id, MSH-1(field sep), MSH-2(enc chars), MSH-3, ...]
-        return texts[0] + texts[1] + texts[2] + texts[1] + field_sep.join(texts[3:])
+        return _join_header(texts, field_sep)
     return field_sep.join(texts)
+
+
+def _join_header(
+    texts: list[str], field_sep: str, convert: Callable[[str], str] | None = None
+) -> str:
+    """Rejoin a split MSH/BHS/FHS line: ``[id, MSH-1 (field sep), MSH-2 (enc chars), MSH-3, ...]``,
+    with ``convert`` applied to MSH-3 onward. With no MSH-3 entry the line had no separator after
+    MSH-2, so none is written (see :func:`_parse_msh`)."""
+    head = texts[0] + texts[1] + texts[2]
+    if len(texts) == 3:
+        return head
+    rest = texts[3:] if convert is None else map(convert, texts[3:])
+    return head + texts[1] + field_sep.join(rest)
 
 
 def encode(msg: ParsedMessage) -> str:
@@ -1023,8 +1043,7 @@ def _encode_segment_raw_separators(
         fields = seg["fields"]
         texts = [_field_text(f) if not isinstance(f, str) else f for f in fields]
         if len(texts) >= 3:
-            head = texts[0] + texts[1] + texts[2] + texts[1]
-            return head + field_sep.join(unescape_separators(t, seps) for t in texts[3:])
+            return _join_header(texts, field_sep, lambda t: unescape_separators(t, seps))
         return field_sep.join(texts)
     lazy_raw = msg["_lazy"].get(seg_index)
     if lazy_raw is not None:
