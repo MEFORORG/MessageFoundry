@@ -66,8 +66,9 @@ Lander looks again and re-posts the hold with a marker.
 
 AUTHOR's turn only when ALL of these hold: the newest Lander event is a marker hold (a same-second
 tie with a non-hold Lander event is no hold); the PR's ``headRefOid`` starts with the marker's SHA,
-ignoring case; and no non-Lander event is at or after the hold's second (a tie is a reply).
-Otherwise LANDER's.
+ignoring case; no non-Lander event is at or after the hold's second (a tie is a reply); and no
+comment or review, Lander or not and the hold itself included, was edited at or after the hold's
+second. Otherwise LANDER's.
 
 WHAT COUNTS AS AN EVENT. Issue comments and submitted PR reviews. A review with an empty body is a
 non-Lander event, because an inline-only review is how an author answers a finding in its thread;
@@ -78,7 +79,9 @@ as a Lander event: hiding a reply must not bring back the hold before it. Skippe
 though still counted toward the newest-event age: anything authored by a GitHub App or bot
 (GraphQL ``author.__typename == "Bot"``), such as the auto-approve review a push triggers; the push
 itself is caught as a new head. A non-Lander event dates from its latest edit
-(``lastEditedAt``), so editing an older comment to answer a hold is a reply. An event with no
+(``lastEditedAt``), so editing an older comment to answer a hold is a reply. An edit to a Lander
+event at or after the hold, the hold's own included, also hands the turn back: every seat posts
+under one login, so an edit cannot be told apart from an author answering in place. An event with no
 readable time, or a node that is not an object, is an ERROR row, never dropped, since dropping a
 reply could park the PR on its author. So is a ``comments`` or ``reviews`` connection that is
 null, not an object, or has no ``nodes`` list: it is never read as zero events. Inline review-thread comment bodies are not
@@ -86,8 +89,9 @@ read. Only the latest ``COMMENT_PAGE`` issue comments and ``REVIEW_PAGE`` review
 
 FLAGS. ``held`` (AUTHOR's turn); ``no-hold`` (no Lander event, or the newest is not a marker
 hold); ``new-commit`` (the head does not start with the marker's SHA); ``replied`` (a non-Lander
-event at or after the hold); ``no-new-commit`` (replied, but the head still matches the marker: the
-Lander must read the reply, but can bounce it fast); ``in-queue`` / ``auto-armed`` (the PR is
+event at or after the hold); ``edited`` (a comment or review, of any author, the hold included,
+edited at or after the hold); ``no-new-commit`` (replied or edited, but the head still matches the
+marker: the Lander must read the reply or edit, but can bounce it fast); ``in-queue`` / ``auto-armed`` (the PR is
 already in the merge queue or has auto-merge armed).
 
 Stdlib only.
@@ -245,7 +249,8 @@ class Event:
     #: Trusted association and not minimized: allowed to be a Lander event at all.
     trusted: bool
     dismissed: bool = False
-    #: ``lastEditedAt``: an edit is a reply too, so a non-Lander event dates from its latest edit.
+    #: ``lastEditedAt``: an edit is a reply too, so a non-Lander event dates from its latest edit,
+    #: and any edit at or after the hold, a Lander event's included, hands the turn back.
     edited: datetime | None = None
 
     @property
@@ -325,13 +330,18 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str]]:
     head = head_oid.lower()
     new_commit = not all(head.startswith(h) for h in heads)
     replied = any(e.latest >= when and not e.lander for e in turn_events)
-    if not new_commit and not replied:
+    # Every seat posts under one login, so who edited cannot be told: any edit from the hold's
+    # second on, of the hold itself or of an older Lander comment too, hands the turn back.
+    edited = any(e.edited is not None and e.edited >= when for e in turn_events)
+    if not new_commit and not replied and not edited:
         return AUTHOR, ["held"]
     flags = ["new-commit"] if new_commit else []
     if replied:
         flags.append("replied")
-        if not new_commit:
-            flags.append("no-new-commit")
+    if edited:
+        flags.append("edited")
+    if not new_commit:
+        flags.append("no-new-commit")
     return LANDER, flags
 
 

@@ -449,19 +449,45 @@ def test_reply_by_editing_an_older_comment_hands_the_turn_back(
     edited = _comment("Manager: handover. Answered: finding 2 fixed.", "2026-10-28T11:00:00Z")
     edited["lastEditedAt"] = "2026-10-28T13:00:00Z"
     unedited = _comment("Manager: handover.", "2026-10-28T11:00:00Z")
-    # The Lander editing its own hold is no reply.
-    hold = _hold("2026-10-28T12:00:00Z", _sha(28))
-    hold["lastEditedAt"] = "2026-10-28T13:00:00Z"
     rows = _engine_rows(
         tmp_path,
         capsys,
         _pr(27, comments=[edited, _hold("2026-10-28T12:00:00Z", _sha(27))]),
-        _pr(28, comments=[unedited, hold]),
+        _pr(28, comments=[unedited, _hold("2026-10-28T12:00:00Z", _sha(28))]),
     )
-    assert _turn(rows[27]) == ("LANDER", ["replied", "no-new-commit"])
+    assert _turn(rows[27]) == ("LANDER", ["replied", "edited", "no-new-commit"])
     # The age dates from the edit, the newest thing that happened.
     assert rows[27]["newestEvent"] == "2026-10-28T13:00:00Z"
     assert _turn(rows[28]) == ("AUTHOR", ["held"])
+
+
+def test_any_edit_after_the_hold_hands_the_turn_back(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Every seat posts under one login, so an edit to the hold, or to an older Lander comment, may
+    # be an author answering in place. It cannot be told apart, so it is the Lander's turn.
+    hold = _hold("2026-10-28T12:00:00Z", _sha(37))
+    hold["lastEditedAt"] = "2026-10-28T13:00:00Z"
+    older = _comment(SESSION + "Looking at it.", "2026-10-28T11:00:00Z")
+    older["lastEditedAt"] = "2026-10-28T13:00:00Z"
+    before = _comment(SESSION + "Looking at it.", "2026-10-28T10:00:00Z")
+    before["lastEditedAt"] = "2026-10-28T11:00:00Z"
+    review = _review(SESSION + "Notes.", "2026-10-28T11:00:00Z")
+    review["lastEditedAt"] = "2026-10-28T12:00:00Z"
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _pr(37, comments=[hold]),
+        _pr(38, comments=[older, _hold("2026-10-28T12:00:00Z", _sha(38))]),
+        # An edit finished before the hold was posted changes nothing.
+        _pr(39, comments=[before, _hold("2026-10-28T12:00:00Z", _sha(39))]),
+        # An edit in the hold's own second is not provably before it.
+        _pr(42, comments=[_hold("2026-10-28T12:00:00Z", _sha(42))], reviews=[review]),
+    )
+    assert _turn(rows[37]) == ("LANDER", ["edited", "no-new-commit"])
+    assert _turn(rows[38]) == ("LANDER", ["edited", "no-new-commit"])
+    assert _turn(rows[39]) == ("AUTHOR", ["held"])
+    assert _turn(rows[42]) == ("LANDER", ["edited", "no-new-commit"])
 
 
 def test_unreadable_edit_time_is_an_error_row_not_dropped(
