@@ -97,12 +97,13 @@ auto-remediate **quietly** (restart, no page) or fire alongside a page. The cont
 wants transportless remediation configures at least one transport (documented; a transportless-notifier
 mode is a possible follow-up).
 
-**Amendment (BACKLOG #1741).** One event ends a window early. When alert-state is wired, a
-`connection_started` that the runner raises once an inbound genuinely comes up resolves the open
+**Amendment (BACKLOG #1741).** A `connection_stopped` window can end early. When alert-state is
+wired, a `connection_started` that the runner raises once an inbound genuinely comes up resolves the open
 `connection_stopped` instance and ends that key's window, so a later stop is a new incident that pages and
-acts at once. A start an alert rule's `restart_inbound` makes never ends a window, whichever rule
-dispatched it, so a loop of rule restarts, including two rules restarting each other's inbound, keeps the
-bound above. An operator's resolve by hand does not end the window.
+acts at once. It does not end the window while any alert rule's `restart_inbound` of that inbound is in
+flight, whichever rule dispatched it and whichever door made the start, so a loop of rule restarts,
+including two rules restarting each other's inbound, keeps the bound above. An operator's resolve by hand
+does not end the window.
 
 ## Options considered
 
