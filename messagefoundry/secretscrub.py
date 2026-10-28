@@ -1188,7 +1188,9 @@ def credential_query_params(url: str) -> list[str]:
     one-word compound (:data:`_QUERY_CREDENTIAL_COMPOUNDS`), or as a camelCase tail
     (``accessToken``), unless it is a known non-secret (:data:`_QUERY_NOT_CREDENTIAL_TAILS`). It
     misses a credential under a name it does not know, and it can name a parameter that only looks
-    like one. Its callers WARN rather than refuse for that reason.
+    like one. Some callers WARN rather than refuse for that reason. At least the HTTP family's
+    ``verify_tls = false`` and off-box cleartext credential rules refuse on a match, with no escape,
+    and accept that a name that only looks like one refuses too (vault BACKLOG #3230, #3533).
 
     Not :class:`logging_setup.CredentialQueryScrubFilter`'s list. That one scrubs VALUES out of log
     text and carries ``code`` and ``state`` for the OIDC callback; neither is a credential name on a

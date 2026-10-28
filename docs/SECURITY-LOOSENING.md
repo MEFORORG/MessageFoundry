@@ -49,7 +49,9 @@ answers, so that refusal comes at connect, before the password is sent. The AI b
 builds it for each `POST /ai/chat`, so that request is refused and answers `503`, and the refusal
 names `[ai].endpoint`. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
-`tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection, or
+`tls_hop_attested`, `cleartext_accepted` and a loopback host, with one exception: on the plain
+`http` row a loopback host still carries a credential, since that hop never leaves this machine.
+Each refusal names the connection, or
 the `[auth]` setting for the AD bind, and offers only settings that can fix it. A verify-off refusal
 names a header off the allowlist apart from any credential. Where such headers are all it lists, it
 also offers removing them. The engine then judges the hop as one with no credential, under its own
@@ -63,6 +65,7 @@ pointed at one of those levers.
 | `Ftp` | it is plain FTP (`tls = false`) | use FTPS (`tls = true`) or `Sftp` |
 | `Ftp` with `tls = true` (FTPS) | `tls_verify` or `tls_check_hostname` is off | turn both checks on; pin a private CA with `tls_ca_file` |
 | `Rest`, `Soap`, `FHIR`, `DICOMweb`, `FhirLookup` | `verify_tls = false` on an `https` URL | turn `verify_tls` on; pin a private CA with `tls_ca_file` |
+| `Rest`, `Soap`, `FHIR`, `DICOMweb`, `FhirLookup`, with their OAuth2, SMART and Digest logins | the URL is plain `http` to a host off this machine | use `https` |
 | `Sftp` with a `password` | the server's host key is not in `known_hosts` | add the host key to `known_hosts` |
 | `[auth]` AD binds over LDAPS | `ad_tls_verify = false` | turn it on; pin a private CA with `ad_tls_ca_cert_file` |
 | `[auth]` AD binds | `ad_server` is a plain `ldap://` address, or a bare host (vault BACKLOG #3533) | use an `ldaps://` address; pin a private CA with `ad_tls_ca_cert_file` |
@@ -71,12 +74,18 @@ pointed at one of those levers.
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
-a static header that settings views would mask, such as `Authorization` or an API key. On a
-`verify_tls = false` hop, the engine also refuses any other static header, unless its name is
+a static header that settings views would mask, such as `Authorization` or an API key, in any
+letter case. On a `verify_tls = false` hop the engine also refuses any other static header,
+unless its name is
 `Accept`, `Content-Type`, `User-Agent` or `X-Request-ID`, in any case. The refusal names such a
 header as outside the allowlist, not as a credential. That allowlist fails closed, so a
 secret under a neutral name, such as `X-Session`, is refused without being recognized. A
-credential-shaped value under an allowlisted name is still refused. The HTTP family reads its
+credential-shaped value under an allowlisted name is still refused. A plain `http` hop off this
+machine refuses the credentials only, not a header for its name. A header a Handler stamps per
+message under `dynamic_headers` meets the same rule as the hop's static headers, when the
+message is sent, after the hop's own send-time check. That refusal dead-letters the one
+message and names neither the header nor its
+value. The HTTP family reads its
 auth-setting credentials from the same reader as the static-credential inventory. That inventory
 does not yet count a static header or a `url` query credential, so for those two kinds this rule is
 the wider of the two. A hop with no credential and no such header is not refused by this rule. Its own loosening entry
@@ -90,14 +99,16 @@ every case.
 **The rule does not reach every hop yet.** At least these still send a credential to a peer the
 engine has not verified, when the lever named beside each is set:
 
-- an HTTP-family credential over plain `http`, under `cleartext_accepted` or `tls_hop_attested`;
 - an HTTP-family secret in the `url` that the refusal cannot see as a credential, on a
   `verify_tls = false` hop or over plain `http`, under that hop's own levers. That covers at least a
   query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
   like a credential. A secret anywhere in the path crosses unrefused too. A path secret cannot be
   told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
-- an HTTP-family static header with a neutral name, such as `X-Session`, over plain `http`, under
-  that hop's own levers. The header allowlist applies on `verify_tls = false` hops only;
+- an HTTP-family static or per-message header with a neutral name, such as `X-Session`, over
+  plain `http`, under that hop's own levers. The header allowlist applies on `verify_tls = false`
+  hops only. Whether it should also apply to plain `http` off this machine awaits an owner
+  ruling: the 2026-10-26 ruling on cleartext hops named credentials only (vault BACKLOG #3533
+  item 4);
 - a secret that is not credential-shaped under an allowlisted header name, such as an opaque token
   in `X-Request-ID`, on a `verify_tls = false` hop. The allowlist reads names, and the value test
   knows only auth-scheme prefixes and JWTs;
@@ -105,9 +116,13 @@ engine has not verified, when the lever named beside each is set:
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;
 - a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
-  `[security].enforcement = warn`;
-- a credential header a Handler stamps per message under `dynamic_headers`, on a `verify_tls =
-  false` hop. The refusal reads settings, so it cannot see one.
+  `[security].enforcement = warn`.
+
+**The forward-proxy login is judged by a different owner ruling.** A `proxy_user` login rides the
+leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
+#3416). The owner's ruling of 2026-10-05 (vault BACKLOG #3007) refuses it there unless the
+connection declares `cleartext_accepted` with a reason. The engine also lets it cross under
+`tls_hop_attested`, or to a proxy on this machine.
 
 An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
 leaves the engine.
@@ -1321,7 +1336,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
 - **What you lose:** the payload — and any credential that connection carries — crosses that hop
   **unencrypted and unauthenticated**, readable and modifiable by anything on the path. There is no
-  partial protection here: it is plaintext PHI on the wire for that connection.
+  partial protection here: it is plaintext PHI on the wire for that connection. The exception is an
+  HTTP-family credential to a host off this machine, which is refused whatever this says (vault
+  BACKLOG #3533 item 4). A forward-proxy login is not in that exception: it crosses its cleartext
+  leg under this declaration, as the
+  [credential rule](#no-escape-sends-a-credential-to-an-unverified-peer) says.
 - **When acceptable:** a peer that genuinely cannot do TLS — vendor firmware that predates it, or a
   transport with no TLS support at all. For `Tcp()` and `X12()` the declaration is **permanent and
   structural**: those connectors have no `tls` parameter, so there is nothing to migrate to
@@ -1375,8 +1394,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
   secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
-  hop. If the claim is false, the payload and any credential the connection carries cross in the clear,
-  and nothing about the hop looks wrong afterwards.
+  hop. If the claim is false, the payload and any credential the connection carries cross in the
+  clear, and nothing about the hop looks wrong afterwards. The exception is an HTTP-family
+  credential, other than a forward-proxy login, over cleartext `http` to a host off this machine:
+  it stays refused, attested or not (vault BACKLOG #3533 item 4).
 - **When acceptable:** the hop really is secure, and the engine cannot see why. A TLS-terminating proxy or
   sidecar in front of the connection is the usual case. An isolated, point-to-point segment with its
   own link-layer encryption is the other.
@@ -1386,9 +1407,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Compensating controls:** whatever the reason names. Keep it true: when the proxy or the segment
   changes, the attestation has to change with it.
 - **It is always reported, though not always logged:** at least the inbound bind gates and the
-  raw-TCP/MLLP hop guard log a suppressed enforcing refusal at WARNING with the reason. The OAuth2 and
-  SMART token-endpoint seams and the database weakened-TLS line do not put the reason on it, and a
-  `DatabaseRef` source writes that same line. The complete record is the two reports. `messagefoundry check` prints a
+  raw-TCP/MLLP hop guard log a suppressed enforcing refusal at WARNING with the reason. The database
+  weakened-TLS line does not put the reason on it, and a `DatabaseRef` source writes that same line.
+  The OAuth2 and SMART token-endpoint seams no longer read it for cleartext: their credential is
+  refused over off-box `http` either way (vault BACKLOG #3533 item 4). The complete record is the two reports. `messagefoundry check` prints a
   `tls-hop-attested` line listing the **whole** attested set, and `GET /security/posture` carries a
   `tls_hop_attested` loosening naming every attesting declaration of each kind above. Each gate and
   both reports read the attestation from the same place, so a hop cannot be crossed on an attestation
