@@ -3262,7 +3262,10 @@ offers every caller a passkey button. `POST /ui/login/passkey` charges the sign-
 2) first, then stages an assertion challenge with **no username and an empty `allowCredentials`
 list**, so the options say nothing about any account. Its handle goes back as an HttpOnly,
 `SameSite=Strict` cookie, never keyed by client address. `POST /ui/login` then carries the password
-and the assertion together; the engine pops the challenge on arrival, whatever the outcome. The path
+and the assertion together. The route pops the challenge on arrival, whatever the outcome, before
+it charges the sign-in limiter, and skips that charge only when it found a staged challenge, so one
+passkey sign-in costs one unit of control 2, as a password sign-in does. A forged, expired or absent
+handle finds nothing and is charged (BACKLOG #3937). The path
 runs only when the account row read before any verify holds a discoverable passkey under the
 request's `rp_id`, and the sign-in lock does not refuse it, as it does not refuse option E's
 combined sign-in. The assertion must come from one of the named account's own passkeys under that
@@ -3309,15 +3312,19 @@ unlock lifted before the write; and, at a `lockout_threshold` of 1, an unlock or
 rotation landing after a read that saw a live lock. So the fixed-length lock beside a refused enrolment holds only for serial failures that no
 write races.
 
-**Two limits of the passkey way past, stated.** At least these:
+**Limits of the passkey way past, stated.** At least these:
 
-- The rotation gate, the removal guards and the census count a discoverable passkey under **any**
-  `rp_id`, while the sign-in accepts only one minted under the request's. After an origin change
+- The factor-drop gates count a discoverable passkey only under the `rp_id` the configuration
+  names, `[api].public_origin`'s host: the TOTP removal, the passkey removal, the rotation gate with
+  the first-factor refusal that shares its predicate, the store's conditional writes behind them,
+  and the census (BACKLOG #3937). The sign-in accepts only a passkey minted under the request's
+  `rp_id`, and outside a request the engine knows no other. **With `public_origin` unset the
+  `rp_id` comes from each request, so no passkey counts at those gates**: a covered account keeps
+  its TOTP, and a passkey-only one must enrol TOTP before it rotates and is named by the census.
+  That is the shipped default on a loopback bind. After an origin change
   ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
-  visibly unusable) an account whose only way past is such a passkey is lockable with no way past
-  until it registers a passkey again or enrols TOTP; the census does not name it.
-- One passkey sign-in charges the sign-in window twice, at the begin leg and at the sign-in, so the
-  owner's way past gets half the per-address budget a password sign-in gets.
+  visibly unusable) a passkey under the old `rp_id` no longer counts, so the census names an
+  account whose only way past it was.
 - Without the `[webauthn]` extra no passkey is a way past: the gates and the census do not count
   one, and the sign-in treats an assertion as absent. `POST /users/{id}/reset-mfa` clears passkeys alongside TOTP — the
 always-available recovery, because passkeys mint **no recovery codes by design** (codes are phishable
@@ -5003,8 +5010,8 @@ the console, through `POST /ui/reauth/webauthn`, because the JSON plane has no p
 JSON-only client cannot rotate it. Before this change such a client could rotate it and then do
 nothing else. Its next sign-in was pending, with no way to prove a passkey there. Under
 `[security].require_mfa` a covered passkey-only account rotates only once it holds a way past
-the sign-in lock: `_has_way_past` counts TOTP or a passkey recorded as discoverable (ADR 0197
-Amendment A, wave 2). One whose passkeys are not discoverable must also enrol a factor that is
+the sign-in lock: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
+configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). One whose passkeys are not discoverable must also enrol a factor that is
 before it rotates, so after the passkey it goes to the enrolment page, and only then to the password
 page. Such an account exists only where its passkey came before the requirement covered it, or
 before wave 2: a store from before ADR 0197 Amendment A, a site that turned `require_mfa` on or

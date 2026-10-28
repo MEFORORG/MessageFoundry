@@ -7878,6 +7878,7 @@ def _build_provision_auth_service(
     """
     from messagefoundry.auth.ldap import LdapError
     from messagefoundry.auth.service import AuthService
+    from messagefoundry.auth.webauthn import configured_rp_id
     from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
     from messagefoundry.config.tls_policy import InsecureHopRefused
@@ -7898,6 +7899,8 @@ def _build_provision_auth_service(
             secret_provider=secret_provider,
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
             hop_posture=posture,
+            # BACKLOG #3937: as the serving engine passes it, so a gate here counts the same passkeys.
+            way_past_rp_id=configured_rp_id(settings.api.public_origin),
         )
     except SecretProviderError as exc:
         # BACKLOG #2317: the Vault provider raises a cleartext-address refusal as its own type.

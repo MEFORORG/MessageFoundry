@@ -31,6 +31,12 @@ this line.**
 
 ### Security
 
+- **A passkey sign-in costs one unit of the sign-in window, not two.** `POST /ui/login` pops the
+  challenge the begin leg staged before its own charge, and skips the charge only when it found
+  one; a forged, expired or absent handle is charged. Needs the engine seam that carries
+  `AuthService.take_passkey_challenge`. The console also asks `must_enrol_before_rotating` once per
+  request, and the two passkey ceremonies share one serializer in `app.js`. (BACKLOG #3937)
+
 - **An IdP step-up's return is charged to the operator's own re-authentication budget, not the
   sign-in budget.** `GET /ui/oidc/callback` now reads the user its staged step-up flow names and
   charges a key of its own for that user in the per-actor limiter `POST /ui/reauth/oidc` already

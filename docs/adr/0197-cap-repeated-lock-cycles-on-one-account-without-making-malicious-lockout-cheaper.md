@@ -1076,7 +1076,13 @@ sign-in lock does not refuse it, just as it does not refuse the TOTP combined si
   deployments, so nothing registered earlier needs migrating (CLAUDE.md section 0).
 - **The challenge store stays bounded and cannot become a new denial lever.** The begin leg is a
   POST that charges control 2 (`allow_login_attempt`) first, and stages the challenge under an opaque
-  random handle it sets as an HttpOnly cookie. It is not keyed by client address: behind an
+  random handle it sets as an HttpOnly cookie. The sign-in POST does not charge control 2 again for
+  that challenge (BACKLOG #3937): it pops the challenge before its own charge, always, and skips the
+  charge only when the pop found one. The begin leg's charge already paid for this sign-in, and the
+  challenge is single use, so one charge buys one sign-in. A forged, expired or absent handle pops
+  nothing and is charged like a password sign-in, so the waiver cannot be had without a begin leg
+  that paid. Charging both legs had given the owner's way past half the per-address budget of a
+  password sign-in. It is not keyed by client address: behind an
   undeclared proxy every caller shares one address, so an address key would let one caller cancel
   or crowd out the owner's challenge. The sign-in pops the challenge on any outcome, and checks its
   age on arrival, before the account's queue, as `arrived` does for a TOTP code. Pre-auth
