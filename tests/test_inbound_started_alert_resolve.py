@@ -82,11 +82,14 @@ def _registry(port: int, *, outbound_namesake: bool = False) -> Registry:
     return reg
 
 
-def _runner(reg: Registry, store: MessageStore, sink: object) -> RegistryRunner:
+def _runner(
+    reg: Registry, store: MessageStore, sink: object, *, claim_mode: str = "pooled"
+) -> RegistryRunner:
     return RegistryRunner(
         reg,
         store,
         poll_interval=0.02,
+        claim_mode=claim_mode,
         env_values={},
         alert_sink=sink,  # type: ignore[arg-type]
         egress=EgressSettings(deny_by_default=False),
@@ -191,13 +194,18 @@ async def test_a_held_inbound_halt_or_log_refusal_does_not_emit(
     await runner.start()
     try:
         sink.started.clear()
-        # A router STOP hold the re-arm does not lift (as under pooled, where the start re-arms
-        # nothing): the inbound is listening but its stages are not draining.
-        monkeypatch.setattr(runner, "_ensure_inbound_workers", lambda name: None)
+        # Pooled (the default): a start re-arms no STOPPED lane, so a router STOP's hold stays and
+        # the inbound is listening over stages that are not draining.
         runner._hold_for_operator("IB", "inbound")
         await runner.restart_inbound("IB", operator=True)
-        assert sink.started == []
+        assert runner.inbound_running("IB") and sink.started == []
         runner._release_operator_hold("IB", "inbound")
+        # A lane a dispatcher STOPPED on its own account, with no hold (a leadership-loss STOP).
+        d = next(iter(runner._dispatchers.values()))
+        monkeypatch.setattr(d, "stopped", lambda key: key == "IB")
+        await runner.restart_inbound("IB", operator=True)
+        assert sink.started == []
+        monkeypatch.undo()
         # The log is still unwritable: the start undoes its own bind and must resolve nothing.
         monkeypatch.setattr(runner, "_resume_inbound_processing", lambda name: False)
         monkeypatch.setattr(runner, "_log_write_refused_restart", lambda name: None)
@@ -250,3 +258,64 @@ def test_connection_started_is_an_auto_resolve_inverse_only(
         LoggingAlertSink().connection_stopped("IB", detail="failed to start: x")
     lines = [r.getMessage() for r in caplog.records]
     assert lines == ["ALERT connection_stopped: connection 'IB' stopped: failed to start: x"]
+
+
+async def test_per_lane_emits_only_when_the_start_respawns_the_halted_workers(
+    store: MessageStore,
+) -> None:
+    # per_lane: a router STOP returns its worker, and the start that respawns it releases the hold.
+    # While the workers are alive the hold is live, so the start must resolve nothing.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    sink = _Recording()
+    runner = _runner(reg, store, sink, claim_mode="per_lane")
+    await runner.start()
+    try:
+        assert sink.started == ["IB"]
+        runner._hold_for_operator("IB", "inbound")
+        await runner.restart_inbound("IB", operator=True)
+        assert sink.started == ["IB"]  # both workers alive: nothing re-armed, the hold stands
+        # The halt: the router worker has returned, as a STOP makes it.
+        task = runner._router_workers["IB"]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await runner.restart_inbound("IB", operator=True)
+        assert ("inbound", "IB") not in runner._stop_held
+        assert sink.started == ["IB", "IB"]
+    finally:
+        await runner.stop()
+
+
+class _ClusterNode:
+    """Any coordinator but the single-node one: the leader, so intake is not gated off."""
+
+    def is_leader(self) -> bool:
+        return True
+
+
+async def test_a_clustered_node_or_unowned_namesake_resolves_nothing(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The alert row is in the store every process shares; another process's causes are invisible.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("SHARED", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    sink = _Recording()
+    runner = _runner(reg, store, sink)
+    await runner.start()
+    try:
+        sink.started.clear()
+        monkeypatch.setattr(runner, "_owns_destination", lambda name: False)
+        await runner.restart_inbound("SHARED", operator=True)
+        assert sink.started == []
+        monkeypatch.undo()
+        monkeypatch.setattr(runner, "_coordinator", _ClusterNode())
+        await runner.restart_inbound("SHARED", operator=True)
+        assert sink.started == []
+        monkeypatch.undo()
+        await runner.restart_inbound("SHARED", operator=True)
+        assert sink.started == ["SHARED"]
+    finally:
+        await runner.stop()

@@ -257,8 +257,10 @@ escalation chains (still deferred, ADR 0014 §3). The cross-node durable dedup o
   rely on the deferred staleness sweep or manual resolve until it lands. *Resolved 2026-10-27 (BACKLOG
   #1741):* the runner now raises `connection_started` when an inbound genuinely starts, with no open
   cause on it or on an outbound of the same name, so an inbound's bind-failure `connection_stopped`
-  resolves itself. An outbound's start failure, and a halt whose name has no inbound, still need a manual
-  resolve.
+  resolves itself. At least these still need a manual resolve: an outbound's start failure, a halt whose
+  name has no inbound, an inbound that is never started again, an inbound whose outbound namesake still
+  has an open cause, and any alert raised in a cluster or under an engine shard that does not own the
+  namesake outbound.
 - [ ] **Resolved-instance retention window.** Confirm the prune window for resolved instances (a
   `connection_event_retention_hours` analog) and that it rides the **existing** `RetentionRunner.run_once`
   pass + one audit row (never an open/acknowledged instance).

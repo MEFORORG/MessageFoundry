@@ -4404,25 +4404,30 @@ class RegistryRunner:
         ADR 0031 section 1, ADR 0044 D2).
 
         Only when no known cause still holds the name down IN EITHER DIRECTION, because alerts key on
-        the bare name while every cause here keys on direction (#1813). A skipped resolve leaves an
-        alert open for an operator, which is the safe direction. Never raises: an alert failure must
-        not break a start."""
+        the bare name while every cause here keys on direction (#1813). The alert row lives in the
+        store every process shares, so a clustered node, or an engine shard that does not own the
+        outbound namesake, cannot see every cause and resolves nothing. A pooled lane a dispatcher
+        STOPPED on its own account without a hold (a leadership-loss STOP) counts as a cause too. A
+        skipped resolve leaves an alert open for an operator, which is the safe direction. Never
+        raises: an alert failure must not break a start."""
         blocked = (
             not self.inbound_running(name)
-            or self.inbound_failed(name) is not None
             or ("inbound", name) in self._stop_held
             or name in self._log_halted
             or self._delivery_halted
+            or not isinstance(self._coordinator, NullCoordinator)
+            or not self._owns_destination(name)
             or self.outbound_failed(name) is not None
             or ("outbound", name) in self._stop_held
             or name in self._outbound_paused
+            or any(d.stopped(name) for d in self._dispatchers.values())
         )
         if blocked:
             return
         try:
             self._alert_sink.connection_started(name)
         except Exception:
-            log.warning("alert sink raised on connection_started for %r", name)
+            log.exception("alert sink raised on connection_started for %r", name)
 
     def _release_operator_hold(self, name: str, kind: Direction) -> None:
         """The lane was re-armed (or an operator asked for it), so the scheduler owns its calendar

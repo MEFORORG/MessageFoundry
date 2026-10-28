@@ -905,8 +905,9 @@ class LoggingAlertSink:
     and queue shape are recorded, never a message body."""
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
-        # The detail names the cause and direction: a start failure, an inbound router or transform
-        # halt and a log-write halt all raise this, not only an outbound internal error (#1741).
+        # Not "outbound ... internal error": a start failure, an inbound router or transform halt and
+        # a log-write halt raise this too (#1741). The detail names the cause, and on some paths the
+        # direction; a dual-role name's log-write halt logs two lines that do not say which half.
         log.warning("ALERT connection_stopped: connection %r stopped: %s", name, detail)
 
     def connection_started(self, name: str) -> None:

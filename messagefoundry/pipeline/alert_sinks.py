@@ -129,7 +129,8 @@ class _AlertStateStore(Protocol):
 #: Auto-resolution map (ADR 0044 D2): an inverse lifecycle event type resolves the matching open
 #: instance(s) of the failure event type it cancels. ``connection_restored`` cancels the
 #: ``connection_error`` raised on ``connection_lost``; ``connection_started``, which the runner emits
-#: once an inbound genuinely comes up (BACKLOG #1741), clears a ``connection_stopped``. Keyed by the inverse event's ``type`` → the failure event ``type`` it resolves.
+#: once an inbound genuinely comes up (BACKLOG #1741), clears a ``connection_stopped``. Keyed by the
+#: inverse event's ``type`` → the failure event ``type`` it resolves.
 _AUTO_RESOLVE: dict[str, str] = {
     "connection_restored": "connection_error",
     "connection_started": "connection_stopped",
