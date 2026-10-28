@@ -2,7 +2,8 @@
   "strictness": 2,
   "commentTypes": [
     "logic",
-    "syntax"
+    "syntax",
+    "style"
   ],
   "autoReview": [
     "open",
@@ -11,11 +12,11 @@
   ],
   "shouldUpdateDescription": false,
   "fixWithAI": false,
-  "ignorePatterns": "uv.lock\nrequirements.lock\nconstraints.lock\n**/locks/*.lock\n**/package-lock.json\n.github/actions/cla-assistant-lite/upstream-package-lock.json\n.github/actions/cla-assistant-lite/dist/**\nmessagefoundry/_vendor/**\ntee/anon/_hl7data.py\ntee/anon/keying.py\ntee/anon/rules.py\ntee/anon/surrogates.py\ntests/golden/**\npackaging/messagefoundry-webconsole/tests/golden/**\ndocs/benchmarks/results/**\n**/*.ico",
+  "ignorePatterns": "uv.lock\nrequirements.lock\nconstraints.lock\n**/locks/*.lock\n**/package-lock.json\n.github/actions/cla-assistant-lite/upstream-package-lock.json\ntee/anon/_hl7data.py\ntee/anon/keying.py\ntee/anon/rules.py\ntee/anon/surrogates.py\ntests/golden/**\npackaging/messagefoundry-webconsole/tests/golden/**\ndocs/benchmarks/results/**\n**/*.ico",
   "rules": [
     {
       "id": "phi-out-of-logs-and-audit",
-      "rule": "No full message body, raw segment, field value or payload-carrying exception may reach a log call at INFO or above, an audit row, an alert, or an HTTP error body. Text from a directory, IdP or remote peer stays out of audit rows and refusal text too. Masking reuses an existing masker, for example messagefoundry/anon, messagefoundry/redaction.py, messagefoundry/support/redact.py or mask_for_display in messagefoundry/api/field_authz.py. Flag a new ad hoc masker written beside them.",
+      "rule": "No full message body, raw segment, field value or payload-carrying exception may reach a log call at INFO or above, an audit row, an alert, or an HTTP error body. Text from a directory, IdP or remote peer stays out of refusal text and HTTP error bodies. An audit row may carry the identity fields its event records by design, such as the issuer, subject and username on auth.federated_bind_refused; flag a new audit field that carries free text from such a peer, such as its error message. Masking reuses an existing masker, for example messagefoundry/anon, messagefoundry/redaction.py, messagefoundry/support/redact.py or mask_for_display in messagefoundry/api/field_authz.py. Flag a new ad hoc masker written beside them. `raise ... from None` hides the cause but does not redact the message; tests/test_from_none_is_not_redaction.py checks this only in messagefoundry/ and messagefoundry_toolkit/, so flag code elsewhere that relies on it.",
       "scope": [
         "messagefoundry/**/*.py",
         "messagefoundry_webconsole/**/*.py",
@@ -35,7 +36,7 @@
     },
     {
       "id": "route-auth-and-channel-scope",
-      "rule": "Every new or changed HTTP or WebSocket route is gated in one of the sanctioned ways: a gate dependency marked with mark_route_gate in messagefoundry/api/security.py (the require* and require_ui* factories are marked this way); @public_route(reason); or, on a WebSocket only, @authorizes_in_body(reason) with the caller authorized in the handler before the socket is accepted and re-authorized before each later frame. Do not flag those forms as missing a gate. Flag a route with none of them; mark_route_gate applied to a dependency that does not enforce authentication; a new public_route whose reason is not a step before a session exists or is verified, for example sign-in, sign-out, second factor, re-authentication, liveness or a browser report; any public_route, new or existing, whose change makes it return or change operator, message or configuration data such as connection names, users or the version; and an authorizes_in_body WebSocket that accepts the socket or sends a frame before its authorization check succeeds. A route that returns or changes channel data filters by the caller's channel scope. Flag a change that discloses more about withheld items than the route already does by design, such as a new count, name or id. A state-changing admin action that the surrounding routes protect with step-up re-auth or dual-control approval needs the same protection.",
+      "rule": "Every new or changed HTTP or WebSocket route is gated in one of the sanctioned ways: a gate dependency marked with mark_route_gate in messagefoundry/api/security.py (the require* and require_ui* factories are marked this way); @public_route(reason); or, on a WebSocket only, @authorizes_in_body(reason) with the caller authorized in the handler before the socket is accepted and re-authorized before each later frame. Do not flag those forms as missing a gate. Flag a route with none of them; mark_route_gate applied to a dependency that does not enforce authentication; a new public_route whose reason is not a step before a session exists or is verified, for example sign-in, sign-out, second factor, re-authentication, liveness or a browser report; a change that makes any public_route, new or existing, return or change more operator, message or configuration data than it already does, for example connection names, users, or the version to a caller with no session; and an authorizes_in_body WebSocket that accepts the socket or sends a frame before its authorization check succeeds. A route that returns or changes channel data filters by the caller's channel scope. Flag a change that discloses more about withheld items than the route already does by design, such as a new count, name or id. A state-changing admin action that the surrounding routes protect with step-up re-auth or dual-control approval needs the same protection. A mount of AllowlistedStaticFiles that serves the console's bundled assets, such as /ui/static, is not a route for this rule; flag a new static mount that does not use AllowlistedStaticFiles.",
       "scope": [
         "messagefoundry/api/**/*.py",
         "messagefoundry_webconsole/routes/**/*.py",
@@ -46,7 +47,7 @@
     },
     {
       "id": "fail-closed-classification",
-      "rule": "A security decision fails closed. An exception, timeout, busy pool, unreachable directory or unexpected reply is an outage or fault, never 'no such user', 'wrong password', 'not revoked' or success. An unknown scheme tag, digest marker or enum value in a security decision is refused, not defaulted. Flag any branch where an error path lets a request through or reports a negative answer. This applies to authentication, authorization, revocation, TLS and secret handling. Tolerant HL7 parsing (ADR 0054) is not a security decision; do not apply this rule to it.",
+      "rule": "A security decision fails closed. An exception, timeout, busy pool, unreachable directory or unexpected reply is an outage or fault, never 'no such user', 'wrong password', 'not revoked' or success. An unknown scheme tag, digest marker or enum value in a security decision is refused, not defaulted. Flag any branch where an error path lets a request through or reports a negative answer. This applies at least to authentication, authorization, revocation, TLS and secret handling. Tolerant HL7 parsing (ADR 0054) is not a security decision; do not apply this rule to it.",
       "scope": [
         "messagefoundry/**/*.py",
         "messagefoundry_webconsole/**/*.py"
@@ -65,17 +66,18 @@
     },
     {
       "id": "tls-verify-before-credentials",
-      "rule": "No connection sends a credential, token or PHI to a peer whose certificate and name were not verified, and no escape or opt-out permits it (docs/SECURITY-LOOSENING.md). Flag verify=False, CERT_NONE, check_hostname=False or a disabled CRL check on such a hop. On a hop that carries none of those, weakened TLS must be gated by weakened_tls_escape_permitted_here() in messagefoundry/config/settings.py and log at WARNING; flag one that bypasses that gate. An explicit context=None does not always verify: for stdlib smtplib, ftplib, imaplib and poplib starttls or *_TLS, None builds an unverified context. Flag None there.",
+      "rule": "No connection sends a credential or token to a peer whose certificate and name were not verified. docs/SECURITY-LOOSENING.md, section 'No escape sends a credential to an unverified peer', names the hops that refuse this, the levers that do not lift a refusal, and the hops the refusal does not reach yet. Flag a change that lets a lever lift one of those refusals, adds a credential hop with no refusal, or adds a hop to the not-yet-reached list. Flag verify=False, CERT_NONE, check_hostname=False or a disabled CRL check on a hop that carries a credential. On a hop that carries none, weakened TLS must go through an existing clamp in messagefoundry/config/settings.py, at least weakened_tls_escape_permitted_here(), weakened_tls_escape_permitted(posture) or hop_insecure_escape_downgrades(), and log at WARNING; flag one that goes through none. A probe that sends no credential and never returns its context, such as messagefoundry/config/tls_probe.py, is not such a hop. In stdlib smtplib, ftplib, imaplib and poplib, every TLS entry point, at least starttls(), stls(), SMTP_SSL, FTP_TLS, IMAP4_SSL and POP3_SSL, builds an unverified context when its context or ssl_context argument is None or left out. Flag such a call that does not pass a verifying context.",
       "scope": [
         "messagefoundry/**/*.py",
         "messagefoundry_webconsole/**/*.py",
-        "tee/**/*.py"
+        "tee/**/*.py",
+        "harness/**/*.py"
       ],
       "severity": "high"
     },
     {
       "id": "message-disposition",
-      "rule": "Every received message ends with a recorded disposition. A bad message goes to the error or dead-letter path; it never ends the listener or worker, and it is never accepted and dropped. Parse with the built-in tolerant parser or the codec, read separators from MSH, and never edit raw HL7 by slicing, split('|') or replace before sending it on.",
+      "rule": "Every received message ends with a recorded disposition. A bad message goes to the error or dead-letter path; it never ends the listener or worker, and it is never accepted and dropped. Parse with the built-in tolerant parser or the codec. A received message's separators come from its MSH, not a hardcoded |^~\\&. Never slice, split('|') or replace received HL7 text that then goes back out; work through the parsed model and re-encode (R14). Writing MSH-1 and MSH-2 of a new message is fine. Slicing bytes that are not HL7, such as ciphertext in messagefoundry/store/crypto.py, is not a finding.",
       "scope": [
         "messagefoundry/transports/**/*.py",
         "messagefoundry/pipeline/**/*.py",
@@ -105,6 +107,17 @@
         "messagefoundry_webconsole/**/*.py"
       ],
       "severity": "medium"
+    },
+    {
+      "id": "synthetic-test-data",
+      "rule": "HL7 and other message data in tests, fixtures, samples and the harness must be synthetic (docs/PHI.md; R5 and R7 in docs/REVIEW-STANDARDS.md). Flag anything that looks like a real person: a plausible name with a real-shaped MRN, SSN, phone number or address. Flag a key, password or token written into a test, fixture or sample; secrets come from MEFOR_* environment variables.",
+      "scope": [
+        "tests/**",
+        "samples/**",
+        "harness/**",
+        "packaging/messagefoundry-webconsole/tests/**"
+      ],
+      "severity": "high"
     }
   ]
 }

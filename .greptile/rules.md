@@ -8,7 +8,9 @@ findings and what to leave alone.
 
 `docs/REVIEW-STANDARDS.md` holds rules R1 to R17. Cite the rule number in a finding, for example
 "R12: SQL built by string formatting". Do not raise anything its "Already enforced" table covers.
-Ruff, strict mypy, bandit, gitleaks and the pre-commit hooks already run on every change.
+CI runs Ruff and strict mypy (`ci.yml`) and bandit and gitleaks (`security.yml`). The pre-commit
+hooks run only where a contributor installed them, and CI mirrors only some of them, so a check that
+only a hook makes is still worth a finding.
 
 ## Word findings in the conditional
 
@@ -21,7 +23,7 @@ Ruff, strict mypy, bandit, gitleaks and the pre-commit hooks already run on ever
 ## Project terms
 
 - The building blocks are Connection, Router and Handler. Flag new code or docs that call them
-  "source", "destination", "filter step" or "transformer". The existing `SourceConnector` and
+  "source", "destination", "filter step" or "transformer", where the project term fits. The existing `SourceConnector` and
   `DestinationConnector` class names are fine.
 - Always write "engine shard" or "database shard", never a bare "shard".
 - Routers and Handlers are pure. A Handler may call the read-only `db_lookup` or `fhir_lookup`. A
