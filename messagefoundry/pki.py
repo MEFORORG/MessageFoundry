@@ -914,8 +914,9 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     failed or could not run, and False when no listed CA fits. :class:`CrlSignature` says what
     "fits" means and which CAs are judged. A block with the True flag is reported over one with
     the False flag, wherever it sits in the file. OpenSSL checks a CRL's signature at the
-    handshake, not at the load. So OpenSSL itself loads a CRL with the right issuer name and Authority Key Identifier but a bad
-    signature, and then every handshake it judges fails with ``CRL signature failure``. The
+    handshake, not at the load. So OpenSSL itself loads a CRL with the right issuer name and
+    Authority Key Identifier but a bad signature, and then every handshake it judges fails with
+    ``CRL signature failure``. The
     running-hop reload calls this before a live load, because a load cannot be undone
     (BACKLOG #299).
 

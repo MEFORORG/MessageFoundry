@@ -2066,10 +2066,13 @@ three cases warn:
 
   **That SHA-1 case is a trade-off (vault BACKLOG #4159).** A start loads such a CRL with the
   WARNING, and the running-hop reload holds it back, so it is applied at the next restart. The
-  cost is revocation freshness: on a host whose TLS library accepts SHA-1, as OpenSSL 3.5.7 was
-  measured to, judging a peer by such a CRL, a revocation in a new copy of it waits for a
-  restart. What it avoids is applying live a CRL on which a host that refuses SHA-1, by its build
-  or its system policy, would fail every handshake through that CA. The engine checks with the
+  cost falls on a host whose TLS library accepts SHA-1, as OpenSSL 3.5.7 was measured to, judging
+  a peer by such a CRL. There a revocation in a new copy waits for a restart, and if nobody
+  restarts, the copy the hop holds lapses at its next update and the hop then refuses the peers
+  it judges by it, as for any held-back file. What it avoids is applying live, with nobody acting, a CRL on which a
+  host that refuses SHA-1, by its build or its system policy, would fail every handshake through
+  that CA. It does not prevent that failure: on such a host the restart loads the CRL with the
+  WARNING, and the handshakes through that CA then fail. The engine checks with the
   `cryptography` library's OpenSSL and the handshake runs on Python's, so it cannot tell which
   kind of host it is on. A forged SHA-1 signature that names a listed CA's key is still proved
   bad, and refuses the file.

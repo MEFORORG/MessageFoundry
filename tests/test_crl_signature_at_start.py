@@ -518,7 +518,7 @@ def test_a_crl_its_named_ca_proves_bad_refuses_beside_an_unchecked_ca_with_no_sk
 
     # Control: OpenSSL itself fails this chain's handshake on this CRL, in either listing order.
     # One chain shape only, a leaf under the named CA, with a no-SKI CA whose key is of another
-    # kind than the leaf's signature; pki.CrlSignature names the residuals.
+    # kind than the leaf's signature; docs/CONFIGURATION.md names the residuals.
     with pytest.raises(ssl.SSLError, match="CRL signature failure"):
         _handshake(_raw_hop(mixed, twins.crl), twins.server(sends_renewed=False))
 
@@ -1070,14 +1070,24 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
 
     ca_file, crl_file = tmp_path / "ca.pem", tmp_path / "crl.pem"
     ca_file.write_bytes(ca.public_bytes(_PEM))
+    crl_file.write_bytes(forged)
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        _hop(ca_file, crl_file)
     crl_file.write_bytes(good)
     _assert_uncheckable_and_the_start_warns(tmp_path, good, caplog)
 
-    # The cost, on this host: OpenSSL judges a peer under this CA by the SHA-1 CRL the start
-    # loaded. Control: the same CRL with the peer's serial listed refuses the handshake.
+    # The cost, on a host that accepts SHA-1: OpenSSL judges a peer under this CA by the SHA-1
+    # CRL the start loaded. Control: the same CRL with the peer's serial listed refuses the
+    # handshake. A host whose OpenSSL policy refuses SHA-1 is the other side of the trade-off,
+    # so this half skips there rather than failing; the engine's half above has already run.
     leaf, leaf_key = _leaf(_NAME, key)
     server = _server(tmp_path, leaf.public_bytes(_PEM), leaf_key)
-    _handshake(_hop(ca_file, crl_file), server)  # raises if refused
+    try:
+        _handshake(_hop(ca_file, crl_file), server)
+    except ssl.SSLError as refused:
+        if "CRL signature failure" not in str(refused):
+            raise
+        pytest.skip(f"this host's OpenSSL refuses the SHA-1 CRL: {refused}")
     crl_file.write_bytes(
         _resigned(
             _crl(key, names=key, revoke=leaf.serial_number), key, _SHA1_WITH_RSA, hashes.SHA1()
@@ -1085,10 +1095,6 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
     )
     with pytest.raises(ssl.SSLError, match="revoked"):
         _handshake(_hop(ca_file, crl_file), server)
-
-    crl_file.write_bytes(forged)
-    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
-        _hop(ca_file, crl_file)
 
 
 #: The digests :func:`test_sha1_moves_a_signers_verdict_only_from_verified_to_uncheckable` signs
