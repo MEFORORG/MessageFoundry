@@ -701,14 +701,14 @@ from typing import Any
 #: gained ``lapsed``, which the console ignores. A console from before this change on this engine
 #: would fail its sign-out with a ``TypeError``, and a newer console on an older one would too; the
 #: pinned digest refuses either pair at mount. The digest moved from ``abc94c8c0254d1ff``.
-#: Re-derived with ``--write``.
+#: Re-derived with ``--write`` on the tree merged with main, whose digest was ``5c0af7774d52531e``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "9c07023b6b0f0ba2"
+ENGINE_UI_SEAM: str = "7c5b0091271a1294"
 
 
 @dataclass(frozen=True, slots=True)

@@ -2493,7 +2493,6 @@ def _read_environment_values(
     )
     from messagefoundry.config.snapshot import NotInSnapshot
     from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
-    from messagefoundry.redaction import safe_exc
 
     # Guarded HERE because this is the one site that knows the value file's PATH, and because this
     # function is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
@@ -2520,6 +2519,9 @@ def _read_environment_values(
     # reads it again on every reload. So each read vets it again first, and a file edited or
     # created after the start is not read unvetted. Outside the try below, because WiringError
     # is a ValueError and that arm would wrap the refusal as a read failure.
+    from messagefoundry.engine_secrets import SecretsDirectoryError
+    from messagefoundry.redaction import safe_exc
+
     env_file = values_file_path(base_dir, dir_name, environment)
     if snapshot is not None and not snapshot.covers_environment_file(env_file):
         # Before the vetting below, so the plain read the engine then makes vets the file once.
@@ -2542,6 +2544,12 @@ def _read_environment_values(
             environment=environment,
             environ=os.environ,
         )
+    except SecretsDirectoryError as exc:
+        # Vault BACKLOG #2595: the secrets directory, not the value file, refused. Its message names
+        # the file and its remedy and never a value, so it is passed whole rather than blamed on
+        # env_file and cut to safe_exc's length.
+        refusal = str(exc)
+        failed_on = "could not read environment values from the secrets directory"
     except (ValueError, RecursionError, OSError) as exc:
         # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
         # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
@@ -2551,11 +2559,12 @@ def _read_environment_values(
         # an embedder's arbitrary callable, while this one wraps our own call into a function that
         # returns a dict or raises.
         refusal = safe_exc(exc)
+        failed_on = f"could not read environment values from {env_file}"
     # Raised AFTER the handler, so neither __cause__ nor __context__ is set (BACKLOG #2307). A
     # TOMLDecodeError keeps the whole document on .doc and a UnicodeDecodeError keeps the file's
     # bytes on .object, so chaining either would carry every credential the file holds. `from None`
     # would not do: it leaves __context__ set.
-    raise WiringError(f"could not read environment values from {env_file}: {refusal}")
+    raise WiringError(f"{failed_on}: {refusal}")
 
 
 def _start_files_refused(service_config: str | None, env_file: Path, *, fleet: str = "") -> bool:
@@ -4806,8 +4815,8 @@ def _serve(args: argparse.Namespace) -> int:
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
         # BACKLOG #299: the settings-level CRL files ([tls], [logging] forward, [auth] OIDC, [store],
         # [api] client), so a CRL going stale on an OUTBOUND hop alerts before it fails a handshake.
-        # Vault BACKLOG #2223: plus the SQL Server store pin, whose expiry the driver does not check
-        # under Encrypt=strict.
+        # Vault BACKLOG #2223: plus the SQL Server store pin, whose expiry the engine watches itself
+        # (why: the `ssl_root_cert` row of docs/CONFIGURATION.md).
         settings_crls=[*crls_from_settings(settings), *certs_from_settings(settings)],
         # Reserve the engine's own API listener so no inbound can be wired onto it (it would collide
         # with uvicorn at bind); surfaced as a clear PortConflictError at check/start instead.
@@ -10310,16 +10319,29 @@ def _connection(args: argparse.Namespace) -> int:
     env_name = settings.ai.environment
     # Anchor environments/<env>.toml the same way serve does (honor [environments].base_dir), so a
     # GUI/CLI edit validates against the same env() values the running instance will resolve.
-    env_values = (
-        load_environment_values(
-            base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
-            dir_name=settings.environments.dir,
-            environment=env_name,
-            environ=os.environ,
+    from messagefoundry.engine_secrets import SecretsDirectoryError
+
+    try:
+        env_values = (
+            load_environment_values(
+                base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
+                dir_name=settings.environments.dir,
+                environment=env_name,
+                environ=os.environ,
+            )
+            if env_name is not None
+            else {}
         )
-        if env_name is not None
-        else {}
-    )
+    except (ValueError, RecursionError, OSError) as exc:
+        # Vault BACKLOG #2595: a MEFOR_VALUE_* file the secrets directory cannot supply names the
+        # file and never a value, so it is printed as the refusal it is. Anything else from the read
+        # is a malformed or unreadable value file, reported the way serve's reader reports it,
+        # through safe_exc, rather than as a traceback the IDE bridge sees as no output.
+        if isinstance(exc, SecretsDirectoryError):
+            return _emit_error(str(exc), as_json=args.json)
+        from messagefoundry.redaction import safe_exc
+
+        return _emit_error(f"could not read environment values: {safe_exc(exc)}", as_json=args.json)
 
     def validate(config_dir: Path) -> None:
         # allow_empty: this is an AUTHORING surface, and removing the last connection is a legitimate

@@ -1284,7 +1284,10 @@ hop's own CA list. It refuses one case only: the CRL names a listed CA's key by 
 engine ran the signature check with that key, and the check failed (corrected under vault BACKLOG
 #3506; it read "that key did not sign it", which is also true of a signature of another kind than
 the key, and that loads). Anything short of that proof loads with a WARNING, at least an issuer the
-hop does not list, a CRL that names no key, and a key the engine cannot check with. `docs/CONFIGURATION.md`,
+hop does not list, a CRL that names no key, and a key the engine cannot check with. Since vault
+BACKLOG #4159, that last case loads only where the unchecked key is the one the CRL names, or the
+CRL names no listed key: a same-name CA with no subject key identifier no longer stops the
+refusal, whether its key verifies the CRL or cannot be checked. `docs/CONFIGURATION.md`,
 under "CRL files", is the one place that says how often it is logged and what a refusal stops.
 So the reload refuses more than a start does, on purpose. The ruling's reason is a CA that
 renewed its key: its CRL can fail the engine's check while handshakes still pass, because OpenSSL
