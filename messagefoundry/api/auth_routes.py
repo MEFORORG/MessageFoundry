@@ -143,6 +143,7 @@ from messagefoundry.auth.service import (
     AuthService,
     ChannelScopeSourceConflict,
     CurrentPasswordCheck,
+    CustomRoleUnverifiableError,
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
     DirectoryObjectIdMissing,
@@ -594,20 +595,32 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # BACKLOG #2592: an authority row's seal could not be made or checked through Vault transit.
         # Not a failed seal, and not a crash: a 503 with a fixed text, never Vault's text or the row.
         # The sealer has already logged it, throttled, and raised the alert. An outage passes, so it
-        # carries a Retry-After; a seal under a retired key version does not pass by itself.
-        assert isinstance(exc, TransitSealUnavailableError)
-        if isinstance(exc, TransitSealUnverifiableError):
-            detail = "a stored integrity seal names a retired key version and cannot be checked"
-            headers = None
-        else:
-            detail = "the integrity check service is unavailable; retry shortly"
-            headers = {"Retry-After": str(TRANSIT_SEAL_RETRY_AFTER_SECONDS)}
+        # carries a Retry-After.
         return await http_exception_handler(
             request,
-            HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail, headers=headers),
+            HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "the integrity check service is unavailable; retry shortly",
+                headers={"Retry-After": str(TRANSIT_SEAL_RETRY_AFTER_SECONDS)},
+            ),
         )
 
     app.add_exception_handler(TransitSealUnavailableError, _transit_seal_unavailable)
+
+    async def _transit_seal_unverifiable(request: Request, exc: Exception) -> Response:
+        # BACKLOG #2592: a write or read outside the loaders met a stored seal Vault transit refused
+        # to check. It does not pass by itself, so a 409 with a fixed text and no Retry-After. The
+        # sealer has already logged it, throttled, and raised the alert.
+        return await http_exception_handler(
+            request,
+            HTTPException(
+                status.HTTP_409_CONFLICT,
+                "a stored integrity seal cannot be verified by Vault transit; the request was"
+                " refused",
+            ),
+        )
+
+    app.add_exception_handler(TransitSealUnverifiableError, _transit_seal_unverifiable)
     # --- authentication ------------------------------------------------------
 
     @app.get("/auth/providers", response_model=ProvidersInfo)
@@ -1276,6 +1289,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         except CustomRoleError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except CustomRoleUnverifiableError as exc:
+            # BACKLOG #2592: a fixed text that names deleting the role as the recovery.
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
         return CustomRoleInfo(

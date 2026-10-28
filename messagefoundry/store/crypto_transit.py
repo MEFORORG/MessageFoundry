@@ -64,7 +64,7 @@ from messagefoundry.store.crypto import (
     AuditKeyVersionRefusedError,
     AuditMacFn,
     CipherError,
-    RowSealVersionRetiredError,
+    RowSealUnverifiableError,
     _UnmarkedPolicy,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
@@ -239,28 +239,23 @@ class TransitCipher(_UnmarkedPolicy):
             raise CipherError(f"Transit returned an empty row seal HMAC (key={self._audit_key!r})")
         return mac
 
-    def verify_seal_hmac(self, data: bytes, mac: str, *, key_version: int) -> bool:
+    def verify_seal_hmac(self, data: bytes, mac: str) -> bool:
         """Whether ``mac`` is Transit's HMAC over ``data``, checked by Transit's ``verify`` call at
-        the version ``mac`` names, ``key_version`` (ADR-draft decision D14). It never regenerates and
-        compares, because a MAC regenerated under a newer version differs from every stored one.
+        the version ``mac`` names (ADR-draft decision D14). It never regenerates and compares,
+        because a MAC regenerated under a newer version differs from every stored one. The sealer
+        sends only a ``mac`` it has parsed as well-formed.
 
-        An HTTP 400 is read against the key's version range (:meth:`_seal_key_versions`):
+        Transit answers a MAC that does not match, under a version it holds, with HTTP 200 and
+        ``valid: false``: that is ``False``. It answers HTTP 400 for a version it will not check,
+        below ``min_decryption_version`` or above the latest version the answering node holds, and
+        for a missing key. So a 400 raises
+        :class:`~messagefoundry.store.crypto.RowSealUnverifiableError` when the key still answers an
+        ``hmac`` call over fixed input (:meth:`_key_answers`), and is an outage otherwise. No
+        version arithmetic: the verify and a key read can reach different nodes, so the numbers
+        would not describe the node that refused.
 
-        * ``key_version`` below the key's ``min_decryption_version`` raises
-          :class:`~messagefoundry.store.crypto.RowSealVersionRetiredError`: the seal cannot be
-          verified any more, which is not evidence that it was forged.
-        * ``key_version`` one above the latest version this Vault node reports raises
-          :class:`CipherError`, an outage: a node that lags one rotation refuses a real, newer
-          version. Only one: a version further ahead is not lag, so it reads as ``False``, and a
-          planted giant version is still a failed seal.
-        * Otherwise the refusal was about this string, such as a body Transit cannot read, which a
-          forged seal can carry, so it is ``False``.
-
-        A seal planted with a version below the minimum, or exactly one above the latest, is
-        therefore not recorded as a forgery. It is still refused.
-
-        A failed range read, and any other failure, is an outage and raises :class:`CipherError`.
-        Blocking: the sealer calls it in a worker thread."""
+        Any other failure is an outage and raises :class:`CipherError`. Blocking: the sealer calls
+        it in a worker thread."""
         inp = base64.b64encode(data).decode("ascii")
         try:
             response: Any = self._client.secrets.transit.verify_signed_data(
@@ -276,16 +271,12 @@ class TransitCipher(_UnmarkedPolicy):
                     f"Transit row seal verify failed (key={self._audit_key!r}): "
                     f"{vault_failure_text(exc)}"
                 ) from exc
-            lowest, latest = self._seal_key_versions()
-            if key_version < lowest:
-                raise RowSealVersionRetiredError(key_version, lowest) from exc
-            if key_version == latest + 1:
-                raise CipherError(
-                    f"Transit refused a row seal naming key version {key_version}, newer than the "
-                    f"latest version {latest} this Vault node holds (key={self._audit_key!r}); a "
-                    "node that lags a rotation does this"
-                ) from exc
-            return False
+            if self._key_answers():
+                raise RowSealUnverifiableError() from exc
+            raise CipherError(
+                f"Transit refused a row seal check and its key did not answer either "
+                f"(key={self._audit_key!r}): {vault_failure_text(exc)}"
+            ) from exc
         if not isinstance(valid, bool):
             raise CipherError(
                 f"Transit returned a malformed verify reply (key={self._audit_key!r})"
@@ -331,23 +322,31 @@ class TransitCipher(_UnmarkedPolicy):
             raise CipherError(f"Transit returned an empty audit HMAC (key={self._audit_key!r})")
         return mac
 
-    def _seal_key_versions(self) -> tuple[int, int]:
-        """The audit key's ``(min_decryption_version, latest_version)``, read from its metadata on
-        ``transit/keys/<audit key>``, which :func:`build_transit_cipher` already reads (BACKLOG
-        #2592). A failed read, or a reply without both numbers, raises :class:`CipherError`: the
-        refusal cannot then be placed, so it counts as an outage."""
+    def _probe_mac(self, refused: str) -> object:
+        """The audit key's ``hmac`` over FIXED input under its latest version, or ``None`` when the
+        call fails, which is logged with ``refused`` naming what Transit refused first. Fixed
+        input, so no row's content decides the answer (BACKLOG #2337, #2592)."""
         try:
-            response: Any = self._client.secrets.transit.read_key(name=self._audit_key)
-            meta = response["data"]
-            lowest, latest = meta["min_decryption_version"], meta["latest_version"]
+            probe: Any = self._client.secrets.transit.generate_hmac(
+                name=self._audit_key,
+                hash_input=_VERSION_PROBE_INPUT,
+                algorithm=AUDIT_TRANSIT_HASH_ALGO,
+            )
+            answered: object = probe["data"]["hmac"]
         except Exception as exc:
-            raise CipherError(
-                f"Transit key metadata read failed (key={self._audit_key!r}): "
-                f"{vault_failure_text(exc)}"
-            ) from exc
-        if type(lowest) is not int or type(latest) is not int:
-            raise CipherError(f"Transit returned malformed key metadata (key={self._audit_key!r})")
-        return lowest, latest
+            log.warning(
+                "Transit refused %s, and the probe under the latest version failed too (key=%r): %s",
+                refused,
+                self._audit_key,
+                vault_failure_text(exc),
+            )
+            return None
+        return answered
+
+    def _key_answers(self) -> bool:
+        """Whether the audit key answers an ``hmac`` call over fixed input (BACKLOG #2592)."""
+        answered = self._probe_mac("a row seal check")
+        return isinstance(answered, str) and bool(answered)
 
     def _refuses_only_version(self, exc: Exception, key_version: int) -> bool:
         """Whether ``exc``, raised by a call pinned to ``key_version``, is Transit refusing that
@@ -364,22 +363,8 @@ class TransitCipher(_UnmarkedPolicy):
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
         if not is_vault_bad_request(exc):
             return False
-        try:
-            probe: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key,
-                hash_input=_VERSION_PROBE_INPUT,
-                algorithm=AUDIT_TRANSIT_HASH_ALGO,
-            )
-            answered = probe["data"]["hmac"]
-        except Exception as probe_exc:  # the latest version fails too: not a version refusal
-            log.warning(
-                "Transit refused audit key version %d, and the probe under the latest version failed "
-                "too (key=%r): %s",
-                key_version,
-                self._audit_key,
-                vault_failure_text(probe_exc),
-            )
-            return False
+        # The latest version failing too means this was not a version refusal.
+        answered = self._probe_mac(f"audit key version {key_version}")
         return isinstance(answered, str) and not answered.startswith(f"vault:v{key_version}:")
 
     def audit_mac_fn(self) -> AuditMacFn:

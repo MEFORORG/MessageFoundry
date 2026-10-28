@@ -41,6 +41,8 @@ encoded with :meth:`float.hex`, which is exact, so a value that round-trips thro
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import logging
@@ -50,10 +52,12 @@ from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Final
 
 from messagefoundry.store.crypto import (
+    AUDIT_MAC_HEX_LEN,
+    AUDIT_TRANSIT_HASH_ALGO,
     NO_STORE_ID,
     Cipher,
     CipherError,
-    RowSealVersionRetiredError,
+    RowSealUnverifiableError,
     derive_row_seal_key,
     row_seal_key_id,
 )
@@ -307,23 +311,25 @@ class TransitSealUnavailableError(Exception):
     The API answers it with HTTP 503 and a ``Retry-After``, and the CLI with one error line."""
 
 
-class TransitSealUnverifiableError(TransitSealUnavailableError):
-    """A row seal names a Transit key version the key no longer verifies under: one below its
-    ``min_decryption_version`` (BACKLOG #2592).
+class TransitSealUnverifiableError(Exception):
+    """A well-formed row seal that Transit refused to check (HTTP 400) while its key still answers
+    (BACKLOG #2592): a version below the key's ``min_decryption_version``, one newer than the Vault
+    node that answered holds, or a planted version. The reply cannot tell them apart.
 
-    The row may be genuine. An operator raised the minimum before every row sealed under the older
-    version was sealed again, so this is "cannot be verified", never "forged". A subclass of
-    :class:`TransitSealUnavailableError` on purpose, so every path that already denies an outage
-    without an audit row or a revoked session treats this the same way: the request is refused, and
-    nothing is recorded as a seal failure. Unlike an outage it does not pass by itself, so the API
-    sends no ``Retry-After``. The remedy is to lower the minimum again until the rows are sealed
-    under a version it keeps."""
+    Not an outage, so deliberately NOT a :class:`TransitSealUnavailableError`, and not a proven
+    forgery. The auth service and the approval gate treat the row as they treat a failed seal: it
+    is denied, a session is ended, and the report is written under its own audit action, so an
+    operator can tell the two apart. Elsewhere it propagates and refuses the request (HTTP 409) or
+    the write. Its text is fixed, never row data or Vault's text."""
 
 
 #: The alert hook a :class:`TransitRowSealer` calls, with its cause (``"transit"`` for an outage,
-#: ``"transit-retired"`` for a retired key version) and a PHI-free reason, when it logs its
-#: throttled ERROR. ``serve`` arms it with the engine's alert sink.
+#: ``"transit-unverifiable"`` for a seal Transit refused to check) and a PHI-free reason, when it
+#: logs its throttled ERROR. ``serve`` arms it with the engine's alert sink.
 TransitSealAlertHook = Callable[[str, str], None]
+
+#: The cause :meth:`TransitRowSealer._unverifiable` reports under.
+TRANSIT_UNVERIFIABLE_CAUSE: Final = "transit-unverifiable"
 
 #: The label a Transit seal input starts with. It stands where the HKDF label stands under the
 #: local sealer, so a seal input never reads as another MAC's input under the same Transit key.
@@ -335,6 +341,10 @@ _TRANSIT_KEY_ID_LEN: Final = 16
 #: base64 characters, so this leaves room for any version number and refuses a planted giant.
 _TRANSIT_MAC_MAX_LEN: Final = 128
 _TRANSIT_MAC_PREFIX: Final = "vault:v"
+#: The digest length a well-formed seal's MAC decodes to: SHA-256's, the hash
+#: :data:`~messagefoundry.store.crypto.AUDIT_TRANSIT_HASH_ALGO` names. The assert ties the two.
+_TRANSIT_DIGEST_LEN: Final = AUDIT_MAC_HEX_LEN // 2
+assert AUDIT_TRANSIT_HASH_ALGO == "sha2-256", "the seal digest length assumes sha2-256"
 #: The kind the start probe seals under. No row is of this kind, so a probe seal verifies as no
 #: row's.
 _PROBE_KIND: Final = "start-probe"
@@ -363,9 +373,13 @@ def transit_seal_key_id(key_name: str) -> str:
 
 
 def _transit_version(mac: str) -> int | None:
-    """The key version a Transit MAC string names (``vault:v<N>:<base64>``), or ``None`` when it
-    is not that shape. Parsed by hand, so no regex sees stored text. ``N`` follows the audit
-    chain's ``_TRANSIT_MAC_VERSION`` rule in ``store.py``: 1 to 10 digits, no leading zero."""
+    """The key version a well-formed Transit MAC string names, or ``None`` when it is not one.
+
+    Well-formed is ``vault:v<N>:<base64>``, where ``N`` follows the audit chain's
+    ``_TRANSIT_MAC_VERSION`` rule in ``store.py`` (1 to 10 digits, no leading zero, so at least 1)
+    and the base64 decodes, strictly, to exactly the digest length of
+    :data:`~messagefoundry.store.crypto.AUDIT_TRANSIT_HASH_ALGO`. Parsed by hand, so no regex sees
+    stored text. A stored seal that fails this is a forgery, decided with no Transit call."""
     # ASCII only: a planted non-ASCII value fails here, never later as an encode error.
     if (
         len(mac) > _TRANSIT_MAC_MAX_LEN
@@ -377,6 +391,12 @@ def _transit_version(mac: str) -> int | None:
     if not sep or not body or not version.isdigit():
         return None
     if len(version) > 10 or version.startswith("0"):
+        return None
+    try:
+        digest = base64.b64decode(body, validate=True)
+    except binascii.Error:
+        return None
+    if len(digest) != _TRANSIT_DIGEST_LEN:
         return None
     return int(version)
 
@@ -404,21 +424,23 @@ class TransitRowSealer:
     **An outage is not a failed seal.** A call that does not complete raises
     :class:`TransitSealUnavailableError` and logs an ERROR line, at most once per
     :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, and the same line goes to the alert hook
-    (:meth:`set_alert_hook`) when ``serve`` armed one. A seal naming a version newer than the latest
-    the Vault node holds is an outage too: a node that lags a rotation refuses it. A seal naming a
-    version below the key's minimum raises :class:`TransitSealUnverifiableError`, reported the same
-    way under its own throttle. Neither is recorded as a seal failure. Transit refusing the check
-    for a version inside the key's range means "does not verify"
-    (:meth:`~messagefoundry.store.crypto_transit.TransitCipher.verify_seal_hmac` says how the cases
-    are told apart).
+    (:meth:`set_alert_hook`) when ``serve`` armed one. It is not recorded as a seal failure.
+
+    **Three answers for a check, decided in this order.** A stored seal that is not well-formed
+    (:func:`_transit_version`) fails with no Transit call. Transit's ``valid: false`` fails. A
+    well-formed seal Transit refuses to check while its key answers raises
+    :class:`TransitSealUnverifiableError`, reported like an outage under its own throttle and
+    cause, and its callers treat the row as a failed seal
+    (:meth:`~messagefoundry.store.crypto_transit.TransitCipher.verify_seal_hmac` says why the
+    sealer does not tell a retired version from a lagging node or a planted one).
 
     **The seam (CLAUDE.md section 6).** Each Transit call runs in a worker thread
     (:func:`asyncio.to_thread`), so a seal or a check never blocks the event loop. So only the
     awaited methods exist here, and the cache is touched on the calling coroutine's thread alone.
 
     **No retired keys.** Transit keeps its own versions, so :meth:`sealed_by_retired_key` is always
-    False: a row under a version Transit no longer holds is refused through
-    :class:`TransitSealUnverifiableError` instead, which is never a failed seal. And
+    False: a row under a version Transit no longer checks is refused through
+    :class:`TransitSealUnverifiableError` instead. And
     :meth:`is_active` asks only whether a seal names this Transit key, at any version."""
 
     __slots__ = (
@@ -482,12 +504,12 @@ class TransitRowSealer:
         )
         return TransitSealUnavailableError(f"Transit row seal unavailable: {exc}")
 
-    def _unverifiable(self, exc: RowSealVersionRetiredError) -> TransitSealUnverifiableError:
+    def _unverifiable(self, exc: RowSealUnverifiableError) -> TransitSealUnverifiableError:
         self._report(
-            "transit-retired",
-            "a row seal names a transit key version below the key's min_decryption_version, so it"
-            " cannot be verified; the operation was refused and no seal failure was recorded."
-            " Lower min_decryption_version again; rows are sealed again only when written",
+            TRANSIT_UNVERIFIABLE_CAUSE,
+            "a well-formed row seal could not be verified: Vault transit refused to check it while"
+            " its key answers (a key version below min_decryption_version, one this Vault node"
+            " does not hold yet, or a planted one); the row was denied as a failed seal is",
             exc,
         )
         return TransitSealUnverifiableError(f"Transit row seal unverifiable: {exc}")
@@ -519,7 +541,8 @@ class TransitRowSealer:
         self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
     ) -> bool:
         """Whether ``stored`` is a Transit seal over ``fields`` under this key, at the version it
-        names. A missing, malformed or foreign seal fails with no Transit call."""
+        names. A missing, malformed or foreign seal fails with no Transit call. A well-formed one
+        Transit refuses to check raises :class:`TransitSealUnverifiableError`."""
         parsed = self._parse(stored)
         if parsed is None:
             return False
@@ -532,10 +555,8 @@ class TransitRowSealer:
             return True
         generation = self._generation
         try:
-            valid = await asyncio.to_thread(
-                self._backend.verify_seal_hmac, data, mac, key_version=version
-            )
-        except RowSealVersionRetiredError as exc:
+            valid = await asyncio.to_thread(self._backend.verify_seal_hmac, data, mac)
+        except RowSealUnverifiableError as exc:
             raise self._unverifiable(exc) from exc
         except CipherError as exc:
             raise self._unavailable(exc) from exc
@@ -562,7 +583,8 @@ class TransitRowSealer:
         """Seal fixed input and verify it, through the same two Transit calls a row seal makes.
         ``serve`` runs it once at start, so a token whose policy lacks ``transit/verify`` refuses
         the start rather than every request. Raises :class:`TransitSealUnavailableError` when
-        either call fails, and when Transit answers that its own fresh seal does not verify. It
+        either call fails, and when Transit answers that its own fresh seal does not verify, and
+        :class:`TransitSealUnverifiableError` when Transit refuses to check that seal. It
         seals no row. The input carries the clock, so no cached answer stands in for Transit's."""
         fields: list[tuple[str, object]] = [
             ("probe", "messagefoundry row seal start probe"),
@@ -614,7 +636,7 @@ async def enforce_transit_seal_probe(store: object) -> None:
         return
     try:
         await sealer.probe_async()
-    except TransitSealUnavailableError as exc:
+    except (TransitSealUnavailableError, TransitSealUnverifiableError) as exc:
         raise TransitSealStartRefusedError(
             "refusing to start: [store].cipher_provider = 'vault_transit' and the store could not"
             " seal and verify a row seal through Vault transit. Check that Vault answers, and that"

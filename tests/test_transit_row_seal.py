@@ -15,6 +15,7 @@ The live PostgreSQL and SQL Server legs run the same contracts: ``test_postgres_
 from __future__ import annotations
 
 import asyncio
+import base64
 import sqlite3
 import threading
 import time
@@ -24,19 +25,25 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService
+from messagefoundry.auth.service import (
+    AUTHORITY_SEAL_FAILED_ACTION,
+    AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
+    DIRECTORY_ROLE_MAP_UNSEALED,
+    AuthService,
+    CustomRoleUnverifiableError,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.cli_common import run_cli
 from messagefoundry.config.settings import AuthSettings, EgressSettings, SecurityEnforcement
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import (
-    TRANSIT_SEAL_RETIRED_SUBJECT,
     TRANSIT_SEAL_SUBJECT,
+    TRANSIT_SEAL_UNVERIFIABLE_SUBJECT,
     LoggingAlertSink,
     transit_seal_alert,
 )
 from messagefoundry.store import row_seal
-from messagefoundry.store.crypto import RowSealVersionRetiredError, generate_key, make_cipher
+from messagefoundry.store.crypto import RowSealUnverifiableError, generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     SESSION_KIND,
@@ -47,7 +54,8 @@ from messagefoundry.store.row_seal import (
     TransitSealUnverifiableError,
     transit_seal_key_id,
 )
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import AD_ROLE_MAP, MessageStore
+from tests._approval_seal_contract import _Harness as ApprovalHarness
 from tests._approval_seal_contract import assert_approval_seal_contract
 from tests._role_seal_contract import assert_role_seal_contract
 from tests._session_seal_contract import _mint, _user, assert_session_seal_contract
@@ -88,12 +96,10 @@ def _raw_for(path: Path) -> Any:
     return raw
 
 
-def _seal_failures(path: Path) -> int:
+def _seal_failures(path: Path, action: str = AUTHORITY_SEAL_FAILED_ACTION) -> int:
     conn = sqlite3.connect(path)
     try:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM audit_log WHERE action = ?", (AUTHORITY_SEAL_FAILED_ACTION,)
-        ).fetchone()
+        row = conn.execute("SELECT COUNT(*) FROM audit_log WHERE action = ?", (action,)).fetchone()
         return int(row[0])
     finally:
         conn.close()
@@ -272,59 +278,54 @@ async def test_an_outage_denies_without_a_seal_failure_and_recovers(
     assert _seal_failures(path) == 1
 
 
-async def test_a_refused_check_is_placed_against_the_key_version_range(
+async def test_a_refused_check_is_unverifiable_and_read_from_no_version_range(
     transit_store: Opened,
 ) -> None:
-    """An HTTP 400 from Transit's verify is read against the key's version range (BACKLOG #2592):
-    a newer version than the node holds is an outage, a version below the minimum cannot be
-    verified, and only a refusal inside the range reads as "does not verify"."""
+    """Transit's own answers decide (BACKLOG #2592): a wrong MAC under a held version is HTTP 200
+    ``valid: false``, a failed seal; a well-formed seal it refuses with HTTP 400 while its key
+    answers is unverifiable, whatever version it names; a 400 the key probe cannot clear is an
+    outage. No key metadata is read, so no version arithmetic can place a refusal."""
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
     store, _path, transit = transit_store
     transit.refusal = hvac_exceptions.InvalidRequest
+
+    def no_metadata(**_: Any) -> dict[str, Any]:
+        raise AssertionError("the sealer read key metadata")
+
+    transit.read_key = no_metadata  # type: ignore[method-assign]
     sealer = store.row_sealer()
     assert isinstance(sealer, TransitRowSealer)
     fields = [("token_hash", "synthetic")]
     good = await sealer.seal_async(SESSION_KIND, fields)
     assert await sealer.verify_async(SESSION_KIND, fields, good) is True
+    # valid: false under a version Transit holds: a failed seal.
     assert await sealer.verify_async(SESSION_KIND, [("token_hash", "other")], good) is False
+    # One newer than this node holds (a lagging node) and a planted giant read the same way.
+    for version in ("v2", "v999999"):
+        ahead = good.replace(":vault:v1:", f":vault:{version}:")
+        with pytest.raises(TransitSealUnverifiableError):
+            await sealer.verify_async(SESSION_KIND, fields, ahead)
 
-    # One newer than this Vault node holds: a node lagging a rotation answers so. An outage.
-    newer = good.replace(":vault:v1:", ":vault:v2:")
-    with pytest.raises(TransitSealUnavailableError) as lagging:
-        await sealer.verify_async(SESSION_KIND, fields, newer)
-    assert not isinstance(lagging.value, TransitSealUnverifiableError)
-    # Further ahead is not lag: a planted giant version is a plain no, so it is still a forgery.
-    giant = good.replace(":vault:v1:", ":vault:v9:")
-    assert await sealer.verify_async(SESSION_KIND, fields, giant) is False
-
-    # Inside the range, a 400 is about this string, which a forged seal can carry: a plain no.
-    def refuses_the_body(**_: Any) -> dict[str, Any]:
-        raise hvac_exceptions.InvalidRequest("synthetic: cannot read the HMAC")
-
-    real_verify = transit.verify_signed_data
-    transit.verify_signed_data = refuses_the_body  # type: ignore[method-assign]
-    assert await sealer.verify_async(SESSION_KIND, [("token_hash", "body")], good) is False
-
-    # A 400 whose range cannot be read (a missing or renamed key) is an outage, not a forgery.
+    # A 400 while the key itself does not answer (a missing or renamed key) is an outage.
     def key_gone(**_: Any) -> dict[str, Any]:
         raise hvac_exceptions.InvalidRequest("synthetic: no such key")
 
-    transit.read_key = key_gone  # type: ignore[method-assign]
+    transit.generate_hmac = key_gone  # type: ignore[method-assign]
     with pytest.raises(TransitSealUnavailableError):
-        await sealer.verify_async(SESSION_KIND, [("token_hash", "fresh")], good)
-    transit.verify_signed_data = real_verify  # type: ignore[method-assign]
+        await sealer.verify_async(SESSION_KIND, fields, good.replace(":vault:v1:", ":vault:v2:"))
 
 
-async def test_a_seal_under_a_retired_version_is_refused_but_not_as_a_forgery(
-    transit_store: Opened, caplog: pytest.LogCaptureFixture
+async def test_a_seal_transit_refuses_to_check_is_denied_revoked_audited_and_alerted(
+    transit_store: Opened,
 ) -> None:
     """Raising ``min_decryption_version`` past a version that sealed live rows makes those rows
-    unverifiable (BACKLOG #2592, finding 2). The request is refused, fail-closed, but no seal
-    failure is audited and the session is not ended, because the seal may be genuine."""
+    unverifiable (BACKLOG #2592). Each is treated as a failed seal under its own audit action: the
+    session is ended, the account is refused, and the alert is raised at the forgery's level."""
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
     store, path, transit = transit_store
     transit.refusal = hvac_exceptions.InvalidRequest
-    service = AuthService(store, AuthSettings())
+    alerts: list[str] = []
+    service = AuthService(store, AuthSettings(), integrity_alert=alerts.append)
     await _user(store, "seal-u1")
     token = await _mint(store)
     assert await service.identity_for_token(token) is not None
@@ -333,53 +334,132 @@ async def test_a_seal_under_a_retired_version_is_refused_but_not_as_a_forgery(
     # A seal after the rotation names v2, so the sealer empties its cache of v1 answers.
     await _user(store, "seal-u2")
     await _mint(store, "seal-u2")
-    # Denied as no session, quietly: the same answer an unknown token gets.
     assert await service.identity_for_token(token) is None
-    # A scan skips the retired account rather than aborting, and a sign-in lookup of it answers as
-    # for an unknown name, so the refusal names no account.
-    assert [u.username for u in await service._load_users()] == ["seal-u2"]
-    assert await service._load_user_by_username("seal-u1") is None
-    assert "min_decryption_version" in caplog.text
-    assert _seal_failures(path) == 0
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
+    assert _seal_failures(path) == 0  # not filed as a forgery
+    assert any("could not be verified by Vault transit" in a for a in alerts)
     row = await store.get_session(hash_token(token))
-    assert row is not None and row.revoked_at is None
-    # Control: lowering the minimum again makes the same row verify, so the refusal was the version.
+    assert row is not None and row.revoked_at is not None  # ended, as a failed seal is
+    # A scan skips the account rather than aborting, and reports it.
+    assert [u.username for u in await service._load_users()] == ["seal-u2"]
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 2
+    # Control: lowering the minimum again makes the account verify, so the refusal was Transit's.
     transit.min_decryption = 1
-    assert await service.identity_for_token(token) is not None
-    # And a forged row under a held version is still a recorded seal failure.
-    await _raw_for(path)(
-        "UPDATE sessions SET client = ? WHERE token_hash = ?", ("192.0.2.97", hash_token(token))
+    assert await service._load_user_by_username("seal-u1") is not None
+
+
+async def test_a_planted_well_formed_seal_is_unverifiable_and_alerted(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A planted seal with a giant version but a well-formed body reaches Transit, which refuses
+    it: the session is ended and audited as unverifiable, and the key-level alert fires."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    raised: list[str] = []
+    sink = LoggingAlertSink()
+    monkeypatch.setattr(
+        sink, "integrity_drift", lambda name, *, reason, drift_count: raised.append(name)
     )
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    sealer.set_alert_hook(transit_seal_alert(sink))
+    service = AuthService(store, AuthSettings())
+    await _user(store, "seal-u1")
+    token = await _mint(store)
+    row = await store.get_session(hash_token(token))
+    assert row is not None
+    await _raw_for(path)(
+        "UPDATE sessions SET seal = ? WHERE token_hash = ?",
+        (row.seal.replace(":vault:v1:", ":vault:v999999:"), hash_token(token)),
+    )
+    before = transit.verify_calls
     assert await service.identity_for_token(token) is None
-    assert _seal_failures(path) == 1
+    assert transit.verify_calls > before  # well-formed, so Transit was asked
+    assert raised == [TRANSIT_SEAL_UNVERIFIABLE_SUBJECT]
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
+    ended = await store.get_session(hash_token(token))
+    assert ended is not None and ended.revoked_at is not None
 
 
-async def test_a_seal_naming_a_newer_version_than_vault_holds_is_an_outage(
+async def _retire_v1(store: MessageStore, transit: FakeTransit) -> None:
+    """Rotate, seal once under v2 so the sealer forgets its v1 answers, and retire v1."""
+    transit.rotate()
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    await sealer.seal_async(SESSION_KIND, [("token_hash", "rotate")])
+    transit.min_decryption = 2
+
+
+async def test_an_unverifiable_directory_map_is_skipped_and_only_narrows(
     transit_store: Opened,
 ) -> None:
-    """A session sealed under a version this Vault node does not hold yet, as a node lagging a
-    rotation reports, is denied as unavailable: no seal failure is audited and it is not ended."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    alerts: list[str] = []
+    service = AuthService(store, AuthSettings(), integrity_alert=alerts.append)
+    await service.initialize()  # seeds the built-in roles the map's foreign key names
+    await store.set_ad_group_role_map([("grp", "viewer")])
+    assert await service._ad_roles_for_groups(["grp"]) == {"viewer"}  # control
+    await _retire_v1(store, transit)
+    # Grants nothing, and a step-up reads it as a failing map, never as roles kept.
+    assert await service._ad_roles_for_groups(["grp"]) == set()
+    assert await service._sealed_ad_map(AD_ROLE_MAP) is None
+    assert await service._directory_roles_lost(["viewer"], ["grp"]) == DIRECTORY_ROLE_MAP_UNSEALED
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
+    assert len(alerts) == 1
+
+
+async def test_an_unverifiable_custom_role_is_listed_empty_and_refuses_an_edit(
+    transit_store: Opened,
+) -> None:
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
     store, path, transit = transit_store
     transit.refusal = hvac_exceptions.InvalidRequest
     service = AuthService(store, AuthSettings())
-    await _user(store, "seal-u1")
-    transit.rotate()
-    token = await _mint(store)  # sealed under v2
-    row = await store.get_session(hash_token(token))
-    assert row is not None and ":vault:v2:" in row.seal
-    sealer = store.row_sealer()
-    assert isinstance(sealer, TransitRowSealer)
-    sealer._cache.clear()
-    transit.latest = 1  # the node answering now lags the rotation
-    with pytest.raises(TransitSealUnavailableError) as caught:
-        await service.identity_for_token(token)
-    assert not isinstance(caught.value, TransitSealUnverifiableError)
-    assert _seal_failures(path) == 0
-    row = await store.get_session(hash_token(token))
-    assert row is not None and row.revoked_at is None
-    transit.latest = 2  # the node catches up
-    assert await service.identity_for_token(token) is not None
+    await service.initialize()
+    role = await service.create_custom_role(
+        display_name="r", description=None, permissions=["messages:replay"], actor="t"
+    )
+    await _retire_v1(store, transit)
+    assert await service._load_role(role.id) is None
+    [listed] = [r for r in await service.list_custom_roles() if r.id == role.id]
+    assert listed.permissions == frozenset()
+    with pytest.raises(CustomRoleUnverifiableError, match="delete the role"):
+        await service.update_custom_role(
+            role.id, display_name="r", description=None, permissions=["messages:read"], actor="t"
+        )
+    found = await store.get_role(role.id)
+    assert found is not None and "messages:replay" in str(found["permissions"])  # untouched
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) >= 1
+    # Control: once the role verifies again, the same edit saves.
+    transit.min_decryption = 1
+    await service.update_custom_role(
+        role.id, display_name="r", description=None, permissions=["messages:read"], actor="t"
+    )
+    # And deleting is the recovery path while it cannot be verified.
+    transit.min_decryption = 2
+    await _retire_v1(store, transit)
+    await service.delete_custom_role(role.id, actor="t")
+    assert await store.get_role(role.id) is None
+
+
+async def test_an_unverifiable_approval_is_skipped_with_audit_and_alert(
+    transit_store: Opened,
+) -> None:
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    harness = ApprovalHarness(store, _raw_for(path))
+    approval_id = await harness.request(contract_nonce="repeat")
+    assert await harness.listed(approval_id)  # control
+    await _retire_v1(store, transit)
+    assert not await harness.listed(approval_id)  # skipped, the read did not abort
+    assert harness.alerted(approval_id) == 1
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
+    # A repeat request is filed on its own rather than joining the row nobody can check.
+    assert await harness.request(contract_nonce="repeat") != approval_id
 
 
 # --- a check held open across a rotation (Greptile P2 on PR 2565) ----------------------------------
@@ -447,11 +527,13 @@ async def test_an_outage_alerts_once_per_window(
         with pytest.raises(TransitSealUnavailableError):
             await sealer.seal_async(SESSION_KIND, [("token_hash", "x")])
     assert len(raised) == 1 and raised[0][0] == TRANSIT_SEAL_SUBJECT
-    # A retired version is its own cause, so the outage's alert does not throttle it away.
+    # An unverifiable seal is its own cause, so the outage's alert does not throttle it away.
+    # alerts.py spells the cause itself to import nothing from the store; this ties the two.
+    assert row_seal.TRANSIT_UNVERIFIABLE_CAUSE == "transit-unverifiable"
     transit.down = False
     with pytest.raises(TransitSealUnverifiableError):
-        raise sealer._unverifiable(RowSealVersionRetiredError(1, 2))
-    assert [name for name, _ in raised] == [TRANSIT_SEAL_SUBJECT, TRANSIT_SEAL_RETIRED_SUBJECT]
+        raise sealer._unverifiable(RowSealUnverifiableError())
+    assert [name for name, _ in raised] == [TRANSIT_SEAL_SUBJECT, TRANSIT_SEAL_UNVERIFIABLE_SUBJECT]
     assert "synthetic Vault outage" not in raised[0][1]  # a fixed sentence, never Vault's text
 
 
@@ -502,6 +584,9 @@ def test_the_cli_prints_one_error_line_for_a_transit_outage(
     err = capsys.readouterr().err
     assert err.startswith("error: the command was refused") and "synthetic outage" in err
     assert "last-resort" not in err and "Traceback" not in err
+    # A seal Transit refused to check is a refusal too, and is not called a non-failure.
+    unverifiable = _refusal_text(TransitSealUnverifiableError("Transit row seal unverifiable: x"))
+    assert unverifiable is not None and "nothing was recorded" not in unverifiable
     # Control: an exception that is not a seal refusal still takes the last-resort floor.
     assert _refusal_text(RuntimeError("x")) is None
 
@@ -523,6 +608,10 @@ def test_the_cli_prints_one_error_line_for_a_transit_outage(
         "mfseal:v1:{kid}:vault:v01:abc",  # a leading zero, which Transit never writes
         "mfseal:v1:{kid}:vault:v0:abc",
         "mfseal:v1:{kid}:mac",
+        # Base64, but 31 bytes rather than a SHA-256 digest's 32: refused locally.
+        "mfseal:v1:{kid}:vault:v1:" + base64.b64encode(b"\x00" * 31).decode("ascii"),
+        "mfseal:v1:{kid}:vault:v1:" + "!" * 44,  # 44 characters, none of them base64
+        "mfseal:v1:{kid}:vault:v1:" + "A" * 43,  # bad padding
     ],
 )
 async def test_a_malformed_seal_fails_with_no_transit_call(

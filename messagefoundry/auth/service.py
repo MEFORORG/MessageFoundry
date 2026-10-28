@@ -2963,18 +2963,56 @@ def oidc_client_auth_from_settings(
 
 #: The audit action written when an authority row fails its integrity seal (BACKLOG #2592).
 AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
+#: The audit action written when Vault transit refused to check an authority row's well-formed seal
+#: (BACKLOG #2592). The row is treated as a failed seal, under its own action, because the reply
+#: cannot tell a retired or lagging key version from a planted one.
+AUTHORITY_SEAL_UNVERIFIABLE_ACTION: Final = "integrity.authority_seal_unverifiable"
 
 
 async def _unless_unverifiable(check: Awaitable[bool]) -> bool | None:
-    """``check``'s answer, or ``None`` when the seal names a Transit key version below the key's
-    ``min_decryption_version`` (BACKLOG #2592). The row may be genuine, so a loader denies it
-    without reporting it as a failed seal or ending it, and a scan skips it rather than aborting.
-    The sealer has already logged the cause, throttled, and raised its alert. Any other refusal,
-    an outage included, still propagates."""
+    """``check``'s answer, or ``None`` when Vault transit refused to check a well-formed seal
+    (:class:`~messagefoundry.store.row_seal.TransitSealUnverifiableError`, BACKLOG #2592). A
+    caller treats ``None`` as a failed seal, reported under
+    :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION`, and a scan skips the row rather than aborting. Any
+    other refusal, an outage included, still propagates."""
     try:
         return await check
     except TransitSealUnverifiableError:
         return None
+
+
+class CustomRoleUnverifiableError(Exception):
+    """An edit of a custom role whose stored seal Vault transit refused to check (BACKLOG #2592).
+
+    Refused rather than saved: the role is listed with no permissions, so a re-save would replace
+    what it may genuinely hold. The text names the recovery, and nothing from the row."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "this custom role's stored integrity seal cannot be verified by Vault transit, so it"
+            " was not saved: a save would replace the permissions it may still hold. To recover,"
+            " delete the role and create it again"
+        )
+
+
+class SealReport(NamedTuple):
+    """What one seal report writes: its audit action, its verb phrase and its throttle key."""
+
+    action: str
+    verb: str
+    throttle_key: str
+
+
+def seal_report_text(unverifiable: bool, key: str = "") -> SealReport:
+    """The report for a failed seal, or with ``unverifiable`` for one Transit refused to check
+    (BACKLOG #2592). The throttle key keeps the two apart for the same row ``key``."""
+    if unverifiable:
+        return SealReport(
+            AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
+            "could not be verified by Vault transit",
+            f"unverifiable:{key}",
+        )
+    return SealReport(AUTHORITY_SEAL_FAILED_ACTION, "failed its integrity check", key)
 
 
 #: How much of a session's token hash a log line, audit row or alert names. Twelve hex characters, as
@@ -10033,27 +10071,32 @@ class AuthService:
 
     async def _session_row_holds(self, session: SessionRecord, sealer: Sealer | None) -> bool:
         """Whether an unrevoked session row's seal verifies; a row that fails is handed to
-        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592). A seal Transit can no longer
-        verify (:func:`_unless_unverifiable`) is denied and left alone: not ended, not reported."""
+        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592). So is a seal Vault transit
+        refused to check (:func:`_unless_unverifiable`), reported under its own audit action."""
         held = await _unless_unverifiable(session_seal_ok(sealer, session))
-        if held is None:
-            return False
         if held:
             return True
+        if held is None:
+            await self._session_seal_failed(session.token_hash, unverifiable=True)
+            return False
         await self._session_seal_failed(
             session.token_hash, key_changed=session_sealed_by_retired_key(sealer, session)
         )
         return False
 
-    async def _session_seal_failed(self, token_hash: str, *, key_changed: bool = False) -> None:
+    async def _session_seal_failed(
+        self, token_hash: str, *, key_changed: bool = False, unverifiable: bool = False
+    ) -> None:
         """End a session row that failed its integrity seal, and report it (BACKLOG #2592).
 
         The row is revoked, which blanks its seal and needs no key, so the next presentation is
         refused quietly as a revoked row. With ``key_changed`` the row carries a genuine seal made
         under a retired store key: the store key changed without ``rotate-key`` ending the sessions,
         so it is logged at INFO and nothing more. Otherwise it is an integrity failure: a WARNING,
-        an :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row and an ``integrity_drift`` alert. The
-        caller denies; the engine keeps running.
+        an :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row and an ``integrity_drift`` alert. With
+        ``unverifiable`` Vault transit refused to check the seal: the row is ended and reported the
+        same way, under :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION`. The caller denies; the engine
+        keeps running.
 
         Reports are rate-limited per row, once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`,
         for a row the revoke could not end. Each names the row by a short prefix of its token hash,
@@ -10073,25 +10116,32 @@ class AuthService:
             return
         await self._report_seal_failure(
             ref,
-            f"a {SESSION_KIND} row failed its integrity check and was ended (session {ref})",
+            f"a {SESSION_KIND} row {seal_report_text(unverifiable).verb} and was ended"
+            f" (session {ref})",
             {"kind": SESSION_KIND, "session": ref},
+            unverifiable=unverifiable,
         )
 
-    async def _report_seal_failure(self, key: str, reason: str, detail: dict[str, str]) -> None:
+    async def _report_seal_failure(
+        self, key: str, reason: str, detail: dict[str, str], *, unverifiable: bool = False
+    ) -> None:
         """Report one authority row that failed its integrity seal (BACKLOG #2592): a WARNING, an
         :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row carrying ``detail``, and an
         ``integrity_drift`` alert, at most once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`
-        per ``key``. ``reason`` and ``detail`` name the row by an id, never a row value. A store
+        per ``key``. With ``unverifiable``, a seal Vault transit refused to check, the audit row is
+        :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` and the throttle key is its own; the alert is
+        the same. ``reason`` and ``detail`` name the row by an id, never a row value. A store
         refusal of the audit write is logged, not raised, so it does not turn a denial into an
         error."""
-        if not self._seal_failures_reported.due(key):
+        action, _verb, throttle_key = seal_report_text(unverifiable, key)
+        if not self._seal_failures_reported.due(throttle_key):
             return
         _log.warning("%s", reason)
         await write_audit_soft(
-            lambda: self._audit(AUTHORITY_SEAL_FAILED_ACTION, detail=_json(detail)),
+            lambda: self._audit(action, detail=_json(detail)),
             log=_log,
             message="the %s audit row for a refused authority row could not be written",
-            args=(AUTHORITY_SEAL_FAILED_ACTION,),
+            args=(action,),
             errors=audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
         )
@@ -10195,7 +10245,10 @@ class AuthService:
             else:
                 held = await _unless_unverifiable(user_seal_ok(sealer, record))
             if held is None:
-                return None  # a seal Transit can no longer verify: denied, not reported
+                # Vault transit refused to check the seal: denied and reported, not re-read,
+                # because a re-read asks Transit the same question.
+                await self._user_seal_failed(user.id, unverifiable=True)
+                return None
             if held:
                 return VerifiedUser.of(user, sorted(g.role_id for g in grants))
             if attempt == 0:
@@ -10272,14 +10325,19 @@ class AuthService:
         await self._user_seal_failed(user.id, part="passkeys")
         return None
 
-    async def _user_seal_failed(self, user_id: str, *, part: str = USER_KIND) -> None:
+    async def _user_seal_failed(
+        self, user_id: str, *, part: str = USER_KIND, unverifiable: bool = False
+    ) -> None:
         """Report an account whose record (or, with ``part="passkeys"``, whose passkey set) failed
-        its integrity seal (BACKLOG #2592), through :meth:`_report_seal_failure`, keyed per account.
-        The caller denies; the engine keeps running."""
+        its integrity seal, or with ``unverifiable`` whose seal Vault transit refused to check
+        (BACKLOG #2592), through :meth:`_report_seal_failure`, keyed per account. The caller
+        denies; the engine keeps running."""
         await self._report_seal_failure(
             f"{part}:{user_id}",
-            f"a {part} record failed its integrity check and was refused (account {user_id})",
+            f"a {part} record {seal_report_text(unverifiable).verb} and was refused"
+            f" (account {user_id})",
             {"kind": part, "user_id": user_id},
+            unverifiable=unverifiable,
         )
 
     # --- the role and directory-map loaders (BACKLOG #2592) ----------------------------------------
@@ -10290,21 +10348,29 @@ class AuthService:
         readers of the store's role and AD role-map readers in this service;
         ``tests/test_role_seal.py`` holds that. A row that fails is reported and read as absent, so
         it grants nothing."""
+        checked = await self._checked_role(role_id)
+        return checked[0] if checked is not None and checked[1] else None
+
+    async def _checked_role(self, role_id: str) -> tuple[RoleRow, bool | None] | None:
+        """The ``roles`` row ``role_id`` names with its seal's verdict, or ``None`` for no row:
+        ``True`` holds, ``False`` fails and ``None`` is a seal Vault transit refused to check
+        (BACKLOG #2592). Each of the last two is reported. Only :meth:`_load_role` and
+        :meth:`update_custom_role` read it; the verdict, not the row, decides what they do."""
         found = await self._store.get_role(role_id)
         if found is None:
             return None
         row = RoleRow.from_mapping(found)
         holds = await _unless_unverifiable(role_seal_ok(self._store.row_sealer(), row))
-        if holds:
-            return row
-        if holds is not None:  # None: a seal Transit can no longer verify, denied, not reported
-            await self._role_seal_failed(row.id)
-        return None
+        if not holds:
+            await self._role_seal_failed(row.id, unverifiable=holds is None)
+        return row, holds
 
     async def _load_custom_roles(self) -> list[tuple[RoleRow, bool]]:
-        """Every custom role row, each with whether its seal holds. One that fails is reported, and
-        listed with no permissions by the caller, so an administrator can still see it to save it
-        again or delete it, and never sees, or re-saves, a value written outside the store."""
+        """Every custom role row, each with whether its seal holds. One that fails, or whose seal
+        Vault transit refused to check, is reported, and listed with no permissions by the caller,
+        so an administrator can still see it to save it again or delete it, and never sees, or
+        re-saves, a value written outside the store. A scan skips nothing and aborts on nothing
+        for an unverifiable seal."""
         sealer = self._store.row_sealer()
         out: list[tuple[RoleRow, bool]] = []
         for found in await self._store.list_roles():
@@ -10312,8 +10378,8 @@ class AuthService:
             if not is_custom_role_id(row.id):
                 continue  # a built-in resolves from code; its row grants nothing
             checked = await _unless_unverifiable(role_seal_ok(sealer, row))
-            if checked is False:  # None: a seal Transit can no longer verify, not reported
-                await self._role_seal_failed(row.id)
+            if not checked:
+                await self._role_seal_failed(row.id, unverifiable=checked is None)
             out.append((row, bool(checked)))
         return out
 
@@ -10328,15 +10394,17 @@ class AuthService:
         found = await self._store.get_role(role_id)
         return found is not None and not bool(found["builtin"])
 
-    async def _role_seal_failed(self, role_id: str) -> None:
-        """Report a custom role whose row failed its integrity seal (BACKLOG #2592), through
+    async def _role_seal_failed(self, role_id: str, *, unverifiable: bool = False) -> None:
+        """Report a custom role whose row failed its integrity seal, or with ``unverifiable`` whose
+        seal Vault transit refused to check (BACKLOG #2592), through
         :meth:`_report_seal_failure`, keyed per role. The role grants nothing; its holders keep
         their other roles."""
         await self._report_seal_failure(
             f"{ROLE_KIND}:{role_id}",
-            f"a {ROLE_KIND} definition failed its integrity check and grants nothing"
+            f"a {ROLE_KIND} definition {seal_report_text(unverifiable).verb} and grants nothing"
             f" (role {role_id})",
             {"kind": ROLE_KIND, "role_id": role_id},
+            unverifiable=unverifiable,
         )
 
     async def _ad_map(self, name: str) -> AdMap:
@@ -10352,12 +10420,16 @@ class AuthService:
         """:meth:`_ad_map`, but ``None`` rather than an empty map when the seal fails, for a caller
         that must tell a failing map from an honestly empty one. The failure is still reported."""
         current = await self._store.get_ad_map(name)
-        if await ad_map_seal_ok(self._store.row_sealer(), current):
+        holds = await _unless_unverifiable(ad_map_seal_ok(self._store.row_sealer(), current))
+        if holds:
             return current
+        # A map whose seal Vault transit refused to check is reported and stands in as failing,
+        # so it only ever narrows: every caller reads None as no pair at all.
         await self._report_seal_failure(
             f"{ADSET_KIND}:{name}",
-            f"the {name} failed its integrity check and grants nothing",
+            f"the {name} {seal_report_text(holds is None).verb} and grants nothing",
             {"kind": ADSET_KIND, "map": name},
+            unverifiable=holds is None,
         )
         return None
 
@@ -15053,9 +15125,16 @@ class AuthService:
         an unknown/built-in role and :class:`CustomRoleError` for an invalid permission set.
 
         The whole row is written from these arguments and sealed, so this also repairs a role whose
-        row fails its integrity seal (BACKLOG #2592); nothing is kept from the row it replaces."""
-        if not await self._custom_role_held(role_id):
+        row fails its integrity seal (BACKLOG #2592); nothing is kept from the row it replaces. A
+        role whose seal Vault transit refused to check is NOT re-saved, and raises
+        :class:`CustomRoleUnverifiableError`: it is listed with no permissions, so a re-save from
+        that listing would overwrite the permissions it may genuinely hold."""
+        # One read: the row's own builtin column answers "custom", as _custom_role_held does.
+        checked = await self._checked_role(role_id) if is_custom_role_id(role_id) else None
+        if checked is None or checked[0].builtin:
             raise ValueError("no such custom role")
+        if checked[1] is None:
+            raise CustomRoleUnverifiableError()
         perms = validate_custom_role_permissions(permissions)  # raises CustomRoleError
         await self._store.upsert_role(
             role_id=role_id,

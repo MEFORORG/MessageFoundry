@@ -332,7 +332,8 @@ _ROLE_READERS = frozenset(
 )
 #: The service functions allowed to call a raw role or map reader.
 _LOADERS: dict[str, frozenset[str]] = {
-    "_load_role": frozenset({"get_role"}),
+    # _load_role and update_custom_role read through it, for the seal's verdict (BACKLOG #2592).
+    "_checked_role": frozenset({"get_role"}),
     "_load_custom_roles": frozenset({"list_roles"}),
     # An existence question: only a bool leaves it, never the unchecked row.
     "_custom_role_held": frozenset({"get_role"}),

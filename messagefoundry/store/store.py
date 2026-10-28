@@ -179,6 +179,7 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
     Sealer,
+    TransitSealUnverifiableError,
     seal_bytes,
 )
 from messagefoundry.store.schema_verify import (
@@ -3823,7 +3824,12 @@ async def first_sealed_approval(
         except RowSealError:
             failed += 1
             continue
-        if await approval_seal_ok(sealer, row):
+        try:
+            holds = await approval_seal_ok(sealer, row)
+        except TransitSealUnverifiableError:
+            # Skipped like a failed seal, never joined; the sealer has logged and alerted.
+            holds = False
+        if holds:
             return row
         failed += 1
     if failed:

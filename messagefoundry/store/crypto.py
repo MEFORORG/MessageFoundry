@@ -646,26 +646,19 @@ class AuditKeyVersionRefusedError(CipherError):
         )
 
 
-class RowSealVersionRetiredError(CipherError):
-    """Transit refused a row seal check because the seal names a key version below the key's
-    ``min_decryption_version`` (BACKLOG #2592).
+class RowSealUnverifiableError(CipherError):
+    """Transit refused to check a well-formed row seal (HTTP 400) while its key still answers
+    (BACKLOG #2592).
 
-    The seal may well be genuine: an operator raised the minimum before the rows sealed under the
-    older version were sealed again. So it is "cannot be verified", never "forged". The sealer
-    turns it into a refusal that denies, with no seal-failure audit row and no session ended.
-    Carries the two version numbers only, never row data."""
-
-    def __init__(self, version: int, min_decryption_version: int) -> None:
-        super().__init__(version, min_decryption_version)
-        self.version = version
-        self.min_decryption_version = min_decryption_version
+    Transit answers a wrong MAC under a version it holds with ``valid: false``, so this is not
+    that. It is a seal naming a version Transit will not check: one below the key's
+    ``min_decryption_version``, one newer than the Vault node that answered holds, or a planted
+    version. The reply cannot tell those apart, so the sealer denies, and its callers treat the
+    row as they treat a failed seal, under their own audit action. Its text is fixed, never row
+    data or Vault's text."""
 
     def __str__(self) -> str:
-        return (
-            f"a row seal names Transit key version {self.version}, below the key's "
-            f"min_decryption_version {self.min_decryption_version}, so Transit can no longer "
-            "verify it"
-        )
+        return "Transit refused to check a well-formed row seal while its key still answers"
 
 
 class StoreKeylessError(RuntimeError):

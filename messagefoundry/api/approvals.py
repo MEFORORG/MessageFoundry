@@ -61,7 +61,7 @@ from messagefoundry.api.models import ReleaseBlocked
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
-from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
+from messagefoundry.auth.service import seal_report_text
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, authority_seal_alert
@@ -71,6 +71,7 @@ from messagefoundry.store.row_seal import (
     APPROVAL_KIND,
     RowSealError,
     SealFailureThrottle,
+    TransitSealUnverifiableError,
 )
 from messagefoundry.store.store import ApprovalRow, AuditAppend, approval_seal_ok
 
@@ -2263,30 +2264,37 @@ class ApprovalGate:
         except RowSealError:
             await self._approval_seal_failed(str(found["id"]))
             return None
-        if await approval_seal_ok(self._store.row_sealer(), row):
+        try:
+            holds = await approval_seal_ok(self._store.row_sealer(), row)
+        except TransitSealUnverifiableError:
+            # Vault transit refused to check the seal: skipped and reported as a failed seal is,
+            # under its own audit action, rather than aborting the read.
+            await self._approval_seal_failed(row.id, unverifiable=True)
+            return None
+        if holds:
             return row
         await self._approval_seal_failed(row.id)
         return None
 
-    async def _approval_seal_failed(self, approval_id: str) -> None:
+    async def _approval_seal_failed(self, approval_id: str, *, unverifiable: bool = False) -> None:
         """Report a request whose row failed its integrity seal (BACKLOG #2592): a WARNING, an
         ``integrity.authority_seal_failed`` audit row and an ``integrity_drift`` alert, at most once
         per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` per request, as the auth service reports
-        the rows it checks. The report names the request by its id, never a row value. A failed
-        audit write is logged and paged, not raised, so it does not turn a refusal into an error."""
-        if not self._seal_failures_reported.due(approval_id):
+        the rows it checks. With ``unverifiable``, a seal Vault transit refused to check, the audit
+        action is ``integrity.authority_seal_unverifiable`` and the alert is the same. The report
+        names the request by its id, never a row value. A failed audit write is logged and paged,
+        not raised, so it does not turn a refusal into an error."""
+        action, verb, throttle_key = seal_report_text(unverifiable, approval_id)
+        if not self._seal_failures_reported.due(throttle_key):
             return
         # The id comes from the row that failed, so it is scrubbed before it reaches a log line or
         # an alert (CodeQL py/log-injection).
         ref = scrub_log_argument(approval_id)
-        reason = (
-            f"an {APPROVAL_KIND} request failed its integrity check and acts on nothing"
-            f" (approval {ref})"
-        )
+        reason = f"an {APPROVAL_KIND} request {verb} and acts on nothing (approval {ref})"
         log.warning("%s", reason)
         await self._record_audit_soft(
             ref,
-            AUTHORITY_SEAL_FAILED_ACTION,
+            action,
             actor="system",
             detail=json.dumps({"kind": APPROVAL_KIND, "approval_id": approval_id}),
             client=None,

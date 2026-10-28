@@ -1392,23 +1392,29 @@ def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
 #: because Vault transit did not answer (BACKLOG #2592). Its own subject, apart from
 #: :data:`AUTHORITY_SEAL_SUBJECT`, because it is not recorded as a failed seal.
 TRANSIT_SEAL_SUBJECT = "authority-seal-transit"
-#: The subject for a seal under a key version below the key's ``min_decryption_version``. Apart
-#: from :data:`TRANSIT_SEAL_SUBJECT`, so a passing outage never throttles away this one, which needs
-#: an operator.
-TRANSIT_SEAL_RETIRED_SUBJECT = "authority-seal-transit-retired"
+#: The subject for a well-formed seal Transit refused to check while its key answers. Apart from
+#: :data:`TRANSIT_SEAL_SUBJECT`, so a passing outage never throttles away this one, which is treated
+#: as a failed seal and needs an operator.
+TRANSIT_SEAL_UNVERIFIABLE_SUBJECT = "authority-seal-transit-unverifiable"
+#: The cause the sealer passes for that case: ``row_seal.TRANSIT_UNVERIFIABLE_CAUSE``, spelled here
+#: so this module imports nothing from the store.
+_TRANSIT_UNVERIFIABLE_CAUSE = "transit-unverifiable"
 
 
 def transit_seal_alert(sink: AlertSink) -> Callable[[str, str], None]:
     """An alert hook for :meth:`~messagefoundry.store.row_seal.TransitRowSealer.set_alert_hook`:
-    each call raises ``integrity_drift`` under :data:`TRANSIT_SEAL_RETIRED_SUBJECT` for the
-    ``"transit-retired"`` cause and :data:`TRANSIT_SEAL_SUBJECT` for any other. The sealer calls it
-    on its own throttled ERROR path only, so at most once per throttle window per cause.
+    each call raises ``integrity_drift`` under :data:`TRANSIT_SEAL_UNVERIFIABLE_SUBJECT` for the
+    ``"transit-unverifiable"`` cause and :data:`TRANSIT_SEAL_SUBJECT` for any other: the same
+    method a failed seal raises (:func:`authority_seal_alert`). The sealer calls it on its own
+    throttled ERROR path only, so at most once per throttle window per cause.
 
     The reason is a fixed sentence, never Vault's text or a row value. Never raises."""
 
     def _raise(cause: str, reason: str) -> None:
         subject = (
-            TRANSIT_SEAL_RETIRED_SUBJECT if cause == "transit-retired" else TRANSIT_SEAL_SUBJECT
+            TRANSIT_SEAL_UNVERIFIABLE_SUBJECT
+            if cause == _TRANSIT_UNVERIFIABLE_CAUSE
+            else TRANSIT_SEAL_SUBJECT
         )
         try:
             sink.integrity_drift(subject, reason=reason, drift_count=1)

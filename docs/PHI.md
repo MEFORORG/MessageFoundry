@@ -110,16 +110,26 @@ moved message still shows in the other channel's message list by its plaintext c
 encrypted cells withheld. The engine keeps running. A refusal usually writes an `integrity.*`
 audit row and raises an `integrity_drift` alert, with at least these exceptions. Under
 `vault_transit`, a cell that fails its tag keeps the cipher's own error, with no integrity audit
-row or alert. And under `vault_transit`, a seal Transit cannot make or check refuses the request
-or the write with an error log and an `integrity_drift` alert, and no integrity audit row. At least
-these cases count. Vault did not answer, or the seal names a key version one newer than the Vault
-node holds, as a node that lags a rotation does: the API answers 503. Or the seal names a version
-below the key's `min_decryption_version`, which Transit no longer verifies: that row is denied.
-None of them is recorded as a forgery and no session is ended, although a writer who plants a seal
-of either shape gets the same treatment. **Do not raise the audit key's `min_decryption_version`
-while rows sealed under the older versions remain**: such a row is refused until the minimum is
-lowered again. A row is sealed again only when the engine writes it, and no command re-seals rows
-yet. Each process reports a row that keeps failing again only after an interval: five
+row or alert. And under `vault_transit`, a seal Transit cannot make or check because Vault did not
+answer refuses the request or the write with an error log and no integrity audit row: the API
+answers 503 with a `Retry-After`, the CLI prints one error line, and no session is ended. Under
+`vault_transit` a stored seal is read in three ways:
+
+- not a well-formed Transit MAC, or one Transit answers `valid: false` for: a failed seal;
+- well-formed, but Transit refuses to check it while its key still answers: *unverifiable*. The
+  seal names a key version below `min_decryption_version`, one the Vault node that answered does
+  not hold yet, or a planted one, and the reply cannot tell them apart. So it is treated as a
+  failed seal, under its own audit action, `integrity.authority_seal_unverifiable`: the row is
+  denied, a session is ended, and a directory map grants nothing. A custom role whose seal is
+  unverifiable is refused an edit (HTTP 409); delete it and create it again. Before raising the
+  minimum, read [Raising the Transit audit key's minimum
+  version](#raising-the-transit-audit-keys-minimum-version);
+- anything else Transit answers: an outage, as above.
+
+The audit row is written wherever the auth service or the approval gate reads the row. An
+`integrity_drift` alert reaches a sink only while `serve` runs, from just
+before it seeds the auth tables; another command logs the error and raises no alert.
+Each process reports a row that keeps failing again only after an interval: five
 minutes for a sealed row, and an hour for a message or saved-search cell. What each refusal does
 is in the changelog entries for vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the
 next release, then [CHANGELOG.md](../CHANGELOG.md)). The seal format is
@@ -143,6 +153,15 @@ On a first deployment, a writer could still do at least these:
   the delivered-key rows, which could make a delivery look like a duplicate and skip it; queue
   state and lane order; cluster rows; and `sessions.last_used_at`.
 - **Delete rows.** A delete needs no key, so a writer can always destroy data and stop service.
+
+### Raising the Transit audit key's minimum version
+
+Under `vault_transit`, every authority row seal is an HMAC under the audit key, at the version it
+was made under. **Do not raise the audit key's `min_decryption_version` while rows sealed under
+the older versions remain.** Transit then refuses to check those seals, so each such row is
+*unverifiable* and treated as a failed seal: its session is ended, its account or role grants
+nothing, and its directory map is empty. A row is sealed again only when the engine writes it, and
+no command re-seals rows yet. Lowering the minimum again makes the rows verify again.
 
 ---
 

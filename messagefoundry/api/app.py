@@ -427,6 +427,7 @@ from messagefoundry.pipeline.alerts import (
     authority_seal_alert,
     no_enabled_administrator_alert,
     store_cipher_refusal_forwarder,
+    transit_seal_alert,
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
 from messagefoundry.pipeline.cluster import (
@@ -480,6 +481,7 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
+from messagefoundry.store.row_seal import enforce_transit_seal_probe, store_transit_sealer
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
@@ -11537,6 +11539,14 @@ def create_managed_app(
             # BACKLOG #1923: CONSTRUCTED before engine.start(), so a refusal its constructor raises
             # (the OIDC revocation guard, #1887) stops startup before any connection starts.
             # BACKLOG #2131 moved initialize() and the notice gate up here too, below.
+            # BACKLOG #2592: under vault_transit, arm the row sealer's alert hook and probe Transit
+            # before initialize() reads the first authority row. So a token that cannot verify is
+            # refused here with the start refusal's text, and a seal refused before engine.start()
+            # still alerts. engine.start() probes again and re-arms the hook with its own sink.
+            transit_sealer = store_transit_sealer(store)
+            if transit_sealer is not None:
+                transit_sealer.set_alert_hook(transit_seal_alert(notifier or LoggingAlertSink()))
+            await enforce_transit_seal_probe(store)
             auth: AuthService | None = None
             if auth_settings is not None:
                 # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
