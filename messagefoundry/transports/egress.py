@@ -26,7 +26,12 @@ from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, Egr
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
-from messagefoundry.transports.rest import PROXY_DEFAULT, refuse_url_credentials, url_host_label
+from messagefoundry.transports.rest import (
+    PROXY_DEFAULT,
+    refuse_url_credentials,
+    url_host_label,
+    url_scheme,
+)
 
 log = logging.getLogger(__name__)
 
@@ -198,7 +203,7 @@ def _check_credential_token_url_egress(
             error=WiringError,
         )
         if not _http_egress_allowed(token_url, allowed_http):
-            host = url_host_label(token_url)
+            host = url_host_label(token_url, screened=True)
             log.warning(
                 "egress denied: %s %s host %r not in [egress].allowed_http",
                 label,
@@ -250,11 +255,14 @@ def _check_forward_proxy_egress(
             "proxy host to permit it (the proxy receives a Proxy-Authorization credential, so this "
             "list is deny-by-default even under [security].block_unlisted_outbound = false)"
         )
+    # A URL urlsplit cannot parse is said to be one, rather than reported as an allowlist miss that
+    # no entry could ever clear. Its own ValueError quotes the netloc, so it is never let out.
+    url_scheme(proxy_url, f"{label} proxy_url", use="proxy_user/proxy_password", error=WiringError)
     if not _http_egress_allowed(proxy_url, allowed_proxy):
         # The data, token and FhirLookup arms call refuse_url_credentials first, for a refusal that
         # names the setting. This arm cannot, since a proxy may carry its own userinfo, so the label
         # is what keeps its message clean (BACKLOG #1793, #2686).
-        host = url_host_label(proxy_url)
+        host = url_host_label(proxy_url, screened=False)
         log.warning(
             "egress denied: %s forward proxy host %r not in [egress].allowed_proxy", label, host
         )
@@ -296,7 +304,7 @@ def check_fhir_lookup_allowed(
         if not _http_egress_allowed(
             url, egress.allowed_http
         ):  # same host[:port] matching as the FHIR outbound
-            host = url_host_label(url)
+            host = url_host_label(url, screened=True)
             log.warning(
                 "connect denied: FhirLookup %r host %r not in [egress].allowed_http", name, host
             )
@@ -471,7 +479,7 @@ def check_egress_allowed(
         url = str(dest.settings.get("url", ""))
         refuse_url_credentials(url, f"outbound {dest.name!r} 'url'", error=WiringError)
         if not _http_egress_allowed(url, egress.allowed_http):
-            host = url_host_label(url)
+            host = url_host_label(url, screened=True)
             log.warning(
                 "egress denied: outbound %r %s host %r not in [egress].allowed_http",
                 dest.name,
@@ -687,8 +695,8 @@ def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
     A port ``urlsplit`` cannot read is NOT allowed, and this never raises (BACKLOG #1793). The
     ``ValueError`` from ``.port`` quotes the port text, and a password holding an unencoded ``/``,
     ``?`` or ``#`` ends the authority early, so its head IS that text. ``redact()`` does not match it.
-    A URL ``urlsplit`` cannot parse is not allowed either: that ``ValueError`` quotes the whole
-    netloc, and the proxy arm reaches here with no ``refuse_url_credentials`` in front (#2686)."""
+    A URL ``urlsplit`` cannot parse is not allowed either, since that ``ValueError`` quotes the
+    whole netloc (#2686)."""
     try:
         parts = urllib.parse.urlsplit(url)
         port = parts.port

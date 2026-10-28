@@ -562,28 +562,35 @@ def _withholds_host(p: urllib.parse.SplitResult) -> bool:
     return _host_hides_userinfo(p) or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}")
 
 
+#: Where a refusal tells the operator to put an endpoint's credential instead of its URL.
+_URL_CREDENTIAL_USE = "basic_user/basic_password or bearer_token"
+
 #: What :func:`url_host_label` prints in place of a host it must not print.
 HOST_WITHHELD = "(withheld: the URL may hold a credential)"
 
 
-def url_host_label(url: str) -> str:
+def url_host_label(url: str, *, screened: bool) -> str:
     """The host a refusal may print for ``url``, or :data:`HOST_WITHHELD` (BACKLOG #1793, #2686).
+    Never raises. A host of ``""`` prints as ``""``.
 
-    Withheld whenever :func:`_redact_url` would withhold it. Never raises. A host of ``""`` prints
-    as ``""``. It matters most on a ``proxy_url``, which :func:`refuse_url_credentials` never
-    screens, so no construction refusal stands in front of it."""
+    ``screened`` says :func:`refuse_url_credentials` has already passed ``url``. Then only a host
+    that hides a userinfo is withheld, so an allowlist refusal for a URL with an email in its
+    query still names the host the operator must list. Unscreened, as a ``proxy_url`` always is,
+    the host is withheld wherever :func:`_redact_url` would withhold it: an ``@`` after the
+    authority may end a userinfo, and the host printed would be its username."""
     try:
         p = urllib.parse.urlsplit(url)
     except ValueError:
         return HOST_WITHHELD
-    return HOST_WITHHELD if _withholds_host(p) else (p.hostname or "")
+    withhold = _host_hides_userinfo(p) if screened else _withholds_host(p)
+    return HOST_WITHHELD if withhold else (p.hostname or "")
 
 
 def refuse_url_credentials(
     url: str,
     setting: str,
     *,
-    use: str = "basic_user/basic_password or bearer_token",
+    use: str = _URL_CREDENTIAL_USE,
     error: type[ValueError] = ValueError,
 ) -> None:
     """Refuse an endpoint URL that carries a credential, at CONSTRUCTION time (BACKLOG #1793).
@@ -668,7 +675,7 @@ def url_scheme(
     url: str,
     setting: str,
     *,
-    use: str = "basic_user/basic_password or bearer_token",
+    use: str = _URL_CREDENTIAL_USE,
     error: type[ValueError] = ValueError,
 ) -> str:
     """``url``'s lower-cased scheme, for a constructor that checks it BEFORE
@@ -2191,10 +2198,13 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
             "ech_egress is set but ech_sidecar is empty — supply the loopback ECH sidecar URL, "
             "e.g. http://127.0.0.1:8123 (ADR 0139)"
         )
-    parsed = urllib.parse.urlsplit(sidecar)
+    # Never a bare urlsplit, and never the raw value in the message: a URL can carry userinfo
+    # (BACKLOG #2686).
+    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError(
-            f"ech_sidecar must be an http(s):// loopback URL, got {sidecar!r} (ADR 0139)"
+            f"ech_sidecar must be an http(s):// loopback URL, got {_redact_url(sidecar)!r} "
+            "(ADR 0139)"
         )
     if not is_never_proxied_host(parsed.hostname):
         raise ValueError(

@@ -61,6 +61,7 @@ from messagefoundry.transports.http_auth import HttpAuthError, OAuth2ClientCrede
 from messagefoundry.transports.rest import (
     RestDestination,
     _redact_url,
+    ech_sidecar_url_from_settings,
     proxy_config_from_settings,
     refuse_url_credentials,
 )
@@ -635,14 +636,20 @@ def test_build_check_never_carries_the_password(shape: str) -> None:
 # --- 6. BACKLOG #2686: the egress label and the scheme read before the credential screen -------------
 
 
+#: ``urlsplit`` raises a ``ValueError`` quoting the whole netloc when a character folds to a
+#: delimiter under NFKC; here a fullwidth solidus in the password.
+_UNPARSEABLE = f"https://svc:{SECRET}／q@endpoint.example.invalid/x"
+
+
 def _no_secret(text: str) -> None:
-    # ``hostname`` lower-cases, so a case-sensitive check would pass over the leak.
+    # Case-blind: ``hostname`` lower-cases the text before its first ``%``, so a password with no
+    # ``%`` in front of it would come back lower-cased.
     assert SECRET.lower() not in text.lower(), text
 
 
-def test_the_hidden_port_shape_is_refused_without_echoing_it_in_any_case() -> None:
-    """The ``encoded_colon_bracket_head`` shape above is in every parametrized refusal. Those check
-    ``SECRET`` case-sensitively, and ``hostname`` lower-cases, so this checks it case-blind."""
+def test_the_hidden_port_shape_is_refused_naming_the_encoded_colon() -> None:
+    """The ``encoded_colon_bracket_head`` shape above is in every parametrized refusal; this pins
+    which refusal speaks, since only the encoded colon gives it away."""
     with pytest.raises(ValueError, match="%3A") as exc:
         RestDestination(_dest(ConnectorType.REST, _USERINFO_SHAPES["encoded_colon_bracket_head"]))
     _no_secret(str(exc.value))
@@ -666,28 +673,36 @@ def test_the_proxy_egress_label_withholds_a_host_that_hides_its_port(
         _no_secret(str(exc.value))
         assert "svc" not in str(exc.value), str(exc.value)
         assert "withheld" in str(exc.value)
+    assert "egress denied" in caplog.text  # the warning was captured, so its check means something
     _no_secret(caplog.text)
 
 
 def test_redact_url_never_raises_on_a_url_urlsplit_cannot_parse() -> None:
-    assert _redact_url(f"https://svc:{SECRET}／q@endpoint.example.invalid/x") == "<redacted>"
+    assert _redact_url(_UNPARSEABLE) == "<redacted>"
 
 
 def test_the_egress_label_keeps_an_ordinary_host_and_an_ipv6_literal() -> None:
-    """The control half. ``::1`` holds ``:``, so the IPv6 exemption is what keeps it."""
+    """The control half. ``::1`` holds ``:``, so the IPv6 exemption is what keeps it. A screened
+    URL with an ``@`` in its query keeps its host too, so the operator can see what to list."""
     egress = EgressSettings(allowed_http=["other.example.invalid"])
     for url, host in (
         ("https://endpoint.example.invalid:8443/x", "endpoint.example.invalid"),
         ("https://[::1]:8443/x", "::1"),
+        ("https://endpoint.example.invalid/x?who=a@b", "endpoint.example.invalid"),
     ):
         with pytest.raises(WiringError) as exc:
             check_egress_allowed(_dest(ConnectorType.REST, url), egress)
         assert f"host {host!r}" in str(exc.value), str(exc.value)
 
 
-#: ``urlsplit`` raises a ``ValueError`` quoting the whole netloc when a character folds to a
-#: delimiter under NFKC; here a fullwidth solidus in the password.
-_UNPARSEABLE = f"https://svc:{SECRET}／q@endpoint.example.invalid/x"
+def test_the_ech_sidecar_refusals_never_echo_the_url() -> None:
+    for sidecar in (_UNPARSEABLE, f"ftp://svc:{SECRET}@127.0.0.1:8123"):
+        with pytest.raises(ValueError) as exc:
+            ech_sidecar_url_from_settings({"ech_egress": True, "ech_sidecar": sidecar})
+        _no_secret(str(exc.value))
+        assert "ech_sidecar" in str(exc.value)
+        assert exc.value.__context__ is None
+
 
 _SCHEME_READERS: list[tuple[str, type[ValueError], str, Any]] = [
     *((label, ValueError, "'url'", build) for label, build in _DESTINATIONS),
@@ -742,17 +757,15 @@ def test_a_constructor_refuses_an_unparseable_url_before_reading_its_scheme(
     assert exc.value.__cause__ is None
 
 
-def test_the_proxy_egress_arm_refuses_an_unparseable_proxy_without_echoing_it(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The proxy arm has no ``refuse_url_credentials`` in front, so the match itself must not raise."""
+def test_the_proxy_egress_arm_refuses_an_unparseable_proxy_without_echoing_it() -> None:
+    """The proxy arm has no ``refuse_url_credentials`` in front. It says the URL cannot be parsed,
+    rather than reporting an allowlist miss that no entry could clear."""
     egress = EgressSettings(
         allowed_http=["endpoint.example.invalid"], allowed_proxy=["proxy.example.invalid:3128"]
     )
-    proxy = f"http://svc:{SECRET}／q@proxy.example.invalid:3128"
+    proxy = _UNPARSEABLE.replace("https://", "http://").replace("endpoint.", "proxy.")
     dest = _dest(ConnectorType.REST, "https://endpoint.example.invalid/x", proxy_url=proxy)
-    with caplog.at_level(logging.DEBUG), pytest.raises(WiringError) as exc:
+    with pytest.raises(WiringError, match="proxy_url is not a URL that can be parsed") as exc:
         check_egress_allowed(dest, egress)
     _no_secret(str(exc.value))
-    assert "allowed_proxy" in str(exc.value)
-    _no_secret(caplog.text)
+    assert exc.value.__context__ is None

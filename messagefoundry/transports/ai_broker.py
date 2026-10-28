@@ -155,7 +155,7 @@ class AiBroker:
         # than — and independent of — the permissive-when-empty [egress].allowed_http, so the engine can
         # never be pointed at an un-allowlisted LLM host. An EMPTY allowlist permits NOTHING.
         if not endpoint_host_allowed(endpoint, allowed_endpoints):
-            host = url_host_label(endpoint)
+            host = url_host_label(endpoint, screened=True)
             raise AiBrokerError(
                 f"[ai].endpoint host {host!r} is not in the [ai].allowed_endpoints allowlist; "
                 "list it explicitly to permit engine-brokered AI egress (SSRF fail-closed)"
