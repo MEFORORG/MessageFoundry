@@ -1879,7 +1879,9 @@ _STRUCTURED_ROUNDS = 8
 # for it, at the answer's end; :func:`_maskable_rest` says why. Only the LABEL arm of
 # :data:`_CREDENTIAL_AHEAD` is read here, from ``\b`` alone, so at least these glued to a run print
 # as before: a bare ``bearer`` scheme, the query keys ``code=``, ``state=`` and ``session_state=``,
-# and a label right after a ``%XX`` escape.
+# a label right after a ``%XX`` escape, and a label longer than :data:`_GLUED_LABEL_SPAN`. A
+# credential value followed by anything but a space or the text's end, such as the closing quote
+# of a repr or a JSON string, prints as before too.
 #
 # Where any of that fails, the token is scrubbed as in the plain answer. Residuals, at least these: a
 # value holding punctuation, a non-ASCII letter or one of those words; a value longer than
@@ -1917,9 +1919,27 @@ _GLUED_CREDENTIAL_LABEL = re.compile(
     r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
     r"""|token|pass|pwd)))\b['"]?[:=]\Z"""
 )
-#: The keywords that pattern spells, read from its source: a screen in front of its search.
-_GLUED_CREDENTIAL_WORDS = tuple(
-    _GLUED_CREDENTIAL_LABEL.pattern.split("(?:", 3)[3].split(")", 1)[0].split("|")
+#: The keywords that pattern spells, for a screen in front of its search. A test holds the two to
+#: the same words.
+_GLUED_CREDENTIAL_WORDS = (
+    "encryption_keys_retired",
+    "intake_api_key_next",
+    "encryption_key",
+    "authorization",
+    "private_key",
+    "passphrase",
+    "credential",
+    "password",
+    "session",
+    "api_key",
+    "api-key",
+    "apikey",
+    "bearer",
+    "passwd",
+    "secret",
+    "token",
+    "pass",
+    "pwd",
 )
 #: How far back of a token's end a label is looked for, and how far on its value may run.
 _GLUED_LABEL_SPAN = 48
@@ -1971,6 +1991,12 @@ _UNBOUNDED_HEADS = tuple(
         }
     )
 )
+#: The heads a credential's masked last word is refused on: the ones above, and the bundle marker's
+#: heads that hold digits. A PHI last word that ends the answer is letters only, so it cannot end in
+#: these; a credential's may (code review round 2, #2968). They are not added above, since a quoted
+#: PHI value is masked there whatever its last word holds, and adding them would leave such a value
+#: in view where the answer before #2968 masked it (measured, 7 texts in 90,000).
+_CREDENTIAL_UNBOUNDED_HEADS = (*_UNBOUNDED_HEADS, "mfb6", "mfb64")
 #: Whitespace to the end of the text, matched where a value ends.
 _TRAILING_SPACE = re.compile(r"\s*+\Z")
 
@@ -1998,10 +2024,14 @@ def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> s
 
 
 def _ends_in_credential_label(token: str) -> bool:
-    """Whether ``token`` ends on a credential label and its separator. The word screen is a
-    necessary condition of the pattern, so most tokens skip the search."""
+    """Whether ``token`` ends on a credential label and its separator. On an ASCII tail the word
+    screen is a necessary condition of the pattern, so most tokens skip the search. A tail outside
+    ASCII always takes the search, since the pattern folds case the Unicode way (``\\u017fecret``
+    reads as ``secret``) and ``str.lower`` does not."""
     tail = token[-_GLUED_LABEL_SPAN:]
-    if not (tail.rstrip(":='\"").lower().endswith(_GLUED_CREDENTIAL_WORDS) or "MEFOR_" in tail):
+    if tail.isascii() and not (
+        tail.rstrip(":='\"").lower().endswith(_GLUED_CREDENTIAL_WORDS) or "MEFOR_" in tail
+    ):
         return False
     return _GLUED_CREDENTIAL_LABEL.search(token, max(0, len(token) - _GLUED_LABEL_SPAN)) is not None
 
@@ -2042,7 +2072,8 @@ def _maskable_rest(
     glued = not rest.endswith(" ") and text[stop : stop + 1] not in ("", " ")
     # Punctuation after the last word, a caller's or the terminator, could complete a word read
     # with no boundary: ``ZqMSH"]},`` declares delimiters once a JSON log escapes the quote.
-    if (ends or glued) and last.endswith(_UNBOUNDED_HEADS):
+    heads = _CREDENTIAL_UNBOUNDED_HEADS if credential else _UNBOUNDED_HEADS
+    if (ends or glued) and last.endswith(heads):
         return None
     # A caller's glued digits would join a date arm, and every date arm opens with a digit at a word
     # boundary, so it can start only at the last word's first character and then run on through

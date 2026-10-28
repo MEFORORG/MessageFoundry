@@ -11,8 +11,8 @@ close it.
 **The value is now masked in place, as a glued PHI value is (BACKLOG #3318).** Where the value is one
 plain word, ``redaction._glued_value`` masks it letter for letter, so every route's answer is the
 answer with this rule off, with some letters and digits masked to their class, and nothing else
-changed. The sweep below holds that property; it rules out a value printing that the rule-off
-answer hid, by construction. A fix that kept the trailing label instead was built and withdrawn
+changed. The sweep below holds that property over the texts it plants, which rules out, for
+those texts and routes, a value printing that the rule-off answer hid. A fix that kept the trailing label instead was built and withdrawn
 under batch 255: its own differential printed no new value, but a code review's denser fuzz found
 credential values it printed that this redactor hid. This one keeps no label.
 
@@ -223,8 +223,44 @@ def test_the_glued_label_spells_the_credential_ahead_vocabulary() -> None:
 
 def test_the_keyword_screen_is_the_pattern_vocabulary() -> None:
     """The cheap screen in front of the label search holds exactly the pattern's keywords, which are
-    ``secretscrub``'s, so it never skips a label the pattern reads."""
+    ``secretscrub``'s, so on an ASCII token it skips no label the pattern reads."""
+    source = redaction._GLUED_CREDENTIAL_LABEL.pattern.replace('"""', "")
+    spelled = re.search(r"\{0,6\}\(\?:([a-z_|-]+)\)", source)
+    assert spelled is not None
+    assert set(spelled.group(1).split("|")) == set(redaction._GLUED_CREDENTIAL_WORDS)
     assert set(redaction._GLUED_CREDENTIAL_WORDS) == set(_SCRUB_WORDS)
+
+
+def test_a_quoted_phi_value_ending_in_a_marker_head_is_still_masked() -> None:
+    """Found by the differential after review round 2: the credential arm's extra heads, applied to
+    the PHI arm too, left this quoted PHI value in view where the answer before #2968 masked it."""
+    text = '{"given":"A^B^C,pwd::Bearer zqbafhgmfb6"]}'
+    assert not _all_paths_keeping(text, "zqbafhgmfb6")
+    assert redact(text) == '[redacted] xxxxxxxxxx0"]}'
+
+
+def test_a_label_spelled_with_a_fold_character_is_still_read() -> None:
+    """Found by code review round 2: the pattern folds case the Unicode way and ``str.lower`` does
+    not, so a non-ASCII tail skips the screen and takes the search."""
+    for label in ("ſecret", "paſſword", "İntake_api_key_next"):
+        text = f"x|y|z;{label}: {_VALUE}"
+        assert redaction._GLUED_CREDENTIAL_LABEL.search(f"x|y|z;{label}:"), label
+        assert not _paths_keeping(text, _VALUE), label
+
+
+def test_a_value_ending_in_the_bundle_marker_head_is_refused() -> None:
+    """Found by code review round 2: the support bundle reads ``mfb64:v1:`` with no boundary before
+    it, and a masked credential word may hold digits, so ``mfb6`` must stay as the rule-off
+    answer leaves it."""
+    for value, after in (("Zq9mfb6", "4:v1:SUQ0NDU1"), ("zqmfb64", ":v1:QUJDREVGR0g=")):
+
+        def bundled() -> str:
+            line = safe_exc(ValueError(f"bad x|y|z;password: {value}")) + after  # noqa: B023
+            return redact_log_line(_through_the_chain(line))
+
+        on = bundled()
+        with _rule_off():
+            assert on == bundled(), value
 
 
 #: A PHI value whose rest holds a credential label: the PHI arm masks it to its terminator, and the
@@ -241,10 +277,10 @@ _PHI_HOLDING_A_LABEL = (
 
 @pytest.mark.parametrize("text", _PHI_HOLDING_A_LABEL)
 def test_a_phi_arm_answers_before_the_credential_arm(text: str) -> None:
-    assert not _all_paths_keeping(text, "Vandtjane")
+    paths = _all_paths(text)
+    assert not _keeping(paths, "Vandtjane")
     with _rule_off():
-        main = _all_paths(text)
-    assert _all_paths(text) == main
+        assert paths == _all_paths(text)
 
 
 def test_a_caller_cannot_complete_a_date_from_a_digit_led_value() -> None:
@@ -393,6 +429,17 @@ _REFUSED_VALUES = {
         f"x|y|z%2Cpassword: {_VALUE}",
         _VALUE,
         f"x %2Cpassword: {_VALUE}",
+    ),
+    # Found by code review round 2: the closing quote of a repr or a JSON string after the value.
+    "a-quote-after-the-value": (
+        f'{{"msg":"bad x|y|z;password: {_VALUE}"}}',
+        _VALUE,
+        f'{{"msg":"bad x ;password: {_VALUE}"}}',
+    ),
+    "a-label-longer-than-the-window": (
+        f"bad x|y|z;{'a' * 45}_password: {_VALUE} ok",
+        _VALUE,
+        f"bad x ;{'a' * 45}_password: {_VALUE} ok",
     ),
     # A value that opens with a digit and ends the text: a caller's digits could complete a date.
     "a-digit-led-value-at-the-end": (
@@ -593,7 +640,7 @@ _SWEEP_RUNS = (
 _SWEEP_GLUE = ("", ";", ",", '"', "'", "}", ")", "_", ".", "=", "\\", "|")
 _SWEEP_LABELS = ("password", "db_password", "Token", "api-key", "MEFOR_DB_PW", "'secret'")
 _SWEEP_SEPARATORS = (": ", "= ", "=  ")
-_SWEEP_VALUES = ("zq9hunter2z", "zqpw84", "Zqhunter", "ZQHUNTER7", "19800505T")
+_SWEEP_VALUES = ("zq9hunter2z", "zqpw84", "Zqhunter", "ZQHUNTER7", "19800505T", "Zq9mfb6", "ZqMS")
 _SWEEP_TAILS = (
     "",
     " rest",
@@ -607,15 +654,28 @@ _SWEEP_TAILS = (
     "</name>",
 )
 #: Text a caller writes around an answer: an open quoted credential value before it, a word a name
-#: run could join after it, and digits a date arm could join.
+#: run could join after it, digits a date arm could join, and text completing a word read with no
+#: boundary before it (the bundle marker, a segment id).
 _SWEEP_AROUND = (
     ("", ""),
     ("password: '", "' x"),
     ("", " Plantsuf x"),
     ("", "0505 retry"),
     ("", "1230 retry"),
+    ("", "4:v1:SUQ0NDU1"),
+    ("", "H*^~\\&*A*B\rPID*1**DOEX$JANEX"),
 )
-_SWEEP_PLANTED = ("zq9hunter2z", "zqpw84", "Zqhunter", "ZQHUNTER7", "zqlater", "Plant", "ZQDOE")
+_SWEEP_PLANTED = (
+    "zq9hunter2z",
+    "zqpw84",
+    "Zqhunter",
+    "ZQHUNTER7",
+    "zqlater",
+    "Plant",
+    "ZQDOE",
+    "DOEX",
+    "SUQ0",
+)
 
 
 def _sweep() -> Iterator[str]:
@@ -636,16 +696,16 @@ def _sweep_routes(text: str) -> dict[str, str]:
     for limit in (40, 80):
         routes[f"store after safe_exc {limit}"] = safe_text(safe_exc(ValueError(text), limit=limit))
     for before, after in _SWEEP_AROUND:
-        routes[f"around {before!r} {after!r}"] = _through_the_chain(
-            before + safe_exc(ValueError(text)) + after
-        )
+        around = _through_the_chain(before + safe_exc(ValueError(text)) + after)
+        routes[f"around {before!r} {after!r}"] = around
+        routes[f"bundle of around {before!r} {after!r}"] = redact_log_line(around)
     return routes
 
 
 def test_every_route_of_the_sweep_answers_the_rule_off_redactor_masked() -> None:
     """Every text of the sweep, by every route, with the rule on and off: the output is the rule-off
-    output, masked. That rules out any value the rule-off redactor hid printing, by construction
-    rather than by a list of values. It also counts the routes the rule fixed, so a sweep it never
+    output, masked. Over these texts and routes, that rules out any value the rule-off redactor hid
+    printing, rather than checking a list of values. It also counts the routes the rule fixed, so a sweep it never
     touched cannot pass."""
     texts = list(_sweep())
     assert len(texts) == len(_SWEEP_RUNS) * len(_SWEEP_GLUE) * len(_SWEEP_LABELS) * 3 == 1296
