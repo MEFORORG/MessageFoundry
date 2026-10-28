@@ -253,8 +253,12 @@ write calls the same JSON handler, RBAC permission and audit path the API uses
 whoever holds the permission. Plan an exposure against this list, not against the dashboard's
 read-only-looking front page.
 
-Every row is a `POST`. **Step-up** means the operator is re-verified (password, plus MFA where
-enrolled) before the action runs — a stale window is redirected to `/ui/reauth` rather than refused.
+Every row is a `POST`. **Step-up** means the operator re-proves a credential before the action runs: a local
+account re-enters its password, a directory account signed in by Windows SSO re-enters its directory
+password (a live bind), and an OIDC session goes back to its IdP and is never asked for a password.
+The step-up asks for a TOTP code or a passkey only from a session that has not yet met its second
+factor; a factor proved at sign-in is not asked for again. A stale window is redirected to
+`/ui/reauth` rather than refused.
 **Dual control** applies only where `[approvals]` is enabled (it is **off by default**): the action is
 then held for a second, *distinct* approver holding `approvals:approve` instead of executing inline.
 

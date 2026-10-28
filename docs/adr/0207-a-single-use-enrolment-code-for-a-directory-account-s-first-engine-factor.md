@@ -1,8 +1,19 @@
 # 0207 -- A single-use enrolment code for a directory account's first engine factor
 
-- **Status:** Proposed (2026-10-05). Drafted on the owner's direction of 2026-10-05, given in
+- **Status:** Accepted (2026-10-27), with Amendment A. Accepted by the batch 447 Manager under the
+  Owner's delegation of 2026-10-27 (CLAUDE.md section 5, "A delegated decision counts as that
+  ruling", owner ruling 2026-10-22), after two adversarial reviews; Amendment A records the
+  question, the answer and both reviews. Two repair rounds after both reviews (`2a6f30037`,
+  `83d038b7c`, branch commits the pull request names) changed design text, and a third
+  adversarial read at `83d038b7c` covered those commits and returned *keep accepted after named
+  small fixes*, which the commit after it applies. Amendment A records that read too, and says
+  which text of that last commit no adversarial read has seen. The text below says only the owner can move this record to
+  Accepted: that delegation record is the owner's ruling under CLAUDE.md section 5, so the
+  acceptance rests on it. Three *To resolve on acceptance* items stay open, each with its
+  recommendation; the build follows the recommendation unless the owner rules otherwise.
+  Previously Proposed (2026-10-05): drafted on the owner's direction of 2026-10-05, given in
   session to the batch 194 Manager: design this ceremony as an ADR in status Proposed. Merging this
-  record files it as Proposed and accepts nothing. The Lander merges; only the owner can move it to
+  record filed it as Proposed and accepted nothing. The Lander merges; only the owner can move it to
   Accepted. No code may follow until it is Accepted.
 - **Date:** 2026-10-05
 - **Related:** vault BACKLOG #2609 (its closing item 2; item 1 shipped as engine PR 1918) · vault
@@ -57,7 +68,8 @@ federated sign-in on a site that turned the claim gate off.
    ceremonies, and the session-termination routes that ride the reauth-only gate.
 2. The enrolment ceremonies sit behind the reauth-only gate. A Kerberos session re-proves by a live
    bind with the directory password (`_reauth_ad`). An OIDC session goes back to the identity
-   provider (ADR 0142 Amendment B).
+   provider (ADR 0142 Amendment B). *Amendment A, A1, says what holds once owner ruling A5 removes
+   that bind.*
 3. `_factor_binding_is_blocked` refuses only an account that already holds a factor. An account
    with none passes. That carve-out is deliberate: without it, an account with no factor could
    never enrol. The step-up gates of the TOTP begin and confirm routes and of the passkey begin
@@ -65,6 +77,7 @@ federated sign-in on a site that turned the claim gate off.
    action-less `require_ui_reauth_only`, which does not, and `finish_webauthn_registration` does not
    re-check either. That gap reaches a directory account under the shipped posture, because item 5
    lets a passkey be its first factor. A local account meets it only outside that posture.
+   *Closed at the binding step since this was drafted (BACKLOG #3014, #3061); see Amendment A, A2.*
 4. `begin_mfa_enrollment` accepts a directory account on purpose (BACKLOG #1144).
    `confirm_mfa_enrollment` then stamps the session MFA-verified and rotates it.
    `finish_webauthn_registration` writes the passkey, then does the same.
@@ -101,6 +114,7 @@ federated sign-in on a site that turned the claim gate off.
    method refuses it before the pop, so the challenge stays staged. Since BACKLOG #2389 a call
    inside the login-to-MFA floor is a second exception. It is refused before the pop too, and it
    verifies nothing, so it gains no information about the response.
+   *Closed since this was drafted (BACKLOG #3014); see Amendment A, A2.*
 
 That is the chain BACKLOG #2609 ran end to end. Someone who holds only a directory password signs
 in by Windows SSO, re-proves the same password, and enrols an authenticator they control. They then
@@ -192,13 +206,15 @@ change.
 - **Lifetime.** 24 hours from issue, fixed rather than a setting. See *To resolve on acceptance*.
 - **Bound to its account.** The check reads the digest on the session's own user row, so a code
   proves nothing for any other account.
-- **Single use, spent atomically.** One conditional write clears the digest only where it still
+- **Single use, spent atomically.** One conditional sealed write, through `_write_user` (Amendment
+  A, *What this amendment changes in the build's cost*), clears the digest only where it still
   matches and has not expired. Only a write that changed a row counts, so two racing ceremonies
   cannot both spend one code.
 - **The order in `confirm_mfa_enrollment`.** First read the code: present, well formed, and
   matching the account's digest and expiry. A missing or wrong code is refused here, before the TOTP
   step is consumed, so the holder does not lose that step. Then verify and consume the TOTP step.
-  Then spend the code. Then stamp and rotate the session, then enable TOTP.
+  Then spend the code. Then stamp and rotate the session, then enable TOTP. *Amended by A3: the
+  code is read after the directory lookup, and spent in the enable's own write.*
 - **The enable turns on only the secret that was verified.** Today it turns on whatever the column
   holds at that later moment (Context item 6). The build binds the two: the enable writes the secret
   this call verified, in the same statement that turns TOTP on, and only where TOTP is still off.
@@ -216,7 +232,7 @@ change.
   (`add_webauthn_credential`) before it stamps. So the code is spent before that write, not merely
   before the stamp. A check placed only before the stamp would leave the attacker's passkey bound.
   The label and duplicate checks run before the spend, so a refusal they cause does not cost the
-  code.
+  code. *Amended by A3: that needs a new label read before the spend, step 9.*
 - **Where the code check sits against the challenge pop.** The factor check of section 1 and the
   code read (present, well formed, matching, not expired) run before the method pops the staged
   challenge. So a refused code costs neither the code nor the ceremony, as on the TOTP path. The
@@ -239,7 +255,8 @@ change.
   secret changed, leaves TOTP off and the code spent. Today a plain retry recovers from the first
   two; with this ADR the holder needs a new code. On the passkey path the
   credential is already written, so the factor is enrolled and the holder proves it at the next
-  sign-in. Both fail closed, and both are stated so nobody mistakes them for defects.
+  sign-in. Both fail closed, and both are stated so nobody mistakes them for defects. *Amended
+  by A3: on the TOTP path a failure at or before the enable now costs no code.*
 - **Never in plaintext at rest, never in a log, never in a URL.** Each reply that carries it sends
   `Cache-Control: no-store` because its response model subclasses `CredentialReply`, as the MFA
   reset reply already does. (Until BACKLOG #2372 this read "through `_no_store_reply`", the
@@ -258,7 +275,8 @@ change.
   for itself. Section 6 covers that case.
 - **Refused for** a local account, an account that already holds an engine factor ("reset its MFA
   first"), a disabled account, and an unknown account.
-- **Its write is one conditional statement, like the host command's.** It sets the digest only where
+- **Its write is one conditional sealed write through `_write_user`, like the host command's.** It
+  sets the digest only where
   the account is `ad`, enabled, and holds no factor. An issue whose write changes no row is refused,
   and nothing is shown. So a disable, or a factor, that lands between the route's checks and its
   write leaves no code on the account.
@@ -300,12 +318,16 @@ Context item 1, so none can call the issuing route.
   refusal at `open_store` (`keyless_opt_out_refusal`), and `_refuse_an_unauditable_write` before the
   write (ADR 0194). ADR 0171 states why host access is a real gate: whoever holds the service
   config, the store and its key already holds the database.
-- **Its write is one conditional statement.** It sets the digest only where the account is `ad`,
-  enabled, and holds no factor. So it has no read-then-write window for a live engine to slip into.
+- **Its write is one conditional sealed write through `_write_user`.** It sets the digest only
+  where the account is `ad`, enabled, and holds no factor. `_write_user` reads the record, applies
+  the change to what it read, and writes with a compare on the seal it read, so the conditions are
+  judged on the record the write replaces. On a store with no row sealer that seal is empty and the
+  compare guards nothing across processes, which is one reason the next item keeps the engine
+  stopped.
 - **Whether it may run beside a live engine is not settled here.** That turns on whether a second
   process may append to the audit chain safely. Until the build shows it can, the command follows
   `admin-unlock`'s rule and runs with the engine stopped. That rule is documented in `admin-unlock`,
-  not enforced by it.
+  not enforced by it. *Amendment A, A4, makes the command enforce it.*
 - It prints the code once and writes the same audit row as the route. The actor names the OS user.
 - It applies the route's refusals except self-targeting, which has no meaning at a terminal.
 - It issues for any directory account, not only an Administrator. Host access already grants
@@ -332,9 +354,10 @@ problems. This command is not #2711's answer.
 | `auth.enrolment_code_revoked` | an Administrator cleared one | the Administrator | the target account |
 | `auth.enrolment_code_used` | a ceremony spent one | the account that enrolled | `ceremony`: `totp` or `webauthn` |
 | `auth.enrolment_code_refused` | a binding step refused | the account whose session tried | `reason`: `not_presented` (the request carried no code), `code_refused` (a code was sent and refused: never issued, wrong, expired or already spent), or `factor_present` (the account gained a factor; prove it first) |
+| `auth.enrolment_code_spent_notice` | a ceremony spent a code an Administrator issued (Amendment A, A5) | the issuing Administrator, as the row's **recipient**: the issuer did not act | `actor_role`: `recipient`, which marks the actor column as the notice's recipient and not the account that acted; the account that spent the code; `ceremony`: `totp` or `webauthn`; the client address the spend came from |
 
 **Who reads these rows.** Every audit row stays with `Permission.AUDIT_READ`, as today. All four
-actions also start `auth.`, so `GET /me/security-events` returns each to the account named as its
+actions (five with Amendment A's spent notice) also start `auth.`, so `GET /me/security-events` returns each to the account named as its
 actor, with its detail (`security_events_for_user` selects by actor). So the issued and revoked rows
 reach the Administrator who wrote them, and never the target. The used and refused rows reach the
 account itself, so its real holder sees every refused try on it.
@@ -349,7 +372,7 @@ The engine API's confirm route and the web console's TOTP confirm route already 
 ceremony budget (`allow_reauth_attempt`) on every attempt, before the service runs. The passkey
 finish route draws only the console write floor (Context item 7). **The build adds the
 ceremony-budget draw to `ui_webauthn_verify`, before the service runs**, refusing over budget as
-`ui_mfa_verify` does. A code nobody can guess needs no guess limit, so the budget is not there for
+`ui_mfa_verify` does (*shipped since, BACKLOG #3014; Amendment A, A2*). A code nobody can guess needs no guess limit, so the budget is not there for
 the code's sake. Today the write floor and the challenge's 120 second life already bound the tries
 against one ceremony. What the ceremony budget adds is the bound every other credential ceremony
 already has. A refused code now leaves the challenge staged (section 3), so the tries against one
@@ -378,7 +401,9 @@ comment in `_authenticate_kerberos` changes in the same build.
 
 ## Acceptance Criteria
 
-The tests named below are written with the build; none exists yet.
+The tests named below are written with the build; none exists yet. *Amendment A restates AC-5,
+AC-13 and AC-14 as regression pins on tests that already exist, scopes AC-3 to a code refused at
+the code read (A3), and adds AC-16 to AC-19.*
 
 - **AC-1** -- WHEN a Kerberos session on an unbound directory account with no engine factor
   re-proves its directory password and confirms a TOTP enrolment without a code, THE SYSTEM SHALL
@@ -393,7 +418,9 @@ The tests named below are written with the build; none exists yet.
   the passkey challenge, answer with one client-facing reply whatever the reason, and write
   `auth.enrolment_code_refused` with the reason section 7 names for that case. The refused row SHALL
   carry the one `code_refused` reason for a wrong, expired, spent or never-issued code, so the
-  account's own security-event feed does not tell those cases apart either.
+  account's own security-event feed does not tell those cases apart either. *(Amendment A, A3: this
+  holds for a code refused at the code read. A code that passed the read and is revoked, expires or
+  is spent before the spend is the race A3 names, refused after the consume or the pop.)*
   → `tests/test_directory_enrolment_code.py`
 - **AC-4** -- THE SYSTEM SHALL apply AC-1 to AC-3 to a passkey: `finish_webauthn_registration`
   SHALL spend the code before it writes the credential, and a refused code SHALL leave no credential
@@ -549,8 +576,13 @@ ADR 0197 Amendment A's wave 1. It changes a security control, so it gets its own
 
 ## To resolve on acceptance
 
-- [ ] Require the code with `[security].require_mfa` off as well. Recommended yes, for the reason in
-  Decision section 1.
+- [x] Require the code with `[security].require_mfa` off as well. **Answered yes (Amendment A,
+  2026-10-27).** Beyond the reason in Decision section 1: once owner ruling A5 removes the
+  directory re-bind, Amendment A1 makes the code the only proof at the binding step. A *no* would
+  either leave a bind on a stolen session token alone for a `require_mfa`-off site, or keep the
+  re-bind for such sites. Ruling A5 left that posture to this ADR (A1), and keeping the re-bind
+  there would keep the engine collecting the directory password, the one proof this ADR's attacker
+  already holds, which is what A5 chose to end.
 - [ ] Keep the lifetime fixed at 24 hours. The alternative is an `[auth]` setting, as
   `initial_password_expiry_hours` is for a local credential. Recommended fixed, since the code exists
   for one handover.
@@ -558,3 +590,458 @@ ADR 0197 Amendment A's wave 1. It changes a security control, so it gets its own
   yes.
 - [ ] Let the host command issue for any directory account, not only an Administrator. Recommended
   yes.
+
+## Amendment A (2026-10-27) -- the re-proof once the directory re-bind goes, a re-baseline, and an enforced engine-stopped rule
+
+**Decided by the batch 447 Manager under the Owner's delegation of 2026-10-27** (CLAUDE.md section
+5, "A delegated decision counts as that ruling", owner ruling 2026-10-22). The Manager asked the
+owner, in its own chat by `AskUserQuestion` on 2026-10-27 at about 13:35 UTC, this question,
+quoted verbatim:
+
+> "ADR 0207 review result: ACCEPT WITH NAMED AMENDMENTS (reviewer confidence medium-high). The core
+> design held up: a 128-bit, single-use code bound to one account, spent atomically, issued by an
+> Administrator with step-up. The reviewer found no way to replay it, guess it, or use it on another
+> account. Four amendments: (1) say what a factorless Kerberos session must re-prove after ruling A5
+> removes the directory re-bind. If this stays open, a Builder could simply drop the gate. That is
+> the one unsafe-build gap. (2) Re-baseline to today's tree: BACKLOG #3025 and #3014 already shipped
+> parts of it, so three acceptance tests can no longer 'fail before the build'. (3) Fix the order of
+> checks against the newer _directory_vouches_for_factor lookup. (4) Enforce, rather than only
+> document, that the host command runs with the engine stopped, so the audit chain can't fork.
+> Optional: also notify the issuing Administrator when a code is used, and shorten the 24h
+> lifetime. How do you want to proceed?"
+
+The options offered were "Amend, then I accept (Recommended)", "Accept as written now" and "Not
+now". The owner answered *"/driver"*, which delegated that question to the Manager. The review the
+delegation requires is two adversarial reviews: the first, of the record as proposed, returned
+*accept with named amendments*; the second, of this amendment at `1d119a284`, returned *accept
+after named small fixes* (its fixes F1 to F4, applied below) and affirmed A4's SQLite-only refusal
+after verifying in code that all three backends serialize the audit append. The Manager took the
+recommended option, reading its "I accept" as the delegate's once the question was delegated.
+The Builder's two code-review rounds after the acceptance commit changed design text too (at least
+the TOTP fold's no-passkey condition, the non-database refusal, the sealed columns, and where the
+begin routes' budget draw is built). Those two repair rounds, `2a6f30037` and `83d038b7c`, came
+after both adversarial reviews, so a third adversarial read at `83d038b7c` covered them. It
+returned *keep accepted after named small fixes*: record that read in the Status line and here,
+name how the new columns survive the users-row seal, name the code's writes as conditional sealed
+writes through `_write_user`, and list the spent notice among the audit rows docs/PHI.md says
+store a client address. The commit after
+`83d038b7c` applies them. The third read asked for the seal mechanism to be named, not for a
+mechanism it had approved, so the mechanism that commit names (each new column sealed only when
+non-null), the issuer capture in A5, and the qualifications it adds to the seal and the host
+command's write are design text no adversarial read has seen; the pull request names that commit.
+The original acceptance's decision log id is
+`d20261027T133727170-18c43f`. This amendment changes the design the record proposes, and the
+record was accepted with it on 2026-10-27, under the same delegation (see Status).
+
+Every fact below was read at engine `origin/main` `93f6438c7` on 2026-10-27, by symbol. Where this
+amendment and an earlier section disagree, this amendment wins.
+
+### A1. What the reauth-only gate asks of a factorless directory session once the re-bind goes
+
+**The premise moved.** Context item 2 says a Kerberos session re-proves by a live bind with the
+directory password (`_reauth_ad`, reached from `_reproof_serialized`). Owner ruling A5 of 2026-10-08
+(vault, *OWNER-RULINGS-2026-10-08-BATCH207*, entry A5, row #1137) says a Kerberos session may step up
+with its engine factor instead, and that the directory-password re-bind is removed once this ADR is
+decided. A5's own record lists, among what it does not decide, this ADR and the case of a
+`[security].require_mfa = false` directory session with no factor to challenge; A1 is this record's answer to
+that case. That removal is its own build row, sequenced behind this ADR. After it, an unstamped
+directory session on an account with no engine factor, whose step-up is not at the identity
+provider, has nothing to re-prove with. Today that is every Kerberos session on an unbound account
+with no factor. So this record must say what the reauth-only gates ask of it.
+
+**The decided answer: at the binding step the enrolment code is the re-proof, the enrolment
+begins and the console's TOTP confirm form are admitted with no step-up grant, and every other
+step-up action stays refused until a factor exists.** Route by route, for that session:
+
+| Route | Gate today | What it asks once the re-bind is gone |
+|---|---|---|
+| The TOTP begins (`POST /me/mfa/enroll`, `STEP_UP_ACTION_MFA_ENROLL`, and `POST /ui/account/mfa/enroll`) and the console's passkey begin | a password re-proof | Admitted with no step-up grant. A begin binds nothing (section 2). **New: it draws the per-actor ceremony budget**, which no begin route draws today, and may say early that a code will be needed |
+| The console's TOTP confirm form, `GET /ui/account/mfa/confirm` | the action-less `require_ui_reauth_only` | Admitted with no step-up window, so the form the binding step re-enters is not a dead end |
+| The binding steps: `POST /me/mfa/confirm` (`STEP_UP_ACTION_MFA_CONFIRM`), `ui_mfa_verify`, and `ui_webauthn_verify` | a password re-proof, or the action-less `require_ui_reauth_only` | Admitted with no step-up grant. The service demands a valid code (section 1), and that code is the re-proof. The per-actor ceremony budget is still drawn |
+| Session termination, `STEP_UP_ACTION_SESSION_TERMINATE`: `DELETE /me/sessions`, `DELETE /me/sessions/{session_id}`, `POST /ui/account/sessions/{session_id}/revoke` and `POST /ui/account/sessions/revoke-others` | a password re-proof | Refused until the account holds a factor |
+| Every other step-up action, under `[security].require_mfa = false` | `require_step_up` or `require_step_up_action`, a password re-proof | Refused until the account holds a factor |
+| The same, under `require_mfa` on | already refused by the floor in Context item 1 | Unchanged |
+
+`POST /me/reauth` and `POST /ui/reauth` with a directory password are refused for that session,
+and no bind is made. Signing out its own current session (`POST /auth/logout`) is not a step-up
+action and stays open.
+
+**The new-address check stays on every admitted route.** The reauth-only gates force a fresh
+step-up when the request's address differs from the session's own anchor (`flag_new_client_ip`).
+For this session class nothing answers that step-up once the re-bind is gone, so a request from a
+new address is refused. That is not permanent: a fresh Windows SSO sign-in from the new address
+mints a session anchored there. So the check is kept, and where it runs, a stolen token replayed
+from another address cannot reach the binding step. It does not run in every posture:
+`flag_new_client_ip` raises nothing when `[auth].admin_new_ip_step_up` is off, a named loosening,
+or when the session recorded no client address. There a replayed token reaches the admitted
+routes from any address. It still binds nothing without the code; what it can do is restage the
+TOTP secret and draw the account's ceremony budget, the two costs named below.
+
+**This rests on the code being required with `require_mfa` off**, which *To resolve on acceptance*
+now answers yes. Once the re-bind goes, the code is the only proof at the binding step in every
+posture, so with `require_mfa` off and no code a stolen session token alone would bind a factor.
+
+**Why session termination is refused rather than admitted.** The route comment on
+`revoke_my_session`, and the matching comments on the console's revoke routes, say a no-factor user
+must remain able to revoke. For this session class that no longer holds. Whoever holds the directory password alone could otherwise sign every other session of
+the account out, the real holder's included, with no proof beyond the sign-in. An Administrator can
+still end an account's sessions, and the holder can still sign out the session in hand. The build
+that removes the re-bind changes those comments, and owes two more changes with them:
+
+- **`docs/SECURITY.md`, wherever it says a no-factor user can still end its sessions.** At least
+  these passages: the gate-wrapper row for `require_reauth_only_action` ("deadlock avoidance on
+  the MFA-enrollment lanes, and on session terminate"); the step-up paragraph that says four routes
+  take the password-only variant "so a required-but-unenrolled user cannot deadlock", which names
+  `DELETE /me/sessions/{session_id}` and `DELETE /me/sessions` among them; the session-termination
+  paragraph that says a second-factor gate "would deadlock an MFA-required-but-unenrolled operator
+  out of revoking their own sessions"; and the route rows for `DELETE /me/sessions/{session_id}`,
+  `DELETE /me/sessions`, `POST /ui/account/sessions/revoke-others` and
+  `POST /ui/account/sessions/{session_id}/revoke`. Each must say that a factorless directory
+  session whose step-up is not at the identity provider is refused there.
+- **A vault re-read of the session-termination cell** of the security record, whose evidence
+  rests on a no-factor user being able to revoke. The build names that re-read in its pull request,
+  and a Manager dispatches it as record work.
+
+**What it does not change.** A local account still re-proves by its password. An `oidc` session
+still steps up at the identity provider (ADR 0142 Amendment B), with or without a factor. A
+directory session on an account that holds a factor steps up with that factor, as A5 rules.
+
+**Sequencing.** The binding step demands the code whether or not the session also re-proved a
+password, so this ADR's build does not depend on the re-bind's removal. Before that removal a
+Kerberos session re-proves its password and then shows a code; after it, the code alone. Whichever
+build removes `_reauth_ad` must cite this Amendment's A1 and AC-16, and must carry the gate change
+in the table above in the same change. It must not remove the re-bind without admitting the
+binding steps, or a factorless directory account could never enrol, and it must not admit them
+without the code check this ADR's build adds. That build's ledger row is unfiled: it is the build
+that removes the directory re-bind under owner ruling A5, and the Lander files it.
+
+**Two costs, named.**
+
+- Admitting the TOTP begin with no grant lets anyone holding a session on the account restage its
+  secret. The #3025 compare-and-set then fails a confirm the real holder had in flight, and that
+  confirm ends its session (section A2). It cannot change which secret is enabled, and it binds
+  nothing. **It must not cost the holder's code either**, so on the TOTP path the spend is folded
+  into the enable's conditional sealed write through `_write_user` (section A3): a confirm whose enable matches no row spends
+  nothing. The begin's ceremony-budget draw bounds how often it can restage.
+- The per-actor ceremony budget (`allow_reauth_attempt`) is keyed on the account. So whoever holds a
+  session on the account can spend it with refused codes and make the holder's attempt wait out the
+  window. A session-token holder can already do that today, since `POST /me/reauth` draws the
+  budget before it checks the password. What changes is what stops it: today each wrong password
+  also counts toward the session's re-proof cap, which revokes the session, and toward the lockout.
+  A refused code counts toward neither, so a token holder can keep draining the budget for as long
+  as the session lives. The code itself needs no guess limit, so the budget only paces attempts.
+  For a token thief that drain is bounded by the session's life. For this ADR's own attacker, who
+  holds the directory password and can mint a fresh Windows SSO session at will, it is not: ending
+  the session only starts another. What ends it is disabling the account, or the directory password
+  being changed. This is accepted as a nuisance that denies enrolment and binds nothing. Nothing
+  alerts an Administrator: the refused rows reach the account's own feed and the audit log, which an
+  Administrator reads with `Permission.AUDIT_READ`; once the holder reports it, the Administrator
+  can disable the account.
+
+### A2. Re-baseline: what has shipped since this record was drafted
+
+At least four parts of the record describe code that has since changed. Each is marked done here.
+
+- **Context item 6 is closed (BACKLOG #3025).** `set_totp_secret` stages a secret only where TOTP is
+  off (`totp_stage`), on all three backends. `enable_totp` takes `expected_secret_cell`, the cell
+  the confirm verified a code against, and writes only where the row still holds it and TOTP is
+  still off. `confirm_mfa_enrollment` takes `verified_cell` from the same account read as the staged
+secret, before the floor and the directory lookup, and on an enable that
+  matches no row it ends the session it rotated, returns `session_lost`, and writes
+  `auth.mfa_enroll_refused`. **Section 3's bullets "The enable turns on only the secret that was
+  verified" and "A confirm whose enable did not take effect ends its session" are shipped**, and
+  the build adds nothing for them. The Consequences line "an `enable_totp` that binds the verified
+  secret" is dropped from what the build costs.
+- **Context item 7 is closed (BACKLOG #3014).** `ui_webauthn_verify` draws `allow_reauth_attempt`
+  after the gate's write-floor charge and before the service runs, and refuses over budget.
+  **Section 7's "The build adds the ceremony-budget draw to `ui_webauthn_verify`" is shipped**, and
+  the Consequences line "the ceremony budget on the passkey finish route" is dropped.
+- **Context item 3 is closed for the binding step (BACKLOG #3014, #3061).**
+  `finish_webauthn_registration` asks `_factor_binding_is_blocked` itself, before the floor, and
+  again after the directory lookup, both before the challenge pop. So section 1's check 1 is
+  already made on the passkey path. On the TOTP path, `confirm_mfa_enrollment` asks it once after
+  the lookup and refuses only a passkey; a TOTP enabled meanwhile is left to the compare-and-set.
+  The build adds no factor check of its own. It adds the `auth.enrolment_code_refused` row with
+  `factor_present` beside the `auth.mfa_denied` row those refusals already write, for an unstamped
+  directory session only. The Consequences line "both checks in both binding steps" now means the
+  code check alone.
+- **The Out-of-scope bullet on the passkey finish route for local accounts is closed too.** The
+  finish's own `_factor_binding_is_blocked` asks (#3014) apply to every account type, since
+  `_owes_enrolled_factor_hash` is not limited to directory accounts there. That case is no longer
+  open.
+
+**Three criteria become regression pins.** What each names as pinned already passes, so none can
+"fail on the code before this build". The build keeps the named test green, and adds only what the
+bullet says.
+
+- **AC-5** (restated) -- IF a passkey challenge staged while the account had no factor finishes
+  after the account gained one, THEN THE SYSTEM SHALL refuse it, bind nothing, and stamp nothing.
+  Pinned today by `tests/test_passkey_finish_factor_binding.py`. The build adds, for an unstamped
+  directory session, the `auth.enrolment_code_refused` row with `factor_present`.
+- **AC-13** (restated) -- the #3025 behaviour: no replacing secret is enabled, and an enable that
+  does not take effect ends the rotated session and returns no token, for a local account and a
+  directory account alike. The local-account half is pinned today by the BACKLOG #3025 tests in
+  `tests/test_mfa.py`, which all sign in a local account. The directory-account half has no test
+  yet: the build adds one, in which a valid code was presented and, because the enable did not take
+  effect, was not spent (section A3).
+- **AC-14** (restated) -- the passkey finish route refuses before the service runs when
+  `allow_reauth_attempt` refuses and the write floor is not exhausted. Pinned today by
+  `test_webauthn_verify_draws_on_the_ceremony_budget` in
+  `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py`, not the file AC-14 names.
+
+### A3. The order of the checks in the binding steps
+
+`finish_webauthn_registration` gained a directory re-lookup, `_directory_vouches_for_factor`
+(BACKLOG #3061), which this record did not name. The code check goes after it. The order after the
+build, with what the challenge does at each refusal:
+
+1. Load the account, and check the label. A refusal leaves the challenge staged.
+2. Peek the staged challenge. If none matches, pop it and answer "ceremony expired".
+3. The dead-session guard, then the #3014 factor check. A refusal pops the challenge.
+4. The login-to-MFA floor. A refusal leaves the challenge staged.
+5. The #3061 directory lookup. A `session_lost` refusal pops the challenge, and any other refusal
+   leaves it staged.
+6. The dead-session guard again, then the factor check again. A refusal pops the challenge.
+7. **New: the code read**, for an unstamped session on an `ad` account: present, well formed,
+   matching the digest on the account row the lookup returned, and not expired. A refusal leaves
+   the challenge staged, gets the one reply of section 3, and writes `auth.enrolment_code_refused`.
+8. Pop the challenge, and verify the attestation.
+9. The discoverable check, then the duplicate check on the credential id, then **new: a read of
+   whether the account already holds a passkey with this label**.
+10. **New: the spend**, one conditional sealed write through `_write_user`. It clears the code's digest only where the digest
+    still matches and has not expired, the account is enabled, TOTP is still off, and the account
+    holds no passkey, the same conditions the TOTP fold below puts on its write. So a
+    factor bound by a path that asks no code, after the step 6 re-check and before this write, is
+    not skipped over. A spend that changes no row is refused, as `factor_present` when a re-read
+    shows the account now holds a factor and as `code_refused` otherwise. The challenge is already
+    popped, so that ceremony ends, nothing is written, and the code is not spent.
+11. Write the credential, then stamp and rotate the session.
+
+**The residual after step 10, named.** A factor bound by a path that asks no code between the spend
+and the credential write in step 11 is not seen. That window holds no awaited read, unlike the one
+between steps 6 and 10, which awaits the duplicate read and the label read (step 7 reads the code
+against the row the lookup returned, so it adds no read), and in
+which another process on the same store, an engine shard included, can write. (The attestation
+verify itself runs on the event loop and yields to nothing.) The code is spent by then, and the
+second passkey binds on a code the holder did show.
+
+**The label check before the spend is new.** Today the method checks only the label's length before
+the pop. A clash with another of the account's labels shows only when `add_webauthn_credential`
+fails on the `(user_id, label)` index, which is after the spend. Without the read in step 9, a
+refusal section 3 says "does not cost the code" would cost it. The insert's integrity error stays
+the backstop for a label written concurrently, and that rare race does cost the code.
+
+**A `factor_present` refusal keeps popping the challenge, as it does today.** The ceremony was staged
+against an account state that no longer holds, and a fresh begin re-asks the begin gate, which
+refuses the session until it proves the factor it now has. A refused code does not pop, so a
+mistyped code costs neither the code nor the ceremony.
+
+**Why after the lookup, not before.** The lookup re-reads the account, so the code is checked
+against the row as it stands after the network round trip. A directory refusal also tells the
+caller nothing about whether a code is outstanding, because no code was read.
+
+`confirm_mfa_enrollment` follows the same order up to the code: read the staged secret and
+`verified_cell`, then the floor, the directory lookup, the dead-session guard and its one factor
+check, **then the code read**. After those come the TOTP step verify and consume, then the stamp and
+rotation, **then the enable with the spend folded into it**: one conditional sealed write, through
+`_write_user`, that turns TOTP
+on and clears the code's digest, only where the staged cell is still `verified_cell`, TOTP is still
+off, the account holds no passkey, the account is enabled, and the digest still matches and has not
+expired. The no-passkey condition is new, and it binds only this code-carrying write, for an
+unstamped directory session: the TOTP leg asks the factor check once, before the recovery codes
+are hashed off the event loop, and a passkey bound in that window by a path that asks no code would
+otherwise be skipped over. A confirm that carries no code, a stamped session adding TOTP beside a
+passkey it holds included, keeps today's enable, conditioned on the staged cell and TOTP off
+alone. A fold that fails on its code keeps today's `auth.mfa_enroll_refused` reason, which the
+store state decides, and writes no `auth.enrolment_code_refused` row, so the account's feed still
+cannot tell the code cases apart. So a confirm whose
+enable matches no row spends nothing, and two ceremonies racing one code still cannot both succeed.
+**The fold's cost, named.** A code that passed the read but is revoked, expires, or is spent by a
+racing passkey ceremony before the enable now fails at the enable. By then the TOTP step is
+consumed and the session rotated, so that confirm answers `session_lost` and writes
+`auth.mfa_enroll_refused`, not the one code-refused reply of section 3. AC-3 holds for a code
+refused at the read, which is every case but that race. The race fails closed, binds nothing, and
+tells the caller nothing about the code it did not already know. That enable already
+ends the rotated session when it changes no row (#3025). Section 3's "First read the code" is
+amended to that place: still before the TOTP step is consumed, but after the floor, the lookup and
+the re-check. Section 3's "Then spend the code" before the stamp, and its "A failure after the spend
+costs the code" for the TOTP path, are replaced by this folded write. A session revoked mid-ceremony
+now costs a TOTP step and no code.
+
+### A4. The host command refuses while an engine holds the store
+
+Section 6 left the engine-stopped rule documented and unenforced, as `admin-unlock` and
+`provision-admin` leave it today. The review asked for it to be enforced, on the ground that a second
+process appending to the audit chain could fork it (ADR 0194). **The tree does not bear that
+ground out, so this record does not rest on it.** Every backend already serializes an append from a
+second process. On SQLite, `_append_audit_row` names *"a CLI command run beside a serving engine"*:
+the UNIQUE constraint on `seq` refuses the second row, and one retry under the write lock takes the
+next position. PostgreSQL takes `pg_advisory_xact_lock` on the chain (H-7), and SQL Server takes an
+application lock on it (`_AUDIT_APPEND_LOCK`). The command's issue is also one conditional sealed write
+through `_write_user` (section 6). So beside a live engine its audit row would not fork the chain.
+
+**What is enforced, and why.** This answers section 6's "until the build shows it can" and the
+Consequences line that leans on it: a second process can append safely, so audit-chain safety is no
+longer a reason for the rule. The rule rests on one reason only. A host command that mints a
+credential should not run against a store a serving engine is using **where it can tell**, and a
+file that is not the store must never be keyed by it. So `issue-enrolment-code` checks before it
+opens the store or writes, where the tree has a check.
+
+- **On SQLite.** The command calls `_sqlite_store_held_elsewhere` (BACKLOG #1915), as `rotate-key`
+  does, on the settings `_host_gated_store_settings` resolves. **It refuses on `held`, on
+  `not_a_store`, and on `unchecked`.** `held` is a serving engine's lock. `not_a_store` is a
+  zero-byte file or a SQLite file with no audit table, which the store open would otherwise build
+  and key as a new store; AC-11 already says refuse rather than create, and `rotate-key` refuses it
+  too. A file that is not a SQLite database at all is a fourth case: today the probe answers
+  all-clear on `SQLITE_NOTADB` and leaves that file to the store open to report. The build adds a
+  refusal for it before the open, so AC-17 holds for it. `unchecked` is a store the probe cannot
+  read, or one not in WAL mode, where an idle engine
+  holds no lock. Refusing that is stricter than `rotate-key`, which prints a note and goes on: a
+  command that issues a credential fails closed when it cannot tell. **The cost, named:** a SQLite
+  site whose store stays `unchecked`, not in WAL mode or not openable read-write by the operator's
+  account, has no host path until it fixes that state. A server store in the same cannot-tell state
+  proceeds with a note, because there no probe exists to fix, and the append locks above answer
+  the chain. Keeping a local Administrator (section 6) avoids both.
+- **On PostgreSQL and SQL Server, nothing in the tree probes for an engine, and the command does not
+  refuse.** Refusing there would remove the host path from the site section 6 exists for, a
+  server-store site with no Administrator who can issue a code, on a ground the append locks above
+  already answer. The command prints a note that it could not check, as `rotate-key` does there.
+  So the engine-stopped rule is enforced on SQLite only, and documented for a server store.
+- **Not done here: the same probe in the shared host gate.** `_host_gated_store_settings` also
+  serves at least `admin-unlock` and `admin-reset-totp`, which document the same rule and enforce
+  none. Moving the probe into that gate would cover them all. That changes commands this ADR does
+  not decide, so it is left as its own item, unfiled; by subject, "the shared host gate probes for
+  a serving engine".
+- **The residual, named.** An engine started after the probe is not seen, as `rotate-key`'s own
+  docstring states. The probe narrows the window to the command's run; it does not close it.
+
+### A5. The issuing Administrator learns when a code is spent
+
+Section 7 routes `auth.enrolment_code_used` to the account that enrolled, and the issued row to the
+issuer. So the one person who knows whether the handover went to the right holder never learns that
+the code was used, or from where. **When a code is spent, the issuing Administrator is told.**
+
+- The `users` row records the issuer with the digest: a third nullable column holding the issuing
+  Administrator's account id, or null for a code the host command issued. Issuing writes it with
+  the digest, and every statement that clears the digest clears it too. The spend's conditional
+  sealed write returns the issuer it cleared, so the step that writes the rows below knows whom to
+  tell. `_write_user` returns the record after the change, where the issuer is already null, so the
+  spend's change captures the issuer from the record `_write_user` read, in the same write, and
+  never from a separate read before it, which a re-issue between the two would make name the wrong
+  Administrator.
+- `auth.enrolment_code_used` does not name the issuer. Section 7 returns that row to the account
+  that spent the code, and whoever spent it, an interceptor included, should not learn which
+  Administrator issued it. Its client column records where the spend came from, as every audit
+  row's does.
+- **A second row, `auth.enrolment_code_spent_notice`, is written under the issuer's name** in the
+  same step, its detail naming the account that spent the code, the ceremony, and the client
+  address the spend came from. It is a separate
+  row because `GET /me/security-events` selects `auth.*` rows by actor, on an index keyed on actor
+  (`_security_events_where`). Widening that query to a detail field would give up the index. The
+  issuer's own feed therefore returns the notice row with no query change. **The cost:** a filter by
+  actor over the audit log returns this row under the issuer, though the issuer did not act. Its
+  action name says it is a notice, its detail marks the actor column as the recipient
+  (`actor_role`: `recipient`, section 7), and its detail names the account that did act. The build
+  documents that, in `docs/SECURITY.md`'s Audit section, as the one audit row whose actor is not
+  the account that acted, so an investigator filtering by actor does not read it as the issuer's
+  act.
+- Where the issuer has a `notify_email`, the engine sends it a notice that the code was spent,
+  naming the account and the time and never the code. As in section 4, that notice is a courtesy:
+  the security-event row is the record.
+- A code from the host command, or one whose issuer's account no longer exists, has no one to
+  notify. Its used row is read with `Permission.AUDIT_READ`, as every audit row is.
+
+### A6. Two points the review raised that are not adopted
+
+- **A shorter lifetime than 24 hours.** A shorter life narrows the window in which an intercepted
+  code still works. It is kept at 24 hours. A code handed over late in a day, or across time zones,
+  would otherwise often expire before use, and each re-issue is one more handover, which is the step
+  the control rests on. Single use and revocation already bound what an intercepted code is worth.
+  The issuer's notice (A5) bounds nothing: it arrives after the spend, as detection, and is named
+  here only because it shortens how long a wrong spend goes unnoticed. The *To resolve on acceptance* item on the lifetime stands, with this
+  trade recorded.
+- **On an OIDC site whose identity provider asserts MFA, bind the first factor through the identity
+  provider instead of a code.** Noted, not adopted. A federated session with the claim gate on is
+  already stamped and needs no code (section 1). The cases a code covers are a Kerberos session,
+  which serves unbound accounts only (ADR 0142 Amendment C, engine PR 1918) and so has no
+  identity-provider subject to step up against, and a federated session on a site that turned the claim gate off, where the
+  identity provider's MFA assertion is what the site chose not to rely on. A later ADR may take it
+  up for a site that binds every directory account.
+
+### What this amendment changes in the build's cost
+
+Read the Consequences list with these changes. The `users` row gains three nullable columns, not
+two: the digest, the expiry and the issuer. There are five audit actions, not four, with
+`auth.enrolment_code_spent_notice`; section 7's "All four actions" reads five. There are two notice
+kinds, not one: the issue notice and the spent notice. The TOTP enable's conditional sealed write also
+spends the code (A3), and so does the passkey spend, each conditioned on the account holding no
+factor; the condition binds only the code-carrying write, never the enable of a confirm that
+carries no code. The passkey finish gains a label read (A3). The three new columns join the
+`users` row's integrity seal (BACKLOG #2592), so on a store with a row sealer a database write
+without the sealing key cannot plant a code digest or redirect the spent notice. A store with no
+row sealer has no such control, as for every other sealed column. Added as plain sealed fields they
+would break every existing user's seal: `UserAuthzRecord.seal_fields` seals every `UserRow` field
+but `authz_seal`, and `seal_bytes` encodes a `None` field by its name, so three new fields change
+the sealed bytes of every existing user, and `reseal_user_records`, rotate-key's pass, refuses a
+record that fails its seal. So each new column enters the sealed field set only when it is
+non-null, as `passkey_digest` already does for a passkey's `discoverable` (it leaves the field out
+of the digest while it is false): a user who never held a code keeps the seal it was sealed under,
+and on a store with a row sealer a code digest planted outside the store still fails the seal. The
+build pins that rule with a test that a non-null value of each column changes the seal. Every
+write that sets or clears them goes through `_write_user`: at least the code's issue, its spend,
+the TOTP fold, the revoke and the disable's clear. The issue, the spend and the fold are
+conditional sealed writes; the disable's clear is unconditional (section 3). The static scan in
+`tests/test_user_seal.py` pins each `users` UPDATE written as SQL text in the store modules to the
+sealing writers. The host command gains the SQLite probe refusals and the non-database refusal (A4).
+**The begin routes' ceremony-budget draw, and the rest of the A1 table, belong to the build that
+removes `_reauth_ad`**, the one that admits the begins with no grant (A1, *Sequencing*; AC-16).
+This ADR's build does not add them, and that build must not admit a begin without the draw. The two lines A2 drops are dropped. Section 6's no-issuer state, "under
+`require_mfa`", holds with `require_mfa` off too once the re-bind is gone, since A1 refuses a
+factorless directory Administrator every step-up action, the issuing route's included. **And a
+negative the list above does not name:** on a `[security].require_mfa = false` site, once the re-bind goes,
+every directory operator with no factor loses every step-up-gated action, admin writes and session
+termination included, until an Administrator issues a code and the operator enrols. Under the
+default `require_mfa` the floor already refused those actions, so only the off posture changes.
+
+### A7. Acceptance criteria this amendment adds
+
+- **AC-16** -- WHEN an unstamped directory session on an account with no engine factor, whose
+  step-up is not at the identity provider, calls a session-termination route, or with
+  `[security].require_mfa` off calls any step-up action other than an enrolment begin or a binding
+  step, THE SYSTEM SHALL refuse it once the directory re-bind is removed, on the engine API and the
+  web console alike, and SHALL refuse `POST /me/reauth` and `POST /ui/reauth` with a directory
+  password without making a bind. WHEN that session calls an enrolment begin, the console's TOTP
+  confirm form, or a binding step from its own anchored address, in either `require_mfa` posture,
+  THE SYSTEM SHALL admit it without a step-up grant, SHALL draw the per-actor ceremony budget at
+  each begin, and SHALL bind the factor only with a valid code for the account. WHERE the
+  new-address check runs, THE SYSTEM SHALL refuse each of those routes from an address other than
+  the session's anchor.
+  → `tests/test_directory_enrolment_code.py`, in the build that removes `_reauth_ad`
+- **AC-17** -- WHEN `issue-enrolment-code` runs against a SQLite store that another connection holds,
+  a file that is not a store, or a store the probe cannot check, THE SYSTEM SHALL refuse before it
+  opens the store, issue no code, append no audit row, and leave the file as it was. WHEN it runs
+  against a PostgreSQL or SQL Server store, THE SYSTEM SHALL print a note that it could not check
+  for a serving engine.
+  → `tests/test_directory_enrolment_code.py`
+- **AC-18** -- WHEN a code an Administrator issued is spent, THE SYSTEM SHALL write
+  `auth.enrolment_code_spent_notice` under that Administrator's name, SHALL return the notice row
+  in that Administrator's own `GET /me/security-events` with the client address the spend came
+  from, and SHALL send the Administrator's
+  `notify_email`, where one is set, a notice that names no code. THE SYSTEM SHALL NOT name the
+  issuer in the `auth.enrolment_code_used` row.
+  → `tests/test_directory_enrolment_code.py`
+- **AC-19** -- WHEN a binding step on an unstamped directory session is refused for its code at the
+  code read (A3 step 7, and its place in the TOTP order), THE SYSTEM SHALL leave the passkey
+  challenge staged and the TOTP step unconsumed. A code refused later, at the passkey spend or at
+  the TOTP fold, is the race A3 names: that refusal comes after the pop or the consume, and this
+  criterion does not reach it. WHEN it is refused
+  as `factor_present`, THE SYSTEM SHALL pop the passkey challenge. In both binding steps the code
+  SHALL be read after `_directory_vouches_for_factor` and the factor check that follows it. WHEN a
+  TOTP confirm's enable matches no row, THE SYSTEM SHALL leave the code unspent. WHEN a passkey
+  label clashes with one the account holds, THE SYSTEM SHALL refuse before the spend. IF the
+  account gains TOTP or a passkey after the passkey finish's step 6 re-check and before its spend,
+  THEN THE SYSTEM SHALL refuse the spend, spend nothing in that ceremony, and write no credential
+  row. IF the account gains a passkey after the TOTP confirm's factor check and before its enable,
+  THEN THE SYSTEM SHALL leave TOTP off and spend nothing in that ceremony. Where that factor was
+  bound by a path that asks no code, the code stays unspent.
+  → `tests/test_directory_enrolment_code.py`

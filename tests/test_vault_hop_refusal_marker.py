@@ -140,8 +140,9 @@ def _is_fixed_text(call: ast.Call, constants: frozenset[str]) -> bool:
 
 
 def test_every_marked_refusal_is_built_from_fixed_text() -> None:
-    """The marker means the text names no address, proxy URL, token or reply. This holds each
-    site to a shape that cannot interpolate one. It does not read a listed helper's own text."""
+    """The marker means the text names nothing the ``VaultHopRefused`` docstring says it never
+    names. This holds each site to a shape built only from the connector label, literals, module
+    constants and the listed helpers. It does not read a listed helper's own text."""
     tree = parse_source(_HOME.read_text(encoding="utf-8"))
     constants = _string_constants(tree)
     sites = call_sites(tree, _MARKER)

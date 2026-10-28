@@ -180,6 +180,16 @@ export function engineHostKey(url: string): string | undefined {
   }
 }
 
+/** True when `url` parses and its scheme is `https:`. The one definition the pin pass and the
+ *  unanchored-target warning share, so they cannot disagree about a URL. */
+export function isHttpsUrl(url: string): boolean {
+  try {
+    return new URL(url).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Node error codes meaning "the handshake completed but I do not trust who signed this".
  *
@@ -197,13 +207,47 @@ export const TLS_TRUST_CODES: readonly string[] = [
   "CERT_UNTRUSTED",
 ];
 
-/** True when `code` is one of {@link TLS_TRUST_CODES}. */
+/**
+ * Our own code for a request refused BEFORE it was sent: its `host:port` is pinned by an accepted https
+ * `caFile`, and no certificate from that file is registered yet (BACKLOG #1695). Sending it would
+ * verify against Node's default roots, which a pin exists to exclude. Not in {@link TLS_TRUST_CODES},
+ * whose remedy is a different one, but a trust failure all the same ({@link isTlsTrustError}), so the
+ * failure handler reads the file and the next request carries it.
+ */
+export const CAFILE_UNREAD_CODE = "MF_CAFILE_UNREAD";
+
+/**
+ * Our own code for a request refused BEFORE it was sent because an https entry's `caFile` CLAIMS its
+ * `host:port`, {@link trustPinsFor} refused the value (at least: not a string, not a full path), and no
+ * accepted pin names that host ({@link hostPinsOf}). The user meant to pin that host, so it fails
+ * closed: it is never verified against the default roots, and no file is read for it until the value
+ * is corrected, since there is no file to read. Kept apart from
+ * {@link CAFILE_UNREAD_CODE} because the remedy differs: that one is a file to make readable, this one
+ * is a setting to correct.
+ */
+export const CAFILE_REFUSED_CODE = "MF_CAFILE_REFUSED";
+
+/** True when `code` says a request was refused BEFORE it was sent, for a pin: {@link CAFILE_UNREAD_CODE}
+ *  or {@link CAFILE_REFUSED_CODE}. Such a request can be resent without being duplicated. */
+export function isPinRefusalCode(code: string | undefined): boolean {
+  return code === CAFILE_UNREAD_CODE || code === CAFILE_REFUSED_CODE;
+}
+
+/** True when `code` is one of {@link TLS_TRUST_CODES}, or a pin refusal ({@link isPinRefusalCode}). */
 export function isTlsTrustError(code: string | undefined): boolean {
-  return code !== undefined && TLS_TRUST_CODES.includes(code);
+  return code !== undefined && (isPinRefusalCode(code) || TLS_TRUST_CODES.includes(code));
 }
 
 /**
  * The one sentence a user can act on after a trust failure, or `undefined` when the code is not one.
+ *
+ * The remote remedy names `caFile` first because it is the one fix that needs no administrator: it is
+ * a machine-scoped user setting (see {@link trustPinsFor}). Whether a CA imported into the OS store
+ * reaches this client is READ, not measured (BACKLOG #1695, closing step 4). The `@vscode/proxy-agent`
+ * 0.45.0 that VS Code 1.142.0 bundles adds the OS store under `http.systemCertificates` only when
+ * the request carries NO `ca` of its own (both its `addCertificatesV1` request patch and its V2
+ * `tls.connect` patch return early on a caller's `ca`). So an unpinned target should verify against
+ * an OS-store CA, and a pinned or locally anchored one never does — its `ca` is the whole trust set.
  *
  * **It branches on locality, and that is not a nicety.** The anchor comes from
  * `messagefoundry.serviceConfig`, a workspace-relative path to the LOCAL engine's settings — a
@@ -211,9 +255,31 @@ export function isTlsTrustError(code: string | undefined): boolean {
  * host just presented. Naming it there would send the user to fix a file with no bearing on the
  * engine they dialled. See `engineTarget.ts` for the same boundary on the credential side.
  */
-export function trustRemedy(code: string | undefined, url: string): string | undefined {
+export function trustRemedy(
+  code: string | undefined,
+  url: string,
+  reason?: string,
+): string | undefined {
   if (!isTlsTrustError(code)) {
     return undefined;
+  }
+  if (code === CAFILE_UNREAD_CODE) {
+    return (
+      `not sent to ${url}: its caFile in \`messagefoundry.environments\` has not been read yet, or ` +
+      `could not be read as a PEM certificate, and a pinned engine is never verified against the ` +
+      `default CAs. Check that the file exists, is readable from this machine and holds a PEM ` +
+      `certificate; a refused request tries to read it again, and the MessageFoundry Engine log ` +
+      `names what went wrong.`
+    );
+  }
+  if (code === CAFILE_REFUSED_CODE) {
+    return (
+      `not sent to ${url}: its caFile in \`messagefoundry.environments\` was refused ` +
+      `(${reason ?? "the MessageFoundry Engine log says why"}), and an engine whose https entry sets ` +
+      `a caFile is never verified against the default CAs. Correct the caFile (an engine shard ` +
+      `without its own inherits its environment's), or remove every refused caFile for this ` +
+      `host:port.`
+    );
   }
   const head = `cannot verify the TLS certificate ${url} presented (${code}).`;
   return isLocalEngine(url)
@@ -223,7 +289,8 @@ export function trustRemedy(code: string | undefined, url: string): string | und
         `so the certificate exists.`
     : `${head} The extension can only learn a LOCAL engine's certificate (from ` +
         `\`messagefoundry.serviceConfig\`), so a remote engine's must be trusted by this machine — ` +
-        `install its issuing CA in the system trust store, or front it with a publicly-trusted chain.`;
+        `set \`caFile\` on its \`messagefoundry.environments\` entry to its issuing CA, install that ` +
+        `CA in the system trust store, or front it with a publicly-trusted chain.`;
 }
 
 /**
@@ -250,4 +317,197 @@ export function schemeMismatch(facts: ApiTlsFacts | undefined, url: string): str
   return facts.scheme === "https"
     ? `messagefoundry.engineUrl is http:// but this engine serves https:// — change the setting to https://`
     : `messagefoundry.engineUrl is https:// but this engine declares tls_terminated_upstream and serves plaintext behind its proxy — change the setting to http://, or point it at the proxy`;
+}
+
+/**
+ * One engine a `messagefoundry.environments` entry names, as the pin pass reads it: the entry's own
+ * `url`, or one of its engine shards' (BACKLOG #1695, residual a).
+ *
+ * `caFile` is `unknown` because it arrives from a settings file nothing has type-checked.
+ */
+export interface PinTarget {
+  readonly url: string;
+  readonly caFile?: unknown;
+}
+
+/** An environment entry as `cli.ts` returns it, reduced to what the pin pass needs. */
+export interface PinnableEnvironment extends PinTarget {
+  readonly shards?: readonly PinTarget[];
+}
+
+/**
+ * Every engine the configured environments name, each with the `caFile` that applies to it.
+ *
+ * An engine shard takes its own `caFile` when it sets one and its environment's otherwise: the
+ * engine shards of one environment are instances of one deployment, which normally share an issuing
+ * CA. When they do not
+ * (each serving its own self-signed leaf), the inherited file fails verification and the request
+ * says so; it never widens what is trusted.
+ */
+export function pinTargetsOf(envs: readonly PinnableEnvironment[]): PinTarget[] {
+  const out: PinTarget[] = [];
+  for (const env of envs) {
+    out.push({ url: env.url, caFile: env.caFile });
+    for (const shard of env.shards ?? []) {
+      // "" inherits like an absent key, as trustPinsFor reads "" as "no caFile"; it is not an opt-out.
+      const own = shard.caFile === "" ? undefined : shard.caFile;
+      out.push({ url: shard.url, caFile: own ?? env.caFile });
+    }
+  }
+  return out;
+}
+
+/**
+ * What the pin pass decided for one target that named a `caFile`.
+ *
+ * A refusal still CLAIMS its host (`claims`, the host key) when the target is https: the user meant
+ * to pin that host, so a broken pin fails closed. The host gets no anchor from the certificate a
+ * workspace setting names, and its requests are refused rather than verified against the default
+ * roots (`publishPinnedHosts` in engineTrust.ts). An `http://` target claims nothing. Host keys carry no scheme, so a claim
+ * there would take the anchor from an https engine on the same `host:port`, and plain http has no
+ * handshake to pin anyway.
+ */
+export type TrustPin =
+  | { readonly kind: "pin"; readonly url: string; readonly key: string; readonly file: string }
+  | {
+      readonly kind: "refused";
+      readonly url: string;
+      readonly reason: string;
+      readonly claims: string | undefined;
+    };
+
+/**
+ * What the `caFile` values decide for one host key that a `caFile` CLAIMS ({@link TrustPin}): the
+ * usable file an accepted pin names, or, when no accepted pin names the host, the first reason a
+ * claiming value was refused. A claimed host never takes the certificate `messagefoundry.serviceConfig`
+ * names and is never sent on the default roots; a `refused` one can be anchored by nothing, so every
+ * request to it is refused until a caFile for it is corrected, or every refused one is removed.
+ */
+export type HostPin =
+  | { readonly kind: "pin"; readonly file: string }
+  | { readonly kind: "refused"; readonly reason: string };
+
+/** {@link trustPinsFor}'s output folded per host key ({@link HostPin}); an unclaimed host is absent.
+ *  An accepted pin wins over any refusal for the same host, and the first refusal reason is kept. */
+export function hostPinsOf(pins: readonly TrustPin[]): Map<string, HostPin> {
+  const out = new Map<string, HostPin>();
+  for (const pin of pins) {
+    if (pin.kind === "pin") {
+      out.set(pin.key, { kind: "pin", file: pin.file });
+    } else if (pin.claims !== undefined && !out.has(pin.claims)) {
+      out.set(pin.claims, { kind: "refused", reason: pin.reason });
+    }
+  }
+  return out;
+}
+
+/** The usable `caFile` an accepted pin names for `key`, if any. */
+export function pinnedFile(hosts: ReadonlyMap<string, HostPin>, key: string): string | undefined {
+  const host = hosts.get(key);
+  return host?.kind === "pin" ? host.file : undefined;
+}
+
+/** The two path flavours {@link isFullyQualifiedPath} distinguishes; `node:path` itself is one. */
+type PathFlavour = Pick<typeof path, "sep" | "isAbsolute" | "normalize">;
+
+/**
+ * True when `file` names one file whatever the process cwd is.
+ *
+ * Stricter than `path.isAbsolute` on Windows, on purpose. `path.win32.isAbsolute` accepts
+ * `\certs\ca.pem`, which is ROOT-relative: Windows reads it on the drive of the current directory,
+ * so the same setting could name a different file in a different process. Only a drive-letter path
+ * (`C:\…`) or a UNC path (`\\server\share\…`) is accepted there.
+ */
+export function isFullyQualifiedPath(file: string, flavour: PathFlavour = path): boolean {
+  if (flavour.sep === "\\") {
+    // `[^\\/.?]` after the two separators refuses the device namespaces `\\.\` and `\\?\`. A device
+    // such as `\\.\pipe\x` is not a file. This is a first screen only: a named pipe reached by a UNC
+    // host name (`\\localhost\pipe\x`) passes it, and the shell's reader refuses any descriptor that
+    // is not a regular file, though on Windows the open itself may already have blocked.
+    return /^[A-Za-z]:[\\/]/.test(file) || /^[\\/]{2}[^\\/.?]/.test(file);
+  }
+  return flavour.isAbsolute(file);
+}
+
+/**
+ * Which configured targets get an explicit trust anchor, and which `caFile` values are refused.
+ *
+ * A target with no `caFile` yields NOTHING, not a refusal: that is the ordinary case, a target on a
+ * publicly trusted chain or one whose CA is in the machine's trust store.
+ *
+ * **Why a pin is an explicit per-target file and not trust-on-first-use.** The setting holding it,
+ * `messagefoundry.environments`, is machine-scoped (SEC-005), so a checked-in workspace settings file
+ * cannot add a pin, and nothing here asks the user to accept a certificate by clicking. A pin can
+ * only make verification succeed against the file the user named. It never turns verification off,
+ * and Node's `ca` REPLACES the default roots for that request, so the pinned target stops trusting
+ * the public roots too. That is the point of a pin.
+ *
+ * Each refusal is a value the shell logs, because a pin that silently does nothing fails later with
+ * an unexplained trust error:
+ *   * a `caFile` that is not a non-empty string;
+ *   * a path that is not fully qualified (see {@link isFullyQualifiedPath}). A relative path would be
+ *     read against the workspace or the extension host's cwd, and a workspace is exactly what the
+ *     machine scope keeps out of this decision;
+ *   * a URL that does not parse, or is not `https:` — plain http has no handshake to anchor;
+ *   * a second, DIFFERENT file for a `host:port` an earlier entry already pinned. Anchors are filed by
+ *     `host:port` ({@link engineHostKey}), so two files cannot both apply; the first one stays, and
+ *     the same file named twice (an engine shard repeating its environment's URL) is not a conflict.
+ */
+export function trustPinsFor(
+  targets: readonly PinTarget[],
+  flavour: PathFlavour = path,
+): TrustPin[] {
+  const out: TrustPin[] = [];
+  const byKey = new Map<string, string>();
+  for (const { url, caFile } of targets) {
+    if (caFile === undefined || caFile === null || caFile === "") {
+      continue;
+    }
+    const parsed = engineHostKey(url);
+    const key = parsed !== undefined && isHttpsUrl(url) ? parsed : undefined;
+    if (typeof caFile !== "string") {
+      out.push({ kind: "refused", url, reason: "caFile is not a string", claims: key });
+      continue;
+    }
+    if (!isFullyQualifiedPath(caFile, flavour)) {
+      out.push({
+        kind: "refused",
+        url,
+        claims: key,
+        reason:
+          flavour.sep === "\\"
+            ? `caFile ${caFile} is not a full path (on Windows: a drive-letter or UNC path)`
+            : `caFile ${caFile} is not an absolute path`,
+      });
+      continue;
+    }
+    if (key === undefined) {
+      out.push({
+        kind: "refused",
+        url,
+        reason: "caFile applies only to an https:// url",
+        claims: undefined,
+      });
+      continue;
+    }
+    const file = flavour.normalize(caFile);
+    const earlier = byKey.get(key);
+    if (earlier !== undefined) {
+      // Windows paths are case-insensitive, so C:\PKI\ca.pem and c:\pki\ca.pem are one file.
+      const same =
+        flavour.sep === "\\" ? earlier.toLowerCase() === file.toLowerCase() : earlier === file;
+      if (!same) {
+        out.push({
+          kind: "refused",
+          url,
+          reason: `${key} is already pinned to ${earlier} by an earlier entry`,
+          claims: key,
+        });
+      }
+      continue;
+    }
+    byKey.set(key, file);
+    out.push({ kind: "pin", url, key, file });
+  }
+  return out;
 }
