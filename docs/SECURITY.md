@@ -5175,29 +5175,12 @@ clears the cookie. That row is then missing, with an ERROR log line; the line na
 when the sign-out ended one. A failed owner lookup writes the row with no actor, so it does not
 reach that user's security-events feed.
 
-**Open gap: nothing in the engine bounds sign-outs that end no session.** A sign-out whose token
-matches no unrevoked session row still writes an `auth.logout` row, with `outcome` `nothing_to_revoke`; one with no cookie, or
-an empty one, writes none. `/ui/logout` has no sign-in check and charges no budget, so an
-unauthenticated caller who can reach it could append these rows without limit, and nothing prunes
-`audit_log`: [`[retention]`](CONFIGURATION.md#retention) `audit_log_warn_rows` only warns as it
-grows. Each such sign-out opens two write transactions, the revoke attempt and the row. At least
-these costs follow. On SQLite each transaction takes the single writer that message intake also
-needs, and the rows keep filling the store's volume past the
-[`min_free_disk_mb`](CONFIGURATION.md#retention) floor, below which the engine pauses all message
-intake and `serve` refuses to start. On SQL Server and Postgres the rows grow the database server's
-storage, where that floor does not apply, and each row takes the audit-chain append lock that every
-audit write, in every engine shard and cluster node, queues on. This is an exception to
-[the documented protection set](#the-documented-protection-set-asvs-611), which does not list it.
-A bound in the engine is a follow-up, not yet filed; the repeated-credential audit budget
-(`allow_repeated_credential_audit`) in that set is one model for it. Until then, at least these
-narrow who can reach the route: the loopback default bind, while nothing relays to it, and
-`[security].allowed_client_networks` when set, which always admits loopback and is
-[inert behind an undeclared proxy](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842).
-A rate limiter in a proxy in front of `/ui/logout`, which nothing in the engine checks for, slows
-the rows for callers that pass through it; it does not stop the table growing, and a caller that
-reaches the engine's port directly skips it. Once the route is reachable from beyond the box by any
-path, an opened bind with the console served or a proxy or relay in front of a loopback one, the
-operator must supply such a limiter or stop serving the console there.
+**Open gap: sign-out audit rows are unbounded.** Every `/ui/logout` request that carries a
+non-empty session cookie writes one `auth.logout` row, including one that ends no session. Nothing
+in the engine bounds how many such rows a caller who can reach the route can append, and nothing
+prunes `audit_log` (see [retention](CONFIGURATION.md#retention)). A bound in the engine is a
+follow-up, not yet filed. Until it exists, treat `/ui/logout` as an unbounded audit-write surface
+wherever the console is reachable, including from the engine's own host.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
