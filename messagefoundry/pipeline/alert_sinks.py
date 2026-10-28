@@ -158,11 +158,11 @@ _AUTO_RESOLVE: dict[str, str] = {
 #: ``connection_stopped`` rule of that same inbound dispatched is running resolves NOTHING. The
 #: instance stays open, so its #81 occurrence count, its tier and any suspend entry carry on as for
 #: an instance nothing resolves, and a rule-driven crash loop still reaches its ``after_count``
-#: tier. No auto-resolve happens there, so ADR 0133 D1's reset-on-auto-resolve stays true. Every
-#: other start resolves (engine start, operator start, reload, a restart another alert type's rule
-#: drove), and so does every other inverse: only that dispatch marks a key
-#: (``NotifierAlertSink._restarting``). The mark spans the whole callback, so a start another door
-#: makes while the restart waits for the runner's reload lock resolves nothing either.
+#: tier. No auto-resolve happens there, so ADR 0133 D1's reset-on-auto-resolve stays true. Only
+#: that dispatch marks a key (``NotifierAlertSink._restarting``), so this skip touches no other
+#: inverse and no start outside the mark; whether such a start is raised at all is
+#: ``RegistryRunner._emit_inbound_started``'s to say. The mark spans the whole callback, so a start
+#: another door makes while the restart waits for the runner's reload lock resolves nothing either.
 _SELF_RESTART_ACTION = "restart_inbound"
 
 _T = TypeVar("_T")
@@ -1573,20 +1573,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     decision.control_action,
                     event["type"],
                 )
-            elif decision.control_target is not None:
-                self._dispatch_control(
-                    decision.control_action, decision.control_target, default_target=False
-                )
             else:
-                # BACKLOG #1741: a connection_stopped restarting its own inbound is not resolved by it.
+                target = decision.control_target
+                # BACKLOG #1741: a connection_stopped restarting its own inbound, by default or by
+                # naming it, is not resolved by that restart's start.
                 own = (
-                    event["type"] == _AUTO_RESOLVE["connection_started"]
+                    event["type"] == "connection_stopped"
                     and decision.control_action == _SELF_RESTART_ACTION
+                    and target in (None, subject)
                 )
                 self._dispatch_control(
                     decision.control_action,
-                    subject,
-                    default_target=True,
+                    subject if target is None else target,
+                    default_target=target is None,
                     mark=key if own else None,
                 )
         # #143 (ADR 0044 amendment): the windowed suspend gate — NOTIFICATION-only. The durable instance

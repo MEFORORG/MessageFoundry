@@ -499,3 +499,42 @@ async def test_only_the_rules_own_restart_skips_the_resolve() -> None:
     assert "connection_error:OB" not in sink._occurrences
     await _settle(sink)
     assert resolved == [("connection_stopped", "IB"), ("connection_error", "OB")]
+
+
+@pytest.mark.parametrize(("control_target", "resolves"), [("IB", False), ("OTHER", True)])
+async def test_a_rule_naming_its_own_inbound_skips_the_resolve_too(
+    control_target: str, resolves: bool
+) -> None:
+    # A rule that names its own inbound as control_target is the same self-restart; one that names
+    # another connection is not, so a start of the stopped inbound during it still resolves.
+    resolved: list[object] = []
+
+    class _Resolve:
+        async def upsert_alert_instance(self, **_kw: object) -> None:
+            return None
+
+        async def resolve_alert_instances_for(self, **kw: object) -> int:
+            resolved.append(kw["connection"])
+            return 0
+
+    rule = AlertRule(
+        event_type="connection_stopped",
+        connection="IB",
+        control_action="restart_inbound",
+        control_target=control_target,
+    )
+    sink = NotifierAlertSink([], rules=[rule], store=_Resolve())  # type: ignore[arg-type]
+    targets: list[str] = []
+
+    async def _control(action: str, target: str, *, default_target: bool) -> None:
+        targets.append(target)
+        assert default_target is False
+        sink.connection_started("IB")
+
+    sink.set_control_callback(_control)
+    sink.connection_stopped("IB", detail="router halted")
+    await _settle(sink, sink._control_tasks)
+    await _settle(sink)
+    assert targets == [control_target]
+    assert resolved == (["IB"] if resolves else [])
+    assert ("connection_stopped:IB" in sink._occurrences) is not resolves
