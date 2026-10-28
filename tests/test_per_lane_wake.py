@@ -287,9 +287,9 @@ def _delivery_registry(inbox: Path, out_a: Path, out_b: Path) -> Registry:
 # How long _until waits, in wall-clock seconds. A passing run ends the wait as soon as its condition
 # holds, so this is a ceiling, not a speed assertion. The 3s it replaces (counted in sleeps, not
 # wall time) failed on a windows-2025 runner under a full parallel suite (BACKLOG #3456). It must
-# stay BELOW the per-lane idle backstop, which the test after _until pins: with wake ON, a lane
-# whose wakes are all lost sleeps until that backstop, and a ceiling under it keeps that red. A
-# lost wake followed by a later one on the same lane is NOT caught here, because the later set
+# stay well below the per-lane idle backstop, which the test after _until pins: with wake ON, a
+# lane whose wakes are all lost sleeps until that backstop, and a ceiling under it keeps that red.
+# A lost wake followed by a later one on the same lane is NOT caught here, because the later set
 # wakes the worker and it claims everything pending.
 _UNTIL_CEILING_SECONDS = 15.0
 
@@ -303,10 +303,12 @@ async def _until(predicate: Any, timeout: float = _UNTIL_CEILING_SECONDS) -> Non
         await asyncio.sleep(0.02)
 
 
-def test_until_ceiling_sits_below_the_idle_backstop() -> None:
-    """At or above the backstop, the backstop delivers a lane whose wakes were all lost before the
-    ceiling expires, and the end-to-end tests below pass with per-lane wake broken."""
-    assert _UNTIL_CEILING_SECONDS < _PER_LANE_IDLE_BACKSTOP_SECONDS
+def test_until_ceiling_sits_well_below_the_idle_backstop() -> None:
+    """Each idle worker's backstop wait starts before _until's deadline does, at its last empty
+    claim, so a ceiling just under the backstop still lets the backstop deliver a lane whose wakes
+    were all lost, and the end-to-end tests below would pass with per-lane wake broken. Half the
+    backstop leaves that lead time room."""
+    assert _UNTIL_CEILING_SECONDS <= _PER_LANE_IDLE_BACKSTOP_SECONDS / 2
 
 
 @pytest.mark.parametrize("per_lane_wake", [False, True])
@@ -373,7 +375,8 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
         try:
             await _until(lambda: _n_processed(store, 3))
         except AssertionError as exc:
-            # Name where the messages stopped, so a recurrence shows which stage never drained.
+            # Print how far each message got. ROUTED covers both transform and delivery, so this
+            # separates intake from the later stages, not transform from delivery.
             msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
             raise AssertionError(f"{exc}; statuses: {sorted(m['status'] for m in msgs)}") from exc
     finally:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -45,12 +46,13 @@ async def _accepts(port: int) -> bool:
     except ConnectionRefusedError:
         return False
     except TimeoutError as exc:
-        raise AssertionError(
-            f"port {port} neither accepted nor refused within {_PROBE_CEILING_SECONDS:g}s"
-        ) from exc
+        # An OS connect timeout is a TimeoutError too, and carries an errno; the ceiling's has none.
+        why = f"the OS timed out the connect ({exc})" if exc.errno else "the probe's ceiling passed"
+        raise AssertionError(f"port {port} neither accepted nor refused: {why}") from exc
     writer.close()
-    with contextlib.suppress(OSError):
-        await writer.wait_closed()
+    # Bounded: on the Windows proactor an unbounded wait_closed can stall (mllp.py, _close_bounded).
+    with contextlib.suppress(OSError, TimeoutError):
+        await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
     return True
 
 
@@ -102,6 +104,22 @@ async def test_a_slow_connect_to_a_bound_port_reads_as_bound(
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_a_connect_that_never_answers_fails_rather_than_reading_unbound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the probe's control (BACKLOG #3456): no answer is not a False, which a
+    negative assertion would pass on with the port bound."""
+
+    async def never_open(host: str, to: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(asyncio, "open_connection", never_open)
+    monkeypatch.setattr(sys.modules[__name__], "_PROBE_CEILING_SECONDS", 0.2)
+    with pytest.raises(AssertionError, match="neither accepted nor refused"):
+        await _accepts(1)
 
 
 async def test_a_passive_standby_binds_nothing_and_an_activation_binds_the_critical_feed(
@@ -358,7 +376,9 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
         assert rr is not None
         if not norm_auto_start:
             await rr.start_inbound(_NORM, operator=True)
-            assert await _accepts(norm_port)  # control: the probe sees a bound feed
+            # control: the probe sees a bound feed. A refusal here names whether the runner
+            # still holds the listener, which the 2026-10-13 failure could not say.
+            assert await _accepts(norm_port), f"running={rr.inbound_running(_NORM)}"
             await engine.reload_detail(cfg)
         assert rr.inbound_filtered(_NORM) is not None and not await _accepts(norm_port)
 
