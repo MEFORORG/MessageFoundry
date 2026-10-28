@@ -472,7 +472,9 @@ as a break, and so would the attestation, with no re-attest hint. That limit is 
 regenerating. Vault's Transit API documentation, read on 2026-10-27, says a pinned HMAC generate
 needs a version at or above the key's `min_encryption_version`, and that `min_decryption_version`
 is the floor for verifying an HMAC. No Vault or OpenBao server was run to confirm it. PR 2167
-named Transit's verify call as the fix for this limit; it is not built.
+named Transit's verify call as the fix for this limit; it is not built. Until it is, do not raise
+the audit key's `min_encryption_version` above the oldest version a stored row names: every older
+row would then read as a break in `audit-verify`, and in the startup walk where it is on.
 
 `_refuses_only_version` infers a refused version from Transit's reply; it does not read the key's
 version range. So a node whose copy of the key lags a rotation can refuse a real, newer version, and

@@ -369,6 +369,19 @@ def smoke_live(
     return CheckResult("smoke.live", "Live smoke (MLLP + ACK)", Status.FAIL, detail)
 
 
+#: The SKIP detail for a ``:memory:`` store (BACKLOG #1708). A read-only open refuses one, since
+#: another process's in-memory database is not reachable and a new one is always empty.
+IN_MEMORY_SKIP: Final = (
+    "[store].path is ':memory:': an in-memory store lives inside the engine process, so verify "
+    "cannot open it from here"
+)
+
+
+def in_memory_store(store: StoreSettings) -> bool:
+    """Whether ``store`` is a SQLite ``:memory:`` store, which no other process can open."""
+    return store.backend is StoreBackend.SQLITE and store.path == ":memory:"
+
+
 def missing_sqlite_store(store: StoreSettings) -> Path | None:
     """The configured SQLite path when it is absent, else ``None`` (nothing for this gate to stop).
 
@@ -413,6 +426,8 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     from messagefoundry.last_resort import run_guarded
 
     rid, title = "store.connect", "Store connectivity"
+    if in_memory_store(store):
+        return CheckResult(rid, title, Status.SKIP, IN_MEMORY_SKIP)
     absent = missing_sqlite_store(store)
     if absent is not None:
         return CheckResult(

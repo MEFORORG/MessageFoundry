@@ -417,9 +417,11 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
 
     Imports lazily: ``--section host`` must not pull the store stack in (see ``smoke.py``)."""
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.verify.smoke import missing_sqlite_store
+    from messagefoundry.verify.smoke import IN_MEMORY_SKIP, in_memory_store, missing_sqlite_store
 
     rid, title = "auth.lockable_accounts", "Accounts with no way past a sign-in lock"
+    if in_memory_store(store):
+        return CheckResult(rid, title, Status.SKIP, IN_MEMORY_SKIP)
     absent = missing_sqlite_store(store)
     if absent is not None:
         return CheckResult(rid, title, Status.SKIP, f"no SQLite store at {absent} yet")

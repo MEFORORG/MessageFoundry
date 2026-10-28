@@ -54,7 +54,9 @@ So a mistyped `[store].path` is now a FAIL where it used to be a PASS — the ch
 because it made whatever it was pointed at. Run `python -P -X disable-remote-debug -m messagefoundry serve` once before
 `--section store`. And running `verify` elevated no longer leaves an administrator-owned store and
 directory tree at the configured path, which is the service-identity gap the `store.connect` row's
-own text tells you to go and confirm.
+own text tells you to go and confirm. It can still leave a SQLite store's `-wal` and `-shm` files,
+as the table below says, so run `verify` against a stopped engine's store as the service account,
+or while the engine runs.
 
 **That is narrower than "verify only reads", and the difference matters on a live box.** At least
 these things still write:
@@ -83,7 +85,9 @@ Every `open_store` call in `verify` passes `read_only=True`, and `tests/test_ver
   PASS for it unless the open itself needs an object the store lacks, so a PASS does not prove the
   schema is current. A later read that needs a missing object fails on its own row.
 - **A PASS proves read access, not write access or readiness to serve.** A read-only open writes
-  nothing, so a store file the calling user can read but not write is a PASS. On a server backend
+  nothing to the store, so a store file the calling user can read but not write can be a PASS.
+  Where a WAL store has no `-wal` and `-shm` files yet, SQLite must create them, so a user who
+  cannot write the directory FAILs even with read access. On a server backend
   under `schema_management = external`, an ordinary open also checks the login's runtime grants
   (PostgreSQL) and the database options (SQL Server), and refuses a marker that is not current. A
   read-only open skips those checks, so `store.connect` can PASS a database `serve` refuses. Start

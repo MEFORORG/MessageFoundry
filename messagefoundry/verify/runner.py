@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Sequence
 from pathlib import Path
@@ -21,6 +22,8 @@ from messagefoundry.verify.smoke import (
     smoke_self,
     synthetic_message,
 )
+
+_log = logging.getLogger(__name__)
 
 #: The five runnable sections; default is all of them. "federation" (ADR 0142) is offline and
 #: emits a single SKIP row when [auth].oidc_enabled is false, so it costs a non-federated
@@ -215,7 +218,11 @@ def _run_live_smoke(
                 # BACKLOG #1708: the read-only open refuses a store it cannot read as it is, such
                 # as another application's SQLite file. Never fall back to no baseline: the
                 # synthetic control id is fixed, so a prior run's message would then match.
-                baseline_error = str(exc)
+                # Class named, and a codec error never printed raw (vault BACKLOG #3185).
+                from messagefoundry.redaction import codec_safe_line
+
+                baseline_error = codec_safe_line(exc)
+                _log.warning("verify: the pre-send baseline read failed: %s", baseline_error)
 
     ctx = live_smoke_ssl_context(ca_file=smoke_tls_ca) if smoke_tls else None
     results = [smoke_live(host=host, port=port, message=message, ssl_context=ctx)]

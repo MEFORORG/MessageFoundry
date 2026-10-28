@@ -1033,13 +1033,18 @@ _VERIFY_STORE_OPENERS: Final = [
 _BACKEND_OPENERS: Final = frozenset({"MessageStore", "PostgresStore", "SqlServerStore"})
 
 
+def _attribute_tail(node: ast.expr) -> str | None:
+    """The last name of a bare name or an attribute chain (``a.b.open_store`` reads ``open_store``)."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
 def _callee(call: ast.Call) -> str | None:
     """The called name, bare or as an attribute (``base.open_store`` reads ``open_store``)."""
-    if isinstance(call.func, ast.Name):
-        return call.func.id
-    if isinstance(call.func, ast.Attribute):
-        return call.func.attr
-    return None
+    return _attribute_tail(call.func)
 
 
 def _verify_functions() -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
@@ -1086,11 +1091,24 @@ def test_verify_opens_a_store_only_through_open_store_by_its_own_name() -> None:
         if isinstance(sub, ast.Call)
         and isinstance(sub.func, ast.Attribute)
         and sub.func.attr == "open"
-        and isinstance(sub.func.value, ast.Name)
-        and sub.func.value.id in _BACKEND_OPENERS
+        and _attribute_tail(sub.func.value) in _BACKEND_OPENERS
     ]
+    # ``open_store`` named anywhere but as a callee -- ``partial(open_store, ...)``, or bound to a
+    # local and called by that name -- would hide the call's keywords from the tests below.
+    passed_on: list[str] = []
+    for source_file in sorted(Path(smoke.__file__).parent.glob("*.py")):
+        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        called_at = {id(sub.func) for sub in ast.walk(tree) if isinstance(sub, ast.Call)}
+        passed_on += [
+            f"{source_file.name}:{sub.lineno}"
+            for sub in ast.walk(tree)
+            if isinstance(sub, ast.Name | ast.Attribute)
+            and _attribute_tail(sub) == "open_store"
+            and id(sub) not in called_at
+        ]
     assert not renamed, f"{renamed} import open_store under another name (#1708)"
     assert not direct, f"{direct} open a backend directly, past open_store (#1708)"
+    assert not passed_on, f"open_store is referenced, not called, at {passed_on} (#1708)"
 
 
 def test_every_open_store_in_verify_goes_through_the_gate() -> None:
@@ -1128,7 +1146,22 @@ def test_every_open_store_in_verify_opens_read_only() -> None:
         f"{writable} open the store without read_only=True, so verify would schema-ensure and "
         "migrate the store it reports on, as the calling user (#1708)"
     )
-    assert sorted(where for where, _, _ in calls) == _VERIFY_STORE_OPENERS
+    assert sorted({where for where, _, _ in calls}) == _VERIFY_STORE_OPENERS
+
+
+def test_an_in_memory_store_is_a_skip_not_a_failed_open() -> None:
+    """A read-only open refuses ``:memory:``: another process's in-memory database cannot be
+    reached, and a new one is always empty. The store rows SKIP and say why, rather than FAIL or
+    ERROR on the refusal's own text (BACKLOG #1708)."""
+    from messagefoundry.config.settings import AuthSettings
+
+    memory = StoreSettings(path=":memory:")
+    for r in (
+        smoke.check_store_connectivity(memory),
+        checks.check_lockable_accounts(memory, AuthSettings()),
+    ):
+        assert r.status is Status.SKIP, r
+        assert "in-memory" in r.detail
 
 
 def _sqlite_tables(path: Path) -> set[str]:
