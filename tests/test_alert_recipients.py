@@ -255,10 +255,13 @@ def test_a_rule_override_reaches_rcpt_to_through_the_email_transport(wire: _Wire
     assert to_line.rstrip(b"\r\n") == b"To: a@hospital.example, b@hospital.example"
 
 
-def test_a_partial_rcpt_refusal_fails_the_alert_send(wire: _WireCapture) -> None:
+@pytest.mark.parametrize("quit_ok", [True, False], ids=["quit-221", "quit-refused"])
+def test_a_partial_rcpt_refusal_fails_the_alert_send(wire: _WireCapture, quit_ok: bool) -> None:
     # One of two recipients refused (vault BACKLOG #2924): the send raises rather than returning as
-    # though both got the alert.
+    # though both got the alert, and a QUIT refused after it does not hide the refusal.
     wire.refuse_rcpt = frozenset({_PARTIAL_REFUSED.encode()})
+    if not quit_ok:
+        wire.quit_reply = b"500 no\r\n"
     with pytest.raises(NegativeAckError) as caught:
         _send_to(wire.port, "engine@hospital.example", _PARTIAL_RECIPIENTS)
     assert_partial_refusal(caught.value, ALERTS_SMTP_CELL, wire)
@@ -300,7 +303,8 @@ async def test_the_notifier_logs_a_partial_refusal_without_an_address(
 _UNENCODABLE = "synthetic alert detail \udc80 tail"
 
 
-#: A lone surrogate the Subject header refuses as it is set (``\udc80`` sets, and fails later).
+#: A lone surrogate the Subject header refuses as it is set. ``\udc80`` sets, and the generator
+#: writes it as an ``unknown-8bit`` encoded word without raising.
 _UNENCODABLE_SUBJECT = "synthetic alert detail \ud800 tail"
 
 
@@ -308,11 +312,10 @@ _UNENCODABLE_SUBJECT = "synthetic alert detail \ud800 tail"
 def test_an_unencodable_alert_body_fails_content_free(wire: _WireCapture, part: str) -> None:
     # set_content(), add_alternative() and the Subject header raise a UnicodeEncodeError whose text
     # names the character and whose `.object` is the whole value; the notifier logs that with
-    # exc_info (vault BACKLOG #3011). The refusal keeps the type name only, with no chain, and
-    # nothing is sent.
-    with pytest.raises(
-        ValueError, match="the alert subject or body could not be encoded"
-    ) as caught:
+    # exc_info (vault BACKLOG #3011). The refusal keeps the type name only, with no chain, names the
+    # part that failed, and nothing is sent.
+    which = "subject" if part == "subject" else "body"
+    with pytest.raises(ValueError, match=f"the alert {which} could not be encoded") as caught:
         send_plain_email(
             host="127.0.0.1",
             port=wire.port,
