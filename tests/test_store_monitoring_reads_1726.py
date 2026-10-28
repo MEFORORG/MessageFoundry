@@ -21,6 +21,7 @@ No row is deleted and no figure changes meaning; retention is out of scope here.
 from __future__ import annotations
 
 import contextlib
+import math
 import random
 import sqlite3
 from collections.abc import AsyncIterator, Sequence
@@ -437,16 +438,48 @@ def test_last_received_cost_follows_channels_not_rows() -> None:
 def test_server_schemas_carry_the_received_index() -> None:
     """Limb A: Postgres and SQL Server build ix_messages_received as SQLite does. Each server
     schema is content-hashed (ADR 0064), so adding the statement forces one full run on the next
-    open, where an existing server store gains the index. Both modules import their drivers lazily,
-    so this runs with or without the server extras installed."""
+    open, where an existing server store gains the index. Postgres builds it in
+    _migrate_lease_columns, so _MIGRATION_REV carries it into the hash. Both modules import their
+    drivers lazily, so this runs with or without the server extras installed."""
     from messagefoundry.store import postgres, sqlserver
 
     ddl = f"CREATE INDEX IF NOT EXISTS {_INDEX} ON messages(received_at, id)"
     assert ddl in sqlite_store._SCHEMA
-    assert ddl in postgres._SCHEMA
+    assert ddl == postgres._RECEIVED_INDEX_DDL
     [stmt] = [s for s in sqlserver._SCHEMA if f"'{_INDEX}'" in s]
     assert f"IF INDEXPROPERTY(OBJECT_ID('messages'),'{_INDEX}','IndexID') IS NULL" in stmt
     assert f"CREATE INDEX {_INDEX} ON messages(received_at, id)" in stmt
+
+
+class _RecordingPgConn:
+    """Enough of an asyncpg connection for ``_migrate_lease_columns``: every catalog read returns
+    no rows, and every execute is recorded with the timeout it was given."""
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, object]] = []
+
+    async def fetch(self, sql: str, *args: object) -> list[Any]:
+        return []
+
+    async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
+        self.executed.append((sql, timeout))
+        return ""
+
+
+async def test_postgres_received_index_build_is_exempt_from_the_client_timeout() -> None:
+    """The build passes ``timeout=inf`` and stays out of the generic ``_SCHEMA`` loop, which passes
+    none; ``postgres._RECEIVED_INDEX_DDL`` says why."""
+    from messagefoundry.store import postgres
+
+    assert postgres._RECEIVED_INDEX_DDL not in postgres._SCHEMA
+    conn = _RecordingPgConn()
+    # The method reads nothing off self, so an uninitialised instance stands in for an open store.
+    await postgres.PostgresStore.__new__(postgres.PostgresStore)._migrate_lease_columns(conn)
+    timeouts = [t for sql, t in conn.executed if sql == postgres._RECEIVED_INDEX_DDL]
+    assert timeouts == [math.inf]
+    # Control: the FIFO rebuild this mirrors is seen the same way, so the recorder reads kwargs.
+    fifo = [t for sql, t in conn.executed if "ix_queue_fifo_in_seq" in sql]
+    assert fifo == [math.inf]
 
 
 # --- upgrade ---------------------------------------------------------------------------------------

@@ -521,9 +521,7 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_messages_channel ON messages(channel_id, received_at)",
     "CREATE INDEX IF NOT EXISTS ix_messages_control ON messages(channel_id, control_id)",
-    # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's
-    # plan is pinned by a test; this backend's plan has not been measured.
-    "CREATE INDEX IF NOT EXISTS ix_messages_received ON messages(received_at, id)",
+    # ix_messages_received (BACKLOG #1726) is built in _migrate_lease_columns; _RECEIVED_INDEX_DDL says why.
     """CREATE TABLE IF NOT EXISTS queue (
         id               TEXT PRIMARY KEY,
         message_id       TEXT NOT NULL REFERENCES messages(id),
@@ -1195,7 +1193,16 @@ _SCHEMA.append(
 # columns) are ADDed in the same function. Same contract, same caveat.
 # 6 (ADR 0197 Amendment A, BACKLOG #1131): the users.password_generated ADD lands in the same
 # function. Same contract, same caveat.
-_MIGRATION_REV = 6
+# 7 (BACKLOG #1726): ix_messages_received moved from _SCHEMA into the same function. Same contract.
+_MIGRATION_REV = 7
+
+# BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
+# is pinned by a test; this backend's plan has not been measured. Run by _migrate_lease_columns with
+# timeout=inf, for the FIFO rebuild's reason: an existing store gains the index on its first open
+# after upgrade, the build scans the whole messages table, and asyncpg's client command_timeout (30s
+# by default) would cancel it. SET LOCAL statement_timeout = 0 covers only the server side, and a
+# cancelled build rolls the schema txn back, so every restart would retry it and fail again.
+_RECEIVED_INDEX_DDL = "CREATE INDEX IF NOT EXISTS ix_messages_received ON messages(received_at, id)"
 
 
 def _schema_hash() -> str:
@@ -1958,7 +1965,8 @@ class PostgresStore:
                 # first-upgrade FIFO index rebuild (in _migrate_lease_columns) isn't killed by a
                 # role/database-configured statement_timeout → txn abort → startup crash-loop. This covers
                 # only the server side; asyncpg ALSO imposes a client-side command_timeout, exempted
-                # per-statement with timeout=inf on the FIFO rebuild itself. SET LOCAL scopes to this txn
+                # per-statement with timeout=inf on the long builds in _migrate_lease_columns. SET LOCAL
+                # scopes to this txn
                 # and auto-reverts at commit.
                 await conn.execute("SET LOCAL statement_timeout = 0")
                 await self._advisory_lock(conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK)
@@ -2139,6 +2147,7 @@ class PostgresStore:
         )
         await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_in", timeout=float("inf"))
         await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_out", timeout=float("inf"))
+        await conn.execute(_RECEIVED_INDEX_DDL, timeout=float("inf"))
         # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at; pre-existing rows get NULL.
         sessions_has_reauth = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
