@@ -917,7 +917,7 @@ async def test_lockout_store_contract(store) -> None:
         corrupt_passkeys={
             # A lone UTF-16 surrogate: the driver's decode of the NVARCHAR cell raises
             # UnicodeDecodeError while fetching, before any parse runs. A driver that decodes it
-            # anyway hands the parse a value that is not JSON, which must escalate too.
+            # anyway hands the parse a value that is not JSON, which keeps the fixed length too.
             "fetch": corrupt(
                 "UPDATE webauthn_credentials SET transports=NCHAR(?) WHERE user_id=?", 55296
             ),

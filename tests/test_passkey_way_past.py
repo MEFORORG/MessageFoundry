@@ -13,6 +13,7 @@ here is real: the in-repo soft authenticator drives py_webauthn's own verify fun
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import types
@@ -1853,7 +1854,8 @@ async def test_an_unreadable_passkey_row_counts_the_failure_at_the_fixed_length(
     try:
         service, identity, _, _ = await _passkey_owner(store)
         await _corrupt_passkey_rows(store, identity.user_id, transports)
-        assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+            assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
         warned = [
             r.getMessage()
             for r in caplog.records
@@ -1862,7 +1864,13 @@ async def test_an_unreadable_passkey_row_counts_the_failure_at_the_fixed_length(
             and "could not be read" in r.getMessage()
         ]
         assert warned, "the escalation logged no warning naming the account"
-        assert all(m.isascii() and "json" not in m for m in warned), warned
+        # The whole message, so any trace of the cell, ASCII or not, fails it.
+        allowed = {
+            f"the passkeys of user {identity.user_id} could not be read ({failure}); its sign-in"
+            " lock keeps its fixed length"
+            for failure in ("PasskeyRowMalformed", "OperationalError")
+        }
+        assert set(warned) <= allowed, warned
     finally:
         await store.close()
 
