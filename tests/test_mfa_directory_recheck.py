@@ -1227,15 +1227,10 @@ def test_the_second_factor_legs_ask_no_revoked_at_of_a_loaded_session(method: st
     the premise the test above pins, so these legs carry none on the ``session`` they load. RED
     when: one comes back."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(AuthService, method))))
-    session_reads = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "session"
-    ]
-    # THE CONTROL: each leg reads attributes of the session it loads, so a walk that found none
-    # (a renamed local, a moved body) fails here rather than passing the absence below on nothing.
-    assert len(session_reads) >= 1
-    reads = [node.lineno for node in session_reads if node.attr == "revoked_at"]
+    attributes = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute)]
+    # THE CONTROL: the walk saw the leg's body, so the absence below is not a pass on nothing.
+    assert len(attributes) >= 1
+    # Any `.revoked_at`, not only `session.revoked_at`: a session loaded under another name must
+    # not carry the dead check either. A check moved into a helper the leg calls is not seen here.
+    reads = [node.lineno for node in attributes if node.attr == "revoked_at"]
     assert reads == []
