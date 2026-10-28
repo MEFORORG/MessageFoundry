@@ -993,20 +993,22 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     // Positions count from 0, as the ordinals in the table's first column do. In ALERT_RULES each
     // entry's index equals its position; the test below this one pulls the two apart.
     const cases: [string, (c: Payload) => void, string][] = [
-      ["a quoted number", (c) => (c.rules[2].min_depth = "500"), "the entry at position 2 of the list, min_depth: expected a number, got string"],
-      ["a boolean age", (c) => (c.rules[0].min_oldest_seconds = true), "the entry at position 0 of the list, min_oldest_seconds: expected a number, got boolean"],
-      ["a null cooldown", (c) => (c.rules[1].cooldown_seconds = null), "the entry at position 1 of the list, cooldown_seconds: expected a number, got null"],
-      ["markup for a number", (c) => (c.rules[1].min_depth = SENT), "the entry at position 1 of the list, min_depth: expected a number, got string"],
-      ["markup for a connection list", (c) => (c.rules[0].connection = [SENT]), "the entry at position 0 of the list, connection: expected text, got list"],
-      ["transports is text", (c) => (c.rules[0].transports = SENT), "the entry at position 0 of the list, transports: expected a list of text, got string"],
-      ["transports holds a number", (c) => (c.rules[0].transports = [1, 2]), "the entry at position 0 of the list, transports: expected a list of text, got a list with an entry that is not text"],
-      ["transports holds a null", (c) => (c.rules[0].transports = ["webhook", null]), "the entry at position 0 of the list, transports: expected a list of text, got a list with an entry that is not text"],
-      ["a rule with no index", (c) => delete c.rules[1].index, "the entry at position 1 of the list has no whole-number index"],
-      ["an entry that is text", (c) => (c.rules[2] = SENT), "the entry at position 2 of the list is not a rule"],
+      ["a quoted number", (c) => (c.rules[2].min_depth = "500"), "the entry at position 2 of the list (counted from 0), min_depth: expected a number, got string"],
+      ["a boolean age", (c) => (c.rules[0].min_oldest_seconds = true), "the entry at position 0 of the list (counted from 0), min_oldest_seconds: expected a number, got boolean"],
+      ["a null cooldown", (c) => (c.rules[1].cooldown_seconds = null), "the entry at position 1 of the list (counted from 0), cooldown_seconds: expected a number, got null"],
+      ["markup for a number", (c) => (c.rules[1].min_depth = SENT), "the entry at position 1 of the list (counted from 0), min_depth: expected a number, got string"],
+      ["markup for a connection list", (c) => (c.rules[0].connection = [SENT]), "the entry at position 0 of the list (counted from 0), connection: expected text, got list"],
+      ["transports is text", (c) => (c.rules[0].transports = SENT), "the entry at position 0 of the list (counted from 0), transports: expected a list of text, got string"],
+      ["transports holds a number", (c) => (c.rules[0].transports = [1, 2]), "the entry at position 0 of the list (counted from 0), transports: expected a list of text, got a list with an entry that is not text"],
+      ["transports holds a null", (c) => (c.rules[0].transports = ["webhook", null]), "the entry at position 0 of the list (counted from 0), transports: expected a list of text, got a list with an entry that is not text"],
+      ["a rule with no index", (c) => delete c.rules[1].index, "the entry at position 1 of the list (counted from 0) has no whole-number index"],
+      ["an entry that is text", (c) => (c.rules[2] = SENT), "the entry at position 2 of the list (counted from 0) is not a rule"],
       ["no list", (c) => delete c.rules, "the list is missing or is not a list"],
     ];
-    // Every case gets the same advice text, whatever the bad value is: choosing between texts would
-    // read that value to decide (BACKLOG #1123). Both the file and the command are named in it.
+    // Every case gets the same text around the problem, whatever the bad value is, so no branch on
+    // the message picks the advice (BACKLOG #1123). The whole refusal is compared with the problem
+    // cut out, so wording that varied before the problem would be caught too. Both the file and the
+    // command are named in the advice.
     let advice: string | undefined;
     for (const [why, change, problem] of cases) {
       const p = alertRules.load();
@@ -1016,9 +1018,9 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       const shown = refusalShown(p);
       assert.ok(shown.startsWith(ALERT_REFUSAL), `${why}: no refusal, got "${shown}"`);
       assert.ok(shown.includes(problem), `${why}: the refusal does not say "${problem}": "${shown}"`);
-      const rest = shown.slice(shown.indexOf(problem) + problem.length);
+      const rest = shown.replace(problem, "<problem>");
       advice ??= rest;
-      assert.strictEqual(rest, advice, `${why}: the advice differs from the other cases: "${shown}"`);
+      assert.strictEqual(rest, advice, `${why}: the text around the problem differs from the other cases: "${shown}"`);
       assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "rules"')), `${why}: console.warn was dropped`);
       // Nothing the message carried is echoed, and nothing in it became an element.
       assert.ok(!shown.includes("onerror"), `${why}: the refusal echoed a value from the message`);
@@ -1032,13 +1034,18 @@ suite("webview receivers discard a malformed payload and render a well-formed on
 
   test("Alert Rules: a refusal names an entry by its position, never by the index the message gave", () => {
     // The index is a value from the message, so the refusal must not show it (BACKLOG #1123).
-    // Index 7 sits at position 0 here, and is a digit that appears nowhere else in the text.
+    // Index 7 sits at position 0 here. The problem text is pinned whole, up to the full stop that
+    // ends it, so "rule 7" or a 7 anywhere in it fails, and the fixed advice after it may say what
+    // it likes.
     const p = alertRules.load();
     p.deliver({ command: "rules", rules: [{ event_type: "queue_buildup", min_depth: "500", index: 7 }] });
+    assert.deepStrictEqual(p.errors.map(String), [], "the page threw");
     const shown = refusalShown(p);
-    assert.ok(shown.startsWith(ALERT_REFUSAL), `no refusal, got "${shown}"`);
-    assert.ok(shown.includes("the entry at position 0 of the list, min_depth:"), `the position is not named: "${shown}"`);
-    assert.ok(!shown.includes("7"), `the refusal shows the index the message gave: "${shown}"`);
+    const want =
+      `${ALERT_REFUSAL} The list sent to this panel is malformed: ` +
+      "the entry at position 0 of the list (counted from 0), min_depth: expected a number, got string. ";
+    assert.ok(shown.startsWith(want), `the refusal does not name position 0 alone: "${shown}"`);
+    assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "rules"')), "console.warn was dropped");
   });
 
   test("Alert Rules: a well-formed list after a refusal brings back the table, Remove and Add", () => {

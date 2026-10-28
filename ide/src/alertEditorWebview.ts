@@ -93,8 +93,9 @@ export function alertEditorScript(
       $('rules').style.display = 'none';
       $('empty').style.display = 'none';
       $('add').disabled = true;
-      // One fixed advice text for every problem. Choosing between texts would read the bad value
-      // to decide, and so let the message steer what the refusal says (BACKLOG #1123).
+      // One fixed advice text for every problem, so no branch on the message picks the advice
+      // (BACKLOG #1123). The problem text before it does vary with the message: it names a
+      // position, a field and a fixed kind word, and copies no value in (see rulesProblem()).
       show('These rules cannot be shown. The list sent to this panel is malformed: ' + problem + '.' +
         ' If a value in [[alerts.rules]] of the service-settings file is wrong, fix it; otherwise the' +
         ' command that lists the rules printed something this panel does not expect. Run the Alert' +
@@ -156,23 +157,24 @@ export function alertEditorScript(
     ];
     // What is wrong with the first entry of a 'rules' message that is not a Rule, or null. It names
     // the entry by its position in the list, counted from 0 as the ordinals are, the field, and the
-    // kind of value found. Nothing in the text is taken from the message: the position is this
-    // loop's own counter, never the entry's index (BACKLOG #1123); the field name comes from
-    // RULE_FIELDS; the kind is a fixed word from mfKind(). Never the value.
+    // kind of value found. No value from the message is copied in: the position is this loop's own
+    // counter, never the entry's index (BACKLOG #1123), the field name comes from RULE_FIELDS, and
+    // the kind is a fixed word from mfKind() or this function. Which of those words appear does
+    // depend on the message.
+    const at = (i) => 'the entry at position ' + i + ' of the list (counted from 0)';
     function rulesProblem(d) {
       if (!Array.isArray(d.rules)) { return 'the list is missing or is not a list'; }
       // By index, not for-of or every(): a hole must be seen as an entry that is not a rule.
       for (let i = 0; i < d.rules.length; i++) {
         const r = d.rules[i];
-        const at = 'the entry at position ' + i + ' of the list';
-        if (!mfObj(r)) { return at + ' is not a rule'; }
-        if (!mfInt(r.index)) { return at + ' has no whole-number index'; }
+        if (!mfObj(r)) { return at(i) + ' is not a rule'; }
+        if (!mfInt(r.index)) { return at(i) + ' has no whole-number index'; }
         for (const [key, ok, want] of RULE_FIELDS) {
           const v = r[key];
           if (!mfOpt(v, ok)) {
             // A list is the right kind for transports, so "got list" would name no difference.
             const got = Array.isArray(v) && key === 'transports' ? 'a list with an entry that is not text' : mfKind(v);
-            return at + ', ' + key + ': expected ' + want + ', got ' + got;
+            return at(i) + ', ' + key + ': expected ' + want + ', got ' + got;
           }
         }
       }
