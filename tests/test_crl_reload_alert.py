@@ -492,8 +492,8 @@ def test_every_remedy_has_its_own_class_token() -> None:
     for token in tokens:
         assert token == token.lower() and " " not in token
         assert f"| `{token}` |" in guide, token
-    # The guide says the reload names the strongest "in the order of the rows below", so its rows
-    # follow the rank (vault BACKLOG #3506 code review).
+    # The guide says the event carries the class "first in this table" among those a pass records,
+    # so its rows follow the rank (vault BACKLOG #3506 code review).
     rows = [guide.index(f"| `{token}` |") for token in tokens]
     assert rows == sorted(rows), tokens
     assert ReloadOutcome("p", 1, None).remedy_class is None

@@ -2069,8 +2069,13 @@ row's where the check ran and failed but the CRL names no key of that CA, and th
 `uncheckable_signature` row's where the engine could not check the signature with a matched CA's
 key. After a CA renews its key the file can be right, and a restart then loads it with the WARNING
 above, unless another rule refuses it. Where the engine matches the CRL to no listed CA, the remedy
-is the `no_issuer` row's: restart. Where the CRLs in one file, or the hops holding it, get
-different signature findings, the reload names the strongest, in the order of the rows below.
+is the `no_issuer` row's: restart. For one hop, the reload reads the file's CRLs in order and
+reports the first it matches to a listed CA and cannot confirm. It does not judge the CRLs after
+that one, so a CRL proven badly signed later in the file is not reported. A CRL it matches to no
+listed CA is reported only when it finds no CRL of the first kind. If the check fails on a CRL it
+reaches, even after one it matched to no listed CA, that hop's refusal is `retry`. Where
+the hops holding one file get different signature findings, the reload names the one whose row
+comes first below.
 
 **What a signature refusal stops.** It has the reach of the expired-CRL refusal, because one check
 raises both. This is read from the code, not measured end to end. At `serve`, a refused outbound
@@ -2123,8 +2128,12 @@ line before you act. That holds for this event only: the CRL expiry alert's `det
 reason, once the held copy nears its `nextUpdate`. The expiry date, `held_copy` and `shared_with`
 belong to the CRL expiry alert too. This event carries none of them.
 
-The rows run strongest first. Where one file calls for more than one class, the event carries the
-first of them in this table.
+The rows run in the order the reload ranks the classes. Where one pass records more than one class
+for a file, as when the hops holding it need different things, the event carries the one first in
+this table. A pass does not record every class that would apply. At least `not_provable`, and a
+`retry` because the reload could not stage the file, end the pass for that file before the
+signature check runs, so such a pass never weighs a signature class. And for one hop the signature
+check reports one CRL, which the paragraph on the reload above names.
 
 | `remedy_class` | What to do |
 |---|---|

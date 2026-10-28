@@ -10,4 +10,5 @@
   not yet in effect. Both rank under every class that fixes the file, so a `lapses_first` refusal
   for the same file is no longer hidden behind them. Where a CA file holds the same CRL file, the
   CRL expiry alert still orders the CA-file hop's restart after either, as after `bad_signature`.
-  (vault BACKLOG #3506)
+  Which CRL the reload reports is unchanged: the first in the file that a listed CA matches and
+  does not verify. (vault BACKLOG #3506)
