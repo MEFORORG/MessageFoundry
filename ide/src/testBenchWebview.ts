@@ -106,8 +106,18 @@ export function testBenchScript(token: string): string {
           isArrOf(d.differences, isFieldDifference)),
     };
     function shapeOk(m){
-      const check = isStr(m.type) && Object.prototype.hasOwnProperty.call(SHAPES, m.type) ? SHAPES[m.type] : null;
-      return !!check && check(m);
+      // Read once, so the type the warning prints is the type that was checked.
+      const t = m.type;
+      const known = isStr(t) && Object.prototype.hasOwnProperty.call(SHAPES, t);
+      const check = known ? SHAPES[t] : null;
+      if (typeof check === 'function' && check(m) === true) { return true; }
+      // Discarded, not render-escaped: see PAYLOAD SHAPE above. Said in the webview console so a
+      // host and page that drift apart read as a named discard, not a button that does nothing.
+      // Only a type this page declares is named; any other is message text, and a discard echoes
+      // none of it (BACKLOG #1123).
+      console.warn('MessageFoundry Test Bench: discarded a malformed ' +
+        (known ? '"' + t + '" message' : 'message of an unknown kind'));
+      return false;
     }
 
     // Render one side of the HL7-aware diff. The cells are aligned so before[i] lines up with
@@ -359,12 +369,7 @@ export function testBenchScript(token: string): string {
     window.addEventListener('message', (ev) => {
       const m = mfTrusted(ev);
       if (!m) return;
-      if (!shapeOk(m)) {
-        // Discarded, not render-escaped: see PAYLOAD SHAPE above. Said in the webview console so a
-        // host and page that drift apart read as a named discard, not a button that does nothing.
-        console.warn('MessageFoundry Test Bench: discarded a malformed "' + String(m.type) + '" message');
-        return;
-      }
+      if (!shapeOk(m)) return; // shapeOk() names the discard in the webview console
       // Any other view replaces the run view: drop its case request, and tell the host (leaveRun).
       if (m.type !== 'caseDetail') { wantCase = null; leaveRun(); }
       if (m.type === 'detail') {

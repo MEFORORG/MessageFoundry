@@ -2107,7 +2107,8 @@ class Engine:
         # process's own, so a standby reports its own too, and names itself in the alert key as
         # the intake monitor does. Of the commands, only `serve` builds an engine. The count moves
         # only where the guard is in the process: wherever `messagefoundry.__main__` is imported,
-        # or install_remote_debug_guard is called (docs/SECURITY-LOOSENING.md).
+        # the API's create_app runs, or install_remote_debug_guard is called
+        # (docs/SECURITY-LOOSENING.md).
         if self._remote_debug_watch is None:
             self._remote_debug_watch = RemoteDebugRefusalWatch(
                 self.store, alert_sink=self._alert_sink, node=self.instance_identity

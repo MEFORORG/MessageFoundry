@@ -456,7 +456,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # OpenSSL loads exactly the CRLs judged) to find any certificate before the live load, then
     # adds them to the live context with load_verify_locations(cafile=). It judges the bytes with
     # tls_policy.judge_crl_bytes, which reads the CRL fields, and checks each CRL's signature against
-    # the hop's own CA certificates through pki.crl_signature_refusal (a public-key verify). No key
+    # the hop's own CA certificates through pki.crl_signature_finding (a public-key verify). No key
     # material, no new trust: a certificate the hop does not already trust refuses the reload.
     "messagefoundry/pipeline/crl_reload.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ASVS 11.3.4 (#301): the periodic AES-GCM invocation-reserve refill runner reads the live
