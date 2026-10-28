@@ -8781,9 +8781,11 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         return 2
 
     async def opened() -> Store:
-        return await open_store(
-            settings.store,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        return _arm_seal_pages(
+            await open_store(
+                settings.store,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
         )
 
     async def refusal_for(store: Store, user: UserRecord) -> str | None:
@@ -11055,9 +11057,23 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
     never as the bare ``ValueError`` the open raises for other reasons too.
     """
     try:
-        return await opening
+        return _arm_seal_pages(await opening)
     except _key_unresolved() as exc:
         raise _StoreKeyUnresolved(str(exc)) from exc
+
+
+def _arm_seal_pages(store: Store) -> Store:
+    """``store``, with its Transit row sealer's alert hook armed on a logging sink (BACKLOG
+    #2592), so a write a host command's store helper refuses because Vault transit refused to
+    check the row's seal pages per row, as under ``serve``. A command builds no notifier, so the
+    page is the sink's ``ALERT integrity_drift`` log line. Nothing for a store without one."""
+    from messagefoundry.pipeline.alerts import LoggingAlertSink, transit_seal_alert
+    from messagefoundry.store.row_seal import store_transit_sealer
+
+    sealer = store_transit_sealer(store)
+    if sealer is not None:
+        sealer.set_alert_hook(transit_seal_alert(LoggingAlertSink()))
+    return store
 
 
 async def _close_store_quietly(store: Store) -> None:

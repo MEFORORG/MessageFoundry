@@ -1165,3 +1165,156 @@ async def test_the_reconciler_holds_the_scope_diff_on_an_unverifiable_scope_map(
     ldap.present["jdoe"] = _principal("jdoe")
     plan = await service.reconcile_directory_sessions()
     assert [(r.username, r.reason) for r in plan.revocations] == [("jdoe", "roles_changed")]
+
+
+# --- a write refused for an unverifiable seal pages, once per refusal (BACKLOG #2592) -----------
+
+
+async def _plant_user_version(path: Path, user_id: str) -> None:
+    """Rewrite account ``user_id``'s genuine seal to name a version Transit does not hold."""
+    await _raw_for(path)(
+        "UPDATE users SET authz_seal = replace(authz_seal, ':vault:v1:', ':vault:v7:') WHERE id = ?",
+        (user_id,),
+    )
+
+
+async def test_a_store_write_refused_for_an_unverifiable_seal_pages_once_per_row(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's write helper is where a refusal with no reader around it, such as a host
+    command's or a route's backstop, is seen, so it pages there, under the row's own subject. A
+    reader that meets the same row on the same request does not page it a second time."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    raised = _armed(store, monkeypatch)
+    await _user(store, "seal-w1")
+    await store.clear_lockout("seal-w1")  # control: the write goes through
+    await _plant_user_version(path, "seal-w1")
+    _lapse_cache(store)
+    with pytest.raises(row_seal.RowSealError):
+        await store.clear_lockout("seal-w1")
+    assert raised == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:user:seal-w1"]
+    # The read path on the same row: reported and audited, never paged twice.
+    service = AuthService(store, AuthSettings(), integrity_alert=lambda _r: None)
+    assert await service._load_user("seal-w1") is None
+    assert len(raised) == 1
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
+    # Control: a second row is its own subject, and pages.
+    await _user(store, "seal-w2")
+    await _plant_user_version(path, "seal-w2")
+    _lapse_cache(store)
+    with pytest.raises(row_seal.RowSealError):
+        await store.clear_lockout("seal-w2")
+    assert raised[1:] == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:user:seal-w2"]
+
+
+async def test_a_fallback_that_skips_an_unverifiable_row_pages_it(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``seal_holds_for_write`` callers that skip a row rather than raise, such as the
+    last-administrator guard's holder count, page the row too."""
+    from messagefoundry.store.store import admin_guard_counts
+
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    raised = _armed(store, monkeypatch)
+    await _user(store, "holder")
+    await _plant_user_version(path, "holder")
+    _lapse_cache(store)
+    counted = await admin_guard_counts(
+        [("holder", False)], store.row_sealer(), store._read_user_record
+    )
+    assert counted == (0, 0)  # skipped, as a failing holder is
+    assert raised == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:user:holder"]
+
+
+async def test_an_unverifiable_custom_role_edit_pages_once(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    raised = _armed(store, monkeypatch)
+    service = AuthService(store, AuthSettings(), integrity_alert=lambda _r: None)
+    await service.initialize()
+    role = await service.create_custom_role(
+        display_name="r", description=None, permissions=["messages:replay"], actor="t"
+    )
+    await _retire_old_versions(store, transit)
+    raised.clear()  # the retirement may have paged rows the initialize wrote
+    with pytest.raises(CustomRoleUnverifiableError):
+        await service.update_custom_role(
+            role.id, display_name="r", description=None, permissions=["messages:read"], actor="t"
+        )
+    assert raised == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:role:{role.id}"]
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
+    assert _seal_failures(path) == 0  # never filed as a forgery
+
+
+async def test_the_route_backstops_page_exactly_once(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store write refused under a route reaches the RowSealError backstop, which adds no page
+    to the store's own. A raw Transit refusal reaching its backstop pages once, under its kind."""
+    from messagefoundry.auth import Role
+    from messagefoundry.store.store import seal_holds_for_write
+    from tests.test_api_auth import _add, _client, _login, _service
+
+    store, _path, _transit = transit_store
+    raised = _armed(store, monkeypatch)
+    engine = Engine(store=store, egress_settings=EgressSettings(deny_by_default=False))
+    service = await _service(engine)
+    await _add(service, "admin", Role.ADMINISTRATOR)
+    role = await service.create_custom_role(
+        display_name="r", description=None, permissions=["messages:read"], actor="t"
+    )
+    sealer = store.row_sealer()
+
+    async def unverifiable() -> bool:
+        refused = TransitSealUnverifiableError("Transit row seal unverifiable: synthetic")
+        refused.kind = row_seal.ROLE_KIND
+        raise refused
+
+    async def store_refused(*_a: Any, **_k: Any) -> Any:
+        if not await seal_holds_for_write(unverifiable(), sealer, row_seal.ROLE_KIND, role.id):
+            raise row_seal.RowSealError(row_seal.ROLE_KIND)
+
+    async def raw_refusal(*_a: Any, **_k: Any) -> Any:
+        await unverifiable()
+
+    body = {"display_name": "r2", "description": None, "permissions": ["messages:read"]}
+    async with _client(engine, service) as c:
+        token = (await _login(c, "admin")).json()["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        monkeypatch.setattr(service, "update_custom_role", store_refused)
+        r = await c.put(f"/roles/custom/{role.id}", json=body, headers=headers)
+        assert r.status_code == 409, r.text
+        assert raised == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:role:{role.id}"]
+        monkeypatch.setattr(service, "update_custom_role", raw_refusal)
+        r = await c.put(f"/roles/custom/{role.id}", json=body, headers=headers)
+        assert r.status_code == 409, r.text
+    assert raised[1:] == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:role:unattributed"]
+
+
+async def test_a_host_command_store_pages_a_refused_write(
+    transit_store: Opened, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A host command builds no notifier, so the store it opens is armed on the logging sink and
+    a write it refuses for an unverifiable seal still writes one alert line for that row."""
+    import logging
+
+    from messagefoundry.__main__ import _arm_seal_pages
+
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    assert _arm_seal_pages(store) is store
+    await _user(store, "cli-u")
+    await _plant_user_version(path, "cli-u")
+    _lapse_cache(store)
+    with caplog.at_level(logging.WARNING), pytest.raises(row_seal.RowSealError):
+        await store.clear_lockout("cli-u")
+    lines = [r.getMessage() for r in caplog.records if "ALERT integrity_drift" in r.getMessage()]
+    assert len(lines) == 1 and f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:user:cli-u" in lines[0]

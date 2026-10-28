@@ -131,7 +131,10 @@ answers 503 with a `Retry-After`, the CLI prints one error line, and no session 
 
 The audit row is written wherever the auth service or the approval gate reads the row. An
 `integrity_drift` alert reaches a sink only while `serve` runs, from just
-before it seeds the auth tables; another command logs the error and raises no alert.
+before it seeds the auth tables; another command logs the error and raises no alert, except
+that a host command's write refused for an unverifiable seal also writes the logging sink's
+`ALERT integrity_drift` line for that row. A write the store refused for an unverifiable seal is
+paged by the store itself, per row, so a refusal no reader reported still pages.
 Each process reports a row that keeps failing again only after an interval: five
 minutes for a sealed row, and an hour for a message or saved-search cell. What each refusal does
 is in the changelog entries for vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the

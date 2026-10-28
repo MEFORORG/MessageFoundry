@@ -174,6 +174,7 @@ from messagefoundry.store.queue_tag import (
     report_queue_tag_failure,
 )
 from messagefoundry.store.row_seal import (
+    ROLE_KIND,
     SEAL_PREFIX,
     SESSION_KIND,
     USER_KIND,
@@ -8865,7 +8866,9 @@ class PostgresStore:
         current = await self._read_user_record(conn, user_id)
         if current is None:
             return None
-        if not await seal_holds_for_write(user_seal_ok(self._row_sealer, current)):
+        if not await seal_holds_for_write(
+            user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+        ):
             raise RowSealError(USER_KIND)
         changed = change(current)
         if changed is None:
@@ -8906,7 +8909,9 @@ class PostgresStore:
         the contract."""
         current = await self._read_user_record(conn, user_id)
         if current is not None:
-            if not await seal_holds_for_write(user_seal_ok(self._row_sealer, current)):
+            if not await seal_holds_for_write(
+                user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+            ):
                 raise RowSealError(USER_KIND)
             if (
                 self._row_sealer is not None
@@ -9892,7 +9897,9 @@ class PostgresStore:
                 if locked is None:
                     continue
                 role = RoleRow.from_mapping(dict(locked))
-                if not await seal_holds_for_write(role_seal_ok(sealer, role)):
+                if not await seal_holds_for_write(
+                    role_seal_ok(sealer, role), sealer, ROLE_KIND, role.id
+                ):
                     refused += 1
                     continue
                 await self._write_role(conn, role)
@@ -9996,7 +10003,12 @@ class PostgresStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        if not await seal_holds_for_write(session_seal_ok(self._row_sealer, current)):
+        if not await seal_holds_for_write(
+            session_seal_ok(self._row_sealer, current),
+            self._row_sealer,
+            SESSION_KIND,
+            current.token_hash,
+        ):
             raise RowSealError(SESSION_KIND)
         updated = await seal_session(self._row_sealer, change(current))
         status = await conn.execute(_PG_SESSION_RESEAL, *session_reseal_params(updated, current))

@@ -167,6 +167,7 @@ from messagefoundry.store.row_seal import (
     RowSealError,
     TransitSealUnavailableError,
     TransitSealUnverifiableError,
+    alert_unverifiable_row,
 )
 from messagefoundry.store.store import SessionRecord, UserRecord
 
@@ -622,7 +623,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def _transit_seal_unverifiable(request: Request, exc: Exception) -> Response:
         # BACKLOG #2592: a backstop. The loaders and the store's write helpers catch a seal Vault
         # transit refused to check, so only a check outside both reaches here. It does not pass by
-        # itself, so a 409 with a fixed text and no Retry-After. The sealer has already logged it.
+        # itself, so a 409 with a fixed text and no Retry-After. The sealer has already logged it;
+        # nothing has paged it, so it pages here, under the row kind the sealer named, since no
+        # row id reaches this far.
+        assert isinstance(exc, TransitSealUnverifiableError)
+        auth = get_auth(request)
+        if auth is not None:
+            kind = exc.kind or "row"
+            alert_unverifiable_row(
+                auth.store.row_sealer(),
+                f"{kind}:unattributed",
+                f"a request was refused: Vault transit refused to check a {kind} row's seal",
+            )
         return await http_exception_handler(
             request,
             HTTPException(

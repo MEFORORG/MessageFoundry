@@ -10506,7 +10506,8 @@ class AuthService:
         """The ``roles`` row ``role_id`` names with its seal's verdict, or ``None`` for no row:
         ``True`` holds, ``False`` fails and ``None`` is a seal Vault transit refused to check
         (BACKLOG #2592). It reports nothing: :meth:`_load_role` reports, and
-        :meth:`update_custom_role`, whose save repairs a failing row, does not."""
+        :meth:`update_custom_role` reports only an unverifiable row, since its save repairs a
+        failing one."""
         found = await self._store.get_role(role_id)
         if found is None:
             return None
@@ -15334,6 +15335,8 @@ class AuthService:
         if checked is None or checked[0].builtin:
             raise ValueError("no such custom role")
         if checked[1] is None:
+            # Reported, and so paged per row, as a read of the role is; nothing was written.
+            await self._role_seal_failed(role_id, unverifiable=True)
             raise CustomRoleUnverifiableError()
         perms = validate_custom_role_permissions(permissions)  # raises CustomRoleError
         await self._store.upsert_role(

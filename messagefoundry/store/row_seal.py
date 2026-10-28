@@ -321,7 +321,12 @@ class TransitSealUnverifiableError(Exception):
     forgery. The auth service and the approval gate treat the row as they treat a failed seal: it
     is denied, a session is ended, and the report is written under its own audit action, so an
     operator can tell the two apart. Elsewhere it propagates and refuses the request (HTTP 409) or
-    the write. Its text is fixed, never row data or Vault's text."""
+    the write. Its text is fixed, never row data or Vault's text.
+
+    ``kind`` is the row kind whose check was refused, set by the sealer, so a backstop that meets
+    it with no row id still pages under that kind."""
+
+    kind: str = ""
 
 
 #: The alert hook a :class:`TransitRowSealer` calls with a cause and a PHI-free reason: cause
@@ -460,6 +465,7 @@ class TransitRowSealer:
         "_generation",
         "_probed_version",
         "_prefix",
+        "_row_pages",
         "_throttle",
         "key_id",
     )
@@ -476,6 +482,9 @@ class TransitRowSealer:
         # The latest version the last refused check's key probe named; only empties the cache.
         self._probed_version = 0
         self._throttle = SealFailureThrottle()
+        # Per row, for alert_unverifiable_row: one throttle every reporter shares, the store's
+        # write helpers and the readers alike, so a row refused on both paths pages once.
+        self._row_pages = SealFailureThrottle()
         self._alert: TransitSealAlertHook | None = None
 
     @property
@@ -509,7 +518,9 @@ class TransitRowSealer:
         )
         return TransitSealUnavailableError(f"Transit row seal unavailable: {exc}")
 
-    def _unverifiable(self, exc: RowSealUnverifiableError) -> TransitSealUnverifiableError:
+    def _unverifiable(
+        self, exc: RowSealUnverifiableError, kind: str = ""
+    ) -> TransitSealUnverifiableError:
         # Logged here, never paged: a key-level page shares one subject, so a sink's per-subject
         # throttle would let it mute the per-row pages (alert_unverifiable_row) that follow it.
         self._report(
@@ -520,7 +531,9 @@ class TransitRowSealer:
             exc,
             page=False,
         )
-        return TransitSealUnverifiableError(f"Transit row seal unverifiable: {exc}")
+        refused = TransitSealUnverifiableError(f"Transit row seal unverifiable: {exc}")
+        refused.kind = kind  # in the instance's dict, which copy and pickle carry
+        return refused
 
     def _parse(self, stored: str | None) -> str | None:
         """The well-formed Transit string from a stored seal naming this key, or ``None``."""
@@ -574,7 +587,7 @@ class TransitRowSealer:
                 self._probed_version = probed
                 self._cache.clear()
                 self._generation += 1
-            raise self._unverifiable(exc) from exc
+            raise self._unverifiable(exc, kind) from exc
         except CipherError as exc:
             raise self._unavailable(exc) from exc
         if not valid:
@@ -626,14 +639,48 @@ type Sealer = RowSealer | TransitRowSealer
 
 def alert_unverifiable_row(sealer: Sealer | None, row: str, reason: str) -> None:
     """Page one row whose seal Transit refused to check, through ``sealer``'s armed hook under the
-    unverifiable cause with ``row`` appended, with no throttle here (BACKLOG #2592). ``row`` is the
-    row's kind and id, so the page's subject is the row's own and a sink's per-subject throttle
-    never mutes another row's page. The caller throttles per row. The cause keeps a flood of them
-    off a forgery's subject. ``row`` and ``reason`` name the row by an id, never a row value; the
-    id came from a stored row, so ``row`` is scrubbed of control characters before it becomes a
-    subject. Nothing for a local sealer, which never refuses a check, or with no hook armed."""
-    if isinstance(sealer, TransitRowSealer) and sealer._alert is not None:
-        sealer._alert(f"{TRANSIT_UNVERIFIABLE_CAUSE}:{scrub_log_argument(row)}", reason)
+    unverifiable cause with ``row`` appended (BACKLOG #2592). ``row`` is the row's kind and id, as
+    :func:`seal_row_key` spells it, so the page's subject is the row's own and a sink's
+    per-subject throttle never mutes another row's page. The cause keeps a flood of them off a
+    forgery's subject. Throttled per row on the sealer, at most once per
+    :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, so a refusal a reader reports and the store's
+    write helper also met pages once. ``row`` and ``reason`` name the row by an id, never a row
+    value; the id came from a stored row, so ``row`` is scrubbed of control characters before it
+    becomes a subject. Nothing for a local sealer, which never refuses a check, or with no hook
+    armed."""
+    if not isinstance(sealer, TransitRowSealer) or sealer._alert is None:
+        return
+    subject_row = scrub_log_argument(row)
+    if sealer._row_pages.due(subject_row):
+        sealer._alert(f"{TRANSIT_UNVERIFIABLE_CAUSE}:{subject_row}", reason)
+
+
+#: How much of a session's token hash a seal report names (BACKLOG #2592): twelve hex characters,
+#: as the ``auth.session_revoked`` rows record.
+SESSION_REF_LEN: Final = 12
+
+
+def seal_row_key(kind: str, row_id: str) -> str:
+    """The per-row key a seal report and its page name: ``<kind>:<id>``, a session by the first
+    :data:`SESSION_REF_LEN` characters of its token hash, never the whole hash. The auth service,
+    the approval gate and the store's write helpers all name a row this way, so one row has one
+    page subject whichever of them meets it."""
+    return f"{kind}:{row_id[:SESSION_REF_LEN] if kind == SESSION_KIND else row_id}"
+
+
+def alert_unverifiable_write(sealer: Sealer | None, kind: str, row_id: str) -> None:
+    """Page a store write refused because Transit refused to check the stored row's seal
+    (BACKLOG #2592), under that row's own subject, through :func:`alert_unverifiable_row`. The
+    store's write helpers call it where they catch :class:`TransitSealUnverifiableError`, so a
+    refusal no reader reported, such as one from a route's backstop or a CLI command, still
+    pages."""
+    key = seal_row_key(kind, row_id)
+    alert_unverifiable_row(
+        sealer,
+        key,
+        f"a write to a {kind} row was refused: Vault transit refused to check its seal"
+        f" ({scrub_log_argument(key)})",
+    )
 
 
 class TransitSealStartRefusedError(RuntimeError):
