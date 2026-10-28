@@ -1210,7 +1210,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What the engine refuses without it:** each of the three Vault hops verifies the Vault server's
   certificate, and its handshake checks no CRL and no OCSP. So the client build refuses a Vault
   that is off the box. On the box means a loopback host reached with no proxy, decided on the
-  address the client will really dial, hvac's `VAULT_ADDR` fallback included. A loopback Vault
+  address the client will really dial, which is the hop's `MEFOR_*_VAULT_ADDR`. A loopback Vault
   behind a proxy is not on the box. The refusal applies under `[security].enforcement = enforce`,
   and wherever a client is built without a known posture, which counts as enforcing.
 - **Which callers know the posture:** at least `serve`, `check-privileges` and
