@@ -2326,9 +2326,10 @@ class LockableAccountCensus:
     credential (``password_generated`` unset) and no factor with a way past the sign-in lock: no TOTP,
     and no passkey recorded as discoverable under the configured relying party (wave 2; BACKLOG
     #3937: with none configured, no passkey counts here). ``passkey_only`` and
-    ``unknown_beside_a_passkey`` still count a discoverable passkey under any relying party, since
-    they answer whether a reset would remove one that may sign the holder in, so an account can be
-    named in ``no_way_past`` and ``passkey_only`` at once. ``undecryptable_totp`` names every account
+    ``unknown_beside_a_passkey`` count a discoverable passkey under that relying party too, and any
+    discoverable passkey when none is configured, since they answer whether a reset would remove
+    one that may sign the holder in, so an account can be named in ``no_way_past`` and
+    ``passkey_only`` at once. ``undecryptable_totp`` names every account
     whose ENABLED TOTP secret the engine cannot decrypt or compute with (BACKLOG #3422), which turns
     the owner's combined sign-in into "right password, wrong code". All are usernames only, sorted;
     none carries a secret.

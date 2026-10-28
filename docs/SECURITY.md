@@ -3357,8 +3357,9 @@ write races.
   account keeps its TOTP, removing any discoverable passkey needs a TOTP that is a way past, and
   a passkey-only account must enrol TOTP before it rotates and is named in `no_way_past`. That is
   the shipped default on a loopback bind. The census's reset warning
-  (`reset_would_remove_a_passkey`) still counts a passkey under any `rp_id`, since it asks whether a
-  reset would remove one that may sign the holder in. After an origin change
+  (`reset_would_remove_a_passkey`) counts a passkey under that `rp_id` too, and any discoverable
+  passkey when none is configured, since it asks whether a reset would remove one that may sign
+  the holder in. After an origin change
   ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
   visibly unusable) a passkey under the old `rp_id` no longer counts, so the census names an
   account whose only way past it was.
@@ -5922,7 +5923,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /auth/negotiate` | sign-in window | |
 | `POST /auth/mfa-verify` | sign-in window | an **authenticated** route drawing the sign-in budget (it is a mid-login challenge); also feeds the per-account lockout |
 | `POST /ui/login` | sign-in window | 429 carries a `Retry-After` of the whole sign-in window |
-| `POST /ui/login/passkey` | sign-in window | the passkey sign-in's begin leg (ADR 0197 Amendment A wave 2), charged **before** it stages a challenge; one passkey sign-in charges the window twice, here and at `POST /ui/login`. 429 as `POST /ui/login` |
+| `POST /ui/login/passkey` | sign-in window | the passkey sign-in's begin leg (ADR 0197 Amendment A wave 2), charged **before** it stages a challenge; `POST /ui/login` then renews that hit rather than charging again when it is still in the window (`StagedChallenge.paid`), so one passkey sign-in charges the window once. 429 as `POST /ui/login` |
 | `GET /ui/sso` | sign-in window | the token-bearing leg only; the RFC 4559 challenge leg is deliberately unthrottled |
 | `POST /ui/oidc/start`, `GET /ui/oidc/callback` | sign-in window; the callback's step-up return draws the per-actor ceremony budget instead | one browser login charges it **twice**. The callback reads the flow its cookie names first: a live step-up flow's return charges a key of its own for the user that flow names, as the `POST /ui/reauth/oidc` row says, and every other callback charges the sign-in window (BACKLOG #3374). **Note the verb, and the condition on the GET.** The start leg is a **POST** since the ASVS 3.7.3 interstitial. By default `GET /ui/oidc/start` renders the "you are leaving this site" page, stages **no** flow and charges **no** limiter; the flow starts only when the operator confirms with the POST. **The GET skips that page** when `[security].external_link_interstitial` is off, or when the IdP's authorization host is inside `[security].organization_domains` or on `[security].external_link_allowlist` (`_interstitial_needed()` false). It then runs the POST leg itself (`ui_oidc_start`): the same-origin check, this limiter, the `Sec-Fetch-Mode` check and a staged flow, with the same 303 on a throttle. So the GET charges the window and stages a flow exactly when the interstitial is skipped. |
 | `POST /me/password` | per-actor ceremony budget | **not** the sign-in window |
