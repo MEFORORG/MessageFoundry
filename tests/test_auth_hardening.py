@@ -171,19 +171,12 @@ def test_ad_requires_ldaps_unless_overridden() -> None:
             ad_bind_dn="CN=svc,DC=x",
             ad_bind_password="x",
         )
-    # ldaps is accepted, as is an explicit trusted-network override
+    # ldaps is accepted. The trusted-network override that also let ldap:// through was removed
+    # (vault BACKLOG #3533 item 1); tests/test_security_posture_defaults.py pins its refusal.
     AuthSettings(
         ad_enabled=True,
         ad_server="ldaps://dc",
         ad_user_search_base="DC=x",
-        ad_bind_dn="CN=svc,DC=x",
-        ad_bind_password="x",
-    )
-    AuthSettings(
-        ad_enabled=True,
-        ad_server="ldap://dc",
-        ad_user_search_base="DC=x",
-        ad_allow_insecure_ldap=True,
         ad_bind_dn="CN=svc,DC=x",
         ad_bind_password="x",
     )

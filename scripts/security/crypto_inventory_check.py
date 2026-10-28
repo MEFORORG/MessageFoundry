@@ -309,7 +309,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # settled. It measures the operator's proxy and carries NO application data; the contexts are built,
     # used for one handshake, and never returned. Not a data path — do not reuse these settings.
     "messagefoundry/config/tls_probe.py": frozenset({"ssl"}),
-    "messagefoundry/auth/ldap.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
+    # Vault BACKLOG #3533: tls_policy left with the posture keyword; the context is ldap_tls.py's.
+    "messagefoundry/auth/ldap.py": frozenset({"ssl"}),
     # BACKLOG #2494: the engine ldap3.Tls. It wraps each LDAPS socket with a context that
     # tls_policy.assert_ldap3_tls_suites built, narrowed and asserted.
     "messagefoundry/auth/ldap_tls.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),

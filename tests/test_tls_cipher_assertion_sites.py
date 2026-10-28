@@ -530,24 +530,25 @@ def test_ad_ldaps_bind_asserts(every_suite_looks_weak: None) -> None:
         ldap_auth.LdapAuthenticator(_ad_settings())
 
 
-def test_a_plaintext_ldap_bind_has_no_tls_context_to_assert(every_suite_looks_weak: None) -> None:
-    """The discriminating negative: same fixture, same constructor, DIFFERENT input, no raise.
+def test_a_plaintext_ldap_bind_is_refused_before_any_tls_context(
+    every_suite_looks_weak: None,
+) -> None:
+    """The discriminating negative: same fixture, same constructor, DIFFERENT input, a different
+    error.
 
-    ``ldap://`` builds no ``Tls`` at all, so there is no context to assert and the assertion must not
-    fire. Under a fixture that makes every reachable assertion raise, constructing this cleanly is what
-    proves the LDAPS test above is keyed on the scheme and not merely on the constructor running.
-
-    ``ad_allow_insecure_ldap`` is required to reach this arm at all — ``AuthSettings`` refuses a
-    non-``ldaps://`` bind without it — and so is the ``warn`` dial, because under ``enforce`` the
-    authenticator refuses the plain bind (vault BACKLOG #2354). So this also records that the
-    cleartext-LDAP path is reachable only behind that documented dev override.
+    ``ldap://`` builds no ``Tls`` at all. It used to build cleanly behind the removed
+    ``ad_allow_insecure_ldap`` opt-in, which showed a construction could finish under this fixture.
+    Now it is refused at every posture (vault BACKLOG #3533 item 1), before any context is built, so
+    this pins only that the plain-bind refusal comes first. It no longer shows that the LDAPS test
+    above is keyed on the scheme; the ``LDAPS bind to AD`` match there is what holds that now.
+    ``AuthSettings`` refuses a plain bind while AD is on, so this builds with AD off.
     """
 
-    auth = ldap_auth.LdapAuthenticator(
-        _ad_settings(ad_server="ldap://dc1.example.test:389", ad_allow_insecure_ldap=True),
-        enforcing=False,
-    )
-    assert auth._server().tls is None
+    with pytest.raises(ldap_auth.LdapError, match="refused, with no escape"):
+        ldap_auth.LdapAuthenticator(
+            _ad_settings(ad_enabled=False, ad_server="ldap://dc1.example.test:389"),
+            enforcing=False,
+        )
 
 
 @pytest.mark.parametrize("validate", [ssl.CERT_REQUIRED, ssl.CERT_NONE])

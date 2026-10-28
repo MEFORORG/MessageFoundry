@@ -1876,8 +1876,12 @@ def _limiter_accessors() -> dict[str, str]:
 #: Each marker matches from the start of a word, with its inflections. As a bare substring, ``cap``
 #: matched inside "escape", so an LDAPS refusal reading "no escape" was taken for an
 #: anti-automation bound (vault BACKLOG #3230). The stems keep "exceeded", "bounded" and "throttle".
+#: An underscore also starts and ends a word here, so a marker inside a snake_case name such as
+#: ``upper_bound``, ``max_cap`` or ``queue_full`` counts. ``\b`` does not see that edge, because ``_``
+#: is a word character, and ``capping`` was missing from the ``cap`` inflections (vault BACKLOG
+#: #3533 item 9).
 _BOUND_MARKER_RE = re.compile(
-    r"\b(?:bound\w*|throttl\w*|exceed\w*|cap(?:s|ped|acity)?|too many|full)\b"
+    r"(?<![^\W_])(?:bound\w*|throttl\w*|exceed\w*|cap(?:s|ped|ping|acity)?|too many|full)(?![^\W_])"
 )
 
 
@@ -1923,6 +1927,25 @@ def test_bound_markers_match_whole_words_only() -> None:
     assert _BOUND_MARKER_RE.search("request rate exceeded; capacity reached")
     assert not _BOUND_MARKER_RE.search("refused, with no escape")
     assert not _BOUND_MARKER_RE.search("an unbounded capability, used fully")
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["over the upper_bound", "max_cap reached", "queue_full", "capping the cache"],
+)
+def test_bound_markers_match_inside_snake_case_names_and_capping(message: str) -> None:
+    """Vault BACKLOG #3533 item 9: ``\\b`` treats ``_`` as part of a word, so these four missed."""
+    assert _BOUND_MARKER_RE.search(message), message
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["an escape_hatch", "the capability_set", "fullyqualified", "unbounded_list", "recapping"],
+)
+def test_a_snake_case_edge_does_not_admit_a_marker_inside_a_word(message: str) -> None:
+    """The control for the test above: the underscore edge widens where a word starts and ends,
+    not what counts as one, so a marker inside a longer word still does not match."""
+    assert not _BOUND_MARKER_RE.search(message), message
 
 
 def _derived_protection_seams() -> dict[str, str]:

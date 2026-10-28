@@ -421,4 +421,4 @@ def test_ldap_authenticator_refuses_disabled_cert_verification(
     # The dev escape no longer releases it: every bind carries a password (vault BACKLOG #3230).
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     with pytest.raises(LdapError):
-        LdapAuthenticator(s, posture=_WARN)
+        LdapAuthenticator(s, enforcing=False)

@@ -2915,8 +2915,7 @@ def _refuse_idp_revocation(
     closed the gap, while telling them to set the CRL they had set.
 
     ``posture`` is PASSED, never read ambiently: ``AuthService`` is built in the API lifespan, outside
-    every ``active_hop_posture`` scope, which is the position ``auth/ldap.py`` is already in. ``None``
-    leaves both guards the shipped no-op.
+    every ``active_hop_posture`` scope. ``None`` leaves both guards the shipped no-op.
 
     ``attested=False`` because no per-hop revocation attestation exists for these legs. There is no
     ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.
@@ -3145,17 +3144,13 @@ class AuthService:
             self._ldap: LdapAuthenticator | None = ldap
         elif settings.ad_enabled:
             # Thread the connector SecretProvider (ADR 0019 §5) so an ad_bind_password_secret reference
-            # resolves the bind password from the external backend (fail-closed) at construction. Thread
-            # the instance hop posture too: the bind is built out of the connector-construction gate,
-            # and its plain ldap:// refusal reads it (vault BACKLOG #2354). It used to clamp the
-            # ad_tls_verify=false escape too (#329), until vault BACKLOG #3230 removed that escape.
-            # BACKLOG #2034: the enforcement dial too, since the authenticator now checks its CA anchor.
-            # Vault BACKLOG #2354: the same dial decides whether a plain ldap:// bind is refused, so it
-            # is a transport control here and not only an anchor-ACL knob. Pass the real dial.
+            # resolves the bind password from the external backend (fail-closed) at construction.
+            # BACKLOG #2034: the enforcement dial too, since the authenticator checks its CA anchor.
+            # No posture: the plain ldap:// and verify-off refusals hold at every posture (vault
+            # BACKLOG #3230, #3533), so neither reads one.
             self._ldap = LdapAuthenticator(
                 settings,
                 secret_provider=secret_provider,
-                posture=hop_posture,
                 enforcing=self._trust_anchors_enforcing,
             )
         else:
