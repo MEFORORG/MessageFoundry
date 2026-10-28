@@ -87,6 +87,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import refuse_weak_key_file
+from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
@@ -120,13 +121,6 @@ _PARAM_RE = re.compile(r"(?<![:\w]):(\w+)")
 # deadlock (40001); plus the ODBC connect/operation timeouts.
 _TRANSIENT_PREFIXES = ("08", "40")
 _TRANSIENT_STATES = frozenset({"HYT00", "HYT01"})
-
-
-def _odbc_brace(value: str) -> str:
-    """ODBC-quote a value in braces, doubling any internal ``}`` — neutralizes ``; { } =`` inside it so
-    an attacker-influenced value (e.g. a password) can't inject extra connection keywords (mirrors the
-    store's ``connection_string`` hardening)."""
-    return "{" + value.replace("}", "}}") + "}"
 
 
 def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
@@ -192,12 +186,11 @@ def _build_dsn(
 ) -> str:
     """Build the ODBC connection string for SQL Server from the connection settings.
 
-    Free-text values are brace-quoted (injection guard) and the ``Encrypt``/``TrustServerCertificate``
-    flags are emitted **last** (ODBC is last-wins, so nothing earlier can downgrade TLS). A weakened
-    TLS posture is **refused** via the shared posture-keyed authority (:func:`_weakened_tls_permitted`,
-    #200) — a STRICT verify-off cell that stays refused for staging AND prod PHI, with the global escape
-    clamped so it can never relax a production hop; ``attested`` (the per-connection ``tls_hop_attested``)
-    is the surgical, audited per-hop opt-in.
+    Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (BACKLOG #3714). It sends no
+    ``ServerCertificate`` pin. A weakened TLS posture is **refused** via the shared posture-keyed
+    authority (:func:`_weakened_tls_permitted`, #200) — a STRICT verify-off cell that stays refused
+    for staging AND prod PHI, with the global escape clamped so it can never relax a production hop;
+    ``attested`` (the per-connection ``tls_hop_attested``) is the surgical, audited per-hop opt-in.
 
     ``read_only`` (only the db_lookup pool sets it; destination/source omit it, keeping their DSN
     byte-identical) appends ``ApplicationIntent=ReadOnly`` so the connection advertises read-only intent
@@ -237,26 +230,24 @@ def _build_dsn(
             "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
         )
     parts = [
-        f"DRIVER={_odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
+        f"DRIVER={odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
         f"SERVER={server},{int(s.get('port', 1433))}",
-        f"DATABASE={_odbc_brace(str(s['database']))}",
+        f"DATABASE={odbc_brace(str(s['database']))}",
         # No login-timeout keyword here, on purpose: see :func:`_login_timeout` (BACKLOG #2089).
-        f"APP={_odbc_brace(str(s.get('app_name', 'messagefoundry')))}",
+        f"APP={odbc_brace(str(s.get('app_name', 'messagefoundry')))}",
     ]
     if auth == "sql":
-        parts.append(f"UID={_odbc_brace(str(s.get('username') or ''))}")
-        parts.append(f"PWD={_odbc_brace(str(s.get('password') or ''))}")
+        parts.append(f"UID={odbc_brace(str(s.get('username') or ''))}")
+        parts.append(f"PWD={odbc_brace(str(s.get('password') or ''))}")
     elif auth == "integrated":
         parts.append("Trusted_Connection=yes")
     else:  # entra
         parts.append("Authentication=ActiveDirectoryDefault")
     if read_only:
-        # Advertise read-only intent for the db_lookup pool (ADR 0010). Emitted before the TLS flags so
-        # the last-wins Encrypt/TrustServerCertificate posture is unchanged.
+        # Advertise read-only intent for the db_lookup pool (ADR 0010). Not a TLS keyword, so it goes
+        # in the head, before the TLS tail (messagefoundry.odbc_dsn).
         parts.append("ApplicationIntent=ReadOnly")
-    parts.append(f"Encrypt={'yes' if encrypt else 'no'}")
-    parts.append(f"TrustServerCertificate={'yes' if trust else 'no'}")
-    return ";".join(parts) + ";"
+    return odbc_connection_string(parts, encrypt=encrypt, trust_server_certificate=trust)
 
 
 # A valid ODBC connection-string keyword: a letter then letters/digits/spaces/underscores. Rejecting the
@@ -504,7 +495,7 @@ def _odbc_literal(value: object, *, what: str, connection: str | None, refused: 
             f"{hop_name_prefix(connection)}DATABASE {what} must hold only printable ASCII characters"
             + (f", and none of {listed}" if refused else "")
         )
-    return _odbc_brace(text)
+    return odbc_brace(text)
 
 
 def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> None:

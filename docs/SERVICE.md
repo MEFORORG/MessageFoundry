@@ -617,6 +617,20 @@ environment.
   not refused. What the engine reads, what it names and what it does not cover are in
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment).
 
+- **The other secrets: a secrets directory (any platform).** At least the engine's own secret
+  settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
+  value can each come from a file instead of the service's NSSM list. A variable an operator names
+  as a `[secrets].provider = "env"` reference, and one a library reads for itself, are not read
+  from it. Point `MEFOR_SECRETS_DIRECTORY` at a directory only
+  SYSTEM, Administrators and the service account can reach, with one file per setting, named as
+  its variable. A path in the NSSM list is not a secret. The engine refuses a directory or file a
+  broad group can read or change. The files are plain, protected by their access list alone, and
+  nothing creates the directory yet, so you create it. Which settings it supplies, and the rules,
+  are stated once, in
+  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). This is the
+  first part of the protected channel vault BACKLOG #2595 asks for, not the whole of it: a secret
+  left in the NSSM list is still named, not refused.
+
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:
 >
@@ -740,9 +754,11 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       run `namei -l` on every file there that is a link. Each directory those commands list must be owned by root, or by the engine's own
       account for the config directory itself, with no group or other write bit. The shipped
       image's `/config` sits directly under `/`, which is root-owned.
-  - **The cache folder is checked because it runs.** Python's source loader runs a matching
-    `__pycache__\*.pyc` in place of the `.py` beside it and never compares the two. A cache file
-    the check did not read could run under a source it passed (vault BACKLOG #2596).
+  - **The cache folder is checked because a cache file there can still run.** The loader compiles
+    each config module, and each `_` helper imported with an `import` statement, from the bytes it
+    read, so neither runs from `__pycache__`. A module reached through the ordinary import system
+    still can, at least through `importlib.import_module` or a sibling import while the config
+    directory is on `sys.path`, and so can tools such as `python -m` (vault BACKLOG #2596).
   - **At start, `serve` checks two more files the same way, each with the folder it sits in**: the
     service settings file it read (`--service-config`, else `.\messagefoundry.toml`) and the value
     file `environments\<env>.toml`. It refuses to start when another account can write either one

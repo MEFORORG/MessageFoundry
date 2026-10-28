@@ -139,6 +139,9 @@ channel config) with one section per group, plus **environment-variable override
 CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 ```
 
+A secret-class setting can also come from a file in a secrets directory, which then wins over its
+environment variable: see [The secrets directory](#the-secrets-directory-mefor_secrets_directory).
+
 - File location: `./messagefoundry.toml` by default, or `--service-config <path>`. **Under the
   Windows service, `serve` and `supervise` refuse to start without an absolute `--service-config`**,
   so the service never reads a settings file from its working directory. A relative one under
@@ -723,7 +726,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `session_idle_timeout_minutes` | | | **→ moved to `[security].sign_out_after_idle_minutes`** (ADR 0118) — set it there; no longer accepted in `[auth]`. |
 | `session_absolute_hours` | | | **→ moved to `[security].max_session_hours`** (ADR 0118) — set it there; no longer accepted in `[auth]`. |
 | `max_sessions_per_user` | int | 5 | cap concurrent sessions per user (ASVS 7.1.2; `0` = unlimited); a login beyond the cap revokes the user's oldest live session; only live sessions count, and the same login revokes the user's sessions already past the idle or absolute limit. Sign-ins that still owe a second factor are counted apart: see the *Concurrent session count* row in `docs/SECURITY.md` |
-| `step_up_max_age_seconds` | int | 300 | **step-up re-verification window** (ASVS 7.5.3): a highly sensitive operation requires the session to have re-verified its credential — at login or via `POST /me/reauth` — within this many seconds. A code accepted at `POST /auth/mfa-verify` (or the console's `POST /ui/mfa`) opens the window too, except on a session the OIDC sign-in minted, whose window opens only at the IdP (BACKLOG #2142). A **local** login that owes no second factor usually counts as the first verification (the sudo-timestamp model). The exception is a sign-in from an address the account's known-address record has not seen in the last 90 days, by an account with a baseline. An account has a baseline once it has finished a sign-in, or once its record holds a row of any age. That session is born with no window, which is the first-seen address challenge (BACKLOG #288). A sign-in that stopped at its factor adds nothing to the record; the *First-seen sign-in address* rows of Table A in [SECURITY.md](SECURITY.md) list the events that do, and a step-up or an enrolment writes only in some cases. A step-up from that address passes the challenge; signing in again does not. The check fails open, and the window opens, when the sign-in carries no client address or the account's known-address record cannot be read. A sign-in that proves the password and a TOTP code in one request counts from any address (ADR 0197). A directory login (Windows SSO by either route, or OIDC) does not: it is born with no window, so its first sensitive action asks for a step-up, or for its second factor where it owes one (BACKLOG #1144). An OIDC session that proves its factor still owes the IdP step-up |
+| `step_up_max_age_seconds` | int | 300 | **step-up re-verification window** (ASVS 7.5.3): a highly sensitive operation requires the session to have re-verified its credential — at login or via `POST /me/reauth` — within this many seconds. A code accepted at `POST /auth/mfa-verify` (or the console's `POST /ui/mfa`) opens the window too, except on a session the OIDC sign-in minted, whose window opens only at the IdP (BACKLOG #2142). A **local** login that owes no second factor usually counts as the first verification (the sudo-timestamp model). The exception is a sign-in from an address the account's known-address record has not seen in the last 90 days, by an account with a baseline. An account has a baseline once it has finished a sign-in, or once its record holds a row of any age. That session is born with no window, which is the first-seen address challenge (BACKLOG #288). A sign-in that stopped at its factor adds nothing to the record; the *First-seen sign-in address* rows of Table A in [SECURITY.md](SECURITY.md) list the events that do, and a step-up or an enrolment writes only in some cases. A step-up from that address passes the challenge; signing in again does not. The check fails open, and the window opens, when the sign-in carries no client address or the account's known-address record cannot be read. A combined sign-in (the password and, in the same request, a TOTP code on an account with TOTP enrolled or a passkey assertion as [SECURITY.md](SECURITY.md#webauthn-passkeys-wp-14b-adr-0068) describes, ADR 0197 Amendment A) counts from any address (ADR 0197). A directory login (Windows SSO by either route, or OIDC) does not: it is born with no window, so its first sensitive action asks for a step-up, or for its second factor where it owes one (BACKLOG #1144). An OIDC session that proves its factor still owes the IdP step-up |
 | `require_action_step_up` | bool | `true` | **action-bound step-up** ([ADR 0077](adr/0077-action-bound-step-up.md); ASVS 7.5.1/8.2.4). On by default: a fixed set of routes, four JSON routes and their console twins only under the condition below, requires a fresh proof **bound to that specific action** (`POST /me/reauth` with a matching `purpose`, single-use) instead of riding the session-wide `step_up_max_age_seconds` window. On the JSON API the set is `POST /me/mfa/enroll`, `POST /me/mfa/confirm`, `DELETE /me/mfa`, `DELETE /me/sessions` and `DELETE /me/sessions/{session_id}`, plus the administrator's `PATCH /users/{user_id}`, `POST /users/{user_id}/reset-password`, `POST /users/{user_id}/reset-mfa`, `PUT /users/{user_id}/federated-identity` and `DELETE /users/{user_id}/federated-identity`. Four group-wide saves join the set conditionally (vault BACKLOG #3401): `PUT /ad-group-map`, `PUT /ad-group-scope-map`, `PUT /roles/custom/{role_id}` and `DELETE /roles/custom/{role_id}` take a proof bound to `save_ends_own_sessions` **only when the save would end the caller's own sessions**, as a map save would for a caller whose account is a directory account, or a role save for a caller who holds that role. Any other save of those four keeps the session-window step-up. Since vault BACKLOG #2625 the set also holds the injection and bulk-export routes: `POST /messages/{message_id}/resend`, `POST /messages/{message_id}/edit-resend`, `POST /uploads/{file_id}/resend`, `GET` and `POST /messages/export`, `POST /connections/{name}/purge` and `POST /config/reload`. The console binds the same actions, and passkey enroll and delete too. It closes the most-exploitable default: a session hijacked inside the 300 s login-seeded window could otherwise bind an attacker's authenticator, deliver a fabricated message to a partner, or export bodies in bulk, with no fresh proof. It changes **only** that set; every other step-up route, the rest of the admin surface and replay among them, keeps the session-window step-up. So `false` takes the bound proof off message injection, bulk export, purge and config reload as well as off the factor and admin routes. `false` reverts to the legacy session-window behaviour (0.2.x semantics), the documented org opt-out. **One refusal survives the opt-out and no setting reaches it:** an MFA-pending session on an account that **already holds** a second factor cannot bind a new one or end sessions, on either surface — it must prove the existing factor first. Without that bound, `false` would turn a config knob into an account-takeover path, because the enrollment ceremonies mark a session MFA-satisfied on success. Enrolling a **first** factor is untouched |
 | `password_min_length` | int | 15 | local-password policy — ASVS 5.0-aligned, length-first |
 | `password_require_uppercase` / `password_require_lowercase` / `password_require_digit` / `password_require_symbol` | bool | `false` | character classes — **opt-in**, each independently (ASVS 5.0 forbids mandatory composition); turn one on only for a legacy standard that still mandates it |
@@ -1755,8 +1758,7 @@ started together, can each raise it; the alert list folds them into one instance
   still compared, on the fingerprint taken after the load. When both cover the same files and still
   differ, `GET /config/provenance` also has no loaded fingerprint to vouch for until the next
   reload, and the flag toggle rows that process writes are marked `baseline_unchecked`. The two
-  reads miss at least an edit that lands and is reverted between them, and a module the loader runs
-  from a still-valid `__pycache__` bytecode file rather than from its source.
+  reads miss at least an edit that lands and is reverted between them.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
   WARNING, and the start goes on.
 - A start that never checked its config, because its read failed or it took no fingerprint,
@@ -2334,6 +2336,50 @@ Its text names no part of the proxy URL, and `[security].enforcement` does not r
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
+
+#### The secrets directory, `MEFOR_SECRETS_DIRECTORY`
+
+A secret-class setting can come from a file instead of an environment variable
+([ADR 0214](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md),
+vault BACKLOG #2595). Set `MEFOR_SECRETS_DIRECTORY` to an absolute path. It is a path, not a
+secret. Each file in that directory holds one setting and is named exactly as its variable is:
+`MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_AUTH_OIDC_CLIENT_SECRET`,
+`MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY`, `MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD`,
+`MEFOR_ALERTS_EMAIL_PASSWORD`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_VAULT_TOKEN`,
+`MEFOR_SECRETS_VAULT_TOKEN`, `MEFOR_AI_API_KEY`, or `MEFOR_VALUE_<KEY>` for an `env()` value.
+
+- **A file wins over its variable.** With no file for a setting, the variable is read as before.
+  Unset, no directory is read at all.
+- **The engine refuses, at every `[security].enforcement` setting,** a directory or a file in it
+  that a known broad group (at least Everyone, Authenticated Users and the local Users group; on
+  POSIX, a group or other read or write bit) can read or change, a directory in which such a
+  group may delete a file (Windows `FILE_DELETE_CHILD`), and a link on Windows. It also
+  refuses a relative path, a file that is not a regular file, a file named for no setting above
+  (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
+  whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
+  file whose name starts with `.` is ignored. Every load of the settings, by any command, checks
+  the directory, every file name in it, and every file named for a setting above, even one nothing
+  else reads. A `MEFOR_VALUE_*` file's access and contents are checked only when the `env()` values
+  are read: at a `serve` start and on each reload, by `messagefoundry check`, and by
+  `messagefoundry connection upsert` and `remove`, at least. A command that loads the settings and
+  not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
+  named for no setting is cited by its position, never spelled, since its name may be a value.
+- **The access check is a list of known broad groups.** It does not refuse one named account that
+  can write the directory, the way the config-directory checks do, and it does not read the
+  folders above the directory: a broad group that can write one of those could replace the
+  directory. Restrict the directory, and the folders above it, as below rather than relying on
+  the check.
+- **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
+  [`[store].encryption_key_file`](#store).
+- A trailing line break is dropped; any other character, a space included, is part of the value.
+- The files are plain, protected by their access list alone. Nothing creates the directory for you
+  yet. A variable a library reads for itself, such as `VAULT_TOKEN` or `PGPASSWORD`, is not read
+  from here.
+
+On Windows, create the directory with inheritance off, granting SYSTEM and Administrators full
+control and the service account read, and nothing else. On POSIX, make it mode `0700` and each file
+`0600`, owned by the engine's account.
 
 ### `[secret_rotation]`
 Periodic **secret-rotation reminder** ([ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) §5.1) —

@@ -7,7 +7,16 @@ import * as http from "node:http";
 import * as https from "node:https";
 
 import { serveCommandLine } from "./engineControlModel";
-import { engineHostKey, isRecord, trustRemedy } from "./engineTrustModel";
+import {
+  CAFILE_REFUSED_CODE,
+  CAFILE_UNREAD_CODE,
+  engineHostKey,
+  isRecord,
+  isPinRefusalCode,
+  isTlsTrustError,
+  trustRemedy,
+} from "./engineTrustModel";
+import type { HostPin } from "./engineTrustModel";
 
 /**
  * What a step-up refusal asked for (403 + `X-Step-Up-Required`). `action` is the
@@ -86,6 +95,26 @@ export class NetworkError extends Error {
 }
 
 /**
+ * A request that failed verification after which the trust anchor for its engine changed, and that
+ * was not resent (a POST; see {@link withRenewalRetry}). The anchor changes because the engine renewed
+ * its certificate or because a refresh registered a different `caFile`; in the second case the new
+ * anchor is not known to verify, so the message promises nothing beyond "worth one retry". Whether
+ * the engine received the failed request is not known, so it asks the user to check before repeating
+ * an action. It keeps the TLS `code`, so a caller classifying by code still reads a trust failure.
+ */
+export class CertificateChangedError extends NetworkError {
+  constructor(baseUrl: string, code?: string) {
+    super(
+      `the trusted certificate for the engine at ${baseUrl} changed while this request was in ` +
+        `flight, and the request was not sent again. Retry it; for an action, first check whether ` +
+        `it took effect. If the retry fails the same way, its error names what to fix.`,
+      code,
+    );
+    this.name = "CertificateChangedError";
+  }
+}
+
+/**
  * The negotiated TLS floor for every https request this client makes.
  *
  * State the defect precisely, because the overstated version is wrong: Node has defaulted
@@ -155,8 +184,10 @@ export const TLS_CIPHERS = TLS_12_SUITES.concat(TLS_13_SUITES).join(":");
  * Module-level because a trust anchor is a property of a SERVER, not of one request: every caller
  * in this extension reaching a given engine needs the same one, and threading a `ca` argument
  * through `postJson`/`getJson` and their eight call sites would let one of them be forgotten.
- * Populated by `engineTrust.ts` from what the engine itself reports; empty until then, which is
- * exactly the previous behaviour (Node's default CA set alone).
+ * Populated by `engineTrust.ts` from what the engine itself reports and from `caFile` pins. A host
+ * with no anchor verifies against Node's default CA set alone, unless an https `caFile` claims it:
+ * then the request is refused until the file is read, or for good while the value is refused
+ * ({@link pinRefusal}).
  */
 const trustAnchors = new Map<string, string>();
 
@@ -173,14 +204,161 @@ export function setEngineTrustAnchor(url: string, pem: string | undefined): void
   }
 }
 
-/** Drop every registered anchor, and report whether there WAS one. `engineTrust.ts` calls this before
- *  each refresh, so a target the user edits away from does not leave its certificate registered for
- *  the life of the window. The return value is what tells that caller the trust state changed even
- *  when the refresh ends up registering nothing — dropping an anchor is a change worth re-probing. */
-export function clearEngineTrustAnchors(): boolean {
-  const had = trustAnchors.size > 0;
+/** Drop every registered anchor. `engineTrust.ts` calls this before each refresh, so a target the user
+ *  edits away from does not leave its certificate registered for the life of the window. */
+export function clearEngineTrustAnchors(): void {
   trustAnchors.clear();
-  return had;
+}
+
+/**
+ * Every `host:port` an https `caFile` claims in the settings as they are NOW, accepted or refused,
+ * whether or not its file has been read. Such a host must never be verified against Node's default
+ * roots: a request to one with no anchor registered is refused before it is sent ({@link pinRefusal}).
+ * The value says whether an accepted pin names the host or only a refused value claims it.
+ *
+ * Kept apart from {@link trustAnchors} because the two change at different times. This map follows the
+ * setting the moment it changes (`engineTrust.ts` publishes it synchronously, at activation and on
+ * every settings change), while an anchor arrives only once its file is read, which on a slow share
+ * may take a whole refresh or longer. Only `engineTrust.ts` writes either.
+ */
+let pinnedHosts: ReadonlyMap<string, HostPin> = new Map();
+
+/** Replace the pinned `host:port` keys and what pins each ({@link pinnedHosts}). */
+export function setPinnedEngineHosts(hosts: Iterable<readonly [string, HostPin]>): void {
+  pinnedHosts = new Map(hosts);
+}
+
+/**
+ * Capture the registered anchors and the pinned hosts, and return a function that puts exactly that
+ * state back. For a test that registers its own: in the Extension Host leg `engineTrust.ts` keeps its
+ * own record of what it registered, and clearing the client's state behind its back would leave the
+ * two out of step.
+ */
+export function snapshotEngineTrustAnchors(): () => void {
+  const saved = new Map(trustAnchors);
+  const savedPins = pinnedHosts;
+  return () => {
+    trustAnchors.clear();
+    for (const [key, pem] of saved) {
+      trustAnchors.set(key, pem);
+    }
+    pinnedHosts = savedPins;
+  };
+}
+
+/**
+ * The error a request to `url` fails with WITHOUT being sent, or `undefined` when it may be sent.
+ *
+ * Refused: an https URL whose `host:port` an https `caFile` claims ({@link pinnedHosts}) and that has
+ * no anchor registered. With no `ca`, Node verifies against its default roots, so a publicly signed
+ * certificate for that host would pass, which is what pinning it excludes.
+ *   * An accepted pin whose file is not read yet fails with {@link CAFILE_UNREAD_CODE}, a trust
+ *     failure, so {@link withRenewalRetry} hands it to the failure handler, which reads the file; the
+ *     request, a POST included since it was never sent, then runs once more with the anchor.
+ *   * A host only a refused `caFile` claims fails with {@link CAFILE_REFUSED_CODE}, whose text names
+ *     the reason. There is no file to read, so the handler registers nothing and the request fails,
+ *     unless the caFile was corrected since: then the handler reads the corrected file and the
+ *     request runs once more with it, as above.
+ * Every other URL is unaffected: an unpinned host keeps the default roots, and the loopback engine
+ * keeps the certificate `messagefoundry.serviceConfig` names.
+ */
+export function pinRefusal(url: URL): NetworkError | undefined {
+  if (url.protocol !== "https:") {
+    return undefined;
+  }
+  const key = engineHostKey(url.href);
+  const host = key === undefined ? undefined : pinnedHosts.get(key);
+  if (key === undefined || host === undefined || trustAnchors.has(key)) {
+    return undefined;
+  }
+  const [code, reason] =
+    host.kind === "refused" ? [CAFILE_REFUSED_CODE, host.reason] : [CAFILE_UNREAD_CODE, undefined];
+  return new NetworkError(trustRemedy(code, url.origin, reason) ?? "", code);
+}
+
+/** The anchor registered for `url`'s engine, if any. The ONE lookup: {@link tlsOptions} and
+ *  {@link withRenewalRetry} must agree on which anchor a request carried. */
+function anchorFor(url: string): string | undefined {
+  const key = engineHostKey(url);
+  return key === undefined ? undefined : trustAnchors.get(key);
+}
+
+/**
+ * Called when a request to `url` failed certificate verification while `usedCa` (the anchor that
+ * request carried, or `undefined`) was registered. Resolves true when a DIFFERENT anchor is now
+ * registered for that engine, so the request is worth one more attempt.
+ */
+export type TrustFailureHandler = (url: string, usedCa: string | undefined) => Promise<boolean>;
+
+let trustFailureHandler: TrustFailureHandler | undefined;
+
+/**
+ * Install (or, with `undefined`, remove) the handler {@link withRenewalRetry} consults, and return
+ * the one it replaces so a caller (a test) can put it back.
+ *
+ * A hook rather than an import because `engineTrust.ts` already imports this module, and re-reading
+ * a certificate is file and subprocess work that does not belong in the HTTP client.
+ */
+export function setTrustFailureHandler(
+  handler: TrustFailureHandler | undefined,
+): TrustFailureHandler | undefined {
+  const previous = trustFailureHandler;
+  trustFailureHandler = handler;
+  return previous;
+}
+
+/**
+ * Run `attempt`. If it failed verification, tell the trust handler, and when `retry` is set and the
+ * handler registered a new anchor for that engine, run it ONCE more (BACKLOG #1695, residual c).
+ *
+ * The engine renews its generated certificate at startup, into the same file. The anchor this client
+ * holds was read earlier, so after an engine restart every request failed verification until the
+ * window was reloaded or a setting changed. The engine's own Python client follows a renewal the
+ * same way: re-read the pin on the first verification failure, retry only if it changed.
+ *
+ * ONLY A GET RETRIES, apart from a request {@link pinRefusal} refused, which was never sent. Whether
+ * Node can flush a request's bytes before its JS-side verification destroys the socket has not been
+ * measured, and a POST here can be a reload or a dual-control approval, where a duplicate is costly. A POST still reports the failure, so the anchor is
+ * followed and the NEXT request succeeds; when it was followed, the POST rejects with a
+ * {@link CertificateChangedError} saying a retry will work, not the trust error's remedy, which would
+ * send the user to a configuration that is not at fault. Verification is never relaxed for the retry.
+ *
+ * The handler may also answer false while starting background work (a refresh for a loopback engine
+ * with no anchor yet, or the rest of a `caFile` read this request could not wait for); then the
+ * request fails with the ordinary trust error and a later one picks the certificate up.
+ * `engineTrust.ts`'s `followCertificateChange` says when.
+ */
+async function withRenewalRetry<T>(
+  baseUrl: string,
+  attempt: () => Promise<T>,
+  retry: boolean,
+): Promise<T> {
+  const usedCa = anchorFor(baseUrl);
+  try {
+    return await attempt();
+  } catch (err) {
+    const handler = trustFailureHandler;
+    if (!(err instanceof NetworkError) || !isTlsTrustError(err.code) || handler === undefined) {
+      throw err;
+    }
+    let followed = false;
+    try {
+      followed = await handler(baseUrl, usedCa);
+    } catch {
+      // Best-effort: the request's own trust error is the useful outcome to report.
+    }
+    if (!followed) {
+      throw err;
+    }
+    // A request pinRefusal refused was never sent, so resending it cannot duplicate it, POST or not.
+    // That includes a refused caFile corrected since: the handler reads the corrected file.
+    if (!retry && !isPinRefusalCode(err.code)) {
+      // The trust error's own text sends the user to fix `serviceConfig` or a `caFile`, which is wrong
+      // here: the configuration is fine, the engine's certificate moved, and it is already followed.
+      throw new CertificateChangedError(baseUrl, err.code);
+    }
+    return attempt();
+  }
 }
 
 /**
@@ -207,10 +385,9 @@ export function tlsOptions(url: URL): https.RequestOptions {
   if (url.protocol !== "https:") {
     return {};
   }
-  // engineHostKey on BOTH sides of the Map. Spelling the normalization inline here and calling the
-  // helper in setEngineTrustAnchor would let a later change to one make every lookup silently miss.
-  const key = engineHostKey(url.href);
-  const ca = key === undefined ? undefined : trustAnchors.get(key);
+  // engineHostKey on BOTH sides of the Map (via anchorFor). Spelling the normalization inline here
+  // would let a later change to one side make every lookup silently miss.
+  const ca = anchorFor(url.href);
   const base: https.RequestOptions = { minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS };
   return ca === undefined ? base : { ...base, ca };
 }
@@ -257,7 +434,8 @@ export function postJson<T>(
   token?: string,
   timeoutMs?: number,
 ): Promise<T> {
-  return postReply(baseUrl, route, body, token, timeoutMs).then((reply) => {
+  const attempt = (): Promise<PostReply> => postReply(baseUrl, route, body, token, timeoutMs);
+  return withRenewalRetry(baseUrl, attempt, false).then((reply) => {
     const outcome = classifyApprovable<T>(reply.status, reply.body);
     if (outcome.kind === "held") {
       throw new HeldError(outcome.hold.approvalId);
@@ -343,7 +521,7 @@ export function postApprovable<T>(
   body: unknown,
   token?: string,
 ): Promise<Approvable<T>> {
-  return postReply(baseUrl, route, body, token).then((reply) =>
+  return withRenewalRetry(baseUrl, () => postReply(baseUrl, route, body, token), false).then((reply) =>
     classifyApprovable<T>(reply.status, reply.body),
   );
 }
@@ -369,6 +547,11 @@ function postReply(
       url = new URL(baseUrl.replace(/\/+$/, "") + route);
     } catch {
       reject(new Error(`invalid engine URL: ${baseUrl}`));
+      return;
+    }
+    const refused = pinRefusal(url);
+    if (refused !== undefined) {
+      reject(refused);
       return;
     }
     const payload = Buffer.from(JSON.stringify(body), "utf8");
@@ -433,6 +616,16 @@ export function getJson<T>(
   token?: string,
   timeoutMs: number = GET_TIMEOUT_MS,
 ): Promise<T> {
+  return withRenewalRetry(baseUrl, () => getOnce<T>(baseUrl, route, token, timeoutMs), true);
+}
+
+/** One GET attempt; {@link getJson} adds the renewal retry. */
+function getOnce<T>(
+  baseUrl: string,
+  route: string,
+  token: string | undefined,
+  timeoutMs: number,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let url: URL;
     try {
@@ -441,6 +634,11 @@ export function getJson<T>(
       url = new URL(baseUrl.replace(/\/+$/, "") + route);
     } catch {
       reject(new Error(`invalid engine URL: ${baseUrl}`));
+      return;
+    }
+    const refused = pinRefusal(url);
+    if (refused !== undefined) {
+      reject(refused);
       return;
     }
     const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};

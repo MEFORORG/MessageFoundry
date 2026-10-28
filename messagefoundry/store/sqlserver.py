@@ -74,6 +74,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
+from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import codec_safe_str, safe_text
@@ -2712,20 +2713,15 @@ def _schema_hash() -> str:
     return hashlib.sha256("\n".join(_SCHEMA).encode()).hexdigest()
 
 
-def _odbc_brace(value: str) -> str:
-    """ODBC-quote a value in braces, doubling any internal ``}`` — neutralizes ``; { } =`` inside it
-    so an attacker-influenced value (e.g. a password) can't inject extra connection keywords."""
-    return "{" + value.replace("}", "}}") + "}"
-
-
 def check_pinned_certificate(
     settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
 ) -> None:
     """Refuse a ``[store].ssl_root_cert`` pin the engine must not send. Raises ``ValueError`` naming
     the setting. A no-op when the store sends no pin.
 
-    Vault BACKLOG #2223: under ``Encrypt=strict`` a pin match stands in for the driver's own chain,
-    host-name and expiry checks, and the pinned file is the connection's only trust anchor. So:
+    Vault BACKLOG #2223: the pinned file is the connection's only trust anchor, because of what a
+    pin match does under ``Encrypt=strict``. The ``ssl_root_cert`` row of ``docs/CONFIGURATION.md``
+    states that once, with the build and platform it was tested on. So:
 
     * it takes the trust-anchor ACL and path checks with their own rules and messages
       (:func:`~messagefoundry.auth.trust_anchors.enforced_anchor`): a file or folder a broad
@@ -2803,10 +2799,8 @@ def check_pinned_certificate(
 def connection_string(settings: StoreSettings, *, posture: HopPosture | None = None) -> str:
     """Build an ODBC connection string for the Microsoft ODBC Driver 18 from store settings.
 
-    Free-text values are brace-quoted to prevent connection-string injection (STORE-5), and the
-    ``Encrypt``/``TrustServerCertificate`` security flags are emitted **last** so — ODBC being
-    last-wins on duplicate keywords — nothing earlier can downgrade TLS. Identity fields are also
-    validated up front (see ``StoreSettings._no_odbc_injection``).
+    Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (STORE-5, BACKLOG #3714). Identity
+    fields are also validated up front (see ``StoreSettings._no_odbc_injection``).
 
     ``posture`` is the deriving instance's :class:`HopPosture` (threaded from ``open_store`` by the
     serve/engine caller). ``None`` reads the ambient posture, and with none the escape is NOT
@@ -2835,42 +2829,37 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     parts = [
         "DRIVER={ODBC Driver 18 for SQL Server}",
         f"SERVER={settings.server},{settings.port}",  # server validated; port is an int
-        f"DATABASE={_odbc_brace(settings.database or '')}",
+        f"DATABASE={odbc_brace(settings.database or '')}",
         # No login-timeout keyword here, on purpose (BACKLOG #1626). `Connection Timeout=` is an
         # ADO.NET keyword that ODBC Driver 18 silently ignores: measured against a black-hole address,
         # a DSN carrying `Connection Timeout=2` still waited 15.1 s, the same as no timeout at all.
         # The driver's login timeout is SQL_ATTR_LOGIN_TIMEOUT, which pyodbc sets from its `timeout=`
         # argument, so every connect site passes `timeout=settings.connect_timeout` instead.
-        f"APP={_odbc_brace(settings.application_name)}",
+        f"APP={odbc_brace(settings.application_name)}",
     ]
     if settings.auth is SqlAuth.SQL:
-        parts.append(f"UID={_odbc_brace(settings.username or '')}")
-        parts.append(f"PWD={_odbc_brace(settings.password or '')}")
+        parts.append(f"UID={odbc_brace(settings.username or '')}")
+        parts.append(f"PWD={odbc_brace(settings.password or '')}")
     elif settings.auth is SqlAuth.INTEGRATED:
         parts.append("Trusted_Connection=yes")
     elif settings.auth is SqlAuth.ENTRA:
         parts.append("Authentication=ActiveDirectoryDefault")
-    # AOAG multi-subnet fast failover (BACKLOG #100). Not a TLS keyword, so it goes before the
-    # Encrypt/TrustServerCertificate tail and cannot disturb the last-wins TLS posture.
+    # AOAG multi-subnet fast failover (BACKLOG #100). Not a TLS keyword, so it goes in the head,
+    # before the TLS tail (messagefoundry.odbc_dsn).
     if settings.multi_subnet_failover:
         parts.append("MultiSubnetFailover=Yes")
     # Pin the DB server's certificate by file WITHOUT a machine-wide trust import (#45), via the ODBC
-    # Driver 18.1+ `ServerCertificate` keyword — only on the SECURE posture (encrypt on, verify on; the
-    # weakened branch above already refused/escaped). Brace-quoted (STORE-5). The pin goes out with
-    # Encrypt=strict: on the Driver 18.7 build tested on Windows, the pin was enforced with strict and
-    # NOT with Encrypt=yes, where a pin of the wrong certificate still connected (vault BACKLOG #2223,
-    # measured under #3009). Strict is TDS 8.0, so a server older than SQL Server 2022 refuses the
-    # connection; there is no fall back to an unenforced pin. Microsoft documents the exact match as
-    # done instead of the expiry, host-name and chain checks, so the engine checks the pinned
-    # certificate itself at store open (check_pinned_certificate). Not a revocation control. Both
-    # keywords stay inside the last-wins tail.
-    pin = settings.sqlserver_pin_path()
-    if pin:
-        parts.append(f"ServerCertificate={_odbc_brace(pin)}")
-    encrypt = "strict" if pin else ("yes" if settings.encrypt else "no")
-    parts.append(f"Encrypt={encrypt}")
-    parts.append(f"TrustServerCertificate={'yes' if settings.trust_server_certificate else 'no'}")
-    return ";".join(parts) + ";"
+    # Driver 18.1+ `ServerCertificate` keyword, only on the SECURE posture (encrypt on, verify on; the
+    # weakened branch above already refused or escaped). The pin goes out with Encrypt=strict, and the
+    # engine checks the pinned certificate itself at store open (check_pinned_certificate). Why strict,
+    # what it needs of the server, and what it was tested on: the `ssl_root_cert` row of
+    # docs/CONFIGURATION.md (vault BACKLOG #2223). Not a revocation control.
+    return odbc_connection_string(
+        parts,
+        encrypt=settings.encrypt,
+        trust_server_certificate=settings.trust_server_certificate,
+        pin=settings.sqlserver_pin_path(),
+    )
 
 
 def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) -> ThreadPoolExecutor:
@@ -8954,7 +8943,8 @@ class SqlServerStore:
         # ASVS 14.2.7. Whole-row DELETE — the criteria IS the payload and the row backs no count.
         # `updated_at`/`last_used_at` are FLOAT epochs here (as on SQLite/PG), so the comparison needs no
         # date handling. #306: key on the LATER of last-edited and last-used. T-SQL's GREATEST is SQL
-        # Server 2022+ and this backend's floor is 2016 SP1 (see _SCHEMA's CREATE OR ALTER guard), so the
+        # Server 2022+, newer than the 2016 SP1 that _SCHEMA's CREATE OR ALTER guard checks for, so this
+        # statement does not use it (the supported floor is docs/SYSTEM-REQUIREMENTS.md's). The
         # null-safe greatest-of-two is spelled as the equivalent PREDICATE pair — `MAX(a,b) < cutoff` is
         # exactly `a < cutoff AND (b IS NULL OR b < cutoff)`, and the NULL arm is what keeps a pre-#306
         # row (never recall-stamped) purging on `updated_at` alone. `older_than` is bound TWICE.
