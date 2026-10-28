@@ -1366,8 +1366,8 @@ ledger, so it has no public page.
   `messagefoundry.anon` and `tee.anon`. (`BACKLOG #3003`)
 - **An `anon.toml` overlay that points a default field at a different surrogate kind now warns.**
   The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn` rewrite the first
-  component only, so `"PID-5" = "id"` left the given name in the dataset, and `"PID-7" = "date"`
-  left the birth year. Nothing said so. The leak check counts such a field as scrubbed and does
+  component only, so `"PID-5" = "id"` would have left the given name in the dataset, and
+  `"PID-7" = "date"` the birth year. Nothing said so. The leak check counts such a field as scrubbed and does
   not scan what is left; that is unchanged, so a clean `anonymize_checked` return does not clear
   a retargeted field. `load_rules` now logs each such retarget at WARNING, naming the field, the default kind and the
   new kind, and never a value. A retarget to the same kind and a `drop` do not warn. The new

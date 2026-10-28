@@ -148,15 +148,25 @@ def test_the_checked_run_no_longer_returns_the_shape_whole(
 
 
 @pytest.mark.parametrize(
-    ("mark", "value"), (("-", _SSN_SHAPE), (".", _PHONE_DOTTED)), ids=("dash", "point")
+    ("value_type", "mark", "value"),
+    (
+        ("NM", "-", _SSN_SHAPE),
+        ("NM", ".", _PHONE_DOTTED),
+        # The NM shapes split into parts that are not times (``3456`` has hour 34), so the TM grammar
+        # refuses them with or without the separator guard. A dated shape splits into valid hours.
+        ("TM", "-", "01-02-03"),
+        ("TM", ".", "01.02.03"),
+    ),
+    ids=("NM_dash", "NM_point", "TM_dash", "TM_point"),
 )
-@pytest.mark.parametrize("value_type", ("NM", "TM"))
 @_EACH_MODULE
 def test_nothing_is_kept_under_a_repetition_separator_the_grammar_uses(
     module: Any, value_type: str, mark: str, value: str
 ) -> None:
     """A message may declare any separators. Under a repetition separator of ``-`` the value splits
     into ``000``, ``12`` and ``3456``, and each is a valid number, so the grammar alone keeps it."""
+    # The case discriminates: every part fits the grammar alone, so only the separator guard refuses.
+    assert all(module.preserve_obx5_value(value_type, p, module.Seps()) for p in value.split(mark))
     assert module.preserve_obx5_value(value_type, value, module.Seps(repetition=mark)) is False
     # Control: the same call keeps a plain value under the usual separators.
     assert module.preserve_obx5_value(value_type, "12", module.Seps()) is True
