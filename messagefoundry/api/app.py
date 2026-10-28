@@ -9152,6 +9152,7 @@ def create_app(
                 path=db.path,
                 size_bytes=db.size_bytes,
                 disk_free_bytes=db.disk_free_bytes,
+                disk_free_status=db.disk_free_status.value,
                 journal_mode=db.journal_mode,
                 messages=db.messages,
                 events=db.events,

@@ -37,7 +37,7 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
-from messagefoundry.store.store import load_audit_chain
+from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -694,12 +694,10 @@ async def test_stats_and_metrics(store) -> None:
     # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
     # this guards every run.
     assert db.disk_free_bytes is None
-    # Non-empty is the engine-side fact a reader of the null above depends on: this backend names
-    # itself through `journal_mode` (the recovery model), and the "" fallback here means the
-    # sys.databases read came back empty, so the row says nothing about which store answered.
-    # Deliberately asserts only that, not WHICH model — the set of recovery models a console might
-    # recognise is that console's policy, and restating it in the engine suite would let the two
-    # drift apart while both stayed green.
+    assert db.disk_free_status is DiskFreeStatus.NOT_APPLICABLE  # stated, not inferred
+    # journal_mode is the recovery model, for display only: since disk_free_status states the
+    # not_applicable fact, no reader infers the backend from it. Non-empty means the sys.databases
+    # read answered.
     assert db.journal_mode
     ok, _ = await store.integrity_check()
     assert ok is True

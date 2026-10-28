@@ -222,6 +222,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
+    DiskFreeStatus,
     FailOutcome,
     FederatedUnbind,
     InboundMetrics,
@@ -10575,6 +10576,7 @@ class PostgresStore:
             path=self.path,
             size_bytes=int(size["b"]) if size and size["b"] is not None else 0,
             disk_free_bytes=None,  # a remote server's disk is not ours to stat; unmeasurable, not 0
+            disk_free_status=DiskFreeStatus.NOT_APPLICABLE,
             journal_mode="postgres",
             messages=await self._count("messages"),
             events=await self._count("message_events"),
