@@ -596,6 +596,8 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # Proxy-Authorization header, or the SOCKS user and password), on every proxied request on
         # any requests version, before any connection opens and before a manager is cached.
         _refuse_cleartext_proxy_credentials(proxy, connector=self._connector)
+        # Vault BACKLOG #3454: proxy_headers below reads and encodes the credentials.
+        _refuse_an_unsendable_proxy_url(proxy, connector=self._connector)
         manager = super().proxy_manager_for(proxy, **proxy_kwargs)
         # Only a plain proxy manager's pools are the stock ones. A SOCKS manager's pools open SOCKS
         # connections, and swapping them would send around the proxy, so those are left alone and
@@ -615,10 +617,13 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # BACKLOG #2547, before requests parses the proxy URL: a credentialed URL that will not
         # parse would otherwise fail in requests' own parser, whose error can quote the password.
         # proxy_manager_for checks again, on a requests too old to call this hook.
-        # The proxy is selected once: the three checks below judge the same one.
+        # The proxy is selected once: the checks below judge the same one.
         url = request.url or ""
         proxy = requests.utils.select_proxy(url, proxies)
         _refuse_cleartext_proxy_credentials(proxy, connector=self._connector)
+        # Vault BACKLOG #3454: an https:// proxy passes the check above, and requests' own reads of
+        # its URL, here and in request_url after this returns, can fail quoting the password.
+        _refuse_an_unsendable_proxy_url(proxy, connector=self._connector)
         pool = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
         # Both halves: the class is one of ours, and nothing below it put the stock reader back.
         if not (
@@ -999,6 +1004,67 @@ def _refuse_cleartext_proxy_credentials(proxy: str | None, *, connector: str) ->
     no loopback exception. Raises :class:`VaultHopRefused` with fixed text."""
     if proxy and _proxy_carries_cleartext_credentials(proxy):
         raise VaultHopRefused(f"{connector}: {_CLEARTEXT_PROXY_CREDENTIALS}")
+
+
+#: The fixed text of the unsendable-proxy refusal (vault BACKLOG #3454). It names no part of the
+#: proxy URL, for the reason the refusal exists: the library's own error would have.
+_UNSENDABLE_PROXY_URL = (
+    "the proxy in front of the Vault address has a URL that requests, the HTTP library this hop "
+    "sends through, cannot read, or a user name or password in it that requests cannot send "
+    "(it sends them as Latin-1 text). The library's own error would quote the URL, credentials "
+    "included. Correct the proxy URL in HTTPS_PROXY, HTTP_PROXY, ALL_PROXY or the system proxy "
+    "settings; refusing (vault BACKLOG #3454)"
+)
+
+
+def _proxy_url_requests_cannot_send(proxy: str) -> bool:
+    """Whether requests' own handling of ``proxy`` on a send would raise (vault BACKLOG #3454).
+
+    :func:`_refuse_cleartext_proxy_credentials` passes a credentialed ``https://`` proxy, so its
+    URL then goes on to requests. These are the reads requests makes of it on each send, at least
+    on requests 2.34.2, where they were read. Each one that fails raises an error whose text, or whose attributes,
+    can hold the user name or password, and that error would leave the hop as the cause of the
+    provider's own one, and in the privilege probe's text:
+
+    * ``HTTPAdapter.request_url`` reads the raw URL with ``urllib.parse.urlparse``, whose
+      ``ValueError`` for a network location that NFKC normalization changes quotes all of it.
+    * ``get_connection_with_tls_context`` re-reads it with ``prepend_scheme_if_needed`` and
+      ``urllib3.util.parse_url``.
+    * ``HTTPAdapter.proxy_headers`` takes the user and password with
+      ``requests.utils.get_auth_from_url`` and, when there is a user name, encodes both as
+      Latin-1. The ``UnicodeEncodeError`` keeps the whole string it was encoding.
+
+    The same reads are made here, in the same order, and any failure answers ``True``, so the
+    caller refuses with fixed text, outside the ``except``, before requests makes them. So only a
+    URL whose send would fail anyway is refused. ``tests/test_vault_hop_proxy_parse.py`` pins
+    that this answer and requests' own reads agree on each shape it tries."""
+    try:
+        urllib.parse.urlparse(proxy)
+        prepended = requests.utils.prepend_scheme_if_needed(proxy, "http")
+        urllib3.util.parse_url(prepended)
+        username, password = requests.utils.get_auth_from_url(prepended)
+        if username:
+            username.encode("latin-1")
+            password.encode("latin-1")
+    # ValueError covers LocationParseError and UnicodeEncodeError; TypeError is the prepend's on a
+    # userinfo with no host ("http://u@").
+    except (ValueError, TypeError):
+        return True
+    return False
+
+
+def _refuse_an_unsendable_proxy_url(proxy: str | None, *, connector: str) -> None:
+    """Refuse a Vault hop whose proxy URL requests would fail to read or send (vault BACKLOG
+    #3454), as :func:`_proxy_url_requests_cannot_send` decides. ``proxy`` is the proxy requests
+    would pick, or ``None``.
+
+    Runs right after :func:`_refuse_cleartext_proxy_credentials`, at construction and before
+    each send, so a proxy that is refused for its cleartext credentials keeps that refusal.
+    Takes no posture: a URL requests cannot send fails under every setting. Raises
+    :class:`VaultHopRefused` with fixed text, outside any ``except``, so neither its
+    ``__cause__`` nor its ``__context__`` holds the parser's error."""
+    if proxy and _proxy_url_requests_cannot_send(proxy):
+        raise VaultHopRefused(f"{connector}: {_UNSENDABLE_PROXY_URL}")
 
 
 #: Which settings section holds a Vault hop's revocation attestation (vault BACKLOG #2983).
@@ -1485,6 +1551,7 @@ def _refuse_an_insecure_vault_hop(
     hop = _prepared_vault_hop(session, url, request_proxies)
     sent, proxy = hop if hop is not None else ("", None)
     _refuse_cleartext_proxy_credentials(proxy, connector=connector)
+    _refuse_an_unsendable_proxy_url(proxy, connector=connector)
     # A proxy URL that will not parse reads as not https here, and the cleartext check below then
     # refuses it: an http:// address behind any proxy is refused, with fixed text.
     if _scheme_of(sent) == "http" and proxy and _proxy_scheme(proxy) == "https":
