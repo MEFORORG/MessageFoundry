@@ -7994,11 +7994,18 @@ class AuthService:
         target_roles: dict[str, frozenset[str]] = {}
         scopes: dict[str, channel_scope.ScopeInput] = {}
         # Both directory maps read once for the pass, each through its seal check (BACKLOG #2592),
-        # so every account in the pass is judged against one version of each map.
-        role_map = await self._ad_map(AD_ROLE_MAP)
-        scope_map = await self._ad_map(AD_SCOPE_MAP)
+        # so every account in the pass is judged against one version of each map. A map Vault
+        # transit refused to check is None, reported once for the pass, and its diff is HELD for
+        # every account: judged against an empty map, it would revoke for a role or scope change
+        # the directory never made. An unverifiable role map holds the scope diff too, since the
+        # Administrator short-circuit reads the target roles. An absent or disabled account is
+        # still judged on its probe.
+        role_map = await self._ad_map_unless_unverifiable(AD_ROLE_MAP)
+        scope_map = await self._ad_map_unless_unverifiable(AD_SCOPE_MAP)
         for probe in probes:
-            if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
+            if probe.outcome is not reconcile.ProbeOutcome.PRESENT or role_map is None:
+                # plan_pass reads an account missing from both as no role change and no scope
+                # input.
                 continue
             # RE-READ, after the probes, the roles and the row alike. The row listed at the top of
             # the pass can be up to a whole pass of LDAP round trips old, and a login that landed
@@ -8015,6 +8022,8 @@ class AuthService:
             # The TARGET roles decide the Administrator short-circuit, as they do at login, which
             # decides with the roles it is about to write.
             administrator = Role.ADMINISTRATOR.value in target
+            if scope_map is None:
+                continue  # the scope diff is held; the role diff still runs
             scopes[probe.user_id] = channel_scope.ScopeInput(
                 stored_scope=row.channel_scope,
                 stored_source=row.channel_scope_source,

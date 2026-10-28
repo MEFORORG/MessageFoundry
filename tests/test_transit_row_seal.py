@@ -980,6 +980,7 @@ def test_the_awaited_local_forms_answer_like_the_sync_ones() -> None:
 # --- a directory decision that writes holds on an unverifiable map (BACKLOG #2592) ---------------
 
 _OPS = "cn=mf-ops,dc=test,dc=invalid"
+_ADMINS = "cn=mf-admins,dc=test,dc=invalid"
 _CHANS = "cn=mf-chan,dc=test,dc=invalid"
 
 
@@ -1092,3 +1093,67 @@ async def test_a_local_administrator_can_clear_an_unverifiable_map(
     identity, _token, _password = await login_admin(service)
     await service.set_ad_group_map([], actor=identity.username)
     assert await service.list_ad_group_role_map() == []
+
+
+async def test_the_reconciler_holds_the_role_diff_on_an_unverifiable_map(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass that meets an unverifiable role map revokes nobody for a role change, since every
+    PRESENT account would otherwise read as demoted, and pages once for the map. An account the
+    directory no longer holds still accrues its strike."""
+    from tests.test_ad_session_reconcile import _FakeLdap, _principal, _signed_in_ad_user
+
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    raised = _armed(store, monkeypatch)
+    ldap = _FakeLdap({"jdoe": _principal("jdoe", _ADMINS), "gone": _principal("gone", _ADMINS)})
+    service = await _directory_service(store, ldap)
+    await service.set_ad_group_map([(_ADMINS, "administrator")], actor="t")
+    token = await _signed_in_ad_user(service, store, "jdoe")
+    assert token is not None and await _signed_in_ad_user(service, store, "gone") is not None
+    gone = await store.get_user_by_username("gone")
+    assert gone is not None
+    await _set_map_version(path, AD_ROLE_MAP, planted=True)
+    _lapse_cache(store)
+    del ldap.present["gone"]
+    ldap.present["jdoe"] = _principal("jdoe")  # a role change the pass must not act on
+    plan = await service.reconcile_directory_sessions()
+    assert [r for r in plan.revocations if r.username == "jdoe"] == []
+    assert await service.identity_for_token(token) is not None  # the session stands
+    assert raised.count(f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:adset:{AD_ROLE_MAP}") == 1
+    assert service._reconcile_strikes.get(gone.id, 0) >= 1  # judged on its probe, as before
+    # Control: once the map verifies again, the same demotion revokes.
+    await _set_map_version(path, AD_ROLE_MAP, planted=False)
+    plan = await service.reconcile_directory_sessions()
+    assert ("jdoe", "roles_changed") in [(r.username, r.reason) for r in plan.revocations]
+
+
+async def test_the_reconciler_holds_the_scope_diff_on_an_unverifiable_scope_map(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same for the group-to-channel map alone: the scope diff is held, so a scope the
+    directory set is not read as withdrawn, while the role map still verifies and is judged."""
+    from tests.test_ad_session_reconcile import _FakeLdap, _principal, _signed_in_ad_user
+
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    raised = _armed(store, monkeypatch)
+    ldap = _FakeLdap({"jdoe": _principal("jdoe", _OPS, _CHANS)})
+    service = await _directory_service(store, ldap)
+    await service.set_ad_group_map([(_OPS, "operator")], actor="t")
+    await service.set_ad_group_scope_map([(_CHANS, "chan-a")], actor="t")
+    token = await _signed_in_ad_user(service, store, "jdoe")
+    assert token is not None
+    await _set_map_version(path, AD_SCOPE_MAP, planted=True)
+    _lapse_cache(store)
+    ldap.present["jdoe"] = _principal("jdoe", _OPS)  # out of the channel group
+    plan = await service.reconcile_directory_sessions()
+    assert plan.revocations == ()
+    assert await service.identity_for_token(token) is not None
+    assert raised == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:adset:{AD_SCOPE_MAP}"]
+    # Control: the role map is still judged on the same kind of pass, so a demotion revokes.
+    ldap.present["jdoe"] = _principal("jdoe")
+    plan = await service.reconcile_directory_sessions()
+    assert [(r.username, r.reason) for r in plan.revocations] == [("jdoe", "roles_changed")]
