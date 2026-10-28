@@ -629,14 +629,16 @@ _COMPARATOR = r"(?:<=|>=|<>|[<>=])"
 #: An HL7 NM: an optional sign, digits, and at most one decimal point.
 _NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
 #: An HL7 TM, ``HH[MM[SS[.S[S[S[S]]]]]][+/-ZZZZ]``, with every group in range. The ranges matter: an
-#: eight-digit date is not a time of day, and it does not fit.
+#: eight-digit date is not a time of day, and it does not fit. Every UTC offset in use is a whole
+#: quarter hour, so an offset's minutes are 00, 15, 30 or 45. That refuses most dates written
+#: ``YYYY-MMDD``, which read as an hour, a minute and an offset; a day of 15 or 30 still fits.
 _TIME_OF_DAY = r"""
     (?:[01][0-9]|2[0-3])                    # hour
     (?:[0-5][0-9]                           # minute
       (?:[0-5][0-9]                         # second
         (?:\.[0-9]{1,4})?                   # fraction, only after the seconds
       )?)?
-    (?:[+-](?:(?:0[0-9]|1[0-3])[0-5][0-9]|1400))?  # offset, no wider than 1400 either way
+    (?:[+-](?:(?:0[0-9]|1[0-3])(?:00|15|30|45)|1400))?  # offset, no wider than 1400 either way
 """
 #: Every character the three grammars are written in. No numeric value is kept when one of them is
 #: the component, repetition or subcomponent separator: under a repetition separator of ``-``,

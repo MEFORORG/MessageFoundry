@@ -85,6 +85,8 @@ _REFUSED: dict[str, tuple[str, str]] = {
     "TM five fraction digits": ("TM", "120000.12345"),
     "TM offset out of range": ("TM", "1200+9900"),
     "TM offset past the widest": ("TM", "1200+1459"),
+    "TM offset off the quarter hour": ("TM", "1200-0520"),
+    "TM date written YYYY-MMDD": ("TM", "1945-0612"),
     "TM colons": ("TM", "12:30"),
     "SN unsplit comparator and number": ("SN", "<5"),
     "TM comparator": ("TM", ">1200"),
@@ -113,6 +115,8 @@ _KEPT: dict[str, tuple[str, str]] = {
     "TM fraction": ("TM", "120000.1234"),
     "TM offset": ("TM", "1200-0500"),
     "TM widest offset": ("TM", "000000+1400"),
+    "TM half hour offset": ("TM", "1200+0530"),
+    "TM three quarter hour offset": ("TM", "1200+0545"),
 }
 
 
@@ -241,6 +245,7 @@ _STILL_KEPT_BY_DESIGN: dict[str, tuple[str, str]] = {
     "SN undashed nine digits": ("SN", "^900000001"),
     "NM identifier split across repetitions": ("NM", "000~12~3456"),
     "TM six digits that read as a date": ("TM", "150312"),
+    "TM date written YYYY-MMDD on the fifteenth": ("TM", "1945-0615"),
 }
 
 
