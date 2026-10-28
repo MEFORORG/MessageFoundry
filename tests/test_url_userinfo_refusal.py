@@ -23,6 +23,9 @@ THREE LAYERS, each tested here, then two sites the construction refusal does not
    there prints the URL.
 5. The ``[egress]`` allowlist, which runs BEFORE connector construction, neither raises with nor
    echoes a credential.
+6. BACKLOG #2686: a constructor that reads the scheme before the credential screen refuses a URL
+   ``urlsplit`` cannot parse without echoing it, and the proxy arm's label withholds a host that
+   hides a userinfo.
 
 Synthetic values only. Nothing here opens a socket: ``http.client`` raises ``InvalidURL`` before it
 connects.
@@ -99,6 +102,9 @@ _USERINFO_SHAPES = {
     # ``%5D`` in the head: unquoted, it reads as an IPv6 literal's end and hides the port from the
     # dialling reader, so the raw reader must still see it.
     "encoded_bracket_head": f"https://svc:ab%5Dc/{SECRET}@endpoint.example.invalid/x",
+    # ``%3A`` then ``%5D``: neither reader sees a port, so only the encoded colon gives it away, and
+    # ``hostname`` is the username and the password head (BACKLOG #2686).
+    "encoded_colon_bracket_head": f"https://svc%3A{SECRET}%5D/tail@endpoint.example.invalid/x",
 }
 
 
@@ -628,52 +634,43 @@ def test_build_check_never_carries_the_password(shape: str) -> None:
 
 # --- 6. BACKLOG #2686: the egress label and the scheme read before the credential screen -------------
 
-#: A password head that unquotes to ``:`` then ``]``. Neither reader in ``refuse_url_credentials``
-#: sees a port, so the URL constructs, and ``hostname`` is the username and the password head.
-_HIDDEN_PORT = f"https://svc%3A{SECRET}%5D/tail@endpoint.example.invalid/x"
-
 
 def _no_secret(text: str) -> None:
     # ``hostname`` lower-cases, so a case-sensitive check would pass over the leak.
     assert SECRET.lower() not in text.lower(), text
 
 
-def test_the_hidden_port_shape_constructs_so_only_the_label_stands_in_front() -> None:
-    """The premise of the label fix: this shape is not refused at construction."""
-    refuse_url_credentials(_HIDDEN_PORT, "'url'")
-    RestDestination(_dest(ConnectorType.REST, _HIDDEN_PORT))
+def test_the_hidden_port_shape_is_refused_without_echoing_it_in_any_case() -> None:
+    """The ``encoded_colon_bracket_head`` shape above is in every parametrized refusal. Those check
+    ``SECRET`` case-sensitively, and ``hostname`` lower-cases, so this checks it case-blind."""
+    with pytest.raises(ValueError, match="%3A") as exc:
+        RestDestination(_dest(ConnectorType.REST, _USERINFO_SHAPES["encoded_colon_bracket_head"]))
+    _no_secret(str(exc.value))
 
 
-def test_the_egress_arms_withhold_a_host_that_hides_its_port(
+def test_the_proxy_egress_label_withholds_a_host_that_hides_its_port(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """``proxy_url`` is not screened at construction, so the label is what stands in front of it."""
     egress = EgressSettings(
         allowed_http=["endpoint.example.invalid"],
         allowed_proxy=["proxy.example.invalid:3128"],
     )
-    ok = "https://endpoint.example.invalid/x"
-    proxy = f"http://svc%3A{SECRET}%5D/tail@proxy.example.invalid:3128"
-    with caplog.at_level(logging.DEBUG):
-        for dest in (
-            _dest(ConnectorType.REST, _HIDDEN_PORT),
-            _dest(ConnectorType.REST, ok, oauth2_token_url=_HIDDEN_PORT),
-            _dest(ConnectorType.REST, ok, proxy_url=proxy),
-        ):
-            with pytest.raises(WiringError) as exc:
-                check_egress_allowed(dest, egress)
-            _no_secret(str(exc.value))
-            assert "withheld" in str(exc.value)
-        with pytest.raises(WiringError) as exc:
-            check_fhir_lookup_allowed("FL_2686", {"url": _HIDDEN_PORT}, egress)
+    for proxy in (
+        f"http://svc%3A{SECRET}%5D/tail@proxy.example.invalid:3128",
+        f"http://svc:4821/{SECRET}@proxy.example.invalid:3128",  # the username, port read as 4821
+    ):
+        dest = _dest(ConnectorType.REST, "https://endpoint.example.invalid/x", proxy_url=proxy)
+        with caplog.at_level(logging.DEBUG), pytest.raises(WiringError) as exc:
+            check_egress_allowed(dest, egress)
         _no_secret(str(exc.value))
+        assert "svc" not in str(exc.value), str(exc.value)
+        assert "withheld" in str(exc.value)
     _no_secret(caplog.text)
 
 
-def test_the_ai_allowlist_refusal_withholds_a_host_that_hides_its_port() -> None:
-    with pytest.raises(AiBrokerError) as exc:
-        AiBroker(endpoint=_HIDDEN_PORT, api_key="k", allowed_endpoints=["other.example.invalid"])
-    _no_secret(str(exc.value))
-    assert "withheld" in str(exc.value)
+def test_redact_url_never_raises_on_a_url_urlsplit_cannot_parse() -> None:
+    assert _redact_url(f"https://svc:{SECRET}／q@endpoint.example.invalid/x") == "<redacted>"
 
 
 def test_the_egress_label_keeps_an_ordinary_host_and_an_ipv6_literal() -> None:
@@ -700,6 +697,22 @@ _SCHEME_READERS: list[tuple[str, type[ValueError], str, Any]] = [
         "smart_token_url",
         lambda url: SmartBackendTokenProvider(
             token_url=url, client_id="cid", private_key="unused-before-refusal"
+        ),
+    ),
+    (
+        "OAuth2",
+        HttpAuthError,
+        "oauth2_token_url",
+        lambda url: OAuth2ClientCredentialsProvider(
+            token_url=url, client_id="cid", client_secret="csecret"
+        ),
+    ),
+    (
+        "proxy",
+        ValueError,
+        "proxy_url",
+        lambda url: proxy_config_from_settings(
+            {"proxy_url": url}, dest_scheme="https", connection=None
         ),
     ),
     (

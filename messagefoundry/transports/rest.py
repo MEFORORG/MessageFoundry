@@ -126,6 +126,8 @@ __all__ = [
     "refuse_unrevoked_verified_hop",
     "refuse_url_credentials",
     "refuse_verify_off",
+    "url_host_label",
+    "url_scheme",
 ]
 
 logger = logging.getLogger(__name__)
@@ -529,8 +531,14 @@ def _redact_url(url: str) -> str:
     only an email in a query look the same to a parser, so neither names a host, as ``_peer_label``
     does in ``config/wiring.py``. The ``@`` is read after unquoting, so ``%40`` counts. A host that
     holds ``@`` or ``:`` once unquoted is withheld too: ``svc%3APW%40host`` is a userinfo urllib
-    unquotes, and ``hostname`` would print it whole. An IPv6 literal, zone and all, keeps its host."""
-    p = urllib.parse.urlsplit(url)
+    unquotes, and ``hostname`` would print it whole. An IPv6 literal, zone and all, keeps its host.
+
+    A URL ``urlsplit`` cannot parse renders as ``<redacted>`` alone: its ``ValueError`` quotes the
+    whole netloc."""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<redacted>"
     if _withholds_host(p):
         return f"{p.scheme}://<redacted>"
     try:
@@ -540,17 +548,18 @@ def _redact_url(url: str) -> str:
     return f"{p.scheme}://{p.hostname or ''}{port}{p.path}"
 
 
-def _withholds_host(p: urllib.parse.SplitResult) -> bool:
-    """Must a render of ``p`` withhold its host? :func:`_redact_url` says why (BACKLOG #2686).
-
-    True for an ``@`` anywhere after the authority, and for an unbracketed host that holds ``@`` or
-    ``:`` once unquoted. A password head written as ``%3A`` then ``%5D`` hides its port from both
-    readers in :func:`refuse_url_credentials`, so such a URL constructs, and its ``hostname`` is the
-    username and the password head."""
-    encoded_userinfo = not p.netloc.rpartition("@")[2].startswith("[") and any(
+def _host_hides_userinfo(p: urllib.parse.SplitResult) -> bool:
+    """Does an unbracketed host hold ``@`` or ``:`` once unquoted? Then it is userinfo written with
+    ``%40`` or ``%3A``, and ``hostname`` is the username and some of the password. An IPv6 literal
+    holds ``:``, so a bracketed host never counts."""
+    return not p.netloc.rpartition("@")[2].startswith("[") and any(
         c in urllib.parse.unquote(p.hostname or "") for c in "@:"
     )
-    return encoded_userinfo or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}")
+
+
+def _withholds_host(p: urllib.parse.SplitResult) -> bool:
+    """Must a render of ``p`` withhold its host? :func:`_redact_url` says why (BACKLOG #2686)."""
+    return _host_hides_userinfo(p) or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}")
 
 
 #: What :func:`url_host_label` prints in place of a host it must not print.
@@ -560,8 +569,9 @@ HOST_WITHHELD = "(withheld: the URL may hold a credential)"
 def url_host_label(url: str) -> str:
     """The host a refusal may print for ``url``, or :data:`HOST_WITHHELD` (BACKLOG #1793, #2686).
 
-    Withheld whenever :func:`_redact_url` would withhold it, and when ``urlsplit`` cannot parse the
-    URL: its ``ValueError`` quotes the whole netloc. Never raises. A host of ``""`` prints as ``""``."""
+    Withheld whenever :func:`_redact_url` would withhold it. Never raises. A host of ``""`` prints
+    as ``""``. It matters most on a ``proxy_url``, which :func:`refuse_url_credentials` never
+    screens, so no construction refusal stands in front of it."""
     try:
         p = urllib.parse.urlsplit(url)
     except ValueError:
@@ -624,6 +634,14 @@ def refuse_url_credentials(
             f"{setting} has a port followed by an '@'. A password written into the URL can cause "
             f"this; set credentials in {use} instead. Write a literal '@' as %40, or leave out a "
             "default port"
+        )
+    # A password head written with ``%3A`` and then ``%5D`` hides its port from both readers above,
+    # since the dialling reader takes the ``]`` for an IPv6 literal's end (BACKLOG #2686). No host
+    # name holds a ``:``, so an encoded one outside brackets is refused whatever follows it.
+    if _host_hides_userinfo(p):
+        raise error(
+            f"{setting} has a ':' written as %3A in its host. A password written into the URL can "
+            f"cause this; set credentials in {use} instead"
         )
 
 
@@ -2107,7 +2125,7 @@ def proxy_config_from_settings(
             digest=None,
             connection=connection,
         )
-    proxy_scheme = urllib.parse.urlsplit(proxy_url).scheme.lower()
+    proxy_scheme = url_scheme(proxy_url, "proxy_url", use="proxy_user/proxy_password")
     if proxy_scheme not in ("http", "https"):
         raise ValueError(
             f"proxy_url must be 'default' or an http(s):// address, got scheme {proxy_scheme!r} "

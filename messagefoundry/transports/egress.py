@@ -198,7 +198,7 @@ def _check_credential_token_url_egress(
             error=WiringError,
         )
         if not _http_egress_allowed(token_url, allowed_http):
-            host = _egress_host_label(token_url)
+            host = url_host_label(token_url)
             log.warning(
                 "egress denied: %s %s host %r not in [egress].allowed_http",
                 label,
@@ -251,7 +251,10 @@ def _check_forward_proxy_egress(
             "list is deny-by-default even under [security].block_unlisted_outbound = false)"
         )
     if not _http_egress_allowed(proxy_url, allowed_proxy):
-        host = _egress_host_label(proxy_url)
+        # The data, token and FhirLookup arms call refuse_url_credentials first, for a refusal that
+        # names the setting. This arm cannot, since a proxy may carry its own userinfo, so the label
+        # is what keeps its message clean (BACKLOG #1793, #2686).
+        host = url_host_label(proxy_url)
         log.warning(
             "egress denied: %s forward proxy host %r not in [egress].allowed_proxy", label, host
         )
@@ -293,7 +296,7 @@ def check_fhir_lookup_allowed(
         if not _http_egress_allowed(
             url, egress.allowed_http
         ):  # same host[:port] matching as the FHIR outbound
-            host = _egress_host_label(url)
+            host = url_host_label(url)
             log.warning(
                 "connect denied: FhirLookup %r host %r not in [egress].allowed_http", name, host
             )
@@ -468,7 +471,7 @@ def check_egress_allowed(
         url = str(dest.settings.get("url", ""))
         refuse_url_credentials(url, f"outbound {dest.name!r} 'url'", error=WiringError)
         if not _http_egress_allowed(url, egress.allowed_http):
-            host = _egress_host_label(url)
+            host = url_host_label(url)
             log.warning(
                 "egress denied: outbound %r %s host %r not in [egress].allowed_http",
                 dest.name,
@@ -675,19 +678,6 @@ def _dir_egress_allowed(directory: str, allowed: list[str]) -> bool:
         if target == base or base in target.parents:
             return True
     return False
-
-
-def _egress_host_label(url: str) -> str:
-    """The host an egress refusal may print (BACKLOG #1793, #2686): ``url_host_label``, which
-    withholds the host wherever ``_redact_url`` would. urllib unquotes the host, so one that holds an
-    ``@`` once unquoted is userinfo written as ``%40``. One that holds a ``:`` is a password head
-    whose port both readers in ``refuse_url_credentials`` miss, so the data arms pass it too.
-
-    Every egress check runs BEFORE the connector constructor, so the construction refusal in the
-    connector never speaks first. The data, token and FhirLookup arms therefore also call
-    ``refuse_url_credentials`` up front, for a refusal that names the setting. The proxy arm cannot,
-    since a proxy may carry its own userinfo, and this label is what keeps its message clean."""
-    return url_host_label(url)
 
 
 def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
