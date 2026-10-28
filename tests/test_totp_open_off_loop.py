@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -122,6 +122,14 @@ async def _longest_stall[T](work: Awaitable[T]) -> tuple[T, float]:
     return result, max(stalls)
 
 
+@pytest.fixture
+async def store() -> AsyncIterator[MessageStore]:
+    """An in-memory store, closed at teardown."""
+    s = await MessageStore.open(":memory:")
+    yield s
+    await s.close()
+
+
 @pytest.mark.parametrize("on_loop", [False, True], ids=["off-loop", "control-on-loop"])
 async def test_a_combined_sign_in_does_not_stall_the_loop_on_a_blocking_decrypt(
     monkeypatch: pytest.MonkeyPatch, on_loop: bool
@@ -163,57 +171,56 @@ async def test_a_combined_sign_in_does_not_stall_the_loop_on_a_blocking_decrypt(
 
 
 async def test_the_service_paths_that_open_the_totp_cell_open_it_off_the_loop(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
     """At least these service paths open the TOTP cell in a worker thread: the enrolment's confirm,
     the combined sign-in, the two-step verify (its code check and its before-and-after enrolment
     reads), a replayed code's failed spend (its after-read), a way-past gate (``_totp_state``), and
     the status read where a re-enrolment is possible. The lockable-account census is not among them:
     it reads through the store's ``get_totp_secret``, whose decrypt is the store's own."""
-    store = await MessageStore.open(":memory:")
-    try:
-        real_open = store.open_totp_secret
-        seen: dict[str, list[threading.Thread]] = {}
-        path = ["setup"]
+    real_open = store.open_totp_secret
+    seen: dict[str, list[threading.Thread]] = {}
+    path = ["setup"]
 
-        def spy(user_id: str, cell: str | None) -> str | None:
-            seen.setdefault(path[0], []).append(threading.current_thread())
-            return real_open(user_id, cell)
+    def spy(user_id: str, cell: str | None) -> str | None:
+        seen.setdefault(path[0], []).append(threading.current_thread())
+        return real_open(user_id, cell)
 
-        def install() -> None:
-            path[0] = "confirm"
-            monkeypatch.setattr(store, "open_totp_secret", spy)
+    def install() -> None:
+        path[0] = "confirm"
+        monkeypatch.setattr(store, "open_totp_secret", spy)
 
-        service, identity, password, steps, _codes = await _totp_admin(
-            store, monkeypatch, before_confirm=install
-        )
-        path[0] = "combined"
-        assert (await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())).ok
-        path[0] = "two-step"
-        pending = await service.login(ADMIN_USERNAME, password)
-        assert pending.ok and pending.mfa_required and pending.token is not None
-        code = steps.next_code()
-        assert (await service.verify_mfa(pending.token, code)).ok
-        path[0] = "replayed"
-        again = await service.login(ADMIN_USERNAME, password)
-        assert again.ok and again.token is not None
-        assert not (await service.verify_mfa(again.token, code)).ok  # its step is spent
-        path[0] = "gate"
-        await service.must_enrol_before_rotating(identity)
-        path[0] = "status"
-        monkeypatch.setattr(totp, "reenrolment_possible", lambda: True)
-        await service.mfa_status(identity)
-        assert set(seen) == {"confirm", "combined", "two-step", "replayed", "gate", "status"}, (
-            sorted(seen)
-        )
-        # A verify opens the cell for the enrolment it checks, for the code, and again for the
-        # enrolment the row holds after the check; the replay's after-read is its third.
-        assert len(seen["two-step"]) >= 3 and len(seen["replayed"]) >= 3, seen
-        loop_thread = threading.current_thread()
-        on_loop = sorted(p for p, threads in seen.items() if loop_thread in threads)
-        assert on_loop == [], f"a TOTP cell was opened on the event loop by: {on_loop}"
-    finally:
-        await store.close()
+    service, identity, password, steps, _codes = await _totp_admin(
+        store, monkeypatch, before_confirm=install
+    )
+    path[0] = "combined"
+    assert (await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())).ok
+    path[0] = "two-step"
+    pending = await service.login(ADMIN_USERNAME, password)
+    assert pending.ok and pending.mfa_required and pending.token is not None
+    code = steps.next_code()
+    assert (await service.verify_mfa(pending.token, code)).ok
+    path[0] = "replayed"
+    again = await service.login(ADMIN_USERNAME, password)
+    assert again.ok and again.token is not None
+    assert not (await service.verify_mfa(again.token, code)).ok  # its step is spent
+    path[0] = "gate"
+    await service.must_enrol_before_rotating(identity)
+    path[0] = "status"
+    monkeypatch.setattr(totp, "reenrolment_possible", lambda: True)
+    await service.mfa_status(identity)
+    assert set(seen) == {"confirm", "combined", "two-step", "replayed", "gate", "status"}, sorted(
+        seen
+    )
+    # Cannot fail once the equality above passes. It restates that census in a form the
+    # vacuous-absence lint reads as a guard on the on-loop walk below; the equality is the check.
+    assert seen, "the spy recorded no open, so the on-loop walk below would inspect nothing"
+    # A verify opens the cell for the enrolment it checks, for the code, and again for the
+    # enrolment the row holds after the check; the replay's after-read is its third.
+    assert len(seen["two-step"]) >= 3 and len(seen["replayed"]) >= 3, seen
+    loop_thread = threading.current_thread()
+    on_loop = sorted(p for p, threads in seen.items() if loop_thread in threads)
+    assert on_loop == [], f"a TOTP cell was opened on the event loop by: {on_loop}"
 
 
 async def test_a_cell_that_did_not_open_before_the_check_spends_no_code(
