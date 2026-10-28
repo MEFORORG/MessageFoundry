@@ -184,8 +184,8 @@ one, so take these steps in order, and stop at the first that clears it:
 2. **Re-seal a row under a retired version.** Only if the row was sealed under a version the audit
    key's `min_decryption_version` has retired: lower the minimum until the row verifies, save it
    again (a custom role through its edit, a directory map through `PUT /ad-group-map` or
-   `PUT /ad-group-scope-map` with its pairs), which seals it under the latest version, then raise
-   the minimum again.
+   `PUT /ad-group-scope-map` with its pairs), which seals it under the latest version. Raise the
+   minimum again only once no row sealed under a retired version remains, as the rule above says.
 3. **Delete or clear it, as the last resort.** A row that still does not verify may be planted.
    Delete the custom role and create it again, or clear the directory map by saving it with no
    entries and enter its pairs again. Both replace what the row held.

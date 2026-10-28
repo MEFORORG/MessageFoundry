@@ -1415,12 +1415,18 @@ _TRANSIT_UNVERIFIABLE_CAUSE = "transit-unverifiable"
 #: addresses or of planted rows, cannot open an alert instance, and send a page, per key. The
 #: security-signal detectors (``security_signals.py``) and the unverifiable-row pages share it.
 MAX_SUBJECT_ALERTS: Final = 5
-#: The window the unverifiable-row cap counts over: twice the sealer's per-row page interval
+#: The window the unverifiable-row cap counts over: three times the sealer's per-row page interval
 #: (``row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS``), spelled here to import nothing from the
-#: store. Strictly longer than the interval, so a row that stays unverifiable pages again before
-#: its own entry ages out, and keeps its own subject for as long as it keeps paging. At exactly
-#: the interval, the entry would always be evicted first.
-_UNVERIFIABLE_SUBJECT_WINDOW_SECONDS: Final = 600.0
+#: store. A row read steadily pages at most about two intervals apart, because the reader's own
+#: per-row throttle sits in series with the sealer's, so this window outlasts that gap: a row that
+#: stays unverifiable pages again before its own entry ages out, and keeps its own subject for as
+#: long as it keeps paging. At exactly the interval, the entry would always be evicted first.
+_UNVERIFIABLE_SUBJECT_WINDOW_SECONDS: Final = 900.0
+#: The longest per-row subject raised under its own name. A stored row's id is not bounded, and
+#: SQL Server holds an alert instance's key in NVARCHAR(256), so a longer one, a planted row's say,
+#: pages under the shared ``":*"`` subject rather than failing the alert write. The same bound
+#: the security signals keep (``security_signals._SUBJECT_LIMIT``).
+_UNVERIFIABLE_SUBJECT_LIMIT: Final = 200
 
 
 class SubjectCap:
@@ -1472,7 +1478,10 @@ def transit_seal_alert(
         if cause.partition(":")[0] == _TRANSIT_UNVERIFIABLE_CAUSE:
             # "transit-unverifiable:<row>" keeps its ":<row>" on the subject, within the cap.
             subject = TRANSIT_SEAL_UNVERIFIABLE_SUBJECT + cause[len(_TRANSIT_UNVERIFIABLE_CAUSE) :]
-            if not cap.named(subject, clock()):
+            if len(subject) > _UNVERIFIABLE_SUBJECT_LIMIT:
+                subject = f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:*"
+                reason += "; the row's key is too long for a subject of its own"
+            elif not cap.named(subject, clock()):
                 subject = f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:*"
                 reason += f"; {MAX_SUBJECT_ALERTS} other rows already paged this window"
         else:

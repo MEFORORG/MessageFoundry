@@ -1194,17 +1194,20 @@ async def test_a_held_reconcile_pass_confirms_nobody_behind_a_trip(
     service._reconcile_breaker_standing = "tripped"
     service._reconcile_hold_standing = "held"
     service._reconcile_unconfirmed = {user.id}
+    service._reconcile_alert = "synthetic: the breaker tripped"
     await _set_map_version(path, unverifiable, planted=True)
     _lapse_cache(store)
     held = await service.reconcile_directory_sessions()
     assert held.aborted is None and held.outcomes[user.id] is reconcile.ProbeOutcome.PRESENT
     assert (held.breaker_clear, held.hold_clear) == (False, False)
     assert service._reconcile_unconfirmed == {user.id}
+    assert service.directory_reconcile_alert == "synthetic: the breaker tripped"
     # Control: once the map verifies again, the same read confirms the account and clears.
     await _set_map_version(path, unverifiable, planted=False)
     _lapse_cache(store)
     clean = await service.reconcile_directory_sessions()
     assert service._reconcile_unconfirmed == set()
+    assert service.directory_reconcile_alert is None
     assert (clean.breaker_clear, clean.hold_clear) == (True, True)
 
 
@@ -1506,17 +1509,37 @@ def test_the_cli_names_vault_first_for_an_unverifiable_write() -> None:
 
 def test_the_cap_window_outlasts_the_sealers_per_row_page_interval() -> None:
     """alerts.py spells the window to import nothing from the store; this ties the two. The window
-    must be strictly longer than the interval: at equal values a row's entry has always aged out
-    by the time its throttle lets it page again, so a row that keeps paging could be folded into
-    the aggregate subject.
+    must outlast the gap between a steadily read row's pages, about two intervals since the
+    reader's throttle sits in series with the sealer's: at equal values a row's entry has always
+    aged out by the time its throttle lets it page again, so a row that keeps paging could be
+    folded into the aggregate subject.
 
-    RED when: the window is at most the interval."""
+    RED when: the window is no longer than two intervals."""
     from messagefoundry.pipeline import alerts
 
     assert (
         alerts._UNVERIFIABLE_SUBJECT_WINDOW_SECONDS
-        == 2 * row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS
+        == 3 * row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS
     )
+
+
+def test_a_row_key_too_long_for_a_subject_pages_under_the_aggregate() -> None:
+    """A stored row's id is not bounded, and a server store keys an alert instance in at most 256
+    characters, so a planted row with a long id pages under the shared subject, not a key that
+    would fail the alert write. Control: a short key keeps its own subject.
+
+    RED when: the subject is raised unbounded."""
+    from messagefoundry.pipeline import alerts
+
+    raised: list[str] = []
+    sink = LoggingAlertSink()
+    sink.integrity_drift = lambda name, *, reason, drift_count: raised.append(name)  # type: ignore[method-assign]
+    hook = transit_seal_alert(sink, clock=lambda: 1000.0)
+    hook(f"{row_seal.TRANSIT_UNVERIFIABLE_CAUSE}:role:{'x' * 300}", "r")
+    assert raised == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:*"]
+    assert all(len(s) <= alerts._UNVERIFIABLE_SUBJECT_LIMIT for s in raised)
+    hook(f"{row_seal.TRANSIT_UNVERIFIABLE_CAUSE}:role:short", "r")
+    assert raised[-1] == f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:role:short"
 
 
 def test_a_row_that_keeps_paging_keeps_its_own_subject_past_the_cap() -> None:

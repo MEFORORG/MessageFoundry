@@ -3023,8 +3023,8 @@ class CustomRoleUnverifiableError(Exception):
             " was not saved: a save would replace the permissions it may still hold."
             f" {UNVERIFIABLE_RECOVERY} Only if the role was sealed under a key version the audit"
             " key's min_decryption_version has retired, lower that minimum until the role"
-            " verifies and save it again, which re-seals it, then raise the minimum back at once,"
-            " so the retired versions are refused again; deleting the role and creating it"
+            " verifies and save it again, which re-seals it, and raise the minimum back only once"
+            " no row sealed under a retired version remains; deleting the role and creating it"
             " again is the last resort"
         )
 
@@ -3048,8 +3048,8 @@ class AdMapUnverifiableError(Exception):
             " cannot be listed or replaced: an edit would overwrite the pairs it may still hold."
             f" {UNVERIFIABLE_RECOVERY} Only if the map was sealed under a key version the audit"
             " key's min_decryption_version has retired, lower that minimum until the map verifies"
-            " and save it again, which re-seals it, then raise the minimum back at once, so the"
-            " retired versions are refused again; clearing the map by saving it with no entries"
+            " and save it again, which re-seals it, and raise the minimum back only once no row"
+            " sealed under a retired version remains; clearing the map by saving it with no entries"
             " (PUT /ad-group-map or /ad-group-scope-map) and entering its pairs again is the last"
             " resort"
         )
@@ -8142,7 +8142,9 @@ class AuthService:
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
             return plan
 
-        self._reconcile_alert = None
+        if not diffs_held:
+            # A held pass judged no account, so a latched breaker message is not cleared by it.
+            self._reconcile_alert = None
         if plan.unavailable:
             _log.warning(
                 "directory reconcile: %d of %d principals asked could not be resolved (directory "
