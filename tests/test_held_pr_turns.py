@@ -46,8 +46,19 @@ def _sha(n: int) -> str:
     return f"{n:040x}"
 
 
-def _comment(body: str, at: str, login: str = LOGIN, typename: str = "User") -> dict[str, Any]:
-    return {"body": body, "createdAt": at, "author": {"__typename": typename, "login": login}}
+def _comment(
+    body: str,
+    at: str,
+    login: str = LOGIN,
+    typename: str = "User",
+    association: str = "OWNER",
+) -> dict[str, Any]:
+    return {
+        "body": body,
+        "createdAt": at,
+        "authorAssociation": association,
+        "author": {"__typename": typename, "login": login},
+    }
 
 
 def _hold(at: str, sha: str | None, *, still: bool = False) -> dict[str, Any]:
@@ -241,30 +252,77 @@ def test_classification_keys_on_body_prefix_not_login(
     assert rows[8]["flags"] == ["no-lander-comment"]
 
 
-def test_review_body_counts_but_bot_and_empty_reviews_do_not(
+def _review(body: str, at: str, *, state: str = "COMMENTED", bot: bool = False) -> dict[str, Any]:
+    return {
+        "body": body,
+        "state": state,
+        "submittedAt": at,
+        "authorAssociation": "NONE" if bot else "OWNER",
+        "author": {
+            "__typename": "Bot" if bot else "User",
+            "login": "greptile-apps" if bot else LOGIN,
+        },
+    }
+
+
+def test_bot_review_does_not_move_the_turn_but_dates_the_pr(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    hold = _hold("2026-10-28T12:00:00Z", _sha(9))
-    bot = {
-        "body": "<!-- greptile-auto-approve -->",
-        "submittedAt": "2026-10-28T14:00:00Z",
-        "author": {"__typename": "Bot", "login": "greptile-apps"},
-    }
-    empty = {"body": "", "submittedAt": "2026-10-28T14:30:00Z", "author": {"__typename": "User"}}
-    reply = {
-        "body": "Author: fixed, see thread.",
-        "submittedAt": "2026-10-28T15:00:00Z",
-        "author": {"__typename": "User", "login": LOGIN},
-    }
+    bot = _review("<!-- greptile-auto-approve -->", "2026-10-28T14:30:00Z", bot=True)
+    pr = _pr(9, comments=[_hold("2026-10-28T12:00:00Z", _sha(9))], reviews=[bot])
+    row = _engine_rows(tmp_path, capsys, pr)[9]
+    assert (row["turn"], row["flags"]) == ("AUTHOR", ["held"])
+    assert row["age"] == "3h30m"
+
+
+def test_review_bodies_and_inline_only_reviews_count_as_replies(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    reply = _review("Author: fixed, see thread.", "2026-10-28T15:00:00Z")
+    inline_only = _review("", "2026-10-28T15:00:00Z")
     rows = _engine_rows(
         tmp_path,
         capsys,
-        _pr(9, comments=[hold], reviews=[bot, empty]),
         _pr(10, comments=[_hold("2026-10-28T12:00:00Z", _sha(10))], reviews=[reply]),
+        _pr(13, comments=[_hold("2026-10-28T12:00:00Z", _sha(13))], reviews=[inline_only]),
     )
-    assert (rows[9]["turn"], rows[9]["flags"]) == ("AUTHOR", ["held"])
-    assert rows[9]["age"] == "3h30m"  # the ignored events still date the PR
     assert (rows[10]["turn"], rows[10]["flags"]) == ("LANDER", ["no-new-commit"])
+    assert (rows[13]["turn"], rows[13]["flags"]) == ("LANDER", ["no-new-commit"])
+
+
+def test_pending_review_and_minimized_comment_are_ignored(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pending = _review("Manager: draft, not submitted.", "2026-10-28T15:00:00Z", state="PENDING")
+    hidden = _comment("Manager: ready for landing.", "2026-10-28T15:00:00Z")
+    hidden["isMinimized"] = True
+    pr = _pr(14, comments=[_hold("2026-10-28T12:00:00Z", _sha(14)), hidden], reviews=[pending])
+    row = _engine_rows(tmp_path, capsys, pr)[14]
+    assert (row["turn"], row["flags"]) == ("AUTHOR", ["held"])
+
+
+def test_outside_account_cannot_post_a_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _comment(
+        f"Lander (session x). **Held, at `{_sha(15)[:9]}`.**",
+        "2026-10-28T12:00:00Z",
+        login="someone",
+        association="NONE",
+    )
+    row = _engine_rows(tmp_path, capsys, _pr(15, comments=[fake]))[15]
+    assert (row["turn"], row["flags"]) == ("LANDER", ["no-lander-comment"])
+
+
+def test_bold_held_quoted_in_a_non_hold_comment_is_not_a_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    body = (
+        "Lander (session x). **Cleared; merging once CI is green.** The earlier **Held** is fixed."
+    )
+    pr = _pr(16, comments=[_comment(body, "2026-10-28T12:00:00Z")])
+    row = _engine_rows(tmp_path, capsys, pr)[16]
+    assert (row["turn"], row["flags"]) == ("LANDER", ["lander-not-hold"])
 
 
 def test_hold_without_sha_falls_back_to_commit_date(
@@ -285,6 +343,36 @@ def test_hold_sha_reads_the_headline_only() -> None:
     body = "Lander (session x). **Held, at `1234567ab`.** The fix `fedcba987` is elsewhere."
     assert hpt.hold_sha(body) == "1234567ab"
     assert hpt.hold_sha("Lander (session x). **Held.** See `fedcba987`.") is None
+    # The SHA after "at" wins over another commit the headline names.
+    assert hpt.hold_sha("x **Held: fix `bbbbbbb` missing, at `aaaaaaa`.**") == "aaaaaaa"
+    # The only SHA in the headline is read; two with none after "at" name no head.
+    assert hpt.hold_sha("x **Held, back to the author (`aaaaaaa`).**") == "aaaaaaa"
+    assert hpt.hold_sha("x **Held: `bbbbbbb` and `ccccccc` are missing.**") is None
+    # A recap of an earlier hold before the bold headline is outside it.
+    recap = "Lander (session x). Earlier hold at `ccccccc`. **Still held, at `aaaaaaa`.**"
+    assert hpt.hold_sha(recap) == "aaaaaaa"
+
+
+def test_non_utc_stamp_and_odd_number_do_not_break_the_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    odd = _pr(80, committed="2026-10-28T12:00:00+02:00")
+    odd["number"] = "eighty"
+    code, rows = _run(
+        tmp_path, {ENGINE: {"pages": [_page([odd])], "required": ENGINE_REQUIRED}}, capsys
+    )
+    assert code == 0
+    row = next(r for r in rows if r["repo"] == ENGINE)
+    assert row["newestEvent"] == "2026-10-28T10:00:00Z"
+
+
+def test_table_names_the_reason_for_an_unknown_green(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    doc = {ENGINE: {"pages": [_page([_pr(81), _pr(82)])]}}
+    code, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
+    assert code == 0
+    assert "note: MessageFoundry GREEN ? on 2 PR(s): required list unreadable" in out
 
 
 def test_vault_pr_uses_the_vault_required_list(

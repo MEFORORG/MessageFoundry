@@ -16,7 +16,11 @@ WHY PYTHON, AND WHAT IT REUSES. ``pr_state.py`` beside it says why coord tooling
 Python. This script loads ``pr_state.py`` by path and reuses its gh runner, GraphQL wrapper,
 ``fetch_required`` (branch protection plus rulesets, parsed by ``scripts/ci/required_contexts.py``)
 and ``required_verdict`` (per-context verdicts through ``scripts/ci/_pr_checks.py``), so there is no
-second check-run classifier here to drift. One consequence: a required context whose newest run
+second check-run classifier here to drift. It is fed less than ``pr_state`` feeds it: GitHub's
+per-run ``isRequired`` needs a PR number argument, which a paginated PR list cannot pass, so here a
+same-named run from an app the rule does not count is read as speaking for the context, and a
+context GitHub requires but the list omits is not surfaced. GREEN is advisory: before arming a
+merge the Lander still reads the live list, as CLAUDE.md section 5 requires. One consequence: a required context whose newest run
 concluded NEUTRAL or SKIPPED counts as green, as ``_pr_checks.PASSING`` and branch protection both
 read it. A required context with no result on the head yet is NOT green.
 
@@ -28,31 +32,40 @@ engine's required list costs two REST calls more, through ``fetch_required``.
 CLASSIFICATION -- BY BODY PREFIX, NEVER BY AUTHOR LOGIN. Every seat posts under the same GitHub
 login, so the login says nothing about which seat wrote a comment.
 
-* A Lander comment is one whose body, after leading whitespace, starts with ``Lander (session``.
-  ("Lander handover from the batch 453 Manager" is a Manager's comment, and is not one.)
-* A hold is a Lander comment containing ``**Held`` or ``**Still held``.
+* A Lander comment is one whose body, after leading whitespace, starts with ``Lander (session``,
+  from an account whose ``authorAssociation`` is OWNER, MEMBER or COLLABORATOR. ("Lander handover
+  from the batch 453 Manager" is a Manager's comment, and is not one.) The association check is not
+  a seat check: it only stops an outside account on a public repository from posting a fake hold
+  that would park a PR on its author. A comment from an outside account still counts as a newer
+  non-Lander comment, which can only hand the turn TO the Lander, the safe direction.
+* A hold is a Lander comment whose headline, the first bold run (``**...**``), opens with ``Held``
+  or ``Still held``. A bold ``**Held**`` quoted later in a non-hold comment is not a hold.
 * LANDER's turn: there is no Lander comment; or the latest Lander comment is not a hold; or there is
   a commit newer than the latest hold; or a non-Lander comment newer than it.
 * AUTHOR's turn: the latest Lander comment is a hold and nothing is newer.
 
-"A commit newer than the hold". A hold names the head it held at in backticks, e.g.
-``**Held, back to the author, at `f4f4dd470`.**``. That is the preferred signal: if the hold names a
-SHA and the current head does not start with it, there is a new commit. Only when the hold names no
-SHA does this fall back to the head commit's ``committedDate`` against the hold's ``createdAt``. That
-is the weaker signal: ``committedDate`` is when the commit was made, not pushed, so a rebase or an
-old local commit pushed after the hold can predate it. Rows decided that way carry ``date-fallback``.
+"A commit newer than the hold". A hold names the head it held at in backticks in its headline,
+e.g. ``**Held, back to the author, at `f4f4dd470`.**``. That is the preferred signal: if the hold
+names a SHA and the current head does not start with it, there is a new commit. The SHA read is the
+one after ``at``; failing that, the headline's only backticked SHA. A headline naming several SHAs
+with none after ``at`` names no head. Only when the hold names no head does this fall back to the
+head commit's ``committedDate`` against the hold's ``createdAt``. That is the weaker signal:
+``committedDate`` is the committer date, not the push time, so an old local commit pushed after the
+hold, or a rewrite with ``--committer-date-is-author-date``, can predate it. (A plain rebase rewrites
+the committer date, so it is caught.) Rows decided that way carry ``date-fallback``.
 
-WHAT COUNTS AS A COMMENT (the choice made here). Issue comments and PR review bodies both count, and
-both are classified by the same body prefix, so a Lander verdict posted as a review body is a Lander
-comment. Two things are skipped for the TURN, though both still count toward the newest-event age:
+WHAT COUNTS AS A COMMENT (the choice made here). Issue comments and submitted PR reviews both count,
+and both are classified by the same body prefix, so a Lander verdict posted as a review body is a
+Lander comment. A review with an empty body counts as a non-Lander comment, because an inline-only
+review is how an author answers a finding in its thread. Skipped entirely: a PENDING review (every
+seat shares one login, so each sees the others' unsubmitted drafts, which the author cannot) and a
+minimized comment or review. Skipped for the TURN, though still counted toward the newest-event
+age: anything authored by a GitHub App or bot (GraphQL ``author.__typename == "Bot"``), such as the
+greptile auto-approve review a push triggers. A bot reacting to a push is not the author moving;
+the push itself is the move, and it is caught as a new commit. This keys on the author's TYPE, not
+its login, so it never separates two seats.
 
-* a review with an empty body (inline-only or a bare approval): there is no text to read as a move;
-* anything authored by a GitHub App or bot (GraphQL ``author.__typename == "Bot"``), such as the
-  greptile auto-approve review a push triggers. A bot reacting to a push is not the author moving;
-  the push itself is the move, and it is caught as a new commit. This keys on the author's TYPE,
-  not its login, so it never separates two seats.
-
-Inline review-thread comments are not read. Only the latest ``COMMENT_PAGE`` issue comments and
+Inline review-thread comment bodies are not read. Only the latest ``COMMENT_PAGE`` issue comments and
 ``REVIEW_PAGE`` reviews are fetched, enough to hold the newest Lander comment on any PR seen so far.
 
 FLAGS. ``no-lander-comment``, ``lander-not-hold``, ``new-commit``, ``no-new-commit`` (LANDER's turn
@@ -100,9 +113,12 @@ REVIEW_PAGE = 50
 TITLE_WIDTH = 50
 
 LANDER_PREFIX = "Lander (session"
-HOLD_MARKERS = ("**Held", "**Still held")
-#: A SHA named in backticks. Bounded and literal, so the ReDoS scanner resolves it statically.
+HOLD_HEADS = ("Held", "Still held")
+#: Associations whose comments may be Lander comments: accounts with standing on the repository.
+TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+#: SHAs named in backticks. Bounded and literal, so the ReDoS scanner resolves them statically.
 _SHA_IN_BACKTICKS = re.compile(r"`([0-9a-fA-F]{7,40})`")
+_SHA_AFTER_AT = re.compile(r"\bat `([0-9a-fA-F]{7,40})`")
 
 LANDER = "LANDER"
 AUTHOR = "AUTHOR"
@@ -128,9 +144,14 @@ query($owner: String!, $name: String!, $cursor: String) {
             }
           }
         } } } }
-        comments(last: %COMMENT_PAGE%) { nodes { body createdAt author { __typename login } } }
+        comments(last: %COMMENT_PAGE%) {
+          nodes { body createdAt authorAssociation isMinimized author { __typename login } }
+        }
         reviews(last: %REVIEW_PAGE%) {
-          nodes { body createdAt submittedAt author { __typename login } }
+          nodes {
+            body state createdAt submittedAt authorAssociation isMinimized
+            author { __typename login }
+          }
         }
       }
     }
@@ -184,18 +205,15 @@ class Event:
     when: datetime
     body: str
     bot: bool
+    trusted: bool
 
     @property
     def lander(self) -> bool:
-        return self.body.lstrip().startswith(LANDER_PREFIX)
+        return self.trusted and self.body.lstrip().startswith(LANDER_PREFIX)
 
     @property
     def hold(self) -> bool:
-        return self.lander and any(m in self.body for m in HOLD_MARKERS)
-
-    @property
-    def counts_for_turn(self) -> bool:
-        return not self.bot and bool(self.body.strip())
+        return self.lander and headline(self.body).lstrip().startswith(HOLD_HEADS)
 
 
 _nodes = pr_state._nodes
@@ -208,7 +226,11 @@ def _events(pr: dict[str, Any]) -> list[Event]:
         ("reviews", ("submittedAt", "createdAt")),
     ):
         for node in _nodes(pr.get(kind)):
-            if not isinstance(node, dict):
+            if (
+                not isinstance(node, dict)
+                or node.get("isMinimized")
+                or node.get("state") == "PENDING"
+            ):
                 continue
             when = next(
                 (w for k in stamp_keys if (w := pr_state.parse_iso(node.get(k))) is not None), None
@@ -217,31 +239,38 @@ def _events(pr: dict[str, Any]) -> list[Event]:
                 continue
             author = node.get("author")
             bot = isinstance(author, dict) and author.get("__typename") == "Bot"
-            out.append(Event(when, str(node.get("body") or ""), bot))
+            trusted = node.get("authorAssociation") in TRUSTED_ASSOCIATIONS
+            out.append(Event(when, str(node.get("body") or ""), bot, trusted))
     return out
 
 
-def hold_sha(body: str) -> str | None:
-    """The SHA a hold names in backticks inside its bold headline, lower-cased, or None.
+def headline(body: str) -> str:
+    """The text of a comment's first bold run (``**...**``), or ``""`` where it has none."""
+    start = body.find("**")
+    end = body.find("**", start + 2) if start >= 0 else -1
+    return body[start + 2 : end] if end >= 0 else ""
 
-    Only the bold run that opens at the hold marker is searched, so a SHA quoted later in the body
-    (a fix commit, a parent) is never mistaken for the held head.
+
+def hold_sha(body: str) -> str | None:
+    """The head a hold names in its headline, lower-cased, or None.
+
+    Only the headline is searched, so a SHA quoted later in the body (a fix commit, a parent, an
+    earlier hold recapped) is never mistaken for the held head. Within it, the SHA after ``at``
+    wins; otherwise the only backticked SHA. Two or more with none after ``at`` name no head.
     """
-    starts = [i for m in HOLD_MARKERS if (i := body.find(m)) >= 0]
-    if not starts:
-        return None
-    start = min(starts)
-    end = body.find("**", start + 2)
-    headline = body[start : end if end >= 0 else len(body)]
-    match = _SHA_IN_BACKTICKS.search(headline)
-    return match.group(1).lower() if match else None
+    head = headline(body)
+    match = _SHA_AFTER_AT.search(head)
+    if match:
+        return match.group(1).lower()
+    found = _SHA_IN_BACKTICKS.findall(head)
+    return found[0].lower() if len(found) == 1 else None
 
 
 def classify(
     head_oid: str, committed: datetime | None, events: Iterable[Event]
 ) -> tuple[str, list[str]]:
     """``(turn, flags)`` for one PR. Pure; the module docstring states the rules."""
-    turn_events = [e for e in events if e.counts_for_turn]
+    turn_events = [e for e in events if not e.bot]
     landers = [e for e in turn_events if e.lander]
     if not landers:
         return LANDER, ["no-lander-comment"]
@@ -282,7 +311,6 @@ def _required_green(
     head_oid = str(pr.get("headRefOid") or "")
     contexts: dict[str, Any] | None = None
     if head.get("oid") == head_oid:
-        # commits(last: 1) is not guaranteed to be the head; a verdict on another commit is none.
         rollup = head.get("statusCheckRollup")
         conn = rollup.get("contexts") if isinstance(rollup, dict) else None
         page = conn.get("pageInfo") if isinstance(conn, dict) else None
@@ -308,7 +336,9 @@ def build_rows(repo: str, read: RepoRead, now: datetime) -> list[dict[str, Any]]
             continue
         head = pr_state._head_commit(pr)
         head_oid = str(pr.get("headRefOid") or "")
-        committed = pr_state.parse_iso(head.get("committedDate"))
+        # commits(last: 1) may not be the head; another commit's date says nothing about a push.
+        on_head = head.get("oid") == head_oid
+        committed = pr_state.parse_iso(head.get("committedDate")) if on_head else None
         events = _events(pr)
         turn, flags = classify(head_oid, committed, events)
         green, verdict = _required_green(pr, head, read)
@@ -329,7 +359,7 @@ def build_rows(repo: str, read: RepoRead, now: datetime) -> list[dict[str, Any]]
                 },
                 "turn": turn,
                 "flags": flags,
-                "newestEvent": newest.strftime("%Y-%m-%dT%H:%M:%SZ") if newest else None,
+                "newestEvent": pr_state.iso(newest) if newest else None,
                 "age": age_text(age) if age is not None else "?",
                 "ageSeconds": age,
             }
@@ -347,7 +377,7 @@ def sort_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             order.get(row["turn"], 3),
             -(age if isinstance(age, int) else -1),
             row["repo"],
-            int(row.get("number") or 0),
+            number if isinstance(number := row.get("number"), int) else 0,
         )
 
     return sorted(rows, key=key)
@@ -451,6 +481,14 @@ def render(rows: list[dict[str, Any]]) -> str:
         "  ".join([*(cell.ljust(w) for cell, w in zip(r[:-1], widths, strict=True)), r[-1]])
         for r in table
     ]
+    # A "?" carries its reason only in the JSON; name each distinct one here, so the table does
+    # not hide why a column could not be read.
+    unknown: dict[tuple[str, str], int] = {}
+    for row in rows:
+        if row["turn"] != ERROR and row["requiredGreen"] == "?":
+            why = (row["repo"].split("/", 1)[-1], str(row["required"].get("reason")))
+            unknown[why] = unknown.get(why, 0) + 1
+    lines += [f"note: {repo} GREEN ? on {n} PR(s): {why}" for (repo, why), n in unknown.items()]
     return "\n".join(line.rstrip() for line in lines)
 
 
