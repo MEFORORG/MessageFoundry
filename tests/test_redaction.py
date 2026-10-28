@@ -7,10 +7,13 @@ safe_name() derives a safe label for a partner-chosen file name, which redact() 
 
 from __future__ import annotations
 
+import hashlib
 import http.client
+import inspect
 import logging
 import random
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator
 from typing import Any, SupportsIndex
@@ -28,7 +31,7 @@ from messagefoundry.redaction import (
     safe_name,
     safe_text,
 )
-from tests._cpu_clock import cpu_seconds as _cpu_seconds
+from tests._cpu_clock import CPU_SAMPLE_FLOOR_SECONDS
 from tests.test_log_redaction_secret_domain import PCT_STARTED
 
 ADT = (
@@ -229,6 +232,113 @@ _CPU_GROWTH_LINE = 24.0
 #: wall-clock budget, on purpose.** The ratio is what the arm is about; this bound keeps a linear
 #: path with a ruinous constant from passing. It is the same 0.5 s the MRN arm uses.
 _CPU_CEILING_SECONDS = 0.5
+
+
+#: The line between "charged for another thread's hash" and "not". Measured 2026-10-27 (Central) on a
+#: 32-way Windows box, twenty runs idle and twenty beside a GIL-holding spinner thread: across a
+#: 256 MiB hash the process clock moved 0.094 to 0.156 s idle and 0.250 to 0.344 s beside the
+#: spinner, at least 1.9 times over; the sampler's clock read 0.0000 in all forty. A runner with a
+#: faster SHA-256 than this box would thin the process side, which is the control, not the arm.
+_OTHER_THREAD_LINE_SECONDS = 0.05
+
+
+def _thread_cpu_sample(
+    work: Callable[[], object], clock: Callable[[], float] = time.thread_time
+) -> float:
+    """CPU seconds per call of ``work``, over one sample at least ``CPU_SAMPLE_FLOOR_SECONDS`` of
+    ``clock`` long, for the reason ``tests._cpu_clock`` gives.
+
+    **The CALLING THREAD's clock, not the process clock that helper reads (BACKLOG #3721).** The
+    process clock charges every thread in the worker, so a thread an earlier test left running is
+    billed to whichever side of a ratio it overlaps. Busy while the small side is sampled and gone
+    before the large one, it deflates the ratio, which is the direction that reds a control. The
+    readings are under :func:`test_a_credential_search_from_index_0_is_quadratic_on_the_same_line`;
+    :func:`test_the_cpu_sample_charges_the_measuring_thread_only` pins the property, reading the
+    default of ``clock``, which is a parameter for that reason alone.
+
+    **What it gives up: work moved off the calling thread reads as free.** Every arm on it times a
+    call that runs synchronously on the caller's thread, which is the property the event-loop
+    argument rests on; a scan moved to a helper thread would need its arm re-derived.
+
+    **Not exact either.** On Windows this clock moves in the same 15.625 ms ticks as the process
+    clock, and each tick is charged to whichever thread holds the core at it. For work that runs
+    straight through on the calling thread the floor caps that error. For work that blocks, or that
+    hands the GIL to a busy thread, the charge is sampled, and a sample can read LOW by tens of
+    percent; keeping the minimum then picks the lowest."""
+    calls = 0
+    start = clock()
+    while True:
+        work()
+        calls += 1
+        spent = clock() - start
+        if spent >= CPU_SAMPLE_FLOOR_SECONDS:
+            return spent / calls
+
+
+def _interleaved_growth(
+    small: Callable[[], object], large: Callable[[], object], large_reps: int = 3
+) -> tuple[float, float]:
+    """``(ratio, large)``: the best of at least three ``small`` samples over the best of
+    ``large_reps`` ``large`` ones, and the large reading alone.
+
+    **Paired rounds in a drawn order, not two blocks (BACKLOG #3721).** In blocks every small sample
+    came first, so a slow spell that ended during the test landed on the small side alone and
+    deflated the ratio. Each round here takes a small and a large sample, which goes first drawn from
+    an unseeded generator, the rule ``_growth_between`` in ``tests/test_log_redaction_secret_domain.py``
+    measured against a co-tenant with a fixed rhythm. Rounds past ``large_reps`` take a small sample
+    alone, so the small side always has three. A spell covering every sample of one side still moves
+    the ratio; nothing that keeps a minimum per side can cancel that."""
+    if large_reps < 1:
+        raise ValueError(
+            f"large_reps must be at least 1, not {large_reps}: no sample is no reading"
+        )
+    order = random.Random()
+    best_small = best_large = float("inf")
+    for rep in range(max(3, large_reps)):
+        sides = [True, False] if rep < large_reps else [True]
+        order.shuffle(sides)
+        for is_small in sides:
+            if is_small:
+                best_small = min(best_small, _thread_cpu_sample(small))
+            else:
+                best_large = min(best_large, _thread_cpu_sample(large))
+    return best_large / best_small, best_large
+
+
+def test_the_cpu_sample_charges_the_measuring_thread_only() -> None:
+    """The property :func:`_thread_cpu_sample` exists for (BACKLOG #3721), with the process clock as
+    its control.
+
+    The measuring thread waits while a second thread hashes 256 MiB, which ``hashlib`` does without
+    the GIL. The sampler's clock must barely move across that wait: a thread asleep in ``join`` is
+    charged no tick. The process clock must move by the hash, which is what proves the other thread
+    really burned CPU; without that control, a hash too cheap to see would pass this arm too. The
+    wait is read once rather than sampled to a floor, because a thread that blocks is charged by
+    sampling, and a ratio of such samples read 0.8 to 9.4 under review.
+
+    Measured 2026-10-27 (Central) on a 32-way Windows box: see the figures beside the line."""
+    clock = inspect.signature(_thread_cpu_sample).parameters["clock"].default
+    block = bytes(64 << 20)
+
+    def hash_four_times() -> None:
+        for _ in range(4):
+            hashlib.sha256(block).digest()
+
+    helper = threading.Thread(target=hash_four_times)
+    before_sampler, before_process = clock(), time.process_time()
+    helper.start()
+    helper.join()
+    on_sampler = clock() - before_sampler
+    on_process = time.process_time() - before_process
+
+    assert on_process > _OTHER_THREAD_LINE_SECONDS, (
+        f"the process clock moved {on_process:.4f}s across the hash, so this fixture no longer shows "
+        f"a second thread's work at all"
+    )
+    assert on_sampler < _OTHER_THREAD_LINE_SECONDS, (
+        f"the CPU sample's clock moved {on_sampler:.4f}s while its thread waited on another thread's "
+        f"work, which is how a leftover thread deflates a growth ratio"
+    )
 
 
 def _redact_seconds(reps: int) -> float:
@@ -1069,12 +1179,17 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     ratio of 7.3 to 9.1, and 5.8 to 7.0 ms at the shipped window, under ``_CPU_CEILING_SECONDS`` by
     about 70 times. The control below reads 62 to 76 for a search that restarts at index 0.
 
+    **Re-measured 2026-10-27 (Central) on the instrument BACKLOG #3721 moved it to**, on a 32-way
+    Windows box: 6.6 to 8.0 idle over six runs, and a review's runs read up to 9.8, about 2.4 times
+    under the line. The control's readings, and why
+    the instrument moved, are under the control below.
+
     **An absolute bound is kept, but it is ten times looser than the old one.** BACKLOG #2952 limit 3
     asks that an absolute bound on one clamp's cost survive. A pure ratio would give it up, so the
     shipped window is also held under ``_CPU_CEILING_SECONDS``. That ceiling passes a walk that stays
     linear but costs up to about 70 times today's, where the old budget caught about 8 times. The
     batch 255 Manager ruling on #2952 and #2958 (2026-10-13) chose that trade for headroom on a loaded
-    runner. The ratio's own margin is smaller, about 2.6 times, so load can still turn it red."""
+    runner. The ratio's own margin is smaller, about 2.4 times, so load can still turn it red."""
     growth, large = _credential_walk_growth()
     assert growth < _CPU_GROWTH_LINE, (
         f"an eight times wider window cost the credential walk {growth:.1f} times the CPU time, over "
@@ -1097,7 +1212,18 @@ def test_a_credential_search_from_index_0_is_quadratic_on_the_same_line(
     read 8 for every walk would pass the arm while measuring nothing. It patches the module global
     ``_drop_truncated_userinfo`` reads, so the whole shipping path runs the quadratic search.
 
-    One rep for the large input, because a slow sample there only helps this assertion."""
+    One rep for the large input, because a slow sample there only helps this assertion.
+
+    **A slow SMALL sample is what hurts it, and that is how it went red (BACKLOG #3721).** It read 13.6
+    and 15.3 on ``windows-2022`` merge-group legs, against 62 to 76 here. Measured 2026-10-27
+    (Central) on a 32-way Windows box, with twelve GIL-free threads started with the control and
+    left running for 0.25 s, the shape of a thread an earlier test leaves behind: the old instrument
+    (the process clock, every small sample first) read 7.9 to 23.8 over eighteen runs, every one
+    under the line. The one now in :func:`_thread_cpu_sample` and :func:`_interleaved_growth` read
+    63.4 to 90.0 under that load, and 54.2 to 80.8 idle, at least 2.2 times over the line. Forty busy
+    PROCESSES on that box moved neither clock out of its idle range, but a 4-vCPU runner, whose
+    workers share cores, is not measured. What ran on the hosted runner is not known either; this is
+    a mechanism that can give the reading, not its established cause."""
 
     def search_from_zero(text: str, cut: int) -> int:
         pos = 0
@@ -1131,20 +1257,19 @@ def _credential_walk_growth(large_reps: int = 3) -> tuple[float, float]:
 
     Both walls are checked before anything is divided, because a ratio hides a broken reading: a walk
     that stopped after a pass or two would be fast at both sizes for the wrong reason."""
-    readings = []
-    for window, reps in (
-        (redaction._REDACT_WINDOW // 8, 3),
-        (redaction._REDACT_WINDOW, large_reps),
-    ):
-        hostile = _credential_wall(window)
+    small_window, large_window = redaction._REDACT_WINDOW // 8, redaction._REDACT_WINDOW
+    small_wall, large_wall = _credential_wall(small_window), _credential_wall(large_window)
+    for window, hostile in ((small_window, small_wall), (large_window, large_wall)):
         head, _ = redaction._clamp(hostile, window - redaction._CLAMP_MARKER_BUDGET)
         assert len(head) < redaction._USERINFO_SPAN, (
             f"the walk stopped with {len(head)} characters still in hand at a {window}-character "
             f"window, so this fixture is not measuring a full-window walk"
         )
-        readings.append(_cpu_seconds(lambda: clamp_untrusted(hostile, window=window), reps))  # noqa: B023
-    small, large = readings
-    return large / small, large
+    return _interleaved_growth(
+        lambda: clamp_untrusted(small_wall, window=small_window),
+        lambda: clamp_untrusted(large_wall, window=large_window),
+        large_reps,
+    )
 
 
 def test_the_credential_walk_costs_an_ordinary_message_nothing() -> None:
@@ -1303,9 +1428,7 @@ def _frame_cap_prose_growth(
     it is near 267. An 8x pair, the shape the MRN arm uses, would read 8 unbounded and sit under the line."""
     large_text = _FRAME_CAP_SHAPES["delimiter-free prose"]()
     small_text = large_text[: redaction._REDACT_WINDOW]
-    small = _cpu_seconds(lambda: scan(small_text))
-    large = _cpu_seconds(lambda: scan(large_text), large_reps)
-    return large / small, large
+    return _interleaved_growth(lambda: scan(small_text), lambda: scan(large_text), large_reps)
 
 
 def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs() -> None:
@@ -1318,8 +1441,12 @@ def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs() -> None:
     cap, under ``_CPU_CEILING_SECONDS`` by about 90 times. The control below reads 282 to 320 for the
     unbounded scan.
 
+    **Those readings are the process clock's.** Re-measured 2026-10-27 (Central) on the instrument
+    BACKLOG #3721 moved this file to, over four runs: 0.84 to 1.14, 4.95 to 7.25 ms, and 237 to 275
+    for the control.
+
     **The ceiling is an absolute bound of the kind BACKLOG #2952 limit 3 asks to keep**, ten times looser than
-    the old line: it passes a scan up to about 90 times today's. ``safe_text`` runs the whole clamp on
+    the old line: it passes a scan up to about 69 times today's, on the re-measured 7.25 ms. ``safe_text`` runs the whole clamp on
     this input, the name walk included."""
     growth, large = _frame_cap_prose_growth(safe_text)
     assert growth < _CPU_GROWTH_LINE, (
