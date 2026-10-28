@@ -7767,11 +7767,18 @@ def _offline_security_notifier(
     never reaches this point on such a hop: settings refuse ``[alerts].email_username`` beside it
     at load (vault BACKLOG #3533 item 3).
 
-    **ANY failure to build the channel is WARNED and yields ``None`` rather than refusing.** This
-    serves a recovery command, and losing the notice is the smaller harm than losing the recovery. A
-    build error escaping here would also land after the store was created, leaving no administrator.
-    The audit row then records that no channel was wired. That covers a relay CA the trust-anchor
-    checks refuse (BACKLOG #3470): the CA is never loaded, and the notice is dropped.
+    **A failure to build the channel here is WARNED and yields ``None`` rather than refusing.**
+    This serves a recovery command, and losing the notice is the smaller harm than losing the
+    recovery. A build error escaping here would also land after the store was created, leaving no
+    administrator. The audit row then records that no channel was wired. That covers a relay CA the
+    trust-anchor checks refuse (BACKLOG #3470): the CA is never loaded, and the notice is dropped.
+
+    **One shape is refused earlier, and the command does not run.** An ``[alerts]`` SMTP login
+    (``email_username`` set) beside ``email_use_tls = false`` or ``email_tls_verify = false`` is
+    refused when settings load (vault BACKLOG #3533 item 3). That is before any store is opened or
+    created, so ``provision-admin`` and every other command that loads settings stop there and
+    leave nothing half-written. The remedy is to verify the relay's TLS, or to remove
+    ``email_username`` and the password and send unauthenticated.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
     from messagefoundry.pipeline.security_notify import security_notifier_from_settings
