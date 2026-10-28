@@ -111,6 +111,7 @@ _GUARDS = _GUARD_ROOTS | frozenset(
         "_refuse_forward_revocation",
         "_refuse_idp_revocation",
         "idp_revocation_guards",
+        "_refuse_ad_revocation",  # auth/ldap.py, the LDAPS AD bind (BACKLOG #2193)
         # transports/strict_requests.py, the Vault hops (vault BACKLOG #2983)
         "refuse_an_unrevoked_hop",  # StrictReplyAdapter's, at the mount and before each send
         "mount_strict_reply_adapter",
@@ -162,6 +163,15 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/auth/service.py::AuthService.__init__": Guarded(
         note="the OIDC token and JWKS legs, through _refuse_idp_revocation"
     ),
+    "messagefoundry/auth/ldap.py::LdapAuthenticator.__init__": Guarded(
+        note="the LDAPS AD bind, through _refuse_ad_revocation on the finished NarrowedTls "
+        "(BACKLOG #2193). Every engine build passes it a posture: "
+        "tests/test_ldaps_revocation_guard.py pins that"
+    ),
+    "messagefoundry/auth/ldap.py::_refuse_ad_revocation": Guarded(
+        note="the LDAPS guard itself, which takes the finished NarrowedTls and reads a context "
+        "its factory builds (BACKLOG #2193)"
+    ),
     "messagefoundry/logging_setup.py::_build_syslog_handler": Guarded(
         by="messagefoundry/logging_setup.py::_build_tls_context",
         note="the builder runs _refuse_forward_revocation on the context it returns",
@@ -197,7 +207,6 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         note=f"the Vault Transit key provider hop, which the Transit cipher shares, {_VAULT_GUARD}"
     ),
     # --- exempt: ungated verifying hops ------------------------------------------------------------
-    "messagefoundry/auth/ldap.py::LdapAuthenticator.__init__": Exempt(f"LDAPS: {_UNGATED}"),
     "messagefoundry/pipeline/alert_sinks.py::_build_no_redirect_opener": Exempt(
         f"the webhook alert sink: {_UNGATED}"
     ),

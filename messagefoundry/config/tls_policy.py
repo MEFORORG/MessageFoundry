@@ -837,7 +837,8 @@ def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
 
     Reads ``VERIFY_CRL_CHECK_LEAF`` off the context itself rather than trusting that some setting was
     configured somewhere. That distinction is the whole point: ``[tls].crl_file`` is instance-wide, but
-    the hops it reaches are not — the LDAPS context loads no CRL, and a ``truststore`` context is
+    the hops it reaches are not — the LDAPS context loads its own ``[auth].ad_tls_crl_file`` and
+    never that one (BACKLOG #2193; it loaded none before), and a ``truststore`` context is
     built by a library that never sees the policy, so a setting-shaped test would report "revocation
     is checked" for a handshake that checks nothing. Asking the object that performs the handshake cannot make that mistake.
 
@@ -1789,7 +1790,11 @@ def _hold_to_approved_list(ctx: ssl.SSLContext, *, connector: str, hop: str) -> 
 
 
 def assert_ldap3_tls_suites(
-    *, validate: ssl.VerifyMode, ca_certs_data: str | None, connector: str
+    *,
+    validate: ssl.VerifyMode,
+    ca_certs_data: str | None,
+    connector: str,
+    crl_file: str | None = None,
 ) -> Callable[[], ssl.SSLContext]:
     """Build and assert the LDAPS hop's TLS context; return the factory that builds it.
 
@@ -1817,6 +1822,15 @@ def assert_ldap3_tls_suites(
     asserts it, and :func:`_hold_to_approved_list` holds it to the approved list. This runs the
     factory once before returning, so a narrowing that stopped working fails at construction.
     Raises :class:`ValueError`, like every other assertion site.
+
+    ``crl_file`` is ``[auth].ad_tls_crl_file`` (BACKLOG #2193). On a verifying context it is loaded
+    by :func:`harden_crl_check` after the trust store is final, so the hop's revocation guard reads
+    ``VERIFY_CRL_CHECK_LEAF`` off a context that really holds it. The factory builds a fresh
+    context for every connection and loads the file again each time, so a replaced CRL reaches the
+    next bind, and nothing records a held copy (``record_held_copy=False``, as for the Postgres
+    store). A file that cannot be loaded refuses, at construction and at any later bind: ldap3
+    turns the refusal raised inside ``wrap_socket`` into ``LDAPSocketOpenError``, so that bind
+    fails rather than handshaking unchecked.
     """
 
     def narrowed_context() -> ssl.SSLContext:
@@ -1826,6 +1840,10 @@ def assert_ldap3_tls_suites(
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         if validate != ssl.CERT_NONE:
             harden_verify_flags(ctx)
+            if crl_file:
+                harden_crl_check(
+                    ctx, crl_file, setting="[auth].ad_tls_crl_file", record_held_copy=False
+                )
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
         _narrow_library_context(ctx, connector=connector, hop="the LDAPS TLS context")
         harden_cipher_suites(ctx, connector=connector)

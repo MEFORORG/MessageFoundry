@@ -310,7 +310,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # used for one handshake, and never returned. Not a data path — do not reuse these settings.
     "messagefoundry/config/tls_probe.py": frozenset({"ssl"}),
     # Vault BACKLOG #3533: tls_policy left with the posture keyword; the context is ldap_tls.py's.
-    "messagefoundry/auth/ldap.py": frozenset({"ssl"}),
+    # BACKLOG #2193: tls_policy is back, for the LDAPS revocation-hop guard (RevocationHopGuard,
+    # hop_url_host). It reads the check flag off a context ldap_tls.py builds; it builds none.
+    "messagefoundry/auth/ldap.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # BACKLOG #2494: the engine ldap3.Tls. It wraps each LDAPS socket with a context that
     # tls_policy.assert_ldap3_tls_suites built, narrowed and asserted.
     "messagefoundry/auth/ldap_tls.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
@@ -1120,9 +1122,16 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     # BACKLOG #2494: the LDAPS context is built by tls_policy.assert_ldap3_tls_suites, and the socket
-    # is wrapped with it here, in place of ldap3's own wrap_socket.
+    # is wrapped with it here, in place of ldap3's own wrap_socket. BACKLOG #2193: that builder now
+    # loads [auth].ad_tls_crl_file through harden_crl_check, the CRL read and signature check the
+    # key_cert and sign_verify entries name, as on the OIDC opener.
     "messagefoundry/auth/ldap_tls.py": frozenset(
-        {"tls_context:.wrap_socket()", "tls_context:via messagefoundry.config.tls_policy"}
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "sign_verify:via messagefoundry.config.tls_policy",
+            "tls_context:.wrap_socket()",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
     ),
     "messagefoundry/auth/oidc/claims.py": frozenset(
         {"compare:hmac.compare_digest", "sign_verify:via messagefoundry.transports.signing"}

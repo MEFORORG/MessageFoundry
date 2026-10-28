@@ -11753,9 +11753,10 @@ def create_managed_app(
                     # central run_anchor_preflight above) rather than refusing at enforce-only. Central
                     # preflight already ran before any listener bound; this keeps the seam consistent.
                     enforcing=trust_anchors_enforcing,
-                    # Thread the derived instance posture to the AD bind, which is built out of the
-                    # connector-construction gate: its plain ldap:// refusal reads it (vault BACKLOG
-                    # #2354). Its ad_tls_verify=false escape, which #329 clamped here, is gone (#3230).
+                    # Thread the derived instance posture to the hops this service builds out of the
+                    # connector-construction gate: the OIDC legs' revocation guard (BACKLOG #1887)
+                    # and the LDAPS AD bind's (BACKLOG #2193). CORRECTED 2026-10-28: this said the
+                    # plain ldap:// refusal read it; that refusal holds at every posture (#3533).
                     hop_posture=_hop_posture,
                     # BACKLOG #2592: an authority row that fails its integrity seal is denied and
                     # raises integrity_drift on the same sink the cipher refusal uses.

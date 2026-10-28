@@ -50,12 +50,24 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
     """
 
     def __init__(
-        self, *, validate: ssl.VerifyMode, ca_certs_data: str | None, connector: str
+        self,
+        *,
+        validate: ssl.VerifyMode,
+        ca_certs_data: str | None,
+        connector: str,
+        crl_file: str | None = None,
     ) -> None:
         self._context_factory = assert_ldap3_tls_suites(
-            validate=validate, ca_certs_data=ca_certs_data, connector=connector
+            validate=validate, ca_certs_data=ca_certs_data, connector=connector, crl_file=crl_file
         )
         super().__init__(validate=validate, ca_certs_data=ca_certs_data)
+
+    def handshake_context(self) -> ssl.SSLContext:
+        """A context built exactly as :meth:`wrap_socket` builds one for each bind.
+
+        The LDAPS revocation guard reads it (BACKLOG #2193), so the guard judges what a bind's
+        handshake really loads, ``[auth].ad_tls_crl_file`` included, and never the setting."""
+        return self._context_factory()
 
     def wrap_socket(self, connection: Any, do_handshake: bool = False) -> None:
         """ldap3's wrap step on a fresh engine context; ldap3 calls this for LDAPS and StartTLS."""

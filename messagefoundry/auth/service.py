@@ -3146,12 +3146,15 @@ class AuthService:
             # Thread the connector SecretProvider (ADR 0019 §5) so an ad_bind_password_secret reference
             # resolves the bind password from the external backend (fail-closed) at construction.
             # BACKLOG #2034: the enforcement dial too, since the authenticator checks its CA anchor.
-            # No posture: the plain ldap:// and verify-off refusals hold at every posture (vault
-            # BACKLOG #3230, #3533), so neither reads one.
+            # The plain ldap:// and verify-off refusals hold at every posture (vault BACKLOG #3230,
+            # #3533) and read none. The posture is for the LDAPS revocation guard (BACKLOG #2193),
+            # passed as the OIDC legs' is, since this service is built outside every
+            # active_hop_posture scope.
             self._ldap = LdapAuthenticator(
                 settings,
                 secret_provider=secret_provider,
                 enforcing=self._trust_anchors_enforcing,
+                hop_posture=hop_posture,
             )
         else:
             self._ldap = None
