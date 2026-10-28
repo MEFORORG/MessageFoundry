@@ -106,9 +106,10 @@ engine has not verified, when the lever named beside each is set:
   query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
   like a credential. A secret anywhere in the path crosses unrefused too. A path secret cannot be
   told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
-- a secret that is not credential-shaped under an allowlisted header name, such as an opaque token
-  in `X-Request-ID`, on a `verify_tls = false` hop. The allowlist reads names, and the value test
-  knows only auth-scheme prefixes and JWTs;
+- a secret that is not
+  [credential-shaped](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine) under
+  an allowlisted header name, such as an opaque token in `X-Request-ID`, on a `verify_tls = false`
+  hop. The allowlist reads names, and the value test knows only the shapes that definition lists;
 - the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;
@@ -128,11 +129,24 @@ leaves the engine.
 
 Over plain `http` to a host off this machine, an HTTP-family header with a neutral name, such as
 `X-Session`, still crosses. That holds for a static header and for one a Handler stamps per
-message. It crosses even when its value is a secret, if that secret is not credential-shaped (no
-auth-scheme prefix, not a JWT). On that hop the no-escape rule refuses only the credentials it
+message. It crosses even when its value is a secret, if that secret is not credential-shaped, as
+defined below. On that hop the no-escape rule refuses only the credentials it
 recognizes, described above (vault BACKLOG #3533 item 4). A credential-shaped value is refused
 under any name. The header allowlist applies on `verify_tls = false` hops only. The hop itself
 crosses only under its own levers, such as `cleartext_accepted` or `tls_hop_attested`.
+
+**Credential-shaped** means the engine's value test recognizes the value, whatever the header is
+called. That test is `_looks_like_a_credential_value` in `messagefoundry/config/wiring.py`. It
+trims surrounding whitespace, then recognizes two shapes only:
+
+- a value that starts, in any letter case, with `Bearer `, `Basic `, `Digest ` or `Negotiate `
+  (each with its trailing space), or with `AWS4-HMAC`, as in `AWS4-HMAC-SHA256`;
+- a JWT: the whole value matches `^eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+$`,
+  three base64url segments joined by dots, the first starting `eyJ`.
+
+Any other scheme word is not recognized. A value such as `Token abc123`, `SSWS abc123`,
+`SharedAccessSignature sr=...` or `OAuth abc123` is not credential-shaped. Under a neutral name,
+it crosses.
 
 This limit is accepted, with no fix planned (owner ruling 2026-10-28). The owner was asked whether
 the allowlist should also apply to declared plain-`http` hops. The answer was *"No, keep it as

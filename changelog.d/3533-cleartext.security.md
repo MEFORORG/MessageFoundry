@@ -6,10 +6,11 @@
   `verify_tls = false` refusal counts, header names in any case, so a static API-key header or a
   credential-shaped value under a neutral name is refused too. It does not take that refusal's
   header-name allowlist. So a header with a neutral name, such as `X-Session`, still crosses a
-  declared cleartext hop. That includes a secret in it that is not credential-shaped (no
-  auth-scheme prefix, not a JWT). The owner ruled on 2026-10-28 to accept that limit, and
+  declared cleartext hop. That includes a secret in it that is not credential-shaped. The owner
+  ruled on 2026-10-28 to accept that limit, and
   [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine)
-  says why. A static `Proxy-Authorization` is left to the
+  says why and defines which values are credential-shaped.
+  A static `Proxy-Authorization` is left to the
   send-time proxy rule only when the request goes to a proxy. A hop can bypass a configured
   `proxy_url` through `proxy_no_proxy`, urllib's own bypass list, or a `"default"` with no system
   proxy. That hop goes direct, so the header counts as a credential and refuses it at build. A

@@ -385,7 +385,9 @@ the header counts as a credential and refuses the hop at build.
 **What did not change.** `cleartext_accepted` still carries a body with no credential across, with
 the WARN and the audit record decision 2 describes. That was the case decision 2 was written for.
 A header with a neutral name, static or per message, still crosses with that body. So does a
-secret in it that is not credential-shaped (no auth-scheme prefix, not a JWT). The verify-off
+secret in it that is not
+[credential-shaped](../SECURITY-LOOSENING.md#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine).
+The verify-off
 rule's header-name allowlist (owner ruling 2026-10-26 on item 7) is not applied to cleartext hops.
 The owner ruled on 2026-10-28 to keep it that way. The ruling and its reasons are stated once, in
 [SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine).

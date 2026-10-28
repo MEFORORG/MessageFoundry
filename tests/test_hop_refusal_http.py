@@ -678,8 +678,9 @@ def test_a_declared_cleartext_hop_carries_a_neutral_static_header(
 ) -> None:
     """The verify-off header allowlist does not apply to a declared cleartext hop: the owner's
     ruling on item 4 refuses recognized credentials only, so a header with a neutral name crosses.
-    So does a secret in it that is not credential-shaped (no auth-scheme prefix, not a JWT). That
-    is an accepted limit (owner ruling 2026-10-28); docs/SECURITY-LOOSENING.md says why."""
+    So does a secret in it that is not credential-shaped. That is an accepted limit (owner ruling
+    2026-10-28); docs/SECURITY-LOOSENING.md, "Accepted limit: a neutral header crosses plain http
+    off this machine", says why and defines which values are credential-shaped."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_PROD):
         dest = _build(
