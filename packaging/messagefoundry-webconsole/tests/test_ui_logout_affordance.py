@@ -22,19 +22,22 @@ Three layers, because pinning the five fixed pages cannot catch a SIXTH bare pag
 from __future__ import annotations
 
 import ast
-import json
+import time
 from pathlib import Path
 
 import httpx
+import pytest
 from _ui_clients import create_local_user_chosen
 
 import messagefoundry_webconsole
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole import pages
+from tests._logout_rows import logout_details, logout_rows
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -184,14 +187,6 @@ async def _service(engine: Engine) -> AuthService:
     return service
 
 
-async def _logout_rows(engine: Engine) -> list[tuple[object, object, object]]:
-    """Each ``auth.logout`` row as its actor, client address and ``outcome``."""
-    return [
-        (r["actor"], r["client"], json.loads(str(r["detail"] or "{}")).get("outcome"))
-        for r in await engine.store.list_audit(action="auth.logout")
-    ]
-
-
 async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> None:
     """A must_change_password account is confined to /ui/account/password. The page now renders the
     Sign-out form, and POST /ui/logout — which has no Depends gate precisely so this works — really
@@ -231,7 +226,7 @@ async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> N
     # BACKLOG #3029: the route passes no actor, so the auth.logout row names the owner of the
     # session it ended rather than carrying a NULL actor. BACKLOG #3339: it also records the
     # address the sign-out came from.
-    assert await _logout_rows(engine) == [("rotate", PEER_ADDRESS, "revoked")]
+    assert await logout_rows(engine.store) == [("rotate", PEER_ADDRESS, "revoked")]
 
 
 async def test_ui_logout_with_a_cookie_naming_no_session_still_records_the_address(
@@ -241,15 +236,111 @@ async def test_ui_logout_with_a_cookie_naming_no_session_still_records_the_addre
     owner to name and says ``nothing_to_revoke``; the client address is still recorded. Read beside
     the test above, it shows the actor there comes from the session, not from the request.
 
-    It pins the CURRENT behaviour, which is still open: an unauthenticated sign-out can append a
-    row for a cookie naming no session (engine PR 2384, open finding 6, held by vault BACKLOG
-    #3749). A fix that writes no row here, or bounds the rows, is expected to change this test."""
+    Such rows are bounded per client address (BACKLOG #3749 item 6); one is well inside the
+    budget, which ``tests/test_logout_lineage.py`` drives."""
     service = await _service(engine)
+    out = await _sign_out_with(engine, service, "a-token-that-names-no-session")
+    assert out.status_code == 303
+    assert await logout_rows(engine.store) == [(None, PEER_ADDRESS, "nothing_to_revoke")]
+
+
+async def _signed_in_operator(engine: Engine) -> tuple[AuthService, str]:
+    """A service with one operator, and a console session cookie for it, minted from LOGIN_PEER."""
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    await service.initialize()
+    user_id = await create_local_user_chosen(
+        service,
+        username="op",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.password_hash is not None
+    await engine.store.set_password(
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
+    )
+    outcome = await service.login("op", PW)
+    assert outcome.ok and outcome.token is not None
+    return service, outcome.token
+
+
+async def _sign_out_with(engine: Engine, service: AuthService, cookie: str) -> httpx.Response:
     transport = httpx.ASGITransport(
         app=create_app(engine, auth=service, serve_ui=True), client=(PEER_ADDRESS, 51234)
     )
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        c.cookies.set("mf_session", "a-token-that-names-no-session")
-        out = await c.post("/ui/logout")
-        assert out.status_code == 303
-    assert await _logout_rows(engine) == [(None, PEER_ADDRESS, "nothing_to_revoke")]
+        c.cookies.set("mf_session", cookie)
+        return await c.post("/ui/logout")
+
+
+async def test_ui_logout_with_a_cookie_an_elevation_just_retired_ends_its_successor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3715, #3749 item 3. An elevation in another tab re-keys the session while this
+    tab's sign-out is in flight, so the cookie it sends names no session. Within 5 seconds of
+    the elevation the sign-out follows the link, ends the session under its new token, and the
+    row names the owner, where it used to keep a NULL actor and leave the session live."""
+    service, old = await _signed_in_operator(engine)
+    successor = await service._rotate_session_token(old)
+    assert successor is not None, "the rotation failed closed, so the race was not driven"
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 4.0)
+    out = await _sign_out_with(engine, service, old)
+    assert out.status_code == 303
+    assert await service.identity_for_token(successor, activity=False) is None
+    assert await logout_rows(engine.store) == [("op", PEER_ADDRESS, "revoked")]
+    assert await logout_details(engine.store) == [
+        {
+            "outcome": "revoked",
+            "session": hash_token(successor)[:12],
+            "presented": hash_token(old)[:12],
+        }
+    ]
+
+
+async def test_ui_logout_with_a_cookie_retired_past_the_window_ends_nothing(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above, one second past the 5-second window. This route carries no
+    credential, so a retired cookie leads nowhere after that: nothing is revoked, the row says
+    ``nothing_to_revoke`` and has no owner to name."""
+    service, old = await _signed_in_operator(engine)
+    successor = await service._rotate_session_token(old)
+    assert successor is not None
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 6.0)
+    out = await _sign_out_with(engine, service, old)
+    assert out.status_code == 303
+    assert await service.identity_for_token(successor, activity=False) is not None
+    assert await logout_rows(engine.store) == [(None, PEER_ADDRESS, "nothing_to_revoke")]
+
+
+async def test_ui_logout_clears_the_cookie_when_the_row_fails_after_the_revoke(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3884 item 1. Once the session ended, a refused ``auth.logout`` row used to raise
+    through the route, which answered 500 and never cleared the cookie or sent Clear-Site-Data.
+    The sign-out has happened, so the route must still finish it."""
+    service, token = await _signed_in_operator(engine)
+    real_record = engine.store.record_audit
+
+    async def _refuse_logout_row(action: str, **kwargs: object) -> object:
+        if action == "auth.logout":
+            raise OSError("the audit store refused the row")
+        return await real_record(action, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(engine.store, "record_audit", _refuse_logout_row)
+    out = await _sign_out_with(engine, service, token)
+    assert out.status_code == 303
+    assert "clear-site-data" in out.headers
+    assert any(
+        "mf_session=" in header and "max-age=0" in header.lower()
+        for header in out.headers.get_list("set-cookie")
+    ), out.headers.get_list("set-cookie")
+    assert await service.identity_for_token(token, activity=False) is None

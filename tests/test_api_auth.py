@@ -35,6 +35,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._logout_rows import logout_details, logout_rows
 from tests._role_pairing import bypass_view_raw_pairing_rule
 from tests._session_race import rotate_after_first_call
 
@@ -633,17 +634,18 @@ async def test_login_then_permission_enforced(engine: Engine) -> None:
         assert (await c.get("/stats", headers=_auth(token))).status_code == 401
 
 
-async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
+async def test_a_logout_raced_by_a_rotation_ends_the_session_under_its_new_token(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #3029. ``POST /auth/logout`` reads the session in its auth dependency, then the
+    """BACKLOG #3715. ``POST /auth/logout`` reads the session in its auth dependency, then the
     service revokes it by hash. A step-up on the same session that re-keys it between the two
-    leaves that hash naming no session. The ``auth.logout`` row used to read the same either way.
+    leaves that hash naming no session, and the session used to live on under its new token while
+    the row said ``nothing_to_revoke`` (BACKLOG #3029).
 
     The rotation runs right after the dependency's read of the presented hash, so it always lands
-    and the session lives on under its new token. The row's ``outcome`` must then say nothing was
-    revoked. Ending it under the rotated token is not this route's to do; that is BACKLOG #3028.
-    The branch where the revoke lands is test_session_supersession.py's logout test.
+    after the request arrived. The route passes its arrival time, so the service follows that
+    rotation's link and ends the session under the new token. The row names the caller, the
+    session that ended and, in ``presented``, the hash the caller sent.
     """
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
@@ -660,18 +662,17 @@ async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
     assert rotations, "the injection never fired, so this measured nothing"
     rotated = rotations[0]
     assert rotated is not None, "the rotation failed closed, so the race was not driven"
-    assert await service.identity_for_token(rotated, activity=False) is not None
-    # BACKLOG #3339: a sign-out that ended nothing still names the caller and the address.
-    assert await _logout_rows(store) == [("u", _DEFAULT_PEER[0], "nothing_to_revoke")], (
-        "the auth.logout row claimed a revoke that missed, or lost its actor or address"
+    assert await service.identity_for_token(rotated, activity=False) is None, (
+        "the sign-out left the session live under the token the rotation handed out"
     )
-
-
-async def _logout_rows(store: Any) -> list[tuple[object, object, object]]:
-    """Each ``auth.logout`` row as its actor, client address and ``detail.outcome``."""
-    return [
-        (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")).get("outcome"))
-        for row in await store.list_audit(action="auth.logout")
+    # BACKLOG #3339: the row names the caller and the address.
+    assert await logout_rows(store) == [("u", _DEFAULT_PEER[0], "revoked")]
+    assert await logout_details(store) == [
+        {
+            "outcome": "revoked",
+            "session": hash_token(rotated)[:12],
+            "presented": hash_token(token)[:12],
+        }
     ]
 
 
@@ -680,15 +681,15 @@ async def test_a_logout_audit_row_names_the_caller_and_the_client_address(engine
     ``client_ip``, and the ``auth.logout`` row records both. The peer is pinned, so the ``client``
     assertion compares a value this test named (BACKLOG #1644). The sign-in comes from another
     address, so the row cannot pass by recording the address the session was minted from. The
-    route's control, a token that names no session, is the rotation race test above: its dependency
-    refuses any other dead token."""
+    route's dependency refuses a dead token, so the route has no control that names no session;
+    ``tests/test_logout_lineage.py`` drives that branch in the service."""
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
     async with _client(engine, service, peer=("192.0.2.10", 40000)) as c:
         token = (await _login(c, "u")).json()["token"]
     async with _client(engine, service, peer=("192.0.2.44", 40001)) as c:
         assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
-    assert await _logout_rows(engine.store) == [("u", "192.0.2.44", "revoked")]
+    assert await logout_rows(engine.store) == [("u", "192.0.2.44", "revoked")]
 
 
 async def test_cluster_endpoints_gated_by_monitoring_read(engine: Engine) -> None:
@@ -2272,6 +2273,33 @@ async def test_list_and_revoke_own_session(engine: Engine) -> None:
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # revoked
         assert (await c.get("/auth/me", headers=h2)).status_code == 200  # current still valid
         assert len((await c.get("/me/sessions", headers=h2)).json()["sessions"]) == 1
+
+
+async def test_revoking_an_own_session_a_rotation_re_keyed_answers_404_and_writes_a_miss_row(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3749 item 7. A session's id is its token hash, so an elevation on that session
+    makes an id the caller read earlier name nothing. ``DELETE /me/sessions/{id}`` then answers
+    404, as for an unknown id, revokes nothing and writes the ``auth.session_revoke_missed`` row
+    (vault BACKLOG #3260, limb 2). The positive branch is test_list_and_revoke_own_session."""
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service) as c:
+        t1 = (await _login(c, "u")).json()["token"]
+        t2 = (await _login(c, "u")).json()["token"]
+        _r, t2 = await _reauth(c, t2, purpose="session_terminate")
+        assert _r.status_code == 200
+        stale = hash_token(t1)
+        rotated = await service._rotate_session_token(t1)  # an elevation in t1's own tab
+        assert rotated is not None
+        missed = await c.delete(f"/me/sessions/{stale}", headers=_auth(t2))
+        assert missed.status_code == 404
+        still = await c.get("/auth/me", headers=_auth(rotated))
+        assert still.status_code == 200, "a revoke landed on the re-keyed session"
+    rows = await engine.store.list_audit(action="auth.session_revoke_missed")
+    assert [(row["actor"], json.loads(str(row["detail"]))) for row in rows] == [
+        ("u", {"session": stale[:12]})
+    ]
 
 
 async def test_revoke_other_sessions_keeps_current(engine: Engine) -> None:

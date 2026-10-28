@@ -26,11 +26,12 @@ import pytest
 from messagefoundry.auth import Role
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.oidc import FederatedPrincipal
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import _LOGOUT_MISS_ROWS_PER_CLIENT, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._logout_rows import logout_details, logout_rows, logout_rows_dropped
 from tests._session_race import rotate_after_first_call
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
@@ -309,18 +310,10 @@ async def test_a_logout_records_whether_it_ended_a_session(store: MessageStore) 
     replay = await service.logout(token, actor="op", client=None)
     assert not await _live(service, token)
     assert [first, replay] == ["revoked", "nothing_to_revoke"]
-    assert await _logouts(store) == [
-        {"outcome": "nothing_to_revoke", "actor": "op"},
-        {"outcome": "revoked", "actor": "op"},
+    assert await logout_rows(store) == [
+        ("op", None, "nothing_to_revoke"),
+        ("op", None, "revoked"),
     ], "newest first: the replay, then the logout"
-
-
-async def _logouts(store: MessageStore) -> list[dict[str, object]]:
-    """Each ``auth.logout`` row, newest first, as its ``outcome`` plus the row's ``actor``."""
-    return [
-        {"outcome": json.loads(str(row["detail"] or "{}")).get("outcome"), "actor": row["actor"]}
-        for row in await store.list_audit(action="auth.logout")
-    ]
 
 
 async def test_a_logout_with_no_actor_names_the_owner_of_the_session_it_ended(
@@ -335,13 +328,11 @@ async def test_a_logout_with_no_actor_names_the_owner_of_the_session_it_ended(
     first = await service.logout(token, client="203.0.113.5")
     replay = await service.logout(token, client="203.0.113.6")
     assert [first, replay] == ["revoked", "nothing_to_revoke"]
-    assert await _logouts(store) == [
-        {"outcome": "nothing_to_revoke", "actor": None},
-        {"outcome": "revoked", "actor": "other"},
-    ]
     # BACKLOG #3339: each row records the address that call passed, on both branches.
-    rows = await store.list_audit(action="auth.logout")
-    assert [row["client"] for row in rows] == ["203.0.113.6", "203.0.113.5"]
+    assert await logout_rows(store) == [
+        (None, "203.0.113.6", "nothing_to_revoke"),
+        ("other", "203.0.113.5", "revoked"),
+    ]
 
 
 async def test_a_logout_with_no_token_returns_nothing_to_revoke_and_writes_no_row(
@@ -350,7 +341,7 @@ async def test_a_logout_with_no_token_returns_nothing_to_revoke_and_writes_no_ro
     service = await _service(store)
     assert await service.logout(None, client=None) == "nothing_to_revoke"
     assert await service.logout("", client=None) == "nothing_to_revoke"
-    assert await _logouts(store) == []
+    assert await logout_rows(store) == []
 
 
 async def test_a_rotation_racing_a_self_revoke_is_not_reported_as_a_revoke(
@@ -362,8 +353,8 @@ async def test_a_rotation_racing_a_self_revoke_is_not_reported_as_a_revoke(
     # test_a_rotation_racing_the_supersession_cannot_keep_the_session_live: the rotation runs right
     # after the FIRST store call naming the target's hash, which is the read, so the rotation always
     # lands and the session lives on under its new token. The call must then return False and write
-    # no row. Ending it under its rotated token is not this call's to do; that is BACKLOG #3028. The
-    # branch where the revoke lands is test_api_auth.py::test_list_and_revoke_own_session.
+    # no row. Ending it under its rotated token is the self-revoke half of BACKLOG #3715, still
+    # open. The branch where the revoke lands is test_api_auth.py::test_list_and_revoke_own_session.
     service = await _service(store)
     target = await _token(service)
     target_hash = hash_token(target)
@@ -546,3 +537,97 @@ async def test_the_callback_supersedes_only_after_the_proof_succeeds(
     assert outcome.ok is ok, outcome
     assert await _live(service, prior) is not ok
     assert len(await _superseded(store)) == (1 if ok else 0)
+
+
+# --- BACKLOG #3715, #3749: the lineage a logout follows, a lapsed row, the row budget ---
+
+
+async def _rotated(service: AuthService, token: str) -> str:
+    """Re-key ``token``'s session, as an elevation in another tab does, and return the new token."""
+    new = await service._rotate_session_token(token)
+    assert new is not None, "the rotation failed closed"
+    return new
+
+
+async def test_a_lapsed_session_is_recorded_as_lapsed_and_names_its_owner(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3749 item 4. The revoke still ends a row over its idle limit, but the row used to
+    # say "revoked", which put the end of a live session in the owner's feed. It is judged as the
+    # sign-in supersession judges it, and the owner stays the actor so the user still sees it.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    token = await _token(service)
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 40 * 60)  # idle 40 min, limit 30: lapsed
+    assert await service.logout(token, client=None) == "lapsed"
+    assert await logout_rows(store) == [("op", None, "lapsed")]
+
+
+async def test_a_logout_follows_a_rotation_only_since_lineage_since(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3715. POST /auth/logout passes the moment its request arrived, so a link written
+    # before that moment is not followed: the token was already retired when it arrived, which the
+    # route's gate would have refused. The clock steps so the rotation lands strictly before it.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    token = await _token(service)
+    successor = await _rotated(service, token)
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 1.0)
+    outcome = await service.logout(token, client=None, actor="op", lineage_since=time.time())
+    assert outcome == "nothing_to_revoke"
+    assert await _live(service, successor), "a link older than lineage_since was followed"
+
+
+async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(
+    store: MessageStore,
+) -> None:
+    # The positive control for the test above: with lineage_since before the rotation, the
+    # retired token ends its successor, and the row names both hashes.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    token = await _token(service)
+    since = time.time()
+    successor = await _rotated(service, token)
+    outcome = await service.logout(token, client=None, actor="op", lineage_since=since)
+    assert outcome == "revoked"
+    assert not await _live(service, successor)
+    assert await logout_details(store) == [
+        {
+            "outcome": "revoked",
+            "session": hash_token(successor)[:12],
+            "presented": hash_token(token)[:12],
+        }
+    ]
+
+
+async def _misses(service: AuthService, client: str, count: int) -> None:
+    for n in range(count):
+        assert await service.logout(f"no-such-token-{n}", client=client) == "nothing_to_revoke"
+
+
+async def test_sign_outs_that_end_nothing_write_rows_within_a_budget(store: MessageStore) -> None:
+    # BACKLOG #3749 item 6. /ui/logout has no auth dependency, so anyone could append auth.logout
+    # rows. Past the per-client budget the row is dropped, and counted: one row when the budget
+    # trips, the rest of the count before the next row it admits.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    budget = _LOGOUT_MISS_ROWS_PER_CLIENT
+    await _misses(service, "203.0.113.9", budget + 3)
+    assert len(await logout_rows(store)) == budget, "the budget did not bound the rows"
+    assert await logout_rows_dropped(store) == [1], "the trip wrote no counted row"
+    # Another client still has its own budget, and its row first flushes the count.
+    await _misses(service, "203.0.113.10", 1)
+    assert await logout_rows_dropped(store) == [2, 1], "newest first: the flush, then the trip"
+    assert len(await logout_rows(store)) == budget + 1
+    # A sign-out that ends a session always writes, from the tripped client too.
+    token = await _token(service)
+    assert await service.logout(token, client="203.0.113.9") == "revoked"
+    assert (await logout_rows(store))[0] == ("op", "203.0.113.9", "revoked")
+
+
+async def test_sign_outs_that_end_nothing_inside_the_budget_all_write(store: MessageStore) -> None:
+    # The control for the test above: at the budget exactly, every row is written and no count is.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    budget = _LOGOUT_MISS_ROWS_PER_CLIENT
+    await _misses(service, "203.0.113.9", budget)
+    assert await logout_rows(store) == [(None, "203.0.113.9", "nothing_to_revoke")] * budget
+    assert await logout_rows_dropped(store) == []

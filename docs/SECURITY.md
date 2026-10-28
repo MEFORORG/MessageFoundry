@@ -5103,8 +5103,9 @@ as before this change:
   size of the step, in either direction.
 
 **A retired token authenticates nothing.** No session read, the validator included, consults the
-links; the supersession is their one reader. For the length of the bound, a retired token has one
-power: presented at a sign-in that succeeds, it ends the session it became. That power is new, and
+links; only a revoke follows them, at a sign-in's supersession or at a sign-out (below). For the
+length of the bound, a retired token has one power at a sign-in: presented at a sign-in that
+succeeds, it ends the session it became. That power is new, and
 it can only end a session, never open or extend one. Whoever held that token before the elevation
 could already end the session with `POST /auth/logout`; the link lets them do it for the length of
 the bound after the elevation too, through a sign-in whose first credential passes; with MFA
@@ -5113,6 +5114,26 @@ so a password alone is enough. A wall
 clock that stepped forward at the elevation, or back before the sign-in, lengthens that time by the
 step; the reaper's clock-step guard covers its own purge, not this. The links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
 revoke, and a revoke needs no key on any backend.
+
+**A sign-out follows the links too, for far less time (BACKLOG #3715).** An elevation in another
+tab can re-key the session while a sign-out is in flight, and the sign-out then ends the session
+under its new token, in the same transaction as the revoke. `POST /auth/logout` follows only links
+written after its request arrived. Its sign-in check proved the token live after that moment, so
+the route gains no reach. `/ui/logout` carries no credential, so it follows links written up to 5
+seconds before the call. **That is a separate power, credential-free and end-only:** for 5 seconds
+after an elevation, anyone who presents the RETIRED token to `/ui/logout` ends the session it
+became, with no sign-in. It cannot open or extend a session. The `auth.logout` row names the
+session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
+was presented. A row the sign-out ended that was already over its idle or absolute limit is
+recorded as `lapsed`, not `revoked`, and still names the owner.
+
+**A sign-out that ended nothing writes its row within a budget (BACKLOG #3749).** `/ui/logout` has
+no sign-in check, so without one anyone could append `auth.logout` rows without limit. At most 10
+such rows per client address, and 100 in all, are written per 60 seconds; past that the row is
+dropped and counted in an `auth.logout_rows_dropped` row. One is written when the budget first
+trips, and another with the rest of the count before the next row the budget admits. The budget is
+in-process, so each engine shard keeps its own. It bounds only the row: the sign-out itself is
+never throttled, and a sign-out that ended a session always writes its row.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was

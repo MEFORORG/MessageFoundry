@@ -31,6 +31,14 @@ this line.**
 
 ### Security
 
+- **`/ui/logout` ends the session an elevation in another tab re-keyed up to 5 seconds before,
+  and still clears the cookie when the sign-out's audit row fails.** A retired cookie that
+  sign-out sends now ends the session it became, with the owner as the row's actor, rather
+  than leaving it live. Once a session ended, a refused `auth.logout` row no longer answers 500
+  without clearing the cookie and sending Clear-Site-Data. Both are the engine's behaviour; this
+  console pins the engine seam whose `AuthService.logout` carries `lineage_since`.
+  (BACKLOG #3715, #3749, #3884)
+
 - **An IdP step-up's return is charged to the operator's own re-authentication budget, not the
   sign-in budget.** `GET /ui/oidc/callback` now reads the user its staged step-up flow names and
   charges a key of its own for that user in the per-actor limiter `POST /ui/reauth/oidc` already

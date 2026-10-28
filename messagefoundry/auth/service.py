@@ -2684,7 +2684,25 @@ CREDENTIAL_ISSUE_REFUSED_ACTION: Final = "auth.credential_issue_refused"
 #: The ``op`` values that row carries, one per issuing operation.
 CredentialIssueOp = Literal["create", "password_reset", "mfa_reset"]
 #: What :meth:`AuthService.logout` reports, and what its ``auth.logout`` row's ``outcome`` records.
-LogoutOutcome = Literal["revoked", "nothing_to_revoke"]
+#: ``lapsed`` is a revoke of a row that was already over its idle or absolute limit (BACKLOG #3749).
+LogoutOutcome = Literal["revoked", "lapsed", "nothing_to_revoke"]
+#: BACKLOG #3715, #3749: how far back a sign-out given no ``lineage_since`` follows the session
+#: lineage. ``/ui/logout`` carries no credential, so this is the whole of its reach: long enough
+#: for an elevation in another tab that committed while the sign-out was in flight, and no longer.
+#: docs/SECURITY.md states it as a power of its own.
+_UNPROVEN_LOGOUT_LINEAGE_SECONDS: Final = 5.0
+#: BACKLOG #3749 item 6: the budget on ``auth.logout`` rows for a sign-out that ended nothing.
+#: ``/ui/logout`` has no auth dependency, so without it anyone could append such rows without
+#: limit. Per client address, with a global ceiling so a flood from many addresses is bounded too.
+#: The sign-out itself is never throttled (BACKLOG #287), and a sign-out that ended a session
+#: always writes its row.
+_LOGOUT_MISS_ROWS_PER_CLIENT: Final = 10
+_LOGOUT_MISS_ROWS_GLOBAL: Final = 100
+_LOGOUT_MISS_WINDOW_SECONDS: Final = 60.0
+#: The row that counts ``auth.logout`` rows the budget above dropped. Its detail's ``dropped`` is
+#: the number dropped since the previous such row, across all clients: one is written when the
+#: budget first trips, and another, with the rest of the count, before the next row it admits.
+LOGOUT_ROWS_DROPPED_ACTION: Final = "auth.logout_rows_dropped"
 _ISSUE_ROW_EARLY_SECONDS: Final = 5.0
 _ISSUE_ROW_LATE_SECONDS: Final = 60.0
 _ISSUE_ROW_PAGE: Final = 200
@@ -3204,6 +3222,15 @@ class AuthService:
             if settings.login_rate_limit_enabled
             else None
         )
+        # BACKLOG #3749 item 6: bounds the auth.logout rows a sign-out that ended nothing writes.
+        # In-process, as every limiter here is. See _LOGOUT_MISS_ROWS_PER_CLIENT.
+        self._logout_miss_limiter = SlidingWindowRateLimiter(
+            per_key=_LOGOUT_MISS_ROWS_PER_CLIENT,
+            glob=_LOGOUT_MISS_ROWS_GLOBAL,
+            window_seconds=_LOGOUT_MISS_WINDOW_SECONDS,
+        )
+        self._logout_misses_dropped = 0
+        self._logout_miss_trip_written = False
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # bounded host keys (_bounded_address_text(_host_key(...)), BACKLOG #3772) already flagged since the session's last re-verification (BACKLOG #2159). Every
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
@@ -10741,36 +10768,63 @@ class AuthService:
         return await self._build_identity(user)
 
     async def logout(
-        self, token: str | None, *, client: str | None, actor: str | None = None
+        self,
+        token: str | None,
+        *,
+        client: str | None,
+        actor: str | None = None,
+        lineage_since: float | None = None,
     ) -> LogoutOutcome:
-        """End the session ``token`` names, audit ``auth.logout`` saying whether one ended, and
-        return that same outcome.
+        """End the session ``token`` names, or the one it became, audit ``auth.logout`` saying
+        what ended, and return that same outcome.
 
         The revoke is :meth:`AuthStore.supersede_session`, which reports whether it matched a row,
         rather than a blind revoke by hash (BACKLOG #3029). The hash can name no unrevoked session
-        for at least these reasons: a rotation re-keyed the session after the caller read it, a
-        concurrent revoke ended it first, or the token was stale or never valid (``/ui/logout``
-        has no auth dependency). The outcome is then ``nothing_to_revoke`` rather than a revoke
-        that did not happen. ``revoked`` means an unrevoked row was revoked, which may be one
-        already over its idle or absolute limit. Ending the session under a rotated token is not
-        attempted here; that is BACKLOG #3028.
+        for at least these reasons: a concurrent revoke ended it first, a rotation re-keyed it
+        longer ago than the lineage bound below, or the token was stale or never valid
+        (``/ui/logout`` has no auth dependency). The outcome is then ``nothing_to_revoke`` rather
+        than a revoke that did not happen. ``revoked`` means a session that was still live ended.
+        ``lapsed`` means the row ended was already over its idle or absolute limit (BACKLOG #3749),
+        judged as :meth:`_supersede_session_hash` judges it.
+
+        **A rotation that committed first is followed, for a bounded time (BACKLOG #3715).** An
+        elevation in another tab can re-key the session while the sign-out is in flight, leaving
+        the presented hash naming no row. The store then follows the lineage links rotations wrote,
+        as the login supersession does, and ends the session at the live end, in the same
+        transaction as the revoke. There is no read before the revoke: a read through
+        :meth:`_load_session` ends and reports a row whose seal fails, so the revoke would then
+        record ``nothing_to_revoke`` for a session this call ended. ``lineage_since`` is the oldest
+        link followed. ``POST /auth/logout`` passes the moment its request arrived: its auth
+        dependency proved the token live after that, so only a rotation in flight is followed and
+        the route gains no reach. With ``None``, as ``/ui/logout`` passes, the bound is
+        :data:`_UNPROVEN_LOGOUT_LINEAGE_SECONDS` before the call. That route proves nothing about
+        the token, so for those seconds a holder of a RETIRED token can end the session it became.
+        docs/SECURITY.md states that power beside the sign-in's.
 
         The return is for the caller's own logic and tests, NOT for the client (a Manager ruling on
         BACKLOG #3029). ``POST /auth/logout`` answers 200 and ``/ui/logout`` redirects whatever it
         says, so sign-out stays idempotent. ``/ui/logout`` has no auth dependency, so a different
         answer there would tell an unauthenticated caller whether a cookie value was live; ``POST
         /auth/logout`` already refuses a dead token at its dependency, and keeps one answer for
-        consistency. The audit row carries the outcome. With no token there is nothing to look up,
-        so this returns ``nothing_to_revoke`` and writes no row.
+        consistency. The audit row carries the outcome, and, when a session ended, the first 12
+        characters of its id and, when a link was followed, of the hash presented. With no token
+        there is nothing to look up, so this returns ``nothing_to_revoke`` and writes no row.
+
+        **A sign-out that ended nothing writes its row within a budget (BACKLOG #3749 item 6).**
+        :data:`_LOGOUT_MISS_ROWS_PER_CLIENT` rows per client address, under a global ceiling, per
+        :data:`_LOGOUT_MISS_WINDOW_SECONDS`; past it the row is dropped and counted in a
+        :data:`LOGOUT_ROWS_DROPPED_ACTION` row. Only the row is budgeted: the sign-out itself runs
+        and answers as before (BACKLOG #287), and a sign-out that ended a session always writes.
+
+        **Once a session ended, a fault in the owner lookup or the row write is logged, not raised
+        (BACKLOG #3884 item 1).** The sign-out has already happened, so a raise would report it as
+        a failure, and on ``/ui/logout`` it answered 500 without clearing the cookie.
 
         The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
         caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
         has no auth dependency to name a caller, still lands in that user's ``/me/security-events``
-        feed; with nothing ended there is no owner, and the actor stays NULL. That includes a
-        console sign-out that loses a rotation race (engine PR 2384, open finding 3). A
-        read before the revoke would name the owner only through :meth:`_load_session`, the one
-        sanctioned session reader, and that read ends and reports a row whose seal fails, so the
-        revoke would then record ``nothing_to_revoke`` for a session this call ended.
+        feed, a lapsed one included. With nothing ended there is no owner, and the actor stays
+        NULL.
 
         ``client`` is the caller's address, from ``client_ip`` on a request (ADR 0150). It is
         ``None`` where ``client_ip`` finds no address, so on this row a NULL client does not by
@@ -10778,17 +10832,85 @@ class AuthService:
         omit it silently (BACKLOG #3339)."""
         if not token:
             return "nothing_to_revoke"
-        ended = await self._store.supersede_session(hash_token(token), now=time.time())
-        outcome: LogoutOutcome = "nothing_to_revoke" if ended is None else "revoked"
-        if actor is None and ended is not None:
-            owner = await self._load_user(ended.user_id)
-            actor = owner.username if owner is not None else None
-        # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
-        # ended, so the trail still records the sign-out request.
-        await self._audit(
-            "auth.logout", actor=actor, detail=_json({"outcome": outcome}), client=client
+        presented = hash_token(token)
+        before = time.time()
+        since = (
+            before - _UNPROVEN_LOGOUT_LINEAGE_SECONDS if lineage_since is None else lineage_since
+        )
+        ended = await self._store.supersede_session(presented, now=before, lineage_since=since)
+        if ended is None:
+            # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
+            # ended, so the trail still records the sign-out request, within the budget.
+            if await self._admit_logout_miss_row(client):
+                await self._audit(
+                    "auth.logout",
+                    actor=actor,
+                    detail=_json({"outcome": "nothing_to_revoke"}),
+                    client=client,
+                )
+            return "nothing_to_revoke"
+        outcome: LogoutOutcome = (
+            "revoked" if self._was_live_at_revoke(ended, before, time.time()) else "lapsed"
+        )
+        detail = {"outcome": outcome, "session": ended.token_hash[:12]}
+        if not constant_time_equal(ended.token_hash, presented):  # ASVS 11.2.4, as elsewhere
+            detail["presented"] = presented[:12]
+
+        async def _row() -> None:
+            named = actor if actor is not None else await self._owner_name(ended.user_id)
+            await self._audit("auth.logout", actor=named, detail=_json(detail), client=client)
+
+        await write_audit_soft(
+            _row,
+            log=_log,
+            message="a sign-out ended its session, but its auth.logout row failed",
+            # A raise would report a sign-out that already ran as a failure (see above).
+            defects=(),
         )
         return outcome
+
+    async def _admit_logout_miss_row(self, client: str | None) -> bool:
+        """Whether a sign-out that ended nothing may write its ``auth.logout`` row now, writing a
+        :data:`LOGOUT_ROWS_DROPPED_ACTION` row first where the budget's count is due (BACKLOG #3749
+        item 6). Charged and checked with no ``await`` between, so the count is atomic on the
+        event loop. A client with no address shares one bucket."""
+        admitted = self._logout_miss_limiter.allow(client or "")
+        if admitted:
+            dropped, self._logout_misses_dropped = self._logout_misses_dropped, 0
+            self._logout_miss_trip_written = False
+        else:
+            self._logout_misses_dropped += 1
+            if self._logout_miss_trip_written:
+                return False
+            self._logout_miss_trip_written = True
+            dropped, self._logout_misses_dropped = self._logout_misses_dropped, 0
+        if dropped:
+            await self._audit(
+                LOGOUT_ROWS_DROPPED_ACTION, detail=_json({"dropped": dropped}), client=client
+            )
+        return admitted
+
+    async def _owner_name(self, user_id: str) -> str | None:
+        """The username of the account ``user_id`` names, or ``None`` when there is none: the actor
+        a session-ending row names, so the event reaches that user's ``/me/security-events`` feed.
+
+        ``user_id`` here comes from the row :meth:`AuthStore.supersede_session` returns, whose seal
+        that call blanks without checking it first (BACKLOG #3716). So the name is only as good as
+        that unchecked column: a tampered row would attribute the event to another account. Do not
+        build any trust on this beyond the attribution; the fix is #3716's, in the store."""
+        owner = await self._load_user(user_id)
+        return owner.username if owner is not None else None
+
+    def _was_live_at_revoke(self, row: SessionRecord, before: float, after: float) -> bool:
+        """Whether ``row``, ended by a revoke that ran between the clock reads ``before`` and
+        ``after``, was a live session then: the validator's own test, clock-step checks included
+        (BACKLOG #2096). A row stamped ahead of the clock is one the validator would refuse, so
+        ending it is not the end of a live session. The row is judged at the latest moment it can
+        show to have been used, clamped to that span. A touch that committed inside the call is
+        then not mistaken for a clock step, a stamp past ``after`` still is one, and a session
+        already over at ``before`` is not judged live by waiting."""
+        moment = min(max(before, row.last_used_at), after)
+        return row.is_live(now=moment, idle_seconds=self.session_idle_seconds)
 
     async def _supersede_session_hash(self, prior_hash: str, *, client: str | None) -> bool:
         """End the session a browser presented at a fresh sign-in (ASVS 7.2.4, login side).
@@ -10807,7 +10929,8 @@ class AuthService:
         /auth/logout``, so ending the presented session grants no new power. Following the lineage
         does grant one, and it is bounded: for :attr:`supersession_lineage_seconds` after an
         elevation, a holder of the RETIRED token can end the session it became through a sign-in
-        that succeeds, which ``logout`` cannot do. docs/SECURITY.md states it. The audit row's
+        that succeeds. ``logout`` follows the lineage too, for far shorter windows (BACKLOG
+        #3715). docs/SECURITY.md states both. The audit row's
         actor is the session's OWNER, not whoever signed
         in: ``/me/security-events`` selects rows by actor, so the event belongs in the feed of the
         user whose session ended, and must not put that user's ids in anyone else's.
@@ -10827,8 +10950,9 @@ class AuthService:
         federated leg the presented hash was read at the start leg, before the identity provider's
         round trip. The presented hash then names no session. The store follows the lineage links
         each rotation wrote to the session's live end and revokes that, in the same transaction.
-        Only links retired within :attr:`supersession_lineage_seconds` of now are followed, so this
-        is the one place a retired hash leads anywhere, and it leads only to an end. An elevation
+        Only links retired within :attr:`supersession_lineage_seconds` of now are followed. This and
+        :meth:`logout` are the only places a retired hash leads anywhere, and it leads only to an
+        end. An elevation
         that finished longer ago than that, such as one a second holder of the token completed
         earlier, is not followed; docs/SECURITY.md (ASVS 7.2.4, the supersession paragraphs) states
         that bound. The audit row names the session that ended and, when a link was followed, the
@@ -10839,25 +10963,14 @@ class AuthService:
         prior = await self._store.supersede_session(
             prior_hash, now=before, lineage_since=before - self.supersession_lineage_seconds
         )
-        if prior is None:
+        if prior is None or not self._was_live_at_revoke(prior, before, time.time()):
             return False
-        after = time.time()
-        # The validator's own test, clock-step checks included (BACKLOG #2096): a row stamped ahead
-        # of the clock is one the validator would refuse, so ending it is not the end of a live
-        # session. The revoke landed somewhere between `before` and `after`, so the row is judged at
-        # the latest moment it can show to have been used, clamped to that span. A touch that
-        # committed inside the call is then not mistaken for a clock step, a stamp past `after`
-        # still is one, and a session already over at `before` is not judged live by waiting.
-        moment = min(max(before, prior.last_used_at), after)
-        if not prior.is_live(now=moment, idle_seconds=self.session_idle_seconds):
-            return False
-        owner = await self._load_user(prior.user_id)
         detail = {"scope": "superseded", "session": prior.token_hash[:12]}
         if not constant_time_equal(prior.token_hash, prior_hash):  # ASVS 11.2.4, as elsewhere
             detail["presented"] = prior_hash[:12]
         await self._audit(
             "auth.session_revoked",
-            actor=owner.username if owner is not None else None,
+            actor=await self._owner_name(prior.user_id),
             detail=_json(detail),
             client=client,
         )
