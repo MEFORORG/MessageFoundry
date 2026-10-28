@@ -1193,15 +1193,14 @@ _SCHEMA.append(
 # columns) are ADDed in the same function. Same contract, same caveat.
 # 6 (ADR 0197 Amendment A, BACKLOG #1131): the users.password_generated ADD lands in the same
 # function. Same contract, same caveat.
-# 7 (BACKLOG #1726): ix_messages_received moved from _SCHEMA into the same function. Same contract.
+# 7 (BACKLOG #1726): the same function builds ix_messages_received. Same contract. This bump is the
+# only thing that moves the hash for it, since _SCHEMA is unchanged.
 _MIGRATION_REV = 7
 
 # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
-# is pinned by a test; this backend's plan has not been measured. Run by _migrate_lease_columns with
-# timeout=inf, for the FIFO rebuild's reason: an existing store gains the index on its first open
-# after upgrade, the build scans the whole messages table, and asyncpg's client command_timeout (30s
-# by default) would cancel it. SET LOCAL statement_timeout = 0 covers only the server side, and a
-# cancelled build rolls the schema txn back, so every restart would retry it and fail again.
+# is pinned by a test; this backend's plan has not been measured. Built in _migrate_lease_columns with
+# timeout=inf, for the reason its FIFO covering-index comment gives: an existing store's first build
+# scans the whole table.
 _RECEIVED_INDEX_DDL = "CREATE INDEX IF NOT EXISTS ix_messages_received ON messages(received_at, id)"
 
 
@@ -1966,8 +1965,7 @@ class PostgresStore:
                 # role/database-configured statement_timeout → txn abort → startup crash-loop. This covers
                 # only the server side; asyncpg ALSO imposes a client-side command_timeout, exempted
                 # per-statement with timeout=inf on the long builds in _migrate_lease_columns. SET LOCAL
-                # scopes to this txn
-                # and auto-reverts at commit.
+                # scopes to this txn and auto-reverts at commit.
                 await conn.execute("SET LOCAL statement_timeout = 0")
                 await self._advisory_lock(conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK)
                 # Double-check under the lock: the peer this open queued behind may have just applied
@@ -2099,7 +2097,9 @@ class PostgresStore:
         open. Gating on ``information_schema`` keeps re-opens of an already-migrated DB lock-free
         (this runs under the schema advisory lock alongside the CREATEs). Also creates the lease
         index here — AFTER the columns are guaranteed present — since on a Step-1 table the index
-        would reference a not-yet-added column if it lived in the _SCHEMA loop."""
+        would reference a not-yet-added column if it lived in the _SCHEMA loop. Also runs the index
+        builds that need asyncpg's client timeout lifted (the FIFO covering indexes and
+        ix_messages_received), which the _SCHEMA loop cannot give per statement."""
         present = {
             r["column_name"]
             for r in await conn.fetch(

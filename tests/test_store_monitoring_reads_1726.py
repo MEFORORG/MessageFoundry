@@ -21,6 +21,7 @@ No row is deleted and no figure changes meaning; retention is out of scope here.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 import random
 import sqlite3
@@ -477,6 +478,10 @@ async def test_postgres_received_index_build_is_exempt_from_the_client_timeout()
     await postgres.PostgresStore.__new__(postgres.PostgresStore)._migrate_lease_columns(conn)
     timeouts = [t for sql, t in conn.executed if sql == postgres._RECEIVED_INDEX_DDL]
     assert timeouts == [math.inf]
+    # The _SCHEMA text is unchanged by #1726, so only the revision bump to 7 moves the hash: a store
+    # whose marker records revision 6 must take the full run, or it skips the build above.
+    rev6 = hashlib.sha256(("\n".join(postgres._SCHEMA) + "\nmigration_rev=6").encode()).hexdigest()
+    assert rev6 != postgres._schema_hash()
     # Control: the FIFO rebuild this mirrors is seen the same way, so the recorder reads kwargs.
     fifo = [t for sql, t in conn.executed if "ix_queue_fifo_in_seq" in sql]
     assert fifo == [math.inf]
