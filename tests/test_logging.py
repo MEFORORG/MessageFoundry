@@ -1369,7 +1369,7 @@ def test_a_general_log_flood_does_not_cost_an_audit_line(
                 )
     finally:
         gate.set()
-    fwd.close()
+        fwd.close()
 
     assert fwd.dropped > 0, "the flood never overflowed the general lane, so it tested nothing"
     delivered = [r.getMessage() for r in target.seen]
@@ -1378,14 +1378,16 @@ def test_a_general_log_flood_does_not_cost_an_audit_line(
     assert audit == expected  # every audit line, once each, in the order it was logged
 
 
-def test_the_drop_report_names_dropped_audit_lines_without_counting_them(
+def test_the_drop_report_names_the_audit_lane_when_only_it_dropped(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A count of dropped audit tee lines counts the audit rows written, the hidden lock rows
-    included, and the drop report reaches ``GET /logs/tail`` (BACKLOG #1131, #2612). So the report
-    names an audit drop and gives it no number of its own: its only numbers are the combined batch,
-    the general lane's depth and the combined total, which ``queue_dropped`` already serves."""
+    included, and the drop report reaches ``GET /logs/tail`` (BACKLOG #1131, #2612). The report's
+    only numbers are the combined batch, the lane depth and the combined total, which
+    ``queue_dropped`` already serves. With only the audit lane dropping they are the audit count,
+    a residual docs/SECURITY.md records as not closed; this test pins that the lane is named
+    right, not that the count is hidden."""
     from messagefoundry.store import audit_tee
 
     monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_QUEUE_MAXSIZE", 2)

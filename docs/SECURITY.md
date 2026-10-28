@@ -6128,16 +6128,17 @@ process for each relay, by the security notifier when it is built rather than at
 a failed TLS key-exchange pin is logged once per process. **The cost of the tee line:** a sink that
 stays broken, or recovers and breaks again, is reported only by that first line.
 
-**The forwarder's audit lane (vault BACKLOG #2612) leaves at least these on the channel.** What
-`queued`, the drop warning and the drop counts report about the audit lane is stated once, in
-[CONFIGURATION.md](CONFIGURATION.md) under `[logging]`, where the audit lane is described. `queued`
-leaves the audit lane out, so it does not move as audit rows are written while the general lane is
-full. The drop warning, which `GET /logs/tail` serves, is written at most once per
-`_FORWARD_DROP_REPORT_INTERVAL` (60 seconds), so a warning naming the audit lane tells a `logs:view`
-reader that an audit row was written in that window. **Not closed:** the drop counts on `GET
-/status`, in the warning and in the `log_forward_failed` alert include dropped audit tee lines, as
-the single queue's did. While only the audit lane drops, they rise by one per audit row written. The
-alert's `audit_queue_full` reason word, which is new, says the audit lane dropped.
+**The forwarder's audit lane (vault BACKLOG #2612) leaves at least these on the channel.**
+[CONFIGURATION.md](CONFIGURATION.md) describes the lane under `[logging]`, and this paragraph
+states only what it leaves a `logs:view` or `monitoring:read` reader without `users:manage`.
+`queued` on `GET /status` counts the general lane only, so it does not move with audit rows while
+the general lane is full; a depth over both lanes would have risen by one per row. The drop warning,
+which `GET /logs/tail` serves, is written at most once per `_FORWARD_DROP_REPORT_INTERVAL`, so a
+warning naming the audit lane tells its reader that an audit row was written in that window.
+**Not closed:** the drop counts on `GET /status`, in the warning and in the `log_forward_failed`
+alert include dropped audit tee lines, as the single queue's did. While only the audit lane drops,
+they rise by one per audit row written. The alert's `audit_queue_full` reason word, which is new,
+and the warning's lane name say when that is so.
 
 **A notice the relay loses is audited (BACKLOG #2383).** The `auth.lock_notice` row is written
 when the notice is handed to the relay. It reads `mailed: true` only when the relay queued the

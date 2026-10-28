@@ -1477,11 +1477,11 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
                 audit_total,
             )
             self._dropped_since_report = 0
-        # The line names the lane or lanes that dropped and gives no per-lane number (BACKLOG
+        # The line names the lane or lanes that dropped, with no separate number per lane (BACKLOG
         # #1131): the audit count is the audit rows written, the hidden lock rows included, and this
         # line reaches ``GET /logs/tail``. The batch and the total stay combined, as
-        # ``queue_dropped`` on ``GET /status`` is. When only the audit lane dropped, they equal the
-        # audit count, as on the single queue before #2612 when only audit lines arrived at it full.
+        # ``queue_dropped`` on ``GET /status`` is. So when only the audit lane dropped, they ARE the
+        # audit count, and the lane name says so. docs/SECURITY.md records that as not closed.
         self._reporting.active = True
         try:
             _log.warning(
