@@ -10129,8 +10129,8 @@ class AuthService:
         :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row carrying ``detail``, and an
         ``integrity_drift`` alert, at most once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`
         per ``key``. With ``unverifiable``, a seal Vault transit refused to check, the audit row is
-        :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` and the throttle key is its own; the alert is
-        the same. ``reason`` and ``detail`` name the row by an id, never a row value. A store
+        :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` and the throttle key is its own; no alert is raised
+        here, because the sealer pages once per key for it. ``reason`` and ``detail`` name the row by an id, never a row value. A store
         refusal of the audit write is logged, not raised, so it does not turn a denial into an
         error."""
         action, _verb, throttle_key = seal_report_text(unverifiable, key)
@@ -10145,7 +10145,9 @@ class AuthService:
             errors=audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
         )
-        if self._integrity_alert is not None:
+        # An unverifiable seal pages once per key from the sealer, under its own subject, so a flood
+        # of them after a minimum is raised never throttles or mutes a forgery's page here.
+        if self._integrity_alert is not None and not unverifiable:
             self._integrity_alert(reason)
 
     @asynccontextmanager
@@ -10343,27 +10345,31 @@ class AuthService:
     # --- the role and directory-map loaders (BACKLOG #2592) ----------------------------------------
 
     async def _load_role(self, role_id: str) -> RoleRow | None:
-        """The ``roles`` row ``role_id`` names, its integrity seal checked, or ``None``. With
-        :meth:`_load_custom_roles`, :meth:`_custom_role_held` and :meth:`_ad_map`, the ONLY
-        readers of the store's role and AD role-map readers in this service;
+        """The ``roles`` row ``role_id`` names, its integrity seal checked, or ``None``. Through
+        :meth:`_checked_role`, which with :meth:`_load_custom_roles`, :meth:`_custom_role_held` and
+        :meth:`_sealed_ad_map` are the ONLY readers of the store's role and AD role-map readers in
+        this service;
         ``tests/test_role_seal.py`` holds that. A row that fails is reported and read as absent, so
         it grants nothing."""
         checked = await self._checked_role(role_id)
-        return checked[0] if checked is not None and checked[1] else None
+        if checked is None:
+            return None
+        row, holds = checked
+        if holds:
+            return row
+        await self._role_seal_failed(row.id, unverifiable=holds is None)
+        return None
 
     async def _checked_role(self, role_id: str) -> tuple[RoleRow, bool | None] | None:
         """The ``roles`` row ``role_id`` names with its seal's verdict, or ``None`` for no row:
         ``True`` holds, ``False`` fails and ``None`` is a seal Vault transit refused to check
-        (BACKLOG #2592). Each of the last two is reported. Only :meth:`_load_role` and
-        :meth:`update_custom_role` read it; the verdict, not the row, decides what they do."""
+        (BACKLOG #2592). It reports nothing: :meth:`_load_role` reports, and
+        :meth:`update_custom_role`, whose save repairs a failing row, does not."""
         found = await self._store.get_role(role_id)
         if found is None:
             return None
         row = RoleRow.from_mapping(found)
-        holds = await _unless_unverifiable(role_seal_ok(self._store.row_sealer(), row))
-        if not holds:
-            await self._role_seal_failed(row.id, unverifiable=holds is None)
-        return row, holds
+        return row, await _unless_unverifiable(role_seal_ok(self._store.row_sealer(), row))
 
     async def _load_custom_roles(self) -> list[tuple[RoleRow, bool]]:
         """Every custom role row, each with whether its seal holds. One that fails, or whose seal

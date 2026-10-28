@@ -2281,7 +2281,7 @@ class ApprovalGate:
         ``integrity.authority_seal_failed`` audit row and an ``integrity_drift`` alert, at most once
         per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` per request, as the auth service reports
         the rows it checks. With ``unverifiable``, a seal Vault transit refused to check, the audit
-        action is ``integrity.authority_seal_unverifiable`` and the alert is the same. The report
+        action is ``integrity.authority_seal_unverifiable`` and the sealer, not this, pages. The report
         names the request by its id, never a row value. A failed audit write is logged and paged,
         not raised, so it does not turn a refusal into an error."""
         action, verb, throttle_key = seal_report_text(unverifiable, approval_id)
@@ -2300,7 +2300,8 @@ class ApprovalGate:
             client=None,
             context="a request failed its integrity seal",
         )
-        authority_seal_alert(self._alert_sink)(reason)
+        if not unverifiable:  # that one pages from the sealer, under its own subject
+            authority_seal_alert(self._alert_sink)(reason)
 
     def _label(self, operation: str) -> str:
         op = self._ops.get(operation)

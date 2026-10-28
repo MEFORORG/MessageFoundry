@@ -320,7 +320,7 @@ async def test_a_seal_transit_refuses_to_check_is_denied_revoked_audited_and_ale
 ) -> None:
     """Raising ``min_decryption_version`` past a version that sealed live rows makes those rows
     unverifiable (BACKLOG #2592). Each is treated as a failed seal under its own audit action: the
-    session is ended, the account is refused, and the alert is raised at the forgery's level."""
+    session is ended and the account is refused. The page comes from the sealer, once per key."""
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
     store, path, transit = transit_store
     transit.refusal = hvac_exceptions.InvalidRequest
@@ -337,7 +337,7 @@ async def test_a_seal_transit_refuses_to_check_is_denied_revoked_audited_and_ale
     assert await service.identity_for_token(token) is None
     assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
     assert _seal_failures(path) == 0  # not filed as a forgery
-    assert any("could not be verified by Vault transit" in a for a in alerts)
+    assert alerts == []  # the forgery subject is never paged for it
     row = await store.get_session(hash_token(token))
     assert row is not None and row.revoked_at is not None  # ended, as a failed seal is
     # A scan skips the account rather than aborting, and reports it.
@@ -348,6 +348,32 @@ async def test_a_seal_transit_refuses_to_check_is_denied_revoked_audited_and_ale
     assert await service._load_user_by_username("seal-u1") is not None
 
 
+async def test_a_refusal_of_the_newest_version_seen_is_a_lagging_node(
+    transit_store: Opened,
+) -> None:
+    """A session sealed under the newest version Transit named to this process, then checked by a
+    node that lags the rotation, is an outage: denied, not ended, not audited. Vault never lets
+    the minimum pass the latest version, so that refusal cannot be a retirement."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    service = AuthService(store, AuthSettings())
+    await _user(store, "seal-u1")
+    transit.rotate()
+    token = await _mint(store)  # sealed under v2, the newest this process has seen
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    sealer._cache.clear()
+    transit.latest = 1  # the node answering now lags the rotation
+    with pytest.raises(TransitSealUnavailableError):
+        await service.identity_for_token(token)
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 0
+    row = await store.get_session(hash_token(token))
+    assert row is not None and row.revoked_at is None
+    transit.latest = 2  # the node catches up
+    assert await service.identity_for_token(token) is not None
+
+
 async def test_a_planted_well_formed_seal_is_unverifiable_and_alerted(
     transit_store: Opened, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -356,14 +382,7 @@ async def test_a_planted_well_formed_seal_is_unverifiable_and_alerted(
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
     store, path, transit = transit_store
     transit.refusal = hvac_exceptions.InvalidRequest
-    raised: list[str] = []
-    sink = LoggingAlertSink()
-    monkeypatch.setattr(
-        sink, "integrity_drift", lambda name, *, reason, drift_count: raised.append(name)
-    )
-    sealer = store.row_sealer()
-    assert isinstance(sealer, TransitRowSealer)
-    sealer.set_alert_hook(transit_seal_alert(sink))
+    raised = _armed(store, monkeypatch)
     service = AuthService(store, AuthSettings())
     await _user(store, "seal-u1")
     token = await _mint(store)
@@ -382,36 +401,50 @@ async def test_a_planted_well_formed_seal_is_unverifiable_and_alerted(
     assert ended is not None and ended.revoked_at is not None
 
 
-async def _retire_v1(store: MessageStore, transit: FakeTransit) -> None:
-    """Rotate, seal once under v2 so the sealer forgets its v1 answers, and retire v1."""
+def _armed(store: MessageStore, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Arm the sealer's alert hook on a recording sink; returns the subjects it pages."""
+    raised: list[str] = []
+    sink = LoggingAlertSink()
+    monkeypatch.setattr(
+        sink, "integrity_drift", lambda name, *, reason, drift_count: raised.append(name)
+    )
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    sealer.set_alert_hook(transit_seal_alert(sink))
+    return raised
+
+
+async def _retire_old_versions(store: MessageStore, transit: FakeTransit) -> None:
+    """Rotate, seal once under the new version so the sealer forgets its older answers, and raise
+    the minimum to that new version, retiring every older one."""
     transit.rotate()
     sealer = store.row_sealer()
     assert isinstance(sealer, TransitRowSealer)
     await sealer.seal_async(SESSION_KIND, [("token_hash", "rotate")])
-    transit.min_decryption = 2
+    transit.min_decryption = transit.latest
 
 
 async def test_an_unverifiable_directory_map_is_skipped_and_only_narrows(
-    transit_store: Opened,
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
     store, path, transit = transit_store
     transit.refusal = hvac_exceptions.InvalidRequest
-    alerts: list[str] = []
-    service = AuthService(store, AuthSettings(), integrity_alert=alerts.append)
+    raised = _armed(store, monkeypatch)
+    service = AuthService(store, AuthSettings())
     await service.initialize()  # seeds the built-in roles the map's foreign key names
     await store.set_ad_group_role_map([("grp", "viewer")])
     assert await service._ad_roles_for_groups(["grp"]) == {"viewer"}  # control
-    await _retire_v1(store, transit)
+    await _retire_old_versions(store, transit)
     # Grants nothing, and a step-up reads it as a failing map, never as roles kept.
     assert await service._ad_roles_for_groups(["grp"]) == set()
     assert await service._sealed_ad_map(AD_ROLE_MAP) is None
     assert await service._directory_roles_lost(["viewer"], ["grp"]) == DIRECTORY_ROLE_MAP_UNSEALED
     assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
-    assert len(alerts) == 1
+    assert raised == [TRANSIT_SEAL_UNVERIFIABLE_SUBJECT]
 
 
-async def test_an_unverifiable_custom_role_is_listed_empty_and_refuses_an_edit(
+async def test_an_unverifiable_custom_role_is_listed_empty_refuses_an_edit_and_deletes(
     transit_store: Opened,
 ) -> None:
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
@@ -422,7 +455,7 @@ async def test_an_unverifiable_custom_role_is_listed_empty_and_refuses_an_edit(
     role = await service.create_custom_role(
         display_name="r", description=None, permissions=["messages:replay"], actor="t"
     )
-    await _retire_v1(store, transit)
+    await _retire_old_versions(store, transit)
     assert await service._load_role(role.id) is None
     [listed] = [r for r in await service.list_custom_roles() if r.id == role.id]
     assert listed.permissions == frozenset()
@@ -438,25 +471,32 @@ async def test_an_unverifiable_custom_role_is_listed_empty_and_refuses_an_edit(
     await service.update_custom_role(
         role.id, display_name="r", description=None, permissions=["messages:read"], actor="t"
     )
-    # And deleting is the recovery path while it cannot be verified.
-    transit.min_decryption = 2
-    await _retire_v1(store, transit)
+    # Deleting is the recovery path, even with a holder and an AD map pair that are themselves
+    # unverifiable: each falls back to deleting its own row of the role.
+    await _user(store, "holder")
+    await store.set_user_roles("holder", [role.id])
+    await store.set_ad_group_role_map([("grp", role.id)])
+    await _retire_old_versions(store, transit)
+    assert await service._load_role(role.id) is None  # control: the role is unverifiable now
     await service.delete_custom_role(role.id, actor="t")
     assert await store.get_role(role.id) is None
+    assert role.id not in await store.get_user_role_ids("holder")
 
 
 async def test_an_unverifiable_approval_is_skipped_with_audit_and_alert(
-    transit_store: Opened,
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
     store, path, transit = transit_store
     transit.refusal = hvac_exceptions.InvalidRequest
+    raised = _armed(store, monkeypatch)
     harness = ApprovalHarness(store, _raw_for(path))
     approval_id = await harness.request(contract_nonce="repeat")
     assert await harness.listed(approval_id)  # control
-    await _retire_v1(store, transit)
+    await _retire_old_versions(store, transit)
     assert not await harness.listed(approval_id)  # skipped, the read did not abort
-    assert harness.alerted(approval_id) == 1
+    assert harness.alerted(approval_id) == 0  # the forgery subject is not paged for it
+    assert raised == [TRANSIT_SEAL_UNVERIFIABLE_SUBJECT]
     assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
     # A repeat request is filed on its own rather than joining the row nobody can check.
     assert await harness.request(contract_nonce="repeat") != approval_id

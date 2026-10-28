@@ -1348,6 +1348,20 @@ async def seal_session(sealer: Sealer | None, record: SessionRecord) -> SessionR
     return replace(record, seal=seal)
 
 
+async def seal_holds_for_write(check: Awaitable[bool]) -> bool:
+    """``check``'s answer, with a seal Vault transit refused to check
+    (:class:`~messagefoundry.store.row_seal.TransitSealUnverifiableError`) read as failing
+    (BACKLOG #2592). Every store-side check runs through it, on every backend: a write helper then
+    refuses with :class:`RowSealError`, so each existing fallback for a failing row (a holder's
+    row deleted, an epoch bumped, a guard that skips the holder) covers that seal too. The auth
+    service's and the approval gate's loaders call the ``*_seal_ok`` helpers directly instead,
+    because they report the two cases under different audit actions."""
+    try:
+        return await check
+    except TransitSealUnverifiableError:
+        return False
+
+
 async def session_seal_ok(sealer: Sealer | None, record: SessionRecord) -> bool:
     """Whether ``record`` carries a valid seal. Always True with no sealer: a store that holds no
     key writes and checks no seals. With one, a missing or empty seal fails like a wrong one."""
@@ -1799,7 +1813,7 @@ async def admin_guard_counts(
             target += 1
             continue
         record = await read_record(holder_id)
-        if record is None or not await user_seal_ok(sealer, record):
+        if record is None or not await seal_holds_for_write(user_seal_ok(sealer, record)):
             continue
         if counts is None or counts(record.row):
             others += 1
@@ -3551,7 +3565,7 @@ async def ad_map_write(sealer: Sealer | None, current: AdMap, change: AdMapChang
     """
     if isinstance(change, AdMap):
         changed = replace(change, name=current.name)
-    elif not await ad_map_seal_ok(sealer, current):
+    elif not await seal_holds_for_write(ad_map_seal_ok(sealer, current)):
         raise RowSealError(ADSET_KIND)
     else:
         changed = change(current)
@@ -3806,7 +3820,7 @@ async def approval_update(
     """What a backend's ``_write_approval`` writes over ``current``, the row it read: ``new``,
     sealed. Raises :class:`RowSealError` when ``current`` fails its seal, because the write keeps
     its stored values, so a change made outside the store must never be sealed in."""
-    if not await approval_seal_ok(sealer, current):
+    if not await seal_holds_for_write(approval_seal_ok(sealer, current)):
         raise RowSealError(APPROVAL_KIND)
     return await seal_approval(sealer, new)
 
@@ -3824,12 +3838,8 @@ async def first_sealed_approval(
         except RowSealError:
             failed += 1
             continue
-        try:
-            holds = await approval_seal_ok(sealer, row)
-        except TransitSealUnverifiableError:
-            # Skipped like a failed seal, never joined; the sealer has logged and alerted.
-            holds = False
-        if holds:
+        # An unverifiable seal is skipped like a failed one, never joined.
+        if await seal_holds_for_write(approval_seal_ok(sealer, row)):
             return row
         failed += 1
     if failed:
@@ -15366,7 +15376,7 @@ class MessageStore:
         current = await self._read_user_record(user_id)
         if current is None:
             return None
-        if not await user_seal_ok(self._row_sealer, current):
+        if not await seal_holds_for_write(user_seal_ok(self._row_sealer, current)):
             raise RowSealError(USER_KIND)
         changed = change(current)
         if changed is None:
@@ -15413,7 +15423,7 @@ class MessageStore:
         left to seal, so ``admin_reset_mfa`` can still clear a set that fails."""
         current = await self._read_user_record(user_id)
         if current is not None:
-            if not await user_seal_ok(self._row_sealer, current):
+            if not await seal_holds_for_write(user_seal_ok(self._row_sealer, current)):
                 raise RowSealError(USER_KIND)
             if (
                 self._row_sealer is not None
@@ -16630,7 +16640,7 @@ class MessageStore:
                 if found is None:
                     continue
                 row = RoleRow.from_mapping(found)
-                if not await role_seal_ok(sealer, row):
+                if not await seal_holds_for_write(role_seal_ok(sealer, row)):
                     refused += 1
                     continue
                 await self._write_role(row)
@@ -16730,7 +16740,7 @@ class MessageStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        if not await session_seal_ok(self._row_sealer, current):
+        if not await seal_holds_for_write(session_seal_ok(self._row_sealer, current)):
             raise RowSealError(SESSION_KIND)
         updated = await seal_session(self._row_sealer, change(current))
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))

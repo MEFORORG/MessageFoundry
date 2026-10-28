@@ -430,9 +430,12 @@ class TransitRowSealer:
     (:func:`_transit_version`) fails with no Transit call. Transit's ``valid: false`` fails. A
     well-formed seal Transit refuses to check while its key answers raises
     :class:`TransitSealUnverifiableError`, reported like an outage under its own throttle and
-    cause, and its callers treat the row as a failed seal
-    (:meth:`~messagefoundry.store.crypto_transit.TransitCipher.verify_seal_hmac` says why the
-    sealer does not tell a retired version from a lagging node or a planted one).
+    cause, and the auth service and approval gate treat the row as a failed seal
+    (:meth:`~messagefoundry.store.crypto_transit.TransitCipher.verify_seal_hmac` says why Transit's
+    reply cannot tell a retired version from a lagging node or a planted one). One exception, from
+    this process's own evidence: a refusal of exactly the newest version Transit has named to this
+    process cannot be a retirement, so it is an outage. A node two or more rotations behind still
+    reads as unverifiable.
 
     **The seam (CLAUDE.md section 6).** Each Transit call runs in a worker thread
     (:func:`asyncio.to_thread`), so a seal or a check never blocks the event loop. So only the
@@ -509,7 +512,7 @@ class TransitRowSealer:
             TRANSIT_UNVERIFIABLE_CAUSE,
             "a well-formed row seal could not be verified: Vault transit refused to check it while"
             " its key answers (a key version below min_decryption_version, one this Vault node"
-            " does not hold yet, or a planted one); the row was denied as a failed seal is",
+            " does not hold yet, or a planted one); the operation was refused",
             exc,
         )
         return TransitSealUnverifiableError(f"Transit row seal unverifiable: {exc}")
@@ -557,6 +560,16 @@ class TransitRowSealer:
         try:
             valid = await asyncio.to_thread(self._backend.verify_seal_hmac, data, mac)
         except RowSealUnverifiableError as exc:
+            if version == self._latest_version:
+                # Transit itself named this version to this process, and Vault never lets the
+                # minimum pass the latest version, so a refusal of it cannot be a retirement: the
+                # node that answered lags a rotation. An outage, never a revoked session.
+                raise self._unavailable(
+                    CipherError(
+                        "Transit refused to check a seal under the newest key version this process"
+                        " has seen; a Vault node that lags a rotation does this"
+                    )
+                ) from exc
             raise self._unverifiable(exc) from exc
         except CipherError as exc:
             raise self._unavailable(exc) from exc

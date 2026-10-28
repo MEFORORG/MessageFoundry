@@ -16,8 +16,9 @@
   forgery. A stored seal that is not a well-formed Transit MAC fails with no Vault call. A
   well-formed one Transit refuses to check while its key answers (a retired version, one the node
   does not hold yet, or a planted one) is treated as a failed seal: denied, its session ended, an
-  `integrity.authority_seal_unverifiable` audit row, and `integrity_drift` alerts under
-  `authority-seal` for the row and `authority-seal-transit-unverifiable` for the key. An edit of a custom role in that state is refused with
+  `integrity.authority_seal_unverifiable` audit row, and an `integrity_drift` alert under
+  `authority-seal-transit-unverifiable`, at most once per five minutes for the key. A refusal of
+  exactly the newest version Transit has named to the engine is a lagging node, so an outage. An edit of a custom role in that state is refused with
   409. Before raising the audit key's `min_decryption_version`, read
   [PHI.md](docs/PHI.md#raising-the-transit-audit-keys-minimum-version). `serve` seals and verifies
   fixed input at start, before it seeds the auth tables, and refuses to start when the token

@@ -118,7 +118,9 @@ answers 503 with a `Retry-After`, the CLI prints one error line, and no session 
 - not a well-formed Transit MAC, or one Transit answers `valid: false` for: a failed seal;
 - well-formed, but Transit refuses to check it while its key still answers: *unverifiable*. The
   seal names a key version below `min_decryption_version`, one the Vault node that answered does
-  not hold yet, or a planted one, and the reply cannot tell them apart. So it is treated as a
+  not hold yet, or a planted one, and the reply cannot tell them apart. (A refusal of exactly the
+  newest version Transit has named to this process cannot be a retirement, so that one is read
+  as a node lagging a rotation: an outage.) Otherwise it is treated as a
   failed seal, under its own audit action, `integrity.authority_seal_unverifiable`: the row is
   denied, a session is ended, and a directory map grants nothing. A custom role whose seal is
   unverifiable is refused an edit (HTTP 409); delete it and create it again. Before raising the
