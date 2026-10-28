@@ -2155,7 +2155,8 @@ Properties of the anonymizer:
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
   scrubbed dataset stays structurally realistic.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
-  loose string search.
+  loose string search. With no site prefix loaded it matches nothing, and
+  `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
   reach. Plain `anonymize` and `anonymize_checked` both refuse it, on the engine and on the tee.
@@ -2177,8 +2178,8 @@ both are described below:
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IP address, survives | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
-| A dashed SSN (`NNN-NN-NNNN`) appears whole inside one field | Fields no rule maps |
-| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears whole inside one field | Fields no rule maps |
+| A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps. A cut shape counts when at least one of its fields is one no rule maps |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps. A cut shape counts when at least one of its fields is one no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it as `PV2 (line with no fields)` | Every line but the header. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
@@ -2188,13 +2189,28 @@ a bare ten-digit phone number, an account number and a free-text note. A Z-segme
 case, since no default rule names one. A name in `PV1-11`, the temporary location, passes the same
 way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
 
-**A shape split across fields by the message's own field separator passes.** The detectors read
-one field at a time, after the message is split on the separator its header declares. Under a
-field separator of `-`, at least the lines `ZZZ-1-123-45-6789` and `ZZZ-1-555-555-0100` would
-pass `anonymize_checked` on both anonymizers. The message itself cuts each value into three
-fields. Under `|`, the same two values are refused. With `require_full_coverage` on, such a
-message is refused only because nobody decided the `ZZZ` fields. A `keep` on each of them would
-let it through.
+**A shape cut across fields by the message's own field separator is refused, but not in every
+form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three
+fields, and none of them holds the shape. The check also reads each line as written, so both
+anonymizers refuse it, naming the fields: `unmapped SSN-shaped value across ZZZ-2 to ZZZ-4, cut
+by the field separator` (vault BACKLOG #3465). A match whose every field a rule rewrites is not
+a hit. The cost: under `-`, numeric fields side by side that read as such a shape are refused
+whatever they hold, so `OBR-1-123-45-6789` is refused as an SSN in `OBR-2` to `OBR-4`. At least
+these still get through, on both anonymizers:
+
+- The rest of a shape whose first or last part a rule scrubbed, which is no shape. Under `OBX-5`
+  typed `ST`, `OBX-1-ST-8480^S^LN--123-45-6789` leaves as `...--[REDACTED]-45-6789`, and
+  `OBX-1-ST-123-45-6789` as `OBX-1-ST-123-45-[REDACTED]`. `NTE-3` and `OBX-5` typed `TX` leave
+  such a rest too.
+- A shape whose separators the sender escaped, as HL7 asks: `123\F\45\F\6789`. No detector
+  decodes an escape.
+- A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
+  it. The detectors read that digit as part of a longer number.
+- A shape in the header line, which the check skips whole.
+
+With `require_full_coverage` on, such a message is refused for as long as nobody decides the
+fields that carry the rest of the shape. A `keep` on each of them would let it through. That
+switch skips the header line too, so it does not refuse a shape there.
 
 **A wrapped line can still look like a segment, but its id is never printed.** A line such as
 `KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id
@@ -2373,8 +2389,11 @@ What the `date` kind does to a value:
   one timestamp, and a second one after the component separator is not a precision code.
 - An `OBX-5` result whose `OBX-2` type is `DT` or `TS`, such as a last menstrual period, takes the
   `date` kind too: the year stays, and a value that is not a valid timestamp is scrubbed to
-  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is still
-  kept whole, and one sent as `DTM` or `ST` is redacted whole.
+  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is kept
+  whole whenever it fits the `NM` grammar below. At least these fit: digits alone, such as
+  `20110715`, even after a sign or a comparator; one decimal point, such as `2011.07`; and a date
+  split across repetitions. A dash or a slash inside the date, as in `2011-07-15`, does not fit,
+  so that one is redacted whole, as is one sent as `DTM` or `ST`.
 - An `OBX-5` result whose `OBX-2` type is `NM`, `SN` or `TM` is kept whole only when it fits the
   grammar of that type (vault BACKLOG #2961). `NM` is an optional comparator, an optional sign,
   digits and at most one decimal point. `SN` is a comparator, a number, a separator and a second
@@ -2382,17 +2401,17 @@ What the `date` kind does to a value:
   becomes `[REDACTED]`. So `123-45-6789` or `555-555-0100` under a numeric label would no longer
   leave whole, and neither would an eight-digit date under `TM`. **The grammar cannot tell a
   number from an identifier written as a number.** At least these would still leave whole under
-  `NM`, and in a number part of an `SN`: an undashed nine-digit number, which is the shape of an
-  SSN; an undashed ten-digit number, or eleven digits after a `+`, which is the shape of a phone
-  number; an eight-digit number that reads as a date; and an identifier split across repetitions.
+  `NM`, and in a number part of an `SN`. An undashed nine-digit number has the shape of an SSN.
+  An undashed ten-digit number, or eleven digits after a `+`, has the shape of a phone number. An
+  eight-digit number can read as a date. And an identifier can be split across repetitions.
   Under `TM`, at least a six-digit date whose parts are in range for a time would still leave
   whole: `150312` reads as 15:03:12. The leak-check's shape detectors do not scan `OBX-5`,
   because a rule maps it, so nothing refuses these. A message that declares a digit or one of
   `+ - . : / < > =` as its component, repetition or subcomponent separator keeps no numeric
-  `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, at
-  least a value such as `000-12-3456` would still leave whole. The message itself splits it
-  across `OBX-5`, `OBX-6` and `OBX-7`. The first part is a valid number, and no rule maps the
-  other two fields. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
+  `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, a
+  value such as `000-12-3456` is split by the message itself across `OBX-5`, `OBX-6` and `OBX-7`.
+  The first part is a valid number, so the guard keeps it, and the leak-check refuses the cut
+  shape, as *What the leak-check refuses, and what it lets through* says. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
   under one of them, such as a surname, would still leave whole.
 - When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
   site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
