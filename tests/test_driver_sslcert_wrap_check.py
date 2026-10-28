@@ -189,6 +189,9 @@ def test_a_file_that_is_not_regular_is_not_read(
     monkeypatch.setattr(os, "fstat", as_pipe)
     assert f"sslcert={{{path}}}" in _build(path)
     assert handles
+    # The same pipe named as sslkey is refused unread, as keywrap refused what it could not read.
+    with pytest.raises(KeyWrapRefused, match="not a regular file"):
+        _build(_write(tmp_path, client.cert_pem, "plain.pem"), extra={"sslkey": path})
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes need POSIX mkfifo")
@@ -242,3 +245,22 @@ def test_a_pipe_named_as_sslkey_is_not_opened(tmp_path: Path, client: _Client) -
     assert f"sslkey={{{pipe}}}" in _build(
         _write(tmp_path, client.cert_pem), extra={"sslkey": str(pipe)}
     )
+
+
+def test_a_blank_sslkey_does_not_turn_off_the_sslcert_check(
+    tmp_path: Path, client: _Client
+) -> None:
+    """A blank ``sslkey`` names no key file, so a driver that trims it takes the key from
+    ``sslcert``. Red with the ``.strip()`` taken out of ``_refuse_weak_driver_cert``."""
+    cert = _write(tmp_path, client.cert_pem + client.approved_key)
+    with pytest.raises(KeyWrapRefused, match="Set odbc_params sslpassword"):
+        _build(cert, extra={"sslkey": " "})
+
+
+def test_a_directory_named_as_sslkey_is_still_refused(tmp_path: Path, client: _Client) -> None:
+    """``keywrap.refuse_weak_key_file`` refused a directory as unreadable, and ``sslkey`` keeps
+    that. ``sslcert`` leaves one to the driver, as ``sslca`` does."""
+    cert = _write(tmp_path, client.cert_pem)
+    with pytest.raises(KeyWrapRefused, match="not a regular file"):
+        _build(cert, extra={"sslkey": str(tmp_path)})
+    assert f"sslcert={{{tmp_path}}}" in _build(str(tmp_path))

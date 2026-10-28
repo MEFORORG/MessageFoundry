@@ -191,10 +191,10 @@ def test_the_registry_collects_the_database_outbound_and_poller(tmp_path: Path) 
     assert ta.registry_anchor_specs(registry, {}, lanes=False) == []
     poller = registry.inbound[_IN]
     assert wiring_runner._inbound_lane_reads_ca(poller)
-    assert wiring_runner._lane_ca_setting(poller.spec.settings) == "odbc_params sslca"
+    assert ta.lane_ca_setting(poller.spec.settings) == "odbc_params sslca"
     # The control: a poller with no sslca has no lane CA, and a tls_ca_file line keeps its name.
     assert not wiring_runner._inbound_lane_reads_ca(registry.inbound["IB_DB_PLAIN"])
-    assert wiring_runner._lane_ca_setting({"tls_ca_file": str(ca)}) == "tls_ca_file"
+    assert ta.lane_ca_setting({"tls_ca_file": str(ca)}) == "tls_ca_file"
 
 
 def test_a_path_object_names_the_anchor_as_its_text_does(tmp_path: Path) -> None:
@@ -356,3 +356,36 @@ def test_a_real_pipe_is_refused_without_waiting(tmp_path: Path) -> None:
     os.mkfifo(pipe)
     with pytest.raises(OSError, match="not a regular file"):
         ta.evaluate_anchor(ta.AnchorSpec("outbound:X", "setting", str(pipe)))
+
+
+@pytest.mark.parametrize(
+    "remote", ["//db-ca.invalid/share/ca.pem", "\\\\db-ca.invalid\\share\\ca.pem"]
+)
+def test_a_value_that_can_name_another_host_is_never_opened(
+    remote: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lane check runs before the build at a start, and the build refuses a remote spelling,
+    so the spec must not stat or open it first: on Windows that would dial the host over SMB. Red
+    with the remote screen taken out of ``driver_file_spellings``."""
+
+    touched: list[object] = []
+
+    def recording(p: object) -> bool:
+        touched.append(p)
+        return True  # as if the remote file were there
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os.path, "exists", recording)
+        patched.setattr(os.path, "isdir", lambda _p: False)
+        spec = ta.lane_anchor_spec("outbound", _OUT, _settings(remote))
+    assert touched == [] and spec is None
+
+
+def test_a_device_named_as_sslca_is_refused_unread(tmp_path: Path) -> None:
+    """A pipe or device in place before the check is not left unjudged: the spec names it, and
+    the read refuses it. ``os.devnull`` is a device on every platform. Red with the spec built only
+    for a regular file: no spec, so nothing checks who can write the path."""
+    spec = ta.lane_anchor_spec("outbound", _OUT, _settings(os.devnull))
+    assert spec is not None and spec.path == os.devnull
+    with pytest.raises(OSError, match="not a regular file"):
+        ta.evaluate_anchor(spec)

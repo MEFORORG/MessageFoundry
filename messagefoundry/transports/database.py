@@ -86,7 +86,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
-from messagefoundry.keywrap import refuse_weak_key_wrap
+from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
@@ -534,6 +534,24 @@ def _odbc_literal(value: object, *, what: str, connection: str | None, refused: 
     return _odbc_brace(text)
 
 
+def _is_remote_spelling(value: object) -> bool:
+    """Whether the trimmed ``value`` starts with two separators, or with the device prefix, and so
+    can name another host. The spelling only; :func:`_refuse_remote_path` says what it misses."""
+    text = str(value).strip()
+    return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
+
+
+def driver_file_spellings(value: object) -> tuple[str, ...]:
+    """The spellings of a driver file keyword's value the engine checks: as sent, then trimmed,
+    since a driver may trim it. None for a value that can name another host, which the build
+    refuses (:func:`_refuse_remote_path`), so no check opens a remote path first (vault BACKLOG
+    #3090). A ``Path`` value is read as its text, as the build sends it."""
+    if not value or _is_remote_spelling(value):
+        return ()
+    raw = os.fspath(value) if isinstance(value, os.PathLike) else str(value)
+    return tuple(p for p in dict.fromkeys((raw, raw.strip())) if p)
+
+
 def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> None:
     """Refuse a file keyword whose path is not a plain local one.
 
@@ -541,8 +559,7 @@ def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> 
     the driver (or, for ``sslkey``, the engine's own wrap check) would open a connection to it. This
     reads the spelling only. It does not resolve the path, so a mapped drive or a link that leads
     to another host is not caught here."""
-    text = str(value).strip()
-    if len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?":
+    if _is_remote_spelling(value):
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' must be a plain "
             "local path: a drive letter, or one leading separator"
@@ -567,7 +584,7 @@ def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None 
 
     The file is read as :func:`_driver_file_spellings` reads it (vault BACKLOG #3090), so a pipe
     named here is never opened for reading, and a padded value is checked as a driver may trim it."""
-    _refuse_weak_driver_wrap(named, "sslkey", "key file", connection)
+    _refuse_weak_driver_wrap(named, "sslkey", "key file", connection, leave_irregular=False)
 
 
 def _refuse_weak_driver_cert(named: Mapping[str, Any], *, connection: str | None = None) -> None:
@@ -585,16 +602,32 @@ def _refuse_weak_driver_cert(named: Mapping[str, Any], *, connection: str | None
     :func:`~messagefoundry.keywrap.refuse_weak_cert_chain_key` follows. It runs when the
     connection is built, not at each connect. docs/CONNECTIONS.md, under the generic dialect, says
     what it does not cover."""
-    if not named.get("sslkey"):
+    if not str(named.get("sslkey") or "").strip():
         _refuse_weak_driver_wrap(named, "sslcert", "certificate file", connection)
 
 
 def _refuse_weak_driver_wrap(
-    named: Mapping[str, Any], keyword: str, what: str, connection: str | None
+    named: Mapping[str, Any],
+    keyword: str,
+    what: str,
+    connection: str | None,
+    *,
+    leave_irregular: bool = True,
 ) -> None:
     """Refuse a weak or unlockable key wrap in the ``keyword`` file, with ``sslpassword`` as its
-    passphrase, through :func:`~messagefoundry.keywrap.refuse_weak_key_wrap`."""
-    for setting, data in _driver_file_spellings(named, keyword, connection, what, "its wrap"):
+    passphrase, through :func:`~messagefoundry.keywrap.refuse_weak_key_wrap`. A file the check
+    cannot read is refused as :class:`~messagefoundry.keywrap.KeyWrapRefused`, as
+    :func:`~messagefoundry.keywrap.refuse_weak_key_file` refuses it. ``leave_irregular`` is
+    :func:`_read_driver_file`'s."""
+    for setting, data in _driver_file_spellings(
+        named,
+        keyword,
+        connection,
+        what,
+        "its wrap",
+        error=KeyWrapRefused,
+        leave_irregular=leave_irregular,
+    ):
         refuse_weak_key_wrap(
             data,
             setting=setting,
@@ -649,68 +682,95 @@ def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | N
 
 
 def _driver_file_spellings(
-    named: Mapping[str, Any], keyword: str, connection: str | None, what: str, checked_for: str
+    named: Mapping[str, Any],
+    keyword: str,
+    connection: str | None,
+    what: str,
+    checked_for: str,
+    *,
+    error: type[ValueError] = ValueError,
+    leave_irregular: bool = True,
 ) -> Iterator[tuple[str, bytes]]:
-    """``(setting, bytes)`` for each spelling of the ``keyword`` file that :func:`_read_driver_file`
-    reads, for the caller to check. The value is read as sent and trimmed, since
-    :func:`_refuse_remote_path` judges the trimmed spelling and a driver may trim it. Nothing when
-    the keyword is unset."""
-    value = named.get(keyword)
-    if not value:
-        return
+    """``(setting, bytes)`` for each spelling of the ``keyword`` file
+    (:func:`driver_file_spellings`) that :func:`_read_driver_file` reads, for the caller to check.
+    Nothing when the keyword is unset."""
     setting = f"{hop_name_prefix(connection)}DATABASE odbc_params {keyword}"
-    raw = str(value)
-    for path in dict.fromkeys((raw, raw.strip())):
-        data = _read_driver_file(path, setting, what, checked_for)
+    for path in driver_file_spellings(named.get(keyword)):
+        data = _read_driver_file(
+            path, setting, what, checked_for, error=error, leave_irregular=leave_irregular
+        )
         if data is not None:
             yield setting, data
 
 
-def _read_driver_file(path: str, setting: str, what: str, checked_for: str) -> bytes | None:
+def _read_driver_file(
+    path: str,
+    setting: str,
+    what: str,
+    checked_for: str,
+    *,
+    error: type[ValueError] = ValueError,
+    leave_irregular: bool = True,
+) -> bytes | None:
     """The bytes of one spelling of a file a driver loads, for the engine to check first, or
-    ``None`` when the file is left to the driver. ``what`` and ``checked_for`` word a refusal.
+    ``None`` when the file is left to the driver. ``what`` and ``checked_for`` word a refusal, and
+    ``error`` is its type.
 
     Like :func:`~messagefoundry.keywrap.refuse_weak_key_file`, a path that does not exist is left
-    to the driver, which reports it. So is anything that is not a regular file: a directory, which
-    is loaded as before, and a device or pipe, which the engine does not read because reading one
-    could itself wait. Any other read failure is refused, because a file the check cannot read is
-    one it cannot clear, and so is a file past :data:`_MAX_DRIVER_CA_FILE_BYTES`.
+    to the driver, which reports it. With ``leave_irregular``, so is anything that is not a regular
+    file: a directory, which is loaded as before, and a device or pipe, which the engine does not
+    read because reading one could itself wait. Without it, as for ``sslkey``, those are refused
+    unread, as ``refuse_weak_key_file`` refused a directory. Any other read failure is refused,
+    because a file the check cannot read is one it cannot clear, and so is a file past
+    :data:`_MAX_DRIVER_CA_FILE_BYTES`.
 
     The file is opened once and judged by its own descriptor, so nothing can swap a pipe in
     between a check and the open. ``O_NONBLOCK``, where the platform has it, keeps that open from
     waiting on a pipe with no writer."""
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    data: bytes | None = None
     try:
         with os.fdopen(os.open(path, flags), "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                logger.debug("%s: not a regular file, so the engine does not check it", setting)
-                return None
-            data = handle.read(_MAX_DRIVER_CA_FILE_BYTES + 1)
-    except (FileNotFoundError, NotADirectoryError, ValueError):
-        # No such file, a path through a file, or a NUL in the path: the driver cannot load it
-        # either.
+            if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                data = handle.read(_MAX_DRIVER_CA_FILE_BYTES + 1)
+    except (FileNotFoundError, ValueError):
+        # No such file, or a NUL in the path: the driver cannot load it either.
         logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
         return None
     except OSError as exc:
         # Opening a directory fails, as IsADirectoryError on POSIX and PermissionError on Windows.
-        # A directory is loaded as before.
-        if os.path.isdir(path):
-            logger.debug("%s: not a regular file, so the engine does not check it", setting)
+        # A path through a file names no file either; keywrap refused both, so sslkey still does.
+        if os.path.isdir(path) or isinstance(exc, NotADirectoryError):
+            _irregular(setting, what, checked_for, error, leave_irregular)
             return None
         if exc.errno == errno.EINVAL or getattr(exc, "winerror", None) == _WINDOWS_INVALID_NAME:
             # A name the platform cannot spell, such as a padded Windows path: no such file.
             logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
             return None
-        raise ValueError(
+        raise error(
             f"{setting}: the {what} could not be read to check {checked_for}: "
             f"{exc.strerror or type(exc).__name__}"
         ) from exc
+    if data is None:  # a device or pipe: judged by its descriptor, never read
+        _irregular(setting, what, checked_for, error, leave_irregular)
+        return None
     if len(data) > _MAX_DRIVER_CA_FILE_BYTES:
-        raise ValueError(
+        raise error(
             f"{setting}: the {what} is larger than the {_MAX_DRIVER_CA_FILE_BYTES // 2**20} MiB "
             f"the engine reads to check {checked_for}"
         )
     return data
+
+
+def _irregular(
+    setting: str, what: str, checked_for: str, error: type[ValueError], leave: bool
+) -> None:
+    """:func:`_read_driver_file`'s answer for a path that names no regular file."""
+    if not leave:
+        raise error(
+            f"{setting}: the {what} could not be read to check {checked_for}: not a regular file"
+        )
+    logger.debug("%s: not a regular file, so the engine does not check it", setting)
 
 
 def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:

@@ -195,14 +195,18 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     operator starts it, and refuses the whole reload when a reload pre-check finds it on a lane it
     keeps running. ``warn`` warns instead for the ACL and path. A file swapped since the last
     check writes a ``changed`` row. A CA the driver never reads under ``sslmode=disable`` is not
-    checked (:func:`unread_ca_reason`), and neither is a value that names no regular file, which
-    the build leaves to the driver.
+    checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
+    build leaves to the driver, or a value that can name another host, which the build refuses.
+    A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
+    that holds for every anchor here since vault BACKLOG #3090.
 
     **Not covered**, as in item 9: the driver reads the file by path, at every connect its pool
     opens. A running lane is not stopped when its file fails a later check: its pool goes on
     reading the file at each new connect until the lane is rebuilt, and the refused reload is the
     only signal. Any check-then-load leaves a swap window, as for ``sslkey``. There is no pin:
-    ``odbc_params`` has no pin setting.
+    ``odbc_params`` has no pin setting. An ``sslcapath`` CA directory, which a driver also reads
+    to choose whom to trust, is not an anchor at all: no ACL, path or audit check covers it. Nor
+    is the lane check skipped for a TLS-off keyword other than ``sslmode``, such as ``Encrypt``.
 """
 
 from __future__ import annotations
@@ -233,7 +237,7 @@ from messagefoundry.auth.anchor_path import (
     anchor_path_verdict,
 )
 from messagefoundry.childenv import system_tool_environment
-from messagefoundry.config.models import bool_setting
+from messagefoundry.config.models import ConnectorType, bool_setting
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.redaction import codec_safe_str, safe_exc
@@ -1579,6 +1583,24 @@ def _odbc_tls_disabled(settings: Mapping[str, Any]) -> bool:
     return generic_odbc_tls_off(settings)
 
 
+def inbound_lane_reads_ca(conn_type: object, settings: Mapping[str, Any]) -> bool:
+    """Whether an inbound of ``conn_type`` dials out with a CA its lane check reads: an ``Ftp``
+    poller naming a ``tls_ca_file``, or a ``DatabasePoll`` naming an ``odbc_params`` ``sslca``
+    (vault BACKLOG #3090, step 7). ``settings`` may be unresolved; the check resolves them. The one
+    list of such inbounds, for :func:`registry_anchor_specs` and the runner."""
+    if conn_type is ConnectorType.REMOTEFILE:
+        return bool(settings.get("tls_ca_file"))
+    return conn_type is ConnectorType.DATABASE and bool(_generic_odbc_param(settings, "sslca"))
+
+
+def lane_ca_setting(settings: Mapping[str, Any]) -> str:
+    """The setting that names a lane's CA, for a refusal line that may not name the file:
+    ``tls_ca_file``, or a generic DATABASE lane's ``odbc_params sslca`` (module item 12)."""
+    if not settings.get("tls_ca_file") and _generic_odbc_param(settings, "sslca") is not None:
+        return "odbc_params sslca"
+    return "tls_ca_file"
+
+
 def database_ca_anchor_spec(
     name: str,
     settings: Mapping[str, Any],
@@ -1590,17 +1612,19 @@ def database_ca_anchor_spec(
     ``None`` (module item 12, vault BACKLOG #3090 step 7).
 
     ``None`` when the connection names no ``sslca``, when its driver never reads it
-    (:func:`unread_ca_reason`), and when no spelling of the value names a regular file, as sent or
-    trimmed: the build leaves a directory, a pipe or a missing file to the driver. The first
-    spelling that names one is checked. A pipe swapped in after this ``stat`` is refused by
-    :func:`evaluate_anchor`'s read, not waited on. ``kind`` and ``label`` are
+    (:func:`unread_ca_reason`), and when no spelling the build checks names an existing path other
+    than a directory: a missing file or a directory is left to the driver, as the build leaves it,
+    and a value that can name another host is never opened here, since the build refuses it. The
+    first spelling that names one is checked. A pipe or device is a spec, and
+    :func:`evaluate_anchor` refuses it unread. ``kind`` and ``label`` are
     :func:`outbound_anchor_spec`'s. Module item 12 says what the check covers."""
     value = _generic_odbc_param(settings, "sslca")
-    if isinstance(value, os.PathLike):
-        value = os.fspath(value)
-    if not isinstance(value, str) or unread_ca_reason(settings) is not None:
+    if value is None or unread_ca_reason(settings) is not None:
         return None
-    path = next((p for p in dict.fromkeys((value, value.strip())) if p and os.path.isfile(p)), None)
+    from messagefoundry.transports.database import driver_file_spellings
+
+    spellings = driver_file_spellings(value)
+    path = next((p for p in spellings if os.path.exists(p) and not os.path.isdir(p)), None)
     if path is None:
         return None
     return AnchorSpec(
@@ -1778,7 +1802,6 @@ def registry_anchor_specs(
     ``lanes=False`` leaves out the outbound, ``Ftp`` poller and ``DatabasePoll`` CAs, which the start checks lane by
     lane instead (module item 9). A connection whose anchor settings do not resolve is skipped:
     its own build refuses it, and that error names the missing value."""
-    from messagefoundry.config.models import ConnectorType
     from messagefoundry.config.wiring import WiringError, resolve_env_settings
 
     def resolved(settings: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -1798,9 +1821,8 @@ def registry_anchor_specs(
             st = resolved(oc.spec.settings) if oc.deployed else None
             if st is not None and (spec := lane_anchor_spec("outbound", oc.name, st)):
                 specs.append(spec)
-        dialling = (ConnectorType.REMOTEFILE, ConnectorType.DATABASE)
         for ic in registry.inbound.values():
-            if ic.deployed and ic.spec.type in dialling:
+            if ic.deployed and inbound_lane_reads_ca(ic.spec.type, ic.spec.settings):
                 st = resolved(ic.spec.settings)
                 if st is not None and (spec := lane_anchor_spec("inbound", ic.name, st)):
                     specs.append(spec)
@@ -2448,19 +2470,17 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
             return (spec.path, spec.pin, "unreadable", exc.errno)
         return (spec.path, spec.pin, v.fingerprint, v.acl_ok, v.pin_ok, v.path_ok)
 
-    def look(
-        direction: str, name: str, settings: Mapping[str, Any]
-    ) -> tuple[AnchorSpec, tuple[object, ...]] | None:
-        # One thread hop: a DATABASE lane's spec stats its sslca path (database_ca_anchor_spec).
-        spec = lane_anchor_spec(direction, name, settings)
-        return None if spec is None else (spec, state(spec))
-
     async def check(direction: str, name: str, settings: Mapping[str, Any]) -> None:
-        found = await asyncio.to_thread(look, direction, name, settings)
-        if found is None:
+        # A DATABASE lane's spec stats its sslca path (database_ca_anchor_spec), so it is built
+        # off the loop; any other lane's spec reads only the settings.
+        if settings.get("odbc_params"):
+            spec = await asyncio.to_thread(lane_anchor_spec, direction, name, settings)
+        else:
+            spec = lane_anchor_spec(direction, name, settings)
+        if spec is None:
             refused.pop(f"{direction}:{name}", None)
             return
-        spec, now = found
+        now = await asyncio.to_thread(state, spec)
         prior = refused.pop(spec.label, None)
         if prior is not None and prior[0] == now:
             refused[spec.label] = prior

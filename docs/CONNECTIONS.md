@@ -1762,18 +1762,20 @@ is built or an operator starts it, at `[security].enforcement = enforce`; `warn`
 ACL and path instead. Before a reload, the same check on a lane the reload keeps running refuses
 the whole reload, and the running lane is not stopped. A file swapped since the last check is
 audited as `changed`. The check does not run under `SSLmode=disable` (or `SSLMODE=DISABLED`),
-where the driver reads no CA, and there is no pin for this file. **What it does not cover:** a
-running lane's pool goes on reading the file at each new connect until the lane is rebuilt, even
-after a later check refuses it, and any check-then-load leaves a swap window, as for `SSLKEY`.
+where the driver reads no CA, and there is no pin for this file. A missing file or a directory
+is left to the driver here too, and a pipe or device is refused unread. **What it does not
+cover**, at least: a running lane's pool goes on reading the file at each new connect until the
+lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
+for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all.
 
 An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-wrap check
 (BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key
 with a weak wrap is refused, and so is an encrypted key with no `sslpassword`. A legacy
 `Proc-Type: 4,ENCRYPTED` key is refused even with one. A certificate with no key passes, PEM or
 DER. With `SSLKEY` set, the key comes from that file, so `SSLCERT` is not read. Each file is read
-the way an `SSLCA` file is: a missing file, a directory, a device or a pipe is left to the
-driver, a padded value is checked as a driver may trim it, and a file over 1 MiB is refused. At
-least these gaps remain:
+the way an `SSLCA` file is: a missing file is left to the driver, a padded value is checked as a
+driver may trim it, and a file over 1 MiB is refused. A directory, a device or a pipe is left to
+the driver as `SSLCERT`, and refused unread as `SSLKEY`. At least these gaps remain:
 
 - **MySQL's ODBC driver has no passphrase keyword.** An `sslpassword` set beside its `SSLCERT`
   passes this check, the driver ignores it, and it may still prompt for the key's password.
