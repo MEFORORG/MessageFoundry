@@ -46,6 +46,26 @@ async def store(tmp_path: Path):
     await s.close()
 
 
+# A ceiling on a wait whose normal case ends far sooner, so a passing run never sleeps on it. It is
+# not a speed assertion: it turns one hang into a failure at its own line, well under the per-test
+# watchdog (pytest-timeout; the --timeout note in pyproject.toml says where each leg's is set). A
+# run starved at every step at once can still reach the watchdog first, which fails it all the
+# same. The 3s it replaces was a speed assertion by accident: a windows-2025 runner under a full
+# parallel suite took longer than that to carry one file into send() (BACKLOG #3456).
+_HANG_CEILING_SECONDS = 20.0
+
+
+async def _bounded_stop(runner: RegistryRunner) -> None:
+    """``runner.stop()``, failed at the ceiling. Not ``wait_for``: since Python 3.12 it waits for
+    the cancelled stop to finish, so a send that swallows its cancellation would hang it anyway.
+    The stop task is left running on a timeout, because nothing can end it."""
+    stop = asyncio.create_task(runner.stop())
+    done, _pending = await asyncio.wait({stop}, timeout=_HANG_CEILING_SECONDS)
+    if not done:
+        raise AssertionError(f"runner.stop() did not finish within {_HANG_CEILING_SECONDS:g}s")
+    stop.result()
+
+
 class _HangingDestination(DestinationConnector):
     """A connector whose send() hangs forever (until the delivery worker task is cancelled). Models
     a wedged downstream — the worst case for graceful stop."""
@@ -53,10 +73,17 @@ class _HangingDestination(DestinationConnector):
     def __init__(self) -> None:
         self.entered = asyncio.Event()  # set the moment send() is first called
         self.closed = False
+        self.cancelled = False  # send() saw its CancelledError
+        self.task: asyncio.Task[object] | None = None  # the task send() ran on
 
     async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
+        self.task = asyncio.current_task()
         self.entered.set()
-        await asyncio.Event().wait()  # never returns; only a task cancellation unblocks it
+        try:
+            await asyncio.Event().wait()  # never returns; only a task cancellation unblocks it
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
     async def aclose(self) -> None:
         self.closed = True
@@ -67,7 +94,7 @@ def _mllp_client(port: int) -> MLLPDestination:
         Destination(
             name="c",
             type=ConnectorType.MLLP,
-            settings={"host": "127.0.0.1", "port": port, "timeout_seconds": 5},
+            settings={"host": "127.0.0.1", "port": port, "timeout_seconds": _HANG_CEILING_SECONDS},
         )
     )
 
@@ -134,15 +161,25 @@ async def test_hung_outbound_does_not_block_graceful_stop(
     )
     await runner.start()
     hung = _HangingDestination()
-    runner._destinations["out"] = hung  # swap in the wedged connector (worker re-resolves per item)
-    (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
-    await asyncio.wait_for(hung.entered.wait(), timeout=3.0)  # send() is now hung mid-delivery
-    # The hung send must NOT block graceful stop — bounded so a regression (a swallowed cancellation)
-    # fails loud as a timeout instead of hanging the suite.
-    await asyncio.wait_for(runner.stop(), timeout=5.0)
+    try:
+        runner._destinations["out"] = hung  # swap in the wedged connector (re-resolved per item)
+        (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+        # Setup, not the property: send() is now hung mid-delivery.
+        await asyncio.wait_for(hung.entered.wait(), timeout=_HANG_CEILING_SECONDS)
+    except BaseException:
+        # A failed setup still stops the graph, or its tasks outlive the store fixture and log
+        # against a closed database, as the 2026-10-12 failure's teardown did.
+        await _bounded_stop(runner)
+        raise
+    # The hung send must NOT block graceful stop. A regression (a swallowed or missing
+    # cancellation) hangs here for good, and the ceiling turns that into a failure.
+    await _bounded_stop(runner)
     assert not runner.running
     assert runner._workers == {} and runner._sources == {}  # no leaked tasks/sources
     assert hung.closed  # the connector was closed during teardown
+    # Stop cancelled the hung send rather than abandoning it, and the task it ran on is finished.
+    assert hung.cancelled
+    assert hung.task is not None and hung.task.done()
 
 
 async def test_problem_connection_does_not_block_engine_restart(
@@ -156,23 +193,29 @@ async def test_problem_connection_does_not_block_engine_restart(
         reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )
     await runner.start()
-    port = runner._sources["mllp_in"].sockport  # type: ignore[attr-defined]
     hung = _HangingDestination()
-    runner._destinations["out"] = hung
-    await _mllp_client(port).send(ADT)  # AA at ingress; routes to the hung lane → in-flight send
-    await asyncio.wait_for(hung.entered.wait(), timeout=3.0)
-
-    await asyncio.wait_for(runner.stop(), timeout=5.0)  # clean stop despite the wedged connection
+    try:
+        port = runner._sources["mllp_in"].sockport  # type: ignore[attr-defined]
+        runner._destinations["out"] = hung
+        # AA at ingress; routes to the hung lane, so the send is in flight.
+        await _mllp_client(port).send(ADT)
+        await asyncio.wait_for(hung.entered.wait(), timeout=_HANG_CEILING_SECONDS)
+    except BaseException:  # as in the test above: a failed setup still stops the graph
+        await _bounded_stop(runner)
+        raise
+    await _bounded_stop(runner)  # clean stop despite the wedged connection
     assert not runner.running and runner._sources == {} and runner._workers == {}
+    assert hung.cancelled
 
     runner2 = RegistryRunner(
         reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )  # fresh start of the same graph
-    await asyncio.wait_for(runner2.start(), timeout=5.0)
     try:
+        # A start cut off at the ceiling is still stopped below; stop() handles a half start.
+        await asyncio.wait_for(runner2.start(), timeout=_HANG_CEILING_SECONDS)
         assert runner2.running and runner2.inbound_running("mllp_in")
         assert (
             not runner2.degraded_inbound() and not runner2.degraded_outbound()
         )  # nothing carried over as failed
     finally:
-        await runner2.stop()
+        await _bounded_stop(runner2)
