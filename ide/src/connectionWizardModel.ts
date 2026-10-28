@@ -168,25 +168,26 @@ const CLI_FALLBACK_SERVICE_CONFIG = "messagefoundry.toml";
  * The `--service-config` value a connection edit run in `workspace` passes, or `undefined` to leave
  * the flag off (BACKLOG #2908).
  *
- * The CLI checks a connection edit against the named file's `[egress]` allowlist, which denies an
- * unlisted outbound host by default. With no flag it reads `./messagefoundry.toml` only if one is in
- * the working directory, so a workspace whose `messagefoundry.serviceConfig` names another file
- * would be checked against the wrong settings, or none. So the setting is passed.
+ * The CLI checks a connection edit against the named file, at least its `[egress]` allowlist, which
+ * denies an unlisted outbound host by default. With no flag it reads `./messagefoundry.toml`, and
+ * only if that file exists. A setting naming another file would then go unread. So the setting is
+ * passed.
  *
- * One case leaves it off: neither the file the setting names nor the CLI's fallback file exists.
- * The CLI refuses a named file that is missing ("service config not found"), so passing the flag
- * there would block every edit in a workspace that has no settings file yet, where leaving it off
- * reads no file either -- the edit is checked with no instance settings, as it was before. When the
- * named file is missing but the fallback exists, the flag is still passed, so the CLI says the
- * named file is missing rather than quietly checking against a file the setting did not name. A
- * blank setting names no file, so it leaves the flag off too.
+ * The flag is left off when neither the named file nor the fallback exists. The CLI refuses a named
+ * file that is missing. Passing the flag there would block every edit in a workspace with no
+ * settings file yet. Leaving it off reads no file either, as before this change.
+ *
+ * When only the fallback exists, the flag is still passed. The CLI then reports the missing file
+ * instead of checking against a file the setting did not name. A blank or non-string setting names
+ * no file, so it leaves the flag off too.
  */
 export function connectionServiceConfig(
   workspace: string,
   setting: string,
   exists: (p: string) => boolean = fs.existsSync,
 ): string | undefined {
-  if (setting.trim() === "") {
+  // The manifest declares a string, but VS Code does not enforce it on a hand-edited settings.json.
+  if (typeof setting !== "string" || setting.trim() === "") {
     return undefined;
   }
   const named = path.resolve(workspace, setting);
@@ -204,8 +205,9 @@ function serviceConfigArgs(serviceConfig: string | undefined): string[] {
 /**
  * The `messagefoundry connection upsert` argv (sans the `--json` the runJson helper appends). Every
  * IDE writer of connections.toml (the webview form, the custom editor, this wizard) builds its argv
- * here, so all of them name the instance's service settings the same way, as the alert, security and
- * trust editors do. `serviceConfig` comes from {@link connectionServiceConfig}.
+ * here, so all of them name the instance's service settings the same way. `serviceConfig` comes from
+ * {@link connectionServiceConfig}, which can leave the flag off; the alert, security and trust
+ * editors pass theirs unconditionally.
  */
 export function connectionUpsertArgs(
   configDir: string,

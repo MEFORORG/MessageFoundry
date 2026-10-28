@@ -292,6 +292,12 @@ suite("connectionServiceConfig — which settings file a connection edit names",
     assert.strictEqual(connectionServiceConfig(WS, "", present(FALLBACK)), undefined);
     assert.strictEqual(connectionServiceConfig(WS, "   ", present(FALLBACK)), undefined);
   });
+
+  test("a non-string setting from a hand-edited settings.json names no file and does not throw", () => {
+    for (const bad of [null, undefined, 123]) {
+      assert.strictEqual(connectionServiceConfig(WS, bad as unknown as string, present(FALLBACK)), undefined);
+    }
+  });
 });
 
 // The builders above pin the argv, but only if every writer uses them. Read the extension source and

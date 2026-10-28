@@ -721,7 +721,7 @@
         "messagefoundry.serviceConfig": {
           "type": "string",
           "default": "messagefoundry.toml",
-          "description": "Service-settings TOML the engine loads (relative to the workspace). The Alert Wizard reads/writes its [[alerts.rules]] (ADR 0014); created on first add if absent. Connection edits are checked against its [egress] and [security] settings; a connection edit fails if this names a missing file while ./messagefoundry.toml exists."
+          "description": "Service-settings TOML the engine loads (relative to the workspace). The Alert Wizard reads/writes its [[alerts.rules]] (ADR 0014); created on first add if absent. Connection edits are also checked against this file; the extension README says when."
         },
         "messagefoundry.engineUrl": {
           "type": "string",
