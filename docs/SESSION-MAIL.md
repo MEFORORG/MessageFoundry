@@ -228,6 +228,33 @@ sender sees a queued message, the recipient sees an empty inbox, and nothing any
 mismatch. Two copies of that function would drift, and the copy that drifts is the one nobody is
 testing. Do not reimplement it; dot-source `mail-key.ps1`.
 
+### Mail sent to the worktree you moved into
+
+**The drain reads the box of the worktree the session STARTED in, not the one it is in now.** The rule
+lives in [`scripts/hooks/_hookinput.ps1`](../scripts/hooks/_hookinput.ps1): a SessionStart pins the
+launch worktree, and every later event answers for the pin, so a `cd` into a sibling never shows or
+consumes the sibling's mail. `EnterWorktree` looks like that `cd` to the drain.
+
+The seat record does not follow the pin. `scripts/coord/seat.ps1` records the hook `cwd`, so after a
+move a peer that addresses you by your seat record, or replies to the `from` of mail you sent from
+there, writes to the box you moved into. Measured 2026-10-28: a Lander launched in the primary,
+entered a sibling worktree, and fifteen messages waited there for fourteen hours with nothing saying
+so.
+
+The drain now names that box. When the hook `cwd` is in another worktree of the same repository and
+that worktree's box holds mail, the injection carries one line with the count and the path. It never
+shows or consumes that box, because after a stray `cd` it is a sibling's. The line is said once per
+change in that inbox, because Stop output re-wakes the model.
+
+To read and consume it, run the drain from the worktree you moved into, with no session id, so no
+pin applies. Run it only where you moved on purpose; the drain consumes what it shows.
+
+    '{"hook_event_name":"Stop","cwd":"<that worktree>"}' | pwsh -NoProfile -File scripts\hooks\mail-drain.ps1
+
+The `cwd` is JSON, so double each backslash in the path. The output is the hook's JSON; the mail is in `hookSpecificOutput.additionalContext`. To count
+without reading, run `scripts\coord\mail.ps1 -Status` from that worktree. Starting the session in
+the worktree avoids all of this ([`WORKTREES.md`](WORKTREES.md#start-the-session-in-the-worktree)).
+
 ---
 
 ## The write side is unauthenticated. The trust boundary is the OS account.
