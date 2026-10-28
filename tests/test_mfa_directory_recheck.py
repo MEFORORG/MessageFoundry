@@ -1227,10 +1227,33 @@ def test_the_second_factor_legs_ask_no_revoked_at_of_a_loaded_session(method: st
     the premise the test above pins, so these legs carry none on the ``session`` they load. RED
     when: one comes back."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(AuthService, method))))
-    attributes = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute)]
-    # THE CONTROL: the walk saw the leg's body, so the absence below is not a pass on nothing.
-    assert len(attributes) >= 1
-    # Any `.revoked_at`, not only `session.revoked_at`: a session loaded under another name must
-    # not carry the dead check either. A check moved into a helper the leg calls is not seen here.
-    reads = [node.lineno for node in attributes if node.attr == "revoked_at"]
+    nodes = list(ast.walk(tree))
+    assert len(nodes) >= 1
+    # Every local the leg binds from `_load_session(...)`, whatever it is named.
+    loaded = {
+        target.id
+        for node in nodes
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_load_session"
+            for call in ast.walk(node.value)
+        )
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    # THE CONTROL: the leg loads its session here, so a leg turned into a delegate fails rather
+    # than passing the absence below on a body that never loads one. A check moved into a helper
+    # the leg calls, or spelt `getattr(session, "revoked_at")`, is not seen.
+    assert loaded
+    reads = [
+        node.lineno
+        for node in nodes
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.ctx, ast.Load)
+        and node.attr == "revoked_at"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in loaded
+    ]
     assert reads == []

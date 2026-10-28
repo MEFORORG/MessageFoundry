@@ -357,7 +357,7 @@ async def test_an_account_that_left_the_directory_is_still_revoked(
 
 
 @pytest.mark.parametrize(
-    ("code", "paged"),
+    ("code", "misconfigured"),
     [
         (RESULT_NO_SUCH_OBJECT, True),
         (RESULT_INVALID_DN_SYNTAX, True),
@@ -376,7 +376,7 @@ async def test_an_account_that_left_the_directory_is_still_revoked(
     ],
 )
 async def test_a_refused_user_search_base_above_the_breaker_floor_pages_and_never_revokes(
-    monkeypatch: pytest.MonkeyPatch, code: int, paged: bool
+    monkeypatch: pytest.MonkeyPatch, code: int, misconfigured: bool
 ) -> None:
     """D3b, #3010 limb 5, through the real authenticator. Eight signed-in accounts, above the
     breaker's floor, whose user search base the directory refuses on every pass. Before #3010 a
@@ -391,8 +391,10 @@ async def test_a_refused_user_search_base_above_the_breaker_floor_pages_and_neve
 
     RED before D3b for the three configuration codes: each pass is a plain outage."""
     names = [f"user{i:02d}" for i in range(8)]
-    # Set here, not read from the default: the four passes below reach the outage page and pass it.
-    outage_passes = 3
+    # The validator's minimum, not the default (3), so a page on pass 2 shows the setting reached
+    # the service; the passes after it show the page is not raised again in the run.
+    outage_passes = 2
+    passes = 4  # far past ad_session_recheck_strikes
     async with _signed_in_estate(monkeypatch, names, ad_reconcile_outage_passes=outage_passes) as (
         _directory,
         service,
@@ -402,32 +404,30 @@ async def test_a_refused_user_search_base_above_the_breaker_floor_pages_and_neve
         _answer_with(monkeypatch, code, when=_user_search)
         sink = _Sink()
         outage_pages_on: list[int] = []
-        for n in range(1, 5):  # far past ad_session_recheck_strikes
+        for n in range(1, passes + 1):
             plan = await _pass(service, sink)
             assert plan.revocations == ()
-            if paged:
+            assert not plan.outage_clear  # no run here has paged and then reached the directory
+            if misconfigured:
                 assert plan.aborted == MISCONFIGURED_ABORT
-                # A configuration refusal reached the directory, so it starts no outage run.
-                assert plan.outage_passes == 0
+                assert plan.outage_passes == 0  # not an outage pass, so it counts toward no run
             else:
                 assert plan.directory_outage
                 assert plan.outage_passes == n
             if plan.outage_page:
                 outage_pages_on.append(n)
-        assert outage_pages_on == ([] if paged else [outage_passes])
+        assert outage_pages_on == ([] if misconfigured else [outage_passes])
         assert await _alive(service, tokens) == set(names)
         assert await _audited(store, "auth.ad_session_revoked") == []
         assert await _audited(store, "auth.ad_reconcile_aborted") == []
         refused = await _audited(store, "auth.ad_reconcile_misconfigured")
-        assert len(refused) == (4 if paged else 0)
+        assert len(refused) == (passes if misconfigured else 0)
         assert all(_LEAK not in str(dict(r)["detail"]) for r in refused)
         # The outage page pairs with the per-pass skipped row, which carries the run's length.
         skipped = await _audited(store, "auth.ad_reconcile_skipped")
         assert [json.loads(dict(r)["detail"])["passes"] for r in reversed(skipped)] == (
-            [] if paged else [1, 2, 3, 4]
+            [] if misconfigured else list(range(1, passes + 1))
         )
-        assert len(sink.events) >= 1
-        assert all(_LEAK not in str(e[2].get("detail", "")) for e in sink.events)
         pages = [
             (e[1], e[2]["reason"], e[2]["probed"])
             for e in sink.events
@@ -435,12 +435,13 @@ async def test_a_refused_user_search_base_above_the_breaker_floor_pages_and_neve
         ]
         expected = ("directory-reconciler-misconfigured", MISCONFIGURED_ABORT, len(names))
         outage = ("directory-reconciler-outage", OUTAGE_ABORT, len(names))
-        assert pages == ([expected] * 4 if paged else [outage])
-        if not paged:
+        assert pages == ([expected] * passes if misconfigured else [outage])
+        assert all(_LEAK not in str(e[2].get("detail", "")) for e in sink.events)
+        if not misconfigured:
             outage_detail = next(e[2]["detail"] for e in sink.events if e[1] == outage[0])
             assert f"in {outage_passes} reconcile passes" in outage_detail
         detail = service.directory_reconcile_misconfigured
-        assert (detail is not None) is paged
+        assert (detail is not None) is misconfigured
         assert detail is None or _LEAK not in detail
 
 
