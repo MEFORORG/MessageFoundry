@@ -383,15 +383,10 @@ def missing_sqlite_store(store: StoreSettings) -> Path | None:
 
     ``:memory:`` creates nothing on disk and so is outside what this gate exists to stop.
 
-    **Scoped to SQLite.** The server backends never ``CREATE DATABASE``, so a wrong database *name*
-    fails at connect. What stops verify building a store into a database that *does* exist is not
-    this gate but the ``read_only=True`` every verify ``open_store`` call passes (BACKLOG #1708,
-    pinned by a test). On SQLite that open is ``mode=ro``, so a file that is not a MessageFoundry
-    store is refused rather than filled. On PostgreSQL and SQL Server it runs no DDL and no
-    ``ALTER DATABASE`` whatever ``[store].schema_management`` says, and a database with no
-    ``schema_meta`` table this login can see raises ``StoreNotFoundError``, which
-    :func:`check_store_connectivity` reports as FAIL. A store whose schema is older than this build
-    is opened as it is and only logged as stale; ``store.connect`` does not report that.
+    **Scoped to SQLite.** What stops verify building into, or migrating, a database that *does*
+    exist is not this gate but the ``read_only=True`` every verify ``open_store`` call passes
+    (BACKLOG #1708, pinned by a test). ``open_store``'s docstring says what that open does on each
+    backend, and ``docs/testing/VERIFY.md`` says what it leaves a PASS unable to prove.
     """
     if store.backend is not StoreBackend.SQLITE or store.path == ":memory:":
         return None
@@ -412,8 +407,8 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     path before the service started under another identity.
 
     The open is read-only (BACKLOG #1708), so against a store that exists it neither migrates it
-    nor builds one into a database that holds none; :func:`missing_sqlite_store` says what each
-    backend does then.
+    nor builds one into a database that holds none. So a PASS proves the calling user can open and
+    read the store, not that it can write it.
     """
     from messagefoundry.last_resort import run_guarded
 
@@ -453,8 +448,9 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
         rid,
         title,
         Status.PASS,
-        f"{store.backend.value} store opened and closed cleanly as the calling user "
-        "(NOT proof the NSSM service account can connect — confirm the service-identity grants)",
+        f"{store.backend.value} store opened read-only and closed cleanly as the calling user "
+        "(NOT proof that this user can write it, nor that the NSSM service account can connect — "
+        "confirm the service-identity grants)",
     )
 
 

@@ -63,15 +63,16 @@ these things still write:
 |---|---|---|
 | `host.writable` | every host run | a probe temp file in the store dir, deleted immediately |
 | `host.ciphers` | a host run where `pyodbc` is installed, on Windows or Linux (DEPLOY-SERVER-DB.md section 5.4 says what it reads) | nothing of its own. Its hop census loads the `--config` graph, which can leave Python's `__pycache__` files in that folder, as the self smoke can. On Windows, the PowerShell it starts may write that program's own per-account files, such as its module analysis cache, as any PowerShell start can |
-| `store.connect` | `--section store`, store **already exists** | no schema-ensure and no migration: the open is read-only. On SQLite, the `-wal`/`-shm` sidecars of a WAL store, as any reader creates them, as the calling user |
+| `store.connect` | `--section store`, store **already exists** | no schema-ensure and no migration: the open is read-only. On SQLite, the `-wal`/`-shm` sidecars of a WAL store, as any reader creates them, as the calling user. A read-only close does not remove them, so with the engine stopped they stay after `verify` exits, owned by the calling user |
 | `smoke.live` | `--smoke live` only | one synthetic message, persisted by the engine |
 
-Every store open `verify` makes is read-only (BACKLOG #1708): `store.connect`, the
-`auth.lockable_accounts` census, and both `--check-disposition` reads. What that means per backend:
+Every `open_store` call in `verify` passes `read_only=True`, and `tests/test_verify.py` pins it
+(BACKLOG #1708). At least `store.connect`, the `auth.lockable_accounts` census and both
+`--check-disposition` reads open the store that way. What that means per backend:
 
-- **SQLite.** The file is opened `mode=ro`, so SQLite itself refuses every write. A file that is not
-  a MessageFoundry store, such as a sibling application's database, is a FAIL, and nothing is built
-  into it.
+- **SQLite.** The file is opened `mode=ro`, so SQLite itself refuses every write. On a file that is
+  not a MessageFoundry store, such as a sibling application's database, `store.connect` FAILs and
+  nothing is built into it.
 - **PostgreSQL and SQL Server.** The open runs no DDL and no `ALTER DATABASE`, whatever
   `[store].schema_management` says. A wrong database *name* fails at connect. A database that exists
   but has no `schema_meta` table this login can see, such as `postgres` or a sibling application's,
@@ -81,6 +82,12 @@ Every store open `verify` makes is read-only (BACKLOG #1708): `store.connect`, t
   opened as it is, neither migrated nor refused, and the store logs a WARNING. `store.connect` reads
   PASS for it unless the open itself needs an object the store lacks, so a PASS does not prove the
   schema is current. A later read that needs a missing object fails on its own row.
+- **A PASS proves read access, not write access or readiness to serve.** A read-only open writes
+  nothing, so a store file the calling user can read but not write is a PASS. On a server backend
+  under `schema_management = external`, an ordinary open also checks the login's runtime grants
+  (PostgreSQL) and the database options (SQL Server), and refuses a marker that is not current. A
+  read-only open skips those checks, so `store.connect` can PASS a database `serve` refuses. Start
+  `serve` to see those refusals.
 
 ### Handling a captured `id_token`
 

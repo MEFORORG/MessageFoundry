@@ -6,8 +6,8 @@
   below is kept as it was decided. **Amended 2026-10-20** (BACKLOG #3420): see *Amendment
   2026-10-20*, which adds a scheme to each range record and supersedes nothing. **Amended
   2026-10-27** (BACKLOG #2720): see *Amendment 2026-10-27*, which records what a Transit key
-  rotation does to the chain and supersedes the two sentences that put Transit's key versioning
-  outside this ADR.
+  rotation does to the chain. It supersedes only the clause, stated twice, that put Transit's key
+  versioning outside this ADR; that the engine sees one Transit range still stands.
 - **Date:** 2026-09-23
 - **Related:** BACKLOG #1904 (the defect), #1905 (keyless chain after `provision-admin`), #190 (the
   keyed chain and its watermark), [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)
@@ -419,9 +419,9 @@ The AC-13 to AC-15 cases run on all three backends, as the 2026-10-01 cases do.
 
 - **Status:** Accepted -- records behaviour already built by engine PR 2167 (merged 2026-10-08,
   BACKLOG #2337). This amendment changes no code (BACKLOG #2720).
-- **Supersedes:** the last sentence of *Negative / risks* (*"Transit's own key versioning is
-  outside this ADR"*) and the same clause in the 2026-10-01 amendment's *What this amendment does
-  not do*. Under `vault_transit` the engine still sees one range, `vault-transit`; what is no longer
+- **Supersedes:** one clause, stated twice: *"Transit's own key versioning is outside this ADR"*,
+  at the end of *Negative / risks*, and its restatement in the 2026-10-01 amendment's *What this
+  amendment does not do*. Under `vault_transit` the engine still sees one range, `vault-transit`; what is no longer
   outside this ADR is what a Transit key rotation does to that range.
 
 ### Why

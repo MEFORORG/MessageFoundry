@@ -202,13 +202,20 @@ def _run_live_smoke(
 
     control_id: str | None = None
     baseline_id: str | None = None
+    baseline_error: str | None = None
     if check_disposition and settings is not None:
         try:
             control_id = Peek.parse(message).control_id
         except HL7PeekError:
             control_id = None
         if control_id:
-            baseline_id = newest_message_id(settings.store, control_id)
+            try:
+                baseline_id = newest_message_id(settings.store, control_id)
+            except Exception as exc:  # any open or driver failure: a row, never a crashed run
+                # BACKLOG #1708: the read-only open refuses a store it cannot read as it is, such
+                # as another application's SQLite file. Never fall back to no baseline: the
+                # synthetic control id is fixed, so a prior run's message would then match.
+                baseline_error = str(exc)
 
     ctx = live_smoke_ssl_context(ca_file=smoke_tls_ca) if smoke_tls else None
     results = [smoke_live(host=host, port=port, message=message, ssl_context=ctx)]
@@ -228,6 +235,16 @@ def _run_live_smoke(
     elif not control_id:
         results.append(
             CheckResult(rid, title, Status.SKIP, "no MSH-10 control id in the synthetic message")
+        )
+    elif baseline_error is not None:
+        results.append(
+            CheckResult(
+                rid,
+                title,
+                Status.ERROR,
+                "could not read the pre-send baseline from the store, so the disposition was not "
+                f"polled: {baseline_error}",
+            )
         )
     elif results[0].status is not Status.PASS:
         results.append(
