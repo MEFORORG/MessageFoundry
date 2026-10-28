@@ -139,6 +139,9 @@ channel config) with one section per group, plus **environment-variable override
 CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 ```
 
+A secret-class setting can also come from a file in a secrets directory, which then wins over its
+environment variable: see [The secrets directory](#the-secrets-directory-mefor_secrets_directory).
+
 - File location: `./messagefoundry.toml` by default, or `--service-config <path>`. **Under the
   Windows service, `serve` and `supervise` refuse to start without an absolute `--service-config`**,
   so the service never reads a settings file from its working directory. A relative one under
@@ -2333,6 +2336,50 @@ Its text names no part of the proxy URL, and `[security].enforcement` does not r
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
+
+#### The secrets directory, `MEFOR_SECRETS_DIRECTORY`
+
+A secret-class setting can come from a file instead of an environment variable
+([ADR 0214](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md),
+vault BACKLOG #2595). Set `MEFOR_SECRETS_DIRECTORY` to an absolute path. It is a path, not a
+secret. Each file in that directory holds one setting and is named exactly as its variable is:
+`MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_AUTH_OIDC_CLIENT_SECRET`,
+`MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY`, `MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD`,
+`MEFOR_ALERTS_EMAIL_PASSWORD`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_VAULT_TOKEN`,
+`MEFOR_SECRETS_VAULT_TOKEN`, `MEFOR_AI_API_KEY`, or `MEFOR_VALUE_<KEY>` for an `env()` value.
+
+- **A file wins over its variable.** With no file for a setting, the variable is read as before.
+  Unset, no directory is read at all.
+- **The engine refuses, at every `[security].enforcement` setting,** a directory or a file in it
+  that a known broad group (at least Everyone, Authenticated Users and the local Users group; on
+  POSIX, a group or other read or write bit) can read or change, a directory in which such a
+  group may delete a file (Windows `FILE_DELETE_CHILD`), and a link on Windows. It also
+  refuses a relative path, a file that is not a regular file, a file named for no setting above
+  (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
+  whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
+  file whose name starts with `.` is ignored. Every load of the settings, by any command, checks
+  the directory, every file name in it, and every file named for a setting above, even one nothing
+  else reads. A `MEFOR_VALUE_*` file's access and contents are checked only when the `env()` values
+  are read: at a `serve` start and on each reload, by `messagefoundry check`, and by
+  `messagefoundry connection upsert` and `remove`, at least. A command that loads the settings and
+  not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
+  named for no setting is cited by its position, never spelled, since its name may be a value.
+- **The access check is a list of known broad groups.** It does not refuse one named account that
+  can write the directory, the way the config-directory checks do, and it does not read the
+  folders above the directory: a broad group that can write one of those could replace the
+  directory. Restrict the directory, and the folders above it, as below rather than relying on
+  the check.
+- **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
+  [`[store].encryption_key_file`](#store).
+- A trailing line break is dropped; any other character, a space included, is part of the value.
+- The files are plain, protected by their access list alone. Nothing creates the directory for you
+  yet. A variable a library reads for itself, such as `VAULT_TOKEN` or `PGPASSWORD`, is not read
+  from here.
+
+On Windows, create the directory with inheritance off, granting SYSTEM and Administrators full
+control and the service account read, and nothing else. On POSIX, make it mode `0700` and each file
+`0600`, owned by the engine's account.
 
 ### `[secret_rotation]`
 Periodic **secret-rotation reminder** ([ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) §5.1) —
