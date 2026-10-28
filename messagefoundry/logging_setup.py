@@ -902,10 +902,30 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     For the forwarder this means the **queue** handler, on the near side of the hand-off, and the
     socket handler behind it carries no chain of its own — see :class:`_ForwardQueueHandler`, which is
     where that placement is argued."""
-    handler.addFilter(RedactionFilter())  # PHI redaction — message + exception traceback (Gate #1)
+    # BACKLOG #3005 EVIDENCE BRANCH, NOT FOR MERGE: the credential filters ahead of the PHI pass,
+    # with the traceback rendered by its own first filter so they still read it.
+    handler.addFilter(_RenderExceptionFilter())
     handler.addFilter(CredentialQueryScrubFilter())  # OIDC code/state in a URL (ADR 0142 AC-10)
     handler.addFilter(CredentialScrubFilter())  # credential labels + values (BACKLOG #1478)
+    handler.addFilter(RedactionFilter())  # PHI redaction — message + exception traceback (Gate #1)
     handler.addFilter(ControlCharScrubFilter())  # log-injection defense (16.4.1)
+
+
+class _RenderExceptionFilter(logging.Filter):
+    """BACKLOG #3005 evidence: render ``exc_info`` into ``exc_text`` before any scrub, as
+    :class:`RedactionFilter` does first on ``main``, and fail closed on a message that cannot be
+    rendered, which the credential filters do not catch."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        prepare_log_record(record)
+        try:
+            record.getMessage()
+        except Exception as exc:  # noqa: BLE001 -- a log call must never raise
+            record.msg = f"[log record dropped: {type(exc).__name__} while redacting it]"
+            record.args = ()
+            record.exc_text = None
+            record.stack_info = None
+        return True
 
 
 def _build_syslog_handler(
