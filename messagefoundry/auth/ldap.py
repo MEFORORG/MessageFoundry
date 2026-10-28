@@ -70,6 +70,25 @@ _AD_WAYS_ACROSS = (
 )
 
 
+def _ldap3_dial_host(address: str) -> str | None:
+    """The host ldap3 2.9.1's ``Server`` dials for the ``ldaps://`` address ``address``, or
+    ``None`` where its host rule refuses the address.
+
+    The host rule of ``ldap3.core.server.Server.__init__``, restated for an ``ldaps://`` URL and
+    pinned against the real class by ``tests/test_ldaps_revocation_guard.py``. Restated, not called:
+    building a throwaway ``Server`` here would be one more ldap3 construction site for the timeout
+    and referral censuses to cover, and tests replace ``ldap3.Server`` with doubles that hold no
+    host. Only the host is read: a port ldap3 would refuse leaves the host it names, and no bind
+    to it can happen, since every bind builds the real ``Server``."""
+    rest = address.strip()[len("ldaps://") :]
+    if rest.count(":") == 1:
+        return rest.partition(":")[0]
+    if rest.startswith("["):
+        hostname, sep, _ = rest[1:].partition("]")
+        return hostname if sep else None
+    return None if rest.count(":") > 1 else rest
+
+
 def _refuse_ad_revocation(
     settings: AuthSettings, tls: NarrowedTls, posture: HopPosture | None
 ) -> None:
@@ -81,35 +100,29 @@ def _refuse_ad_revocation(
 
     Called with the finished ``tls`` and handed a context its factory built, the recipe every bind's
     ``wrap_socket`` runs, so an ``[auth].ad_tls_crl_file`` that really loaded relaxes the refusal and
-    the guard never reads the setting. ``posture`` is PASSED, never read ambiently: ``AuthService``
-    is built in the API lifespan, outside every ``active_hop_posture`` scope, as the OIDC legs'
-    guard says. ``None`` leaves the guard the shipped no-op.
+    the guard never reads the setting. ``posture`` is PASSED: ``AuthService`` is built in the API
+    lifespan, outside every ``active_hop_posture`` scope, as the OIDC legs' guard says. ``None``
+    reads the ambient posture, as ``RevocationHopGuard.capture`` does for every hop, and where
+    ``AuthService`` is built none is stamped, so there the guard is the shipped no-op.
 
     ``attested=False``: the owner ruling of 2026-10-27 gave this hop the guard and a CRL setting,
     and no attestation, as the OIDC legs have none.
 
-    **The host is the one ldap3 dials, read with ldap3's own parser** (``Server.host``, as
-    :meth:`LdapAuthenticator._server` builds it), never ``urlsplit``. The two disagree on at least
-    userinfo: ``ldaps://dc.corp@127.0.0.1`` is loopback to ``urlsplit`` and ``dc.corp@127.0.0.1``
-    to ldap3, so a URL reader would let a hop it misread cross as on the box. The Vault guard reads
-    its address with the parser that dials for the same reason. An address that names no host, or
-    one ldap3 refuses, is refused here, whatever the posture, since a bind to it could not be
-    classified as on the box or off it.
+    **The host is the one ldap3 dials** (:func:`_ldap3_dial_host`), never what ``urlsplit`` reads.
+    The two disagree on at least userinfo: ``ldaps://dc.corp@127.0.0.1`` is loopback to
+    ``urlsplit`` and ``dc.corp@127.0.0.1`` to ldap3, so a URL reader would let a hop it misread
+    cross as on the box. The Vault guard reads its address with the parser that dials for the same
+    reason. An address that names no host, or one ldap3's host rule refuses, is refused here,
+    whatever the posture, since a bind to it could not be classified as on the box or off it.
 
     A Kerberos sign-in adds no hop here. The SPNEGO acceptor reads a ticket the browser sent and
     builds no TLS context, and every bind in this module is an ldap3 SIMPLE bind over this one
     context, so the lookups a Kerberos or OIDC sign-in makes ride the hop this guards."""
-    import ldap3  # lazy, like every ldap3 import here
-    from ldap3.core.exceptions import LDAPException
-
-    try:
-        host = str(ldap3.Server(str(settings.ad_server), get_info=ldap3.NONE).host)
-    except LDAPException as exc:
-        raise LdapError(f"ad_server is not an address ldap3 can dial: {exc}") from exc
+    host = _ldap3_dial_host(str(settings.ad_server))
     if not host:
         raise LdapError(
-            "ad_server names no host, so the LDAPS bind cannot be judged on or off this box; "
-            "name the domain controller in ad_server"
+            "ad_server names no host ldap3 can dial, so the LDAPS bind cannot be judged on or off "
+            "this box; name the domain controller in ad_server, an IPv6 address in brackets"
         )
     RevocationHopGuard.capture(
         host=host,

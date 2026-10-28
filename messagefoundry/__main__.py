@@ -7906,7 +7906,7 @@ _PROVISION_AUTH_REFUSALS = {
     ),
     "file": (
         "a file the [auth] settings name does not exist: check ad_tls_ca_cert_file, "
-        "ad_tls_crl_file, oidc_tls_ca_cert_file and oidc_tls_crl_file"
+        "oidc_tls_ca_cert_file and oidc_tls_crl_file"
     ),
 }
 

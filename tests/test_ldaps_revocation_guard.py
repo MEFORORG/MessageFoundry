@@ -183,7 +183,47 @@ def test_an_ldaps_bind_warns_but_builds_when_not_enforcing() -> None:
 
 
 def test_an_ldaps_bind_built_with_no_posture_is_unchanged() -> None:
-    _authenticator(None)
+    """No posture, none stamped: the guard is the shipped no-op, so it neither refuses nor warns.
+    The warn arm above is the control that this capture sees the guard's lines."""
+    with _guard_log() as log:
+        _authenticator(None)
+        _authenticator(NOT_ENFORCING)
+    assert len(log.messages) >= 1, log.state()
+    assert sum("[auth] AD LDAPS bind" in m for m in log.messages) == 1, log.state()
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "ldaps://dc1.example.test:636",
+        "ldaps://dc1.example.test",
+        " ldaps://DC1.example.test:3269 ",
+        "ldaps://127.0.0.1:636",
+        "ldaps://[::1]:636",
+        "ldaps://[::1]",
+        "ldaps://dc.corp@127.0.0.1:636",
+        "ldaps://dc1/x",
+        "ldaps://:636",
+    ],
+)
+def test_the_guard_reads_the_host_ldap3_itself_dials(address: str) -> None:
+    """``_ldap3_dial_host`` restates ldap3's host rule rather than build a throwaway Server, so it
+    is pinned to the real class here, address by address."""
+    import ldap3
+
+    assert ldap_auth._ldap3_dial_host(address) == ldap3.Server(address, get_info=ldap3.NONE).host
+
+
+@pytest.mark.parametrize("address", ["ldaps://::1", "ldaps://[::1"])
+def test_an_address_ldap3_refuses_is_refused_by_the_guard(address: str) -> None:
+    import ldap3
+    from ldap3.core.exceptions import LDAPInvalidServerError
+
+    with pytest.raises(LDAPInvalidServerError):
+        ldap3.Server(address, get_info=ldap3.NONE)
+    assert ldap_auth._ldap3_dial_host(address) is None
+    with pytest.raises(LdapError, match="names no host"):
+        _authenticator(ENFORCING, ad_server=address)
 
 
 def test_an_ldaps_server_that_names_no_host_is_refused_whatever_the_posture() -> None:

@@ -1014,7 +1014,8 @@ reached them.
 **Note 2026-10-28: the LDAPS AD bind is guarded (BACKLOG #2193 slice (b), owner ruling 2026-10-27).** The LDAPS row of the table above says how. The counts paragraph below names LDAPS as one of its seven hops; it no longer needs a guard. Two facts the row does not carry. A Kerberos sign-in adds no hop: the SPNEGO acceptor reads a ticket the browser sent and builds no TLS context, and the directory lookups a Kerberos or OIDC sign-in makes are binds over this one guarded context, since every bind in `auth/ldap.py` is an ldap3 SIMPLE bind. And `messagefoundry check` has no leg for this guard, where it reports the OIDC legs' through its required `oidc-revocation` leg (BACKLOG #2131). At least `serve`, `provision-admin` and `messagefoundry check-privileges` reach it. This note does not re-check the paragraph's other counts.
 
 **The counts.** At least seven hops need a guard: the FHIR lookup, the AI broker, the DICOM SCU,
-FTPS, LDAPS, the alert and security-notice SMTP hop, and the alert webhook. BACKLOG #2193 tracks
+FTPS, LDAPS (guarded since 2026-10-28, see the note above), the alert and security-notice SMTP hop,
+and the alert webhook. BACKLOG #2193 tracks
 all seven, one checklist line per hop. No row in this table needs an owner answer now. DIRECT,
 the last that did, is graded *Guarded* since BACKLOG #2193 built its credential leg on 2026-10-04.
 *(Until 2026-10-11 this read "One row needs an owner answer: DIRECT. #2193 also tracks it, and its
