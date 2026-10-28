@@ -88,13 +88,14 @@ _BOM = "\ufeff"
 #: Files that must each hold at least one checked text. Pinned so a scanner that matches nothing
 #: fails here instead of passing vacuously. ``auth/ldap.py`` left the list with vault BACKLOG #3230:
 #: its LDAPS refusal no longer names the escape, because no escape releases that bind.
+#: ``transports/ai_broker.py`` left it with vault BACKLOG #3533 item 5, for the same reason: no
+#: escape releases the AI broker's api_key over http.
 _MUST_FIND = frozenset(
     {
         "messagefoundry/config/settings.py",
         "messagefoundry/pipeline/alert_sinks.py",
         "messagefoundry/store/postgres.py",
         "messagefoundry/store/sqlserver.py",
-        "messagefoundry/transports/ai_broker.py",
         "messagefoundry/transports/database.py",
         "messagefoundry/transports/direct.py",
         "messagefoundry/transports/email.py",

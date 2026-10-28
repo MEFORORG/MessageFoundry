@@ -50,6 +50,7 @@ from messagefoundry.config.settings import (
     AuthSettings,
     EgressSettings,
     LoggingSettings,
+    StoreSettings,
     TlsSettings,
 )
 from messagefoundry.config.wiring import WiringError
@@ -660,6 +661,7 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
             tls=TlsSettings(),
             alerts=AlertsSettings(),
             log_settings=LoggingSettings(),
+            store=StoreSettings(),
         ),
         store,
         enforcing=True,
@@ -736,6 +738,7 @@ async def test_a_released_reload_names_a_changed_settings_anchor_it_cannot_apply
         tls=TlsSettings(),
         alerts=AlertsSettings(),
         log_settings=LoggingSettings(),
+        store=StoreSettings(),
     )
     (spec,) = specs
     # The consumer's load, which the restart report compares against.

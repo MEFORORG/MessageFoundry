@@ -11,6 +11,10 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
 * :func:`broad_access_problem` answers, before a key file is used, whether a known broad group
   can read it or change it.
 
+Beside them, :func:`unlink_generated` removes a key or certificate file the engine wrote, riding out
+the brief Windows hold another process puts on such a file (:func:`ride_out_a_held_file`). It sits
+here so the `cert` commands, which write through this module, need not import the API TLS module.
+
 ``store._secure_file`` is the other mechanism, and it is for files that hold no key: it tightens a
 file that already exists and only logs when it cannot. A file that holds a key must never have that
 as its only protection.
@@ -33,7 +37,8 @@ from __future__ import annotations
 import os
 import stat
 import sys
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -48,7 +53,15 @@ from messagefoundry.auth.anchor_path import (
 if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinPathSecurity
 
-__all__ = ["RestrictedFileError", "broad_access_problem", "write_restricted_file"]
+__all__ = [
+    "WINERROR_ACCESS_DENIED",
+    "WINERROR_SHARING_VIOLATION",
+    "RestrictedFileError",
+    "broad_access_problem",
+    "ride_out_a_held_file",
+    "unlink_generated",
+    "write_restricted_file",
+]
 
 
 class RestrictedFileError(OSError):
@@ -223,6 +236,43 @@ def broad_access_problem(path: Path) -> str | None:
             return "it is a link, so the access list of the file behind it was not read"
         return _windows_access_problem(_win32_config_source_probes().read_path(path))
     return _posix_access_problem(status.st_mode)
+
+
+# --- removing a file the engine wrote -------------------------------------------------------------
+
+#: Windows ERROR_SHARING_VIOLATION: another process holds the file open without delete sharing.
+WINERROR_SHARING_VIOLATION = 32
+#: Windows ERROR_ACCESS_DENIED: what a REPLACE onto a file held open elsewhere returns, measured on
+#: Windows 11 with a reader holding the destination (a delete returns the sharing violation).
+WINERROR_ACCESS_DENIED = 5
+_HELD_RETRY_S = 2.0
+_HELD_POLL_S = 0.05
+
+
+def ride_out_a_held_file(action: Callable[[], None], held: frozenset[int]) -> None:
+    """Run ``action``, retrying for :data:`_HELD_RETRY_S` while Windows refuses it with one of the
+    ``held`` codes.
+
+    On Windows a file another process holds open cannot be deleted or replaced, and a certificate or
+    key is exactly the file other processes open: the tray pins it, and backup or antivirus may scan
+    it. That hold is momentary, so the refusal is retried before it propagates. Any other error, and
+    every error off Windows, propagates at once.
+    """
+    deadline = time.monotonic() + _HELD_RETRY_S
+    while True:
+        try:
+            action()
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in held or time.monotonic() >= deadline:
+                raise
+        time.sleep(_HELD_POLL_S)
+
+
+def unlink_generated(path: Path) -> None:
+    """Delete one file the engine wrote, riding out a brief Windows sharing violation. Shared by
+    the API's minted pair and the `cert` commands' cleanup, so neither imports the other."""
+    ride_out_a_held_file(path.unlink, frozenset({WINERROR_SHARING_VIOLATION}))
 
 
 # --- creating the file ----------------------------------------------------------------------------

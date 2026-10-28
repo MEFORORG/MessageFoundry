@@ -74,6 +74,7 @@ def _run(
     recorder: _Recorder | None = None,
     client_cert: bool = True,
     env: str | None = "prod",
+    managed_app: Any = None,
 ) -> tuple[int, _Recorder]:
     """Run ``serve`` or ``supervise`` as a prod instance with every OTHER gate pre-cleared.
 
@@ -99,7 +100,9 @@ def _run(
     (tmp_path / "messagefoundry.toml").write_text(provisions + toml, encoding="utf-8")
     monkeypatch.setattr("messagefoundry.__main__.configure_logging", recorder.configure_logging)
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", recorder.supervise)
-    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr(
+        "messagefoundry.api.create_managed_app", managed_app or (lambda **kw: object())
+    )
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     monkeypatch.setattr(socket, "create_connection", _no_network)
     monkeypatch.setattr(socket, "getaddrinfo", _no_network)
@@ -138,6 +141,95 @@ def test_the_supervisor_spool_is_its_own_directory_beside_the_shards(
     assert rc == 0
     spool = Path(recorder.forwards[0].spool_dir or "")
     assert spool == (tmp_path / "log-spool" / "supervisor").resolve()
+
+
+def _collector_ca_judged(monkeypatch: pytest.MonkeyPatch, *, owner_only: bool) -> None:
+    """The trust-anchor checks judge the collector's CA as ``owner_only`` says, with a path that
+    passes, so the host's temp directory does not decide the test."""
+    from messagefoundry.auth import trust_anchors as ta
+    from messagefoundry.auth.anchor_path import PathVerdict
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: owner_only)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
+
+
+def test_supervise_refuses_an_exposed_collector_ca_before_the_forwarder_is_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #3470: the forwarder loads ``[logging].forward_tls_ca_file``, so the CA takes the
+    trust-anchor checks first. ``supervise`` never checked it. Its process has no audited
+    preflight, so it refuses here, before any engine shard spawns. Red before the fix: it started
+    and built the forwarder."""
+    _collector_ca_judged(monkeypatch, owner_only=False)
+    rc, recorder = _run("supervise", tmp_path, monkeypatch, verified_forwarding=True)
+    err = capsys.readouterr().err
+    assert rc == 2 and recorder.forwards == [] and recorder.spawned == 0
+    (error,) = _errors(err)
+    assert "[logging].forward_tls_ca_file" in error
+    assert "before the log forwarder is built" in err
+
+
+def test_serve_hands_an_exposed_collector_ca_to_the_audited_start_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``serve`` builds no forwarder for a refused collector CA, logs that forwarding is off, and
+    hands the refusal to the API lifespan, whose audited check refuses the start. That check
+    writes its row when it can read the file.
+    Red before the fix: ``serve`` built the forwarder, and the lifespan got no refusal."""
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
+
+    given: dict[str, Any] = {}
+
+    def _app(**kwargs: Any) -> object:
+        given.update(kwargs)
+        return object()
+
+    _collector_ca_judged(monkeypatch, owner_only=False)
+    with caplog.at_level("INFO"):
+        rc, recorder = _run(
+            "serve", tmp_path, monkeypatch, verified_forwarding=True, managed_app=_app
+        )
+    assert rc == 0 and recorder.forwards == [] and len(recorder.logging_calls) == 1
+    (refusal,) = given["prestore_anchor_refusals"]
+    assert isinstance(refusal, TrustAnchorError)
+    assert "[logging].forward_tls_ca_file" in str(refusal)
+    assert "logging_forward_ca" in [s.label for s in given["trust_anchor_specs"]]
+    assert "off-box log forwarding is off" in caplog.text
+    assert "off-box log forwarding enabled" not in caplog.text
+
+
+def test_supervise_under_warn_prints_the_collector_ca_warning_and_logs_it_after_the_forwarder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Under ``warn`` an exposed collector CA warns and the forwarder is built. The warning comes
+    before any log handler, so it is printed to stderr scrubbed onto one line, and logged again
+    once the forwarder is up, so the collector gets the record. Red before the fix: the warning was
+    logged once, before the forwarder, with its newline intact."""
+    _collector_ca_judged(monkeypatch, owner_only=False)
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    with caplog.at_level("WARNING"):
+        rc, recorder = _run("supervise", tmp_path, monkeypatch, verified_forwarding=True)
+    err = capsys.readouterr().err
+    assert rc == 0 and len(recorder.forwards) == 1 and recorder.spawned == 1
+    assert any(
+        line.startswith("warning:") and "forward_tls_ca_file" in line and "using it anyway" in line
+        for line in err.splitlines()
+    ), err
+    noted = [r.name for r in caplog.records if "using it anyway" in r.getMessage()]
+    assert noted == ["messagefoundry.__main__"], noted
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_an_owner_only_collector_ca_installs_the_forwarder(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the case above."""
+    _collector_ca_judged(monkeypatch, owner_only=True)
+    rc, recorder = _run(command, tmp_path, monkeypatch, verified_forwarding=True)
+    assert rc == 0 and len(recorder.forwards) == 1
 
 
 def test_no_shard_can_be_given_the_supervisor_spool_directory(tmp_path: Path) -> None:

@@ -386,7 +386,9 @@ def harden_crl_check(
         )
 
     pem = path.read_bytes()
-    facts, blocks = judge_crl_bytes(pem, label=label, now=time.time())
+    facts, blocks = judge_crl_bytes(
+        pem, label=label, now=time.time(), refuse_unread_extensions=True
+    )
 
     before = ctx.cert_store_stats()
     certs_before = before["x509"]  # a missing key raises: fail closed
@@ -559,16 +561,10 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
 
 
 #: Why a start could not confirm a CRL's signature, by :class:`~messagefoundry.pki.CrlSignature`
-#: state, in the words of the one warning :func:`_check_crl_signatures` logs. ``unlisted`` says
-#: what the engine did, not what the CA list holds: a listed CA whose name differs from the
-#: issuer's only in white space reads ``unlisted`` too, and OpenSSL can still use that CA
-#: (:func:`~messagefoundry.pki._issuer_name_key` says why).
+#: state, in the words of the one warning :func:`_check_crl_signatures` logs. ``unlisted`` is not
+#: here: its words are :data:`~messagefoundry.pki.UNLISTED_SIGNATURE`, which the reload's refusal
+#: uses too, so the two cannot drift apart (vault BACKLOG #3506).
 _UNCONFIRMED_SIGNATURE = {
-    "unlisted": (
-        "the engine matched it to no CA certificate this hop lists (it compares the issuer name "
-        "with the case of ASCII letters folded, as OpenSSL does, and white space exactly, and "
-        "then the CRL's authority key identifier, where it carries one)"
-    ),
     "unproven": (
         "a listed CA has that name, ASCII letter case aside, and its key does not "
         "verify the CRL, but the CRL does not "
@@ -600,8 +596,11 @@ def _check_crl_signatures(
     logged. That function is asked only when there is a line to log. So it holds the last file
     version that logged one, and an earlier version is logged again only when it returns after
     another that logged one. A judgment that fails for any other reason is logged at ERROR,
-    once, and the file loads: this is a diagnosis, and a defect in it must not stop a start. That
-    failure discards the whole judgment, a proven bad CRL in the same file included.
+    once, and the file loads: this is a diagnosis, and a defect in it must not stop a start. The
+    verdicts reached before that failure still count (vault BACKLOG #3506): a CRL already proven
+    bad refuses the file, and the others it could not confirm warn. The CRLs after it are not
+    judged, so a proof there is missed, and none is judged when the failure comes before the
+    first verdict.
 
     **Each CRL is judged on its own, as the expired-CRL refusal judges them.** So a badly signed
     copy refuses the file even beside a newer, good CRL from the same issuer, which OpenSSL
@@ -615,25 +614,30 @@ def _check_crl_signatures(
     There is no setting that turns this off and none that widens it, as for the expired-CRL
     refusal in :func:`judge_crl_bytes`."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
-    from messagefoundry.pki import judge_crl_signatures
+    from messagefoundry.pki import UNLISTED_SIGNATURE, CrlSignature, judge_crl_signatures
 
     fingerprint = crl_fingerprint(pem)
+    judged: list[CrlSignature] = []
     try:
-        judged = list(judge_crl_signatures(pem, anchors))
+        # One verdict at a time, so a failure part way keeps the verdicts already reached.
+        for signature in judge_crl_signatures(pem, anchors):
+            judged.append(signature)
     except Exception as exc:
         # Not a verdict on the file, and not proof: the judgment itself failed. Broad on purpose.
         # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
-        # that with exception types of its own. The handshake still checks every signature.
+        # that with exception types of its own. The handshake still checks every signature. The
+        # verdicts already reached are used below: a proof refuses, and the unconfirmed warn.
         if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(exc).__name__)):
             logger.error(
                 "%s: the engine could not check the signatures of the CRL(s) in this file at "
-                "start (%s). That is not a verdict on the file. It is loaded and revocation "
+                "start (%s), after judging %d of them. That is not a verdict on the rest. Unless "
+                "a CRL it judged is proven badly signed, the file is loaded and revocation "
                 "checking is on, and OpenSSL checks each signature at the handshake",
                 label,
                 type(exc).__name__,
+                len(judged),
                 exc_info=True,
             )
-        return
     if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
         raise ValueError(
             f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "
@@ -645,15 +649,16 @@ def _check_crl_signatures(
     finding = tuple(signature.state for signature in judged)
     if not unconfirmed or not first_unconfirmed_signature(crl_file, fingerprint, finding):
         return
+    words = {**_UNCONFIRMED_SIGNATURE, "unlisted": UNLISTED_SIGNATURE}
     shown = "; ".join(
-        f"{signature.where}: {_UNCONFIRMED_SIGNATURE[signature.state]}"
+        f"{signature.where}: {words[signature.state]}"
         for signature in unconfirmed[:_UNCONFIRMED_SHOWN]
     )
     if (more := len(unconfirmed) - _UNCONFIRMED_SHOWN) > 0:
         shown = f"{shown}; and {more} more"
     logger.warning(
         "%s: the engine could not confirm at start that a CA this hop lists signed %d of the %d "
-        "CRL(s) in this file. %s. The file is loaded and revocation checking is on. OpenSSL "
+        "CRL(s) it judged in this file. %s. The file is loaded and revocation checking is on. OpenSSL "
         "checks each signature at the handshake. If peers are then refused with 'CRL signature "
         "failure' or 'unable to get certificate CRL', check this file first",
         label,
@@ -707,7 +712,12 @@ def crl_label(crl_file: str, setting: str | None) -> str:
 
 
 def judge_crl_bytes(
-    pem: bytes, *, label: str, now: float, require_in_effect: bool = True
+    pem: bytes,
+    *,
+    label: str,
+    now: float,
+    require_in_effect: bool = True,
+    refuse_unread_extensions: bool = False,
 ) -> tuple[CrlFacts, tuple[CrlBlock, ...]]:
     """Refuse CRL bytes no context may load. Return the facts of the soonest-expiring block, and
     every block, which a context that records its copy needs (BACKLOG #299).
@@ -720,7 +730,10 @@ def judge_crl_bytes(
     load. An expired CRL refuses, because past ``nextUpdate`` it fails every peer, not only revoked
     ones. So does an issuer whose every CRL takes effect later (:class:`CrlNotInEffect`), unless
     ``require_in_effect`` is False: the reload asks :func:`crl_not_in_effect` itself, because a file
-    to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``.
+    to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``, except for a CRL
+    whose extensions ``cryptography`` cannot read: without ``refuse_unread_extensions`` its own
+    error, which is no ``ValueError``, raises as it is. That flag goes to
+    :func:`~messagefoundry.pki.judge_every_crl`, which says who passes it.
 
     No signature is checked here, because this has no CA list. A start checks it in
     :func:`_check_crl_signatures`, and the reload in
@@ -728,7 +741,7 @@ def judge_crl_bytes(
     from messagefoundry.pki import judge_every_crl, soonest_crl
 
     try:
-        judged = judge_every_crl(pem, now=now)
+        judged = judge_every_crl(pem, now=now, refuse_unread_extensions=refuse_unread_extensions)
     except ValueError as exc:
         raise ValueError(f"{label}: {exc}") from exc
     facts = soonest_crl([every for every, _ in judged])
@@ -2402,7 +2415,6 @@ def revocation_hop_disposition(
     *,
     enforcing: bool,
     is_loopback_hop: bool,
-    proxy_proven: bool,
     attested: bool,
     crl_checked: bool = False,
     blanket_attested: bool = False,
@@ -2421,9 +2433,6 @@ def revocation_hop_disposition(
        rather than declared away. The caller derives it from that context (see
        :meth:`RevocationHopGuard.capture`), never from the presence of a ``[tls].crl_file`` setting: a
        configured CRL that a given hop's handshake never consults must not silence that hop's guard.
-    #. ``proxy_proven`` → :attr:`~HopDisposition.ALLOW` — revocation is *proven in front* by a declared
-       revocation-checking egress terminator (the outbound analogue of ADR 0078's ``proxy_terminated``).
-       **Unreachable today:** no call site sets it, so no refusal offers it (BACKLOG #2987).
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
@@ -2440,11 +2449,14 @@ def revocation_hop_disposition(
     ALLOWs, byte-identical to the pre-clamp behaviour, so nothing outside an enforcing posture moves.
 
     A ``not is_phi`` ALLOW arm sat fourth until BACKLOG #1279. Every instance carries patient data now,
-    so it could no longer fire and its removal leaves the remaining relaxations as the whole set.
+    so it could no longer fire and its removal leaves the remaining relaxations as the whole set. A
+    ``proxy_proven`` ALLOW arm, for revocation proven by a declared revocation-checking egress
+    terminator, sat between ``crl_checked`` and ``attested`` until BACKLOG #3514 item 5: no engine call
+    site ever set it True, so it never fired outside tests.
 
     Unlike :func:`insecure_hop_disposition` this carries NO global-escape (``audited_opt_out``) arm — the
-    only relaxations an ENFORCING hop has are the on-box carve-out, an in-engine CRL check, a declared
-    revocation-checking terminator and a per-connection attestation. This never turns verification off
+    only relaxations an ENFORCING hop has are the on-box carve-out, an in-engine CRL check and a
+    per-connection attestation. This never turns verification off
     (the caller has already built a verifying context) — it only decides whether the
     *unchecked-revocation* property of that verified hop is tolerable, so it composes with (never
     weakens) the #200 cleartext/verify-off refusals."""
@@ -2452,13 +2464,11 @@ def revocation_hop_disposition(
         return HopDisposition.ALLOW
     if crl_checked:
         return HopDisposition.ALLOW
-    if proxy_proven:
-        return HopDisposition.ALLOW
     if attested:
         return HopDisposition.ALLOW
     if enforcing:
         # The clamp: a blanket env attestation does NOT reach this arm. Only the per-connection
-        # attestation above, a proven terminator, or a real in-engine CRL check crosses an enforcing hop.
+        # attestation above or a real in-engine CRL check crosses an enforcing hop.
         return HopDisposition.REFUSE
     if blanket_attested:
         return HopDisposition.ALLOW
@@ -2485,8 +2495,8 @@ CREDENTIAL_HOP_WAYS_ACROSS = (
 #: four documents off such a count. Find the consumers by symbol.
 #:
 #: It offered a third lever until BACKLOG #2987 (#2977 item 9): terminate at a revocation-checking
-#: egress proxy. No call site sets ``proxy_proven``, so routing egress through such a proxy never
-#: changed the decision, and the refusal named a remedy the operator could not perform (SDS-3.7).
+#: egress proxy. No call site ever declared such a proxy, so routing egress through one never changed
+#: the decision, and the refusal named a remedy the operator could not perform (SDS-3.7).
 _CONNECTION_WAYS_ACROSS = (
     "Configure [tls].crl_file so the engine checks a CRL on this hop, or set "
     "tls_revocation_attested=true with a tls_revocation_attested_reason on this connection."
@@ -2513,7 +2523,6 @@ class RevocationHopGuard:
     cell: str
     description: str
     attested: bool
-    proxy_proven: bool
     posture: HopPosture | None
     #: Whether the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env was set when this hop was captured.
     #: Held SEPARATELY from the per-connection ``attested`` (BACKLOG #299) — folding the two into one
@@ -2552,7 +2561,6 @@ class RevocationHopGuard:
         cell: str,
         description: str,
         attested: bool,
-        proxy_proven: bool = False,
         context: ssl.SSLContext | None = None,
         posture: HopPosture | None = None,
         ways_across: str | None = None,
@@ -2586,7 +2594,6 @@ class RevocationHopGuard:
             cell=cell,
             description=description,
             attested=attested,
-            proxy_proven=proxy_proven,
             posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
             crl_checked=context_checks_revocation(context),
@@ -2607,7 +2614,6 @@ class RevocationHopGuard:
         return revocation_hop_disposition(
             enforcing=posture.enforcing,
             is_loopback_hop=is_loopback_hop_host(self.host),
-            proxy_proven=self.proxy_proven,
             attested=self.attested,
             crl_checked=self.crl_checked,
             blanket_attested=self.blanket_attested,
@@ -2636,29 +2642,26 @@ class RevocationHopGuard:
         if posture is None:
             return
         disposition = self._disposition(posture)
-        # Audit an attestation / proven terminator that SUPPRESSED a would-be production-PHI refusal: the
-        # disposition is ALLOW only because tls_revocation_attested / proxy_proven fired before the REFUSE
-        # arm, so an operator should see the unchecked-revocation hop was crossed on their attestation.
+        # Audit an attestation that SUPPRESSED a would-be production-PHI refusal: the disposition is
+        # ALLOW only because tls_revocation_attested fired before the REFUSE arm, so an operator should
+        # see the unchecked-revocation hop was crossed on their attestation.
         # crl_checked is deliberately NOT in this condition: that hop DOES check revocation, so there is
         # no unchecked-revocation crossing to audit. blanket_attested is not here either — under an
         # enforcing posture it can no longer produce an ALLOW (BACKLOG #299), and under a non-enforcing
         # one `posture.enforcing` already excludes the line.
         if (
             disposition is HopDisposition.ALLOW
-            and (self.attested or self.proxy_proven)
+            and self.attested
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
-            # A proven terminator ALLOWs without any per-connection attestation, so say which.
             log_attested_crossing(
                 logger,
                 crossing="verified TLS hop crossed without certificate revocation checking",
                 connection=self.connection,
                 detail=f"{self.cell}: {self._detail()}",
-                reason=self.attested_reason
-                if self.attested
-                else "revocation proven by a declared egress terminator",
-                declaration="tls_revocation_attested" if self.attested else "proxy_proven",
+                reason=self.attested_reason,
+                declaration="tls_revocation_attested",
             )
         enforce_insecure_hop(
             disposition, message=self._detail(), cell=self.cell, connection=self.connection

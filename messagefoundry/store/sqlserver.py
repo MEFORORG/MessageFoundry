@@ -119,7 +119,9 @@ from messagefoundry.store.crypto import (
     cipher_meta_key,
     decrypt_json_cell,
     report_sealed_surface,
-    rotation_fingerprint_key,
+    reseal_rotation_fingerprints,
+    rotation_fingerprint_cipher,
+    rotation_fingerprint_reseal_likes,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.gcm_bound import (
@@ -2671,13 +2673,21 @@ _SCHEMA: list[str] = [
         CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner_user_id, name)""",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
-    # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
-    # the tracked-since age floor + the auto-detected last-rotation stamp. Adding this DDL moves
-    # _schema_hash() — the ADR 0064 bump — so the table is created at open on SQL Server too, engaging the
-    # engine's `isinstance(store, SecretRotationMetaStore)` reconcile on the server backends (SQL Server / Postgres).
+    # is the DEK's one-way key-id, or for any other class a store-cipher cell sealing a keyed MAC under
+    # a random per-row key (BACKLOG #3472, ADR 0213) — never the value; the dates are the tracked-since
+    # age floor + the auto-detected last-rotation stamp. Adding this DDL moves _schema_hash() — the ADR
+    # 0064 bump — so the table is created at open on SQL Server too, engaging the engine's
+    # `isinstance(store, SecretRotationMetaStore)` reconcile on the server backends (SQL Server / Postgres).
     """IF OBJECT_ID('secret_rotation_meta','U') IS NULL CREATE TABLE secret_rotation_meta (
-        secret_key NVARCHAR(255) NOT NULL PRIMARY KEY, fingerprint NVARCHAR(255) NOT NULL,
+        secret_key NVARCHAR(255) NOT NULL PRIMARY KEY, fingerprint NVARCHAR(MAX) NOT NULL,
         tracked_since NVARCHAR(32) NOT NULL, last_rotated NVARCHAR(32) NOT NULL)""",
+    # BACKLOG #3472: a sealed fingerprint cell can be longer than 255 characters (measured: about 240
+    # to 255 under the frozen v1 writer, 260 to 320 under the default cell-bound writer, and more
+    # for a long env() key), so a table created at NVARCHAR(255) is widened in place. COL_LENGTH is
+    # -1 for a MAX column and NULL for no table, so this runs once and never on a fresh store. The
+    # column is in no key or index, so it alters in place.
+    """IF COL_LENGTH('secret_rotation_meta','fingerprint') <> -1
+        ALTER TABLE secret_rotation_meta ALTER COLUMN fingerprint NVARCHAR(MAX) NOT NULL""",
     # ADR 0114 sub-lever A: the lane-family claim procedures, deployed as guarded,
     # self-no-op'ing CREATE OR ALTER statements (see _claim_proc_ddl — a guard miss leaves the proc
     # uncreated, NEVER a failed open; the flag-ON startup gate then degrades loudly to the batch).
@@ -2707,14 +2717,6 @@ def _odbc_brace(value: str) -> str:
     return "{" + value.replace("}", "}}") + "}"
 
 
-def _pin_path(settings: StoreSettings) -> str | None:
-    """The ``[store].ssl_root_cert`` pin the store sends, or ``None``: it rides only the secure
-    posture, so an escaped weakened one (verify off, or no encryption) sends none."""
-    if settings.trust_server_certificate or not settings.encrypt:
-        return None
-    return settings.ssl_root_cert or None
-
-
 def check_pinned_certificate(
     settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
 ) -> None:
@@ -2724,41 +2726,63 @@ def check_pinned_certificate(
     Vault BACKLOG #2223: under ``Encrypt=strict`` a pin match stands in for the driver's own chain,
     host-name and expiry checks, and the pinned file is the connection's only trust anchor. So:
 
-    * the file must be one server certificate (:func:`~messagefoundry.pki.read_pinned_server_certificate`);
     * it takes the trust-anchor ACL and path checks with their own rules and messages
-      (:func:`~messagefoundry.auth.trust_anchors.enforce_anchor`): a file or folder a broad
+      (:func:`~messagefoundry.auth.trust_anchors.enforced_anchor`): a file or folder a broad
       principal can write refuses at ``[security].enforcement = enforce`` and warns at ``warn``,
       and no posture counts as enforcing. The driver reads the file by path, so the spec carries
-      ``loads_verified_bytes=False``;
+      ``loads_verified_bytes=False`` (:func:`~messagefoundry.auth.trust_anchors.store_pin_anchor_spec`);
+    * it must be no larger than :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES`, judged by its size
+      on disk before the anchor checks read it, and again on the bytes they read;
+    * the file must be one server certificate (:func:`~messagefoundry.pki.pinned_server_certificate`);
     * it must be inside its validity period at ``now`` (default the wall clock); notAfter itself
       still counts as valid, as RFC 5280 reads it.
+
+    The file is read once, and the certificate checks read the bytes the anchor checks read
+    (BACKLOG #3714). It writes no audit row. The audited check is the settings preflight
+    (:mod:`messagefoundry.auth.trust_anchors`, module item 11, which says what a reload skips).
 
     Blocking: it reads the file and, on Windows, runs ``icacls``. :meth:`SqlServerStore.open` and
     :meth:`SqlServerStore._one_connection_store` run it off the event loop once per store open,
     before any connect, never per query. A store opened before notAfter keeps connecting after it,
     so the certificate-expiry monitor, which watches this file, is what warns ahead of that date."""
-    from messagefoundry.auth.trust_anchors import AnchorSpec, TrustAnchorError, enforce_anchor
-    from messagefoundry.pki import read_pinned_server_certificate
+    from messagefoundry.auth.trust_anchors import (
+        TrustAnchorError,
+        enforced_anchor,
+        store_pin_anchor_spec,
+    )
+    from messagefoundry.pki import (
+        oversized_pin_reason,
+        pinned_server_certificate,
+        unreadable_pin_reason,
+    )
     from messagefoundry.redaction import log_timestamp
 
-    path = _pin_path(settings)
-    if path is None:
+    spec = store_pin_anchor_spec(settings)
+    if spec is None:
         return
-    cert = read_pinned_server_certificate(path)
+    path = spec.path
+    # The anchor checks read the whole file, so a file too large for a pin is refused first.
+    if (too_large := oversized_pin_reason(path)) is not None:
+        raise ValueError(f"[store].ssl_root_cert {path!r} {too_large}")
+    checked: bytes | str  # the bytes the anchor checks read, or the refusal
+    try:
+        enforcing = posture is None or posture.enforcing
+        # remember_warning: serve's preflight checks this file again moments later, and need not
+        # log the same warning twice (BACKLOG #3714).
+        checked = enforced_anchor(spec, enforcing=enforcing, remember_warning=True).data
+    except TrustAnchorError as exc:
+        checked = str(exc)  # the anchor module's own message, which names the setting and the fix
+    except (OSError, ValueError, TypeError) as exc:  # the last two: a path open() refuses
+        checked = f"[store].ssl_root_cert {path!r} {unreadable_pin_reason(exc)}"
+    except MemoryError:
+        # Turns a MemoryError raised while the anchor checks run into a refusal naming the setting.
+        # The store open does not guard a FIFO or an endless device: such a read can block or never end.
+        checked = f"[store].ssl_root_cert {path!r} could not be read: the engine ran out of memory"
+    if isinstance(checked, str):  # raised outside the handler, so no chained parser text
+        raise ValueError(checked)
+    cert = pinned_server_certificate(checked)
     if isinstance(cert, str):
         raise ValueError(f"[store].ssl_root_cert {path!r} {cert}")
-    spec = AnchorSpec(
-        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
-    )
-    refusal: str | None = None
-    try:
-        enforce_anchor(spec, enforcing=posture is None or posture.enforcing)
-    except TrustAnchorError as exc:
-        refusal = str(exc)  # the anchor module's own message, which names the setting and the fix
-    except OSError as exc:
-        refusal = f"[store].ssl_root_cert {path!r} could not be read: {exc.strerror or type(exc).__name__}"
-    if refusal is not None:
-        raise ValueError(refusal)
     moment = time.time() if now is None else now
     not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
     if moment > not_after.timestamp():
@@ -2839,7 +2863,7 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     # done instead of the expiry, host-name and chain checks, so the engine checks the pinned
     # certificate itself at store open (check_pinned_certificate). Not a revocation control. Both
     # keywords stay inside the last-wins tail.
-    pin = _pin_path(settings)
+    pin = settings.sqlserver_pin_path()
     if pin:
         parts.append(f"ServerCertificate={_odbc_brace(pin)}")
     encrypt = "strict" if pin else ("yes" if settings.encrypt else "no")
@@ -3086,8 +3110,11 @@ class SqlServerStore:
         # against this and re-reads only the sets that differ. Seeded at open (_load_reference_cache)
         # and on every write_reference_snapshot.
         self._reference_versions: dict[str, str] = {}
-        # Serializes audit-chain appends in-process (the store is the single audit writer per engine
-        # process; active-passive = one active node) — see record_audit.
+        # A near gate only: it orders the appends in THIS process that take it (record_audit and
+        # its siblings; _append_operator_audit does not). The chain's lock is `_AUDIT_APPEND_LOCK`,
+        # taken by every append in every engine-shard process (why: record_audit). That premise is
+        # tested in tests/test_control_premises.py (offline: the applock precedes the head read)
+        # and the gated tests/test_sqlserver_audit_applock.py (live: it holds across processes).
         self._audit_lock = asyncio.Lock()
         # H1 fencing token: the held leader epoch + the leader_lease row to validate it against, pushed
         # by the engine on promotion via set_leader_epoch() (the store NEVER imports the coordinator —
@@ -3642,11 +3669,10 @@ class SqlServerStore:
     # `isinstance(store, SecretRotationMetaStore)` reconcile on the SQL Server backend (mirrors
     # MessageStore's SQLite implementation).
 
-    def secret_rotation_fingerprint_key(self) -> bytes | None:
-        """The DEK-derived HMAC subkey the rotation watcher fingerprints tracked secret values with
-        (ASVS 13.3.4). Derived off THIS store's live cipher; ``None`` when keyless / DEK not in heap, in
-        which case the watcher tracks only the non-secret DEK key-id stamp. Never returns the DEK."""
-        return rotation_fingerprint_key(self._cipher)
+    def secret_rotation_cipher(self) -> AesGcmCipher | None:
+        """The cipher the rotation watcher seals each non-DEK fingerprint cell with (ASVS 13.3.4,
+        BACKLOG #3472); ``None`` when keyless or ``vault_transit``. Mirrors MessageStore's."""
+        return rotation_fingerprint_cipher(self._cipher)
 
     async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
         """Every persisted secret-rotation watch record, keyed by ``secret_key`` (non-secret dates +
@@ -3669,7 +3695,9 @@ class SqlServerStore:
     ) -> None:
         """Insert or replace one NON-SECRET watch record. Idempotent via a single atomic ``MERGE``
         under ``HOLDLOCK`` (range-locks the PK so two concurrent nodes can't both INSERT), so a re-run —
-        or a second cluster node — writing an identical fingerprint/date is a no-op."""
+        or a second cluster node — writing an identical fingerprint/date is a no-op. A sealed non-DEK fingerprint draws a fresh key on every write (BACKLOG #3472), so two nodes
+        sealing one class at once each write a different cell and the last write wins; either opens
+        to the same verdict."""
         await self._execute(
             "MERGE secret_rotation_meta WITH (HOLDLOCK) AS t"
             " USING (SELECT ? AS secret_key) AS s ON t.secret_key=s.secret_key"
@@ -8576,6 +8604,8 @@ class SqlServerStore:
         total += await self._reencrypt_identity_composite(
             "alert_instance", ("event_type", "connection"), "reason", active_like, batch
         )
+        # BACKLOG #3472 (ADR 0213): each sealed secret-rotation fingerprint; store.py's twin says why.
+        total += await self._reseal_rotation_fingerprints_to_active(cipher, active_like)
         if total:
             log.info("re-encrypted %d row(s) to the active key", total)
         # BACKLOG #2592: a rotation ends every session; store.py's reencrypt_to_active says why.
@@ -8642,6 +8672,36 @@ class SqlServerStore:
                 column,
             )
         return total
+
+    async def _reseal_rotation_fingerprints_to_active(
+        self, cipher: AesGcmCipher, active_like: str
+    ) -> int:
+        """Re-seal each sealed ``secret_rotation_meta.fingerprint`` under the active key (BACKLOG
+        #3472). Mirrors MessageStore._reseal_rotation_fingerprints_to_active: one read, and a cell no
+        key opens is left in place."""
+        sealed, active = rotation_fingerprint_reseal_likes(active_like)
+        rows = await self._fetchall(
+            "SELECT secret_key, fingerprint FROM secret_rotation_meta"
+            " WHERE fingerprint LIKE ? AND fingerprint NOT LIKE ?",
+            (sealed, active),
+        )
+        updates = reseal_rotation_fingerprints(
+            cipher, [(r["secret_key"], r["fingerprint"]) for r in rows]
+        )
+        if updates:
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    for enc, skey in updates:
+                        await cur.execute(
+                            "UPDATE secret_rotation_meta SET fingerprint=? WHERE secret_key=?",
+                            (enc, skey),
+                        )
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+            await self._charge_bound_batch()
+        return len(updates)
 
     def _reencrypt_value(self, stored: str, aad: bytes) -> str:
         """Decrypt (keyring — any key) then re-encrypt under the active key, rebinding the SAME cell AAD

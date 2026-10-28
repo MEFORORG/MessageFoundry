@@ -310,10 +310,12 @@ from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     AnchorStoreUnavailable,
     TrustAnchorError,
+    anchor_refusal,
     make_lane_anchor_check,
     make_registry_anchor_preflight,
     make_settings_anchor_preflight,
     run_anchor_preflight,
+    smtp_hop_anchor_spec,
 )
 from messagefoundry.config.ai_policy import (
     AiDataScope,
@@ -419,7 +421,11 @@ from messagefoundry.pipeline import (
     Engine,
     ReloadOutcome,
 )
-from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
+from messagefoundry.pipeline.alert_sinks import (
+    EmailTransport,
+    configured_alert_transport_names,
+    notifier_from_settings,
+)
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
@@ -10918,6 +10924,54 @@ def _chain_registry_preflights(
     return chained
 
 
+def _alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
+    """``alerts`` with the email transport dropped, for a lifespan whose SMTP CA was refused
+    (BACKLOG #3470). A refused CA must never suppress an alert.
+
+    * Each rule and escalation tier stops naming ``email``. The notifier refuses a rule naming a
+      transport it lacks, and the other transports would go with it.
+    * A rule or tier that named only email now names every transport left. An empty list means
+      suppress, and the operator never asked for that. ``None`` would not do for a tier: it keeps
+      its rule's transports, which may be an empty list. An explicit empty list stays one.
+    * With no transport left there is no notifier, and the engine's logging sink logs each
+      alert. Only a rule that names a transport is kept then. The notifier refuses it, and the
+      lifespan logs that refusal. The rest route only the notifier, and kept they would log
+      advice to configure the email that is configured.
+    * The SMTP password reference is dropped, so no secret is resolved for a transport that is
+      not built. A secret store that is down cannot abort the start before the CA refusal."""
+    left = sorted(configured_alert_transport_names(alerts) - {"email"})
+
+    def _no_email(transports: list[str] | None) -> list[str] | None:
+        if transports is None:
+            return None
+        kept = [t for t in transports if t != "email"]
+        if transports and not kept:
+            return list(left)
+        return kept
+
+    rules = [
+        rule.model_copy(
+            update={
+                "transports": _no_email(rule.transports),
+                "escalate": [
+                    tier.model_copy(update={"transports": _no_email(tier.transports)})
+                    for tier in rule.escalate
+                ],
+            }
+        )
+        for rule in alerts.rules
+    ]
+    if not left:
+        rules = [r for r in rules if r.transports or any(t.transports for t in r.escalate)]
+    return alerts.model_copy(
+        update={
+            "email_to": [],
+            "email_password_secret": None,  # nosec B105 -- clears a secret reference, sets no value
+            "rules": rules,
+        }
+    )
+
+
 def create_managed_app(
     *,
     db_path: str | Path | None = None,
@@ -11007,6 +11061,7 @@ def create_managed_app(
     configured_log_level: str | None = None,
     trust_anchor_specs: Sequence[AnchorSpec] = (),
     trust_anchors_enforcing: bool = True,
+    prestore_anchor_refusals: Sequence[TrustAnchorError] = (),
 ) -> FastAPI:
     """Build an app that owns its engine for its whole lifespan (CLI server / sync tests).
 
@@ -11033,6 +11088,10 @@ def create_managed_app(
     trust-anchor audit row. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
     inventory's settings half from; ``None`` makes that route say it could not read it.
+    ``prestore_anchor_refusals`` holds trust-anchor refusals a caller made before the store opened
+    (``serve`` passes the log forwarder's, BACKLOG #3470). A non-empty tuple always refuses the
+    start: the trust-anchor preflight refuses it, or, if that passes, the first one is raised
+    marked ``unaudited``.
     """
     if store_settings is None:
         if db_path is None:
@@ -11092,19 +11151,55 @@ def create_managed_app(
             if secrets_settings is not None
             else None
         )
-        notifier = (
-            notifier_from_settings(
-                alerts_settings,
-                secret_provider=secret_provider,
-                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
-                # an estate on a private CA needs no per-alert CA path.
-                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
-                posture=_hop_posture,
+        # BACKLOG #3470: the CA the notifier's email transport reads is checked before the
+        # notifier is built, since at least three things send through it before the start check
+        # below. Only a CA that check is given. trust_anchors module item 10 says what a refusal
+        # does.
+        smtp_ca = (
+            smtp_hop_anchor_spec(
+                alerts_settings, auth_settings or AuthSettings(), tls_settings or TlsSettings()
             )
-            if alerts_settings is not None
+            if alerts_settings is not None and alerts_settings.email_to
             else None
         )
+        smtp_anchor_refusal = (
+            await asyncio.to_thread(anchor_refusal, smtp_ca, enforcing=trust_anchors_enforcing)
+            if smtp_ca is not None and smtp_ca in trust_anchor_specs
+            else None
+        )
+        notifier_alerts = alerts_settings
+        if smtp_anchor_refusal is not None and alerts_settings is not None:
+            # Keep the webhook: drop only the email transport, which would load the refused CA.
+            notifier_alerts = _alerts_without_email(alerts_settings)
+            _log.warning(
+                "alert email is off: the CA it reads was refused. The start check below refuses "
+                "the start. Until then a rule that sent only by email uses the other transports, "
+                "or the log when there are none."
+            )
+        try:
+            notifier = (
+                notifier_from_settings(
+                    notifier_alerts,
+                    secret_provider=secret_provider,
+                    # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP
+                    # hop too, so an estate on a private CA needs no per-alert CA path.
+                    trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                    # #329: clamp the webhook sink's cleartext-http escape to the derived posture.
+                    posture=_hop_posture,
+                )
+                if notifier_alerts is not None
+                else None
+            )
+        except ValueError as exc:
+            if smtp_anchor_refusal is None:
+                raise
+            # The start is refused below for the CA anyway, so this refusal must not hide behind
+            # it: it is logged, and the operator meets it now rather than at the next start.
+            _log.error(
+                "the alert notifier was not built either, so startup alerts reach only the log: %s",
+                scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+            )
+            notifier = None
         # BACKLOG #1169: the notifier is built BEFORE the store opens so the cipher's refusal hook can
         # reach it during the open. A planted `state`/`reference` value on a sealed surface aborts the
         # open (those tables are read eagerly), and a planted row the at-open sweep finds is left in
@@ -11202,16 +11297,25 @@ def create_managed_app(
                 await store.close()
                 raise
         # #285 (ASVS 6.7.1): preflight every operator-supplied auth-path trust anchor (OIDC / AD /
-        # api-mTLS client CA), and the settings CAs a hop dials with (vault BACKLOG #3188;
-        # trust_anchors module item 10), BEFORE any listener binds — a group/world-writable anchor refuses (at
+        # api-mTLS client CA), the settings CAs a hop dials with (vault BACKLOG #3188;
+        # trust_anchors module item 10) and the SQL Server store pin (item 11), BEFORE any listener binds — a group/world-writable anchor refuses (at
         # enforce) or warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
         # change since the last load is audited (auth.trust_anchor). Dormant (no store call, no audit)
         # when no anchor is configured. On a fatal violation it raises, so we tear down like attestation.
-        if trust_anchor_specs:
+        # BACKLOG #3470: a CA refused before the store opened, here or by serve's forwarder gate.
+        early_refusal = smtp_anchor_refusal or next(iter(prestore_anchor_refusals), None)
+        if trust_anchor_specs or early_refusal is not None:
             try:
-                await run_anchor_preflight(
-                    trust_anchor_specs, store, enforcing=trust_anchors_enforcing
-                )
+                if trust_anchor_specs:
+                    await run_anchor_preflight(
+                        trust_anchor_specs, store, enforcing=trust_anchors_enforcing
+                    )
+                if early_refusal is not None:
+                    # The CA passed here after it was refused before the store opened: it
+                    # changed, or a read failed once. Its hop was built without it, so the engine
+                    # does not start. No row records this refusal.
+                    early_refusal.unaudited = True
+                    raise early_refusal
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()

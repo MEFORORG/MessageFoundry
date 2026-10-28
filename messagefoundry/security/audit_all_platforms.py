@@ -26,7 +26,10 @@ always audited.
 
 WHAT IT DOES, in order, exiting with the first non-zero status:
 
-1. ``pip install --dry-run --ignore-installed --require-hashes -r <lock>`` on the lock AS COMMITTED.
+1. ``pip install --dry-run --ignore-installed --require-hashes --only-binary :all: -r <lock>`` on
+   the lock AS COMMITTED. Wheels only, whatever the caller's pip configuration says: a dry-run
+   still builds an sdist to read its metadata, and that runs the package's build code in an audit.
+   So a pin with no wheel for the host fails here (vault BACKLOG #4083 finding 4).
    This keeps what the old ``pip-audit -r <lock>`` did as a side effect: its pip path dry-run
    installed the lock into a fresh venv, so a pin with a wrong hash or no installable artifact on the
    runner reddened the gate. For ``ci/locks/ci-quality.lock`` that was the only such check in a
@@ -235,7 +238,9 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         print(f"  {entry}")
     sys.stdout.flush()
     pip_check = [*python_module_argv("pip"), "install", "--dry-run", "--ignore-installed"]
-    status = run([*pip_check, "--require-hashes", "--quiet", "-r", str(args.lock)])
+    status = run(
+        [*pip_check, "--require-hashes", "--only-binary", ":all:", "--quiet", "-r", str(args.lock)]
+    )
     if status:
         return status
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP") or None) as tmp:

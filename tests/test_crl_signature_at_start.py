@@ -24,7 +24,9 @@ All material is synthetic and minted here. No PHI.
 from __future__ import annotations
 
 import datetime
+import logging
 import ssl
+import warnings
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,18 +36,21 @@ from cryptography import x509
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, padding, rsa
+from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.x509.oid import NameOID
 
 from messagefoundry import pki as pki_module
-from messagefoundry.config import loaded_crls
+from messagefoundry.config import loaded_crls, tls_policy
 from messagefoundry.config.tls_policy import (
-    _UNCONFIRMED_SIGNATURE,
     TrustAnchor,
     build_verifying_client_context,
     harden_crl_check,
 )
-from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE
+from messagefoundry.keywrap import der_children, read_der_tlv
+from messagefoundry.pipeline import crl_reload
+from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE, FIX, reload_replaced_crls
 from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
+from tests.test_crl_held_copy_alert import _bundle_scan
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
 from tests.test_trust_anchor_byte_binding import _handshake
 
@@ -535,10 +540,10 @@ def test_a_ca_cryptography_cannot_read_is_skipped_alone(
     real = pki_module._akid_fit
     old = x509.load_pem_x509_certificate(twins.old_ca.read_bytes())
 
-    def fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
-        if ca == old:
+    def fit(akid: pki_module._CrlAkid | None, ca: pki_module._ListedCa) -> bool | None:
+        if ca.cert == old:
             raise x509.UnsupportedGeneralNameType("x400Address is not supported")
-        return real(crl, ca)
+        return real(akid, ca)
 
     monkeypatch.setattr(pki_module, "_akid_fit", fit)
     pem = twins.write_crl("new", "new")
@@ -668,11 +673,10 @@ def test_a_name_that_genuinely_differs_is_still_unlisted(
     with caplog.at_level("WARNING"):
         hop = twins.hop("new")  # loads: no proof
     (line,) = _warnings(caplog)
-    assert _UNCONFIRMED_SIGNATURE["unlisted"] in line
+    assert pki_module.UNLISTED_SIGNATURE in line
     verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
     assert verdict is not None and verdict[1] is False  # the reload's NO_ISSUER case
-    # The reload gives the same state the same words, so the two cannot drift apart.
-    assert _UNCONFIRMED_SIGNATURE["unlisted"] in verdict[0]
+    assert pki_module.UNLISTED_SIGNATURE in verdict[0]  # one sentence for both
     # The premise: OpenSSL finds no CRL for the leaf's issuer in this file, so it does not judge
     # the peer by it, and a leaf-checking hop fails for want of one, not on the signature.
     with pytest.raises(ssl.SSLError, match="unable to get certificate CRL"):
@@ -693,7 +697,7 @@ def test_a_name_that_differs_only_in_white_space_is_unlisted_though_openssl_matc
     with caplog.at_level("WARNING"):
         hop = twins.hop("new")
     (line,) = _warnings(caplog)
-    words = _UNCONFIRMED_SIGNATURE["unlisted"]
+    words = pki_module.UNLISTED_SIGNATURE
     assert words in line and "white space exactly" in words
     with pytest.raises(ssl.SSLError, match="CRL signature failure"):
         _handshake(hop, twins.server(sends_renewed=False))
@@ -795,3 +799,507 @@ def test_a_crl_that_reaches_a_hop_through_its_ca_file_alone_is_not_signature_che
         twins.hop("new")
     with pytest.raises(ValueError, match="does not verify the CRL's signature"):
         _hop(bundle, bundle)
+
+
+# --- vault BACKLOG #3506: the open findings on engine PR 2309 ------------------------------------
+
+
+def test_on_a_context_that_already_held_a_crl_the_staging_refusal_comes_before_the_signature(
+    twins: _Twins, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Manager's item 2: the seam where vault BACKLOG #2866 and #2905 meet. A context that
+    already holds a CRL proves the load on a private copy first, and the signature check runs
+    only after that, as the last refusal. So a copy that cannot be made refuses as that, even for
+    a forged CRL. The control is the same file with the copy working: the signature refuses."""
+    forged = _crl(twins.stranger, names=twins.new_key)
+    bundle = tmp_path / "ca-and-crl.pem"
+    bundle.write_bytes(twins.new_ca.read_bytes() + forged)
+
+    # Control first: the staged path runs, and the signature check refuses after it.
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        _hop(bundle, bundle)
+
+    def no_copy(pem: bytes) -> object:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tls_policy, "staged_crl", no_copy)
+    with pytest.raises(ValueError, match="could not make or read its private copy") as refused:
+        _hop(bundle, bundle)
+    assert "does not verify" not in str(refused.value)
+
+
+def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
+    twins: _Twins, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Manager's item 9: a failure in the judgment of block 2 no longer discards block 1's
+    proof. Before, the broad ``except`` logged an ERROR and the forged CRL loaded."""
+    real = pki_module._signature_state
+    calls = 0
+
+    def second_fails(crl: x509.CertificateRevocationList, cas: list[pki_module._ListedCa]) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("a defect in the check")
+        return real(crl, cas)
+
+    monkeypatch.setattr(pki_module, "_signature_state", second_fails)
+    twins.crl.write_bytes(
+        _crl(twins.stranger, names=twins.new_key)
+        + _crl(twins.stranger, names=twins.stranger, name=_OTHER_NAME)
+    )
+    with caplog.at_level("WARNING"), pytest.raises(ValueError, match="CRL block 1 of 2"):
+        twins.hop("new")
+    # The failure is still logged, with how far the judgment got.
+    (error,) = [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
+    assert "after judging 1 of them" in error.getMessage() and error.exc_info is not None
+
+    # Control: the same failure with no proof reached first still loads, with the ERROR.
+    calls = 0
+    caplog.clear()
+    loaded_crls._UNCONFIRMED.clear()
+    twins.crl.write_bytes(
+        _crl(twins.new_key, names=twins.new_key) + _crl(twins.stranger, names=twins.new_key)
+    )
+    with caplog.at_level("WARNING"):
+        hop = twins.hop("new")
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
+
+
+#: The name of the CA :func:`_zero_serial_ca` makes.
+_ZERO_NAME = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-zero-serial")])
+
+
+def _zero_serial_ca(
+    key: ec.EllipticCurvePrivateKey, serial: int = 0x00, *, own_akid: bool = False
+) -> bytes:
+    """A CA certificate for ``key``, as DER, whose serial number is the one byte ``serial``: 0x00
+    for 0, as at least some system roots carry, or 0x80 for -128. It is built with serial 1 and
+    then edited, since the builder refuses both; its own signature then fails, which neither
+    ``cryptography``'s parse nor OpenSSL's load checks. It carries a Subject Key Identifier, so a
+    CRL can name its key. With ``own_akid`` it also carries an Authority Key Identifier naming
+    itself by key, name and that same serial, as at least some such roots do."""
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(_ZERO_NAME)
+        .issuer_name(_ZERO_NAME)
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(_NOW - _DAY)
+        .not_valid_after(_NOW + _DAY)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
+    )
+    if own_akid:
+        ski = x509.SubjectKeyIdentifier.from_public_key(key.public_key()).digest
+        akid = x509.AuthorityKeyIdentifier(ski, [x509.DirectoryName(_ZERO_NAME)], 1)
+        builder = builder.add_extension(akid, False)
+    der = builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.DER)
+    version_and_serial = bytes.fromhex("a003020102020101")  # v3, then INTEGER 1
+    assert der.count(version_and_serial) == 1
+    der = der.replace(version_and_serial, version_and_serial[:-1] + bytes([serial]))
+    if own_akid:
+        akid_serial = bytes.fromhex("820101")  # the AKID's [2] serial, 1
+        assert der.count(akid_serial) == 1
+        der = der.replace(akid_serial, akid_serial[:-1] + bytes([serial]))
+    return der
+
+
+def test_a_root_with_a_zero_serial_does_not_end_the_judgment_where_warnings_are_errors(
+    twins: _Twins,
+) -> None:
+    """The Manager's item 3. Under warnings as errors, ``cryptography``'s warning about a serial
+    number that is not positive used to end the whole judgment, so a CRL proven badly signed
+    loaded. The proof from another CA stands beside such a CA."""
+    odd = _zero_serial_ca(ec.generate_private_key(ec.SECP256R1()))
+    forged = _crl(twins.stranger, names=twins.new_key)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        # Control: the instrument is real. Parsing that CA warns, and as an error it raises.
+        with pytest.raises(CryptographyDeprecationWarning):
+            x509.load_der_x509_certificate(odd)
+        judged = [s.state for s in judge_crl_signatures(forged, [odd, *_ders(twins.new_ca)])]
+    assert judged == ["bad"]
+
+
+@pytest.mark.parametrize("own_akid", [False, True], ids=["no-own-akid", "own-akid"])
+@pytest.mark.parametrize("serial", [0x00, 0x80], ids=["zero", "negative"])
+def test_a_forged_crl_from_a_root_with_a_serial_not_positive_refuses_the_start(
+    tmp_path: Path, serial: int, own_akid: bool
+) -> None:
+    """Review finding F1 on vault BACKLOG #3506. Where warnings are errors, a CA whose serial is
+    not positive was skipped, so a forged CRL naming its key read ``unlisted`` and the start
+    loaded it with a warning. That CA is read now, and the start refuses. A root that names that
+    serial again in its own Authority Key Identifier is read too: reading its extensions warned
+    as well."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    odd = _zero_serial_ca(key, serial, own_akid=own_akid)
+    if own_akid:
+        # Control: the instrument is real. The parse of the extension itself warns.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", CryptographyDeprecationWarning)
+            cert = x509.load_der_x509_certificate(odd)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CryptographyDeprecationWarning)
+            with pytest.raises(CryptographyDeprecationWarning):
+                cert.extensions  # noqa: B018 -- the read is the point
+    ca_file = tmp_path / "zero-serial-ca.pem"
+    ca_file.write_text(ssl.DER_cert_to_PEM_cert(odd), "ascii")
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(_crl(ec.generate_private_key(ec.SECP256R1()), names=key, name=_ZERO_NAME))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        with pytest.raises(ValueError, match="does not verify the CRL's signature") as refused:
+            _hop(ca_file, crl)
+        assert "mefor-3506-zero-serial" in str(refused.value)
+        # Control: the CRL that CA's key signed loads, so the refusal is about the signature.
+        crl.write_bytes(_crl(key, names=key, name=_ZERO_NAME))
+        assert _hop(ca_file, crl).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_ca_whose_parse_raises_a_deprecation_is_skipped_alone(
+    twins: _Twins, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``CryptographyDeprecationWarning`` stays in ``_UNREADABLE_CA`` for any other deprecation
+    a CA's parse raises where warnings are errors: that CA is skipped, and the judgment goes on."""
+    real = pki_module._listed_ca
+    odd = _ders(twins.old_ca)[0]
+
+    def deprecated(der: bytes) -> pki_module._ListedCa:
+        if der == odd:
+            raise CryptographyDeprecationWarning("a deprecation this parse warns of")
+        return real(der)
+
+    monkeypatch.setattr(pki_module, "_listed_ca", deprecated)
+    forged = _crl(twins.stranger, names=twins.new_key)
+    judged = [s.state for s in judge_crl_signatures(forged, [odd, *_ders(twins.new_ca)])]
+    assert judged == ["bad"]
+
+
+def test_a_root_with_a_zero_serial_is_matched_by_its_real_serial_and_prints_no_warning() -> None:
+    """The Authority Key Identifier match reads the serial the CA carries, not the one the parsed
+    copy carries. In a normal run that CA prints no raw ``cryptography`` warning either."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    stranger = ec.generate_private_key(ec.SECP256R1())
+    odd = _zero_serial_ca(key)
+
+    def forged(serial: int) -> bytes:
+        akid = x509.AuthorityKeyIdentifier(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()).digest,
+            [x509.DirectoryName(_ZERO_NAME)],
+            serial,
+        )
+        return (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(_ZERO_NAME)
+            .last_update(_NOW - _DAY)
+            .next_update(_NOW + 30 * _DAY)
+            .add_extension(akid, False)
+            .sign(stranger, hashes.SHA256())
+            .public_bytes(_PEM)
+        )
+
+    with warnings.catch_warnings():
+        # A serial of 0 in the CRL's own key identifier is read without the warning too, so
+        # this holds where warnings are errors.
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        assert [s.state for s in judge_crl_signatures(forged(0), [odd])] == ["bad"]
+        # Control: serial 1, the parsed copy's serial, is not that CA's, so no CA fits.
+        assert [s.state for s in judge_crl_signatures(forged(1), [odd])] == ["unlisted"]
+
+    plain = _crl(stranger, names=key, name=_ZERO_NAME)  # a key identifier alone, as is usual
+    with warnings.catch_warnings(record=True) as shown:
+        warnings.simplefilter("always")
+        assert [s.state for s in judge_crl_signatures(plain, [odd])] == ["bad"]
+        named = _zero_serial_ca(key, own_akid=True)
+        assert [s.state for s in judge_crl_signatures(plain, [named])] == ["bad"]
+    assert not [w for w in shown if issubclass(w.category, CryptographyDeprecationWarning)]
+
+
+def _der_length(n: int) -> bytes:
+    """A DER length, minimal, for the CRLs :func:`_crl_naming_serial` assembles."""
+    assert n < 0x10000
+    if n < 0x80:
+        return bytes([n])
+    return bytes([0x81, n]) if n < 0x100 else bytes([0x82, n >> 8, n & 0xFF])
+
+
+def _crl_naming_serial(
+    signer: ec.EllipticCurvePrivateKey,
+    named: ec.EllipticCurvePrivateKey,
+    serial: int,
+    *,
+    x400: bool = False,
+) -> bytes:
+    """A CRL from :data:`_ZERO_NAME` signed by ``signer``, whose Authority Key Identifier names
+    ``named``'s key, the name :data:`_ZERO_NAME` and the CA serial that is the one byte
+    ``serial``: 0x00 for 0, 0x80 for -128, as :func:`_zero_serial_ca` takes. The builder refuses
+    a negative serial, so it is built with serial 1, edited, and signed again by ``signer``. With
+    ``x400`` the name is tagged as an x400Address instead, a general name ``cryptography`` does
+    not read."""
+    akid = x509.AuthorityKeyIdentifier(
+        x509.SubjectKeyIdentifier.from_public_key(named.public_key()).digest,
+        [x509.DirectoryName(_ZERO_NAME)],
+        1,
+    )
+    der = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(_ZERO_NAME)
+        .last_update(_NOW - _DAY)
+        .next_update(_NOW + 30 * _DAY)
+        .add_extension(akid, False)
+        .sign(signer, hashes.SHA256())
+        .public_bytes(serialization.Encoding.DER)
+    )
+    akid_serial = bytes.fromhex("820101")  # the AKID's [2] serial, 1
+    assert der.count(akid_serial) == 1
+    der = der.replace(akid_serial, akid_serial[:-1] + bytes([serial]))
+    if x400:
+        found = pki_module._crl_akid_spans(der)
+        assert found is not None
+        akid_tlv = read_der_tlv(der, *found[0])
+        (names,) = [part for part in der_children(der, akid_tlv) if part.tag == 0xA1]
+        assert der[names.start] == 0xA4  # directoryName, [4]
+        der = der[: names.start] + b"\xa3" + der[names.start + 1 :]  # x400Address, [3]
+    outer = read_der_tlv(der, 0, len(der))
+    tbs = read_der_tlv(der, outer.start, outer.end)
+    algorithm = read_der_tlv(der, tbs.end, outer.end)
+    signature = signer.sign(der[outer.start : tbs.end], ec.ECDSA(hashes.SHA256()))
+    body = (
+        der[outer.start : algorithm.end]
+        + b"\x03"
+        + _der_length(len(signature) + 1)
+        + b"\x00"
+        + signature
+    )
+    whole = b"\x30" + _der_length(len(body)) + body
+    # The parse reads no extension, so this neither warns nor raises for what was edited.
+    return x509.load_der_x509_crl(whole).public_bytes(_PEM)
+
+
+_NOT_POSITIVE = pytest.mark.parametrize("serial", [0x00, 0x80], ids=["zero", "negative"])
+
+
+@_NOT_POSITIVE
+def test_a_forged_crl_whose_own_key_identifier_carries_a_serial_not_positive_refuses_the_start(
+    tmp_path: Path, serial: int
+) -> None:
+    """Review finding 1 of round four on vault BACKLOG #3506. A CRL whose own Authority Key
+    Identifier carries serial 0 warned when its extensions were read. Where warnings are errors,
+    a start then failed with that raw warning rather than a refusal naming the file, and the
+    signature check read the CRL as ``unlisted``. It is read without the warning now."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    ca_file = tmp_path / "zero-serial-ca.pem"
+    ca_file.write_text(ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key, serial)), "ascii")
+    crl = tmp_path / "crl.pem"
+    forged = _crl_naming_serial(ec.generate_private_key(ec.SECP256R1()), key, serial)
+    crl.write_bytes(forged)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        # Control: the instrument is real. Reading this CRL's extensions warns, as an error.
+        with pytest.raises(CryptographyDeprecationWarning):
+            x509.load_pem_x509_crl(forged).extensions  # noqa: B018 -- the read is the point
+        with pytest.raises(ValueError, match="does not verify the CRL's signature") as refused:
+            _hop(ca_file, crl)
+        assert str(refused.value).startswith(f"{_SETTING} ({str(crl)!r})")
+        assert "mefor-3506-zero-serial" in str(refused.value)
+        # Control: the CRL that CA's key signed, with the same key identifier, loads.
+        crl.write_bytes(_crl_naming_serial(key, key, serial))
+        assert _hop(ca_file, crl).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+@_NOT_POSITIVE
+def test_a_crl_key_identifier_serial_is_kept_as_the_crl_carries_it(serial: int) -> None:
+    """The copy :func:`pki._crl_extensions` reads has serial 1 where the CRL carries 0 or -128.
+    What OpenSSL scores a CRL on still holds the real serial, so a CRL naming that serial and one
+    naming serial 1 do not score alike."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = _NOW.timestamp()
+    pem = _crl_naming_serial(key, key, serial)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        ((_, odd),) = pki_module.judge_every_crl(pem, now=now)
+    ((_, one),) = pki_module.judge_every_crl(_crl_naming_serial(key, key, 0x01), now=now)
+    assert odd.selection[1] is not None and one.selection[1] is not None
+    assert odd.selection[1] != one.selection[1]
+    # The bytes differ in the serial alone, and the CRL's own carries ``serial``.
+    carried = bytes([0x82, 0x01, serial])
+    assert odd.selection[1].replace(carried, b"\x82\x01\x01") == one.selection[1]
+    # The fingerprint is the CRL's own, not the rewritten copy's.
+    assert odd.fingerprint == x509.load_pem_x509_crl(pem).fingerprint(hashes.SHA256())
+
+
+def test_a_crl_whose_extensions_do_not_read_is_refused_by_name(tmp_path: Path) -> None:
+    """Review round four on vault BACKLOG #3506. A CRL extension ``cryptography`` cannot read
+    raised out of the start as itself, naming neither the setting nor the file. One such is a
+    general name of a type it does not support, which OpenSSL loads. It refuses by name now."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    ca_file = tmp_path / "ca.pem"  # serial 1: this test is not about the serial
+    ca_file.write_text(ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key, 0x01)), "ascii")
+    crl = tmp_path / "crl.pem"
+    unread = _crl_naming_serial(key, key, 0x01, x400=True)
+    # Control: the instrument is real. Reading this CRL's extensions raises, and not a ValueError.
+    with pytest.raises(x509.UnsupportedGeneralNameType):
+        x509.load_pem_x509_crl(unread).extensions  # noqa: B018 -- the read is the point
+    crl.write_bytes(unread)
+    with pytest.raises(ValueError, match="CRL block 1 of 1 cannot be judged: its extensions do"):
+        _hop(ca_file, crl)
+    # Control: the same CRL with its name tagged as a directory name loads.
+    crl.write_bytes(_crl_naming_serial(key, key, 0x01))
+    assert _hop(ca_file, crl).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_the_ca_file_scan_does_not_call_a_crl_whose_extensions_do_not_read_unjudged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Lander's hold on engine PR 2566 (vault row #4532, BACKLOG #3506). The refusal by name
+    above is for a start and the reload. It must not change what the expiry scan reports for a
+    CA file holding such a CRL, which nothing at start checks, so a restart loads it. An earlier
+    head of that PR reported it as a CRL the engine cannot judge, to be replaced before a
+    restart. What the scan reports is held to what it reported before #3506, measured at
+    origin/main 93f6438c7: no held-copy account and no remedy, and one ERROR that it could not
+    judge the held copies, with ``cryptography``'s own error. That ERROR leaves the held copy's
+    date out of the row, before #3506 as now, and ``docs/CONFIGURATION.md`` says so. A change
+    that closes that gap without the unjudged remedy may change the first assertion."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    ca_pem = ssl.DER_cert_to_PEM_cert(_zero_serial_ca(key, 0x01)).encode("ascii")
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(ca_pem + _crl(key, names=key, name=_ZERO_NAME))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(_crl(key, names=key, name=_ZERO_NAME, age=2 * _DAY))
+    hop = _hop(bundle, crl)  # holds the CA file's CRL, and checks revocation
+    bundle.write_bytes(ca_pem + _crl_naming_serial(key, key, 0x01, x400=True))
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.cert_expiry"):
+        sink, mine = _bundle_scan(bundle)
+
+    # One alert, dated by the file, which lapses within the scan's 30 days, and nothing more.
+    assert [sink.crl_notes[i] for i in mine] == [(False, "", ())]
+    # A held copy's path can be case-folded (loaded_crls.crl_path_key).
+    records = [r for r in caplog.records if str(bundle).lower() in r.getMessage().lower()]
+    assert [r.levelno for r in records] == [logging.ERROR]
+    assert "could not judge the copies" in records[0].getMessage()
+    assert records[0].exc_info is not None
+    assert isinstance(records[0].exc_info[1], x509.UnsupportedGeneralNameType)
+
+    # Control: the scan reached the CA file's check. The same CRL with its name tagged as a
+    # directory name is one the engine judges, so a restart applies it.
+    bundle.write_bytes(ca_pem + _crl_naming_serial(key, key, 0x01))
+    sink, mine = _bundle_scan(bundle)
+    assert [sink.crl_notes[i][1].startswith("Restart the engine") for i in mine] == [True]
+
+    # In a CRL setting such a CRL is still refused by name: by a start, and by the reload as one
+    # to fix, which leaves the running hop on the copy it holds. The reload's own records are
+    # this test's, as test_crl_reload.py's fixture keeps them.
+    crl.write_bytes(_crl_naming_serial(key, key, 0x01, x400=True))
+    with pytest.raises(ValueError, match="CRL block 1 of 1 cannot be judged: its extensions do"):
+        _hop(bundle, crl)
+    monkeypatch.setattr(loaded_crls, "_REFUSED", {})
+    for record, empty in (("_SEEN", {}), ("_UNREADABLE", set()), ("_FAILED", {}), ("_LABELS", {})):
+        monkeypatch.setattr(crl_reload, record, empty)
+    outcomes = reload_replaced_crls()
+    (outcome,) = [o for o in outcomes if Path(o.path).exists() and Path(o.path).samefile(crl)]
+    assert outcome.refusal is not None and outcome.refusal.remedy == FIX
+    assert "CRL block 1 of 1 cannot be judged: its extensions do not read" in (
+        outcome.refusal.reason
+    )
+    assert outcome.reloaded == 0
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF  # keeps the hop alive to here
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        x509.UnsupportedGeneralNameType("x400Address is not supported"),
+        CryptographyDeprecationWarning("a deprecation raised as an error"),
+    ],
+    ids=["unsupported-name", "deprecation"],
+)
+def test_unread_extensions_refuse_by_name_only_where_asked(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """Both kinds of :data:`pki._UNREAD_EXTENSIONS`, the second of which no CRL built here can
+    raise once the serial rewrite reads it: each refuses by name with the flag a start and the
+    reload pass, and raises as itself without it, as the CA-file scan calls it."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    pem = _crl(key, names=key)
+
+    def _unread(crl: x509.CertificateRevocationList) -> object:
+        raise error
+
+    monkeypatch.setattr(pki_module, "_crl_extensions", _unread)
+    now = _NOW.timestamp()
+    with pytest.raises(ValueError, match="CRL block 1 of 1 cannot be judged: its extensions do"):
+        pki_module.judge_every_crl(pem, now=now, refuse_unread_extensions=True)
+    with pytest.raises(type(error)) as raw:
+        pki_module.judge_every_crl(pem, now=now)
+    assert raw.value is error
+
+
+def test_a_long_issuer_name_is_quoted_with_a_bound(twins: _Twins) -> None:
+    """The Lander's list: the issuer name a message quotes has a length bound now."""
+    long_name = x509.Name(
+        [x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, f"unit-{n:03}") for n in range(80)]
+    )
+    pem = _crl(twins.stranger, names=twins.stranger, name=long_name)
+    assert len(long_name.rfc4514_string()) > 600  # the premise
+    (signature,) = judge_crl_signatures(pem, _ders(twins.new_ca))
+    assert len(signature.where) < 300 and "... (cut: the name is" in signature.where
+    # Escapes count toward the bound: a name of control characters quotes four for each.
+    controls = x509.Name([x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "\x01" * 60)] * 4)
+    (escaped,) = judge_crl_signatures(_crl(twins.stranger, names=None, name=controls), [])
+    assert len(escaped.where) < 300 and "(cut: the name is" in escaped.where
+    # Control: a short name is quoted whole.
+    (short,) = judge_crl_signatures(_crl(twins.stranger, names=None), _ders(twins.new_ca))
+    assert "'CN=mefor-2905-twin-ca')" in short.where and "cut:" not in short.where
+
+
+#: Two of the four sentences withdrawn from the code (vault BACKLOG #3506, finding (c)). The guide
+#: test in ``tests/test_docs_security_pathways.py`` pins the two that sat in the guide.
+_WITHDRAWN_FROM_THE_CODE = (
+    # The reload's remedy: false for a good SHA-1 CRL and for a signature of another kind.
+    "Where the CRL names that CA's key, a start refuses the file too",
+    # The warning: wrong where the name differs from a listed CA's only in white space.
+    "no CA certificate this hop lists has that name",
+)
+
+
+def test_the_withdrawn_sentences_stay_out_of_the_code() -> None:
+    texts = [
+        BAD_SIGNATURE,
+        pki_module.UNLISTED_SIGNATURE,
+        *tls_policy._UNCONFIRMED_SIGNATURE.values(),
+    ]
+    # Control: the texts searched are the ones those sentences sat in.
+    assert any("a start refuses the file too" in text for text in texts)
+    for sentence in _WITHDRAWN_FROM_THE_CODE:
+        assert not any(sentence in text for text in texts), sentence
+
+
+def test_a_crl_in_the_postgres_stores_root_cert_is_in_use_and_not_signature_checked(
+    twins: _Twins, tmp_path: Path
+) -> None:
+    """Finding (e), measured: the Postgres store loads ``[store].ssl_root_cert`` with ``cafile=``,
+    so a CRL block in it is loaded, and once ``[store].ssl_crl_file`` turns revocation checking on,
+    it is in use. Neither a start nor a reload checks its signature. The guide says so."""
+    from messagefoundry.config.settings import StoreBackend, StoreSettings
+    from messagefoundry.store.postgres import _verifying_context
+
+    bundle = tmp_path / "root-and-crl.pem"
+    bundle.write_bytes(twins.new_ca.read_bytes() + _crl(twins.stranger, names=twins.new_key))
+    twins.crl.write_bytes(_crl(twins.stranger, names=twins.stranger, name=_OTHER_NAME))
+    settings = StoreSettings(
+        backend=StoreBackend.POSTGRES,
+        server="db.example.test",
+        database="mefor",
+        username="mefor",
+        ssl_root_cert=str(bundle),
+        ssl_crl_file=str(twins.crl),
+    )
+
+    ctx = _verifying_context(settings)  # builds: the forged CRL in the root file is not judged
+
+    assert ctx.cert_store_stats()["crl"] == 2
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
+        _handshake(ctx, twins.server(sends_renewed=False))

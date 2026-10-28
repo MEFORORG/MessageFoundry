@@ -48,7 +48,7 @@ param(
     # script refuses a binary that does not match, before it stops a running helper and again after
     # the copy, because it starts that binary as LocalSystem. REQUIRED, with no default: this
     # repository cannot pin a binary that each release and each machine builds for itself.
-    [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$HelperSha256,
+    [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{64}\z')][string]$HelperSha256,
     # Administrator-only by default, and the README explains why it is not under ProgramData: the
     # engine's account has modify rights there, so it could replace the binary that runs as SYSTEM.
     [string]$InstallDir = "C:\Program Files\MessageFoundry\net-helper",
@@ -57,15 +57,18 @@ param(
     # WQL literal, so the query either errors or matches a DIFFERENT service - and this script reads
     # the engine's run-as account out of that result and writes it into the helper's pipe ACL.
     #
-    # THE CHARACTER SET IS messagefoundry/service.py's `_SAFE_SERVICE_NAME`, SPACE INCLUDED, and the
+    # THE CHARACTER SET IS messagefoundry/service_status.py's `_SAFE_SERVICE_NAME`, SPACE INCLUDED, and the
     # space is the part to leave alone. -EngineServiceName names the service the ENGINE's installer
-    # created, install-service.ps1 puts no validation on its own -ServiceName, and a space is legal
-    # there -- `_elevated_cmd_params` uses "My Engine" as its worked example. A tighter pattern here
+    # created, install-service.ps1 validates its own -ServiceName with this same pattern, and a space is
+    # legal there -- `_elevated_cmd_params` uses "My Engine" as its worked example. A tighter pattern here
     # would make an engine installed as "MessageFoundry Prod" unnameable to this script, failing at
     # parameter binding before anything ran. A space cannot end a WQL literal, so it costs nothing.
-    [ValidatePattern('^[A-Za-z0-9 ._-]+$')][string]$ServiceName = "MessageFoundryNetHelper",
+    # The first character must be alphanumeric, `\z` (not `$`, which also matches before a trailing
+    # line feed) ends the match, and Options = 'None' makes it case-sensitive, because a
+    # case-insensitive [A-Za-z] also matches the Kelvin sign: as in the Python guard (BACKLOG #1680).
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$ServiceName = "MessageFoundryNetHelper",
     # The engine's service, read for its run-as account (the pipe's only non-administrator caller).
-    [ValidatePattern('^[A-Za-z0-9 ._-]+$')][string]$EngineServiceName = "MessageFoundry",
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$EngineServiceName = "MessageFoundry",
     # The engine executable, used only to read [cluster.vip]. Defaults to the repo venv, as
     # install-service.ps1's -AppExe does.
     [string]$AppExe,
