@@ -3864,8 +3864,10 @@ Router/Handler is user code that can `raise ValueError(f"...{raw}")`, so every v
 write methods — so an HL7-shaped fragment can't land in those columns. HL7-shaped content (segment dumps,
 ≥2-delimiter field runs) is cut while the exception **type** / field **name** is kept; the residual control
 for free-text PHI a script invents (e.g. a bare `"DOE^JANE"`) remains the read-side gate above + the "never
-put PHI in an exception" convention. A captured reply is text a remote peer wrote, which that
-convention does not bind ([PHI.md](PHI.md) section 7, *Who the exception-message convention binds*). These columns are also **encrypted at rest on every backend** —
+put PHI in an exception" convention. That convention binds neither a remote peer, whose captured
+reply lands here, nor a library or the runtime, whose exception text can quote a received value
+(`int()` does); for that text only the read-side gate and the encryption below remain
+([PHI.md](PHI.md) section 7, *Who the exception-message convention binds*). These columns are also **encrypted at rest on every backend** —
 SQLite, Postgres, **and SQL Server** (H4 brought SQL Server to parity; `docs/PHI.md` §3) — as
 defense-in-depth around the scrub.
 

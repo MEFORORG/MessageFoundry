@@ -23,15 +23,16 @@ single tokens by construction: FHIR (or any) JSON keyed ``family``/``given``/``n
 ``identifier``/``telecom``/``address``, DICOM group ``(0010,xxxx)`` tag dumps and ``PatientName=``-style
 labels, and XML elements with the same vocabulary (:func:`_redact_structured`, BACKLOG #1711).
 
-Residuals, at least these, and this module claims no completeness: an adversarially-crafted
-*single-token* or non-name-shaped identifier, a **headerless** custom-delimiter fragment (no MSH, so
+Residuals, at least these, and this module claims no completeness: a *single-token* or
+non-name-shaped identifier, the name runs :data:`_NAME_RUN` lists, a **headerless** custom-delimiter fragment (no MSH, so
 nothing declares its delimiters), a custom-delimiter fragment whose declaring MSH sits past the
 clamp's cut (which falls before :data:`_REDACT_WINDOW`, and further back after its walks), so the
 clamp drops the header the sniff needs and the fragment in the kept head survives (BACKLOG #1848,
 accepted below under :data:`_CUT_CHARS`), and the structured shapes the
 section comment above :func:`_redact_structured` lists. The "never put PHI in an exception message"
-convention covers them only in text the engine's own authors write (docs/PHI.md section 7, *Who the
-exception-message convention binds*).
+convention binds only the engine's own authors, Router and Handler authors included, and never a
+remote peer, a library or the runtime (docs/PHI.md section 7, *Who the exception-message convention
+binds*).
 
 A **file name is exactly the first of those residuals**, which is why :func:`safe_name` exists beside
 the heuristic rather than inside it: a partner names a drop ``MRN123456789_ADT.hl7`` or
@@ -282,8 +283,9 @@ _CREDENTIAL_AHEAD = re.compile(
 #: :func:`log_timestamp` in a form no arm here reads, and ``isoformat()`` in engine text fails
 #: ``tests/test_engine_text_survives_the_name_run.py``. Residual, at least: the US ``MM/DD/YYYY`` arm
 #: takes no time, so ``05/05/1980T12:30`` passes. The "never put PHI in an exception message"
-#: convention covers that only in text the engine's own authors write (docs/PHI.md section 7, *Who
-#: the exception-message convention binds*).
+#: convention binds only the engine's own authors, Router and Handler authors included, and never a
+#: remote peer, a library or the runtime (docs/PHI.md section 7, *Who the exception-message
+#: convention binds*).
 _DATE_RUN = re.compile(
     r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}"
     r"(?:[Tt]\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d{1,9})?)?)?(?:[Zz]|[+-]\d{2}(?::?\d{2})?)?|\b)"
@@ -346,13 +348,19 @@ _SSN_RUN = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
 #: and ``Else If``. ``tests/test_engine_text_survives_the_name_run.py`` fails on a new run of either
 #: arm in at least the message shapes it scans; its docstring names the ones it does not.
 #:
-#: **Residual, accepted (BACKLOG #2079): a longer run is taken four tokens at a time, so a run of five
-#: keeps its fifth token.** A real name can be that long, so this needs no adversary. Each arm stops at four, and the scan resumes after the match, so a run of
-#: 4k+1 tokens leaves its last one alone: ``Mary Ann Jo Lee Smith`` reaches the log as ``[redacted]
-#: Smith``. :data:`_COMMA_NAME_RUN` has the same bound on each side of its comma, and it runs first.
-#: Five tokens before the comma keep the FIRST one, because the match starts at the second:
-#: ``Aaron Bobby Carl Dave Eve, Jane`` becomes ``Aaron [redacted]``. Five after it keep the last.
-#: Neither bound was widened; this is a stated residual, not a fix.
+#: **Residuals, OPEN (BACKLOG #2079), and a real name can hit both with no adversary:**
+#:
+#: - **A run is taken four tokens at a time.** Each arm stops at four and the scan resumes after the
+#:   match, so a run of 4j+1 tokens (5, 9, ...) keeps its LAST token and every other length loses all
+#:   of them (2 to 4, 6 to 8, ...): ``Mary Ann Jo Lee Smith`` reaches the log as ``[redacted] Smith``.
+#:   :data:`_COMMA_NAME_RUN` runs first and takes at most four tokens each side of its comma; what is
+#:   left on either side is then read as a run by the same rule. So five tokens before the comma keep
+#:   the FIRST one (``Aaron Bobby Carl Dave Eve, Jane`` becomes ``Aaron [redacted]``), five after it
+#:   keep the last, and five on each side keep two.
+#: - **A run mixing the two cases matches neither arm.** Each arm needs every token in one case, so
+#:   ``Jane DOE`` passes whole.
+#:
+#: Neither is fixed; ``tests/test_redaction.py`` pins both as they stand.
 _NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
 #: A **name written family-comma-given**: ``Doe, Jane`` or ``DOE, JANE`` (vault BACKLOG #2784).
 #: :data:`_NAME_RUN` joins its tokens with whitespace alone, so the comma split this into two single
@@ -475,8 +483,9 @@ def _sniff_delimiters(text: str) -> frozenset[str]:
     Returns an empty set for text with no MSH header, which is the accepted residual: a headerless
     custom-delimiter fragment declares nothing, so there is nothing to recover and it passes through
     (``id MRN123$$$H$MR here`` still survives). This claims no completeness. The "never put PHI in an
-    exception message" convention covers that, and a single-token identifier, only in text the
-    engine's own authors write (docs/PHI.md section 7, *Who the exception-message convention binds*)."""
+    exception message" convention binds only the engine's own authors, Router and Handler authors
+    included, and never a remote peer, a library or the runtime (docs/PHI.md section 7, *Who the
+    exception-message convention binds*)."""
     found: set[str] = set()
     for match in _MSH_DELIMITERS.finditer(text):
         encoding = match.group("enc")
@@ -1070,9 +1079,9 @@ def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 # label and is still scrubbed to its end. The exceptions are XML text a placeholder test reads as
 # prose; :func:`_redact_xml_elements` states them.
 #
-# **Residuals, at least these, which the "never put PHI in an exception message" convention covers
-# only in text the engine's own authors write (docs/PHI.md section 7, *Who the exception-message
-# convention binds*):** JSON or XML quoted INSIDE a JSON string (``\"family\"`` escapes defeat the
+# **Residuals, at least these; the "never put PHI in an exception message" convention binds only the
+# engine's own authors, Router and Handler authors included, and never a remote peer, a library or
+# the runtime (docs/PHI.md section 7, *Who the exception-message convention binds*):** JSON or XML quoted INSIDE a JSON string (``\"family\"`` escapes defeat the
 # key and attribute patterns); a structure that uses PHI as its KEYS, since keys are always kept; a
 # string under a JSON ``name`` or ``address`` that the shape rule reads as an operator's, such as
 # ``J.Doe`` or ``DOE_JANE`` (:data:`_PHI_STRUCTURE_ONLY_KEYS` says why); DICOM identifiers
@@ -1709,9 +1718,10 @@ def redact(text: str) -> str:
     XML elements) run after those within each round, so they can only add redaction to what the others left (the section
     comment above them says what running them first cost). The free-text heuristic narrows the prior
     residual to, at least, *single-token* identifiers (a lone name with no second token, no date) and
-    the shapes the module docstring and :data:`_NAME_RUN` name,
-    which the "never put PHI in an exception message" convention covers only in text the engine's own
-    authors write (docs/PHI.md section 7, *Who the exception-message convention binds*). The percent-encoded run (:data:`_HL7_ENCODED_FIELD_RUN`) comes
+    the shapes the module docstring and :data:`_NAME_RUN` name. The "never put PHI in an exception
+    message" convention binds only the engine's own authors, Router and Handler authors included, and
+    never a remote peer, a library or the runtime (docs/PHI.md section 7, *Who the exception-message
+    convention binds*). The percent-encoded run (:data:`_HL7_ENCODED_FIELD_RUN`) comes
     after all of them, as the last paragraph here says. Meant to be idempotent, since the literal ``[redacted]`` substituted
     in is built never to re-match a pattern; it is not quite, and :func:`safe_text` names the known
     exceptions.

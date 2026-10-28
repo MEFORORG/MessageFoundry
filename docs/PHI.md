@@ -1565,9 +1565,10 @@ provides `redact()` (scrubs HL7 segment/field content from free text, keeping se
 [wiring runner](../messagefoundry/pipeline/wiring_runner.py)). It is conservative redaction, **not**
 de-identification (§9). Beyond HL7-shaped spans, `redact()` now also applies a **conservative free-text
 heuristic** — date/DOB runs and multi-token name runs (e.g. `DOE JANE`) are scrubbed even without HL7
-delimiters — so the prior free-text residual is **narrowed** to an adversarially-crafted *single-token*
-or non-name-shaped identifier (for the convention's part in that residual, see *Who the
-exception-message convention binds*, below).
+delimiters — so the prior free-text residual is **narrowed** to, at least, a *single-token* or
+non-name-shaped identifier and the shapes listed two paragraphs down, some of which a real name hits
+with no adversary. The "never put PHI in an exception message" convention binds only some of the
+text those residuals reach; *Who the exception-message convention binds*, below, says which.
 The HL7 delimiters are **read from the message's MSH header** rather than assumed to be `| ^ ~ &`
 (BACKLOG #1572), so a feed declaring its own separators is covered wherever the scan reads that
 header; before that fix a custom-delimiter message matched nothing and a deploying site would have
@@ -1579,8 +1580,10 @@ date (`19800505123000-0500`, fraction included), an ISO date-time in either form
 `19800505T123000`, with `Z` or a numeric offset), a family-comma-given name (`Doe, Jane`,
 `DOE, JANE`, up to four tokens a side) and a dashed SSN (`123-45-6789`). It still does NOT take, at
 least: a US `MM/DD/YYYY` date with a time glued to it, an undashed or spaced SSN, a name with an
-apostrophe or an inner capital (`O'Brien`, `McDoe`), and one token of a name of five or more
-tokens (the `_NAME_RUN` comment in `redaction.py` says which, and why). One engine-owned shape is carved out by name: a
+apostrophe or an inner capital (`O'Brien`, `McDoe`), a name mixing the two cases (`Jane DOE`
+passes whole), and part of a long name: a run of 5, 9 or any 4j+1 tokens keeps its last token, and
+a comma name can keep one token on each side (the `_NAME_RUN` comment in `redaction.py` states the
+rule as measured). Both name residuals are open, not accepted. One engine-owned shape is carved out by name: a
 backup archive's stamp followed by `.mfbak`. The price is over-redaction of a 10-, 12- or 14-digit
 number opening `19` or `20`, of any ISO time in a message, and of upper-case codes joined with a
 comma. Engine text works around that at its source, which is a convention and not a guarantee:
@@ -1604,8 +1607,10 @@ INFO+ and the CR/LF log-injection filter — remain in
 loggers, which wrote whole field values at ERROR on an unmapped escape. python-hl7 is retired and
 the built-in parser logs no field value, so that silencer went with it (ADR 0054 amendment).
 
-**Who the exception-message convention binds.** Where this file or the redaction code names the
-"never put PHI in an exception message" convention for a redaction residual, the convention binds
+**Who the exception-message convention binds.** Wherever this repository names the "never put PHI
+in an exception message" convention for a redaction residual (at least this file,
+[CONFIGURATION.md](CONFIGURATION.md), [SECURITY.md](SECURITY.md), the redaction code and its
+tests), the convention binds
 only the engine's own authors: the people who write the engine, a Router or a Handler, and only in
 text they write themselves. It does not bind a remote peer. A diagnostic can quote text a peer
 wrote, at least a reply field or a negative acknowledgment. Nor does it bind a library or the
@@ -1715,8 +1720,8 @@ it.
 **A second residual, from the same honesty rule (BACKLOG #1572):** the delimiter sniff reads MSH-1 and
 MSH-2, so a **headerless** custom-delimiter fragment declares nothing and passes through — `id
 MRN123$$$H$MR here` still survives. So does a message whose MSH-2 is shorter than its conformant width.
-Neither is a completeness claim. The convention above covers both only in text the engine's own
-authors write; *Who the exception-message convention binds* says what it leaves.
+Neither is a completeness claim. The convention above binds only the engine's own authors;
+*Who the exception-message convention binds* says what that leaves.
 
 **A third residual, accepted and not fixed (BACKLOG #1848):** the bounded scrubbers read at most the
 first 64 KiB of a text, and the delimiter sniff reads only what they read. Those are at least

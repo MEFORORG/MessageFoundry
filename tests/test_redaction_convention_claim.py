@@ -11,8 +11,9 @@ convention binds*, and the other places point there.
 This pins the absence of the old claim, in the shapes the controls below hold, over ``docs/``,
 ``messagefoundry/``, ``tests/``, ``packaging/``, ``harness/`` and ``scripts/``. It is a lexical floor:
 a paraphrase that never says "the control" passes it. It also pins that the statement the pointers
-cite is still in section 7. A future ``CORRECTED`` note quoting the old wording would trip it too;
-quote it with a word changed instead.
+cite is still in section 7. A ``CORRECTED`` note may quote the old wording verbatim: a match with
+that marker in the :data:`_CORRECTED_REACH` folded characters before it is a quoted retraction, not
+the claim.
 """
 
 from __future__ import annotations
@@ -46,10 +47,20 @@ def _folded(text: str) -> str:
     return " ".join(_LINE_MARKER.sub("", text).split())
 
 
+#: How far back a ``CORRECTED`` marker may sit and still own a quoted claim: room for the marker's
+#: date and a lead-in such as ``this read``, never a whole paragraph.
+_CORRECTED_REACH = 200
+
+
 def _claims(text: str) -> list[str]:
     if not _MAYBE.search(text):
         return []
-    return [m.group(0) for m in _CLAIM.finditer(_folded(text))]
+    folded = _folded(text)
+    return [
+        m.group(0)
+        for m in _CLAIM.finditer(folded)
+        if "CORRECTED" not in folded[max(0, m.start() - _CORRECTED_REACH) : m.start()]
+    ]
 
 
 @pytest.mark.parametrize(
@@ -79,6 +90,8 @@ def test_the_scan_finds_each_shipped_wording(shipped: str) -> None:
         "engine's own authors write.",
         "the SPDX header convention is the control here",  # another convention
         'the "never put PHI in an exception message" convention is the controller',
+        # a retraction quoting the old claim verbatim
+        '**CORRECTED 2026-10-28:** this read "the convention above remains the control for both".',
     ],
 )
 def test_the_scan_passes_other_prose(prose: str) -> None:

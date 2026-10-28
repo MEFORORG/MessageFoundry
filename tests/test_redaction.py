@@ -544,9 +544,9 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
 
     The sniff reads MSH-1 and MSH-2. A fragment carrying custom delimiters but no MSH header declares
     nothing, so there is no delimiter set to recover and it passes through. This fix does NOT claim
-    completeness. The "never put PHI in an exception message" convention covers a headerless fragment,
-    and a bare single-token identifier, only in text the engine's own authors write (docs/PHI.md
-    section 7, *Who the exception-message convention binds*).
+    completeness. The "never put PHI in an exception message" convention binds only the engine's own
+    authors, Router and Handler authors included, and never a remote peer, a library or the runtime
+    (docs/PHI.md section 7, *Who the exception-message convention binds*).
 
     The fixture read ``mrn MRN123$$$H$MR here`` until BACKLOG #2079, whose labelled-MRN pass now
     scrubs the value after that ``mrn`` label. That is a different pass reaching it, not the sniff, so
@@ -560,20 +560,33 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
     ("text", "expected"),
     [
         ("x Ann Jo Lee Smith y", "x [redacted] y"),  # control: four tokens go whole
-        ("x Mary Ann Jo Lee Smith y", "x [redacted] Smith y"),
+        ("x Mary Ann Jo Lee Smith y", "x [redacted] Smith y"),  # 4j+1: the last survives
         ("x MARY ANN JO LEE SMITH y", "x [redacted] SMITH y"),
         ("x Mary Ann Jo Lee Smith Doe y", "x [redacted] [redacted] y"),  # six: four, then two
+        ("x Aa Bb Cc Dd Ee Ff Gg Hh y", "x [redacted] [redacted] y"),  # eight: none survives
+        ("x Aa Bb Cc Dd Ee Ff Gg Hh Ii y", "x [redacted] [redacted] Ii y"),  # nine: the last
         ("x Aaron Bobby Carl Dave Eve, Jane y", "x Aaron [redacted] y"),  # comma: the FIRST
         ("x Doe, Aaron Bobby Carl Dave Eve y", "x [redacted] Eve y"),  # comma: the last
+        ("x Aa Bb Cc Dd Ee, Ff Gg Hh Ii Jj y", "x Aa [redacted] Jj y"),  # comma: one each side
     ],
 )
-def test_a_five_token_name_keeps_one_token(text: str, expected: str) -> None:
-    """DOCUMENTED RESIDUAL (BACKLOG #2079), pinned so a change to it is deliberate.
+def test_a_long_name_run_keeps_a_token_on_each_4j_plus_1_remainder(
+    text: str, expected: str
+) -> None:
+    """DOCUMENTED RESIDUAL, OPEN (BACKLOG #2079), pinned so a change to it is deliberate.
 
     Each ``_NAME_RUN`` arm takes two to four tokens and the scan resumes after a match, so a run of
-    five leaves its fifth token alone. ``_COMMA_NAME_RUN`` has the same bound a side and runs first,
-    so five before its comma leave the first. The comment above ``_NAME_RUN`` states both."""
+    4j+1 tokens keeps its last token and every other length loses all. ``_COMMA_NAME_RUN`` runs first
+    and takes at most four a side, and what is left either side is read as a run by the same rule.
+    The comment above ``_NAME_RUN`` states it."""
     assert redact(text) == expected
+
+
+@pytest.mark.parametrize("text", ["x Jane DOE y", "x JANE Doe y", "x Mary JO Smith y"])
+def test_a_name_mixing_the_two_cases_passes_whole(text: str) -> None:
+    """DOCUMENTED RESIDUAL, OPEN (BACKLOG #2079): each ``_NAME_RUN`` arm needs one case throughout."""
+    assert redact(text) == text
+    assert redact("x Jane Doe y") == "x [redacted] y"  # control: one case is caught
 
 
 # --- safe_name: a partner-chosen FILE NAME (BACKLOG #1748) --------------------
