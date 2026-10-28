@@ -1151,13 +1151,16 @@ async def test_a_session_lost_while_queued_is_audited_once(
 ) -> None:
     """BACKLOG #3780 item 2. ``verify_mfa`` reads the session and the account again once it holds
     the account's queue, and a session revoked or an account disabled while it waited answers
-    ``session_lost``. RED when: that refusal writes no audit row, as every other ``session_lost``
-    refusal on the leg does, or writes two. The code is never checked, so nothing is charged."""
+    ``session_lost``. RED when: that refusal writes no ``auth.mfa_failed`` row, as the
+    ``session_lost`` refusal ``_factor_holder_current`` gives does, or writes two, or names the
+    account as it was before a rename that landed with the change (#2291 class). The code is never
+    checked, so nothing is charged."""
     e = await _enrolled_directory_session(store, monkeypatch)
     real_lock = e.service._account_credential_lock
 
     @asynccontextmanager
     async def _queue_while_something_lands(username: str) -> AsyncIterator[None]:
+        assert await store.set_user_username(e.user_id, "jdoe-renamed", expected_username="jdoe")
         if change == "revoke":
             await store.revoke_session(hash_token(e.token))
         else:
@@ -1174,7 +1177,7 @@ async def test_a_session_lost_while_queued_is_audited_once(
     lost = [
         r for r in rows if r["detail"] and json.loads(r["detail"]) == {"reason": "session_lost"}
     ]
-    assert [r["actor"] for r in lost] == ["jdoe"]
+    assert [r["actor"] for r in lost] == ["jdoe-renamed"]
     user = await store.get_user(e.user_id)
     assert user is not None and user.second_step_failed_attempts == 0
 

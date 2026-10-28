@@ -13063,9 +13063,10 @@ class AuthService:
             # or account gone answers ``session_lost``, as the re-reads before and after this one
             # do (BACKLOG #3068): the token no longer authenticates. Audited with the row
             # :meth:`_factor_holder_current` writes (BACKLOG #3780), under the account's name as it
-            # is now when the row is still there (#2291 class).
+            # is now when the row is still there (#2291 class). The account is read even when the
+            # session is gone, so a rename that came with the revocation names the row too.
             session = await self._load_session(hash_token(token))
-            loaded = None if session is None else await self._load_user(session.user_id)
+            loaded = await self._load_user(user.id if session is None else session.user_id)
             if session is None or loaded is None or loaded.disabled:
                 await self._audit_session_lost(
                     "auth.mfa_failed",

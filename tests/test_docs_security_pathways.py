@@ -523,16 +523,10 @@ def _provider_reads(tree: ast.AST) -> int:
     """How many provider branches ``tree`` holds: each ``.auth_provider`` read and each call of
     ``_is_directory_account``, the service's shared reading (BACKLOG #3117, #3780). Docstrings are
     constants, so they never match."""
-    return sum(
-        1
-        for n in ast.walk(tree)
-        if (isinstance(n, ast.Attribute) and n.attr == "auth_provider")
-        or (
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "_is_directory_account"
-        )
+    attrs = sum(
+        1 for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
     )
+    return attrs + len(call_sites(tree, "_is_directory_account", bare_only=True))
 
 
 def _reads_auth_provider(func: Callable[..., Any]) -> bool:
@@ -597,7 +591,7 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
         AuthService.finish_webauthn_registration,
     ):
         assert not _reads_auth_provider(func), (
-            f"{func.__qualname__} now reads auth_provider. The pathway rows say a directory account "
+            f"{func.__qualname__} now branches on the provider. The pathway rows say a directory account "
             "can enrol TOTP or a passkey and that its TOTP leg feeds the lockout; re-derive both."
         )
     assert any(
@@ -4704,7 +4698,7 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
         _provider_reads(fn) for fn in (assertion, helper, _service_func("_factor_holder_current"))
     )
     assert provider_reads == 1, (
-        f"finish_webauthn_assertion and its two helpers read auth_provider {provider_reads} "
+        f"finish_webauthn_assertion and its two helpers branch on the provider {provider_reads} "
         "times; the lockout paragraph says each second-factor leg has ONE provider branch, the "
         "directory check."
     )
