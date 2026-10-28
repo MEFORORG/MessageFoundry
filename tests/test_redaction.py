@@ -28,7 +28,7 @@ from messagefoundry.redaction import (
     safe_name,
     safe_text,
 )
-from tests._cpu_clock import cpu_seconds as _cpu_seconds
+from tests._cpu_clock import CPU_SAMPLE_FLOOR_SECONDS
 from tests.test_log_redaction_secret_domain import PCT_STARTED
 
 ADT = (
@@ -229,6 +229,46 @@ _CPU_GROWTH_LINE = 24.0
 #: wall-clock budget, on purpose.** The ratio is what the arm is about; this bound keeps a linear
 #: path with a ruinous constant from passing. It is the same 0.5 s the MRN arm uses.
 _CPU_CEILING_SECONDS = 0.5
+
+
+def _thread_cpu_sample(work: Callable[[], object]) -> float:
+    """CPU seconds per call of ``work`` on the CALLING THREAD's clock, over one sample at least
+    ``CPU_SAMPLE_FLOOR_SECONDS`` long, for the reason ``tests._cpu_clock`` gives.
+
+    **The thread clock, not the process clock that helper reads (BACKLOG #3721).** The process clock
+    charges every thread in the worker, so a thread an earlier test left running is billed to
+    whichever side of a ratio it overlaps. Busy while the small side is sampled and gone before the
+    large one, it deflates the ratio, which is the direction that reds a control. Measured 2026-10-27
+    on a 32-way Windows box, with six GIL-free threads running for 0.3 s from the start of the
+    control: the process clock read 25.0, 36.0 and 57.4; this clock read 66.5 to 79.7. Unloaded, both
+    read 60 to 82. Load from OTHER processes is not this: 40 busy processes on the same box moved
+    neither clock outside that range."""
+    calls = 0
+    start = time.thread_time()
+    while True:
+        work()
+        calls += 1
+        spent = time.thread_time() - start
+        if spent >= CPU_SAMPLE_FLOOR_SECONDS:
+            return spent / calls
+
+
+def _interleaved_growth(
+    small: Callable[[], object], large: Callable[[], object], large_reps: int = 3
+) -> tuple[float, float]:
+    """``(ratio, large)``: the best of three ``small`` samples and of ``large_reps`` ``large`` ones,
+    taken alternately, and the large reading alone.
+
+    **Alternately, not in two blocks (BACKLOG #3721).** In blocks every small sample came first, so a
+    slow spell that ended during the test landed on the small side alone and deflated the ratio.
+    Alternating puts small samples after a large one too. The minimum is kept on each side, because
+    noise can only inflate a sample."""
+    best_small = best_large = float("inf")
+    for rep in range(3):
+        best_small = min(best_small, _thread_cpu_sample(small))
+        if rep < large_reps:
+            best_large = min(best_large, _thread_cpu_sample(large))
+    return best_large / best_small, best_large
 
 
 def _redact_seconds(reps: int) -> float:
@@ -1069,6 +1109,11 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     ratio of 7.3 to 9.1, and 5.8 to 7.0 ms at the shipped window, under ``_CPU_CEILING_SECONDS`` by
     about 70 times. The control below reads 62 to 76 for a search that restarts at index 0.
 
+    **Re-measured 2026-10-27 on the thread clock with alternating samples (BACKLOG #3721)**, on a
+    32-way Windows box: this arm read 7.1 to 8.8 idle and 7.3 to 8.3 beside a ``pytest -n 4`` run of
+    unrelated suites, at least 2.7 times under the line. The control read 61.8 to 74.3, at least 2.6
+    times over it. The hosted ``windows-2022`` leg is not measured here.
+
     **An absolute bound is kept, but it is ten times looser than the old one.** BACKLOG #2952 limit 3
     asks that an absolute bound on one clamp's cost survive. A pure ratio would give it up, so the
     shipped window is also held under ``_CPU_CEILING_SECONDS``. That ceiling passes a walk that stays
@@ -1097,7 +1142,15 @@ def test_a_credential_search_from_index_0_is_quadratic_on_the_same_line(
     read 8 for every walk would pass the arm while measuring nothing. It patches the module global
     ``_drop_truncated_userinfo`` reads, so the whole shipping path runs the quadratic search.
 
-    One rep for the large input, because a slow sample there only helps this assertion."""
+    One rep for the large input, because a slow sample there only helps this assertion.
+
+    **A slow SMALL sample is what hurts it, and that is how it went red (BACKLOG #3721).** It read 13.6
+    and 15.3 on ``windows-2022`` merge-group legs, against 62 to 76 here. On the old instrument -- the
+    process clock, every small sample first -- twelve GIL-free threads left running for 0.25 s from
+    the start read 7.9 to 23.8 on a Windows box, over twelve runs, every one under the line.
+    ``_thread_cpu_sample`` and ``_interleaved_growth`` read 61.8 to 103.4 under the same load. What
+    ran on the hosted runner is not known; this is a mechanism that can give the reading, not its
+    established cause."""
 
     def search_from_zero(text: str, cut: int) -> int:
         pos = 0
@@ -1131,20 +1184,19 @@ def _credential_walk_growth(large_reps: int = 3) -> tuple[float, float]:
 
     Both walls are checked before anything is divided, because a ratio hides a broken reading: a walk
     that stopped after a pass or two would be fast at both sizes for the wrong reason."""
-    readings = []
-    for window, reps in (
-        (redaction._REDACT_WINDOW // 8, 3),
-        (redaction._REDACT_WINDOW, large_reps),
-    ):
-        hostile = _credential_wall(window)
+    small_window, large_window = redaction._REDACT_WINDOW // 8, redaction._REDACT_WINDOW
+    small_wall, large_wall = _credential_wall(small_window), _credential_wall(large_window)
+    for window, hostile in ((small_window, small_wall), (large_window, large_wall)):
         head, _ = redaction._clamp(hostile, window - redaction._CLAMP_MARKER_BUDGET)
         assert len(head) < redaction._USERINFO_SPAN, (
             f"the walk stopped with {len(head)} characters still in hand at a {window}-character "
             f"window, so this fixture is not measuring a full-window walk"
         )
-        readings.append(_cpu_seconds(lambda: clamp_untrusted(hostile, window=window), reps))  # noqa: B023
-    small, large = readings
-    return large / small, large
+    return _interleaved_growth(
+        lambda: clamp_untrusted(small_wall, window=small_window),
+        lambda: clamp_untrusted(large_wall, window=large_window),
+        large_reps,
+    )
 
 
 def test_the_credential_walk_costs_an_ordinary_message_nothing() -> None:
@@ -1303,9 +1355,7 @@ def _frame_cap_prose_growth(
     it is near 267. An 8x pair, the shape the MRN arm uses, would read 8 unbounded and sit under the line."""
     large_text = _FRAME_CAP_SHAPES["delimiter-free prose"]()
     small_text = large_text[: redaction._REDACT_WINDOW]
-    small = _cpu_seconds(lambda: scan(small_text))
-    large = _cpu_seconds(lambda: scan(large_text), large_reps)
-    return large / small, large
+    return _interleaved_growth(lambda: scan(small_text), lambda: scan(large_text), large_reps)
 
 
 def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs() -> None:
