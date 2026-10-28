@@ -29,8 +29,10 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.logging_setup import (
+    AUDIT_LOGGER_NAME,
     ForwarderStatus,
     SyslogForward,
+    _ForwardLanes,
     _ForwardQueueHandler,
     _ForwardQueueListener,
     _TimeoutSysLogHandler,
@@ -97,11 +99,16 @@ class _Collector(logging.Handler):
 
 
 def _attach(
-    collector: _Collector, *, maxsize: int = 100
+    collector: _Collector, *, maxsize: int = 100, audit_maxsize: int | None = None
 ) -> tuple[_ForwardQueueHandler, _ForwardQueueListener]:
     """A forwarder on the root logger whose listener thread is NOT started, so the test decides
-    when a record leaves the queue."""
-    records: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
+    when a record leaves the queue. With ``audit_maxsize`` it has the two lanes the shipped
+    forwarder has (BACKLOG #2612); without it, one plain queue."""
+    records: queue.Queue[Any] = (
+        queue.Queue(maxsize=maxsize)
+        if audit_maxsize is None
+        else _ForwardLanes(maxsize, audit_maxsize)
+    )
     listener = _ForwardQueueListener(records, collector)
     handler = _ForwardQueueHandler(records, listener)
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -307,6 +314,41 @@ def test_a_rising_drop_count_raises_the_alert_with_no_record_text() -> None:
     watch.run_once()
     assert sink.forward_failures == [("forwarder:dropping", "queue_full", dropped)]
     assert "DOE" not in repr(sink.forward_failures) and "PID" not in repr(sink.forward_failures)
+
+
+def test_a_full_audit_lane_raises_the_alert_beside_queue_full() -> None:
+    """An audit tee line dropped for a full audit lane is a queue drop, and it is named on its own
+    (BACKLOG #2612). It is counted once in ``lost``: the audit count is a part of ``queue_dropped``."""
+    handler, _ = _attach(_Collector(), audit_maxsize=1)
+    sink = _RecordingSink()
+    watch, _ = _watch(sink)
+    watch.run_once()
+    for _ in range(3):
+        handler.handle(
+            logging.LogRecord(AUDIT_LOGGER_NAME, logging.INFO, __file__, 1, "{}", None, None)
+        )
+    status = forwarder_status()
+    assert status.audit_queue_dropped == handler.audit_dropped == 2
+    # The drop warning is a general record, and the general lane had room for it.
+    assert status.queue_dropped == status.lost == 2
+    assert status.state == "degraded"
+    watch.run_once()
+    assert sink.forward_failures == [("forwarder:dropping", "queue_full,audit_queue_full", 2)]
+
+
+def test_a_general_drop_does_not_name_the_audit_lane() -> None:
+    """The control for the test above: a general record dropped while the audit lane has room
+    raises ``queue_full`` alone."""
+    handler, _ = _attach(_Collector(), maxsize=1, audit_maxsize=1)
+    sink = _RecordingSink()
+    watch, _ = _watch(sink)
+    for _ in range(3):
+        handler.handle(_record(SYNTHETIC_RECORD))
+    assert handler.audit_dropped == 0
+    watch.run_once()
+    assert [(name, reason) for name, reason, _ in sink.forward_failures] == [
+        ("forwarder:dropping", "queue_full")
+    ]
 
 
 def test_a_healthy_forwarder_raises_nothing() -> None:

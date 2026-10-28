@@ -23,7 +23,8 @@ same :func:`~messagefoundry.pipeline.intake_bound.process_alert_subject`.
   emitted again. The reason is the start failure's fixed word, or ``stopped`` when it went away
   later.
 * ``dropping``: a loss counter rose. The count is :attr:`ForwarderStatus.lost`, a floor on the
-  records lost since the process started.
+  records lost since the process started. An audit tee line dropped for a full audit lane adds
+  ``audit_queue_full`` to the reason, beside ``queue_full`` (BACKLOG #2612).
 * ``spool_unreadable``: the on-disk spool could not be read. Held, not lost.
 * ``not_sending``: every pass for a whole re-alert window found
   :attr:`ForwarderStatus.send_failing` set, and a send has failed since the last alert. Not raised
@@ -55,7 +56,12 @@ import logging
 import time
 from collections.abc import Callable
 
-from messagefoundry.logging_setup import FORWARD_LOSS_COUNTERS, ForwarderStatus, forwarder_status
+from messagefoundry.logging_setup import (
+    FORWARD_LOSS_COUNTERS,
+    FORWARD_LOSS_PARTS,
+    ForwarderStatus,
+    forwarder_status,
+)
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject
 
@@ -72,6 +78,10 @@ REALERT_SECONDS = 300.0
 #: later clock reads, so an alert re-fired at exactly 300 could land inside it and be dropped.
 _THROTTLE_MARGIN_SECONDS = 1.0
 
+#: Every count a rise is read from. A part rises with the counter it is part of, so it is named
+#: beside it, not instead.
+_WATCHED_COUNTS = (*FORWARD_LOSS_COUNTERS, *FORWARD_LOSS_PARTS)
+
 #: The first part of the alert key. Not a connection name: the key always carries a colon.
 _LABEL = "forwarder"
 
@@ -82,7 +92,7 @@ def _restarted(status: ForwarderStatus, last: ForwarderStatus) -> bool:
     return (
         status.spool_read_errors < last.spool_read_errors
         or status.send_failures < last.send_failures
-        or any(getattr(status, field) < getattr(last, field) for field, _ in FORWARD_LOSS_COUNTERS)
+        or any(getattr(status, field) < getattr(last, field) for field, _ in _WATCHED_COUNTS)
     )
 
 
@@ -165,9 +175,7 @@ class LogForwardWatch:
             self._failing_since = now
         last = ForwarderStatus() if _restarted(status, self._alerted) else self._alerted
         rose = [
-            word
-            for field, word in FORWARD_LOSS_COUNTERS
-            if getattr(status, field) > getattr(last, field)
+            word for field, word in _WATCHED_COUNTS if getattr(status, field) > getattr(last, field)
         ]
         unread = status.spool_read_errors > last.spool_read_errors
         # "Still failing" needs a send that failed since the last alert. The flag alone is only

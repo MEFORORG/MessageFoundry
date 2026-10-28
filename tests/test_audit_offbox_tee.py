@@ -527,6 +527,123 @@ def test_a_later_handler_keeps_the_tee_json(separator: str, tmp_path: Path, caps
     json.loads(_tee_line(file_text))
 
 
+class _Collector(logging.Handler):
+    """Stands in for the syslog socket handler behind the forwarder's queue."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+
+def test_each_sink_gets_each_tee_line_once_redacted(tmp_path: Path, capsys, monkeypatch) -> None:
+    """Vault BACKLOG #2612: the audit lane changed how a tee line reaches the forwarder, so this
+    pins what must not change. Each tee line reaches stdout, the file and the off-box forwarder
+    exactly once, with the HL7 in ``detail`` redacted and a DEL in ``actor`` escaped on every sink.
+
+    The forwarder is the one ``configure_logging`` builds, with its socket handler replaced by an
+    in-memory collector, so the lanes, the near-side filters and the listener thread are the
+    shipped ones."""
+    from messagefoundry import logging_setup
+    from messagefoundry.logging_setup import LogFile, SyslogForward
+
+    collector = _Collector()
+    monkeypatch.setattr(logging_setup, "_build_syslog_handler", lambda *_a, **_k: collector)
+    # configure_logging sets these; put them back for the tests that read them.
+    for name in ("_forward_configured", "_forward_start_failure", "_forward_delivery_confirmed"):
+        monkeypatch.setattr(logging_setup, name, getattr(logging_setup, name))
+    log_path = tmp_path / "engine.log"
+    hl7 = "PID|1||100^^^H^MR||DOE^JANE^Q||19800101|F"
+    with _handlerless_process():
+        try:
+            installed = configure_logging(
+                "INFO",
+                fmt="text",
+                log_file=LogFile(path=str(log_path)),
+                forward=SyslogForward(host="collector.invalid", port=6514, protocol="tcp"),
+            )
+            assert installed
+            capsys.readouterr()
+            emit_audit_tee(
+                action="auth.login_failed",
+                actor=f"ali{chr(0x7F)}ce",
+                channel_id=None,
+                detail=f"transform failed on {hl7}",
+                ts=1.0,
+                row_id=1,
+                seq=1,
+                row_hash=_HASH,
+            )
+        finally:
+            for handler in list(logging.getLogger().handlers):
+                handler.close()  # the forwarder's close() drains its queue to the collector
+        stdout_text = capsys.readouterr().out
+        file_text = log_path.read_text(encoding="utf-8")
+    sinks = {
+        "stdout": stdout_text.splitlines(),
+        "file": file_text.splitlines(),
+        "forwarder": collector.lines,
+    }
+    for sink, lines in sinks.items():
+        tee = [ln for ln in lines if "auth.login_failed" in ln]
+        assert len(tee) == 1, (sink, tee)
+        assert chr(0x7F) not in tee[0], sink
+        assert "DOE" not in tee[0] and "19800101" not in tee[0], sink
+        # Not parsed as JSON: the HL7 redaction cuts to the end of the line and takes the closing
+        # quote with it on every sink, a residual emit_audit_tee's docstring names and #2612 does
+        # not touch. The anchor fields come before ``detail``, so they survive it. The forwarder
+        # renders JSON by default, which escapes the tee document's quotes inside its own.
+        assert f'"seq": 1, "row_hash": "{_HASH}"' in tee[0].replace('\\"', '"'), sink
+
+
+def test_a_failing_tee_is_reported_again_after_the_interval_and_never_counts_rows(
+    audit_capture, monkeypatch, caplog
+) -> None:
+    """Vault BACKLOG #2612: the tee reported its first failure in the process and nothing after it,
+    so a sink broken for a day read the same as one that failed once. It reports again once per
+    interval, and no line names or counts a row (BACKLOG #1131)."""
+    monkeypatch.setattr(audit_tee, "_tee_failure_reported_at", None)
+
+    def broken(*_a, **_k):
+        raise OSError("sink down")
+
+    monkeypatch.setattr(audit_tee.audit_logger, "info", broken)
+
+    def tee(n: int) -> None:
+        emit_audit_tee(
+            action="auth.account_locked",
+            actor="z",
+            channel_id=None,
+            detail=None,
+            ts=1.0,
+            row_id=n,
+            seq=n,
+            row_hash=_HASH,
+        )
+
+    with caplog.at_level(logging.WARNING, logger=audit_tee.log.name):
+        for n in range(1, 6):
+            tee(n)
+        within = [r.getMessage() for r in caplog.records if r.name == audit_tee.log.name]
+        # The interval has passed: put the last report that far back rather than sleep.
+        assert audit_tee._tee_failure_reported_at is not None
+        monkeypatch.setattr(
+            audit_tee,
+            "_tee_failure_reported_at",
+            audit_tee._tee_failure_reported_at - audit_tee.TEE_FAILURE_REPORT_INTERVAL,
+        )
+        for n in range(6, 9):
+            tee(n)
+    lines = [r.getMessage() for r in caplog.records if r.name == audit_tee.log.name]
+    assert len(within) == 1 and "tee failed" in within[0], within  # five failures, one line
+    assert len(lines) == 2 and "still failing" in lines[1], lines  # three more, one more line
+    for line in lines:
+        assert "auth." not in line and "account_locked" not in line, line
+        assert not any(ch.isdigit() for ch in line.replace("300", "")), line  # no row count
+
+
 def test_emit_audit_tee_is_best_effort_on_logging_failure(audit_capture, monkeypatch) -> None:
     def boom(*_a, **_k):
         raise RuntimeError("forwarder exploded")

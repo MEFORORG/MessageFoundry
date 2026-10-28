@@ -1025,7 +1025,8 @@ about a missing or failing forwarder two ways (BACKLOG #2612).
     the cause, then restart the engine.
   - `dropping`: a loss count rose. The reason names which. `count` is `lost` from the status
     field below: the records the engine has counted as lost since the process started. It is a
-    floor, because some losses are not counted.
+    floor, because some losses are not counted. An audit tee line dropped because the audit
+    lane was full adds `audit_queue_full` to the reason, beside `queue_full`.
   - `spool_unreadable`: a read of the on-disk spool failed. The spool keeps its records, and
     they are not sent until a read succeeds.
   - `not_sending`: every check for five minutes found `send_failing` true, and a send has
@@ -1068,7 +1069,16 @@ applies, and the alert item above says what the suffix holds. The count in the a
 different number: how many times the engine has raised that alert.
 
 `queued` is how many records sit on the in-memory hand-off queue right now. It does not count
-records waiting in the on-disk spool, and no field does. Every other count runs from the start of
+records waiting in the on-disk spool, and no field does.
+
+**Audit tee lines have their own lane of that queue** (vault BACKLOG #2612). Each lane holds up
+to 10,000 records, so a flood of general log lines against a collector that is not taking them
+fills the general lane and leaves the audit lane room. The forwarder sends the next audit line
+before the next general one, so an audit line can reach the collector ahead of a general line
+logged before it; order the two by their timestamps. `queue_dropped` counts drops from both
+lanes, and `lost` counts each once. The audit lane fills on audit traffic alone, and the alert
+reason above says when it has. Both lanes share one sending thread, one connection and one
+on-disk spool, so a full spool refuses audit lines as it refuses general ones. Every other count runs from the start of
 the process. While the state is `not_installed`, every count reads zero, whatever was counted
 before. Each engine process has
 its own forwarder and watches its own: every engine shard, and a cluster standby too.

@@ -1334,6 +1334,48 @@ def test_the_hand_off_queue_is_bounded_and_reports_what_it_drops(
     assert "8 dropped since this process started" in later[1].getMessage()
 
 
+def test_a_general_log_flood_does_not_cost_an_audit_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #2612, closing step 2: audit tee lines have their own lane, so a flood of
+    general log traffic against a stalled collector cannot drop them.
+
+    The collector is gated, so nothing drains while the flood runs, and the general lane is cut to
+    five so the flood overflows it. The control is that it did: ``dropped`` counts the general
+    records that did not fit. On the single shared queue this test was written against, the audit
+    lines logged after the queue filled were dropped with them, and the test failed."""
+    from messagefoundry.store import audit_tee
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 5)
+    gate = threading.Event()
+    target = _CapturingHandler(gate=gate, wait=30.0)
+    fwd = _build_queued_forwarder(target, fmt="text")
+    expected: list[str] = []
+    try:
+        for i in range(200):
+            fwd.handle(
+                logging.LogRecord(
+                    "mefor.test.flood", logging.WARNING, __file__, 1, "flood %d", (i,), None
+                )
+            )
+            if i % 20 == 0:
+                line = f'{{"event": "audit", "n": {i}}}'
+                expected.append(line)
+                fwd.handle(
+                    logging.LogRecord(
+                        audit_tee.audit_logger.name, logging.INFO, __file__, 1, line, None, None
+                    )
+                )
+    finally:
+        gate.set()
+    fwd.close()
+
+    assert fwd.dropped > 0, "the flood never overflowed the general lane, so it tested nothing"
+    delivered = [r.getMessage() for r in target.seen]
+    audit = [line for line in expected for m in delivered if m.endswith(line)]
+    assert audit == expected  # every audit line, once each, in the order it was logged
+
+
 def test_the_drop_report_does_not_recurse_on_the_root_logger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
