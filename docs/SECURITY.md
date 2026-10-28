@@ -3263,9 +3263,11 @@ offers every caller a passkey button. `POST /ui/login/passkey` charges the sign-
 list**, so the options say nothing about any account. Its handle goes back as an HttpOnly,
 `SameSite=Strict` cookie, never keyed by client address. `POST /ui/login` then carries the password
 and the assertion together. The route pops the challenge on arrival, whatever the outcome, before
-it charges the sign-in limiter, and skips that charge only when it found a staged challenge, so one
-passkey sign-in costs one unit of control 2, as a password sign-in does. A forged, expired or absent
-handle finds nothing and is charged (BACKLOG #3937). The path
+it charges the sign-in limiter, and skips that charge only when it found a staged challenge whose
+begin leg charged inside the limiter's window, so one passkey sign-in costs one unit of control 2,
+as a password sign-in does. A challenge lives 120 seconds, longer than the default window, so an
+older one is charged again and begin legs cannot be banked across windows. A forged, expired or
+absent handle finds nothing and is charged (BACKLOG #3937). The path
 runs only when the account row read before any verify holds a discoverable passkey under the
 request's `rp_id`, and the sign-in lock does not refuse it, as it does not refuse option E's
 combined sign-in. The assertion must come from one of the named account's own passkeys under that
@@ -3314,14 +3316,17 @@ write races.
 
 **Limits of the passkey way past, stated.** At least these:
 
-- The factor-drop gates count a discoverable passkey only under the `rp_id` the configuration
-  names, `[api].public_origin`'s host: the TOTP removal, the passkey removal, the rotation gate with
-  the first-factor refusal that shares its predicate, the store's conditional writes behind them,
-  and the census (BACKLOG #3937). The sign-in accepts only a passkey minted under the request's
+- The factor-drop gates count a discoverable passkey as a way past only under the `rp_id` the
+  configuration names, `[api].public_origin`'s host. At least these ask it: the TOTP removal, the
+  passkey removal, the rotation gate, the store's conditional writes behind them, and the census's
+  `no_way_past` (BACKLOG #3937). The sign-in accepts only a passkey minted under the request's
   `rp_id`, and outside a request the engine knows no other. **With `public_origin` unset the
-  `rp_id` comes from each request, so no passkey counts at those gates**: a covered account keeps
-  its TOTP, and a passkey-only one must enrol TOTP before it rotates and is named by the census.
-  That is the shipped default on a loopback bind. After an origin change
+  `rp_id` comes from each request, so no passkey counts as what remains at those gates**: a covered
+  account keeps its TOTP, removing its last discoverable passkey needs a TOTP that is a way past, and
+  a passkey-only account must enrol TOTP before it rotates and is named in `no_way_past`. That is
+  the shipped default on a loopback bind. The census's reset warning
+  (`reset_would_remove_a_passkey`) still counts a passkey under any `rp_id`, since it asks whether a
+  reset would remove one that may sign the holder in. After an origin change
   ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
   visibly unusable) a passkey under the old `rp_id` no longer counts, so the census names an
   account whose only way past it was.

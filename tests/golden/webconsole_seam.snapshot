@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-c200ec735c63a21d
+27c38abe54f0ffde
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -201,6 +201,7 @@ must_enrol_before_rotating: (self, identity: 'Identity') -> 'bool'
 oidc_enabled: property -> 'bool'
 oidc_flow_ttl_seconds: property -> 'int'
 oidc_step_up_flow: (self, flow_id: 'str') -> 'OidcStepUpFlow | None'
+passkeys_count_as_way_past: (self) -> 'bool'
 password_change_owes_factor: (self, token: 'str | None') -> 'bool'
 phi_read_retry_after: (self, actor: 'str') -> 'int'
 reauth: (self, identity: 'Identity', password: 'str', *, token: 'str', client: 'str | None' = None, purpose: 'str | None' = None) -> 'Elevation'
@@ -211,7 +212,7 @@ sessions_ended_by_ad_map_save: (self) -> 'frozenset[str]'
 sessions_ended_by_custom_role_save: (self, role_id: 'str') -> 'frozenset[str]'
 store: property -> 'AdminStore'
 suggested_notify_email: (profile_email: 'str | None') -> 'str | None'
-take_passkey_challenge: (self, handle: 'str') -> 'bytes | None'
+take_passkey_challenge: (self, handle: 'str') -> 'StagedChallenge | None'
 verify_mfa: (self, token: 'str | None', code: 'str', *, client: 'str | None' = None) -> 'Elevation'
 webauthn_available: (self) -> 'bool'
 

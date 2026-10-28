@@ -695,7 +695,7 @@ def test_the_pre_auth_pool_evicts_its_oldest_rather_than_refusing() -> None:
         pool.put(f"k{i}", bytes([i]))
     pool.put("k3", b"\x03")
     assert len(pool) == 3
-    assert pool.pop("k0") is None and pool.pop("k1") == b"\x01"
+    assert pool.pop("k0") is None and pool.pop("k1") == (b"\x01", 1.0)  # (challenge, age)
     assert pool.pop("k1") is None
     clock[0] += 10
     assert pool.pop("k2") is None and pool.pop("k3") is None
@@ -1572,7 +1572,9 @@ async def test_a_passkey_under_another_rp_id_does_not_open_the_rotation_gate(
         with pytest.raises(FactorEnrolmentRequired):
             await gate.change_password(identity, _NEW_PASSWORD)
         census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=configured)
-        assert census.no_way_past == (identity.username,) and census.passkey_only == ()
+        assert census.no_way_past == (identity.username,) and census.passkey_only == (
+            identity.username,
+        )
 
         control = _gate_service(store, RP)
         assert not await control.must_enrol_before_rotating(identity)
@@ -1641,5 +1643,62 @@ async def test_a_seal_refusal_calls_a_passkey_sign_in_combined_only_where_it_was
         assert not out.ok and out.error == "invalid credentials"
         (row,) = await store.list_audit(action="auth.login_failed")
         assert json.loads(row["detail"]).get("combined", False) is holds_one
+    finally:
+        await store.close()
+
+
+async def test_a_staged_challenge_waives_the_sign_in_charge_only_inside_the_window() -> None:
+    """Item 2: a challenge lives longer than the limiter's window, so one staged in an earlier
+    window is not ``paid`` and the sign-in POST charges again. Otherwise begin legs could be
+    banked and spent later as uncharged sign-ins. A forged handle finds nothing."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store, login_rate_limit_window_seconds=60.0)
+        clock = [1_000.0]
+        service._preauth_challenges = wa.PreAuthChallengePool(clock=lambda: clock[0])
+        fresh = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.30")
+        old = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.30")
+        assert fresh is not None and old is not None
+        clock[0] += 30
+        taken = service.take_passkey_challenge(fresh[0])
+        assert taken is not None and taken.paid
+        clock[0] += 31  # 61 s after staging: still live (120 s), past the 60 s window
+        taken = service.take_passkey_challenge(old[0])
+        assert taken is not None and not taken.paid
+        assert service.take_passkey_challenge(old[0]) is None, "a challenge was taken twice"
+        assert service.take_passkey_challenge("forged") is None
+    finally:
+        await store.close()
+
+
+def test_the_configured_rp_id_is_the_public_origin_host() -> None:
+    """Item 1: the one derivation the engine, ``verify`` and the console share."""
+    from messagefoundry.auth.webauthn import configured_rp_id
+
+    assert configured_rp_id("https://Ops.Example:8443") == "ops.example"
+    assert configured_rp_id(None) is None and configured_rp_id("") is None
+
+
+async def test_with_no_configured_rp_id_the_last_discoverable_passkey_still_needs_totp() -> None:
+    """Item 1, the removal gate with no configured rp_id: any discoverable passkey may be the way
+    past the sign-in uses, so removing one is guarded, and no other passkey counts as what remains.
+    Beside a passkey that is not discoverable it is refused; beside a usable TOTP it may go."""
+    store = await MessageStore.open(":memory:")
+    try:
+        setup = _service(store)
+        identity, token, _ = await login_admin(setup)
+        _, token = await _register(setup, identity, token, label="resident")
+        _, token = await _register(setup, identity, token, resident_key=False, label="plain")
+        gate = _gate_service(store, None)
+        by_label = {c.label: c for c in await store.list_webauthn_credentials(identity.user_id)}
+        with pytest.raises(ValueError) as refused:
+            await gate.delete_webauthn_credential(identity, by_label["resident"].credential_id_hash)
+        assert str(refused.value) == PASSKEY_REMOVAL_REFUSED
+        await _enable_totp(store, identity.user_id, _USABLE_TOTP)
+        assert await gate.delete_webauthn_credential(
+            identity, by_label["resident"].credential_id_hash
+        )
     finally:
         await store.close()

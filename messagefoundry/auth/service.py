@@ -1086,14 +1086,25 @@ class PasskeyProof:
     origin: str
 
 
+@dataclass(frozen=True)
+class StagedChallenge:
+    """A challenge :meth:`AuthService.take_passkey_challenge` popped. ``paid`` says whether the
+    begin leg's sign-in limiter charge for it is still inside the limiter's window, so the sign-in
+    POST may skip its own (BACKLOG #3937 item 2)."""
+
+    challenge: bytes
+    paid: bool
+
+
 @dataclass
 class _SignInShape:
     """What :meth:`AuthService._login_local` found a sign-in to be, recorded for
-    :meth:`AuthService.login`'s seal refusal (BACKLOG #3937 item 3). ``combined`` is ``None`` until
+    :meth:`AuthService.login`'s seal refusal (BACKLOG #3937 item 3). ``combined`` is ``False`` until
     the sign-in decides it, then whether it was a combined sign-in: a code on an account with TOTP,
-    or a passkey assertion on one holding a discoverable passkey under the request's rp_id."""
+    or a passkey assertion on one holding a discoverable passkey under the request's rp_id. It is
+    decided right after the account is read, before any write a seal could refuse."""
 
-    combined: bool | None = None
+    combined: bool = False
 
 
 @dataclass(frozen=True)
@@ -2314,7 +2325,11 @@ class LockableAccountCensus:
 
     ``no_way_past`` names every local account ``[security].require_mfa`` covers that holds a chosen
     credential (``password_generated`` unset) and no factor with a way past the sign-in lock: no TOTP,
-    and no passkey recorded as discoverable (wave 2). ``undecryptable_totp`` names every account
+    and no passkey recorded as discoverable under the configured relying party (wave 2; BACKLOG
+    #3937: with none configured, no passkey counts here). ``passkey_only`` and
+    ``unknown_beside_a_passkey`` still count a discoverable passkey under any relying party, since
+    they answer whether a reset would remove one that may sign the holder in, so an account can be
+    named in ``no_way_past`` and ``passkey_only`` at once. ``undecryptable_totp`` names every account
     whose ENABLED TOTP secret the engine cannot decrypt or compute with (BACKLOG #3422), which turns
     the owner's combined sign-in into "right password, wrong code". All are usernames only, sorted;
     none carries a secret.
@@ -2559,11 +2574,7 @@ async def lockable_account_census(
     # One probe, so a site with no passkey anywhere reads no account's set below. Without the
     # [webauthn] extra no passkey can sign in, so none is a way past and none is read.
     # With no configured rp_id no passkey counts (BACKLOG #3937), so none is read either.
-    any_passkeys = (
-        way_past_rp_id is not None
-        and webauthn.available()
-        and await store.any_webauthn_credentials()
-    )
+    any_passkeys = webauthn.available() and await store.any_webauthn_credentials()
 
     def counts(cred: WebAuthnCredential) -> bool:
         return passkey_is_way_past_under(cred, way_past_rp_id)
@@ -2602,17 +2613,18 @@ async def lockable_account_census(
         # seal covers. A set that fails its digest counts for nothing, so the account is named.
         creds = await store.list_webauthn_credentials(user.id) if any_passkeys else []
         digest = user.row.cred_digest if user.row is not None else ""
-        if discoverable_way_past(
-            creds,
-            digest,
-            sealed=sealed,
-            passkey_counts=counts,
-        ):
+        # Two questions, two rules (BACKLOG #3937). Whether a reset would remove a passkey that
+        # may still sign the holder in asks the plain rule, since on a loopback bind with no
+        # public_origin the sign-in takes a passkey under the request's rp_id. Whether the account
+        # holds a way past the GATES count asks the configured rp_id, as the gates do.
+        if discoverable_way_past(creds, digest, sealed=sealed):
             if state == "unknown":
                 unknown_beside_a_passkey.append(user.username)
             else:
                 passkey_only.append(user.username)
-        elif not user.totp_enabled:
+        if not user.totp_enabled and not discoverable_way_past(
+            creds, digest, sealed=sealed, passkey_counts=counts
+        ):
             no_way_past.append(user.username)
     return LockableAccountCensus(
         no_way_past=tuple(sorted(no_way_past)),
@@ -4658,7 +4670,8 @@ class AuthService:
         # Popped before the queue, on every outcome: the handle names a challenge, never an account.
         staged = passkey_challenge
         if staged is None and passkey is not None:
-            staged = self.take_passkey_challenge(passkey.handle)
+            taken = self.take_passkey_challenge(passkey.handle)
+            staged = taken.challenge if taken is not None else None
         # What the sign-in turned out to be, for the seal refusal's row (BACKLOG #3937 item 3).
         shape = _SignInShape()
         async with self._account_credential_lock(username):
@@ -4697,13 +4710,9 @@ class AuthService:
                     raise  # another record's seal: its own handler, as before BACKLOG #3510
                 # The combined flag the sign-in itself recorded, so the row reads as a wrong
                 # credential's would: a passkey sent to an account holding no discoverable one
-                # under this relying party is no combined sign-in (BACKLOG #3937 item 3). A write
-                # refused before the sign-in decided keeps the code-only reading.
-                combined = shape.combined
-                if combined is None:
-                    combined = bool(totp_code and totp_code.strip())
+                # under this relying party is no combined sign-in (BACKLOG #3937 item 3).
                 outcome = self._sign_in_seal_refused(
-                    username, after_pad, client=client, combined=combined
+                    username, after_pad, client=client, combined=shape.combined
                 )
             # The room is set on every branch, whether it deferred rows or not, so every refusal
             # answers on the same slot.
@@ -5370,8 +5379,14 @@ class AuthService:
                 notice["totp_state"] = "unknown"
             # ADR 0197 Amendment A, wave 2: the way past is the combined passkey sign-in. Beside a
             # TOTP nobody could check, the passkey is named too, since it needs no TOTP cell.
+            # With a configured relying party every sign-in arrives under it, so only a passkey
+            # under it is named (BACKLOG #3937).
             if totp_state != "usable" and await self._holds_discoverable_passkey(
-                user, held=passkeys
+                user,
+                held=passkeys,
+                counts=self._gate_counts
+                if self.passkeys_count_as_way_past()
+                else passkey_is_way_past,
             ):
                 notice["combined_passkey_sign_in"] = True
         await self._record_suspicious_login(
@@ -12529,6 +12544,14 @@ class AuthService:
             held = await self._verified_passkeys(user)
         return any(counts(c) for c in held or ())
 
+    def passkeys_count_as_way_past(self) -> bool:
+        """Whether any passkey can count as a way past the sign-in lock at the factor-drop gates:
+        only where the configuration names a relying party (:meth:`_gate_counts`, BACKLOG #3937).
+        The console's enrol-first notice asks it, so it offers a passkey only where one would
+        discharge the requirement, and the first-factor refusal of a passkey that is not
+        discoverable asks it too."""
+        return self._way_past_rp_id is not None
+
     async def _holds_gate_passkey(self, user: VerifiedUser) -> bool:
         """:meth:`_holds_discoverable_passkey` under :meth:`_gate_counts`, answered without reading
         the set where no rp_id is configured, since then no passkey counts."""
@@ -14261,6 +14284,7 @@ class AuthService:
         # stored. Asked after the verify, since only the response says what was made.
         if (
             not discoverable
+            and self.passkeys_count_as_way_past()
             and self._covered_by_requirement(user, identity.roles)
             and not await self._has_way_past(user)
         ):
@@ -14356,17 +14380,25 @@ class AuthService:
         self._preauth_challenges.put(hash_token(handle), challenge)
         return handle, options
 
-    def take_passkey_challenge(self, handle: str) -> bytes | None:
-        """Pop the challenge :meth:`begin_passkey_sign_in` staged under ``handle``: the challenge,
-        or ``None`` when none is staged (never staged, forged, expired or already taken). Single
-        use, so a second call finds nothing.
+    def take_passkey_challenge(self, handle: str) -> StagedChallenge | None:
+        """Pop the challenge :meth:`begin_passkey_sign_in` staged under ``handle``, or ``None``
+        when none is staged (never staged, forged, expired or already taken). Single use, so a
+        second call finds nothing.
 
         ``POST /ui/login`` calls it BEFORE the sign-in limiter and skips its own charge only when
-        it returns a challenge, since the begin leg that staged it already charged control 2 for
-        this sign-in (BACKLOG #3937 item 2, ADR 0197 Amendment A). A forged or absent handle
-        finds nothing, so that request is charged like any other. It passes what it took to
-        :meth:`login` as ``passkey_challenge``."""
-        return self._preauth_challenges.pop(hash_token(handle))
+        the result is ``paid``: the begin leg that staged it charged control 2 for this sign-in,
+        and that charge is still inside the limiter's window (BACKLOG #3937 item 2, ADR 0197
+        Amendment A). A challenge lives longer than the window, so an older one is charged again;
+        otherwise begin legs run in earlier windows could be banked and spent later as uncharged
+        sign-ins. A forged or absent handle finds nothing and is charged like any other request.
+        The route passes the challenge to :meth:`login` as ``passkey_challenge``."""
+        taken = self._preauth_challenges.pop(hash_token(handle))
+        if taken is None:
+            return None
+        challenge, age = taken
+        return StagedChallenge(
+            challenge=challenge, paid=age < self._settings.login_rate_limit_window_seconds
+        )
 
     async def begin_webauthn_assertion(self, token: str | None, *, rp_id: str) -> str | None:
         """Stage an assertion ceremony for the caller's session; returns the browser request-options
@@ -14671,10 +14703,16 @@ class AuthService:
         # passkey that is not discoverable is no way past, so its removal is never refused on this
         # ground. ``admin_reset_mfa`` stays the recovery for a lost or stolen one, as ADR 0068 says.
         # BACKLOG #3937: a passkey under another relying party than the configured one is no way
-        # past (:meth:`_gate_counts`), so its removal is not refused on this ground either.
-        keep_way_past = self._gate_counts(target) and self._covered_by_requirement(
-            user, identity.roles
+        # past (:meth:`_gate_counts`), so its removal is not refused on this ground either. With no
+        # configured one, any discoverable passkey may be the way past the sign-in uses, so its
+        # removal is guarded, and the store counts no other passkey as what remains: the removal
+        # then needs TOTP that is a way past, the direction that keeps a factor.
+        target_counts = (
+            self._gate_counts(target)
+            if self._way_past_rp_id is not None
+            else passkey_is_way_past(target)
         )
+        keep_way_past = target_counts and self._covered_by_requirement(user, identity.roles)
         # A TOTP this release refuses is no factor the holder can use (BACKLOG #3422), so the
         # last-factor rule (ADR 0068 decision 5) does not count it either.
         last_second_factor = len(creds) == 1 and not await self._totp_way_past(user)

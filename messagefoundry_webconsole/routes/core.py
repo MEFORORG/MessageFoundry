@@ -729,13 +729,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         client = client_ip(request)
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in's challenge, named by the
         # handle cookie the begin leg set. ALWAYS popped here, never peeked, and before the limiter:
-        # a staged challenge means the begin leg already charged control 2 for this sign-in, so it
-        # is not charged twice (BACKLOG #3937 item 2). A forged, expired or absent handle pops
-        # nothing, so that request is charged like any other. Single use, so one charge buys one
-        # sign-in whatever the form carries.
+        # a staged challenge whose begin leg charged control 2 inside the limiter's window is not
+        # charged twice (BACKLOG #3937 item 2). An older one is charged again, so begin legs cannot
+        # be banked across windows. A forged, expired or absent handle pops nothing, so that
+        # request is charged like any other. Single use, so one charge buys one sign-in whatever
+        # the form carries.
         handle = request.cookies.get(passkey_sign_in_cookie_name(request))
         staged = auth.take_passkey_challenge(handle) if handle else None
-        if staged is None and not auth.allow_login_attempt(client):
+        paid = staged is not None and staged.paid
+        if not paid and not auth.allow_login_attempt(client):
             # BACKLOG #3293, owner ruling 2026-10-20: the whole sign-in window, never the bucket's
             # own wait, so an unauthenticated caller reads no other caller's timing.
             raise HTTPException(
@@ -780,7 +782,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # it valid and unreachable until it expires. A failed sign-in ends nothing.
             supersedes=session_token(request),
             passkey=passkey,
-            passkey_challenge=staged,
+            passkey_challenge=staged.challenge if staged is not None else None,
         )
         if not outcome.ok or outcome.token is None:
             refused = RedirectResponse("/ui/login?e=bad", status_code=303)

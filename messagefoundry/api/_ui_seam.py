@@ -696,7 +696,8 @@ from typing import Any
 #: ea0b48d0bf69ec09; this branch at d3f76a351d8328bd). The value below was re-derived with
 #: ``--write`` on the merged tree, so it covers both.
 #:
-#: BACKLOG #3937 items 2 and 5: ``AuthService`` gained ``take_passkey_challenge`` and ``login`` the
+#: BACKLOG #3937 items 1, 2 and 5: ``AuthService`` gained ``take_passkey_challenge`` (returning a
+#: ``StagedChallenge``), ``passkeys_count_as_way_past`` (the enrol-first notice) and ``login`` the
 #: ``passkey_challenge`` keyword. ``POST /ui/login`` pops the staged challenge itself and skips its
 #: own sign-in limiter charge only when it found one, so a passkey sign-in costs one unit. The
 #: console keeps ``must_enrol_before_rotating``'s answer in the request scope for the request, and
@@ -709,7 +710,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "c200ec735c63a21d"
+ENGINE_UI_SEAM: str = "27c38abe54f0ffde"
 
 
 @dataclass(frozen=True, slots=True)

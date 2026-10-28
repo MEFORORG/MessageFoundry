@@ -225,13 +225,10 @@ async def test_a_passkey_sign_in_costs_one_sign_in_unit(engine: Engine) -> None:
         begun = await c.post("/ui/login/passkey", headers=SAME_ORIGIN)
         assert begun.status_code == 200
         challenge = base64url_to_bytes(begun.json()["options"]["challenge"])
+        assertion = key.get_response(challenge)  # type: ignore[attr-defined]
         r = await c.post(
             "/ui/login",
-            data={
-                "username": "op",
-                "password": PW,
-                "passkey_assertion": key.get_response(challenge),
-            },  # type: ignore[attr-defined]
+            data={"username": "op", "password": PW, "passkey_assertion": assertion},
         )
         assert r.status_code == 303 and r.headers["location"] != "/ui/login?e=bad", r.headers
     assert _left(service) == 4, "a passkey sign-in did not cost exactly one unit"

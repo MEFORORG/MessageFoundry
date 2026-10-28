@@ -452,14 +452,17 @@ class PreAuthChallengePool:
             self._entries.popitem(last=False)
         self._entries[key] = (challenge, now + self._ttl)
 
-    def pop(self, key: str) -> bytes | None:
-        """Consume the challenge staged under ``key``: single use, ``None`` if absent or expired."""
+    def pop(self, key: str) -> tuple[bytes, float] | None:
+        """Consume the challenge staged under ``key``: single use, ``None`` if absent or expired.
+        Returns the challenge and its age in seconds, which the sign-in reads to judge whether the
+        begin leg's limiter charge is still inside the limiter's window (BACKLOG #3937)."""
         # A dict lookup, discharged for ASVS 11.2.4 for the reason ChallengeCache.put gives: the
         # key is the SHA-256 of the caller's own handle.
         entry = self._entries.pop(key, None)
-        if entry is None or entry[1] <= self._clock():
+        now = self._clock()
+        if entry is None or entry[1] <= now:
             return None
-        return entry[0]
+        return entry[0], now - (entry[1] - self._ttl)
 
 
 @dataclass(frozen=True, slots=True)
