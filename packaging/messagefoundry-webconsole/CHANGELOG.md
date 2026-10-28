@@ -38,7 +38,6 @@ this line.**
   without clearing the cookie and sending Clear-Site-Data. Both are the engine's behaviour; this
   console passes `AuthService.logout`'s new required `proven_at` and pins that engine seam.
   (BACKLOG #3715, #3749, #3884)
-
 - **A passkey sign-in costs one unit of the sign-in window, not two.** `POST /ui/login` pops the
   challenge the begin leg staged before its own charge, and charges only when the engine did not
   renew the begin leg's hit (`StagedChallenge.paid`; the engine's SECURITY.md states the rule).
