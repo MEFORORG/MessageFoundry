@@ -706,11 +706,41 @@ class EscapeScanLimitExceeded(ValueError):
 
 _ESCAPE_DEFAULT = "\\"
 
+#: A run of whitespace as ``str.strip`` counts it, matched in place so nothing is copied.
+_WS_RUN = re.compile(r"\s*")
+
+#: How much of the first line :func:`_extract_separators` reads: the id, MSH-1 and four encoding
+#: characters.
+_SEPARATOR_HEAD = 8
+
+
+def _whitespace_end(text: str, pos: int, endpos: int) -> int:
+    """Where the whitespace run starting at ``pos`` ends, scanning no further than ``endpos``."""
+    match = _WS_RUN.match(text, pos, endpos)
+    return match.end() if match else pos  # ``\s*`` always matches; this satisfies the type
+
+
+def _first_line_head(norm: str) -> str:
+    """The first :data:`_SEPARATOR_HEAD` characters of the line :func:`parse` takes as its first,
+    ``norm.strip().split("\\r")[0]``, without copying the body. This runs before the ACK on every
+    message, where a ``strip`` would copy all of a body that ends in ``\\r``."""
+    end = len(norm)
+    start = _whitespace_end(norm, 0, end)
+    cr = norm.find("\r", start)
+    stop = end if cr == -1 else cr
+    head = norm[start : min(stop, start + _SEPARATOR_HEAD)]
+    # strip() trims the line's own trailing whitespace only when nothing but whitespace follows
+    # it, and that trim reaches the head only when the rest of the line is whitespace too.
+    last = cr == -1 or _whitespace_end(norm, cr, end) == end
+    if last and _whitespace_end(norm, start + len(head), stop) == stop:
+        head = head.rstrip()
+    return head
+
 
 def message_escape_char(norm: str) -> str:
     """Best-effort read of a raw message's OWN escape character (MSH-2's 4th encoding char).
 
-    Takes the first line the way :func:`parse` does (``strip`` then split on ``\\r``) and calls
+    Takes the first line the way :func:`parse` does (:func:`_first_line_head`) and calls
     :func:`_extract_separators` itself, so the budget and the **built-in** parser can never disagree
     about which character escapes a given message — a disagreement would let a payload hide its
     escapes from the pre-parse budget. It differs only in being defensive: this runs *before* any
@@ -718,7 +748,7 @@ def message_escape_char(norm: str) -> str:
     default ``\\`` rather than indexing off the end. Never hardcodes the escape character for a
     well-formed message (CLAUDE.md §8).
     """
-    line = norm.strip().split("\r", 1)[0]
+    line = _first_line_head(norm)
     if len(line) < 4:
         return _ESCAPE_DEFAULT
     return _extract_separators(line)[4]

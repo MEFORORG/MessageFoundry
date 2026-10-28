@@ -96,3 +96,44 @@ def test_the_delimiter_rewrite_keeps_a_later_header_line_in_shape(line: str) -> 
     before this change too."""
     parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
     assert line in _builtin_hl7.encode_with_separators(parsed, parsed["seps"]).split("\r")
+
+
+#: Bodies whose first line ``strip`` would change: padded single lines, whitespace past the encoding
+#: characters, a trailing ``\r`` run, and a normal multi-line message as the control.
+_ESCAPE_BODIES = [
+    "MSH|^~!&|S\rPID|1\r",
+    "MSH|^~!&|S\r",
+    "MSH|^~!",
+    " \t\rMSH|^~! \r",
+    "MSH|^~ ",
+    "MSH|^~ \r\n \r",
+    "MSH|^~  \t\t\t\t\t\t",
+    "MSH|^~\x1c\r\x1c",
+    "MSH|^~! \rPID|1",
+    "\x0bMSH|^~\\&\x0c",
+    "MSH|^~!#ABCDEFGH   \r ",
+]
+
+
+@pytest.mark.parametrize("body", _ESCAPE_BODIES)
+def test_the_escape_read_takes_the_first_line_parse_takes(body: str) -> None:
+    """The pre-parse escape read finds the first line in place. It must be the line ``parse`` takes
+    through ``strip``, or the budget and the parser could disagree on the escape character."""
+    assert _builtin_hl7._first_line_head(body) == body.strip().split("\r", 1)[0][:8]
+    assert message_escape_char(body) == _builtin_hl7.parse(body)["seps"][4]
+
+
+@pytest.mark.parametrize("tail", ["\r", "\rPID|1\r"], ids=["single-line", "multi-line"])
+def test_the_escape_read_copies_nothing_of_the_body(tail: str) -> None:
+    """Round 1 of this change read the first line through ``strip``, which copies all of a body that
+    ends in ``\\r``, before the ACK on every message. The read is now bounded."""
+    import tracemalloc
+
+    body = "MSH|^~!&|" + "A" * 2_000_000 + tail
+    tracemalloc.start()
+    try:
+        assert message_escape_char(body) == "!"
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 100_000
