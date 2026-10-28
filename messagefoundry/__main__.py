@@ -96,7 +96,9 @@ if TYPE_CHECKING:
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
+    from messagefoundry.config.environments import EnvironmentValuesReader
     from messagefoundry.config.settings import ServiceSettings, StoreSettings
+    from messagefoundry.config.snapshot import ConfigSnapshot
     from messagefoundry.config.static_credentials import StaticCredentialGateOutcome
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.config.wiring import Registry
@@ -206,9 +208,10 @@ def _refuse_toolkit_command(command: str, argv: Sequence[str]) -> int:
     ``_emit_error`` writes JSON to stdout or one line to stderr, never both, and its own return value
     is 1, so it is not returned. ``argv_wants_json`` is the one pre-parse JSON rule both commands use.
 
-    The line names no install command. The toolkit distribution is not yet on PyPI, and
-    tests/test_install_instruction_provenance.py refuses shipped text that tells a user to install
-    an unclaimed name.
+    The line names no install command. It was written while the toolkit name was unclaimed on PyPI,
+    when tests/test_install_instruction_provenance.py refused shipped text telling a user to
+    install it by name. ADR 0201 slice 3 recorded the name as claimed; the docs that give a
+    bare-name install arrive with slice 4.
     """
     _emit_error(
         f"`{command}` is not a messagefoundry command. It is an authoring command: run it as "
@@ -2450,14 +2453,45 @@ def _exposure_description(settings: ServiceSettings, *, exposed: bool) -> str:
     return "admin interface reachable from beyond this host"
 
 
-def _read_environment_values(*, base_dir: Path, dir_name: str, environment: str) -> dict[str, Any]:
+def _environment_values_reader(
+    *, base_dir: Path, dir_name: str, environment: str
+) -> EnvironmentValuesReader:
+    """``serve``'s ``env_values_provider``: :func:`_read_environment_values` over one value file.
+
+    The Engine calls it with no arguments at start, and with a reload's config snapshot on a
+    reload that read one, so a value file the snapshot covers is parsed from the bytes the reload's
+    digest names (vault BACKLOG #2596). ``supervise`` builds the same reader."""
+    from messagefoundry.config.environments import EnvironmentValuesReader
+
+    return EnvironmentValuesReader(
+        _read_environment_values, base_dir=base_dir, dir_name=dir_name, environment=environment
+    )
+
+
+def _read_environment_values(
+    *,
+    base_dir: Path,
+    dir_name: str,
+    environment: str,
+    snapshot: ConfigSnapshot | None = None,
+) -> dict[str, Any]:
     """This instance's environment values: the value file
     :func:`~messagefoundry.config.environments.values_file_path` names, plus the ``MEFOR_VALUE_*``
-    environment. ``serve`` hands it to the Engine as the ``env_values_provider``, so it runs at
-    start and again on every reload."""
+    environment. ``serve`` hands it to the Engine as the ``env_values_provider``
+    (:func:`_environment_values_reader`), so it runs at start and again on every reload.
+
+    With ``snapshot``, the value file is parsed from the bytes the snapshot read and never read
+    from disk, so a file edited after that read does not apply, and one created or removed since is
+    refused (vault BACKLOG #2596). A value file outside the snapshot's ``environments/`` folder
+    raises :class:`~messagefoundry.config.snapshot.NotInSnapshot` instead."""
     import os
 
-    from messagefoundry.config.environments import load_environment_values, values_file_path
+    from messagefoundry.config.environments import (
+        environment_values_from_bytes,
+        load_environment_values,
+        values_file_path,
+    )
+    from messagefoundry.config.snapshot import NotInSnapshot
     from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
     from messagefoundry.redaction import safe_exc
 
@@ -2487,8 +2521,21 @@ def _read_environment_values(*, base_dir: Path, dir_name: str, environment: str)
     # created after the start is not read unvetted. Outside the try below, because WiringError
     # is a ValueError and that arm would wrap the refusal as a read failure.
     env_file = values_file_path(base_dir, dir_name, environment)
-    assert_trusted_start_paths([env_file], lead="refusing to read environment values from")
+    if snapshot is not None and not snapshot.covers_environment_file(env_file):
+        # Before the vetting below, so the plain read the engine then makes vets the file once.
+        raise NotInSnapshot(f"{env_file} is not in the config snapshot's environments folder")
+    # With a snapshot, its folder is vetted even when the file has gone: the bytes that apply were
+    # read earlier, and whoever can write the folder could have planted them (vault BACKLOG #2596).
+    assert_trusted_start_paths(
+        [env_file],
+        lead="refusing to read environment values from",
+        folders=[env_file.parent] if snapshot is not None else (),
+    )
     try:
+        if snapshot is not None:
+            return environment_values_from_bytes(
+                snapshot.environment_file(env_file), path=env_file, environ=os.environ
+            )
         return load_environment_values(
             base_dir=base_dir,
             dir_name=dir_name,
@@ -4534,11 +4581,8 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError
     from messagefoundry.redaction import safe_exc
 
-    env_values = functools.partial(
-        _read_environment_values,
-        base_dir=env_base,
-        dir_name=settings.environments.dir,
-        environment=env_name,
+    env_values = _environment_values_reader(
+        base_dir=env_base, dir_name=settings.environments.dir, environment=env_name
     )
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
@@ -5340,8 +5384,7 @@ def _supervise(args: argparse.Namespace) -> int:
             registry_guard=_chain_registry_guards(
                 refuse_keep_forever_overrides,
                 _fleet_connection_key_file_refusal(
-                    functools.partial(
-                        _read_environment_values,
+                    _environment_values_reader(
                         base_dir=env_base,
                         dir_name=settings.environments.dir,
                         environment=env_name,

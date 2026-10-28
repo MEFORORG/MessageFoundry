@@ -213,6 +213,8 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
         source_dir=registry.source_dir,
         # And compares the digest of what it loaded with the engine's (vault BACKLOG #2724).
         code_digest=registry.code_digest,
+        # And is sent the bytes the graph was loaded from (vault BACKLOG #2596).
+        config_snapshot=registry.config_snapshot,
         shard_id=shard if sharded else None,
         all_shard_ids=tuple(ids) if sharded else None,
         # Pin the UNFILTERED loopback inbounds beside the shard identity: `selected` drops the inbounds

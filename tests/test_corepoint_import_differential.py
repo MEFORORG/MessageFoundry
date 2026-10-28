@@ -80,6 +80,7 @@ from typing import Any
 import pytest
 
 from messagefoundry import corepoint_import as head
+from messagefoundry.config.snapshot import read_config_snapshot
 from messagefoundry.config.wiring import Registry, _loading
 from messagefoundry.parsing.message import Message
 
@@ -1137,7 +1138,7 @@ def _execute(src: str, where: Path) -> _Run:
     # Every refusal is read as a human deleting it: the handler runs on past it, so a send after a
     # refusal is executed and checked too, in both importers alike.
     runnable = _REFUSAL.sub(r"\1pass  # refusal removed by the guard", src)
-    with _loading(where, registry):
+    with _loading(read_config_snapshot(where, strict=False), registry):
         exec(compile(runnable, _GENERATED, "exec"), namespace)
     inp = Message.parse(_INPUT)
     try:
