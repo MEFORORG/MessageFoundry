@@ -104,7 +104,11 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import rotation_fingerprint_keys
-from messagefoundry.store.row_seal import enforce_transit_seal_probe, store_transit_sealer
+from messagefoundry.store.row_seal import (
+    TransitRowSealer,
+    enforce_transit_seal_probe,
+    store_transit_sealer,
+)
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
     REINGRESS_TARGET_PREFIX,
@@ -716,6 +720,9 @@ class Engine:
         # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
         # #1169); None until start() arms it, and again after stop() disarms it.
         self._cipher_refusal_armed: Any = None
+        # The Transit row sealer whose alert hook this engine armed (BACKLOG #2592), so stop()
+        # disarms only what this engine armed.
+        self._transit_sealer_armed: TransitRowSealer | None = None
         # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5) — the secret-side twin of
         # cert_monitor. None (embedding/tests) → no reminder task; a no-op when warn_days=0 or nothing is
         # tracked. The tracked-secret set is derived at scan time from [secret_rotation] so a reload is
@@ -1825,6 +1832,7 @@ class Engine:
         sealer = store_transit_sealer(self.store)
         if sealer is not None:
             sealer.set_alert_hook(transit_seal_alert(sink))
+            self._transit_sealer_armed = sealer
         getter = getattr(self.store, "cipher", None)
         cipher = getter() if callable(getter) else None
         setter = getattr(cipher, "set_refusal_hook", None)
@@ -1839,7 +1847,8 @@ class Engine:
         self._cipher_refusal_armed = cipher
 
     def _disarm_cipher_refusal_alert(self) -> None:
-        sealer = store_transit_sealer(self.store)
+        sealer = self._transit_sealer_armed
+        self._transit_sealer_armed = None
         if sealer is not None:
             sealer.set_alert_hook(None)
         cipher = self._cipher_refusal_armed

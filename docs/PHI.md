@@ -111,13 +111,15 @@ encrypted cells withheld. The engine keeps running. A refusal usually writes an 
 audit row and raises an `integrity_drift` alert, with at least these exceptions. Under
 `vault_transit`, a cell that fails its tag keeps the cipher's own error, with no integrity audit
 row or alert. And under `vault_transit`, a seal Transit cannot make or check refuses the request
-or the write with an error log, an `integrity_drift` alert under the `authority-seal-transit`
-subject, and no integrity audit row: the API answers 503. At least these cases count: Vault did
-not answer; the seal names a key version newer than the Vault node holds, as a node that lags a
-rotation does; or it names a version below the key's `min_decryption_version`, which Transit no
-longer verifies. None of them is a forgery, so no session is ended. **Seal rows again before
-raising the audit key's `min_decryption_version`**: a row whose seal names a retired version is
-refused until the minimum is lowered again. No engine command re-seals rows yet. Each process reports a row that keeps failing again only after an interval: five
+or the write with an error log and an `integrity_drift` alert, and no integrity audit row. At least
+these cases count. Vault did not answer, or the seal names a key version one newer than the Vault
+node holds, as a node that lags a rotation does: the API answers 503. Or the seal names a version
+below the key's `min_decryption_version`, which Transit no longer verifies: that row is denied.
+None of them is recorded as a forgery and no session is ended, although a writer who plants a seal
+of either shape gets the same treatment. **Do not raise the audit key's `min_decryption_version`
+while rows sealed under the older versions remain**: such a row is refused until the minimum is
+lowered again. A row is sealed again only when the engine writes it, and no command re-seals rows
+yet. Each process reports a row that keeps failing again only after an interval: five
 minutes for a sealed row, and an hour for a message or saved-search cell. What each refusal does
 is in the changelog entries for vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the
 next release, then [CHANGELOG.md](../CHANGELOG.md)). The seal format is

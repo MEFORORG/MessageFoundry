@@ -13,11 +13,12 @@
   with a `Retry-After`, the CLI prints one error line, and the engine logs an error and raises an
   `integrity_drift` alert under `authority-seal-transit`, each at most once per five minutes. It
   writes no `integrity.authority_seal_failed` row and ends no session, since an outage is not a
-  forgery. A seal naming a key version newer than the Vault node holds counts as that outage, and
-  one naming a version below the key's `min_decryption_version` is refused the same way, with a
-  503 and no `Retry-After`. So seal rows again before raising that minimum; no engine command does
-  that yet. `serve` seals and verifies fixed input at start, and refuses to start when the token
-  cannot.
+  forgery. A seal naming a key version one newer than the Vault node holds counts as that outage.
+  A seal naming a version below the key's `min_decryption_version` is denied without being
+  recorded as a forgery, and alerts under `authority-seal-transit-retired`. So do not raise that
+  minimum while rows sealed under the older versions remain: a row is sealed again only when the
+  engine writes it, and no command re-seals rows yet. `serve` seals and verifies fixed input at
+  start, and refuses to start when the token cannot.
   A row written on `vault_transit` before this change carries no seal, and is refused like any
   other unsealed row. Not yet built: the store id pin (vault BACKLOG #3411) and rollback
   detection. (vault BACKLOG #2592)

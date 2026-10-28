@@ -156,15 +156,15 @@ def run_cli(
     try:
         return dispatch[args.command](args)
     except Exception as exc:
+        code = floor_code(args) if floor_code is not None else None
         refused = refusal_text(exc) if refusal_text is not None else None
         if refused is not None:
-            return _emit_error(refused, as_json=as_json)
+            return _emit_error(refused, as_json=as_json, code=code)
         from messagefoundry.last_resort import report_uncaught
 
         text = report_uncaught(exc)
         if not as_json:
             return 1
-        code = floor_code(args) if floor_code is not None else None
         return _emit_error(text, as_json=True, code=code)
 
 

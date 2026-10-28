@@ -249,10 +249,15 @@ class TransitCipher(_UnmarkedPolicy):
         * ``key_version`` below the key's ``min_decryption_version`` raises
           :class:`~messagefoundry.store.crypto.RowSealVersionRetiredError`: the seal cannot be
           verified any more, which is not evidence that it was forged.
-        * ``key_version`` above the latest version this Vault node reports raises
-          :class:`CipherError`, an outage: a node that lags a rotation refuses a real, newer version.
-        * Inside the range, the refusal was about this string, such as a body Transit cannot read,
-          which a forged seal can carry, so it is ``False``.
+        * ``key_version`` one above the latest version this Vault node reports raises
+          :class:`CipherError`, an outage: a node that lags one rotation refuses a real, newer
+          version. Only one: a version further ahead is not lag, so it reads as ``False``, and a
+          planted giant version is still a failed seal.
+        * Otherwise the refusal was about this string, such as a body Transit cannot read, which a
+          forged seal can carry, so it is ``False``.
+
+        A seal planted with a version below the minimum, or exactly one above the latest, is
+        therefore not recorded as a forgery. It is still refused.
 
         A failed range read, and any other failure, is an outage and raises :class:`CipherError`.
         Blocking: the sealer calls it in a worker thread."""
@@ -274,7 +279,7 @@ class TransitCipher(_UnmarkedPolicy):
             lowest, latest = self._seal_key_versions()
             if key_version < lowest:
                 raise RowSealVersionRetiredError(key_version, lowest) from exc
-            if key_version > latest:
+            if key_version == latest + 1:
                 raise CipherError(
                     f"Transit refused a row seal naming key version {key_version}, newer than the "
                     f"latest version {latest} this Vault node holds (key={self._audit_key!r}); a "

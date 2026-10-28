@@ -164,6 +164,7 @@ from messagefoundry.store.row_seal import (
     RowSealError,
     Sealer,
     SealFailureThrottle,
+    TransitSealUnverifiableError,
 )
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
@@ -2962,6 +2963,20 @@ def oidc_client_auth_from_settings(
 
 #: The audit action written when an authority row fails its integrity seal (BACKLOG #2592).
 AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
+
+
+async def _unverifiable(check: Awaitable[bool]) -> bool | None:
+    """``check``'s answer, or ``None`` when the seal names a Transit key version below the key's
+    ``min_decryption_version`` (BACKLOG #2592). The row may be genuine, so a loader denies it
+    without reporting it as a failed seal or ending it, and a scan skips it rather than aborting.
+    The sealer has already logged the cause, throttled, and raised its alert. Any other refusal,
+    an outage included, still propagates."""
+    try:
+        return await check
+    except TransitSealUnverifiableError:
+        return None
+
+
 #: How much of a session's token hash a log line, audit row or alert names. Twelve hex characters, as
 #: the ``auth.session_revoked`` rows already record.
 _SESSION_REF_LEN: Final = 12
@@ -10018,8 +10033,12 @@ class AuthService:
 
     async def _session_row_holds(self, session: SessionRecord, sealer: Sealer | None) -> bool:
         """Whether an unrevoked session row's seal verifies; a row that fails is handed to
-        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592)."""
-        if await session_seal_ok(sealer, session):
+        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592). A seal Transit can no longer
+        verify (:func:`_unverifiable`) is denied and left alone: not ended, not reported."""
+        held = await _unverifiable(session_seal_ok(sealer, session))
+        if held is None:
+            return False
+        if held:
             return True
         await self._session_seal_failed(
             session.token_hash, key_changed=session_sealed_by_retired_key(sealer, session)
@@ -10171,7 +10190,13 @@ class AuthService:
         for attempt in range(2):
             grants = await self._store.get_user_role_grants(user.id)
             record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
-            if sealer is None or (record is not None and await user_seal_ok(sealer, record)):
+            if sealer is None or record is None:
+                held: bool | None = sealer is None
+            else:
+                held = await _unverifiable(user_seal_ok(sealer, record))
+            if held is None:
+                return None  # a seal Transit can no longer verify: denied, not reported
+            if held:
                 return VerifiedUser.of(user, sorted(g.role_id for g in grants))
             if attempt == 0:
                 reread = await self._store.get_user(user.id)
@@ -10269,9 +10294,11 @@ class AuthService:
         if found is None:
             return None
         row = RoleRow.from_mapping(found)
-        if await role_seal_ok(self._store.row_sealer(), row):
+        holds = await _unverifiable(role_seal_ok(self._store.row_sealer(), row))
+        if holds:
             return row
-        await self._role_seal_failed(row.id)
+        if holds is not None:  # None: a seal Transit can no longer verify, denied, not reported
+            await self._role_seal_failed(row.id)
         return None
 
     async def _load_custom_roles(self) -> list[tuple[RoleRow, bool]]:
@@ -10284,10 +10311,10 @@ class AuthService:
             row = RoleRow.from_mapping(found)
             if not is_custom_role_id(row.id):
                 continue  # a built-in resolves from code; its row grants nothing
-            holds = await role_seal_ok(sealer, row)
-            if not holds:
+            checked = await _unverifiable(role_seal_ok(sealer, row))
+            if checked is False:  # None: a seal Transit can no longer verify, not reported
                 await self._role_seal_failed(row.id)
-            out.append((row, holds))
+            out.append((row, bool(checked)))
         return out
 
     async def _custom_role_held(self, role_id: str) -> bool:

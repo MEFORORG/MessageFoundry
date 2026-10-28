@@ -320,9 +320,10 @@ class TransitSealUnverifiableError(TransitSealUnavailableError):
     under a version it keeps."""
 
 
-#: The alert hook a :class:`TransitRowSealer` calls with a PHI-free reason when it logs its
+#: The alert hook a :class:`TransitRowSealer` calls, with its cause (``"transit"`` for an outage,
+#: ``"transit-retired"`` for a retired key version) and a PHI-free reason, when it logs its
 #: throttled ERROR. ``serve`` arms it with the engine's alert sink.
-TransitSealAlertHook = Callable[[str], None]
+TransitSealAlertHook = Callable[[str, str], None]
 
 #: The label a Transit seal input starts with. It stands where the HKDF label stands under the
 #: local sealer, so a seal input never reads as another MAC's input under the same Transit key.
@@ -470,7 +471,7 @@ class TransitRowSealer:
             return
         log.error("%s (BACKLOG #2592): %s", reason, exc)
         if self._alert is not None:
-            self._alert(reason)
+            self._alert(key, reason)
 
     def _unavailable(self, exc: Exception) -> TransitSealUnavailableError:
         self._report(
@@ -486,7 +487,7 @@ class TransitRowSealer:
             "transit-retired",
             "a row seal names a transit key version below the key's min_decryption_version, so it"
             " cannot be verified; the operation was refused and no seal failure was recorded."
-            " Lower min_decryption_version until those rows are sealed again",
+            " Lower min_decryption_version again; rows are sealed again only when written",
             exc,
         )
         return TransitSealUnverifiableError(f"Transit row seal unverifiable: {exc}")

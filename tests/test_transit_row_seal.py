@@ -30,12 +30,13 @@ from messagefoundry.cli_common import run_cli
 from messagefoundry.config.settings import AuthSettings, EgressSettings, SecurityEnforcement
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import (
+    TRANSIT_SEAL_RETIRED_SUBJECT,
     TRANSIT_SEAL_SUBJECT,
     LoggingAlertSink,
     transit_seal_alert,
 )
 from messagefoundry.store import row_seal
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import RowSealVersionRetiredError, generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     SESSION_KIND,
@@ -287,11 +288,14 @@ async def test_a_refused_check_is_placed_against_the_key_version_range(
     assert await sealer.verify_async(SESSION_KIND, fields, good) is True
     assert await sealer.verify_async(SESSION_KIND, [("token_hash", "other")], good) is False
 
-    # Newer than this Vault node holds: a node lagging a rotation answers so. An outage, not a no.
-    newer = good.replace(":vault:v1:", ":vault:v9:")
+    # One newer than this Vault node holds: a node lagging a rotation answers so. An outage.
+    newer = good.replace(":vault:v1:", ":vault:v2:")
     with pytest.raises(TransitSealUnavailableError) as lagging:
         await sealer.verify_async(SESSION_KIND, fields, newer)
     assert not isinstance(lagging.value, TransitSealUnverifiableError)
+    # Further ahead is not lag: a planted giant version is a plain no, so it is still a forgery.
+    giant = good.replace(":vault:v1:", ":vault:v9:")
+    assert await sealer.verify_async(SESSION_KIND, fields, giant) is False
 
     # Inside the range, a 400 is about this string, which a forged seal can carry: a plain no.
     def refuses_the_body(**_: Any) -> dict[str, Any]:
@@ -329,8 +333,12 @@ async def test_a_seal_under_a_retired_version_is_refused_but_not_as_a_forgery(
     # A seal after the rotation names v2, so the sealer empties its cache of v1 answers.
     await _user(store, "seal-u2")
     await _mint(store, "seal-u2")
-    with pytest.raises(TransitSealUnverifiableError):
-        await service.identity_for_token(token)
+    # Denied as no session, quietly: the same answer an unknown token gets.
+    assert await service.identity_for_token(token) is None
+    # A scan skips the retired account rather than aborting, and a sign-in lookup of it answers as
+    # for an unknown name, so the refusal names no account.
+    assert [u.username for u in await service._load_users()] == ["seal-u2"]
+    assert await service._load_user_by_username("seal-u1") is None
     assert "min_decryption_version" in caplog.text
     assert _seal_failures(path) == 0
     row = await store.get_session(hash_token(token))
@@ -439,6 +447,11 @@ async def test_an_outage_alerts_once_per_window(
         with pytest.raises(TransitSealUnavailableError):
             await sealer.seal_async(SESSION_KIND, [("token_hash", "x")])
     assert len(raised) == 1 and raised[0][0] == TRANSIT_SEAL_SUBJECT
+    # A retired version is its own cause, so the outage's alert does not throttle it away.
+    transit.down = False
+    with pytest.raises(TransitSealUnverifiableError):
+        raise sealer._unverifiable(RowSealVersionRetiredError(1, 2))
+    assert [name for name, _ in raised] == [TRANSIT_SEAL_SUBJECT, TRANSIT_SEAL_RETIRED_SUBJECT]
     assert "synthetic Vault outage" not in raised[0][1]  # a fixed sentence, never Vault's text
 
 

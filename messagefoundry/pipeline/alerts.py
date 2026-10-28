@@ -1389,23 +1389,31 @@ def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
 
 
 #: The ``integrity_drift`` subject for an authority row seal that could not be made or checked
-#: through Vault transit: an outage, or a seal under a retired key version (BACKLOG #2592). Its own
-#: subject, apart from :data:`AUTHORITY_SEAL_SUBJECT`, because neither is a failed seal.
+#: because Vault transit did not answer (BACKLOG #2592). Its own subject, apart from
+#: :data:`AUTHORITY_SEAL_SUBJECT`, because it is not recorded as a failed seal.
 TRANSIT_SEAL_SUBJECT = "authority-seal-transit"
+#: The subject for a seal under a key version below the key's ``min_decryption_version``. Apart
+#: from :data:`TRANSIT_SEAL_SUBJECT`, so a passing outage never throttles away this one, which needs
+#: an operator.
+TRANSIT_SEAL_RETIRED_SUBJECT = "authority-seal-transit-retired"
 
 
-def transit_seal_alert(sink: AlertSink) -> Callable[[str], None]:
+def transit_seal_alert(sink: AlertSink) -> Callable[[str, str], None]:
     """An alert hook for :meth:`~messagefoundry.store.row_seal.TransitRowSealer.set_alert_hook`:
-    each call raises ``integrity_drift`` under :data:`TRANSIT_SEAL_SUBJECT`. The sealer calls it on
-    its own throttled ERROR path only, so at most once per throttle window per cause.
+    each call raises ``integrity_drift`` under :data:`TRANSIT_SEAL_RETIRED_SUBJECT` for the
+    ``"transit-retired"`` cause and :data:`TRANSIT_SEAL_SUBJECT` for any other. The sealer calls it
+    on its own throttled ERROR path only, so at most once per throttle window per cause.
 
     The reason is a fixed sentence, never Vault's text or a row value. Never raises."""
 
-    def _raise(reason: str) -> None:
+    def _raise(cause: str, reason: str) -> None:
+        subject = (
+            TRANSIT_SEAL_RETIRED_SUBJECT if cause == "transit-retired" else TRANSIT_SEAL_SUBJECT
+        )
         try:
-            sink.integrity_drift(TRANSIT_SEAL_SUBJECT, reason=reason, drift_count=1)
-        except Exception:  # noqa: BLE001 -- an alert-sink failure must never break a request
-            log.warning("transit row seal alert could not be delivered")
+            sink.integrity_drift(subject, reason=reason, drift_count=1)
+        except Exception as exc:  # noqa: BLE001 -- an alert-sink failure must never break a request
+            log.warning("transit row seal alert could not be delivered: %s", type(exc).__name__)
 
     return _raise
 
