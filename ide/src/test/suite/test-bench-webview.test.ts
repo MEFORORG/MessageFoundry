@@ -139,7 +139,7 @@ function clone(p: Payload): Payload {
  * nothing threw. The no-throw half matters: a renderer that crashed partway would also leave
  * `detail` alone, and would read here as a discard it is not.
  */
-function assertDiscarded(payload: Payload, why: string): void {
+function assertDiscarded(payload: Payload, why: string): Bench {
   const b = bench();
   b.detail.innerHTML = SENTINEL;
   const before = { html: b.detail.innerHTML, d: b.detail.style.display, r: b.results.style.display };
@@ -148,7 +148,16 @@ function assertDiscarded(payload: Payload, why: string): void {
   assert.strictEqual(b.detail.innerHTML, before.html, `${why}: detail was re-rendered`);
   assert.strictEqual(b.detail.style.display, before.d, `${why}: detail visibility changed`);
   assert.strictEqual(b.results.style.display, before.r, `${why}: results visibility changed`);
+  // A discard may warn, but only in one of the two fixed forms, so no case echoes message text.
+  for (const w of b.warnings) {
+    assert.match(w, DISCARD_WARNING, `${why}: the warning is not one of the fixed forms: ${w}`);
+  }
+  return b;
 }
+
+/** The only warnings a discard writes: a type the page declares, or the fixed unknown-kind phrase. */
+const DISCARD_WARNING =
+  /^MessageFoundry Test Bench: discarded a malformed (?:"(?:detail|trace|hex|collections|collectionRun|caseDetail)" message|message of an unknown kind)$/;
 
 /** Assert that `payload` RENDERS, and return the bench so the caller can inspect what rendered. */
 function assertRendered(payload: Payload, why: string, state: Record<string, unknown> | null = null): Bench {
@@ -516,11 +525,26 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
     ]);
   });
 
-  test("an unknown type is discarded, as it was before the shape check", () => {
-    assertDiscarded({ type: "nothingWeRender", source: "a.hl7" }, "unknown type");
-    assertDiscarded({ type: 7 }, "numeric type");
-    assertDiscarded({ type: "hasOwnProperty" }, "a type naming an Object.prototype member");
-  });
+  // One test per case, so a failure names the case. The whole warning is fixed text, so nothing
+  // the message carried reaches the console (BACKLOG #1123).
+  const unknownTypes: [Payload, string][] = [
+    [{ type: "nothingWeRender", source: "a.hl7" }, "unknown type"],
+    [{ type: 7 }, "numeric type"],
+    [{ type: "hasOwnProperty" }, "a type naming an Object.prototype member"],
+    [{ type: `"'><img src=x onerror=1> PID|1||A123`, source: "a.hl7" }, "a type carrying quotes and markup"],
+    [{ type: ["PID|1||A123"] }, "a list type, which String()s to its text"],
+  ];
+  for (const [payload, why] of unknownTypes) {
+    test(`an unknown type is discarded, and its warning carries no text from the message: ${why}`, () => {
+      const b = assertDiscarded(payload, why);
+      assert.deepStrictEqual(
+        b.warnings,
+        ["MessageFoundry Test Bench: discarded a malformed message of an unknown kind"],
+        `${why}: the discard was not reported with the fixed phrase`,
+      );
+      assert.ok(!b.warnings.some((w) => w.includes(String(payload.type))), `${why}: the type was echoed`);
+    });
+  }
 });
 
 suite("Test Bench webview — escaping still applies to a well-formed payload", () => {
@@ -717,7 +741,11 @@ suite("Test Bench webview — a collection run reveals values one case at a time
       assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw instead of discarding`);
       assert.strictEqual(b.detail.innerHTML, shown, `${why}: detail was re-rendered`);
       // The discard must come from the shape check, not from the stale-reply check behind it.
-      assert.ok(b.warnings.some((w) => w.includes('discarded a malformed "caseDetail"')), `${why}: not a shape discard`);
+      assert.deepStrictEqual(
+        b.warnings,
+        ['MessageFoundry Test Bench: discarded a malformed "caseDetail" message'],
+        `${why}: not a shape discard, or the warning carried more`,
+      );
     }
   });
 

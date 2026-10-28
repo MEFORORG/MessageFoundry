@@ -861,9 +861,9 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     **The one exception covers cleartext legs only.** A caller-set header that its connection
     admitted when it was built is sent on the cleartext leg to the proxy that connection's
     ``transports.rest.ProxyConfig`` names. The admitting check is the connection's posture-keyed
-    guard, ``transports.rest.refuse_cleartext_credential_hop``. It admits a ``proxy_user``
-    credential in at least these cases: under ``[security].enforcement = warn``, where it logs a
-    WARNING, and when the connection declares ``cleartext_accepted`` or ``tls_hop_attested``. The
+    guard, ``transports.rest.proxy_auth_handler_from_settings``. It admits a ``proxy_user``
+    credential when the connection declares ``cleartext_accepted`` or ``tls_hop_attested``, or the
+    proxy is on this machine. The
     connection's proxy handler then carries ``caller_header_admitted``. The exception covers that
     header in its plain spelling only, under a name that is a ``str`` and no subclass of one.
     Every other spelling :func:`is_proxy_credential_header_name` reads is never admitted, and

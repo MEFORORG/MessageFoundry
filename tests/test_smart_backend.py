@@ -440,31 +440,31 @@ def test_cleartext_token_url_is_decided_by_the_one_authority(
         )
 
 
-def test_cleartext_token_url_crosses_on_a_per_connection_declaration(
+def test_cleartext_token_url_is_refused_and_names_the_connection(
     monkeypatch: pytest.MonkeyPatch, rsa_pem: str
 ) -> None:
-    """The other arm: the connection's OWN declaration crosses it — loudly, audited, and named by the
-    loosening registry. Without it, an operator whose legacy IdP has no TLS listener would be pushed
-    into writing a false ``tls_hop_attested``, the defect ADR 0153 exists to remove."""
+    """Vault BACKLOG #3533 item 4 (owner ruling 2026-10-26): the signed client assertion never
+    crosses cleartext http off-box. The provider takes no declaration any more; the settings test
+    below shows a mirrored one does not lift the refusal."""
     from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(HopPosture(enforcing=True)):
-        provider = SmartBackendTokenProvider(
+    with (
+        active_hop_posture(HopPosture(enforcing=True)),
+        pytest.raises(SmartAuthError, match="use https") as exc,
+    ):
+        SmartBackendTokenProvider(
             token_url="http://auth.example/token",
             client_id="c",
             private_key=rsa_pem,
-            cleartext_accepted=True,
-            cleartext_reason="legacy IdP has no TLS listener",
             connection="OB_LEGACY",
         )
-    assert provider.token_url == "http://auth.example/token"
+    assert "OB_LEGACY" in str(exc.value)
 
 
-def test_token_provider_from_settings_reads_the_declaration(rsa_pem: str) -> None:
-    """The settings-driven seam: `_dest_config` mirrors the declaration (and the connection name) into
-    the resolved settings, and this factory must READ it — otherwise the graph-authored pair never
-    reaches the token-endpoint gate and a declared connection dies at construction."""
+def test_token_provider_from_settings_names_the_mirrored_connection(rsa_pem: str) -> None:
+    """The settings-driven seam still reads the mirrored connection name, so the refusal says
+    which connection to fix, though the mirrored declaration no longer lifts it."""
     from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
     from messagefoundry.transports.smart import token_provider_from_settings
 
@@ -476,9 +476,11 @@ def test_token_provider_from_settings_reads_the_declaration(rsa_pem: str) -> Non
         "cleartext_reason": "legacy IdP has no TLS listener",
         "connection_name": "OB_LEGACY",
     }
-    with active_hop_posture(HopPosture(enforcing=True)):
-        provider = token_provider_from_settings(settings)
-    assert provider is not None
+    with (
+        active_hop_posture(HopPosture(enforcing=True)),
+        pytest.raises(SmartAuthError, match="OB_LEGACY"),
+    ):
+        token_provider_from_settings(settings)
 
 
 def test_missing_client_id_refused(rsa_pem: str) -> None:

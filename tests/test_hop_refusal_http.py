@@ -23,6 +23,7 @@ Nothing hits the network: refusals fire at construction, and the one send test u
 from __future__ import annotations
 
 import re
+import urllib.request
 from typing import Any
 
 import pytest
@@ -41,6 +42,7 @@ from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import (
     InsecureHopGuard,
     refuse_cleartext_credential_hop,
+    refuse_cleartext_credentials,
     refuse_cleartext_egress,
     refuse_verify_off,
 )
@@ -437,11 +439,13 @@ def test_a_neutral_named_static_header_over_verify_off_is_refused(
     assert "its credentials (" not in message  # a header refused for its name is not a credential
     assert "Or remove the header" in message  # the one listed item that removal can clear
     # It names the places the refusal cannot see, never the whole url: it does see a
-    # credential-named query parameter.
+    # credential-named query parameter. A dynamic header is judged at send since vault BACKLOG
+    # #3533 item 6, so the text says that instead of calling it a blind spot.
     assert (
-        "Moving a secret into the url path, a query parameter with a neutral name or a dynamic "
-        "header is not a fix" in message
+        "Moving a secret into the url path or a query parameter with a neutral name is not a fix"
+        in message
     )
+    assert "A dynamic header outside the allowlist is refused at send." in message
     _assert_credential_refusal(exc)
 
 
@@ -611,22 +615,268 @@ def test_soap_ws_username_cleartext_refused_on_prod(monkeypatch: pytest.MonkeyPa
         )
 
 
-def test_soap_ws_username_cleartext_attested_allowed_on_prod(
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_soap_ws_username_cleartext_refused_whatever_the_declaration(
+    declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3533 item 4: no declaration lets a credential cross cleartext http off-box."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with (
+        active_hop_posture(_PROD),
+        pytest.raises(InsecureHopRefused, match="UsernameToken credential.*with no escape"),
+    ):
+        _build(
+            _CLEARTEXT["SOAP"],
+            **{declared: True},
+            soap_version="1.2",
+            ws_security=True,
+            ws_username="u",
+            ws_password="p",  # noqa: S106 — synthetic test credential, not a real secret
+        )
+
+
+# --- vault BACKLOG #3533 item 4: no declaration carries a credential across cleartext http ------
+#
+# Owner ruling 2026-10-26: a credential is refused across an off-box cleartext hop that
+# tls_hop_attested or cleartext_accepted would otherwise let through, and the credential test
+# counts the credentials the verify_tls=false rule counts, header names in any case. It does not
+# take that rule's name allowlist: the ruling names credentials only.
+
+#: Each a credential the cleartext rule must count. The last three are static headers the old
+#: test, which keyed on the exact name ``Authorization``, did not see.
+_ITEM4_CREDENTIALS: dict[str, dict[str, Any]] = {
+    "bearer token": {"bearer_token": "synthetic-token"},
+    "lower-case authorization header": {"headers": {"authorization": "Bearer synthetic-token"}},
+    "api-key header": {"headers": {"X-Api-Key": "synthetic-key"}},
+    "credential value under a neutral name": {"headers": {"X-Session": "Bearer synthetic-token"}},
+}
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+@pytest.mark.parametrize("credential", list(_ITEM4_CREDENTIALS))
+def test_a_declared_cleartext_hop_refuses_every_credential(
+    cell: str, declared: str, credential: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with (
+        active_hop_posture(_PROD),
+        pytest.raises(
+            InsecureHopRefused, match="HTTP cleartext credentials: .*with no escape"
+        ) as exc,
+    ):
+        _build(_CLEARTEXT[cell], **{declared: True}, **_ITEM4_CREDENTIALS[credential])
+    assert "connection 'OB'" in str(exc.value)
+    assert "synthetic" not in str(exc.value)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_a_declared_cleartext_hop_carries_a_neutral_static_header(
+    cell: str, declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verify-off header allowlist does not apply to a declared cleartext hop: the owner's
+    ruling on item 4 refuses credentials only, so a header with a neutral name and value crosses.
+    Whether the allowlist should apply here too is an open owner question."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD):
+        dest = _build(
+            _CLEARTEXT[cell],
+            **{declared: True},
+            headers={"Prefer": "return=minimal", "X-Correlation-Id": "c1"},
+        )
+    assert dest is not None
+
+
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_a_static_proxy_authorization_with_no_proxy_is_refused_at_build(
+    declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-2 review finding 3: with no proxy configured, a static ``Proxy-Authorization`` would
+    go to the destination, so it counts as a credential and refuses the hop at build, rather than
+    building and failing each send with a retryable error."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with (
+        active_hop_posture(_PROD),
+        pytest.raises(
+            InsecureHopRefused, match="HTTP cleartext credentials: .*Proxy-Authorization"
+        ),
+    ):
+        _build(
+            _CLEARTEXT["REST"],
+            **{declared: True},
+            headers={"Proxy-Authorization": "Basic synthetic"},
+        )
+
+
+def test_a_credential_typed_into_a_proxy_authorization_key_is_not_echoed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Review round 3: with no proxy, a Proxy-Authorization spelling now refuses the cleartext
+    hop at build, and its key may hold a credential typed into the name (vault BACKLOG #3457). The
+    refusal shows the key only as far as the plain name."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD), pytest.raises(InsecureHopRefused) as exc:
+        _build(
+            _CLEARTEXT["REST"],
+            accepted=True,
+            headers={"Proxy-Authorization Basic c3ludGhldGljOnB3": "x"},
+        )
+    text = str(exc.value)
+    assert "Proxy-Authorization" in text
+    assert "c3ludGhldGljOnB3" not in text
+
+
+# --- Lander finding 2 on engine PR 2576: a proxy_url this hop does not use -----------------------
+#
+# The static Proxy-Authorization is left to the send-time proxy rule only when the request goes
+# to a proxy. A hop the proxy bypasses goes direct, where that rule refuses the header on every
+# send, retryably, until the message dead-letters. So such a hop counts the header and refuses at
+# build, as a hop with no proxy does.
+
+_PROXY = "http://127.0.0.1:3128"
+
+
+def _build_beside_a_proxy(cell: str, **proxy: Any) -> DestinationConnector:
+    spec: tuple[Any, Any, str] = _CLEARTEXT[cell]
+    ctype, factory, url = spec
+    settings = {
+        **factory(url=url, headers={"Proxy-Authorization": "Basic synthetic"}).settings,
+        **proxy,
+    }
+    with active_hop_posture(_PROD):
+        return build_destination(
+            Destination(
+                name="OB",
+                type=ctype,
+                settings=settings,
+                cleartext_accepted=True,
+                cleartext_reason="vendor firmware predates TLS",
+            ),
+            egress=EgressSettings(deny_by_default=False, allowed_proxy=["127.0.0.1"]),
+        )
+
+
+def _pin_system_proxy(
+    monkeypatch: pytest.MonkeyPatch, proxies: dict[str, str], *, bypass: bool = False
+) -> None:
+    """Pin the system proxy map and urllib's bypass list, so the host's own proxy settings
+    cannot decide a case."""
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: dict(proxies))
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: bypass)
+
+
+#: Each way a configured proxy_url leaves this hop direct.
+_BYPASSED: dict[str, dict[str, Any]] = {
+    "proxy_no_proxy names the host": {"proxy_url": _PROXY, "proxy_no_proxy": ["*"]},
+    "urllib's own bypass list names the host": {"proxy_url": _PROXY},
+    "default with no system proxy": {"proxy_url": "default"},
+}
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("case", list(_BYPASSED))
+def test_a_static_proxy_authorization_on_a_bypassed_hop_is_refused_at_build(
+    cell: str, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _pin_system_proxy(monkeypatch, {}, bypass=case.startswith("urllib"))
+    with pytest.raises(
+        InsecureHopRefused, match="HTTP cleartext credentials: .*Proxy-Authorization"
+    ) as exc:
+        _build_beside_a_proxy(cell, **_BYPASSED[case])
+    assert "synthetic" not in str(exc.value)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("proxy_url", [_PROXY, "default"])
+def test_control_a_static_proxy_authorization_on_a_proxied_hop_still_builds(
+    cell: str, proxy_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm above refuses for the bypass, not for the header: the same header on a hop that
+    does reach a proxy, configured or the system's, is left to the send-time proxy rule."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _pin_system_proxy(monkeypatch, {"http": _PROXY, "https": _PROXY})
+    assert _build_beside_a_proxy(cell, proxy_url=proxy_url) is not None
+
+
+# --- Lander finding 3 on engine PR 2576: a credential typed into a header key -------------------
+
+#: Each a key the refusal must not echo, with the part that would be the credential.
+_KEYS_WITH_A_CREDENTIAL = {
+    "scheme and token": ("Authorization Bearer tok", "tok"),
+    "jwt-shaped key": ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl", "c2lnbmF0dXJl"),
+    "tab inside": ("X-Api-Key\tsekrit", "sekrit"),
+}
+
+
+@pytest.mark.parametrize("case", list(_KEYS_WITH_A_CREDENTIAL))
+@pytest.mark.parametrize("hop", ["cleartext", "verify-off"])
+def test_a_credential_typed_into_a_header_key_is_not_echoed(
+    case: str, hop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    key, secret = _KEYS_WITH_A_CREDENTIAL[case]
+    with active_hop_posture(_PROD), pytest.raises(ValueError) as exc:
+        if hop == "cleartext":
+            _build(_CLEARTEXT["REST"], accepted=True, headers={key: "Bearer v"})
+        else:
+            _build_raw("REST", {"verify_tls": False, "headers": {key: "Bearer v"}})
+    text = str(exc.value)
+    assert secret not in text
+    assert "[a key withheld]" in text
+
+
+@pytest.mark.parametrize("hop", ["cleartext", "verify-off"])
+def test_control_a_plain_header_key_is_still_named(
+    hop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm above withholds the key for its shape: a plain header name is still shown, so the
+    operator can find the header."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD), pytest.raises(ValueError) as exc:
+        if hop == "cleartext":
+            _build(_CLEARTEXT["REST"], accepted=True, headers={"X-Api-Key": "x"})
+        else:
+            _build_raw("REST", {"verify_tls": False, "headers": {"X-Api-Key": "x"}})
+    assert "X-Api-Key header" in str(exc.value)
+    assert "withheld" not in str(exc.value)
+
+
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_control_a_soap_ws_username_without_ws_security_sends_no_token(
+    declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ws_security off no UsernameToken is stamped, so the WS-Security refusal does not fire
+    on a declared cleartext hop (review round 1 of this change)."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD):
+        assert _build(_CLEARTEXT["SOAP"], **{declared: True}, ws_username="u") is not None
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_control_a_declared_cleartext_hop_with_no_credential_still_crosses(
+    cell: str, declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal above is for the credential, not the declared hop: an allowlisted header with
+    a plain value still crosses, so the arm above cannot pass by refusing every declared hop."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_PROD):
         assert (
-            _build(
-                _CLEARTEXT["SOAP"],
-                attested=True,
-                soap_version="1.2",
-                ws_security=True,
-                ws_username="u",
-                ws_password="p",  # noqa: S106 — synthetic test credential, not a real secret
-            )
-            is not None
+            _build(_CLEARTEXT[cell], **{declared: True}, headers={"X-Request-ID": "r1"}) is not None
         )
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("credential", list(_ITEM4_CREDENTIALS))
+def test_control_a_loopback_cleartext_hop_still_carries_a_credential(
+    cell: str, credential: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On-box loopback stays the one way across, so a local test peer keeps working."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD):
+        assert _build(_LOOPBACK[cell], **_ITEM4_CREDENTIALS[credential]) is not None
 
 
 # --- the FhirLookup read path (a cleartext read pulls PHI back over the wire) -------------------------
@@ -789,13 +1039,14 @@ def _cleartext_egress(scheme: str, url: str, **declared: Any) -> object:
     return refuse_cleartext_egress(scheme, url, connection=None, **declared)
 
 
-def _cleartext_credential(scheme: str, url: str, **declared: Any) -> object:
+def _cleartext_credential(scheme: str, url: str) -> object:
+    # No declaration reaches the credential rule (vault BACKLOG #3533 item 4), so it takes none;
+    # test_the_credential_rule_takes_no_declaration pins that.
     refuse_cleartext_credential_hop(
         scheme,
         url,
         credential="credential (Authorization header)",
         connection=None,
-        **declared,
     )
     return None
 
@@ -827,7 +1078,17 @@ def test_a_hop_with_no_host_is_refused_not_treated_as_loopback(
         fn(scheme, f"{scheme}://{authority}/x")
 
 
-@pytest.mark.parametrize("guard", list(_HOST_GUARDS))
+def test_the_credential_rule_takes_no_declaration() -> None:
+    """Vault BACKLOG #3533 item 4: neither credential refusal accepts a declaration, so none can
+    lift it. A re-added parameter fails here before any arm could quietly cross."""
+    import inspect
+
+    for fn in (refuse_cleartext_credential_hop, refuse_cleartext_credentials):
+        params = set(inspect.signature(fn).parameters)
+        assert not params & {"attested", "cleartext_accepted", "cleartext_reason"}, fn.__name__
+
+
+@pytest.mark.parametrize("guard", [g for g in _HOST_GUARDS if g != "cleartext credential"])
 def test_no_declaration_or_escape_crosses_the_no_host_refusal(
     guard: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

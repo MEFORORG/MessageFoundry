@@ -8,6 +8,7 @@ import * as path from "path";
 import { nonce } from "../../cspNonce";
 import { assertBrowsableUrl, assertTargetAllowed } from "../../engineTarget";
 import { getJson, postJson } from "../../engineClient";
+import type { EngineTlsOptions } from "../../engineClient";
 import { WEBVIEW_GUARD_NOTE } from "../../webviewMessaging";
 
 // Four hardening properties of the extension, asserted against the SOURCE as well as against
@@ -282,13 +283,13 @@ suite("https requests carry a pinned TLS floor", () => {
   // __importStar copy whose properties are getters onto the real module, so assigning to the copy
   // fails and assigning to the module is what both this file and engineClient.ts observe.
   const httpsModule = require("node:https") as { request: typeof httpsTypes.request };
-  let captured: httpsTypes.RequestOptions | undefined;
+  let captured: EngineTlsOptions | undefined;
   let realRequest: typeof httpsTypes.request;
 
   setup(() => {
     captured = undefined;
     realRequest = httpsModule.request;
-    httpsModule.request = ((_url: unknown, options: httpsTypes.RequestOptions): unknown => {
+    httpsModule.request = ((_url: unknown, options: EngineTlsOptions): unknown => {
       captured = options;
       throw new Error("intercepted before the socket");
     }) as unknown as typeof httpsTypes.request;
@@ -298,16 +299,19 @@ suite("https requests carry a pinned TLS floor", () => {
     httpsModule.request = realRequest;
   });
 
-  test("getJson over https pins minVersion to TLSv1.2", async () => {
+  // The group floor is BACKLOG #300; engine-client-dh.test.ts shows it refusing a real handshake.
+  test("getJson over https pins minVersion to TLSv1.2 and minDHSize to 2048", async () => {
     await assert.rejects(getJson("https://engine.example.com", "/health"));
     assert.ok(captured, "the interceptor never ran — the test proves nothing");
     assert.strictEqual(captured!.minVersion, "TLSv1.2");
+    assert.strictEqual(captured!.minDHSize, 2048);
   });
 
-  test("postJson over https pins minVersion to TLSv1.2", async () => {
+  test("postJson over https pins minVersion to TLSv1.2 and minDHSize to 2048", async () => {
     await assert.rejects(postJson("https://engine.example.com", "/promote", { a: 1 }));
     assert.ok(captured, "the interceptor never ran — the test proves nothing");
     assert.strictEqual(captured!.minVersion, "TLSv1.2");
+    assert.strictEqual(captured!.minDHSize, 2048);
   });
 
   test("a plain-http request does not go through the https transport at all", async () => {
