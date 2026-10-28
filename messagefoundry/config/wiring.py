@@ -7155,7 +7155,9 @@ def inbound(
     listener that sets ``tls_ca_file`` without ``tls_crl_file``. It needs a written
     ``tls_revocation_attested_reason``, recorded in the WARNING audit line logged whenever the
     attestation suppresses that refusal. Prefer ``tls_crl_file``, which checks revocation in the engine.
-    Also a ``connections.toml`` key."""
+    On an ``Ftp(tls=True)`` poller, which dials out, the same pair attests the partner SERVER's
+    certificates instead, and crosses the refusal of an off-box poll with no ``[tls].crl_file`` on
+    its context (BACKLOG #2193). Also a ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_inbound(
         build_inbound_connection(

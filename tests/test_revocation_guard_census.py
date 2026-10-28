@@ -182,8 +182,10 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/transports/fhir.py::FhirLookupExecutor.__init__": Guarded(),
     "messagefoundry/transports/mllp.py::MLLPDestination.__init__": Guarded(),
     "messagefoundry/transports/remotefile.py::_FtpClient.__init__": Guarded(
-        by="messagefoundry/transports/remotefile.py::RemoteFileDestination.__init__",
-        note="the FTPS upload. The inbound FTPS poll builds the same client and is " + _UNGATED,
+        by="messagefoundry/transports/remotefile.py::_guard_ftps_revocation",
+        note="the FTPS upload and the inbound FTPS poll: RemoteFileDestination.__init__ and "
+        "RemoteFileSource.__init__ each call the guard on the client's own context (BACKLOG "
+        "#2193). This census does not follow those two calls; the behaviour tests do",
     ),
     "messagefoundry/transports/rest.py::RestDestination.__init__": Guarded(),
     "messagefoundry/transports/smart.py::_TokenEndpointProvider._open_token_hop": Guarded(

@@ -77,7 +77,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any, NamedTuple, TypeVar
+from typing import Any, Literal, NamedTuple, TypeVar
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -2059,6 +2059,40 @@ def _make_client(
     raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
 
 
+def _guard_ftps_revocation(
+    client: _RemoteClient,
+    s: dict[str, Any],
+    *,
+    direction: Literal["destination", "source"],
+    what: Literal["upload", "poll"],
+    attested: bool,
+    attested_reason: str | None,
+    connection: str | None,
+) -> None:
+    """Run the ADR 0173 revocation-hop guard on a verifying FTPS hop, either direction (BACKLOG
+    #2193): stdlib ssl checks no OCSP or CRL, so a revoked server certificate would otherwise be
+    accepted on a hop that carries message files and the FTP login.
+
+    Called AFTER ``client`` is built, and handed the context that client will really dial with, so
+    a ``[tls].crl_file`` that reached this hop relaxes the refusal and a hop it never reached keeps
+    it (vault BACKLOG #2188). Keyed on the context, as MLLP's is: sftp and plain ftp build none,
+    and a ``tls_verify=false`` context verifies nothing, so the refusals that own those hops stay
+    the only gate on them. A CRL that is configured but cannot be loaded never gets here: the
+    context build refuses it first (``harden_crl_check``)."""
+    context = client.tls_context
+    if context is None or context.verify_mode is ssl.CERT_NONE:
+        return
+    RevocationHopGuard.capture(
+        host=str(s["host"]),
+        cell=f"REMOTEFILE ftps {direction}",
+        description=f"verified FTPS {what} (no revocation check)",
+        attested=attested,
+        attested_reason=attested_reason,
+        connection=connection,
+        context=context,
+    ).enforce_construction()
+
+
 def _anon_ftp_guard(
     s: dict[str, Any],
     *,
@@ -2179,24 +2213,15 @@ class RemoteFileDestination(DestinationConnector):
         self._client = _make_client(
             s, trust_anchor_policy=config.trust_anchor_policy, name=config.name
         )
-        # BACKLOG #2193 (ADR 0173): a verifying FTPS upload validates the server certificate, but
-        # stdlib ssl checks no OCSP or CRL, so a revoked certificate would still be accepted on a hop
-        # that carries message files and the FTP login. Taken AFTER the client is built and handed
-        # the context that client will really dial with, so a [tls].crl_file that reached this hop
-        # relaxes the refusal and a hop it never reached keeps it. Keyed on the context, as MLLP's
-        # is: sftp and plain ftp build none, and a tls_verify=false context verifies nothing, so
-        # the refusals that own those hops stay the only gate on them.
-        ftps_context = self._client.tls_context
-        if ftps_context is not None and ftps_context.verify_mode is not ssl.CERT_NONE:
-            RevocationHopGuard.capture(
-                host=str(s["host"]),
-                cell="REMOTEFILE ftps destination",
-                description="verified FTPS upload (no revocation check)",
-                attested=config.tls_revocation_attested,
-                attested_reason=config.tls_revocation_attested_reason,
-                connection=config.name,
-                context=ftps_context,
-            ).enforce_construction()
+        _guard_ftps_revocation(
+            self._client,
+            s,
+            direction="destination",
+            what="upload",
+            attested=config.tls_revocation_attested,
+            attested_reason=config.tls_revocation_attested_reason,
+            connection=config.name,
+        )
         self._settings = s
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
@@ -2441,6 +2466,18 @@ class RemoteFileSource(SourceConnector):
         # and its warnings and refusals spell it inbound:<name>, as _validate_common above does.
         self._client = _make_client(
             s, trust_anchor_policy=config.trust_anchor_policy, name=self._connection
+        )
+        # BACKLOG #2193 slice (a): the poll sends the same FTP login and reads message files, so it
+        # takes the upload's guard. Its [tls].crl_file arrives through the policy above (#2370), and
+        # its attestation is the inbound's typed tls_revocation_attested pair.
+        _guard_ftps_revocation(
+            self._client,
+            s,
+            direction="source",
+            what="poll",
+            attested=config.tls_revocation_attested,
+            attested_reason=config.tls_revocation_attested_reason,
+            connection=self._connection or None,
         )
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])

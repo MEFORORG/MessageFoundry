@@ -1500,7 +1500,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** the engine's refusal of a *verifying* TLS hop that checks no certificate
   revocation. On an outbound hop that is the `RevocationHopGuard` refusal (stdlib `ssl` fetches no
   OCSP or CRL). On an mTLS listener it is the `check_inbound_revocation` refusal of a listener with
-  `tls_ca_file` and no `tls_crl_file`. With the attestation set, a revoked but unexpired certificate on
+  `tls_ca_file` and no `tls_crl_file`. On an `Ftp(tls=True)` poller, the one inbound that dials out
+  and verifies a server, it is the outbound `RevocationHopGuard` refusal (BACKLOG #2193). With the
+  attestation set, a revoked but unexpired certificate on
   that hop is accepted **unless your PKI or terminator stops it**, because the engine will not.
   **On a `FhirLookup`, one declaration lifts two refusals** (BACKLOG #2193): the https read to the
   FHIR server, and the SMART token endpoint the lookup signs in to. Those are often two hosts, so
