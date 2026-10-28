@@ -120,9 +120,9 @@ LOCK_EVENT_ACTIONS: Final[frozenset[str]] = frozenset(
 LOCKED_REFUSAL_DETAIL: Final = json.dumps({"reason": "locked"}, sort_keys=True)
 #: The exact detail a directory (Kerberos or OIDC) lock refusal stored under ``auth.login_failed``
 #: before BACKLOG #3726 gave it :data:`DIRECTORY_LOGIN_LOCKED_ACTION`. No writer stores it now.
-#: RETAINED DELIBERATELY (batch 458 Manager decision): removing a filter was not #3726's call. It
-#: stays in the exclusion below, and uncounted by the sign-in burst signal, so a row in that shape
-#: still never shows a reader without ``users:manage`` a lock, until its own follow-up row decides.
+#: RETAINED DELIBERATELY: removing a filter was out of #3726's scope. It stays in the exclusion
+#: below, and uncounted by the sign-in burst signal, until the dead-directory-lock-filter removal,
+#: unallocated follow-up work, decides.
 DIRECTORY_LOCKED_REFUSAL_DETAIL: Final = json.dumps(
     {"provider": "ad", "reason": "locked"}, sort_keys=True
 )

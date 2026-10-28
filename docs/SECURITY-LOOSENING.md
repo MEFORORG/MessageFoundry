@@ -1006,8 +1006,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   method stays floored. Each exempted pass records the matched values as `callback_floor_exempt_amr`
   on its audit rows, failed attempts included; [SECURITY.md](SECURITY.md), *What these floors do
   not do*, says which rows. Review those rows. A directory lock refusal carries the marker too
-  (BACKLOG #3726), but the audit read routes show that row only to a reader holding
-  `users:manage`, such as an Administrator. An Auditor does not see it (owner ruling 2026-09-28),
+  (BACKLOG #3726), but the trail's read routes (at least `GET /audit`, the exports and
+  `/ui/audit`) show that row only to a reader holding `users:manage`, such as an Administrator; the
+  account holder's own `/me/security-events` feed is unfiltered. An Auditor reading the trail does
+  not see it (owner ruling 2026-09-28),
   so a review that must include exempted attempts against locked accounts needs an Administrator.
   Load refuses a value `oidc_mfa_amr_values` also accepts while the claim gate is
   on, since that value would exempt every token the gate admits by it.

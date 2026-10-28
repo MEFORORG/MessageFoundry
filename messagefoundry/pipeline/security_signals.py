@@ -18,12 +18,13 @@ commit and its tee) is missed here too.
 
 **What a detector never sends.** No message body, no message id, no audit row ``detail`` and no
 typed username. The sign-in detector keys on the client address for that last reason: a typed
-username can be a password typed into the wrong box. It counts ``auth.login_failed``, which at
-least every refused local sign-in writes once in every lock state (``auth/audit_visibility.py``),
-so the count does not say whether a local account is locked. Directory (Kerberos and OIDC)
-refusals are counted too, all but a lock refusal, which writes ``auth.directory_login_locked``
-instead (BACKLOG #3726). The lock rows themselves are not read, and so an account lock raises no
-alert: that would show lock state to a reader the 2026-09-28 owner ruling withholds it from.
+username can be a password typed into the wrong box. It counts ``auth.login_failed`` and no other
+sign-in row. A refused local credential sign-in writes that row the same way in every lock state
+(``auth/audit_visibility.py``), so the count does not say whether a local account is locked. A
+directory (Kerberos or OIDC) lock refusal writes ``auth.directory_login_locked`` instead (BACKLOG
+#3726), so it is not counted. Refusals that write some other action are not counted either. The
+lock rows themselves are not read, and so an account lock raises no alert: that would show lock
+state to a reader the 2026-09-28 owner ruling withholds it from.
 
 **Bounded where the caller chooses the key.** A windowed detector tracks at most
 :data:`MAX_SUBJECTS` subjects. Past :data:`MAX_SUBJECT_ALERTS` alerts in one window it raises under
@@ -90,8 +91,9 @@ _DENIAL_ACTIONS: Final = frozenset(
 )
 #: The pre-BACKLOG #3726 detail of a directory lock refusal under ``auth.login_failed``. Such a
 #: refusal now has its own action, which no detector reads, and no writer stores this text. RETAINED
-#: DELIBERATELY (batch 458 Manager decision): removing a filter was not #3726's call, so this
-#: zero-weight stays until its own follow-up row removes it. Spelled here rather than imported from
+#: DELIBERATELY: removing a filter was out of #3726's scope, so this zero-weight stays until the
+#: dead-directory-lock-filter removal, unallocated follow-up work, decides. Spelled here rather than
+#: imported from
 #: ``auth/``; a test pins it to ``DIRECTORY_LOCKED_REFUSAL_DETAIL``.
 _DIRECTORY_LOCKED_DETAIL: Final = json.dumps({"provider": "ad", "reason": "locked"}, sort_keys=True)
 
