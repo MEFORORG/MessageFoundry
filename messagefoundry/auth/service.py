@@ -11039,9 +11039,9 @@ class AuthService:
             await write_audit_soft(
                 _read_the_owner,
                 log=_log,
-                message="a sign-out ended session %s, but its owner could not be read; "
-                + " and ".join(unread),
-                args=(session,),
+                # A literal, so the console and redaction gates in test_audit_write can read it.
+                message="a sign-out ended session %s, but its owner could not be read; %s",
+                args=(session, " and ".join(unread)),
                 # The session has ended: a raise would lose its row and report it as a failure.
                 defects=(),
             )
