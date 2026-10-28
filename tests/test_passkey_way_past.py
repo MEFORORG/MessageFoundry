@@ -1839,20 +1839,21 @@ _UNPARSEABLE_TRANSPORTS = ["not json", "5", '"usb"', "null", "[" * 100_000]
     [*_UNPARSEABLE_TRANSPORTS, b"\xff"],
     ids=["text", "5", "str", "null", "deep", "not-utf8"],
 )
-async def test_an_unreadable_passkey_row_counts_the_failure_and_escalates_the_lock(
+async def test_an_unreadable_passkey_row_counts_the_failure_at_the_fixed_length(
     transports: str | bytes, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The escalation reads the passkey set inside the count's own transaction. A row that does not
     parse, or one the driver cannot even fetch (``not-utf8``), must not roll the count back, or the
-    account would never lock. Every failure counts, the lock arms on every cycle, and it escalates:
-    an unreadable set is treated as escalating, the closed direction (BACKLOG #3937 item 8). A
-    warning names the account and carries none of the cell. RED when: the fetch error escapes the
-    increment, or the unreadable set keeps the fixed length."""
+    account would never lock. Every failure counts and the lock arms on every cycle, at the fixed
+    length: a passkey that cannot be read signs nobody in, so it is no way past and does not
+    escalate (BACKLOG #3937 item 8). The owner's passkey is discoverable, so a corruption that did
+    not land would escalate and fail this. A warning names the account and carries none of the
+    cell. RED when: the fetch error escapes the increment, or the unreadable set escalates."""
     store = await MessageStore.open(":memory:")
     try:
         service, identity, _, _ = await _passkey_owner(store)
         await _corrupt_passkey_rows(store, identity.user_id, transports)
-        assert await _two_sign_in_cycles(service, identity.user_id) == 1800.0
+        assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
         warned = [
             r.getMessage()
             for r in caplog.records
@@ -1900,13 +1901,13 @@ def _real_sqlite_decode_failure() -> sqlite3.OperationalError:
         "other",
     ],
 )
-async def test_only_a_decode_or_parse_failure_escalates_rather_than_rolling_back(
+async def test_only_a_decode_or_parse_failure_is_survived_rather_than_rolling_back(
     monkeypatch: pytest.MonkeyPatch, error: Exception, unreadable: bool
 ) -> None:
     """The escalation's passkey read catches only what says the SET cannot be read: a cell the
     driver cannot decode while fetching, told apart by type or, for sqlite3, by message. Every
     other driver error still raises and rolls the failure's write back as any write failure does,
-    rather than being swallowed into an escalation. RED when: the catch widens to every
+    rather than being swallowed into the fixed length. RED when: the catch widens to every
     ``OperationalError``, or misses the decode one."""
     from messagefoundry.store import store as store_mod
 
@@ -1927,7 +1928,8 @@ async def test_only_a_decode_or_parse_failure_escalates_rather_than_rolling_back
         read_passkeys=read_passkeys,
     )
     if unreadable:
-        assert await call is store_mod.UnreadablePasskeys.UNREADABLE
+        # The gates above are forced open, so None here can only be the survived read.
+        assert await call is None
     else:
         with pytest.raises(type(error)):
             await call
