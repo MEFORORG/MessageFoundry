@@ -9,7 +9,7 @@
 # samples/messages/hapi-hl7v2/README.md and from the shape of each surrogate in the committed
 # corpus. The corpus was scrubbed with a salt nobody recorded, so this file does not reproduce it.
 #
-# Use it with:  anonymize_checked(raw, salt=..., overlay=Path("tests/fixtures/anon/batch_18.anon.toml"))
+# Use it with:  anonymize_checked(raw, salt=..., rules=load_rules(Path("tests/fixtures/anon/batch_18.anon.toml")))
 
 [hl7.fields]
 # IN1-4 is the insurance company name. ADR 0030 section 3 keeps IN1-2/3/4 by default, because they

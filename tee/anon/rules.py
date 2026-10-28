@@ -15,7 +15,8 @@ The data layer is deliberately incapable of expressing a *transform*: a rule may
 whole-**field** path to an existing :class:`SurrogateKind` (or ``keep``/``drop``). There is no
 expression language, no conditionals, no field arithmetic — the moment a rule needs to *do*
 something new, that is a code change in ``surrogates.py``. :func:`load_rules` **enforces** this at
-load time (it rejects any overlay key that is not a ``path -> kind``/``keep``/``drop``), so the
+load time (it rejects any overlay key that is not a ``path -> kind``/``keep``/``drop``, or the
+``retarget_acknowledged`` list, which only lets a retarget load and maps nothing), so the
 config can never drift into declarative *logic* authoring (CLAUDE.md §12). This shapes test data;
 it is tooling-side only and never enters a Router/Handler or ``pipeline/``.
 
@@ -36,7 +37,11 @@ from pathlib import Path
 #: field's value (ADR 0030 §3), so rules address whole fields only. The number is ASCII digits with
 #: no leading zero: ``PID-0`` is the segment id itself, which the tee would overwrite, and ``PID-05``
 #: or a non-ASCII digit names a field the two adapters and the leak-check would read differently.
-_FIELD_PATH_RE = re.compile(r"[A-Z][A-Z0-9]{2}-[1-9][0-9]*")
+#: The number has at most three digits: with no bound, a path of thousands of digits loaded as a
+#: rule (BACKLOG #3493). The cost is a field past 999, which no rule or keep can name, so
+#: ``require_full_coverage`` refuses a message that carries a value there. No HL7-defined
+#: segment comes near that many fields.
+_FIELD_PATH_RE = re.compile(r"[A-Z][A-Z0-9]{2}-[1-9][0-9]{0,2}")
 
 
 class SurrogateKind(StrEnum):
@@ -103,8 +108,9 @@ def _check_field_path(path: object) -> None:
     overlay key alike."""
     if not isinstance(path, str) or _FIELD_PATH_RE.fullmatch(path) is None:
         raise RuleError(
-            f"rule path {_quoted(path)} is not a whole-field HL7 address like 'PID-5' "
-            "(component paths and free text are rejected — selection is field-level only)"
+            f"rule path {_quoted(path)} is not a whole-field HL7 address like 'PID-5', a "
+            "segment id and a field number from 1 to 999 (component paths and free text are "
+            "rejected — selection is field-level only)"
         )
 
 
@@ -239,35 +245,27 @@ class AnonError(ValueError):
 
 _LOG = logging.getLogger(__name__)
 
-#: The overlay warnings this process has already logged. One entry is every line ONE load
-#: produced. :func:`load_rules` runs again for every message when a caller hands the anonymizer a
-#: path, and without this each message repeated every line (BACKLOG #3000). The key is the
-#: warnings' own text and not the file alone, so an overlay edited to keep or retarget a
-#: different field warns again in a process that stays up.
-_warned: set[tuple[str, ...]] = set()
-
-#: ``_warned`` is emptied when it holds this many entries. A caller that writes a new overlay
-#: file per message would otherwise grow it without limit. Emptying it costs a repeated warning.
-_WARNED_LIMIT = 256
+#: The ``[hl7]`` key that lets an overlay retarget a default field to a kind that can leave part of
+#: it as captured. Without it such a retarget is refused (BACKLOG #3000).
+RETARGET_ACKNOWLEDGED = "retarget_acknowledged"
 
 
-def _warn_once(lines: tuple[str, ...]) -> None:
-    """Log ``lines`` at WARNING unless this process already logged exactly these lines.
+#: The most retargets an unlisted-retarget refusal names one by one. The rest are counted, so the
+#: refusal stays one bounded line however many default fields an overlay retargets.
+_RETARGETS_NAMED = 3
 
-    Nothing is remembered while WARNING is switched off, so a caller that turns it on later still
-    gets the lines once."""
-    if not lines or lines in _warned or not _LOG.isEnabledFor(logging.WARNING):
-        return
-    if len(_warned) >= _WARNED_LIMIT:
-        _warned.clear()
-    _warned.add(lines)
-    for line in lines:
-        _LOG.warning("%s", line)
+#: The ``[hl7]`` keys an overlay can write by mistake under ``[hl7.fields]``: in TOML, a key after
+#: that header belongs to it. Each is named with a hint, matched in any case, rather than refused
+#: as a field rule whose kind is not a string.
+_HL7_LIST_KEYS = frozenset({"keep", "drop", RETARGET_ACKNOWLEDGED})
 
 
-def _forget_warnings() -> None:
-    """Empty the record of warnings already logged, so the next load warns again. For tests."""
-    _warned.clear()
+def _shown(overlay: Path) -> str:
+    """The overlay's file path for a refusal or a warning, with each character that does not print
+    written as its escape, so a NUL or a newline in a path a caller built reaches the console as
+    ``\\x00`` or ``\\n`` and never as itself (BACKLOG #3493). It is the escape ``_printable`` in
+    ``messagefoundry/config/settings.py`` writes, copied because this module imports only stdlib."""
+    return "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in str(overlay))
 
 
 #: The header segments. Fields 1 and 2 of each hold delimiters: the field separator and the
@@ -345,6 +343,7 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         [hl7]
         keep = ["PID-13"]  # cancel a default scrub, or record a field as reviewed and left intact
         drop = ["PID-40"]  # blank the field entirely
+        retarget_acknowledged = ["PID-5"]  # load a retarget of a default field, see below
 
     Any other table/key, a component path, or an unknown kind raises :class:`RuleError`. So does
     an overlay that cannot be read or parsed: that error names the file and, for bad TOML, a line
@@ -362,14 +361,17 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     A keep on a :data:`DEFAULT_RULES` path turns that default scrub off. Each one is logged at
     WARNING, by field address and kind only; :func:`kept_defaults` lists them (BACKLOG #2268).
 
-    An overlay that points a :data:`DEFAULT_RULES` path at a DIFFERENT kind is logged at WARNING
-    too, by field address, default kind and new kind; :func:`retargeted_defaults` lists them. A
-    different kind can leave part of the field as captured: ``id``, ``mrn`` and ``ssn`` rewrite
-    the first component only, so on ``PID-5`` they leave the given name. A retarget to the same
-    kind changes nothing and a ``drop`` blanks the field, so neither warns (BACKLOG #3000).
+    An overlay that points a :data:`DEFAULT_RULES` path at a DIFFERENT kind is REFUSED, unless the
+    path is also listed under ``[hl7].retarget_acknowledged``. :func:`retargeted_defaults` names
+    the retargets this covers. A different kind can leave part of the field as captured: ``id``,
+    ``mrn`` and ``ssn`` rewrite the first component only, so on ``PID-5`` they leave the given
+    name. A retarget to the same kind changes nothing, and ``drop`` and ``freetext`` write a
+    constant, so none of those needs the list. A path on the list that is not such a retarget is
+    refused too, so a misspelt entry cannot sit there doing nothing. Each acknowledged retarget is
+    logged at WARNING, by field address, default kind and new kind (BACKLOG #3000).
 
-    Both warnings are logged once per process for one set of lines, not once per call, so a
-    caller that passes ``overlay=`` for every message does not repeat them.
+    Every warning is logged on every call. The anonymizer never loads an overlay itself, so a
+    caller loads it once and passes the rules to each message.
 
     A schema refusal quotes at most :data:`_QUOTE_LIMIT` characters of any one overlay key or
     value, and of the whole list of unknown keys.
@@ -381,6 +383,7 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     # a UnicodeDecodeError holds its bytes on ``.object``, so neither may reach the refusal's chain.
     # The read and the parse are two steps, so an error about the PATH is never reported as one
     # about the file's content (BACKLOG #3003).
+    shown = _shown(overlay)
     refusal: str | None = None
     try:
         text = overlay.read_text(encoding="utf-8")
@@ -402,27 +405,35 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     if refusal is not None:
         # Raised AFTER the handler, so neither __cause__ nor __context__ is set. ``from None``
         # would not do: it leaves __context__ populated (BACKLOG #2310).
-        raise RuleError(f"cannot read anon overlay {overlay}: {refusal}")
+        raise RuleError(f"cannot read anon overlay {shown}: {refusal}")
 
     unknown_top = set(data) - {"hl7"}
     if unknown_top:
         raise RuleError(
             f"anon overlay has unexpected top-level key(s) {_quoted(sorted(unknown_top))}; "
-            "only an [hl7] section (fields/keep/drop) is allowed"
+            f"only an [hl7] section (fields/keep/drop/{RETARGET_ACKNOWLEDGED}) is allowed"
         )
     hl7 = data.get("hl7", {})
     if not isinstance(hl7, dict):
         raise RuleError("anon overlay [hl7] must be a table")
-    unknown_hl7 = set(hl7) - {"fields", "keep", "drop"}
+    unknown_hl7 = set(hl7) - {"fields", "keep", "drop", RETARGET_ACKNOWLEDGED}
     if unknown_hl7:
         raise RuleError(
             f"anon overlay [hl7] has unexpected key(s) {_quoted(sorted(unknown_hl7))}; "
-            "only 'fields', 'keep', 'drop' are allowed"
+            f"only 'fields', 'keep', 'drop', '{RETARGET_ACKNOWLEDGED}' are allowed"
         )
 
     fields = hl7.get("fields", {})
     if not isinstance(fields, dict):
         raise RuleError("anon overlay [hl7.fields] must be a table of path = kind")
+    misplaced = sorted(key for key in fields if key.lower() in _HL7_LIST_KEYS)
+    if misplaced:
+        raise RuleError(
+            f"anon overlay [hl7.fields] holds {_quoted(misplaced)}, which belongs under [hl7]. "
+            "In TOML a key written after the [hl7.fields] header is part of that table. Put it "
+            "under an [hl7] header, written in lower case, and merge it into a list of that name "
+            "already there"
+        )
     effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     for path, raw_kind in fields.items():
         effective[_validate_path(path)] = _coerce_kind(path, raw_kind)
@@ -430,6 +441,7 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         effective[_validate_path(path)] = SurrogateKind.KEEP
     for path in _as_path_list(hl7, "drop"):
         effective[_validate_path(path)] = SurrogateKind.DROP
+    acknowledged = {_validate_path(path) for path in _as_path_list(hl7, RETARGET_ACKNOWLEDGED)}
 
     # A KEEP rule is returned, not dropped: it is the record that someone decided the field.
     rules = tuple(FieldRule(path, kind) for path, kind in effective.items())
@@ -440,27 +452,52 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     unwritable = _unwritable_fields(rules)
     if unwritable:
         raise RuleError(
-            f"anon overlay {overlay} sets a rule on {', '.join(unwritable)}, which no rule can "
+            f"anon overlay {shown} sets a rule on {', '.join(unwritable)}, which no rule can "
             "rewrite: fields 1 and 2 of a header segment (MSH/BHS/FHS) hold delimiters. Remove "
             "the rule"
         )
-    # Field addresses and kinds only, never a value.
-    _warn_once(
-        (
-            *(
-                f"anon overlay {overlay} keeps {cancelled.path}, which turns off its default "
-                f"{cancelled.kind.value} scrub: the field is left as captured"
-                for cancelled in kept_defaults(rules)
-            ),
-            *(
-                f"anon overlay {overlay} retargets {default.path} from its default "
-                f"{default.kind.value} scrub to {now.kind.value}: a different kind can leave "
-                "part of the field as captured"
-                for default, now in retargeted_defaults(rules)
-            ),
+    retargeted = retargeted_defaults(rules)
+    # Checked first: a misspelt entry is the likeliest reason the retarget it meant is unlisted.
+    stray = sorted(acknowledged - {default.path for default, _ in retargeted})
+    if stray:
+        raise RuleError(
+            f"anon overlay {shown} lists {_quoted(stray)} under [hl7].{RETARGET_ACKNOWLEDGED}, "
+            "but sets no rule that points that default field at a kind the list is for: a kind "
+            "other than the default's own, drop or freetext. Remove the entry, or correct it"
         )
-    )
+    unlisted = [(default, now) for default, now in retargeted if default.path not in acknowledged]
+    if unlisted:
+        named = [_retarget_phrase(default, now) for default, now in unlisted[:_RETARGETS_NAMED]]
+        if len(unlisted) > _RETARGETS_NAMED:
+            named.append(f"and {len(unlisted) - _RETARGETS_NAMED} more default field(s)")
+        raise RuleError(
+            f"anon overlay {shown} retargets {', '.join(named)}: a different kind can leave "
+            "part of the field as captured. Point each back at its default kind, or at drop or "
+            f"freetext, or list it under [hl7].{RETARGET_ACKNOWLEDGED} to load it anyway"
+        )
+    # Field addresses and kinds only, never a value.
+    for cancelled in kept_defaults(rules):
+        _LOG.warning(
+            "anon overlay %s keeps %s, which turns off its default %s scrub: the field is left "
+            "as captured",
+            shown,
+            cancelled.path,
+            cancelled.kind.value,
+        )
+    for default, now in retargeted:
+        _LOG.warning(
+            "anon overlay %s retargets %s, as [hl7].%s allows: a different kind can leave part "
+            "of the field as captured",
+            shown,
+            _retarget_phrase(default, now),
+            RETARGET_ACKNOWLEDGED,
+        )
     return rules
+
+
+def _retarget_phrase(default: FieldRule, now: FieldRule) -> str:
+    """One retarget, as the refusal and the warning both name it: addresses and kinds only."""
+    return f"{default.path} from its default {default.kind.value} scrub to {now.kind.value}"
 
 
 def _toml_refusal(exc: tomllib.TOMLDecodeError) -> str:
@@ -488,23 +525,31 @@ def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
     return tuple(r for r in DEFAULT_RULES if r.path in kept)
 
 
+#: The kinds that write a constant in place of the whole field, so nothing of the value is left
+#: whatever the default was: ``drop`` writes nothing and ``freetext`` a fixed marker. On OBX-5,
+#: where ``freetext`` can keep a value, it is the default's own kind (BACKLOG #3493).
+_CONSTANT_KINDS: tuple[SurrogateKind, ...] = (SurrogateKind.DROP, SurrogateKind.FREETEXT)
+
+
 def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, FieldRule], ...]:
     """The :data:`DEFAULT_RULES` entries that ``rules`` scrubs with a DIFFERENT kind, each as
     ``(default rule, last rule on that path)``, in :data:`DEFAULT_RULES` order.
 
     The kinds do not rewrite the same parts of a field, so a retarget can leave part of a real
-    value behind while the leak-check still counts the field as scrubbed. ``id``, ``mrn`` and
+    value behind, and the leak-check scans what is left only for a dashed SSN or a punctuated
+    phone (``leak.retarget_residue_hits``). ``id``, ``mrn`` and
     ``ssn`` rewrite the first component only: on ``PID-5`` that leaves the given name, on
     ``PID-11`` the city and postal code, on ``PV1-7`` the clinician's name. ``date`` keeps the
     year, so on ``PID-7`` it keeps the birth year. No ordering of the kinds says which retarget is
     safe, because what ``date`` leaves depends on the value. So every change of kind is listed,
-    with two exceptions: a ``drop``, which blanks the field, and a ``keep``, which
-    :func:`kept_defaults` lists. A rule that names the default's own kind changed nothing and is
-    not listed. :func:`load_rules` logs each entry, and a caller with a console of its own can
-    repeat them there.
+    with three exceptions: ``drop`` and ``freetext``, which write a constant in place of the whole
+    field, and a ``keep``, which :func:`kept_defaults` lists. A rule that names the default's own
+    kind changed nothing and is not listed. :func:`load_rules` refuses each entry the overlay does
+    not list under ``[hl7].retarget_acknowledged`` and logs the rest, and a caller with a console
+    of its own can repeat them there.
     """
     # Every rule on a path runs, in order, so a set built in code may hold several. The default
-    # scrub is replaced only when none of them is the default's kind and none is a drop.
+    # scrub is replaced only when none of them is the default's kind or writes a constant.
     on_path: dict[str, list[FieldRule]] = {}
     for rule in rules:
         if rule.kind != SurrogateKind.KEEP:
@@ -513,7 +558,7 @@ def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, 
     for default in DEFAULT_RULES:
         rewrites = on_path.get(default.path, [])
         kinds = [rule.kind for rule in rewrites]  # a list: kinds compare by value, see FieldRule
-        if rewrites and default.kind not in kinds and SurrogateKind.DROP not in kinds:
+        if rewrites and all(kind not in kinds for kind in (default.kind, *_CONSTANT_KINDS)):
             listed.append((default, rewrites[-1]))
     return tuple(listed)
 

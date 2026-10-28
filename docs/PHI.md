@@ -2177,8 +2177,8 @@ both are described below:
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IP address, survives | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
-| A dashed SSN (`NNN-NN-NNNN`) appears whole inside one field | Fields no rule maps |
-| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears whole inside one field | Fields no rule maps |
+| A dashed SSN (`NNN-NN-NNNN`) appears whole inside one field | Fields no rule maps, and what a retarget of a default field leaves past its first component |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears whole inside one field | Fields no rule maps, and what a retarget of a default field leaves past its first component |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it as `PV2 (line with no fields)` | Every line but the header. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
@@ -2441,21 +2441,37 @@ refuses.
 **A keep on a field the default rules scrub turns that scrub off.** A keep on `PID-5` leaves the
 patient name in the output as captured, whatever the keep was added for. A default-scrubbed field
 already counts as decided, so a keep on one never clears a refusal. `load_rules` logs one WARNING
-line for each such field, but not on every load. It remembers each set of lines it has logged in
-this process, and skips a set it remembers. The line names the field and the kind of scrub it
-lost, never a value. A keep on a
+line for each such field, on every load. The anonymizer takes no overlay path, so a caller loads
+the overlay once and passes the rules to every message. The line names the field and the kind of
+scrub it lost, never a value. A keep on a
 field with no default rule logs nothing. `python -m tee anonymize-captures` also prints one
 `warning:` line that lists those fields, and `--log-level` cannot hide it.
 
 **An overlay can also point a default field at a different kind, and that can leave part of the
 field as captured.** The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn`
 rewrite the first component only, so `PID-5` pointed at `id` leaves the given name. `date` keeps
-the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check counts such a field
-as scrubbed, and its shape detectors do not scan what is left. So a clean return does not clear it. `load_rules`
-logs one WARNING line for each such field, under the same once-per-set rule as a keep. The line
-names the field, the default kind and the new kind. `python -m tee anonymize-captures` prints
-one `warning:` line that lists them. A retarget to the same kind does not warn, and neither does
-a `drop`. Nothing refuses the retarget (vault BACKLOG #3000).
+the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check scans what such a
+field has left past its first component for a dashed SSN and a punctuated phone number, as the
+table above says, and refuses either. A name, a city or a year left there passes, and so does a
+year left in the first component, so a clean return does not clear it.
+
+**`load_rules` refuses such a retarget unless the overlay lists the field under
+`retarget_acknowledged`** (vault BACKLOG #3000):
+
+```toml
+[hl7]
+retarget_acknowledged = ["PID-5"]
+
+[hl7.fields]
+"PID-5" = "id"
+```
+
+A retarget to the same kind needs no entry, because it changes nothing. Nor does one to `drop` or
+`freetext`, which write a constant in place of the field; on `OBX-5`, where `freetext` keeps some
+values, it is already the default kind. An entry that names no retarget needing it, such as a misspelt field,
+is refused too. A listed retarget loads, and `load_rules` logs one WARNING line for each, as it
+does for a keep. The line names the field, the default kind and the new kind, never a value.
+`python -m tee anonymize-captures` prints one `warning:` line that lists them.
 
 **The tee checks the salt and reads the overlay once, before it reads the store.** A salt the
 keyer refuses, an overlay it cannot read or parse, or one that breaks the schema, refuses the
