@@ -11193,8 +11193,8 @@ class AuthService:
         if prior is None or not self._was_live_at_revoke(prior, before, after):
             return
         owner = await self._load_user(prior.user_id)
-        # BACKLOG #3749: a session whose owner's temporary credential had lapsed is not recorded as
-        # the end of a live one; ``_gate_refusal`` says which gate refusals are not acted on here.
+        # BACKLOG #3749: a session ``_gate_refusal`` finds a credential lapse on is not recorded as
+        # the end of a live one; that method says which gate refusals are not acted on here.
         # Judged at ``after``, as logout judges it. The owner is read through the row's user_id,
         # which the revoke returns unchecked (BACKLOG #3716), so a tampered row could judge, and
         # name, another account.

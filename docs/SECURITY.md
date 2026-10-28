@@ -5205,8 +5205,9 @@ checks is recorded `revoked`. So is a session minted under an older session epoc
 account's, which a gate would end: the sign-out reads the account after its revoke, so a
 whole-account revoke landing between the two would make a session that was live look stale. The
 owner is read through the ended row's `user_id`, which the revoke does not check against the row's
-seal (BACKLOG #3716), so a tampered row could put the lapse row, and the outcome, on another
-account, and on `/ui/logout`, which names no caller, the `auth.logout` row's actor too.
+seal (BACKLOG #3716), so a tampered row could let another account decide the outcome and whether
+a lapse row is written, and put that lapse row on it; on `/ui/logout`, which names no caller, the
+`auth.logout` row's actor is that account too.
 
 **A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
 clears the cookie. That row is then missing, with an ERROR log line; the line names the session
