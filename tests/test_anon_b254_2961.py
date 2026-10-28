@@ -183,6 +183,44 @@ def test_the_checked_run_redacts_under_a_dash_repetition_separator(
     assert set(_obx5_of(checked(message, salt=_SALT)).split("-")) == {"[REDACTED]"}
 
 
+_SSN_SPACED = "000 12 3456"
+
+
+@pytest.mark.parametrize("mark", (" ", "\t", "\x1f"), ids=("space", "tab", "unit_separator"))
+@pytest.mark.parametrize("value_type", ("NM", "TM"))
+@_EACH_MODULE
+def test_nothing_is_kept_under_a_whitespace_separator(
+    module: Any, value_type: str, mark: str
+) -> None:
+    """Each part is stripped before it is matched, so whitespace is no mark the grammar can see.
+    Under a repetition separator of a space, ``000 12 3456`` split into three valid numbers and was
+    kept. ``\\x1f`` is whitespace to ``str.strip`` as well."""
+    value = _SSN_SPACED.replace(" ", mark) if value_type == "NM" else f"01{mark}02{mark}03"
+    # The case discriminates: every part fits the grammar alone, so only the guard refuses.
+    assert all(module.preserve_obx5_value(value_type, p, module.Seps()) for p in value.split(mark))
+    for seps in (
+        module.Seps(repetition=mark),
+        module.Seps(component=mark),
+        module.Seps(subcomponent=mark),
+    ):
+        assert module.preserve_obx5_value(value_type, value, seps) is False
+    # Control: a plain value under the usual separators is still kept.
+    assert module.preserve_obx5_value(value_type, "12", module.Seps()) is True
+
+
+@_EACH_CHECKED
+def test_the_checked_run_redacts_under_a_space_repetition_separator(
+    checked: Callable[..., str],
+) -> None:
+    """The same case end to end, read from the message's own MSH-2."""
+    message = _message("NM", _SSN_SPACED).replace(r"|^~\&|", r"|^ \&|")
+    assert r"|^ \&|" in message
+    out = checked(message, salt=_SALT)
+    # The redact is written once per repetition, and here the spaces are the repetition marks.
+    assert set(_obx5_of(out).split(" ")) == {"[REDACTED]"}
+    assert "3456" not in out
+
+
 @_EACH_MODULE
 def test_the_grammar_reads_ascii_digits_only(module: Any) -> None:
     """Control for the ``[0-9]`` in the patterns: ``\\d`` would also match these digits. The old

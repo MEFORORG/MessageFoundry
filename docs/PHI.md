@@ -2387,9 +2387,9 @@ What the `date` kind does to a value:
   number; an eight-digit number that reads as a date; and an identifier split across repetitions.
   Under `TM`, at least a six-digit date whose parts are in range for a time would still leave
   whole: `150312` reads as 15:03:12. The leak-check's shape detectors do not scan `OBX-5`,
-  because a rule maps it, so nothing refuses these. A message that declares a digit or one of
-  `+ - . : / < > =` as its component, repetition or subcomponent separator keeps no numeric
-  `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, at
+  because a rule maps it, so nothing refuses these. A message that declares a digit, a whitespace
+  character or one of `+ - . : / < > =` as its component, repetition or subcomponent separator
+  keeps no numeric `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, at
   least a value such as `000-12-3456` would still leave whole. The message itself splits it
   across `OBX-5`, `OBX-6` and `OBX-7`. The first part is a valid number, and no rule maps the
   other two fields. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
