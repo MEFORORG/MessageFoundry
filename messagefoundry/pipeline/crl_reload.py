@@ -201,8 +201,9 @@ LAPSES_FIRST = (
 #:
 #: ``bad``: a file to fix. It names no restart, so it takes no not-in-effect caveat
 #: (:data:`_LEADS_TO_A_START`): a start whose check finds the same refuses the file whatever the
-#: time. The text gives no definition of proof, on purpose: ``CrlSignature`` holds it, and a short
-#: form here went wrong.
+#: time. While such a file is not in effect it is still judged again each pass
+#: (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`). The text gives no definition of proof, on purpose:
+#: ``CrlSignature`` holds it, and a short form here went wrong.
 BAD_SIGNATURE = (
     "Fix the file: give a CRL the hop's CA signed. On the signature, a start refuses the file too "
     "wherever its own check proves the same, at any time, not only while a CRL in the file is not "
@@ -273,6 +274,13 @@ _RANK = {remedy: rank for rank, remedy in enumerate(_PRECEDENCE)}
 _LEADS_TO_A_START = frozenset(
     {RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE, UNPROVEN_SIGNATURE, UNCHECKABLE_SIGNATURE}
 )
+#: The remedies whose refusal the reload judges again each pass while a CRL in the file is not in
+#: effect (:meth:`_Refusals.reopen`). Each one in :data:`_LEADS_TO_A_START` is, because its caveat
+#: names a time that passes. So is :data:`BAD_SIGNATURE`, as it was before item 8 of vault
+#: BACKLOG #3506 took it out of that set: otherwise it is final until the bytes change, and a
+#: refusal a later pass would find for the same bytes is never reported. One such is
+#: :data:`LAPSES_FIRST`, which it outranks, once the hop's CA list gains a CA that verifies the CRL.
+_REOPENED_WHILE_NOT_IN_EFFECT = _LEADS_TO_A_START | {BAD_SIGNATURE}
 #: The remedy for each :class:`~messagefoundry.pki.CrlSignature` state that holds a file back.
 #: ``unlisted`` is no signature finding: the reload's list may lack the issuer, so a restart.
 _SIGNATURE_REMEDY = {
@@ -808,24 +816,27 @@ def _reload_path(
         refusals.error = exc
     if (
         refusals.strongest is not None
-        and refusals.strongest[1] in _LEADS_TO_A_START
+        and refusals.strongest[1] in _REOPENED_WHILE_NOT_IN_EFFECT
         and (unmet := crl_not_in_effect(blocks, now=now)) is not None
     ):
-        # For the alert, which carries no reason. The reopen below is what lets this flag live
-        # on the outcome and not on the recorded refusal: such a refusal is never final, so
-        # ``_pending`` never replays it without the flag.
-        refusals.start_refuses = True
         why, remedy = refusals.strongest
-        # "At least": the time ends one cause of a refusal, and a start can refuse after it for
-        # another, such as a private copy it cannot make. A proven bad signature takes no caveat:
-        # its remedy names no restart and says a start refuses it at any time (vault BACKLOG #3506).
-        refusals.strongest = (
-            f"{why}. Not before {log_timestamp(unmet.this_update)}: a start refuses this file "
-            f"too at least until then, since its CRL from issuer "
-            f"{quoted_issuer(unmet.issuer)} is not in effect",
-            remedy,
-        )
-        # Judged again each pass, so the warning goes once its time has passed.
+        if remedy in _LEADS_TO_A_START:
+            # For the alert, which carries no reason. The reopen below is what lets this flag
+            # live on the outcome and not on the recorded refusal: such a refusal is never final,
+            # so ``_pending`` never replays it without the flag.
+            refusals.start_refuses = True
+            # "At least": the time ends one cause of a refusal, and a start can refuse after it
+            # for another, such as a private copy it cannot make. A proven bad signature takes no
+            # caveat: its remedy names no restart and says a start refuses it at any time (vault
+            # BACKLOG #3506).
+            refusals.strongest = (
+                f"{why}. Not before {log_timestamp(unmet.this_update)}: a start refuses this file "
+                f"too at least until then, since its CRL from issuer "
+                f"{quoted_issuer(unmet.issuer)} is not in effect",
+                remedy,
+            )
+        # Judged again each pass, so a warning goes once its time has passed, and a refusal a
+        # later pass finds for these bytes is reported (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`).
         refusals.reopen()
     return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)
 

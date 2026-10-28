@@ -37,6 +37,7 @@ from typing import Any, cast
 
 import pytest
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.hazmat.primitives.asymmetric.types import CertificateIssuerPrivateKeyTypes
 from cryptography.x509.oid import NameOID
@@ -83,7 +84,7 @@ from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
 from tests.test_alert_state import _drain as _drain_state
 from tests.test_alert_state import _RecordingStore
-from tests.test_crl_reload import _DAY, _fresher, _Pki, _refusals_logged
+from tests.test_crl_reload import _DAY, _NOW, _fresher, _Pki, _refusals_logged
 
 # The reload suite's fixtures, bound here by name so pytest finds them in this module too: an
 # empty registry and pass state per test, and one CA with a leaf and a CRL file.
@@ -389,8 +390,10 @@ async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_ref
     assert "Restart the engine" not in BAD_SIGNATURE
     assert "at least until then" not in outcome.refusal.reason
     assert not outcome.start_refuses
-    # A file to fix, final until its bytes change, as FIX is: no caveat reopens it each pass.
-    assert outcome.refusal.sticky
+    # Not final while the file is not in effect: judged again each pass, as before item 8.
+    # test_a_bad_signature_for_a_file_not_in_effect_is_judged_again_so_a_later_lapse_shows
+    # says why.
+    assert not outcome.refusal.sticky
     assert "at any time, not only while a CRL in the file is not yet in effect" in BAD_SIGNATURE
     (payload,) = sink.refused()
     assert payload["remedy_class"] == "bad_signature" and payload["start_refuses"] is False
@@ -457,6 +460,61 @@ async def test_a_held_copy_that_lapses_first_outranks_a_signature_short_of_proof
     assert not outcome.start_refuses and not outcome.refusal.sticky
     (payload,) = sink.refused()
     assert payload["remedy_class"] == "lapses_first"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def _ca_naming_no_key(pki: _Pki, key: ec.EllipticCurvePrivateKey) -> str:
+    """A CA certificate for ``pki``'s issuer name and ``key``, with no Subject Key Identifier. A
+    CRL whose key identifier names ``pki``'s key fits it without naming its key, so the CA
+    verifies such a CRL where ``key`` signed it."""
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(pki.name)
+        .issuer_name(pki.name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - _DAY)
+        .not_valid_after(_NOW + 365 * _DAY)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(pki.key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+async def test_a_bad_signature_for_a_file_not_in_effect_is_judged_again_so_a_later_lapse_shows(
+    pki: _Pki,
+) -> None:
+    """Vault BACKLOG #3506 item 8, the Lander's hold on PR 2589. While a CRL in the file is not in
+    effect, a ``bad_signature`` refusal is judged again each pass, as before item 8, so a
+    ``lapses_first`` found for the same bytes later is reported. Here the hop's list gains a CA
+    that verifies the CRL, as a CA directory can add one. The refusal still carries no "at least
+    until" caveat and no ``start_refuses``. Before this repair the refusal was final until the
+    bytes changed, so every later pass replayed ``bad_signature``."""
+    hop = pki.outbound_hop()  # its copy lapses in about five and a half days
+    sink = _Sink()
+    runner = _runner(sink)
+    signer = ec.generate_private_key(ec.SECP256R1())
+    # Names the CA's key and another key signed it: proven bad. In effect in seven days.
+    pki.crl.write_bytes(pki.crl_pem(issued=-7 * _DAY, lasts=90 * _DAY, signer=signer))
+
+    (first,) = _pass(runner)
+
+    # bad_signature outranks lapses_first, as before item 8.
+    assert first.refusal is not None and first.refusal.remedy == BAD_SIGNATURE, first.refusal
+    assert "at least until then" not in first.refusal.reason
+    assert not first.start_refuses
+    assert not first.refusal.sticky
+
+    hop.load_verify_locations(cadata=_ca_naming_no_key(pki, signer))
+    (second,) = _pass(runner)
+
+    assert second.refusal is not None
+    assert second.refusal.remedy == crl_reload.LAPSES_FIRST, second.refusal
+    assert "lapses earlier" in second.refusal.reason
+    assert [payload["remedy_class"] for payload in sink.refused()] == [
+        "bad_signature",
+        "lapses_first",
+    ]
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
