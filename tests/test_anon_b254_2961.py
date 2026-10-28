@@ -156,51 +156,34 @@ def test_the_checked_run_no_longer_returns_the_shape_whole(
     (
         ("NM", "-", _SSN_SHAPE),
         ("NM", ".", _PHONE_DOTTED),
+        ("NM", " ", _SSN_SHAPE.replace("-", " ")),
+        ("NM", "\t", _SSN_SHAPE.replace("-", "\t")),
+        ("NM", "\x1f", _SSN_SHAPE.replace("-", "\x1f")),
         # The NM shapes split into parts that are not times (``3456`` has hour 34), so the TM grammar
         # refuses them with or without the separator guard. A dated shape splits into valid hours.
         ("TM", "-", "01-02-03"),
         ("TM", ".", "01.02.03"),
+        ("TM", " ", "01 02 03"),
     ),
-    ids=("NM_dash", "NM_point", "TM_dash", "TM_point"),
+    ids=(
+        "NM_dash",
+        "NM_point",
+        "NM_space",
+        "NM_tab",
+        "NM_unit_separator",
+        "TM_dash",
+        "TM_point",
+        "TM_space",
+    ),
 )
 @_EACH_MODULE
-def test_nothing_is_kept_under_a_repetition_separator_the_grammar_uses(
+def test_nothing_is_kept_under_a_separator_that_splits_a_value(
     module: Any, value_type: str, mark: str, value: str
 ) -> None:
     """A message may declare any separators. Under a repetition separator of ``-`` the value splits
-    into ``000``, ``12`` and ``3456``, and each is a valid number, so the grammar alone keeps it."""
+    into ``000``, ``12`` and ``3456``, and each is a valid number, so the grammar alone keeps it. A
+    space splits an identifier written unpunctuated the same way, and ``\\x1f`` is whitespace too."""
     # The case discriminates: every part fits the grammar alone, so only the separator guard refuses.
-    assert all(module.preserve_obx5_value(value_type, p, module.Seps()) for p in value.split(mark))
-    assert module.preserve_obx5_value(value_type, value, module.Seps(repetition=mark)) is False
-    # Control: the same call keeps a plain value under the usual separators.
-    assert module.preserve_obx5_value(value_type, "12", module.Seps()) is True
-
-
-@_EACH_CHECKED
-def test_the_checked_run_redacts_under_a_dash_repetition_separator(
-    checked: Callable[..., str],
-) -> None:
-    """The same case end to end, read from the message's own MSH-2."""
-    message = _message("NM", _SSN_SHAPE).replace(r"|^~\&|", r"|^-\&|")
-    assert r"|^-\&|" in message
-    # The redact is written once per repetition, and here the dashes are the repetition marks.
-    assert set(_obx5_of(checked(message, salt=_SALT)).split("-")) == {"[REDACTED]"}
-
-
-_SSN_SPACED = "000 12 3456"
-
-
-@pytest.mark.parametrize("mark", (" ", "\t", "\x1f"), ids=("space", "tab", "unit_separator"))
-@pytest.mark.parametrize("value_type", ("NM", "TM"))
-@_EACH_MODULE
-def test_nothing_is_kept_under_a_whitespace_separator(
-    module: Any, value_type: str, mark: str
-) -> None:
-    """Each part is stripped before it is matched, so whitespace is no mark the grammar can see.
-    Under a repetition separator of a space, ``000 12 3456`` split into three valid numbers and was
-    kept. ``\\x1f`` is whitespace to ``str.strip`` as well."""
-    value = _SSN_SPACED.replace(" ", mark) if value_type == "NM" else f"01{mark}02{mark}03"
-    # The case discriminates: every part fits the grammar alone, so only the guard refuses.
     assert all(module.preserve_obx5_value(value_type, p, module.Seps()) for p in value.split(mark))
     for seps in (
         module.Seps(repetition=mark),
@@ -208,20 +191,21 @@ def test_nothing_is_kept_under_a_whitespace_separator(
         module.Seps(subcomponent=mark),
     ):
         assert module.preserve_obx5_value(value_type, value, seps) is False
-    # Control: a plain value under the usual separators is still kept.
+    # Control: the same call keeps a plain value under the usual separators.
     assert module.preserve_obx5_value(value_type, "12", module.Seps()) is True
 
 
+@pytest.mark.parametrize("mark", ("-", " "), ids=("dash", "space"))
 @_EACH_CHECKED
-def test_the_checked_run_redacts_under_a_space_repetition_separator(
-    checked: Callable[..., str],
+def test_the_checked_run_redacts_under_a_repetition_separator_that_splits_a_value(
+    checked: Callable[..., str], mark: str
 ) -> None:
     """The same case end to end, read from the message's own MSH-2."""
-    message = _message("NM", _SSN_SPACED).replace(r"|^~\&|", r"|^ \&|")
-    assert r"|^ \&|" in message
+    message = _message("NM", _SSN_SHAPE.replace("-", mark)).replace(r"|^~\&|", rf"|^{mark}\&|")
+    assert rf"|^{mark}\&|" in message
     out = checked(message, salt=_SALT)
-    # The redact is written once per repetition, and here the spaces are the repetition marks.
-    assert set(_obx5_of(out).split(" ")) == {"[REDACTED]"}
+    # The redact is written once per repetition, and here the marks are the repetition marks.
+    assert set(_obx5_of(out).split(mark)) == {"[REDACTED]"}
     assert "3456" not in out
 
 

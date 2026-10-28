@@ -643,8 +643,16 @@ _TIME_OF_DAY = r"""
 #: Every character the three grammars are written in. No numeric value is kept when one of them is
 #: the component, repetition or subcomponent separator: under a repetition separator of ``-``,
 #: ``000-12-3456`` splits into three valid numbers. A whitespace separator is refused the same way,
-#: in :func:`_fits_numeric_grammar`. The field separator is not read.
+#: because a space is how an identifier is written unpunctuated: ``000 12 3456`` splits just as
+#: well. The field separator is not read.
 _NUMERIC_GRAMMAR_CHARS = frozenset("0123456789+-.:/<>=")
+
+
+def _splits_a_numeric_value(mark: str) -> bool:
+    """True if a separator ``mark`` could cut an identifier into parts that each fit a grammar."""
+    return mark in _NUMERIC_GRAMMAR_CHARS or mark.isspace()
+
+
 #: What each COMPONENT of a preserved numeric value must match, by position. A value with more
 #: components than its type has is refused. ``NM`` takes a leading comparator because ``<5`` under
 #: ``NM`` is a common sender habit and carries no identifier. ``SN`` is comparator, number,
@@ -680,10 +688,7 @@ def _fits_numeric_grammar(grammar: tuple[re.Pattern[str], ...], value: str, seps
     subcomponents, and the patterns refuse that separator. Nothing is kept when a grammar uses the
     component, repetition or subcomponent separator, or when one of them is whitespace. The field
     separator is not read."""
-    marks = (seps.component, seps.repetition, seps.subcomponent)
-    # Whitespace is refused too: each part is stripped before it is matched, so under a repetition
-    # separator of a space, ``000 12 3456`` splits into three valid numbers.
-    if not _NUMERIC_GRAMMAR_CHARS.isdisjoint(marks) or any(mark.isspace() for mark in marks):
+    if any(map(_splits_a_numeric_value, (seps.component, seps.repetition, seps.subcomponent))):
         return False
     for rep in value.split(seps.repetition):
         comps = _components(rep, seps)
