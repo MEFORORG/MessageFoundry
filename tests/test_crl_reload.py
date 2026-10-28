@@ -23,7 +23,9 @@ from __future__ import annotations
 import asyncio
 import datetime
 import gc
+import itertools
 import logging
+import os
 import re
 import shutil
 import ssl
@@ -1855,18 +1857,20 @@ def test_a_retried_refusal_keeps_its_label_while_a_short_lived_holder_comes_and_
 
 
 def test_the_label_takes_one_spelling_whatever_order_the_holders_come_in() -> None:
-    """Two stale holders spell one file differently. The label names it the same way whichever
-    the registry met first (vault BACKLOG #3498). The holders are stand-ins: the label reads only
-    their spelling and setting. Red under: the label taking the first holder's spelling."""
-    first = SimpleNamespace(configured_path="C:/crls/partner.crl", setting="[tls].crl_file")
-    second = SimpleNamespace(configured_path="c:\\CRLS\\partner.crl", setting="[tls].crl_file")
-    labels = []
-    for order in ((first, second), (second, first)):
+    """Stale holders spell one file differently. The label names it the same way whichever the
+    registry met first, and takes an absolute spelling over a relative one (vault BACKLOG #3498).
+    The holders are stand-ins: the label reads only their spelling and setting. Red under: the
+    label taking the first holder's spelling."""
+    absolute = os.path.abspath(os.path.join("crls", "partner.crl"))
+    spellings = [absolute.upper(), "./crls/partner.crl", absolute]
+    holders = [SimpleNamespace(configured_path=p, setting="[tls].crl_file") for p in spellings]
+    labels = set()
+    for order in itertools.permutations(holders):
         crl_reload._LABELS.clear()
         stale = [(cast(ssl.SSLContext, None), cast(HeldCrl, h)) for h in order]
-        labels.append(crl_reload._label("key", (1, 2), stale, "fallback", refused=False))
-    assert labels[0] == labels[1] and "fallback" not in labels[0]
-    assert labels[0].startswith("[tls].crl_file")  # the one setting both recorded
+        labels.add(crl_reload._label("key", (1, 2), stale, "fallback", refused=False))
+    (label,) = labels
+    assert label.startswith("[tls].crl_file") and "./crls" not in label and "fallback" not in label
 
 
 def test_bytes_put_back_after_a_change_are_named_by_the_hops_that_hold_the_file_now(

@@ -312,6 +312,7 @@ from messagefoundry.auth.trust_anchors import (
     AnchorStoreUnavailable,
     TrustAnchorError,
     anchor_refusal,
+    explicit_cause,
     make_lane_anchor_check,
     make_registry_anchor_preflight,
     make_settings_anchor_preflight,
@@ -2415,7 +2416,7 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
-    elif isinstance(exc, WiringError) and isinstance(exc.__cause__, AnchorStoreUnavailable):
+    elif isinstance(exc, WiringError) and explicit_cause(exc, AnchorStoreUnavailable) is not None:
         # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
         # known to be wrong with the anchor or the config, so neither of the reasons below fits.
         # warn, as every refusal here: a convergence reload's retry logs at DEBUG (vault #3109).
@@ -2427,8 +2428,9 @@ async def _audit_refused_reload(
         status = 503
         answer = "the engine could not reach its store to check a trust anchor; see the engine log"
     elif isinstance(exc, WiringError):
-        # The whole explicit chain, as the connection-test route and a DR abort read it (vault
-        # BACKLOG #3498); one level saw only the refusal refused_connection_anchor wraps.
+        # The whole explicit chain, as the store arm above, the connection-test route and a DR
+        # abort read it (vault BACKLOG #3498); one level saw only what refused_connection_anchor
+        # wraps.
         anchor_refused = trust_anchor_cause(exc) is not None
         warn(
             "config reload %s: %s",

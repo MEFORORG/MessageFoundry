@@ -17,6 +17,7 @@ Each test names the single mutation it goes red under.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -282,6 +283,60 @@ async def test_the_lane_check_names_the_setting_it_refused(
         await check("inbound", _IB, {**settings, "tls_ca_pin": " "})
 
 
+async def test_the_lane_check_takes_a_path_the_os_refuses_as_a_setting(
+    store: MessageStore,
+) -> None:
+    """A NUL in the CA path is a setting to fix: no file was read and no row written (vault
+    BACKLOG #3498). Red under: the check letting the read's ``ValueError`` out bare."""
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    with pytest.raises(AnchorSettingRefused):
+        await check("outbound", "OB_X", {"tls_ca_file": "bad\x00path.pem"})
+
+
+async def test_a_pin_that_does_not_parse_names_the_pin(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """A malformed pin's refusal names the pin's setting, not the file's (vault BACKLOG #3498).
+    Red under: ``evaluate_anchor`` raising it with no ``setting``."""
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    with pytest.raises(TrustAnchorError) as refused:
+        await check("outbound", "OB_X", {"tls_ca_file": str(_ca(tmp_path)), "tls_ca_pin": "zz"})
+    assert refused.value.setting == "outbound connection 'OB_X' tls_ca_pin"
+
+
+def test_a_dr_abort_names_a_long_connection_whole() -> None:
+    """The longest connection name reaches the abort line whole (vault BACKLOG #3498). Red
+    under: the setting cut at 120 characters, as it first was."""
+    from messagefoundry.pipeline.dr import _anchor_refused
+
+    setting = f"inbound connection 'IB_{'X' * 253}' tls_ca_file"
+    assert f"({setting})" in _anchor_refused(setting)
+
+
+@pytest.mark.parametrize(
+    ("cause", "reason", "status"),
+    [(AnchorStoreUnavailable, "store_unavailable", 503), (TrustAnchorError, "trust_anchor", 422)],
+)
+async def test_the_reload_route_reads_a_cause_below_the_first(
+    store: MessageStore, cause: type[Exception], reason: str, status: int
+) -> None:
+    """A store fault or a refusal two wrappers down is still read as one: both arms walk the
+    explicit chain (vault BACKLOG #3498). Red under: either arm reading one level only."""
+    from messagefoundry.api.app import _audit_refused_reload
+
+    inner = WiringError("inner")
+    inner.__cause__ = cause("x")
+    outer = WiringError("outer")
+    outer.__cause__ = inner
+    engine = Engine(store, config_dir=None, egress_settings=EgressSettings())
+    answered, _ = await _audit_refused_reload(
+        engine, outer, actor="alice", requested=None, dry_run=False
+    )
+    rows = await store.list_audit(action="config_reload_failed", limit=5)
+    assert answered == status
+    assert [json.loads(r["detail"])["reason"] for r in rows] == [reason]
+
+
 # --- item 5: the advice a refused setting gets, and a kept failure that stops resolving --------
 
 
@@ -400,23 +455,23 @@ _LONG_NAMES = ["IB_REGIONAL_LAB_RESULTS_FTPS_POLL", "IB_" + "X" * 253]
 @pytest.mark.parametrize(
     ("raised", "passive", "ending"),
     [
-        (TrustAnchorError("refused"), False, "the auth.trust_anchor audit rows say why"),
-        (AnchorSettingRefused("blank"), False, "and start the connection; the server log says why"),
-        (AnchorStoreUnavailable("down"), False, "once the store is back; the server log says why"),
-        (TrustAnchorError("refused"), True, "the auth.trust_anchor audit rows say why"),
+        (TrustAnchorError, False, "the auth.trust_anchor audit rows say why"),
+        (AnchorSettingRefused, False, "and start the connection; the server log says why"),
+        (AnchorStoreUnavailable, False, "once the store is back; the server log says why"),
+        (TrustAnchorError, True, "the auth.trust_anchor audit rows say why"),
         (
-            AnchorSettingRefused("blank"),
+            AnchorSettingRefused,
             True,
             "Fix the setting, then reload; the server log says why",
         ),
-        (RuntimeError("no answer"), True, "reload once the cause is fixed"),
+        (RuntimeError, True, "reload once the cause is fixed"),
     ],
     ids=["file", "setting", "store", "passive-file", "passive-setting", "passive-unchecked"],
 )
 async def test_a_lane_ca_line_is_kept_whole(
     store: MessageStore,
     tmp_path: Path,
-    raised: Exception,
+    raised: type[Exception],
     passive: bool,
     ending: str,
     name: str,
@@ -427,7 +482,7 @@ async def test_a_lane_ca_line_is_kept_whole(
     default for a ``_LaneAnchorLine``."""
     reg = _poller_graph(_ca(tmp_path), None, name=name)
     standby = {"dr_standby": Priority.CRITICAL} if passive else {}
-    runner = _runner(store, reg, lane_anchor_check=_raising(raised), **standby)
+    runner = _runner(store, reg, lane_anchor_check=_raising(raised("x")), **standby)
     await runner.start()
     try:
         reason = runner.inbound_failed(name) or ""

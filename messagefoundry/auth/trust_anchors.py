@@ -288,31 +288,38 @@ class TrustAnchorError(Exception):
     file that cannot be read is refused before any row is written.
 
     ``setting`` names what was refused the way :attr:`AnchorSpec.setting` does, such as
-    ``inbound connection 'IB_X' tls_ca_file``, with no path. The audited check sets it
-    (:func:`_preflight_one`), and so does a reload's lane check (:func:`refused_connection_anchor`).
-    ``None`` where the raiser did not know it. A caller that may not show the refusal's own text,
-    such as a DR activation's abort, shows this instead (vault BACKLOG #3498)."""
+    ``inbound connection 'IB_X' tls_ca_file``, with no path: the pin's setting where the pin did
+    not parse. The audited check sets it (:func:`_preflight_one`), and so does a reload's lane
+    check (:func:`refused_connection_anchor`). ``None`` where the raiser did not know it. A caller
+    that may not show the refusal's own text, such as a DR activation's abort, shows this instead
+    (vault BACKLOG #3498).
+
+    ``fixed_text`` is True for a message built from fixed words, a connection's name and a
+    setting key, never from a refusal's own text, such as a lane's status line. A caller may then
+    keep more of it than its usual length limit (vault BACKLOG #3498)."""
 
     unaudited: bool = False
 
-    def __init__(self, *args: object, setting: str | None = None) -> None:
+    def __init__(self, *args: object, setting: str | None = None, fixed_text: bool = False) -> None:
         super().__init__(*args)
         self.setting = setting
+        self.fixed_text = fixed_text
 
 
 class AnchorSettingRefused(ValueError):
     """A lane's CA settings were refused before any file was read: at least a ``tls_ca_pin`` that
-    is blank, not text, or set beside a CA the hop never reads. :func:`make_lane_anchor_check`
+    is blank, not text, or set beside a CA the hop never reads, and a CA path the OS will not
+    take, such as one holding a NUL. :func:`make_lane_anchor_check`
     raises it, since that check knows which of its steps refused, so a caller tells a setting to
     fix from a file to fix by this class and not by a bare ``ValueError``, which a ``WiringError``
     also is (vault BACKLOG #3498). A malformed pin is still a :class:`TrustAnchorError` from the
-    file check, so it is not one of these."""
+    file check, so it is not one of these, though its ``setting`` names the pin."""
 
 
-def trust_anchor_cause(exc: BaseException) -> TrustAnchorError | None:
-    """The first :class:`TrustAnchorError` on ``exc``'s explicit ``__cause__`` chain, ``exc``
-    itself included, or ``None``. It is how the settings, registry and lane checks raise a
-    refusal, and how ``build_test_connector`` wraps one.
+def explicit_cause[E: BaseException](exc: BaseException, kind: type[E]) -> E | None:
+    """The first ``kind`` on ``exc``'s explicit ``__cause__`` chain, ``exc`` itself included, or
+    ``None``. It is how the settings, registry and lane checks raise a refusal or a store fault,
+    and how ``build_test_connector`` wraps one.
 
     An implicit ``__context__`` is not followed: an unrelated error raised while a refusal was
     being handled would then lose its own text. A cycle ends the walk. The DR activation's abort
@@ -320,11 +327,17 @@ def trust_anchor_cause(exc: BaseException) -> TrustAnchorError | None:
     seen: set[int] = set()
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
-        if isinstance(cur, TrustAnchorError):
+        if isinstance(cur, kind):
             return cur
         seen.add(id(cur))
         cur = cur.__cause__
     return None
+
+
+def trust_anchor_cause(exc: BaseException) -> TrustAnchorError | None:
+    """The first :class:`TrustAnchorError` on ``exc``'s explicit cause chain
+    (:func:`explicit_cause`)."""
+    return explicit_cause(exc, TrustAnchorError)
 
 
 class AnchorStoreUnavailable(Exception):
@@ -1134,7 +1147,8 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
         try:
             pin = parse_anchor_pin(spec.pin)
         except TrustAnchorError as exc:
-            raise TrustAnchorError(f"{spec.pin_setting or spec.setting}: {exc}") from exc
+            pin_setting = spec.pin_setting or spec.setting
+            raise TrustAnchorError(f"{pin_setting}: {exc}", setting=pin_setting) from exc
         same = pin.algorithm == ANCHOR_DIGEST
         seen = fingerprint if same else anchor_digest_hex(pin.algorithm, data)
         # Constant-time (ASVS 11.2.4, BACKLOG #1167). A CA's fingerprint is public, so this hides no
@@ -2295,8 +2309,9 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     refused anchor. An anchor the verdict refuses is still refused as one when a store call fails,
     since the verdict is reached first.
 
-    Every refusal it raises carries ``spec.setting`` as its :attr:`TrustAnchorError.setting`, a
-    malformed pin's included (vault BACKLOG #3498)."""
+    Every refusal it raises carries a :attr:`TrustAnchorError.setting`: the pin's setting for a
+    pin that did not parse (:func:`evaluate_anchor`), ``spec.setting`` for any other (vault
+    BACKLOG #3498)."""
     try:
         return await _preflight_checks(store, spec, enforcing=enforcing)
     except TrustAnchorError as refusal:
@@ -2597,7 +2612,11 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
         if spec is None:
             refused.pop(f"{direction}:{name}", None)
             return
-        now = await asyncio.to_thread(state, spec)
+        try:
+            now = await asyncio.to_thread(state, spec)
+        except ValueError as exc:
+            # A path the OS will not take, such as one holding a NUL: no file was read.
+            raise AnchorSettingRefused(str(exc)) from exc
         prior = refused.pop(spec.label, None)
         if prior is not None and prior[0] == now:
             refused[spec.label] = prior

@@ -3928,9 +3928,12 @@ class RegistryRunner:
             except (TrustAnchorError, ValueError) as exc:
                 # The lane's setting, for a refusal that does not name its own: a DR abort shows
                 # it in place of the refusal's text (vault BACKLOG #3498).
-                error = refused_connection_anchor(
-                    exc, setting=_lane_setting(direction, name, settings)
+                key = (
+                    _SETTING_KEYS
+                    if isinstance(exc, AnchorSettingRefused)
+                    else lane_ca_setting(settings)
                 )
+                error = refused_connection_anchor(exc, setting=_lane_setting(direction, name, key))
                 raise error from error.__cause__
             passed.append((direction, name))
         if store_fault is not None:
@@ -4622,11 +4625,8 @@ class RegistryRunner:
         ``kind`` is part of the KEY, not just the log line (see ``_failed``). The alert still carries the
         bare name: an alert row is addressed to the operator's connection, and the detail says which
         direction failed to start."""
-        reason = (
-            f"TrustAnchorError: {safe_text(str(exc), limit=_ANCHOR_LINE_LIMIT)}"
-            if isinstance(exc, _LaneAnchorLine)
-            else safe_exc(exc)
-        )
+        fixed = isinstance(exc, TrustAnchorError) and exc.fixed_text
+        reason = safe_exc(exc, limit=_ANCHOR_LINE_LIMIT) if fixed else safe_exc(exc)
         self._failed[(kind, name)] = reason  # stored before the alert fires, so a sink reads it
         self._log_and_alert_start_failure(
             f"{kind} connection {name!r}",
@@ -11385,20 +11385,12 @@ def _insecure_bind_cause(source: Source) -> str:
     return "--allow-insecure-bind / require_encryption_for_remote = false"
 
 
-#: How much of a :class:`_LaneAnchorLine` :meth:`RegistryRunner._record_failed` keeps. At
-#: ``safe_exc``'s default of 200 characters a line with its advice was cut, the store's line for
-#: any connection name (vault BACKLOG #3498). A name is at most 256 characters
-#: (``CONNECTION_NAME_PATTERN``), and the longest line's other words are about 210, so this keeps
-#: every line whole with room to spare.
+#: How much of a lane's fixed CA line (:func:`_lane_anchor_line`)
+#: :meth:`RegistryRunner._record_failed` keeps. At ``safe_exc``'s default of 200 characters a line
+#: with its advice was cut, the store's line for any connection name (vault BACKLOG #3498). A name
+#: is at most 256 characters (``CONNECTION_NAME_PATTERN``), and the longest line's other words are
+#: about 210, so this keeps every line whole with room to spare.
 _ANCHOR_LINE_LIMIT = 512
-
-
-class _LaneAnchorLine(TrustAnchorError):
-    """A lane's fixed CA line (:func:`_lane_anchor_line`). It is built from fixed words, the
-    connection's name and a setting key, never from a refusal's own text, so
-    :meth:`RegistryRunner._record_failed` keeps it to :data:`_ANCHOR_LINE_LIMIT` and not to
-    ``safe_exc``'s default. It still takes the redaction, and it is shown as a
-    ``TrustAnchorError``, as it always was."""
 
 
 def _lane_anchor_fault(exc: BaseException) -> Literal["setting", "file", "unchecked"]:
@@ -11419,13 +11411,14 @@ def _lane_anchor_fault(exc: BaseException) -> Literal["setting", "file", "unchec
 
 def _lane_anchor_line(
     direction: str, name: str, settings: Mapping[str, Any], exc: BaseException, *, passive: bool
-) -> _LaneAnchorLine:
+) -> TrustAnchorError:
     """The fixed line a lane's CA check failure is shown as in the lane's status and its
     ``connection_stopped`` alert. The failure's own text names the CA's path, the folders above
     it and its SHA-256, so it goes to the server log only (vault BACKLOG #3224). One ladder for a
     start (:meth:`RegistryRunner._check_lane_anchor`) and a passive DR standby
     (:meth:`RegistryRunner._preflight_passive_lanes`), so the two word a fault alike (vault
-    BACKLOG #3498).
+    BACKLOG #3498). It is ``fixed_text``, so :meth:`RegistryRunner._record_failed` keeps it to
+    :data:`_ANCHOR_LINE_LIMIT`.
 
     A refused setting is not a file to mend, and a start alone reads the same setting again, so
     its advice is to reload. A check that did not run says nothing against the file. At a start,
@@ -11434,7 +11427,7 @@ def _lane_anchor_line(
     ca = lane_ca_setting(settings)
     fault = _lane_anchor_fault(exc)
     if fault == "setting":
-        what = "tls_ca_pin or tls_ca_file setting was refused"
+        what = f"{_SETTING_KEYS} setting was refused"
         start = "" if passive else " and start the connection"
         advice = f"Fix the setting, then reload{start}; the server log says why"
     elif fault == "file":
@@ -11449,16 +11442,21 @@ def _lane_anchor_line(
         what = f"{ca} could not be checked"
         advice = "The server log says why; reload once the cause is fixed"
     where = " on this passive DR standby, and POST /dr/activate needs it" if passive else ""
-    return _LaneAnchorLine(
+    return TrustAnchorError(
         f"{direction} connection '{name}': its {what}{where}. {advice}",
-        setting=_lane_setting(direction, name, settings),
+        setting=_lane_setting(direction, name, _SETTING_KEYS if fault == "setting" else ca),
+        fixed_text=True,
     )
 
 
-def _lane_setting(direction: str, name: str, settings: Mapping[str, Any]) -> str:
-    """A lane's CA setting as :attr:`TrustAnchorError.setting` names one, in
+#: The keys a lane's setting refusal names: the check does not say which of the two it refused.
+_SETTING_KEYS = "tls_ca_pin or tls_ca_file"
+
+
+def _lane_setting(direction: str, name: str, key: str) -> str:
+    """A lane's setting as :attr:`TrustAnchorError.setting` names one, in
     :attr:`AnchorSpec.setting`'s form and with no path (vault BACKLOG #3498)."""
-    return f"{direction} connection '{name}' {lane_ca_setting(settings)}"
+    return f"{direction} connection '{name}' {key}"
 
 
 def _anchor_key(settings: Mapping[str, Any]) -> tuple[str, object]:

@@ -113,11 +113,12 @@ _ANCHOR_REFUSED = (
 def _anchor_refused(setting: str | None) -> str:
     """:data:`_ANCHOR_REFUSED`, naming the refused setting and its connection when the refusal
     carries them (:attr:`TrustAnchorError.setting`, vault BACKLOG #3498). That names no path, so
-    an operator reading the 503 or the audit row knows which connection to fix."""
+    an operator reading the 503 or the audit row knows which connection to fix. The limit takes
+    the longest connection name, 256 characters, with its kind and setting key."""
     if not setting:
         return _ANCHOR_REFUSED
     return (
-        f"a trust anchor was refused ({safe_text(setting, limit=120)}); the server log says why, "
+        f"a trust anchor was refused ({safe_text(setting, limit=320)}); the server log says why, "
         "and a refused file has auth.trust_anchor audit rows too"
     )
 
@@ -468,7 +469,11 @@ class DrCoordinator:
         except Exception as exc:
             self._active = False
             refusal = trust_anchor_cause(exc)
-            if refusal is not None:
+            anchored, named = refusal is not None, refusal.setting if refusal else None
+            # Only the setting is kept. A local holding the refusal would stay on the abort's
+            # traceback frame, and with it the text this arm keeps off the abort.
+            refusal = None
+            if anchored:
                 # The refusal's own text goes to the server log only. The reason below reaches
                 # the API caller and the dr_activation_aborted row, which is teed off the box
                 # (vault BACKLOG #3224; BACKLOG #1142 for the connection-test route's same rule).
@@ -482,14 +487,14 @@ class DrCoordinator:
                 if progress.in_preflight
                 else "DR run-profile activation failed (the engine could not bind the priority "
                 "feeds)"
-            ) + f": {_anchor_refused(refusal.setting) if refusal is not None else safe_exc(exc)}"
+            ) + f": {_anchor_refused(named) if anchored else safe_exc(exc)}"
             if progress.hook_ran:
                 reason += _vip_note("The takeover hook ran")
             # The marker this attempt wrote stays, as audit rows do. Naming it here ties it to this
             # abort, so a retry's own marker reads as a second attempt (vault BACKLOG #3094, item
             # 11). The takeover is not undone: a release hook could hand the address to a primary
             # that is down, so the runbook leaves that to the operator.
-            if refusal is not None:
+            if anchored:
                 anchor_abort = reason
             else:
                 await self._record_aborted("profile", reason, actor, now)

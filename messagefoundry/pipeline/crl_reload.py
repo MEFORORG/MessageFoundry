@@ -729,10 +729,11 @@ def _label(
     kept = _LABELS.get(key)
     if refused and kept is not None and kept[0] == fingerprint:
         return kept[1]
-    # The least spelling, not the first: two holders may spell one file differently, and the
-    # first one depended on the order the registry met them in (vault BACKLOG #3498).
+    # One spelling whatever the order: two holders may spell one file differently, and the first
+    # one depended on the order the registry met them in (vault BACKLOG #3498). An absolute
+    # spelling comes first, since a relative one does not say what it is relative to.
     spellings = [h.configured_path for _, h in stale if h.configured_path]
-    shown = min(spellings, default=path)
+    shown = min(spellings, key=lambda p: (not os.path.isabs(p), p), default=path)
     # The setting, only when every stale holder recorded the same one. Several listeners can share
     # one CRL now that each records its connection's tls_crl_file (vault BACKLOG #1997), and naming
     # whichever the pass met first sent the operator to one hop of several. The path alone is
