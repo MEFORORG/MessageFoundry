@@ -1318,3 +1318,121 @@ async def test_a_host_command_store_pages_a_refused_write(
         await store.clear_lockout("cli-u")
     lines = [r.getMessage() for r in caplog.records if "ALERT integrity_drift" in r.getMessage()]
     assert len(lines) == 1 and f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:user:cli-u" in lines[0]
+
+
+# --- a write refused for an unverifiable seal is filed as unverifiable, not a forgery -----------
+
+
+async def _set_session_seal(path: Path, token_hash: str, seal: str) -> None:
+    await _raw_for(path)("UPDATE sessions SET seal = ? WHERE token_hash = ?", (seal, token_hash))
+
+
+async def test_a_stamp_refused_for_an_unverifiable_seal_is_not_filed_as_a_forgery(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's session stamp refused because Vault transit would not check the row's seal.
+    Before this, the RowSealError carried no cause, so the stamp's handler filed and paged it as
+    a forged session. The cause now rides on the error from the helper that caught Transit's
+    refusal: filed under the unverifiable action, paged once under the row's own subject, and
+    the stamp did not land."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    raised = _armed(store, monkeypatch)
+    forgery_pages: list[str] = []
+    service = AuthService(store, AuthSettings(), integrity_alert=forgery_pages.append)
+    await _user(store, "stamp-u")
+    h = hash_token(await _mint(store, "stamp-u"))
+    row = await store.get_session(h)
+    assert row is not None
+    await _set_session_seal(path, h, row.seal.replace(":vault:v1:", ":vault:v7:"))
+    _lapse_cache(store)
+    with pytest.raises(row_seal.RowSealError) as caught:
+        await store.mark_session_mfa_verified(h)
+    assert caught.value.unverifiable  # the cause, carried from the helper, never from text
+    assert raised == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:{SESSION_KIND}:{h[:12]}"]
+    async with service._sealed_stamp(h) as stamp:
+        await store.mark_session_mfa_verified(h)
+    assert stamp.refused
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
+    assert _seal_failures(path) == 0
+    assert forgery_pages == []
+    assert len(raised) == 1  # the store paged it; the handler's report adds no second page
+    ended = await store.get_session(h)
+    assert ended is not None and ended.revoked_at is not None and ended.mfa_verified_at is None
+
+
+@pytest.mark.parametrize("forged", ["malformed", "valid-false"])
+async def test_a_forged_seal_on_the_write_path_stays_a_forgery(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch, forged: str
+) -> None:
+    """The control: a malformed seal, and a well-formed one Transit answers valid: false for,
+    are refused as forgeries on the write path, never as unverifiable, and nothing is written."""
+    store, path, _transit = transit_store
+    raised = _armed(store, monkeypatch)
+    forgery_pages: list[str] = []
+    service = AuthService(store, AuthSettings(), integrity_alert=forgery_pages.append)
+    await _user(store, "forged-u")
+    h = hash_token(await _mint(store, "forged-u"))
+    donor = await store.get_session(hash_token(await _mint(store, "forged-u")))
+    assert donor is not None
+    # A genuine MAC over another row's fields: well-formed, at a version Transit holds.
+    await _set_session_seal(path, h, "mfseal:v1:junk" if forged == "malformed" else donor.seal)
+    _lapse_cache(store)
+    with pytest.raises(row_seal.RowSealError) as caught:
+        await store.mark_session_mfa_verified(h)
+    assert not caught.value.unverifiable
+    async with service._sealed_stamp(h) as stamp:
+        await store.mark_session_mfa_verified(h)
+    assert stamp.refused
+    assert _seal_failures(path) == 1
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 0
+    assert len(forgery_pages) == 1 and raised == []
+    ended = await store.get_session(h)
+    assert ended is not None and ended.mfa_verified_at is None
+
+
+def test_a_row_seal_error_keeps_its_cause_through_copy_and_pickle() -> None:
+    for unverifiable in (False, True):
+        exc = row_seal.RowSealError(SESSION_KIND, unverifiable=unverifiable)
+        for back in (copy.copy(exc), pickle.loads(pickle.dumps(exc))):  # nosec B301
+            assert (back.kind, back.unverifiable, str(back)) == (
+                SESSION_KIND,
+                unverifiable,
+                str(exc),
+            )
+    assert "cannot be verified by Vault transit" in str(
+        row_seal.RowSealError(SESSION_KIND, unverifiable=True)
+    )
+
+
+async def test_an_unverifiable_write_answers_a_409_naming_vault_not_a_failed_check() -> None:
+    import inspect
+
+    from fastapi import FastAPI
+    from starlette.requests import Request
+
+    from messagefoundry.api.auth_routes import add_auth_routes
+    from messagefoundry.api.security import AuthenticatedBeforeBodyRoute
+
+    app = FastAPI()
+    app.router.route_class = AuthenticatedBeforeBodyRoute
+    add_auth_routes(app)
+    handler = app.exception_handlers[row_seal.RowSealError]
+    request = Request({"type": "http", "method": "PUT", "path": "/x", "headers": [], "app": app})
+    bodies = []
+    for exc in (row_seal.RowSealError(SESSION_KIND, unverifiable=True), row_seal.RowSealError("s")):
+        answered = handler(request, exc)
+        response = await answered if inspect.isawaitable(answered) else answered
+        assert response.status_code == 409
+        bodies.append(bytes(response.body))
+    assert b"cannot be verified by Vault transit" in bodies[0]
+    assert b"fails its integrity check" in bodies[1]
+
+
+def test_the_cli_names_vault_first_for_an_unverifiable_write() -> None:
+    from messagefoundry.__main__ import _seal_refusal
+
+    text = _seal_refusal("u", "unlock", unverifiable=True)
+    assert "Vault transit refused" in text and "restore" not in text
+    assert "changed outside the engine" in _seal_refusal("u", "unlock")  # control

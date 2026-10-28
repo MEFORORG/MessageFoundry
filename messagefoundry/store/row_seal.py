@@ -114,11 +114,27 @@ class RowSealError(Exception):
 
     The helper never re-seals such a row, because the next honest write would otherwise turn a
     change made outside the helper into a sealed row. Carries the kind only, never a key or a row
-    value."""
+    value.
 
-    def __init__(self, kind: str) -> None:
-        super().__init__(f"the {kind} row's integrity seal does not verify; the write was refused")
+    ``unverifiable`` says Vault transit refused to check the seal (BACKLOG #2592). Only the store
+    helper that caught :class:`TransitSealUnverifiableError` sets it
+    (``store.require_seal_for_write``); nothing infers it from text. Such a refusal is no evidence
+    of a forgery, so a caller reports it under the unverifiable audit action, and the helper has
+    already paged it per row. Nothing was written either way."""
+
+    def __init__(self, kind: str, unverifiable: bool = False) -> None:
+        # Both in ``args``, so copy and pickle, which call ``cls(*args)``, rebuild the same error.
+        super().__init__(kind, unverifiable)
         self.kind = kind
+        self.unverifiable = unverifiable
+
+    def __str__(self) -> str:
+        if self.unverifiable:
+            return (
+                f"the {self.kind} row's integrity seal cannot be verified by Vault transit; the"
+                " write was refused"
+            )
+        return f"the {self.kind} row's integrity seal does not verify; the write was refused"
 
 
 #: How often one failing row is reported again while it keeps being presented, in seconds.

@@ -9952,8 +9952,8 @@ class AuthService:
                 rotated = await self._store.rotate_session(
                     old_hash, new_token_hash=hash_token(new_token)
                 )
-            except RowSealError:  # BACKLOG #2592: the row failed its seal; nothing was written
-                await self._session_seal_failed(old_hash)
+            except RowSealError as refused:  # BACKLOG #2592: nothing was written
+                await self._session_seal_failed(old_hash, unverifiable=refused.unverifiable)
                 return None
             except _session_write_errors() as exc:
                 raise _RotationStoreError(
@@ -10303,9 +10303,11 @@ class AuthService:
         outcome = _StampOutcome()
         try:
             yield outcome
-        except RowSealError:
+        except RowSealError as refused:
             outcome.refused = True
-            await self._session_seal_failed(token_hash)
+            # Under the refusal's own cause: one Vault transit would not check is not a
+            # forgery, and is filed as unverifiable (BACKLOG #2592).
+            await self._session_seal_failed(token_hash, unverifiable=refused.unverifiable)
 
     # --- the user loader (BACKLOG #2592) -----------------------------------------------------------
 
@@ -11199,11 +11201,11 @@ class AuthService:
             revoked = await self._store.revoke_user_sessions(
                 identity.user_id, except_token_hash=current_token_hash
             )
-        except RowSealError:
+        except RowSealError as refused:
             # BACKLOG #2592: the caller's own session failed its seal, so the store wrote nothing.
             # The caller asked to end every other session and its own is suspect: end them all,
             # and audit that scope, since the caller's own session is ended too.
-            await self._session_seal_failed(current_token_hash)
+            await self._session_seal_failed(current_token_hash, unverifiable=refused.unverifiable)
             revoked = await self._store.revoke_user_sessions(identity.user_id)
             scope = "self_all"
         if revoked:

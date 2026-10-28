@@ -566,10 +566,10 @@ class ApprovalGate:
                     from_status="executing",
                     audit=AuditAppend("approval.interrupted", actor="system", detail=detail),
                 )
-            except RowSealError:
+            except RowSealError as refused:
                 # Changed outside the store between the read and the move. Nothing re-seals it,
                 # so no later start can move it either (BACKLOG #2592).
-                await self._approval_seal_failed(approval_id)
+                await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
                 continue
             except Exception:  # noqa: BLE001 - every store backend raises its own type
                 log.exception(
@@ -1308,7 +1308,7 @@ class ApprovalGate:
             # The row changed outside the store after it was read, and the store refused the claim
             # (BACKLOG #2592). Nothing ran, and nothing was written. The cause carries the row kind
             # only, never a value.
-            await self._approval_seal_failed(approval_id)
+            await self._approval_seal_failed(approval_id, unverifiable=exc.unverifiable)
             raise ApprovalError(409, _SEAL_REFUSAL) from exc
         except asyncio.CancelledError:
             # Cancelled while claiming. The UPDATE can still commit, and the row would then sit in
@@ -1518,11 +1518,11 @@ class ApprovalGate:
                 from_status="executing",
                 audit=combined,
             )
-        except RowSealError:
+        except RowSealError as refused:
             # The claimed row changed outside the store while the operation ran (BACKLOG #2592).
             # The store wrote nothing and will refuse the status alone too, so the row stays
             # 'executing'. The outcome row below is the record of what happened.
-            await self._approval_seal_failed(approval_id)
+            await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
             moved = None
         except Exception:  # noqa: BLE001 - the outcome stands; see the docstring
             log.exception(
@@ -1583,8 +1583,8 @@ class ApprovalGate:
                 decided_at=self._clock(),
                 from_status="executing",
             )
-        except RowSealError:
-            await self._approval_seal_failed(approval_id)
+        except RowSealError as refused:
+            await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
             return None
         except Exception:  # noqa: BLE001 - the caller's outcome stands either way
             log.exception(
@@ -1612,10 +1612,10 @@ class ApprovalGate:
         it did not commit, the row is still ``pending`` and there is nothing to settle."""
         try:
             claimed = await claim
-        except RowSealError:
+        except RowSealError as refused:
             # The store refused the claim and wrote nothing (BACKLOG #2592), so no audit row was
             # lost: report the failed seal, as the uncancelled path does.
-            await self._approval_seal_failed(approval_id)
+            await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
             return
         except Exception:  # noqa: BLE001 - the caller's cancellation is re-raised either way
             # "Most likely": a COMMIT can land with its reply lost, and then the row and its
@@ -2182,7 +2182,7 @@ class ApprovalGate:
         except RowSealError as exc:
             # The row changed outside the store after it was read (BACKLOG #2592). The store wrote
             # nothing, so the audit row was not lost: this is a refusal, not a fault.
-            await self._approval_seal_failed(approval_id)
+            await self._approval_seal_failed(approval_id, unverifiable=exc.unverifiable)
             raise ApprovalError(409, _SEAL_REFUSAL) from exc
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
             raise self._store_fault(

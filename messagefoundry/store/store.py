@@ -1370,6 +1370,24 @@ async def seal_holds_for_write(
         return False
 
 
+async def require_seal_for_write(
+    check: Awaitable[bool], sealer: Sealer | None, kind: str, row_id: str
+) -> None:
+    """Return when ``check`` holds; otherwise raise :class:`RowSealError` for ``kind``, so the
+    write helper writes nothing (BACKLOG #2592). When Vault transit refused to check the seal, the
+    refusal is paged as :func:`seal_holds_for_write` pages it and the error carries
+    ``unverifiable``, taken from the exception itself rather than inferred later, so a caller
+    reports it under the unverifiable action and never as a forgery. A seal that does not verify
+    raises without it."""
+    try:
+        holds = await check
+    except TransitSealUnverifiableError as exc:
+        alert_unverifiable_write(sealer, kind, row_id)
+        raise RowSealError(kind, unverifiable=True) from exc
+    if not holds:
+        raise RowSealError(kind)
+
+
 async def session_seal_ok(sealer: Sealer | None, record: SessionRecord) -> bool:
     """Whether ``record`` carries a valid seal. Always True with no sealer: a store that holds no
     key writes and checks no seals. With one, a missing or empty seal fails like a wrong one."""
@@ -3575,11 +3593,10 @@ async def ad_map_write(sealer: Sealer | None, current: AdMap, change: AdMapChang
     """
     if isinstance(change, AdMap):
         changed = replace(change, name=current.name)
-    elif not await seal_holds_for_write(
-        ad_map_seal_ok(sealer, current), sealer, ADSET_KIND, current.name
-    ):
-        raise RowSealError(ADSET_KIND)
     else:
+        await require_seal_for_write(
+            ad_map_seal_ok(sealer, current), sealer, ADSET_KIND, current.name
+        )
         changed = change(current)
     seal = "" if sealer is None else await sealer.seal_async(ADSET_KIND, changed.seal_fields())
     new = replace(changed, seal=seal)
@@ -3832,10 +3849,9 @@ async def approval_update(
     """What a backend's ``_write_approval`` writes over ``current``, the row it read: ``new``,
     sealed. Raises :class:`RowSealError` when ``current`` fails its seal, because the write keeps
     its stored values, so a change made outside the store must never be sealed in."""
-    if not await seal_holds_for_write(
+    await require_seal_for_write(
         approval_seal_ok(sealer, current), sealer, APPROVAL_KIND, current.id
-    ):
-        raise RowSealError(APPROVAL_KIND)
+    )
     return await seal_approval(sealer, new)
 
 
@@ -15419,10 +15435,9 @@ class MessageStore:
         current = await self._read_user_record(user_id)
         if current is None:
             return None
-        if not await seal_holds_for_write(
+        await require_seal_for_write(
             user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
-        ):
-            raise RowSealError(USER_KIND)
+        )
         changed = change(current)
         if changed is None:
             return None
@@ -15468,13 +15483,9 @@ class MessageStore:
         left to seal, so ``admin_reset_mfa`` can still clear a set that fails."""
         current = await self._read_user_record(user_id)
         if current is not None:
-            if not await seal_holds_for_write(
-                user_seal_ok(self._row_sealer, current),
-                self._row_sealer,
-                USER_KIND,
-                user_id,
-            ):
-                raise RowSealError(USER_KIND)
+            await require_seal_for_write(
+                user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+            )
             if (
                 self._row_sealer is not None
                 and not removes_all
@@ -16792,13 +16803,12 @@ class MessageStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        if not await seal_holds_for_write(
+        await require_seal_for_write(
             session_seal_ok(self._row_sealer, current),
             self._row_sealer,
             SESSION_KIND,
             current.token_hash,
-        ):
-            raise RowSealError(SESSION_KIND)
+        )
         updated = await seal_session(self._row_sealer, change(current))
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None

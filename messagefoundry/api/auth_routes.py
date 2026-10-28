@@ -589,17 +589,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # seal, and wrote nothing. Any route that edits an account or a session can meet it; it is
         # a refused change, so a 409 with a fixed text, never the row and never a 500. Logged with
         # the row's kind, since this path does not pass the service loader that audits and alerts.
+        # A seal Vault transit refused to check is named as such, never as a failed check: the
+        # store helper set the cause, and has already paged the row.
         assert isinstance(exc, RowSealError)
-        _log.warning(
-            "a write to a %s row was refused: its integrity seal does not verify (BACKLOG #2592)",
-            exc.kind,
+        _log.warning("a write to a %s row was refused: %s (BACKLOG #2592)", exc.kind, exc)
+        detail = (
+            f"the {exc.kind} record's integrity seal cannot be verified by Vault transit, so the"
+            " change was refused"
+            if exc.unverifiable
+            else f"the {exc.kind} record fails its integrity check, so the change was refused"
         )
         return await http_exception_handler(
-            request,
-            HTTPException(
-                status.HTTP_409_CONFLICT,
-                f"the {exc.kind} record fails its integrity check, so the change was refused",
-            ),
+            request, HTTPException(status.HTTP_409_CONFLICT, detail)
         )
 
     app.add_exception_handler(RowSealError, _row_seal_refused)

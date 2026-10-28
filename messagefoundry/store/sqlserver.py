@@ -312,6 +312,7 @@ from messagefoundry.store.store import (
     report_unsealed_users,
     report_user_reseal,
     require_notify_email,
+    require_seal_for_write,
     require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
@@ -13236,10 +13237,9 @@ class SqlServerStore:
         current = await self._read_user_record(cur, user_id)
         if current is None:
             return None
-        if not await seal_holds_for_write(
+        await require_seal_for_write(
             user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
-        ):
-            raise RowSealError(USER_KIND)
+        )
         changed = change(current)
         if changed is None:
             return None
@@ -13292,10 +13292,9 @@ class SqlServerStore:
 
         current = await self._read_user_record(cur, user_id)
         if current is not None:
-            if not await seal_holds_for_write(
+            await require_seal_for_write(
                 user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
-            ):
-                raise RowSealError(USER_KIND)
+            )
             if (
                 self._row_sealer is not None
                 and not removes_all
@@ -14567,13 +14566,12 @@ class SqlServerStore:
         current = SessionRecord.from_mapping(dict(zip(columns, rows[0])))  # noqa: B905
         if current.revoked_at is not None:
             return None
-        if not await seal_holds_for_write(
+        await require_seal_for_write(
             session_seal_ok(self._row_sealer, current),
             self._row_sealer,
             SESSION_KIND,
             current.token_hash,
-        ):
-            raise RowSealError(SESSION_KIND)
+        )
         updated = await seal_session(self._row_sealer, change(current))
         await cur.execute(_MSSQL_SESSION_RESEAL, session_reseal_params(updated, current))
         written = await cur.fetchall()
