@@ -395,7 +395,7 @@ async def test_ui_logout_clears_the_cookie_when_the_owner_lookup_fails(
     session = hash_token(token)[:12]
     assert _error_lines(caplog) == [
         f"a sign-out ended session {session}, but its owner could not be read; its auth.logout "
-        "row names no actor"
+        "row names no actor and its temporary credential is not checked for a lapse"
     ]
 
 
@@ -494,3 +494,57 @@ async def test_ui_logout_before_the_temporary_credential_lapsed_records_revoked(
     _assert_signed_out(out)
     assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "revoked")]
     assert await temp_password_expired_rows(engine.store) == []
+
+
+async def test_ui_logout_of_an_idle_session_with_a_lapsed_credential_writes_no_lapse_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the sign-out judges the temporary credential of a session that was already over.
+    The gate asks the session's own clock checks first and ends an idle session without the lapse
+    row, so the sign-out does too: ``lapsed``, and no ``auth.temp_password_expired`` row."""
+    service, _, token = await _temporary_credential_session(engine)
+    later = time.time() + service.session_idle_seconds + 60
+    monkeypatch.setattr(time, "time", lambda: later)
+    out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "lapsed")]
+    assert await temp_password_expired_rows(engine.store) == []
+
+
+async def test_ui_logout_of_a_disabled_account_writes_no_lapse_row(engine: Engine) -> None:
+    """RED when: the sign-out audits a disabled account's session as a lapsed temporary credential.
+    The gate refuses a disabled account for that reason and writes no lapse row, so the sign-out
+    writes none either."""
+    service, user_id, token = await _temporary_credential_session(engine)
+    await _move_deadline_to(engine, user_id, time.time() - 1)
+    await engine.store.set_user_disabled(user_id, disabled=True)
+    out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await temp_password_expired_rows(engine.store) == []
+
+
+async def test_ui_logout_clears_the_cookie_when_the_lapse_row_fails(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3749, #3884 item 1. A refused ``auth.temp_password_expired`` row is logged, not
+    raised: the route still finishes the sign-out, and the ``auth.logout`` row still says
+    ``lapsed``."""
+    service, user_id, token = await _temporary_credential_session(engine)
+    await _move_deadline_to(engine, user_id, time.time() - 1)
+    real_record = engine.store.record_audit
+
+    async def _refuse_lapse_row(action: str, **kwargs: object) -> None:
+        if action == "auth.temp_password_expired":
+            raise OSError("the audit store refused the row")
+        await real_record(action, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(engine.store, "record_audit", _refuse_lapse_row)
+    caplog.clear()  # only the sign-out's own lines are asserted below
+    with caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
+        out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "lapsed")]
+    assert _error_lines(caplog) == [
+        f"a sign-out ended session {hash_token(token)[:12]}, whose temporary credential had "
+        "lapsed, but its auth.temp_password_expired row failed"
+    ]

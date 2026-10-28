@@ -524,7 +524,9 @@ password was presented for it. The refusal is the generic one for a session that
 and on the console a redirect to the sign-in page saying the session ended. It deliberately does
 not name the reason. So a session opened a second before the deadline cannot go on to finish its
 second factor or rotate. `POST /auth/mfa-verify`, the passkey leg and every re-key ask the same
-question inside the request, with their own `at` values. The remedy is an administrator reset.
+question inside the request, with their own `at` values. So does a sign-out that ends such a
+session, with `"at": "logout"` and the sign-out's client address (BACKLOG #3749; see the sign-out
+paragraphs under ASVS 7.2.4). The remedy is an administrator reset.
 
 **Where `[security].require_mfa` covers a local account, the holder enrols an authenticator app
 before choosing a password.** Changing the password ends every session, so rotating first would pass through a chosen
@@ -5189,12 +5191,14 @@ elevations in a row inside it, and a wall clock that stepped between the elevati
 sign-out, which moves the bound by the step. The `auth.logout` row names the
 session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
 was presented. The `outcome` is `lapsed` instead when the session's own clock checks fail at the
-revoke, or when the owner's admin-issued temporary credential is past its deadline, the test every
-gate applies (a disabled account excepted, as there). At least a session over its idle or absolute
-limit fails the clock checks. The temporary-credential case also writes the gate's
-`auth.temp_password_expired` row, with `"at": "logout"` and the sign-out's client address. A
-`lapsed` row still names the owner. If the owner cannot be read, the temporary credential is not
-checked.
+revoke, or when the session passes them but the owner's admin-issued temporary credential is past
+its deadline, the test every gate applies (a disabled account excepted, as there). At least a
+session over its idle or absolute limit fails the clock checks. The temporary-credential case also
+writes the gate's `auth.temp_password_expired` row, with `"at": "logout"` and the sign-out's client
+address. A `lapsed` row still names the owner. If the owner cannot be read, the temporary
+credential is not checked and the outcome is `revoked`. The owner is read through the ended row's
+`user_id`, which the revoke does not check against the row's seal (BACKLOG #3716), so a tampered
+row could put both rows, and the outcome, on another account.
 
 **A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
 clears the cookie. That row is then missing, with an ERROR log line; the line names the session

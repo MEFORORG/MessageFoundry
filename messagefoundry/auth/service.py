@@ -2739,15 +2739,6 @@ LogoutOutcome = Literal["revoked", "lapsed", "nothing_to_revoke"]
 #: states it as a power of its own.
 _LOGOUT_LINEAGE_SECONDS: Final = 5.0
 
-
-def _revoke_moment(row: SessionRecord, before: float, after: float) -> float:
-    """The moment a revoke that ran between the clock reads ``before`` and ``after`` judges
-    ``row`` at: the latest moment it can show to have been used, clamped to that span. A touch that
-    committed inside the call is then not mistaken for a clock step, a stamp past ``after`` still
-    is one, and a session already over at ``before`` is not judged live by waiting."""
-    return min(max(before, row.last_used_at), after)
-
-
 _ISSUE_ROW_EARLY_SECONDS: Final = 5.0
 _ISSUE_ROW_LATE_SECONDS: Final = 60.0
 _ISSUE_ROW_PAGE: Final = 200
@@ -10217,7 +10208,8 @@ class AuthService:
             await self._store.revoke_session(session.token_hash, now=now)
             return None
         user = await self._load_user(session.user_id)
-        # A disabled account is refused below for that reason, not audited as a lapse.
+        # A disabled account is refused below for that reason, not audited as a lapse. logout
+        # open-codes this condition for a session it ended (BACKLOG #3749): change the two together.
         if user is not None and not user.disabled and self._credential_lapsed(user, now):
             # Asked before the touch below, so a session about to end is not first marked used.
             await self._end_lapsed_session(
@@ -10984,10 +10976,11 @@ class AuthService:
         **A fault in the owner lookup or an audit write is logged, not raised (BACKLOG #3884 item
         1).** Once a session ended, a raise would report a sign-out that already happened as a
         failure, and ``/ui/logout`` answered 500 without clearing the cookie. A failed owner lookup
-        leaves the row with no actor rather than no row, and leaves the temporary credential
-        unchecked, so the outcome rests on the session's own clock checks alone; a refused row
-        write leaves no row and an ERROR log line, which names the session when one ended. A fault in the revoke itself still
-        raises: the session may not have ended, and the caller must not say it did.
+        leaves the row with no actor when the caller named none, rather than no row, and leaves a
+        live session's temporary credential unchecked, so the outcome is ``revoked``; a refused row
+        write leaves no row and an ERROR log line, which names the session when one ended. A fault
+        in the revoke itself still raises: the session may not have ended, and the caller must not
+        say it did.
 
         The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
         caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
@@ -11034,36 +11027,44 @@ class AuthService:
         # Read for the row's actor when the caller named none, and for the lapse test below when
         # the session was live: a session already over has nothing left for that test to decide.
         if actor is None or live:
+            unread = [
+                consequence
+                for consequence, applies in (
+                    ("its auth.logout row names no actor", actor is None),
+                    ("its temporary credential is not checked for a lapse", live),
+                )
+                if applies
+            ]
             await write_audit_soft(
                 _read_the_owner,
                 log=_log,
                 message="a sign-out ended session %s, but its owner could not be read; "
-                + (
-                    "its auth.logout row names no actor"
-                    if actor is None
-                    else "a lapsed temporary credential behind it is not checked"
-                ),
+                + " and ".join(unread),
                 args=(session,),
                 # The session has ended: a raise would lose its row and report it as a failure.
                 defects=(),
             )
-        # BACKLOG #3749: the gate's own lapse test (identity_for_token), a disabled account
-        # excepted as there, so a sign-out with no gate in front of it records what a gate would.
-        # The owner is read through the row's user_id, which the revoke returns unchecked
-        # (BACKLOG #3716), so a tampered row could judge, and name, another account.
-        credential_lapsed = (
-            live
+        # BACKLOG #3749: the gate's own lapse test (identity_for_token, which open-codes the same
+        # condition: change the two together), a disabled account excepted as there, so a
+        # sign-out with no gate in front of it records what a gate would. Judged at ``after``,
+        # as the gate judges at its own clock read, so a deadline that passed while the revoke
+        # waited on the store still counts. The owner is read through the row's user_id, which
+        # the revoke returns unchecked (BACKLOG #3716), so a tampered row could judge, and name,
+        # another account.
+        holder = (
+            user.username
+            if live
             and user is not None
             and not user.disabled
-            and self._credential_lapsed(user, _revoke_moment(ended, before, after))
+            and self._credential_lapsed(user, after)
+            else None
         )
-        outcome: LogoutOutcome = "revoked" if live and not credential_lapsed else "lapsed"
+        outcome: LogoutOutcome = "revoked" if live and holder is None else "lapsed"
         detail = {"outcome": outcome, "session": session}
         if not constant_time_equal(ended.token_hash, presented):  # ASVS 11.2.4, as elsewhere
             detail["presented"] = presented[:12]
         named = actor if actor is not None else (user.username if user is not None else None)
-        if credential_lapsed and user is not None:
-            holder = user.username
+        if holder is not None:
             await write_audit_soft(
                 lambda: self._audit_lapsed_credential(holder, at="logout", client=client),
                 log=_log,
@@ -11098,11 +11099,12 @@ class AuthService:
         """Whether ``row``, ended by a revoke that ran between the clock reads ``before`` and
         ``after``, was a live session then: the validator's own test, clock-step checks included
         (BACKLOG #2096). A row stamped ahead of the clock is one the validator would refuse, so
-        ending it is not the end of a live session. The row is judged at
-        :func:`_revoke_moment`."""
-        return row.is_live(
-            now=_revoke_moment(row, before, after), idle_seconds=self.session_idle_seconds
-        )
+        ending it is not the end of a live session. The row is judged at the latest moment it can
+        show to have been used, clamped to that span. A touch that committed inside the call is
+        then not mistaken for a clock step, a stamp past ``after`` still is one, and a session
+        already over at ``before`` is not judged live by waiting."""
+        moment = min(max(before, row.last_used_at), after)
+        return row.is_live(now=moment, idle_seconds=self.session_idle_seconds)
 
     async def _supersede_session_hash(self, prior_hash: str, *, client: str | None) -> bool:
         """End the session a browser presented at a fresh sign-in (ASVS 7.2.4, login side).
