@@ -484,8 +484,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # snapshot's cipher-covered cells through the store's own cipher, under the same cell-bound AAD the
     # store writes (cell_aad, ASVS 11.3.3), to prove the PHI is readable and not merely that a SQLite
     # file opened. No primitive is implemented here — the cipher is built by build_store_cipher and the
-    # AEAD runs inside it; this module holds only the marker prefix and the fail-closed
-    # CipherError/StoreKeylessError verdicts. The AAD comes from store/cipher_cells.py (BACKLOG #1719).
+    # AEAD runs inside it; the walk that calls it, and the cell AAD, are store/cipher_cells.py's
+    # (BACKLOG #1719), and this module holds only the fail-closed StoreKeylessError verdict.
     # Vault BACKLOG #2983 adds the tls_policy import, for one name: HopPosture, a value type. The
     # backup runner holds the instance posture and hands it to the key resolve and the full verify,
     # so the Vault hop they can dial is judged as `serve` judges it. Builds no context.
@@ -523,9 +523,10 @@ INVENTORY: dict[str, frozenset[str]] = {
         {"hashlib", "cryptography", "messagefoundry.store.crypto"}
     ),
     # BACKLOG #1719: a read-only declaration of the store's composite-key cipher cells, each with the
-    # columns its writer binds into the cell AAD. It builds that AAD with cell_aad through the
-    # store.crypto seam and performs no encrypt or decrypt itself; the full restore-verify does that
-    # through the store cipher in pipeline/dr_backup.py.
+    # columns its writer binds into the cell AAD, built with cell_aad through the store.crypto seam.
+    # Its read_cipher_cells walk decrypts each sealed value through the store cipher it is handed
+    # (built by build_store_cipher), for the full restore-verify and `cipher-audit`. It never
+    # encrypts, and implements no primitive: the AEAD runs inside the cipher.
     "messagefoundry/store/cipher_cells.py": frozenset({"messagefoundry.store.crypto"}),
     # crypto.py also derives the audit-chain HMAC key (#190) via HKDF-SHA256 (cryptography) from the
     # store DEK — no new import (still hashlib + cryptography), an additive key-derivation off the DEK.
@@ -977,10 +978,6 @@ IMPORT_ONLY: dict[str, str] = {
         "active_hop_posture): a TLS posture decision with no crypto-shaped call in it; and names "
         "store.crypto's CipherError only to classify a decrypt failure, calling no cipher"
     ),
-    "messagefoundry/store/cipher_cells.py": (
-        "builds a cell AAD with cell_aad, which is byte framing and not a primitive; the decrypt "
-        "that consumes it runs in pipeline/dr_backup.py, which is inventoried"
-    ),
     "messagefoundry/transports/ai_broker.py": (
         "names HopPosture only to annotate the factory's unread posture parameter; builds no "
         "context"
@@ -1042,6 +1039,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.auth.trust_anchors",
             # BACKLOG #1352: cert import opens a PKCS#12 bundle's encrypted parts through pki.
             "cipher:via messagefoundry.pki",
+            # BACKLOG #1719: cipher-audit decrypts the live store's sealed cells through the store
+            # cipher, by cipher_cells' walk. It never encrypts.
+            "cipher:via messagefoundry.store.cipher_cells",
             "csprng:via messagefoundry.auth.totp",
             "csprng:via messagefoundry.store.crypto",
             "hash:via messagefoundry.api.tls",
@@ -1343,7 +1343,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # store_data_key_id derives (HKDF) and fingerprints (SHA-256) through the store.crypto seam.
     "messagefoundry/pipeline/dr_backup.py": frozenset(
         {
-            "cipher:.decrypt()",
+            # BACKLOG #1719: the full restore-verify's decrypt pass is cipher_cells' shared walk.
+            "cipher:via messagefoundry.store.cipher_cells",
             "cipher:via messagefoundry.store.backup_codec",
             "compare:hmac.compare_digest",
             "compare:via messagefoundry.store.backup_codec",  # BACKLOG #1167: the key_id match
@@ -1489,6 +1490,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the
     # tag its row's routing fields build.
     "messagefoundry/store/queue_tag.py": frozenset({"cipher:.decrypt()"}),
+    # BACKLOG #1719: read_cipher_cells opens each sealed value through the store cipher it is handed.
+    "messagefoundry/store/cipher_cells.py": frozenset({"cipher:.decrypt()"}),
     # BACKLOG #2593: opens a message cell or a preset's criteria (AES-GCM decrypt through the store
     # cipher) under the tag its row's id and channel or owner build.
     "messagefoundry/store/cell_tag.py": frozenset({"cipher:.decrypt()"}),

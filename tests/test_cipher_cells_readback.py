@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import shutil
 import sqlite3
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
+from messagefoundry.__main__ import main
 from messagefoundry.config.settings import BackupSettings, StoreSettings
 from messagefoundry.pipeline import dr_backup
 from messagefoundry.pipeline.dr_backup import BackupRunner, run_restore_verify
@@ -30,10 +33,15 @@ from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.base import build_store_cipher
 from messagefoundry.store.cipher_cells import (
     COMPOSITE_CIPHER_CELLS,
+    DEFAULT_CHUNK_ROWS,
     SQLITE_CIPHER_CELLS,
     CipherCell,
+    CipherWalkInterrupted,
+    audit_cipher_cells,
+    connect_readonly,
+    read_cipher_cells,
 )
-from messagefoundry.store.crypto import _V4_PREFIX, MARKER_PREFIX, generate_key
+from messagefoundry.store.crypto import _V4_PREFIX, MARKER_PREFIX, Cipher, CipherError, generate_key
 from messagefoundry.store.store import Stage
 
 #: Every value the fixture writes, keys included, carries this. A FAIL reason must never contain it:
@@ -358,3 +366,487 @@ async def test_a_keyless_store_plaintext_that_resembles_the_marker_passes(tmp_pa
 
     status, message, _ = dr_backup._decrypt_check(db, settings)
     assert status == "PASS", message
+
+
+# --- cipher-audit: the same walk over a LIVE store (BACKLOG #1719, step 1) -------------------------
+
+
+def _audit(
+    db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], *extra: str
+) -> tuple[int, dict[str, Any]]:
+    """Run ``cipher-audit --json`` on ``db`` from a directory with no service settings file."""
+    monkeypatch.chdir(db.parent)
+    rc = main(["cipher-audit", "--db", str(db), "--json", *extra])
+    out = capsys.readouterr().out
+    payload = json.loads(out.strip().splitlines()[-1])
+    assert _SYNTH not in out, f"cipher-audit printed a plaintext or a key: {out}"
+    return rc, payload
+
+
+def _keyed(monkeypatch: pytest.MonkeyPatch, settings: StoreSettings) -> None:
+    assert settings.encryption_key is not None
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", settings.encryption_key)
+
+
+def _sealed_by_cell(db: Path) -> dict[str, int]:
+    conn = sqlite3.connect(db)
+    try:
+        return {f"{c.table}.{c.column}": _sealed_count(conn, c) for c in SQLITE_CIPHER_CELLS}
+    finally:
+        conn.close()
+
+
+def _cells(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {row["cell"]: row for row in payload["cells"]}
+
+
+async def test_cipher_audit_reads_every_sealed_value_of_a_live_store(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """PASS, run beside an OPEN store, and each cell's count is the number of sealed values in it,
+    so a cell the audit skipped cannot hide inside a nonzero total."""
+    db, settings = _copy(_template, tmp_path)
+    _keyed(monkeypatch, settings)
+    expected = _sealed_by_cell(db)
+    store = await _open(db, settings)
+    try:
+        rc, payload = _audit(db, monkeypatch, capsys)
+    finally:
+        await store.close()
+    assert rc == 0, payload
+    assert payload["status"] == "PASS" and payload["keyed"] is True
+    got = _cells(payload)
+    assert set(got) == set(expected)
+    assert {name: row["opened"] for name, row in got.items()} == expected
+    assert all(row["failed"] == 0 and row["unmarked"] == 0 for row in got.values()), got
+    assert payload["opened"] == sum(expected.values()) > len(COMPOSITE_CIPHER_CELLS)
+
+
+def test_cipher_audit_reports_every_failure_and_keeps_counting(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Unlike the restore-verify, the audit does not stop at the first bad value: two corrupted
+    cells are both counted, each names its first locator, and every other cell is still read."""
+    db, settings = _copy(_template, tmp_path)
+    _keyed(monkeypatch, settings)
+    expected = _sealed_by_cell(db)
+    by_name = {f"{c.table}.{c.column}": c for c in SQLITE_CIPHER_CELLS}
+    raw_at = _flip_one_aead_byte(db, by_name["messages.raw"])
+    body_at = _flip_one_aead_byte(db, by_name["response.body"])
+
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 1 and payload["status"] == "FAIL", payload
+    got = _cells(payload)
+    assert payload["failed"] == 2
+    assert f"messages.raw {raw_at} did not decrypt" in got["messages.raw"]["first_failure"]
+    assert f"response.body {body_at} did not decrypt" in got["response.body"]["first_failure"]
+    assert payload["opened"] == sum(expected.values()) - 2
+
+
+def test_a_damaged_marker_passes_the_restore_walk_and_fails_the_audit(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The marker hole. A value whose ``mfenc:`` prefix is damaged is not selected by the marker,
+    so the restore-verify's walk never reads it and PASSes. The audit counts it as unmarked, and in
+    a keyed store, where the store refuses such a value at read, that is a FAIL. Under the audited
+    ``allow_unmarked_ciphertext`` opt-out the store reads it as plaintext, so it is reported and
+    passes."""
+    db, settings = _copy(_template, tmp_path)
+    _keyed(monkeypatch, settings)
+    conn = sqlite3.connect(db)
+    try:
+        rowid, value, ident = conn.execute(
+            "SELECT rowid, raw, id FROM messages WHERE raw LIKE ? ORDER BY rowid LIMIT 1",
+            (f"{MARKER_PREFIX}%",),
+        ).fetchone()
+        conn.execute("UPDATE messages SET raw = ? WHERE rowid = ?", ("x" + value[1:], rowid))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # The restore-verify's walk still selects by the marker, so it does not read this value: the
+    # marker limb that stays open on the restore path (BACKLOG #1719's remainder).
+    status, message, _ = dr_backup._decrypt_check(db, settings)
+    assert status == "PASS", message
+
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 1 and payload["status"] == "FAIL", payload
+    raw = _cells(payload)["messages.raw"]
+    assert raw["unmarked"] == 1 and raw["failed"] == 0
+    assert raw["first_unmarked"] == f"messages.raw id={ident} carries no at-rest marker"
+
+    monkeypatch.setenv("MEFOR_STORE_ALLOW_UNMARKED_CIPHERTEXT", "true")
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 0 and payload["status"] == "PASS", payload
+    assert payload["unmarked"] == 1 and "allow_unmarked_ciphertext" in payload["reason"]
+
+
+def test_a_shell_without_the_key_reports_key_mismatch(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No key in this shell resolves keyless; the store holds sealed values, so the keyring is the
+    cause, and the exit says so rather than calling the store damaged."""
+    db, _settings = _copy(_template, tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 4 and payload["status"] == "KEY_MISMATCH", payload
+    assert "resolved no key" in payload["reason"]
+
+
+def test_a_server_backend_is_not_covered_and_never_exit_0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A PostgreSQL store: nothing is read, and the exit is neither PASS's 0 nor FAIL's 1."""
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text(
+        '[store]\nbackend = "postgres"\nserver = "db.invalid"\ndatabase = "mefor"\n'
+        'username = "mefor"\n',
+        encoding="utf-8",
+    )
+    rc = main(["cipher-audit", "--service-config", str(cfg), "--json"])
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 3 and payload["status"] == "NOT_COVERED", payload
+
+
+def test_the_audit_reads_a_path_with_uri_characters_and_writes_nothing(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A live path can hold a space, ``#`` or ``%``. Unquoted in a ``file:`` URI, ``#`` would end
+    the path. The read-only open must also leave the file's bytes as they were."""
+    odd = tmp_path / "live # 50% store"
+    odd.mkdir()
+    db, settings = _copy(_template, odd)
+    _keyed(monkeypatch, settings)
+    before = db.read_bytes()
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 0, payload
+    assert payload["opened"] == sum(_sealed_by_cell(db).values())
+    assert db.read_bytes() == before
+
+    # The restore-verify's walk takes the same URI builder now.
+    status, message, cells = dr_backup._decrypt_check(db, settings)
+    assert status == "PASS" and cells == payload["opened"], message
+
+
+def test_table_narrows_the_audit_and_an_unknown_table_is_refused(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db, settings = _copy(_template, tmp_path)
+    _keyed(monkeypatch, settings)
+    rc, payload = _audit(db, monkeypatch, capsys, "--table", "response")
+    assert rc == 0, payload
+    assert set(_cells(payload)) == {"response.body", "response.detail", "response.resp_headers"}
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["cipher-audit", "--db", str(db), "--table", "nope"]) == 2
+    assert "no cipher-covered table named nope" in capsys.readouterr().err
+
+
+def test_a_missing_store_is_refused_and_not_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    missing = tmp_path / "absent.db"
+    assert main(["cipher-audit", "--db", str(missing)]) == 2
+    assert "no store at" in capsys.readouterr().err
+    assert not missing.exists()
+
+
+def _first_sealed(db: Path, table: str, column: str) -> tuple[int, str]:
+    conn = sqlite3.connect(db)
+    try:
+        rowid, value = conn.execute(
+            f"SELECT rowid, {column} FROM {table} WHERE {column} LIKE ? ORDER BY rowid LIMIT 1",
+            (f"{MARKER_PREFIX}%",),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(rowid), str(value)
+
+
+def _set(db: Path, table: str, column: str, rowid: int, value: object) -> None:
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (value, rowid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("damaged", [False, True], ids=["intact", "flipped"])
+def test_a_sealed_value_stored_as_a_blob_fails_as_a_blob(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], damaged: bool
+) -> None:
+    """LIKE matches a BLOB that starts with the marker, so the walk selects it as sealed. The
+    store's reader cannot take a BLOB as a sealed cell, so it fails, intact or not, and says why:
+    read as ``str(bytes)`` it once looked unmarked and a damaged one passed."""
+    db, settings = _copy(_template, tmp_path)
+    rowid, value = _first_sealed(db, "messages", "raw")
+    if damaged:
+        head, _, payload = value.rpartition(":")
+        blob = bytearray(base64.b64decode(payload))
+        blob[-1] ^= 0x01
+        value = f"{head}:{base64.b64encode(bytes(blob)).decode()}"
+    _set(db, "messages", "raw", rowid, value.encode())
+    status, message, _ = dr_backup._decrypt_check(db, settings)
+    assert status == "FAIL" and "messages.raw" in message and "BLOB" in message, message
+
+
+def test_a_marker_in_another_case_fails_even_under_the_opt_out(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Under ``allow_unmarked_ciphertext`` the cipher returns an unmarked value as it is, so a
+    sealed value whose marker case was changed would count as opened with no tag checked."""
+    db, settings = _copy(_template, tmp_path)
+    _keyed(monkeypatch, settings)
+    monkeypatch.setenv("MEFOR_STORE_ALLOW_UNMARKED_CIPHERTEXT", "true")
+    rowid, value = _first_sealed(db, "messages", "raw")
+    _set(db, "messages", "raw", rowid, MARKER_PREFIX.upper() + value[len(MARKER_PREFIX) :])
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 1 and payload["failed"] == 1, payload
+    assert "not spelled" in _cells(payload)["messages.raw"]["first_failure"]
+
+
+def test_another_key_is_named_as_a_possible_cause(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A shell holding a different key fails every value; each failure says its marker names a key
+    these settings do not hold, without calling it anything softer than FAIL."""
+    db, _settings = _copy(_template, tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 1 and payload["status"] == "FAIL", payload
+    assert "names a key these settings do not hold" in payload["reason"]
+
+
+def test_a_keyless_shell_on_a_keyed_store_with_no_sealed_value_is_a_key_mismatch(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every sealed value purged to ``''``: the walk alone finds nothing, but the store records
+    its keyed surfaces, so a shell with no key is still the wrong shell. No counts are printed."""
+    db, _settings = _copy(_template, tmp_path)
+    conn = sqlite3.connect(db)
+    try:
+        for cell in SQLITE_CIPHER_CELLS:
+            conn.execute(
+                f"UPDATE {cell.table} SET {cell.column} = '' WHERE {cell.column} LIKE ?",
+                (f"{MARKER_PREFIX}%",),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 4 and payload["status"] == "KEY_MISMATCH", payload
+    assert payload["opened"] is None and payload["cells"] == []
+
+
+def test_a_file_that_is_not_a_store_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty file is a valid SQLite database holding none of the cells: could not start, never
+    a PASS over nothing."""
+    monkeypatch.chdir(tmp_path)
+    empty = tmp_path / "empty.db"
+    empty.write_bytes(b"")
+    assert main(["cipher-audit", "--db", str(empty)]) == 2
+    assert "not a MessageFoundry store" in capsys.readouterr().err
+
+
+def test_a_queue_row_pointed_at_another_body_fails(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """``body_ref`` is not in the queue tag, so the payload still opens when it is changed; the
+    reader refuses the row because its sealed reference differs, and so must the walk."""
+    db, settings = _copy(_template, tmp_path)
+    conn = sqlite3.connect(db)
+    try:
+        rowid = conn.execute(
+            "SELECT rowid FROM queue WHERE body_ref IS NOT NULL ORDER BY rowid LIMIT 1"
+        ).fetchone()[0]
+        conn.execute("UPDATE queue SET body_ref = ? WHERE rowid = ?", ("0" * 64, rowid))
+        conn.commit()
+    finally:
+        conn.close()
+    status, message, _ = dr_backup._decrypt_check(db, settings)
+    assert status == "FAIL" and "differs from its body_ref" in message, message
+
+
+def test_plaintext_on_a_surface_never_sealed_is_legacy_not_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A store written keyless, audited before any keyed open: its plaintext is what the next
+    keyed open seals, not a stripped marker. It is reported, and the audit passes."""
+    db = tmp_path / "msg.db"
+
+    async def write() -> None:
+        store = await _open(db, StoreSettings(path=str(db)))
+        try:
+            await store.enqueue_message(channel_id="IB_SYNTH", raw=_RAW, deliveries=[("OB", "X")])
+        finally:
+            await store.close()
+
+    asyncio.run(write())
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 0 and payload["status"] == "PASS", payload
+    assert payload["legacy"] >= 1 and payload["unmarked"] == 0, payload
+    assert "next keyed open seals" in payload["reason"]
+
+
+def test_a_cell_the_store_lacks_is_named_not_counted_as_empty(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db, settings = _copy(_template, tmp_path)
+    _keyed(monkeypatch, settings)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DROP TABLE alert_instance")
+        conn.commit()
+    finally:
+        conn.close()
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 0, payload
+    assert _cells(payload)["alert_instance.reason"]["present"] is False
+    assert "not read: alert_instance.reason" in payload["reason"]
+
+
+def test_a_locator_cannot_forge_a_report_line(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    db, settings = _copy(_template, tmp_path)
+    raw = next(c for c in SQLITE_CIPHER_CELLS if (c.table, c.column) == ("messages", "raw"))
+    rowid, _value = _first_sealed(db, "messages", "raw")
+    _set(db, "messages", "id", rowid, "x\nPASS: forged")
+    _flip_one_aead_byte(db, raw)
+    status, message, _ = dr_backup._decrypt_check(db, settings)
+    assert status == "FAIL" and "\n" not in message and "id=x\\nPASS: forged" in message, message
+
+
+def test_a_schema_change_part_way_stops_the_walk(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """A VACUUM between chunks may renumber rowids; the walk stops rather than finish on a subset."""
+    db, settings = _copy(_template, tmp_path)
+    reader = connect_readonly(db, busy_timeout=5.0)
+    writer = sqlite3.connect(db, isolation_level=None)
+    try:
+        walk = read_cipher_cells(reader, build_store_cipher(settings), chunk_rows=1)
+        next(walk)
+        writer.execute("VACUUM")
+        with pytest.raises(CipherWalkInterrupted):
+            list(walk)
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_an_unreachable_key_service_stops_the_audit(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """Transit raises the same CipherError for an outage as for a bad value. The audit stops on
+    the first outage instead of calling every later value damaged."""
+    db, _settings = _copy(_template, tmp_path)
+
+    class _Down:
+        encrypts = True
+        calls = 0
+
+        def is_encrypted(self, stored: str) -> bool:
+            return stored.startswith(MARKER_PREFIX)
+
+        def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+            self.calls += 1
+            try:
+                raise ConnectionRefusedError("synthetic outage")
+            except OSError as exc:
+                raise CipherError("Transit decrypt failed") from exc
+
+    down = _Down()
+    reader = connect_readonly(db, busy_timeout=5.0)
+    try:
+        with pytest.raises(CipherError):
+            audit_cipher_cells(reader, cast(Cipher, down))
+    finally:
+        reader.close()
+    assert down.calls == 1, "the walk kept asking a key service that was down"
+
+
+def test_chunks_read_every_row_and_hold_no_read_transaction_between_them(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """One row per chunk reads the same values as one large chunk, and between chunks the walk
+    holds no snapshot: a TRUNCATE checkpoint, which an open reader blocks, completes. The control
+    proves the checkpoint does report a held snapshot."""
+    db, settings = _copy(_template, tmp_path)
+    cipher = build_store_cipher(settings)
+    reader = connect_readonly(db, busy_timeout=0.0)
+    writer = sqlite3.connect(db, isolation_level=None, timeout=0.0)
+    try:
+        big = audit_cipher_cells(reader, cipher, chunk_rows=DEFAULT_CHUNK_ROWS)
+        small = audit_cipher_cells(reader, cipher, chunk_rows=1)
+        assert [(t.name, t.opened) for t in small.tallies] == [
+            (t.name, t.opened) for t in big.tallies
+        ]
+        assert max(t.opened for t in big.tallies) > 1, "no cell held two rows to chunk"
+
+        # A real change: SQLite skips writing a row an UPDATE leaves as it was, so no frame.
+        writer.execute("CREATE TABLE synth_probe (n INTEGER)")
+
+        def write_a_frame() -> None:
+            writer.execute("INSERT INTO synth_probe VALUES (1)")
+
+        def checkpoint_blocked() -> bool:
+            """Write a frame, then try to empty the WAL: a reader holding a snapshot that reads the
+            WAL blocks that, and the pragma's first column reports it."""
+            write_a_frame()
+            busy, _log, _done = writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            return bool(busy)
+
+        # Each arm reads after a write, so its snapshot reads the WAL rather than the file alone.
+        write_a_frame()
+        walk = read_cipher_cells(reader, cipher, chunk_rows=1)
+        assert next(walk).kind == "opened"
+        assert not checkpoint_blocked(), "the walk held a read transaction between chunks"
+        walk.close()
+
+        # Control: an open read transaction on the same connection does block it.
+        write_a_frame()
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM messages").fetchone()
+        assert checkpoint_blocked(), "the instrument cannot see a held snapshot"
+        reader.execute("COMMIT")
+    finally:
+        reader.close()
+        writer.close()

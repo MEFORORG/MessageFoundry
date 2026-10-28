@@ -271,8 +271,9 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/pipeline/wiring_runner.py": _POSTURE_ONLY,
     "messagefoundry/api/app.py": _POSTURE_ONLY,
     "messagefoundry/api/security.py": _POSTURE_ONLY,
-    "messagefoundry/store/cipher_cells.py": "a read-only declaration of cipher-covered cells; it "
-    "builds a cell's AAD, which is byte framing, and never loads or holds a key",
+    "messagefoundry/store/cipher_cells.py": "declares the cipher-covered cells and walks them "
+    "read-only, decrypting each sealed value through a store cipher its caller built; it builds "
+    "a cell's AAD, which is byte framing, and never loads, resolves or holds a key itself",
     "messagefoundry/transports/base.py": "names the ssl types for a connect helper that receives a "
     "context built elsewhere and reports handshake failures; it builds no context and loads no key",
     "messagefoundry/transports/ai_broker.py": _POSTURE_ONLY,
