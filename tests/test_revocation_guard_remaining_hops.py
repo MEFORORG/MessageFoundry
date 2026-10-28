@@ -690,8 +690,11 @@ def test_a_crl_does_not_admit_an_ftps_hop_that_ignores_certificate_expiry(bare_c
     CRL on that context is not a check that may relax the refusal, as on REST (vault BACKLOG
     #2188). Both directions share the guard, so both are read here."""
     with active_hop_posture(ENFORCING):
-        with pytest.raises(InsecureHopRefused, match="revocation"):
+        with pytest.raises(InsecureHopRefused, match="revocation") as exc:
             RemoteFileSource(_poll(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
+        # The refusal offers only levers that can cross it: not the CRL it already has.
+        assert "tls_allow_expired" in str(exc.value)
+        assert "Configure [tls].crl_file" not in str(exc.value)
         with pytest.raises(InsecureHopRefused, match="revocation"):
             RemoteFileDestination(_ftps(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
         # The control: the same hop without the relaxation is admitted by that CRL.

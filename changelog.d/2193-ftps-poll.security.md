@@ -5,5 +5,8 @@
   refused at construction (`messagefoundry check`, dry-run, reload, and the start, where it is
   recorded failed and the rest of the graph starts) unless a `[tls].crl_file` reaches its context
   or the inbound declares `tls_revocation_attested` with a reason. A CRL that is set but cannot be
-  loaded still refuses the poll. A non-enforcing instance warns. See
+  loaded still refuses the poll. A non-enforcing instance warns. On either FTPS direction, a hop
+  that sets `tls_allow_expired` is no longer admitted by a CRL, since the relaxation also skips
+  the CRL's validity window: only its attestation crosses. An FTPS upload with that setting and
+  a CRL was admitted before. See
   [DEPLOYMENT.md](../docs/DEPLOYMENT.md#revocation-guard-behavior). (`BACKLOG #2193`)
