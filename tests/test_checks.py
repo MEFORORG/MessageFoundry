@@ -653,7 +653,7 @@ _LOOKUP_CALLS = {
 
 
 @pytest.mark.parametrize("bridge", sorted(_LOOKUP_CALLS))
-@pytest.mark.parametrize("sandbox_mode", ["off", "subprocess"])
+@pytest.mark.parametrize("sandbox_mode", ["off", "subprocess", "isolated"])
 def test_a_lookup_handler_fails_the_gate_in_every_sandbox_mode(
     tmp_path: Path, bridge: str, sandbox_mode: str
 ) -> None:

@@ -179,6 +179,7 @@ from messagefoundry.pipeline.reference_sync import (
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
     GraphShape,
+    SandboxError,
     SandboxMode,
     SandboxPolicy,
     SandboxSession,
@@ -5488,8 +5489,10 @@ class RegistryRunner:
     def _sandbox_for(self, name: str) -> SandboxSession | None:
         """The persistent sandbox worker for inbound ``name`` (ADR 0087), or ``None`` to run in-process.
 
-        Returns ``None`` — the byte-identical in-process path — unless ``[sandbox].mode=subprocess``
-        AND a config dir is known. The child re-loads the graph to look a function up by name, from
+        Returns ``None`` — the byte-identical in-process path — unless ``[sandbox].mode`` is
+        ``subprocess`` or ``isolated`` AND a config dir is known. With no config dir, ``isolated``
+        raises :class:`SandboxError` rather than degrade, because the in-process path would run its
+        lookups unbrokered (vault BACKLOG #3131); the rest of this paragraph is about ``subprocess``. The child re-loads the graph to look a function up by name, from
         ``Registry.config_snapshot``, the bytes the served graph was loaded from, and never reads
         the directory (vault BACKLOG #2596). A graph with no snapshot hands the session
         ``Registry.source_dir``, else the constructor's ``sandbox_config_source``, which the session
@@ -5510,6 +5513,15 @@ class RegistryRunner:
                 self._sandbox_config_source[0] if self._sandbox_config_source else None
             )
             if cfg_dir is None:
+                if policy.mode is SandboxMode.ISOLATED:
+                    # FAIL CLOSED. The in-process path would run this inbound's Handlers with the
+                    # engine's own db_lookup/fhir_lookup runners, unbrokered, under a setting that
+                    # asked for the broker (vault BACKLOG #3131). The message dead-letters instead.
+                    raise SandboxError(
+                        f"[sandbox].mode=isolated cannot run inbound {name!r}: its graph has no "
+                        "config directory for a worker to load, and this mode never runs a Router "
+                        "or Handler in the engine process"
+                    )
                 return None
             env = self._sandbox_config_source[1] if self._sandbox_config_source else None
             # The engine's code-set tables travel once per spawn in the boot frame (not per dispatch),
@@ -6373,11 +6385,14 @@ class RegistryRunner:
         # Rather than run user config code unsandboxed under a config that asked for a sandbox, fail
         # CLOSED to the async (sandboxed) path. An IPC round-trip inside a fused hop would negate the
         # fusion anyway, so degrading is the right trade — never a silent isolation bypass.
-        if self._sandbox_policy is not None and self._sandbox_policy.mode is SandboxMode.SUBPROCESS:
+        # `is not OFF`, never `is SUBPROCESS`: every worker mode is isolation this hop would bypass
+        # (mode=isolated included, vault BACKLOG #3131).
+        if self._sandbox_policy is not None and self._sandbox_policy.mode is not SandboxMode.OFF:
             log.warning(
-                "fuse_thread_hops is set but [sandbox].mode=subprocess: fusion runs Router/Handler/"
+                "fuse_thread_hops is set but [sandbox].mode=%s: fusion runs Router/Handler/"
                 "accepts= code in-process (unsandboxed), so it is DISABLED — running the async sandboxed "
-                "pipeline path. Turn the sandbox off to use fusion, or leave fusion off to keep isolation."
+                "pipeline path. Turn the sandbox off to use fusion, or leave fusion off to keep isolation.",
+                self._sandbox_policy.mode.value,
             )
             return False
         backend = self.store.backend

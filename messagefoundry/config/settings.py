@@ -2402,7 +2402,11 @@ class SandboxSettings(_Section):
 
     * **Live enrichment is refused.** ``db_lookup``/``fhir_lookup`` re-enter the event loop, which a
       process boundary breaks, so they fail closed inside the child. **A Handler needing either must
-      run ``mode="off"``** — that escape is supported and is not going away. ``[sandbox]`` is a
+      run ``mode="off"``, or ``mode="isolated"``** — the off escape is supported and is not going
+      away. ``mode="isolated"`` (ADR 0147, vault BACKLOG #3131) is the same worker with both lookups
+      brokered through the engine, refused while ``[egress].allowed_db`` (``allowed_http`` for
+      ``fhir_lookup``) is empty even under the ``block_unlisted_outbound`` opt-out. It adds no
+      OS-level confinement yet: ``docs/CONFIGURATION.md``, section ``[sandbox]``, says what it does. ``[sandbox]`` is a
       single **engine-wide** section: :meth:`messagefoundry.pipeline.engine.Engine.add_registry`
       renders ONE ``SandboxPolicy`` for the whole graph and a connection carries no per-connection
       sandbox field, so ``mode="off"`` set for one Handler runs **every** Router and Handler in the
@@ -2427,9 +2431,10 @@ class SandboxSettings(_Section):
     **restart to change**, exactly like ``claim_mode``)."""
 
     # off (default, byte-identical, no subprocess — and the supported escape for a Handler needing
-    # live enrichment) | subprocess (persistent per-inbound worker child). ENGINE-WIDE, not per
-    # connection: one policy is rendered for the whole graph.
-    mode: Literal["off", "subprocess"] = Field(default="off")
+    # live enrichment) | subprocess (persistent per-inbound worker child) | isolated (that worker,
+    # with db_lookup/fhir_lookup brokered through the engine; ADR 0147). Any other value refuses to
+    # load. ENGINE-WIDE, not per connection: one policy is rendered for the whole graph.
+    mode: Literal["off", "subprocess", "isolated"] = Field(default="off")
     # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
     # There is no RLIMIT_CPU, so CPU spent outside a call has no bound (ADR 0087, 2026-10-07).

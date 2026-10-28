@@ -22,7 +22,9 @@ direction, in either process.
    re-establishes the run-scoped context providers for the phase (substituting the boot-carried code
    sets, which the per-dispatch frame deliberately does not repeat), runs the function, and
    **describes** the result back as ``ok`` — or ``fail`` with ``kind`` ``denied`` (forbidden import, a
-   live ``db_lookup``/``fhir_lookup``, an undescribable result), ``error`` (a plain handler raise) or
+   live ``db_lookup``/``fhir_lookup`` at ``mode=subprocess``), ``error`` (a plain handler raise, an
+   undescribable result, or at ``mode=isolated`` a lookup error, the lookup having been asked of the
+   parent through :class:`_Broker` while the Handler ran) or
    ``memory`` (a ``MemoryError``, after which the worker exits so the parent starts a fresh one).
    The reply echoes the request's ``id``, ``phase`` and ``name`` so the parent can prove the frame
    answers the call it made.
@@ -43,6 +45,7 @@ import contextlib
 import logging
 import os
 import sys
+import threading
 from dataclasses import replace
 from typing import Any
 
@@ -205,8 +208,113 @@ def _install_import_guard(forbidden: tuple[str, ...]) -> None:
     sys.meta_path.insert(0, _ForbiddenImportFinder(forbidden))
 
 
-def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str, str]:
-    """Execute one router/handler request; return ``(ok, result, kind, error)``. Never raises."""
+class _Broker:
+    """The worker's half of the ``mode=isolated`` lookup broker (ADR 0147).
+
+    Its two runners stand in for the engine's while a Handler runs: each writes one ``lookup`` frame
+    to the parent and blocks on the parent's one reply, so a ``db_lookup``/``fhir_lookup`` call
+    returns what the parent's own runner returned, or raises the lookup's own error type with the
+    parent's reason. The parent decides every call; this side only asks.
+
+    Calls are serialized under one lock, because the pipe carries one exchange at a time. A call made
+    while no dispatch is in flight, such as from a thread a Handler left running, is refused rather
+    than written: the parent would read the frame as unsolicited and drop the worker, and its read of
+    stdin would take the next request frame as its reply. A desynchronized or closed pipe marks the
+    broker broken, and :func:`main` exits after the dispatch, so the parent starts a fresh worker."""
+
+    def __init__(self, stdin: Any, stdout: Any) -> None:
+        self._stdin = stdin
+        self._stdout = stdout
+        self._lock = threading.Lock()
+        self._req: Any = None
+        self._seq = 0
+        self.broken = False
+
+    def begin(self, req: Any) -> None:
+        with self._lock:
+            self._req, self._seq = req, 0
+
+    def end(self) -> None:
+        """Close the dispatch. Taken under the lock, so a lookup still in flight on another thread
+        finishes, inside the dispatch, before the answer frame is written."""
+        with self._lock:
+            self._req = None
+
+    def db(self, connection: str, statement: str, params: Any = None) -> Any:
+        from messagefoundry.config.db_lookup import DbLookupError
+        from messagefoundry.pipeline._sandbox_codec import LOOKUP_DB
+
+        return self._ask(LOOKUP_DB, DbLookupError, "db_lookup", connection, statement, params)
+
+    def fhir(self, connection: str, query: str, params: Any = None) -> Any:
+        from messagefoundry.config.fhir_lookup import FhirLookupError
+        from messagefoundry.pipeline._sandbox_codec import LOOKUP_FHIR
+
+        return self._ask(LOOKUP_FHIR, FhirLookupError, "fhir_lookup", connection, query, params)
+
+    def _ask(
+        self,
+        kind: str,
+        error: type[Exception],
+        fn: str,
+        connection: object,
+        target: object,
+        params: object,
+    ) -> Any:
+        from messagefoundry.pipeline import _sandbox_codec as codec
+        from messagefoundry.pipeline._sandbox_codec import SandboxError
+        from messagefoundry.pipeline.sandbox import _read_frame_bytes, _write_frame
+
+        with self._lock:
+            req = self._req
+            if req is None or self.broken:
+                raise error(f"{fn}: no Handler dispatch is in flight in this sandbox worker")
+            self._seq += 1
+            seq = self._seq
+            try:
+                frame = codec.encode_lookup(
+                    request_id=req.request_id,
+                    phase=req.phase,
+                    name=req.name,
+                    seq=seq,
+                    kind=kind,
+                    connection=connection,
+                    target=target,
+                    params=params,
+                )
+            except SandboxError as exc:
+                # A bad argument fails as the call would in-process: the lookup's own error, and the
+                # pipe untouched. Nothing was written.
+                raise error(f"{fn}: its arguments cannot cross the sandbox: {exc}") from None
+            try:
+                _write_frame(self._stdout, frame)
+                body = _read_frame_bytes(self._stdin)
+                if body is None:
+                    raise SandboxError("the engine closed the pipe")
+                ok, result, reason = codec.decode_lookup_reply(
+                    body, request_id=req.request_id, phase=req.phase, name=req.name, seq=seq
+                )
+            except (OSError, SandboxError) as exc:
+                # An over-cap frame raises before a byte is written, so only a pipe the parent
+                # abandoned, or a reply that does not answer this call, gets here. Either way the
+                # pipe no longer lines up with the protocol.
+                self.broken = True
+                raise error(f"{fn}: the sandbox lookup broker failed: {exc}") from None
+        if not ok:
+            raise error(reason)
+        return result
+
+
+def _run_one(
+    registry: Any, req: Any, code_sets: Any, broker: _Broker | None = None
+) -> tuple[bool, object, str, str]:
+    """Execute one router/handler request; return ``(ok, result, kind, error)``. Never raises.
+
+    ``broker`` is set at ``mode=isolated`` (ADR 0147): a Handler's ``db_lookup``/``fhir_lookup``
+    is then asked of the parent, and an error it raises is that Handler's error, as at ``mode=off``.
+    Without it, both lookups are refused in the worker, as ADR 0087 built them."""
+    from messagefoundry.config import db_lookup as db_lookup_mod
+    from messagefoundry.config import fhir_lookup as fhir_lookup_mod
     from messagefoundry.config.db_lookup import DbLookupError
     from messagefoundry.config.fhir_lookup import FhirLookupError
     from messagefoundry.config.run_context import run_contexts
@@ -243,8 +351,15 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
     if fn is None:
         return False, None, "error", f"no such {phase} {name!r} in registry"
 
+    # The brokered runners exist only for a Handler: a Router or an accepts= predicate finds no
+    # runner, so its lookup raises the "unavailable here" error it raises at mode=off.
+    brokered = broker is not None and phase == "transform"
     try:
-        with run_contexts(run_context, phase=phase_key):
+        with (
+            run_contexts(run_context, phase=phase_key),
+            db_lookup_mod.activated(broker.db if brokered and broker else None),
+            fhir_lookup_mod.activated(broker.fhir if brokered and broker else None),
+        ):
             result = fn(req.payload)
             if phase == "transform":
                 # Materialise a CONTAINER return here, INSIDE the run context (BACKLOG #341). A
@@ -269,8 +384,13 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
             # ``[sandbox].mode`` never change the routing decision (ADR 0087).
             result = bool(result)
     except (DbLookupError, FhirLookupError) as exc:
+        if broker is not None:
+            # mode=isolated: the lookup ran, or was refused, through the parent, so its error is the
+            # Handler's error exactly as at mode=off. A Router's lookup lands here too, with the
+            # "unavailable here" text mode=off gives it.
+            return False, None, "error", _error_text(exc)
         # db_lookup/fhir_lookup bridge back onto the engine event loop (run_coroutine_threadsafe),
-        # which a subprocess boundary breaks — forbidden + fail-closed for this PR (ADR 0087).
+        # which a subprocess boundary breaks — forbidden + fail-closed at mode=subprocess (ADR 0087).
         return (
             False,
             None,
@@ -303,13 +423,13 @@ def _error_text(exc: BaseException) -> str:
         return type(exc).__name__
 
 
-def _respond(registry: Any, req: Any, code_sets: Any) -> bytes:
+def _respond(registry: Any, req: Any, code_sets: Any, broker: _Broker | None = None) -> bytes:
     """Build the response frame for one request. Never raises — an undescribable result is
     reported — except ``MemoryError``, which :func:`main` answers."""
     from messagefoundry.pipeline import _sandbox_codec as codec
     from messagefoundry.pipeline._sandbox_codec import SandboxError
 
-    ok, result, kind, error = _run_one(registry, req, code_sets)
+    ok, result, kind, error = _run_one(registry, req, code_sets, broker)
     if ok:
         try:
             return codec.encode_ok(
@@ -377,7 +497,13 @@ def main() -> int:
     except (OSError, SandboxError):
         return 1
 
+    # mode=isolated (ADR 0147): a Handler's lookups are asked of the parent over this same pipe.
+    broker = _Broker(stdin, stdout) if boot.broker else None
     while True:
+        if broker is not None and broker.broken:
+            # A lookup exchange went out of step with the protocol; the next request frame cannot be
+            # trusted to line up either. The parent reads EOF and starts a fresh worker.
+            return 1
         frame = _read_frame_bytes(stdin)
         if frame is None:
             return 0  # parent closed the pipe — clean shutdown
@@ -389,14 +515,18 @@ def main() -> int:
             # dead-letter) and respawns a clean child, rather than hanging to the wall cap.
             log.error("sandbox worker: undecodable request frame (%s)", exc)
             return 1
+        if broker is not None:
+            broker.begin(req)
         try:
-            resp: bytes | None = _respond(registry, req, boot.code_sets)
+            resp: bytes | None = _respond(registry, req, boot.code_sets, broker)
         except MemoryError as exc:
             # Caught here rather than around the Handler alone, so a result too big to encode is
             # answered the same way. Only the text is kept: the reply is built AFTER this block,
             # because until it ends the traceback keeps the Handler's frames, and the memory their
             # locals hold, alive.
             resp, detail = None, _error_text(exc)
+        if broker is not None:
+            broker.end()  # before the answer: no lookup frame may follow it
         if resp is None:
             # A call that ran out of memory may leave memory held (a module global, a cache, a
             # fragmented heap), and the next innocent message would pay for it. Answer, then exit so

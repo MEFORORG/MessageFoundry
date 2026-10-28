@@ -1438,20 +1438,14 @@ class Engine:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""
         # ADR 0087 (#197): render [sandbox] into the runner's policy + the (config_dir, env) source a
         # subprocess worker uses to re-load the graph. mode=off (the default) makes _sandbox_for a
-        # no-op — byte-identical, no child ever spawned; mode=subprocess spawns one persistent worker
-        # child per inbound that dispatches. ONE policy for the WHOLE graph: [sandbox] is engine-wide
+        # no-op — byte-identical, no child ever spawned; mode=subprocess or mode=isolated spawns one
+        # persistent worker child per inbound that dispatches. ONE policy for the WHOLE graph: [sandbox] is engine-wide
         # and no connection carries a per-connection sandbox field, so the mode chosen here governs
         # every Router and Handler in this process.
-        from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy
+        from messagefoundry.pipeline.sandbox import policy_from_settings
 
-        _sb = self._sandbox_settings
-        sandbox_policy = SandboxPolicy(
-            mode=SandboxMode(_sb.mode),
-            wall_seconds=_sb.wall_seconds,
-            mem_mb=_sb.mem_mb,
-            startup_seconds=_sb.startup_seconds,
-            pass_environment=_sb.pass_environment,
-        )
+        # mode=isolated also reads [egress]: its lookup broker refuses a lookup whose list is empty.
+        sandbox_policy = policy_from_settings(self._sandbox_settings, self._egress_settings)
         sandbox_config_source = (
             str(self.config_dir) if self.config_dir is not None else None,
             self._active_environment,
