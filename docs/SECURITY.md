@@ -6132,7 +6132,9 @@ stays broken, or recovers and breaks again, is reported only by that first line.
 [CONFIGURATION.md](CONFIGURATION.md) describes the lane under `[logging]`, and this paragraph
 states only what it leaves a `logs:view` or `monitoring:read` reader without `users:manage`.
 `queued` on `GET /status` counts the general lane only, so it does not move with audit rows while
-the general lane is full; a depth over both lanes would have risen by one per row. The drop warning,
+the general lane is full; a depth over both lanes would have risen by one per row. **Not closed
+either:** while the general lane is draining but not full, audit lines are served ahead of it, so
+each audit row can delay one general line and `queued` can still drift with the audit-row rate. The drop warning,
 which `GET /logs/tail` serves, is written at most once per `_FORWARD_DROP_REPORT_INTERVAL`, so a
 warning naming the audit lane tells its reader that an audit row was written in that window.
 **Not closed:** the drop counts on `GET /status`, in the warning and in the `log_forward_failed`

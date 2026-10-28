@@ -1084,7 +1084,7 @@ order of two lines logged in the same second; an audit line's JSON body carries 
 fractions of a second, and a general line has nothing like it. `queue_dropped` counts drops from
 both lanes, and `lost` counts each once. The audit lane fills on audit traffic alone, and the
 alert reason above says when it has. The drop warning in the engine log names the lane or lanes
-that dropped, with each one's depth, with no separate count per lane. Its batch and total
+that dropped, with each one's capacity, and no separate count per lane. Its batch and total
 count both lanes. What these counts and `queued` tell a reader about audit rows is in
 [SECURITY.md](SECURITY.md), beside the other audit-row residuals of the log channel. No field gives the audit lane's depth. A collector
 whose sends fail shows as `send_failing` and the `degraded` state, and an audit lane that fills

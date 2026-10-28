@@ -21,15 +21,16 @@ installed a handler for it to propagate to, which is a property of the *process*
 (BACKLOG #1199; that function states the defect, and this file does not restate it). This module
 transmits nothing itself. The copy reaches every handler the process installed. The one built to
 ship it off the host is the syslog forwarder that :mod:`messagefoundry.logging_setup` installs when
-forwarding is configured and the forwarder comes up. That forwarder carries the copy in its own lane
-of the in-memory hand-off queue, so a flood of general log lines cannot drop it from that queue
-(vault BACKLOG #2612). The on-disk spool behind the queue is shared and size-capped, so a flood
-there can still cost audit lines; `docs/CONFIGURATION.md` says how. No
-handler is attached to the ``messagefoundry.audit`` logger for that, so each sink still sees the
-copy once, through propagation. Its protocol is whatever
+forwarding is configured and the forwarder comes up. The forwarder's protocol is whatever
 ``[logging].forward_protocol`` says: TLS is ADR 0080, and the on-disk spool for a collector that is
 down is ADR 0200. The other handlers keep the copy on the host, though a copy in the engine's log file
 can still leave through ``GET /logs/tail`` or a support bundle.
+
+The forwarder carries the copy in its own lane of the in-memory hand-off queue, so a flood of
+general log lines cannot drop it from that queue (vault BACKLOG #2612). The on-disk spool behind the
+queue is shared and size-capped, so a flood there can still cost audit lines; ``docs/CONFIGURATION.md``
+says how. No handler is attached to the ``messagefoundry.audit`` logger for that, so each sink still
+sees the copy once, through propagation.
 """
 
 from __future__ import annotations
