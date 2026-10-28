@@ -61,6 +61,7 @@ from messagefoundry.pipeline.alerts import (
     LoggingAlertSink,
     cell_tag_failure_forwarder,
     store_cipher_refusal_forwarder,
+    transit_seal_alert,
 )
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
 from messagefoundry.pipeline.cluster import (
@@ -103,6 +104,7 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import rotation_fingerprint_keys
+from messagefoundry.store.row_seal import enforce_transit_seal_probe, store_transit_sealer
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
     REINGRESS_TARGET_PREFIX,
@@ -1813,13 +1815,21 @@ class Engine:
         double), exactly like the GCM runner's refill hook. With no configured sink it falls back to
         the logging sink, as that runner does. The serve path also arms a hook BEFORE the store opens
         (``api/app.py``), so a refusal that blocks the open alerts too; this one replaces it for the
-        engine's lifetime. The forwarder hops onto the loop when a decrypt ran on another thread."""
+        engine's lifetime. The forwarder hops onto the loop when a decrypt ran on another thread.
+
+        It also arms the Transit row sealer's alert hook (BACKLOG #2592), before the early return a
+        cipher without a refusal hook takes."""
+        sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
+        # BACKLOG #2592: a Transit row seal that cannot be made or checked logs a throttled ERROR;
+        # the same report reaches the sink. Called on the loop's thread, so no hop is needed.
+        sealer = store_transit_sealer(self.store)
+        if sealer is not None:
+            sealer.set_alert_hook(transit_seal_alert(sink))
         getter = getattr(self.store, "cipher", None)
         cipher = getter() if callable(getter) else None
         setter = getattr(cipher, "set_refusal_hook", None)
         if not callable(setter):
             return
-        sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
         setter(store_cipher_refusal_forwarder(sink, asyncio.get_running_loop()))
         # BACKLOG #2593: a queue row whose payload fails its own tag is dead-lettered by the store,
         # which reaches this sink the same way, through the cipher.
@@ -1829,6 +1839,9 @@ class Engine:
         self._cipher_refusal_armed = cipher
 
     def _disarm_cipher_refusal_alert(self) -> None:
+        sealer = store_transit_sealer(self.store)
+        if sealer is not None:
+            sealer.set_alert_hook(None)
         cipher = self._cipher_refusal_armed
         self._cipher_refusal_armed = None
         setter = getattr(cipher, "set_refusal_hook", None)
@@ -1854,6 +1867,10 @@ class Engine:
             self.store.cipher_info().transit_key_name,
             enforcement=self._security_enforcement,
         )
+        # BACKLOG #2592: under vault_transit, seal and verify fixed input once, so a token whose
+        # policy cannot verify refuses the start rather than every request that reads an authority
+        # row. In every enforcement mode; a no-op on any other cipher.
+        await enforce_transit_seal_probe(self.store)
         # All-stages recovery: returns any row a crash left `inflight` — ingress rows mid-route and
         # outbound rows mid-delivery alike — to `pending` so the staged workers re-claim them
         # (staged pipeline, ADR 0001). The handoff/delivery transactions make the re-run idempotent.

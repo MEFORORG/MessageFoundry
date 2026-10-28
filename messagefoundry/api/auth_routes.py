@@ -160,12 +160,20 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
-from messagefoundry.store.row_seal import RowSealError
+from messagefoundry.store.row_seal import (
+    RowSealError,
+    TransitSealUnavailableError,
+    TransitSealUnverifiableError,
+)
 from messagefoundry.store.store import SessionRecord, UserRecord
 
 _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
+
+#: The ``Retry-After`` a request refused for a Vault transit outage carries, in seconds (BACKLOG
+#: #2592). Short, because the sealer asks Vault again on the next request.
+TRANSIT_SEAL_RETRY_AFTER_SECONDS = 30
 
 #: What ``/auth/mfa-verify``, ``/me/reauth`` and ``/me/mfa/confirm`` say when a directory refused
 #: the account: the proof was never checked, or, on a demoted account's re-bind, it was checked and
@@ -581,6 +589,25 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         )
 
     app.add_exception_handler(RowSealError, _row_seal_refused)
+
+    async def _transit_seal_unavailable(request: Request, exc: Exception) -> Response:
+        # BACKLOG #2592: an authority row's seal could not be made or checked through Vault transit.
+        # Not a failed seal, and not a crash: a 503 with a fixed text, never Vault's text or the row.
+        # The sealer has already logged it, throttled, and raised the alert. An outage passes, so it
+        # carries a Retry-After; a seal under a retired key version does not pass by itself.
+        assert isinstance(exc, TransitSealUnavailableError)
+        if isinstance(exc, TransitSealUnverifiableError):
+            detail = "a stored integrity seal names a retired key version and cannot be checked"
+            headers = None
+        else:
+            detail = "the integrity check service is unavailable; retry shortly"
+            headers = {"Retry-After": str(TRANSIT_SEAL_RETRY_AFTER_SECONDS)}
+        return await http_exception_handler(
+            request,
+            HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail, headers=headers),
+        )
+
+    app.add_exception_handler(TransitSealUnavailableError, _transit_seal_unavailable)
     # --- authentication ------------------------------------------------------
 
     @app.get("/auth/providers", response_model=ProvidersInfo)

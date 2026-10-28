@@ -159,7 +159,24 @@ def main(argv: list[str] | None = None) -> int:
         _build_parser,
         configures_own_logging=_CONFIGURES_OWN_LOGGING,
         floor_code=_floor_error_code,
+        refusal_text=_refusal_text,
     )
+
+
+def _refusal_text(exc: Exception) -> str | None:
+    """The one ``error:`` line for an exception that is an operator-facing refusal rather than a
+    defect, or None. run_cli prints it in place of the last-resort report.
+
+    A Transit row seal that could not be made or checked (BACKLOG #2592): Vault did not answer, or
+    a seal names a key version the key no longer verifies under. Looked up in ``sys.modules``, so a
+    command that never loaded the sealer pays no import for it. The text is the sealer's own, which
+    names the cause and Vault's redacted failure text, never row data."""
+    row_seal = sys.modules.get("messagefoundry.store.row_seal")
+    if row_seal is None or not isinstance(exc, row_seal.TransitSealUnavailableError):
+        return None
+    from messagefoundry.redaction import safe_exc
+
+    return f"the command was refused and nothing was recorded as a seal failure: {safe_exc(exc)}"
 
 
 def _floor_error_code(args: argparse.Namespace) -> str | None:

@@ -9,8 +9,10 @@ own driver extra.
 It does what the row seal needs Transit to do, faithfully enough to fail where Transit fails:
 ``generate_hmac`` MACs under a per-version secret held "inside the module" and names that version in
 its ``vault:v<N>:`` string; ``verify_signed_data`` checks the string at the version it names, never
-the latest, and refuses a version it does not hold the way Transit does, with an HTTP 400; and
-``down`` makes every call fail the way an unreachable Vault does. Encrypt and decrypt are real
+the latest, and refuses a version it does not hold the way Transit does, with an HTTP 400, whether
+newer than ``latest`` or below ``min_decryption``; ``read_key`` reports both numbers, as Transit's
+key metadata does; ``down`` makes every call fail the way an unreachable Vault does; and
+``verify_denied`` makes the verify call fail the way a token without that capability does. Encrypt and decrypt are real
 AES-GCM with the cell's associated data, so a store opened on it works end to end.
 """
 
@@ -44,7 +46,9 @@ class FakeTransit:
     def __init__(self) -> None:
         self._aes = AESGCM(b"\x00" * 32)
         self.latest = 1
+        self.min_decryption = 1
         self.down = False
+        self.verify_denied = False
         self.refusal: type[Exception] = TransitRefusal
         self.verify_calls = 0
         #: The thread of every Transit call, so a test can show none ran on the event loop.
@@ -69,7 +73,15 @@ class FakeTransit:
         return f"vault:v{version}:" + base64.b64encode(digest).decode("ascii")
 
     def read_key(self, *, name: str, **_: Any) -> dict[str, Any]:
-        return {"data": {"name": name, "type": "aes256-gcm96"}}
+        self._gate()
+        return {
+            "data": {
+                "name": name,
+                "type": "aes256-gcm96",
+                "latest_version": self.latest,
+                "min_decryption_version": self.min_decryption,
+            }
+        }
 
     def generate_hmac(
         self, *, name: str, hash_input: str, key_version: int | None = None, **_: Any
@@ -84,12 +96,14 @@ class FakeTransit:
         self, *, name: str, hash_input: str, hmac: str | None = None, **_: Any
     ) -> dict[str, Any]:
         self._gate()
+        if self.verify_denied:
+            raise PermissionError("synthetic: permission denied on transit/verify")
         self.verify_calls += 1
         text, _sep, _body = (hmac or "").removeprefix("vault:v").partition(":")
         if not text.isdigit():
             raise self.refusal("synthetic: not a Transit HMAC")
         version = int(text)
-        if not 1 <= version <= self.latest:
+        if not self.min_decryption <= version <= self.latest:
             raise self.refusal("synthetic: key version not held")
         expected = self._mac(name, version, hash_input)
         return {"data": {"valid": hmac_lib.compare_digest(expected, hmac or "")}}

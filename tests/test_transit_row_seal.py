@@ -26,7 +26,14 @@ import pytest
 
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.cli_common import run_cli
+from messagefoundry.config.settings import AuthSettings, EgressSettings, SecurityEnforcement
+from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.alerts import (
+    TRANSIT_SEAL_SUBJECT,
+    LoggingAlertSink,
+    transit_seal_alert,
+)
 from messagefoundry.store import row_seal
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.row_seal import (
@@ -34,7 +41,9 @@ from messagefoundry.store.row_seal import (
     SESSION_KIND,
     RowSealer,
     TransitRowSealer,
+    TransitSealStartRefusedError,
     TransitSealUnavailableError,
+    TransitSealUnverifiableError,
     transit_seal_key_id,
 )
 from messagefoundry.store.store import MessageStore
@@ -244,7 +253,7 @@ async def test_an_outage_denies_without_a_seal_failure_and_recovers(
     transit.down = True
     with pytest.raises(TransitSealUnavailableError):
         await service.identity_for_token(token)
-    assert "Vault transit did not answer" in caplog.text  # the provider alert
+    assert "could not be made or checked through Vault transit" in caplog.text  # the ERROR line
     # An outage is not a forgery: no seal-failure audit row, and the session was not ended.
     assert _seal_failures(path) == 0
     row = await store.get_session(hash_token(token))
@@ -262,7 +271,12 @@ async def test_an_outage_denies_without_a_seal_failure_and_recovers(
     assert _seal_failures(path) == 1
 
 
-async def test_a_version_transit_refuses_does_not_verify(transit_store: Opened) -> None:
+async def test_a_refused_check_is_placed_against_the_key_version_range(
+    transit_store: Opened,
+) -> None:
+    """An HTTP 400 from Transit's verify is read against the key's version range (BACKLOG #2592):
+    a newer version than the node holds is an outage, a version below the minimum cannot be
+    verified, and only a refusal inside the range reads as "does not verify"."""
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
     store, _path, transit = transit_store
     transit.refusal = hvac_exceptions.InvalidRequest
@@ -270,21 +284,213 @@ async def test_a_version_transit_refuses_does_not_verify(transit_store: Opened) 
     assert isinstance(sealer, TransitRowSealer)
     fields = [("token_hash", "synthetic")]
     good = await sealer.seal_async(SESSION_KIND, fields)
-    # A seal naming a version Transit does not hold is Transit's HTTP 400: not verified, no outage.
-    forged = good.replace(":vault:v1:", ":vault:v9:")
-    assert await sealer.verify_async(SESSION_KIND, fields, forged) is False
-    # Control: the honest seal verifies, and a different field fails.
     assert await sealer.verify_async(SESSION_KIND, fields, good) is True
     assert await sealer.verify_async(SESSION_KIND, [("token_hash", "other")], good) is False
 
-    # A 400 while the key itself does not answer (a missing or renamed key) is an outage, not a
-    # forgery: Transit's probe under the latest version must succeed before a 400 means "no".
+    # Newer than this Vault node holds: a node lagging a rotation answers so. An outage, not a no.
+    newer = good.replace(":vault:v1:", ":vault:v9:")
+    with pytest.raises(TransitSealUnavailableError) as lagging:
+        await sealer.verify_async(SESSION_KIND, fields, newer)
+    assert not isinstance(lagging.value, TransitSealUnverifiableError)
+
+    # Inside the range, a 400 is about this string, which a forged seal can carry: a plain no.
+    def refuses_the_body(**_: Any) -> dict[str, Any]:
+        raise hvac_exceptions.InvalidRequest("synthetic: cannot read the HMAC")
+
+    real_verify = transit.verify_signed_data
+    transit.verify_signed_data = refuses_the_body  # type: ignore[method-assign]
+    assert await sealer.verify_async(SESSION_KIND, [("token_hash", "body")], good) is False
+
+    # A 400 whose range cannot be read (a missing or renamed key) is an outage, not a forgery.
     def key_gone(**_: Any) -> dict[str, Any]:
         raise hvac_exceptions.InvalidRequest("synthetic: no such key")
 
-    transit.generate_hmac = key_gone  # type: ignore[method-assign]
+    transit.read_key = key_gone  # type: ignore[method-assign]
     with pytest.raises(TransitSealUnavailableError):
-        await sealer.verify_async(SESSION_KIND, [("token_hash", "fresh")], forged)
+        await sealer.verify_async(SESSION_KIND, [("token_hash", "fresh")], good)
+    transit.verify_signed_data = real_verify  # type: ignore[method-assign]
+
+
+async def test_a_seal_under_a_retired_version_is_refused_but_not_as_a_forgery(
+    transit_store: Opened, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Raising ``min_decryption_version`` past a version that sealed live rows makes those rows
+    unverifiable (BACKLOG #2592, finding 2). The request is refused, fail-closed, but no seal
+    failure is audited and the session is not ended, because the seal may be genuine."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    service = AuthService(store, AuthSettings())
+    await _user(store, "seal-u1")
+    token = await _mint(store)
+    assert await service.identity_for_token(token) is not None
+    transit.rotate()
+    transit.min_decryption = 2
+    # A seal after the rotation names v2, so the sealer empties its cache of v1 answers.
+    await _user(store, "seal-u2")
+    await _mint(store, "seal-u2")
+    with pytest.raises(TransitSealUnverifiableError):
+        await service.identity_for_token(token)
+    assert "min_decryption_version" in caplog.text
+    assert _seal_failures(path) == 0
+    row = await store.get_session(hash_token(token))
+    assert row is not None and row.revoked_at is None
+    # Control: lowering the minimum again makes the same row verify, so the refusal was the version.
+    transit.min_decryption = 1
+    assert await service.identity_for_token(token) is not None
+    # And a forged row under a held version is still a recorded seal failure.
+    await _raw_for(path)(
+        "UPDATE sessions SET client = ? WHERE token_hash = ?", ("192.0.2.97", hash_token(token))
+    )
+    assert await service.identity_for_token(token) is None
+    assert _seal_failures(path) == 1
+
+
+async def test_a_seal_naming_a_newer_version_than_vault_holds_is_an_outage(
+    transit_store: Opened,
+) -> None:
+    """A session sealed under a version this Vault node does not hold yet, as a node lagging a
+    rotation reports, is denied as unavailable: no seal failure is audited and it is not ended."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    service = AuthService(store, AuthSettings())
+    await _user(store, "seal-u1")
+    transit.rotate()
+    token = await _mint(store)  # sealed under v2
+    row = await store.get_session(hash_token(token))
+    assert row is not None and ":vault:v2:" in row.seal
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    sealer._cache.clear()
+    transit.latest = 1  # the node answering now lags the rotation
+    with pytest.raises(TransitSealUnavailableError) as caught:
+        await service.identity_for_token(token)
+    assert not isinstance(caught.value, TransitSealUnverifiableError)
+    assert _seal_failures(path) == 0
+    row = await store.get_session(hash_token(token))
+    assert row is not None and row.revoked_at is None
+    transit.latest = 2  # the node catches up
+    assert await service.identity_for_token(token) is not None
+
+
+# --- a check held open across a rotation (Greptile P2 on PR 2565) ----------------------------------
+
+
+async def _held_check(sealer: TransitRowSealer, transit: FakeTransit, *, rotate: bool) -> bool:
+    """Run one v1 check that Transit holds open, optionally seal under a new version meanwhile,
+    then release it. Returns whether the v1 answer was left in the cache."""
+    fields = [("token_hash", "held")]
+    seal = await sealer.seal_async(SESSION_KIND, fields)
+    sealer._cache.clear()
+    entered, release = threading.Event(), threading.Event()
+    real_verify = transit.verify_signed_data
+
+    def held_verify(**kwargs: Any) -> dict[str, Any]:
+        entered.set()
+        assert release.wait(10), "the test never released the held check"
+        return real_verify(**kwargs)
+
+    transit.verify_signed_data = held_verify  # type: ignore[method-assign]
+    check = asyncio.create_task(sealer.verify_async(SESSION_KIND, fields, seal))
+    assert await asyncio.to_thread(entered.wait, 10)
+    transit.verify_signed_data = real_verify  # type: ignore[method-assign]
+    if rotate:
+        transit.rotate()
+        assert ":vault:v2:" in await sealer.seal_async(SESSION_KIND, [("token_hash", "other")])
+    release.set()
+    assert await check is True  # the answer stands for its own caller either way
+    before = transit.verify_calls
+    assert await sealer.verify_async(SESSION_KIND, fields, seal) is True
+    return transit.verify_calls == before
+
+
+async def test_a_check_held_open_across_a_rotation_does_not_refill_the_cache(
+    transit_store: Opened,
+) -> None:
+    store, _path, transit = transit_store
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    # Control first: with no rotation meanwhile, the held check's answer IS cached.
+    assert await _held_check(sealer, transit, rotate=False) is True
+    # A rotation seen while the v1 check waited empties the cache, and the check does not refill it.
+    assert await _held_check(sealer, transit, rotate=True) is False
+
+
+# --- the alert, the start probe and the CLI line -------------------------------------------------
+
+
+async def test_an_outage_alerts_once_per_window(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _path, transit = transit_store
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    raised: list[tuple[str, str]] = []
+    sink = LoggingAlertSink()
+    monkeypatch.setattr(
+        sink,
+        "integrity_drift",
+        lambda name, *, reason, drift_count: raised.append((name, reason)),
+    )
+    sealer.set_alert_hook(transit_seal_alert(sink))
+    transit.down = True
+    for _ in range(3):
+        with pytest.raises(TransitSealUnavailableError):
+            await sealer.seal_async(SESSION_KIND, [("token_hash", "x")])
+    assert len(raised) == 1 and raised[0][0] == TRANSIT_SEAL_SUBJECT
+    assert "synthetic Vault outage" not in raised[0][1]  # a fixed sentence, never Vault's text
+
+
+async def _start(store: MessageStore) -> None:
+    engine = Engine(
+        store,
+        security_enforcement=SecurityEnforcement.WARN,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        await engine.start()
+    finally:
+        await engine.stop()
+
+
+async def test_serve_refuses_to_start_when_the_token_cannot_verify(tmp_path: Path) -> None:
+    transit = FakeTransit()
+    cipher = transit_cipher(transit)
+    path = tmp_path / "probe.db"
+    store = await MessageStore.open(path, cipher=cipher, audit_mac_fn=cipher.audit_mac_fn())
+    transit.verify_denied = True
+    with pytest.raises(TransitSealStartRefusedError, match="verify"):
+        await _start(store)
+    # Control: the same store, with the capability granted, starts.
+    transit.verify_denied = False
+    again = await MessageStore.open(path, cipher=cipher, audit_mac_fn=cipher.audit_mac_fn())
+    await _start(again)
+
+
+def test_the_cli_prints_one_error_line_for_a_transit_outage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from messagefoundry.__main__ import _refusal_text
+
+    def build() -> Any:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command", required=True)
+        sub.add_parser("probe").add_argument("--json", action="store_true")
+
+        def run(_args: argparse.Namespace) -> int:
+            raise TransitSealUnavailableError("Transit row seal unavailable: synthetic outage")
+
+        return parser, {"probe": run}
+
+    assert run_cli(["probe"], build, refusal_text=_refusal_text) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: the command was refused") and "synthetic outage" in err
+    assert "last-resort" not in err and "Traceback" not in err
+    # Control: an exception that is not a seal refusal still takes the last-resort floor.
+    assert _refusal_text(RuntimeError("x")) is None
 
 
 # --- the stored form --------------------------------------------------------------------------

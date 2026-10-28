@@ -64,6 +64,7 @@ from messagefoundry.store.crypto import (
     AuditKeyVersionRefusedError,
     AuditMacFn,
     CipherError,
+    RowSealVersionRetiredError,
     _UnmarkedPolicy,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
@@ -238,19 +239,23 @@ class TransitCipher(_UnmarkedPolicy):
             raise CipherError(f"Transit returned an empty row seal HMAC (key={self._audit_key!r})")
         return mac
 
-    def verify_seal_hmac(self, data: bytes, mac: str) -> bool:
+    def verify_seal_hmac(self, data: bytes, mac: str, *, key_version: int) -> bool:
         """Whether ``mac`` is Transit's HMAC over ``data``, checked by Transit's ``verify`` call at
-        the version ``mac`` names (ADR-draft decision D14). It never regenerates and compares,
-        because a MAC regenerated under a newer version differs from every stored one.
+        the version ``mac`` names, ``key_version`` (ADR-draft decision D14). It never regenerates and
+        compares, because a MAC regenerated under a newer version differs from every stored one.
 
-        An HTTP 400 is ``False`` only when the key still answers: a probe ``hmac`` call over fixed
-        input, under the latest version, must succeed, as :meth:`_refuses_only_version` probes for
-        the audit chain. Then the refusal was about this string, such as a version Transit does not
-        hold or a body it cannot read, which a forged seal can carry. A 400 the probe cannot clear,
-        such as a missing key, and any other failure, is an outage and raises
-        :class:`CipherError`. A version below the key's minimum still reads as ``False``: the reply
-        does not say which version range the key holds. Blocking: the sealer calls it in a worker
-        thread."""
+        An HTTP 400 is read against the key's version range (:meth:`_seal_key_versions`):
+
+        * ``key_version`` below the key's ``min_decryption_version`` raises
+          :class:`~messagefoundry.store.crypto.RowSealVersionRetiredError`: the seal cannot be
+          verified any more, which is not evidence that it was forged.
+        * ``key_version`` above the latest version this Vault node reports raises
+          :class:`CipherError`, an outage: a node that lags a rotation refuses a real, newer version.
+        * Inside the range, the refusal was about this string, such as a body Transit cannot read,
+          which a forged seal can carry, so it is ``False``.
+
+        A failed range read, and any other failure, is an outage and raises :class:`CipherError`.
+        Blocking: the sealer calls it in a worker thread."""
         inp = base64.b64encode(data).decode("ascii")
         try:
             response: Any = self._client.secrets.transit.verify_signed_data(
@@ -261,12 +266,21 @@ class TransitCipher(_UnmarkedPolicy):
             )
             valid = response["data"]["valid"]
         except Exception as exc:
-            if is_vault_bad_request(exc) and self._key_answers():
-                return False
-            raise CipherError(
-                f"Transit row seal verify failed (key={self._audit_key!r}): "
-                f"{vault_failure_text(exc)}"
-            ) from exc
+            if not is_vault_bad_request(exc):
+                raise CipherError(
+                    f"Transit row seal verify failed (key={self._audit_key!r}): "
+                    f"{vault_failure_text(exc)}"
+                ) from exc
+            lowest, latest = self._seal_key_versions()
+            if key_version < lowest:
+                raise RowSealVersionRetiredError(key_version, lowest) from exc
+            if key_version > latest:
+                raise CipherError(
+                    f"Transit refused a row seal naming key version {key_version}, newer than the "
+                    f"latest version {latest} this Vault node holds (key={self._audit_key!r}); a "
+                    "node that lags a rotation does this"
+                ) from exc
+            return False
         if not isinstance(valid, bool):
             raise CipherError(
                 f"Transit returned a malformed verify reply (key={self._audit_key!r})"
@@ -312,19 +326,23 @@ class TransitCipher(_UnmarkedPolicy):
             raise CipherError(f"Transit returned an empty audit HMAC (key={self._audit_key!r})")
         return mac
 
-    def _key_answers(self) -> bool:
-        """Whether the audit key answers an ``hmac`` call over fixed input, under its latest
-        version. Fixed input, so no row's content decides the answer (BACKLOG #2592)."""
+    def _seal_key_versions(self) -> tuple[int, int]:
+        """The audit key's ``(min_decryption_version, latest_version)``, read from its metadata on
+        ``transit/keys/<audit key>``, which :func:`build_transit_cipher` already reads (BACKLOG
+        #2592). A failed read, or a reply without both numbers, raises :class:`CipherError`: the
+        refusal cannot then be placed, so it counts as an outage."""
         try:
-            probe: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key,
-                hash_input=_VERSION_PROBE_INPUT,
-                algorithm=AUDIT_TRANSIT_HASH_ALGO,
-            )
-            answered = probe["data"]["hmac"]
-        except Exception:  # the key itself fails: an outage, which the sealer logs, throttled
-            return False
-        return isinstance(answered, str) and bool(answered)
+            response: Any = self._client.secrets.transit.read_key(name=self._audit_key)
+            meta = response["data"]
+            lowest, latest = meta["min_decryption_version"], meta["latest_version"]
+        except Exception as exc:
+            raise CipherError(
+                f"Transit key metadata read failed (key={self._audit_key!r}): "
+                f"{vault_failure_text(exc)}"
+            ) from exc
+        if type(lowest) is not int or type(latest) is not int:
+            raise CipherError(f"Transit returned malformed key metadata (key={self._audit_key!r})")
+        return lowest, latest
 
     def _refuses_only_version(self, exc: Exception, key_version: int) -> bool:
         """Whether ``exc``, raised by a call pinned to ``key_version``, is Transit refusing that

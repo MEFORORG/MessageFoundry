@@ -15306,11 +15306,12 @@ class MessageStore:
             directory_object_id=directory_object_id,
             now=now,
         )
+        # BACKLOG #2592: the whole row, sealed, in one INSERT. Sealed before the writer lock, as the
+        # server backends do: under vault_transit the seal is a Vault call, and a new row has no
+        # stored state for the lock to protect while it runs.
+        params = user_insert_params(await seal_user(self._row_sealer, record))
         async with _writer_guard(self._db, self._lock):
-            # BACKLOG #2592: the whole row, sealed, in one INSERT.
-            await self._db.execute(
-                _USER_INSERT, user_insert_params(await seal_user(self._row_sealer, record))
-            )
+            await self._db.execute(_USER_INSERT, params)
             # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
             appended = await self._append_audits(audits, now=now)
             await self._commit()

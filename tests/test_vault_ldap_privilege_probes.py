@@ -540,7 +540,7 @@ def test_the_transit_paths_are_the_ones_the_cipher_calls(
     cipher.decrypt(cipher.encrypt("synthetic", aad=aad), aad=aad)
     cipher.audit_hmac(b"synthetic row")
     # BACKLOG #2592: the row seal's two calls, Transit's HMAC and its verify.
-    cipher.verify_seal_hmac(b"synthetic row", cipher.seal_hmac(b"synthetic row"))
+    cipher.verify_seal_hmac(b"synthetic row", cipher.seal_hmac(b"synthetic row"), key_version=1)
     assert transit.paths == set(crypto_transit.transit_cipher_required_capabilities())
 
 

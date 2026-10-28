@@ -1476,6 +1476,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
+            # BACKLOG #2592: the Transit start probe seals fixed input through Transit's HMAC.
+            "mac:.seal_async()",
         }
     ),
     # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the

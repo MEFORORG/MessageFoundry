@@ -646,6 +646,28 @@ class AuditKeyVersionRefusedError(CipherError):
         )
 
 
+class RowSealVersionRetiredError(CipherError):
+    """Transit refused a row seal check because the seal names a key version below the key's
+    ``min_decryption_version`` (BACKLOG #2592).
+
+    The seal may well be genuine: an operator raised the minimum before the rows sealed under the
+    older version were sealed again. So it is "cannot be verified", never "forged". The sealer
+    turns it into a refusal that denies, with no seal-failure audit row and no session ended.
+    Carries the two version numbers only, never row data."""
+
+    def __init__(self, version: int, min_decryption_version: int) -> None:
+        super().__init__(version, min_decryption_version)
+        self.version = version
+        self.min_decryption_version = min_decryption_version
+
+    def __str__(self) -> str:
+        return (
+            f"a row seal names Transit key version {self.version}, below the key's "
+            f"min_decryption_version {self.min_decryption_version}, so Transit can no longer "
+            "verify it"
+        )
+
+
 class StoreKeylessError(RuntimeError):
     """A store eager-read seam met an **encrypted** value (an ``mfenc:`` marker) but **no store key is
     configured** — a keyless (mis)configured open of a store that carries key-encrypted rows at rest.

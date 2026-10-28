@@ -1388,6 +1388,28 @@ def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
     return _raise
 
 
+#: The ``integrity_drift`` subject for an authority row seal that could not be made or checked
+#: through Vault transit: an outage, or a seal under a retired key version (BACKLOG #2592). Its own
+#: subject, apart from :data:`AUTHORITY_SEAL_SUBJECT`, because neither is a failed seal.
+TRANSIT_SEAL_SUBJECT = "authority-seal-transit"
+
+
+def transit_seal_alert(sink: AlertSink) -> Callable[[str], None]:
+    """An alert hook for :meth:`~messagefoundry.store.row_seal.TransitRowSealer.set_alert_hook`:
+    each call raises ``integrity_drift`` under :data:`TRANSIT_SEAL_SUBJECT`. The sealer calls it on
+    its own throttled ERROR path only, so at most once per throttle window per cause.
+
+    The reason is a fixed sentence, never Vault's text or a row value. Never raises."""
+
+    def _raise(reason: str) -> None:
+        try:
+            sink.integrity_drift(TRANSIT_SEAL_SUBJECT, reason=reason, drift_count=1)
+        except Exception:  # noqa: BLE001 -- an alert-sink failure must never break a request
+            log.warning("transit row seal alert could not be delivered")
+
+    return _raise
+
+
 def no_enabled_administrator_alert(sink: AlertSink) -> Callable[[str, str], None]:
     """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with a
     username and a ``via``, raises :meth:`AlertSink.no_enabled_administrator` keyed

@@ -221,6 +221,41 @@ async def test_a_write_the_store_refuses_for_a_failing_seal_answers_409(
         assert "integrity check" in r.json()["detail"]
 
 
+@pytest.mark.parametrize("retired", [False, True])
+async def test_a_transit_seal_refusal_answers_503(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, retired: bool
+) -> None:
+    """BACKLOG #2592: a row seal Vault transit could not check reaches the caller as a 503, never a
+    500 and never Vault's text. An outage passes, so it carries a Retry-After; a seal under a
+    retired key version does not pass by itself, so it carries none. The control is the same
+    request answering 200 before the refusal is planted."""
+    from messagefoundry.api.auth_routes import TRANSIT_SEAL_RETRY_AFTER_SECONDS
+    from messagefoundry.store.row_seal import (
+        TransitSealUnavailableError,
+        TransitSealUnverifiableError,
+    )
+
+    service = await _service(engine)
+    await _add(service, "viewer", Role.VIEWER)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "viewer")).json()["token"]
+        assert (await c.get("/me/sessions", headers=_auth(token))).status_code == 200
+
+        async def refused(_user_id: str) -> list[Any]:
+            if retired:
+                raise TransitSealUnverifiableError("synthetic vault text")
+            raise TransitSealUnavailableError("synthetic vault text")
+
+        monkeypatch.setattr(service, "list_sessions", refused)
+        r = await c.get("/me/sessions", headers=_auth(token))
+        assert r.status_code == 503
+        assert "synthetic vault text" not in r.text
+        if retired:
+            assert "retry-after" not in r.headers
+        else:
+            assert r.headers["retry-after"] == str(TRANSIT_SEAL_RETRY_AFTER_SECONDS)
+
+
 async def test_security_events_feed_lists_callers_auth_events(engine: Engine) -> None:
     # WP-L3-05 (ASVS 6.3.5/6.3.7): /me/security-events surfaces the caller's own audited auth.* events.
     service = await _service(engine)
