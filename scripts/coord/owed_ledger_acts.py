@@ -40,22 +40,26 @@ minimized:
   a range ``N-M``, ``BACKLOG #N``; pull request citations and ``repo#N`` are removed first). A flip
   sentence with no row borrows the rows of the nearest sentence before it (two back), else the next
   one, and adds every ``BACKLOG #N`` of the comment, else of the PR title; with no row at all and
-  no filing it prints as READ, for a person to read. A filing sentence's count is the nearest count
-  before each "rows"/"findings" in it, summed ("13 open findings", "2 rows for A and 3 rows for B");
-  a filing sentence with no count, or "a row for each finding", makes the count UNKNOWN. The
-  Lander's own comments (first line ``<!-- lander-hold`` or ``Lander (session``) are read for their
-  filings only: its enqueue comment is where the rows it owes after a merge are recorded. This read
+  no filing it prints as READ, for a person to read. A filing sentence's count is the one count
+  word before each "rows"/"findings" in it, summed across them ("13 open findings"); a filing
+  sentence with no count, two count words before one noun ("findings 4, 7 and 2 as rows"), or "a
+  row for each finding" makes the count UNKNOWN. The Lander's own comments (first line
+  ``<!-- lander-hold`` or ``Lander (session``) are read only for the debt they record: its filings
+  ("Rows follow in a Lander ledger pass") and a flip in a sentence that calls it owed. This read
   errs toward over-reporting, but it can still miss an ask phrased in words it does not know, which
-  is why the marker is the reliable form.
+  is why the marker is the reliable form. A PR with 100 or more comments (gh returns no more), and a
+  repository with no merged PR read in the window, print as READ.
 
-WHEN AN ASK COUNTS AS DONE. Prose asks for one row are read as one, from the EARLIEST, so a later
-reminder or acknowledgement cannot move the baseline past the act. Each marker is its own ask. A
-row's baseline is the later of the merge and the ask, read at the vault's last first-parent commit
-at or before it. A row is DONE only when it CHANGED after the baseline: it was OPEN there and is
-CLOSED at the ref; or a banner line new since the baseline cites the PR and does not say the act is
-still owed (owed, flip, pending, waits), and either the row was CLOSED at the baseline (a re-open or
-a re-banner) or its set of status glyphs changed. A row absent at the baseline, or with no banner
-line the grammar recognises there (a grammar change), stays OWED. A citation is ``engine PR <N>``,
+WHEN AN ASK COUNTS AS DONE. Every ask is judged on its own, so a later, different ask on a row (a
+re-open after a flip) is never folded into an earlier one that is done; two asks with one verdict
+print once. A row's baseline is the later of the merge and the ask, read at the vault's last
+first-parent commit at or before it. A row is DONE only when it CHANGED after the baseline: it was
+OPEN there and is CLOSED at the ref; or it was CLOSED there (a re-open, a re-banner) and a banner
+line new since cites the PR and does not say the act is still to come (at least owed, flip,
+pending, waits, queued, held, follows, next pass). A row OPEN at both ends stays OWED even with a
+new status, because a word list cannot tell a banner recording the act from one announcing it. A
+row absent at the baseline, or with no banner line the grammar recognises there (a grammar
+change), stays OWED. A citation is ``engine PR <N>``,
 ``vault PRs <N> and <M>``, ``korus PR <N>`` or a ``/pull/<N>`` URL; a ledger citation without its
 repository word counts for nothing, because the vault writes a bare ``PR <N>`` for its own pull
 requests too. (In an ask, a bare PR is the repository the comment sits on.) The PR itself or one
@@ -73,8 +77,8 @@ file the vault adds beyond ``LEDGER_SOURCES`` (its rows print as MISSING), and a
 recorded without citing the PR, with its repository word, in a banner line. A row filed after the
 ask that cites the PR for another reason (an ASVS follow-up, say) counts toward its filing. A later
 re-banner that drops the citation puts a done act back on the report, the safe direction. The
-vault ledger's own PRs are not read by default (``--repo`` adds them): a ledger PR's comments cite rows that the PR
-itself changed, before its merge, and would read as owed.
+vault ledger's own PRs are not read by default (``--repo`` adds them): a ledger PR's comments cite
+rows that the PR itself changed, before its merge, and would read as owed.
 
 Stdlib only. It loads ``pr_state.py`` by path for its gh runner.
 """
@@ -106,6 +110,8 @@ DEFAULT_DAYS = 14
 #: Measured 2026-10-28: 278 engine PRs merged in 14 days, so 300 was too close.
 PR_LIMIT = 1000
 GIT_TIMEOUT = 300
+#: ``gh pr list --json comments`` returns at most this many comments per pull request.
+GH_COMMENT_CAP = 100
 GH_TIMEOUT = 300
 #: Ledger snapshots kept besides the tip: each is a full parse of a ~23 MB file.
 CACHE_SIZE = 4
@@ -143,7 +149,7 @@ _LANDER_OWN = re.compile(r"(?:<!--\s*lander-hold\b|Lander \(session\s)")
 _LANDER = re.compile(r"\blander\b", re.IGNORECASE)
 
 #: A marker's opening; its closing ``-->`` is looked for within ``_MARKER_SPAN`` characters.
-_MARKER_OPEN = re.compile(r"<!--\s*lander-ledger-ask\b")
+_MARKER_OPEN = re.compile(r"<!--\s*lander-ledger-ask\b", re.IGNORECASE)
 _MARKER_SPAN = 2000
 _MARKER_KEY = re.compile(r"(?P<key>[A-Za-z_][\w-]*)\s*=")
 _NUMBER = re.compile(r"\d{1,6}")
@@ -167,13 +173,13 @@ _ROW_LIST = rf"{_ITEM}(?:{_SEP}{_ITEM})*"
 #: A number, or a range of them, inside a matched list.
 _RANGE = re.compile(r"(\d{1,6})(?:\s*-\s*#?(\d{1,6}))?")
 #: The widest range read as every row in it; a wider one is read as its two ends.
-_RANGE_MAX = 50
+_RANGE_MAX = 200
 #: ``BACKLOG``, ``BACKLOG rows``, ``BACKLOG item``: the word before a row list.
 _BACKLOG_WORD = r"BACKLOG(?:\s+(?:rows?|items?))?"
 #: A row reference: ``#N``, ``row N``, ``rows N and M``, ``BACKLOG #N, #M``. Pull request citations
 #: are removed before this runs.
 _ROW_REF = re.compile(
-    r"(?<![\w/])#(?P<hash>\d{1,6}(?:\s*-\s*#?\d{1,6}\b)?)\b"
+    r"(?<!\w)#(?P<hash>\d{1,6}(?:\s*-\s*#?\d{1,6}\b)?)\b"
     rf"|\b(?:rows?|{_BACKLOG_WORD})\s+(?P<list>{_ROW_LIST})",
     re.IGNORECASE,
 )
@@ -216,17 +222,23 @@ _EACH = re.compile(r"\s+(?:for\s+(?:each|every)|per|each)\b", re.IGNORECASE)
 _PLURAL_NOUNS = frozenset({"rows", "findings", "items", "entries"})
 _FILE_ASK = re.compile(
     rf"\bfil(?:e|ing)\b[^.\n]{{0,60}}?\b{_NOUN}\b|\b{_NOUN}\b[^.\n]{{0,40}}?\bto (?:be )?filed?\b"
-    r"|\brows?\b[^.\n]{0,20}?\bfollow",
+    r"|\brows?\b[^.\n]{0,20}?\bfollow|\b(?:add|needs?)\b[^.\n]{0,40}?\brows?\b",
     re.IGNORECASE,
 )
 _FLIP_WORD = re.compile(
     r"\bflip|\bbanner|\bowed\b|\bclos(?:e|es|ed|ing)\b|\bmark(?:s|ed|ing)?\b|\bre-?open"
-    r"|\bstatus\b|\bretir(?:e|es|ed|ing)\b|\bdeclin(?:e|es|ed|ing)\b",
+    r"|\bstatus\b|\bretir(?:e|es|ed|ing)\b|\bdeclin(?:e|es|ed|ing)\b|\bupdate\b"
+    r"|\bset\b[^.\n]{0,40}\bto\b",
     re.IGNORECASE,
 )
 #: A new banner line that says the act is still to come is not the act.
-_STILL_OWED = re.compile(r"\bowed\b|\bflip\b|\bpending\b|\bawait|\bwaits?\b|\bnot yet\b", re.I)
+_STILL_OWED = re.compile(
+    r"\bowed\b|\bflip\b|\bpending\b|\bawait|\bwaits?\b|\bnot yet\b|\bqueued?\b|\bheld\b"
+    r"|\bfollows?\b|\bto come\b|\btodo\b|\bnext (?:ledger )?pass\b",
+    re.IGNORECASE,
+)
 _SENTENCE = re.compile(r"\n+|(?<=[.!?])\s+")
+_OWED_WORD = re.compile(r"\bowed?\b", re.IGNORECASE)
 
 #: A cited pull request: ``(owner/repo, number)``; the repository is ``None`` when the text did not
 #: name it.
@@ -415,7 +427,7 @@ def _marker_attrs(attrs: str) -> Marker:
 
 def parse_marker(text: str) -> list[Marker]:
     """Every ``lander-ledger-ask`` marker in ``text`` outside code and quotes."""
-    if "lander-ledger-ask" not in text:
+    if "lander-ledger-ask" not in text.lower():
         return []
     live = _live_text(text)
     out = []
@@ -446,8 +458,8 @@ def _numbers(found: Iterable[str]) -> list[int]:
     out: list[int] = []
     for chunk in found:
         for m in _RANGE.finditer(chunk):
-            first, last = int(m.group(1)), int(m.group(2) or m.group(1))
-            span = range(first, last + 1) if 0 < last - first <= _RANGE_MAX else (first, last)
+            first, last = sorted((int(m.group(1)), int(m.group(2) or m.group(1))))
+            span = range(first, last + 1) if last - first <= _RANGE_MAX else (first, last)
             out.extend(n for n in span if n not in out)
     return out
 
@@ -467,10 +479,10 @@ def backlog_refs(text: str) -> list[int]:
 def file_count_of(sentence: str) -> int | None:
     """The count a filing sentence states, or ``None`` when it states none.
 
-    Each noun takes the nearest count in the few words before it, and the nouns' counts are
-    SUMMED: "2 rows for slice A and 3 rows for slice B" is five. Summing can over-count ("13
-    findings ... as 2 rows"), the safe direction; an under-count would let a filing read DONE early.
-    "A row for each finding" states no count.
+    Each noun takes the one count in the few words before it, and the nouns' counts are SUMMED:
+    "2 rows for slice B" after "3 rows for slice C" is five. Summing can over-count, the safe
+    direction; an under-count would let a filing read DONE early. Two count words before one noun
+    ("findings 4, 7 and 2 as rows") or "a row for each finding" state no count.
     """
     text = _PR_CITE.sub(" ", sentence)
     total, start = 0, 0
@@ -479,8 +491,8 @@ def file_count_of(sentence: str) -> int | None:
         tokens = _COUNT_TOKEN.findall(before)
         if not tokens:
             continue
-        if _EACH.match(text, m.end()):
-            return None
+        if len(tokens) > 1 or _EACH.match(text, m.end()):
+            return None  # "findings 4, 7 and 2 as rows", "a row for each": no count stated
         word, noun = tokens[-1].lower(), m.group("noun").lower()
         if word in ("a", "an"):
             total += 0 if noun in _PLURAL_NOUNS else 1  # "a few rows" states no count
@@ -506,12 +518,14 @@ def parse_prose(text: str, title: str = "", repo: str = ENGINE_REPO) -> Prose | 
     """The ask in a Lander-addressed prose comment on a ``repo`` PR, else ``None``."""
     if not _LANDER.search(text):
         return None
-    # The Lander's own comment is not an ask of it, except that its enqueue comment is where the
-    # filings it owes after a merge are recorded ("Rows follow in a Lander ledger pass"), so only
-    # its filings are read.
+    # The Lander's own comment is not an ask of it, except where it records its own debt: the
+    # filings it owes after a merge ("Rows follow in a Lander ledger pass"), and a flip it calls
+    # owed.
     own = _is_landers_own(text)
     sentences = [s for s in _SENTENCE.split(text) if s.strip()]
-    flips = [not own and bool(_FLIP_WORD.search(s)) for s in sentences]
+    flips = [
+        bool(_FLIP_WORD.search(s)) and (not own or bool(_OWED_WORD.search(s))) for s in sentences
+    ]
     filings = [bool(_FILE_ASK.search(s)) for s in sentences]
     if not any(flips) and not any(filings):
         return None
@@ -522,7 +536,7 @@ def parse_prose(text: str, title: str = "", repo: str = ENGINE_REPO) -> Prose | 
     for k, sentence in enumerate(sentences):
         if not flips[k] and not filings[k]:
             continue
-        found = [] if own else refs[k]
+        found = refs[k] if flips[k] or not own else []
         if not found and flips[k]:
             # "Please flip it.": the row is named before, or failing that, just after. The
             # comment's and the title's BACKLOG rows are added below too, since a borrowed row may
@@ -531,7 +545,6 @@ def parse_prose(text: str, title: str = "", repo: str = ENGINE_REPO) -> Prose | 
             for j in (k - 1, k - 2, k + 1):
                 if 0 <= j < len(sentences) and refs[j]:
                     found = refs[j]
-                    cites |= set(cited_prs(sentences[j], repo))
                     break
         rows.extend(n for n in found if n not in rows)
         cites |= set(cited_prs(sentence, repo))
@@ -543,9 +556,8 @@ def parse_prose(text: str, title: str = "", repo: str = ENGINE_REPO) -> Prose | 
                 file_count += count  # two filing sentences are two asks: summed, never merged
     filing = file_count > 0 or file_unknown
     if orphan:
-        # A flip sentence named no row: the comment's BACKLOG rows, then the title's.
-        rows.extend(n for n in backlog_refs(text) or backlog_refs(title) if n not in rows)
-        cites |= set(cited_prs(text, repo))
+        # A flip sentence named no row: the comment's BACKLOG rows and the title's.
+        rows.extend(n for n in backlog_refs(f"{text}\n{title}") if n not in rows)
     return Prose(tuple(rows), file_count, file_unknown, frozenset(cites), not rows and not filing)
 
 
@@ -581,7 +593,15 @@ def extract_asks(repo: str, pr: dict[str, Any]) -> list[Ask]:
             replace(a, rows=(), file_count=0, unread=True, note="a marker in a fork PR's body")
             for a in asks
         ]
-    for c in pr.get("comments") or []:
+    comments = pr.get("comments") or []
+    if len(comments) >= GH_COMMENT_CAP:
+        asks.append(
+            Ask(
+                repo, number, merged, merged, "prose", url, unread=True,
+                note=f"{len(comments)} comments read; any past the first {GH_COMMENT_CAP} are not",
+            )
+        )  # fmt: skip
+    for c in comments:
         if not isinstance(c, dict) or c.get("isMinimized"):
             continue
         if c.get("authorAssociation") not in TRUSTED_ASSOCIATIONS:
@@ -619,11 +639,12 @@ def _sum_filings(group: list[Ask]) -> Ask:
 
 
 def split_acts(asks: Iterable[Ask]) -> list[Ask]:
-    """One ask per act: a row, a PR's filing, an unread comment.
+    """One act per row an ask names, per PR filing, and per unread comment.
 
-    Prose asks for one row merge into the EARLIEST, so a later reminder or "done" note cannot move
-    the baseline past the act; their citations are pooled. Every filing ask on a PR is SUMMED into
-    one act, because filed rows cannot be told apart by which ask they answer.
+    Every ask is judged on its own baseline, so a later, different ask on a row (a re-open after a
+    flip) is not folded into an earlier one that is DONE; ``collect`` merges identical lines. Every
+    filing ask on a PR is SUMMED into one act, because filed rows cannot be told apart by which ask
+    they answer.
     """
     merged: dict[tuple[str, int, object, str], Ask] = {}
     filings: dict[tuple[str, int], list[Ask]] = {}
@@ -637,13 +658,7 @@ def split_acts(asks: Iterable[Ask]) -> list[Ask]:
                 replace(bare, file_count=ask.file_count, file_unknown=ask.file_unknown)
             )
         for act, one in acts:
-            # A marker is a deliberate, separate ask (a re-flip), so it is never folded into an
-            # earlier one; prose repeats are.
-            key = (ask.repo, ask.pr, act, ask.url if ask.source == "marker" else "")
-            if (have := merged.get(key)) is not None:
-                first = have if have.asked_at <= one.asked_at else one
-                one = replace(first, cites=have.cites | one.cites)
-            merged[key] = one
+            merged.setdefault((ask.repo, ask.pr, act, ask.url), one)
     return [*merged.values(), *(_sum_filings(g) for g in filings.values())]
 
 
@@ -691,19 +706,18 @@ def _judge_row(ask: Ask, n: int, ledger: Ledger, tip: dict[int, Block]) -> Row:
         return Row(OWED, ask, what, "the row did not exist at the baseline")
     if not before.banners:
         return Row(OWED, ask, what, "the baseline row has no banner the grammar reads")
-    recorded = any(ln not in before.banners and not _STILL_OWED.search(ln) for ln in citing)
     if before.closed:
         # A re-open, or a re-banner of a closed row, shows only as a new banner line.
-        if recorded:
+        if any(ln not in before.banners and not _STILL_OWED.search(ln) for ln in citing):
             return Row(DONE, ask, what, "CLOSED at the baseline; a new banner line cites the PR")
         return Row(OWED, ask, what, "CLOSED at the baseline, and no new banner line cites the PR")
     if now.closed:
         return Row(DONE, ask, what, "OPEN at the baseline, CLOSED at the ref")
     if now.status == before.status:
         return Row(OWED, ask, what, "its status glyphs are unchanged since the baseline")
-    if not recorded:
-        return Row(OWED, ask, what, "its status changed, but no new banner line records the act")
-    return Row(DONE, ask, what, "its status changed and a new banner line cites the PR")
+    # OPEN at both ends with a new status (a PARTIAL banner, say): whether the new banner records
+    # the act or announces it ("merged; SHIPPED follows") is not something a word list can tell.
+    return Row(OWED, ask, what, "still OPEN, with a new status since the baseline: read it")
 
 
 def _judge_filing(ask: Ask, ledger: Ledger, index: dict[Cite, frozenset[int]]) -> Row:
@@ -864,16 +878,16 @@ class GitLedger:
 
 def collect(
     repos: Iterable[str], gh: Gh, ledger: Ledger, now: datetime, days: int
-) -> tuple[list[Row], int, str]:
-    """``(rows, PRs scanned, a description of the ledger tip)``."""
+) -> tuple[list[Row], dict[str, int], str]:
+    """``(rows, PRs scanned per repository, a description of the ledger tip)``."""
     since = now - timedelta(days=days)
     rows: list[Row] = []
-    scanned = 0
+    per_repo: dict[str, int] = {}
     try:
         sha, date = ledger.tip()
         tip = ledger.blocks(sha)
     except ReadError as exc:
-        return [Row(ERROR, None, "vault ledger", str(exc)[:300])], 0, "unreadable"
+        return [Row(ERROR, None, "vault ledger", str(exc)[:300])], {}, "unreadable"
     index = cite_index(tip)
     described = f"{sha[:10]} ({date})"
     acts: list[Ask] = []
@@ -883,7 +897,7 @@ def collect(
         except (ReadError, pr_state.GhError, OSError) as exc:
             rows.append(Row(ERROR, None, repo, f"read failed: {exc}"[:300]))
             continue
-        scanned += len(prs)
+        per_repo[repo] = len(prs)
         for pr in prs:
             try:
                 acts.extend(split_acts(extract_asks(repo, pr)))
@@ -891,12 +905,23 @@ def collect(
                 rows.append(Row(ERROR, None, f"{repo} PR {pr.get('number')}", str(exc)[:300]))
     # In the order of the commit each act reads (a filing reads at its ask), so acts sharing a
     # ledger snapshot share one cached parse.
+    judged: dict[tuple[object, ...], Row] = {}
     for ask in sorted(acts, key=lambda a: a.baseline if a.rows else a.asked_at):
         try:
-            rows.extend(judge(ask, ledger, tip, index))
+            found = judge(ask, ledger, tip, index)
         except ReadError as exc:
-            rows.append(Row(ERROR, ask, "ledger read", str(exc)[:300]))
-    return rows, scanned, described
+            found = [Row(ERROR, ask, "ledger read", str(exc)[:300])]
+        for row in found:
+            # Two asks for one row with one verdict (a reminder) print once, from the earlier ask.
+            key = (row.status, ask.repo, ask.pr, row.what, row.detail, ask.unread and ask.url)
+            have = judged.get(key)
+            if have is None or (have.ask is not None and ask.asked_at < have.ask.asked_at):
+                judged[key] = row
+    rows.extend(judged.values())
+    for repo, count in per_repo.items():
+        if not count:
+            rows.append(Row(READ, None, repo, "no merged PR read in the window: check gh access"))
+    return rows, per_repo, described
 
 
 _ORDER = {ERROR: 0, MISSING: 1, OWED: 2, READ: 3, DONE: 4}
@@ -926,7 +951,7 @@ def render(rows: list[Row], header: str) -> str:
     return "\n".join("".join(c if c.isprintable() else "?" for c in line) for line in lines)
 
 
-def to_json(rows: list[Row], ledger: str, scanned: int) -> dict[str, Any]:
+def to_json(rows: list[Row], ledger: str, per_repo: dict[str, int]) -> dict[str, Any]:
     out = []
     for r in rows:
         item: dict[str, Any] = {"status": r.status, "what": r.what, "detail": r.detail}
@@ -943,7 +968,12 @@ def to_json(rows: list[Row], ledger: str, scanned: int) -> dict[str, Any]:
         out.append(item)
     # The ledger tip and the scan count travel with the rows, so an empty list with nothing
     # scanned cannot pass for "nothing owed".
-    return {"ledger": ledger, "scannedPullRequests": scanned, "rows": out}
+    return {
+        "ledger": ledger,
+        "scannedPullRequests": sum(per_repo.values()),
+        "scannedByRepo": per_repo,
+        "rows": out,
+    }
 
 
 def main(
@@ -973,12 +1003,16 @@ def main(
             print("ERROR    vault ledger: pass --vault <vault checkout>; nothing was read")
             return 0
         ledger = GitLedger(args.vault, args.ref)
-    rows, scanned, tip = collect(args.repo or DEFAULT_REPOS, gh, ledger, now(), args.days)
+    rows, per_repo, tip = collect(args.repo or DEFAULT_REPOS, gh, ledger, now(), args.days)
     rows = shown(rows, args.all)
     if args.json:
-        print(json.dumps(to_json(rows, f"{args.ref} {tip}", scanned), indent=2))
+        print(json.dumps(to_json(rows, f"{args.ref} {tip}", per_repo), indent=2))
         return 0
-    header = f"ledger {args.ref} {tip}; {scanned} merged PR(s) in the last {args.days} day(s)"
+    counts = ", ".join(f"{r.split('/', 1)[1]} {n}" for r, n in per_repo.items())
+    header = (
+        f"ledger {args.ref} {tip}; {sum(per_repo.values())} merged PR(s) in the last"
+        f" {args.days} day(s) ({counts or 'none read'})"
+    )
     print(render(rows, header))
     return 0
 

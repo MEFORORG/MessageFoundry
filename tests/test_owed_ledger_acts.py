@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 
-from tests._ast_sites import calls_to
+from tests._ast_sites import call_sites, calls_to
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _ROOT / "scripts" / "coord" / "owed_ledger_acts.py"
@@ -269,8 +269,10 @@ def test_untrusted_minimized_and_landers_own_comments_are_ignored(
     comments = [
         _comment("For the Lander: please flip #3844.", "2026-10-27T06:00:00Z", assoc="NONE"),
         _comment("For the Lander: please flip #3844.", "2026-10-27T06:00:01Z", isMinimized=True),
-        _comment("Lander (session ab12), flip of #3844 is owed.", "2026-10-27T06:00:02Z"),
-        _comment("<!-- lander-hold -->\nLander: held; flip #3844 is owed.", "2026-10-27T06:00:03Z"),
+        _comment("Lander (session ab12), flipped #3844; done.", "2026-10-27T06:00:02Z"),
+        _comment(
+            "<!-- lander-hold -->\nLander: held; flip #3844 on merge.", "2026-10-27T06:00:03Z"
+        ),
     ]
     prs = {ENGINE: [_pr(2545, "2026-10-27T04:55:16Z", comments)]}
     assert "nothing owed" in _run(prs, _ledger_433(), capsys, "--repo", ENGINE)
@@ -495,7 +497,10 @@ def test_a_later_acknowledgement_does_not_reopen_the_act(
 ) -> None:
     comments = [
         _comment("For the Lander: please flip #3844.", "2026-10-27T06:00:00Z"),
-        _comment("Lander: flipped #3844 in vault PR 2730; done.", "2026-10-28T11:00:00Z"),
+        _comment(
+            "Lander (session ab12), 2026-10-28: flipped #3844 in vault PR 2730; done.",
+            "2026-10-28T11:00:00Z",
+        ),
     ]
     prs = {ENGINE: [_pr(2545, "2026-10-27T04:55:16Z", comments)]}
     shipped = {3844: "## 3844. gap\n\n> SHIPPED by engine PR 2545"}
@@ -512,8 +517,10 @@ def test_plural_pr_citations() -> None:
 def test_prose_row_word_and_split_sentences() -> None:
     title = "Fix it (BACKLOG #1611)"
     assert oa.parse_prose("For the Lander: please flip row 3844.", title).rows == (3844,)
+    # "Please flip it." names no row: the borrowed #3844 and the title's #1611, an over-report.
     assert oa.parse_prose("Lander: BACKLOG #3844 ships here. Please flip it.", title).rows == (
         3844,
+        1611,
     )
 
 
@@ -571,9 +578,7 @@ def test_row_extraction_skips_repo_refs_and_pr_lists() -> None:
         ("Please file 3 rows.", 3),
         ("File a row.", 1),
         ("The 13 open findings are to file as rows.", 13),
-        ("Please file findings 1 and 2 as two rows.", 2),
-        ("Please file findings 1 to 3 as three rows.", 3),
-        ("File 2 rows for slice A and 3 rows for slice B.", 5),
+        ("File 3 rows for slice C. File 2 rows for slice B.", 5),
     ],
 )
 def test_a_prose_file_ask_takes_its_count(text: str, count: int) -> None:
@@ -608,12 +613,12 @@ def test_b2_a_new_citing_banner_without_a_status_change_is_not_done(
     assert "OWED" in _run(
         _one("For the Lander: please flip #3844."), ledger, capsys, "--repo", ENGINE
     )
-    # ...while one that records the act is.
-    recorded = {3844: OPEN_3844 + "\n> PARTIAL: slice A shipped by engine PR 2545."}
-    ledger = _ledger_433(("2026-10-28T19:00:00Z", "b" * 40, recorded))
-    assert "nothing owed" in _run(
-        _one("For the Lander: please flip #3844."), ledger, capsys, "--repo", ENGINE
-    )
+    # ...and nor is an interim one the word list does not know: an OPEN row's re-banner is read
+    # by a person.
+    interim = {3844: OPEN_3844 + "\n> PARTIAL: engine PR 2545 merged; SHIPPED banner comes later."}
+    ledger = _ledger_433(("2026-10-28T19:00:00Z", "b" * 40, interim))
+    out = _run(_one("For the Lander: please flip #3844."), ledger, capsys, "--repo", ENGINE)
+    assert "OWED" in out and "read it" in out
 
 
 def _statuses(out: str) -> list[str]:
@@ -669,8 +674,8 @@ def test_b7_a_second_ask_in_another_sentence_is_kept() -> None:
 def test_b8_only_the_landers_exact_shapes_are_its_own() -> None:
     assert oa.parse_prose("Lander (8a04c9f3): flip #3844.") is not None
     assert oa.parse_prose("Lander b58f86: flip #3844 is owed.") is not None
-    assert oa.parse_prose("Lander (session 8a04c9f3), 2026-10-28: flip #3844 is owed.") is None
-    assert oa.parse_prose("<!-- lander-hold head=abc -->\nLander: flip #3844 is owed.") is None
+    assert oa.parse_prose("Lander (session 8a04c9f3), 2026-10-28: flipped #3844.") is None
+    assert oa.parse_prose("<!-- lander-hold head=abc -->\nLander: held for the #3844 flip.") is None
 
 
 @pytest.mark.parametrize(
@@ -780,7 +785,8 @@ def test_the_landers_own_enqueue_comment_records_the_filings_it_owes() -> None:
         "1. one\n2. two\nThe banner on #3844 is owed."
     )
     parsed = oa.parse_prose(body)
-    assert parsed is not None and parsed.file_unknown and parsed.rows == ()
+    # Its own note that a flip is owed is its debt too.
+    assert parsed is not None and parsed.file_unknown and parsed.rows == (3844,)
 
 
 def test_a_flip_with_no_row_takes_the_title_rows_beside_a_filing_or_a_borrowed_row() -> None:
@@ -838,3 +844,100 @@ def test_baselines_come_from_the_tip_read_not_a_moved_ref(tmp_path: Path) -> Non
 def test_an_over_long_marker_row_prints_read() -> None:
     (marker,) = oa.parse_marker("<!-- lander-ledger-ask rows=#38443025 -->")
     assert marker.problems and marker.rows == ()
+
+
+# ---- Regressions for the round-b2a025f01f findings. ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Please file findings 4, 7 and 2 as rows.",
+        "Please file findings 1 and 2 as two rows.",
+        "File 2 rows for slice A and 3 rows for slice B.",
+    ],
+)
+def test_finding_numbers_before_rows_are_not_a_count(text: str) -> None:
+    parsed = oa.parse_prose("For the Lander. " + text)
+    assert parsed is not None and parsed.file_unknown
+
+
+def test_a_later_reopen_ask_is_judged_on_its_own_baseline(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    comments = [
+        _comment("For the Lander: please flip #3844.", "2026-10-21T00:00:00Z"),
+        _comment(
+            "For the Lander: #3844 needs to re-open; it was reverted.", "2026-10-27T00:00:00Z"
+        ),
+    ]
+    prs = {ENGINE: [_pr(2545, "2026-10-20T12:00:00Z", comments)]}
+    shipped = {3844: "## 3844. gap\n\n> SHIPPED by engine PR 2545"}
+    ledger = _ledger_433(("2026-10-22T00:00:00Z", "b" * 40, shipped))
+    out = _run(prs, ledger, capsys, "--repo", ENGINE)
+    assert "row #3844" in out and "OWED" in out
+
+
+def test_citations_are_not_borrowed_from_context_sentences() -> None:
+    body = "Lander: please flip it. Background: #3025 was partially shipped by engine PR 2358."
+    parsed = oa.parse_prose(body, repo=ENGINE)
+    assert parsed is not None and 3025 in parsed.rows and parsed.cites == frozenset()
+
+
+def test_a_slash_pair_of_rows_is_both() -> None:
+    assert oa.row_refs("Lander: please flip #3844/#3025.") == [3844, 3025]
+
+
+def test_a_flip_with_no_row_keeps_the_title_row_beside_a_context_row() -> None:
+    body = "Lander: please flip it. See BACKLOG #3000 for context."
+    parsed = oa.parse_prose(body, "Fix (BACKLOG #3844)")
+    assert parsed is not None and 3844 in parsed.rows
+
+
+def test_the_landers_note_of_an_owed_flip_is_read() -> None:
+    parsed = oa.parse_prose("Lander (session ab12), merged. The flip of #3844 is owed; next pass.")
+    assert parsed is not None and parsed.rows == (3844,)
+
+
+def test_a_pr_at_the_comment_cap_prints_read(capsys: pytest.CaptureFixture[str]) -> None:
+    comments = [_comment(f"note {i}", "2026-10-27T06:00:00Z") for i in range(oa.GH_COMMENT_CAP)]
+    prs = {ENGINE: [_pr(2545, "2026-10-27T04:55:16Z", comments)]}
+    out = _run(prs, _ledger_433(), capsys, "--repo", ENGINE)
+    assert "READ" in out and "100 comments read" in out
+
+
+@pytest.mark.parametrize("text", ["Lander: set #3844 to SHIPPED.", "Lander: please update #3844."])
+def test_more_flip_words(text: str) -> None:
+    parsed = oa.parse_prose(text)
+    assert parsed is not None and parsed.rows == (3844,)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Lander: please add 3 rows for the findings.", "Lander: the 3 findings need ledger rows."],
+)
+def test_more_filing_words(text: str) -> None:
+    parsed = oa.parse_prose(text)
+    assert parsed is not None and (parsed.file_count or parsed.file_unknown)
+
+
+def test_a_marker_in_upper_case_is_read() -> None:
+    assert oa.parse_marker("<!-- LANDER-LEDGER-ASK rows=3844 -->") == [oa.Marker((3844,), 0)]
+
+
+def test_wide_and_reversed_ranges() -> None:
+    assert oa.row_refs("Lander: please flip rows 3800-3860.") == list(range(3800, 3861))
+    assert oa.row_refs("flip #3846-3844") == [3844, 3845, 3846]
+
+
+def test_a_repository_with_no_merged_pr_prints_read(capsys: pytest.CaptureFixture[str]) -> None:
+    out = _run({ENGINE: PRS_433[ENGINE], oa.KORUS_REPO: []}, _ledger_433(), capsys)
+    assert "READ" in out and "korus" in out and "check gh access" in out
+
+
+def test_the_only_by_path_load_is_pr_state() -> None:
+    """``_load`` runs a file as code; it must only ever load the engine's own sibling script."""
+    source = _SCRIPT.read_text(encoding="utf-8")
+    loads = call_sites(ast.parse(source), "_load", bare_only=True)
+    assert len(loads) == 1 and ast.unparse(loads[0].args[1]) == "_HERE / 'pr_state.py'"
+    assert source.count("exec_module(") == 1 and source.count("spec_from_file_location(") == 1
