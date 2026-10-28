@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from messagefoundry.config.settings import AlertsSettings
-from messagefoundry.pipeline.alerts import AlertSink
+from messagefoundry.pipeline.alerts import MAX_SUBJECT_ALERTS, AlertSink, SubjectCap
 from messagefoundry.store.audit_tee import add_audit_observer, remove_audit_observer
 
 __all__ = [
@@ -78,8 +78,6 @@ SECURITY_SIGNAL_TYPES: Final[frozenset[str]] = frozenset(
 
 #: The most subjects one windowed detector tracks. Past it the least recent subject is dropped.
 MAX_SUBJECTS: Final = 4096
-#: The most alerts one windowed detector raises under their own subjects in one window.
-MAX_SUBJECT_ALERTS: Final = 5
 #: Characters of a subject. SQL Server holds ``alert_instance.connection`` in 256.
 _SUBJECT_LIMIT: Final = 200
 _SWITCH_LIST_LIMIT: Final = 200
@@ -130,8 +128,7 @@ class _Window:
         self.threshold = threshold
         self.window_seconds = window_seconds
         self._seen: OrderedDict[str, tuple[deque[tuple[float, int]], list[int]]] = OrderedDict()
-        #: Subjects that raised under their own name in the current window, and when.
-        self._named: OrderedDict[str, float] = OrderedDict()
+        self._cap = SubjectCap(window_seconds)
 
     def hit(self, subject: str, now: float, weight: int = 1) -> int | None:
         if self.threshold <= 0 or weight <= 0:
@@ -157,14 +154,7 @@ class _Window:
     def named(self, subject: str, now: float) -> bool:
         """Whether ``subject`` may raise under its own name: it already did this window, or fewer
         than :data:`MAX_SUBJECT_ALERTS` distinct subjects have. Records it when it may."""
-        cutoff = now - self.window_seconds
-        while self._named and next(iter(self._named.values())) <= cutoff:
-            self._named.popitem(last=False)
-        if subject in self._named or len(self._named) < MAX_SUBJECT_ALERTS:
-            self._named.pop(subject, None)
-            self._named[subject] = now
-            return True
-        return False
+        return self._cap.named(subject, now)
 
 
 @dataclass(frozen=True, slots=True)

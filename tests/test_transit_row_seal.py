@@ -1436,3 +1436,77 @@ def test_the_cli_names_vault_first_for_an_unverifiable_write() -> None:
     text = _seal_refusal("u", "unlock", unverifiable=True)
     assert "Vault transit refused" in text and "restore" not in text
     assert "changed outside the engine" in _seal_refusal("u", "unlock")  # control
+
+
+# --- the per-row unverifiable subjects are capped; a forgery's page is not ----------------------
+
+
+def test_unverifiable_row_subjects_are_capped_into_one_aggregate() -> None:
+    from messagefoundry.pipeline.alerts import MAX_SUBJECT_ALERTS
+
+    now = [1000.0]
+    raised: list[tuple[str, str]] = []
+    sink = LoggingAlertSink()
+    sink.integrity_drift = lambda name, *, reason, drift_count: raised.append((name, reason))  # type: ignore[method-assign]
+    hook = transit_seal_alert(sink, clock=lambda: now[0])
+    rows = [f"{SESSION_KIND}:{i:012d}" for i in range(MAX_SUBJECT_ALERTS + 4)]
+    for row in rows:
+        hook(f"{row_seal.TRANSIT_UNVERIFIABLE_CAUSE}:{row}", f"row {row}")
+    subjects = [name for name, _reason in raised]
+    named = [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:{row}" for row in rows[:MAX_SUBJECT_ALERTS]]
+    assert subjects[:MAX_SUBJECT_ALERTS] == named
+    assert set(subjects[MAX_SUBJECT_ALERTS:]) == {f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:*"}
+    assert "other rows already paged" in raised[-1][1]
+    # A row already named keeps its subject inside the window.
+    hook(f"{row_seal.TRANSIT_UNVERIFIABLE_CAUSE}:{rows[0]}", "again")
+    assert raised[-1][0] == named[0]
+    # An outage is not counted against, or folded into, the cap.
+    hook("transit", "outage")
+    assert raised[-1][0] == TRANSIT_SEAL_SUBJECT
+    # Control: once the window passes, a new row is named again.
+    now[0] += 301.0
+    hook(f"{row_seal.TRANSIT_UNVERIFIABLE_CAUSE}:{SESSION_KIND}:late", "late")
+    assert raised[-1][0] == f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:{SESSION_KIND}:late"
+
+
+async def test_a_flood_of_unverifiable_rows_does_not_suppress_a_forgery_page(
+    transit_store: Opened,
+) -> None:
+    """Many planted versions, each its own unverifiable row, fill the cap; a forged session read
+    right after still pages under the forgery subject, through the same sink."""
+    from messagefoundry.pipeline.alerts import (
+        AUTHORITY_SEAL_SUBJECT,
+        MAX_SUBJECT_ALERTS,
+        authority_seal_alert,
+    )
+
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    raised: list[str] = []
+    sink = LoggingAlertSink()
+    sink.integrity_drift = lambda name, *, reason, drift_count: raised.append(name)  # type: ignore[method-assign]
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    sealer.set_alert_hook(transit_seal_alert(sink))
+    service = AuthService(store, AuthSettings(), integrity_alert=authority_seal_alert(sink))
+    await _user(store, "flood-u")
+    tokens = [await _mint(store, "flood-u") for _ in range(MAX_SUBJECT_ALERTS * 3)]
+    for token in tokens:
+        row = await store.get_session(hash_token(token))
+        assert row is not None
+        await _set_session_seal(
+            path, hash_token(token), row.seal.replace(":vault:v1:", ":vault:v7:")
+        )
+    _lapse_cache(store)
+    for token in tokens:
+        assert await service.identity_for_token(token) is None
+    assert raised.count(f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:*") == MAX_SUBJECT_ALERTS * 2
+    assert AUTHORITY_SEAL_SUBJECT not in raised
+    forged = await _mint(store, "flood-u")
+    donor = await store.get_session(hash_token(await _mint(store, "flood-u")))
+    assert donor is not None
+    await _set_session_seal(path, hash_token(forged), donor.seal)
+    _lapse_cache(store)
+    assert await service.identity_for_token(forged) is None
+    assert raised[-1] == AUTHORITY_SEAL_SUBJECT
