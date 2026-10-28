@@ -17,7 +17,8 @@ command line still exits 2, argparse's usage error.
 
 THE UNSAFE DIRECTION. Marking a PR AUTHOR's turn when it is really the Lander's is the failure this
 script exists to prevent, so every ambiguity below resolves to LANDER: a same-second tie, a head it
-cannot read, two heads named in one hold, a negated or past-tense hold.
+cannot read, two heads named in one hold or in one second, a negated or past-tense hold, a
+comment or review with no readable time (an ERROR row rather than a dropped reply).
 
 WHY PYTHON, AND WHAT IT REUSES. ``pr_state.py`` beside it says why coord tooling reading GitHub is
 Python. This script loads ``pr_state.py`` by path and reuses its gh runner, GraphQL wrapper,
@@ -47,7 +48,8 @@ login, so the login says nothing about which seat wrote a comment.
   that would park a PR on its author. A comment from an outside account still counts as a newer
   non-Lander comment, which can only hand the turn TO the Lander, the safe direction.
 * A hold, by MARKER (the primary signal): a Lander comment carrying ``<!-- lander-hold
-  head=<sha> -->`` anywhere in its body, where ``<sha>`` is 7 to 40 hex characters. The marker's
+  head=<sha> -->`` anywhere in its body outside a blockquote or code, where ``<sha>`` is 7 to 40
+  hex characters. A quoted or shown marker is not posted, so it is not read. The marker's
   SHA is the held head, and the prose is not read. A marker whose head is anything else is no
   marker, and the prose decides.
 * A RELEASE, by marker: a Lander comment carrying ``<!-- lander-release -->`` is never a hold, even
@@ -71,7 +73,8 @@ login, so the login says nothing about which seat wrote a comment.
 
 "A commit newer than the hold". The held head is the marker's SHA; failing a marker, the SHA after
 ``at`` in the prose headline (``**Held, back to the author, at `f4f4dd470`.**``); failing that,
-any backticked SHA in the headline (``**Held on `f4f4dd470`**``, ``at head `f4f4dd470```). If the
+any backticked SHA in the headline (``**Held on `f4f4dd470`**``, ``at head `f4f4dd470```). A
+headline that is not a whole sentence (``**Held**, at `f4f4dd470`.``) is read to its sentence's end. If the
 current head does not start with the held head, there is a new commit. Reading any backticked SHA
 can mistake a named fix commit or a hex-spelled word for the head, but that makes a mismatch, a new
 commit, the safe direction. Two or more distinct heads are ambiguous: LANDER's, ``sha-ambiguous``.
@@ -177,10 +180,15 @@ _NOT_A_HOLD = (
     "previously",
     "formerly",
 )
-#: What may end a headline that is a whole sentence, so the text after it is a new sentence.
-_SENTENCE_END = (".", "!", ":", ";")
+#: What may end a headline that is a whole sentence, so the text after it is a new sentence. A
+#: colon or semicolon does not: "**Held:** answered" puts its predicate after the run.
+_SENTENCE_END = (".", "!")
 #: What may follow the word in a hold headline, so "Held-over" or "Heldout" is no hold.
-_HEAD_END = ("", " ", ",", *_SENTENCE_END)
+_HEAD_END = ("", " ", ",", ":", ";", *_SENTENCE_END)
+#: A run of backticks, which opens or closes a code span.
+_BACKTICKS = re.compile(r"`+")
+#: What opens or closes a fenced code block.
+_FENCES = ("```", "~~~")
 
 LANDER = "LANDER"
 AUTHOR = "AUTHOR"
@@ -299,7 +307,8 @@ def _events(pr: dict[str, Any]) -> list[Event]:
                 (w for k in stamp_keys if (w := pr_state.parse_iso(node.get(k))) is not None), None
             )
             if when is None:
-                continue
+                # Dropping it could hide a reply after the hold and park the PR on its author.
+                raise ValueError(f"a {kind[:-1]} has no readable timestamp")
             author = node.get("author")
             bot = isinstance(author, dict) and author.get("__typename") == "Bot"
             trusted = node.get("authorAssociation") in TRUSTED_ASSOCIATIONS
@@ -335,7 +344,10 @@ def _negated(text: str) -> bool:
 
 
 def _prose_hold(body: str) -> str | None:
-    """The headline of a prose hold, or ``None`` when the body is no prose hold."""
+    """The sentence of a prose hold, or ``None`` when the body is no prose hold.
+
+    That is the headline, plus the rest of its sentence when the headline is not a whole one.
+    """
     head, tail = _headline_and_tail(body)
     text = head.lstrip().casefold()
     if not any(
@@ -345,7 +357,30 @@ def _prose_hold(body: str) -> str | None:
         return None
     # A bare "**Held**" leaves its predicate outside the run, so read the rest of that sentence.
     whole = head if head.rstrip().endswith(_SENTENCE_END) else head + tail
-    return None if _negated(whole) else head
+    return None if _negated(whole) else whole
+
+
+def _live_text(body: str) -> str:
+    """``body`` without blockquotes, fenced code blocks and code spans, where markers are read.
+
+    A marker there is quoted or shown, not posted: a release quoting the hold it clears, or a hold
+    telling the author how to release it. An unclosed fence runs to the end of the body, as
+    Markdown renders it; an unclosed backtick is plain text, so it hides nothing.
+    """
+    kept: list[str] = []
+    fenced = False
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(_FENCES):
+            fenced = not fenced
+            continue
+        if fenced or stripped.startswith(">"):
+            continue
+        parts = _BACKTICKS.split(line)
+        # An odd run count leaves the last run unclosed, so its text is plain, not code.
+        plain = parts[0::2] if len(parts) % 2 else [*parts[0::2], parts[-1]]
+        kept.append(" ".join(plain))
+    return "\n".join(kept)
 
 
 def _distinct(shas: Iterable[str]) -> tuple[str, ...]:
@@ -357,13 +392,15 @@ def hold_heads(body: str) -> tuple[str, ...] | None:
 
     A ``lander-release`` marker makes it no hold, even beside a hold marker. A valid
     ``lander-hold`` marker makes it a hold at the marker's head, whatever the prose says. Without
-    either, the prose headline decides, and its heads are the SHAs after ``at`` in the headline,
-    else every backticked SHA in it. ``()`` is a hold naming no head; two or more heads are
-    ambiguous. Only the headline is searched, so a SHA quoted later in the body is never read.
+    either, the prose headline decides, and its heads are the SHAs after ``at`` in the headline's
+    sentence, else every backticked SHA in it. ``()`` is a hold naming no head; two or more heads
+    are ambiguous. Only that sentence is searched, so a SHA quoted later in the body is never read.
+    Markers are read only outside blockquotes and code (``_live_text``).
     """
-    if _RELEASE_MARKER.search(body):
+    live = _live_text(body)
+    if _RELEASE_MARKER.search(live):
         return None
-    marked = _HOLD_MARKER.findall(body)
+    marked = _HOLD_MARKER.findall(live)
     if marked:
         return _distinct(marked)
     head = _prose_hold(body)
@@ -380,23 +417,25 @@ def classify(
     landers = [e for e in turn_events if e.lander]
     if not landers:
         return LANDER, ["no-lander-comment"]
-    # On a same-second tie the non-hold wins, so list order never decides and the Lander looks.
-    latest = max(landers, key=lambda e: (e.when, not e.hold))
-    if not latest.hold:
+    # Every Lander comment in the latest second is read together, so list order never decides:
+    # a non-hold among them wins, and their heads are pooled, so two different heads are ambiguous.
+    when = max(e.when for e in landers)
+    tied = [e for e in landers if e.when == when]
+    if not all(e.hold for e in tied):
         return LANDER, ["lander-not-hold"]
     flags: list[str] = []
-    heads = latest.heads or ()
+    heads = _distinct(h for e in tied for h in e.heads or ())
     if len(heads) > 1:
         return LANDER, ["sha-ambiguous"]
-    if heads:
-        new_commit = not head_oid.lower().startswith(heads[0])
-    elif committed is None:
-        return LANDER, ["head-unknown", "date-fallback"]
-    else:
+    new_commit = bool(heads) and not head_oid.lower().startswith(heads[0])
+    if any(not e.heads for e in tied):
+        # A hold naming no head falls back to the commit date.
+        if committed is None:
+            return LANDER, ["head-unknown", "date-fallback"]
         flags.append("date-fallback")
         # A same-second tie is a new commit: a tie must never park a PR on its author.
-        new_commit = committed >= latest.when
-    newer_comment = any(e.when >= latest.when and not e.lander for e in turn_events)
+        new_commit = new_commit or committed >= when
+    newer_comment = any(e.when >= when and not e.lander for e in turn_events)
     if new_commit:
         return LANDER, ["new-commit", *flags]
     if newer_comment:
@@ -435,6 +474,8 @@ def _required_green(
     )
     if read.required_error and verdict.get("reason") == "no required-context list":
         verdict["reason"] = read.required_error
+    elif contexts is None and verdict.get("state") != "SUCCESS":
+        verdict["reason"] = "the commit listed is not the head (a push during the read?); re-run"
     state = verdict.get("state")
     return (
         "yes" if state == "SUCCESS" else "no" if state in ("FAILURE", "PENDING") else "?"
@@ -480,7 +521,10 @@ def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[s
 def build_rows(repo: str, read: RepoRead, now: datetime) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for pr in read.prs:
-        if not isinstance(pr, dict) or pr.get("isDraft"):
+        if not isinstance(pr, dict):
+            rows.append(error_row(repo, f"a PR node is not an object: {type(pr).__name__}"))
+            continue
+        if pr.get("isDraft"):
             continue
         try:
             rows.append(_row(repo, pr, read, now))

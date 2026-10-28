@@ -706,3 +706,85 @@ def test_age_text() -> None:
     assert hpt.age_text(45 * 60) == "45m"
     assert hpt.age_text(3 * 3600 + 12 * 60) == "3h12m"
     assert hpt.age_text(-5) == "0m"
+
+
+def test_marker_quoted_or_in_code_is_not_read() -> None:
+    heads = hpt.hold_heads
+    marker = "<!-- lander-hold head=abcdef1 -->"
+    cleared = "Lander (session y), 2026-10-28. **Cleared; merging.**\n\n"
+    # A marker quoted from an earlier hold, in a blockquote or a code block, is no hold.
+    assert heads(cleared + "> Earlier hold:\n> " + marker) is None
+    assert heads(cleared + "```\n" + marker + "\n```") is None
+    assert heads(cleared + "~~~\n" + marker + "\n~~~") is None
+    assert heads(cleared + "Mark a hold with `" + marker + "`.") is None
+    # A release marker shown as an instruction does not release a real hold.
+    told = "Lander (session x). **Held, at `abcdef1`.** Post `<!-- lander-release -->` when fixed."
+    assert heads(told) == ("abcdef1",)
+    assert heads(_marked("> <!-- lander-release -->", "**Held, at `abcdef1`.**")) == ("abcdef1",)
+    # A stray backtick opens no code span, so it hides no release marker after it.
+    stray = "Lander (session x). **Held.** A stray ` then <!-- lander-release -->"
+    assert heads(stray) is None
+    # A live marker beside a quoted one still counts.
+    assert heads(cleared + "> " + marker + "\n\n<!-- lander-hold head=1234567 -->") == ("1234567",)
+
+
+def test_bare_held_headline_reads_its_sentence_for_the_head_and_negation() -> None:
+    heads = hpt.hold_heads
+    assert heads("Lander (session x). **Held**, at `abcdef1`.") == ("abcdef1",)
+    assert heads("Lander (session x). **Still held**: at `abcdef1`. Fix `1234567` next.") == (
+        "abcdef1",
+    )
+    assert heads("Lander (session x). **Held:** at `abcdef1`.") == ("abcdef1",)
+    # A label-form headline's predicate is read for negation.
+    assert heads("Lander (session x). **Held:** answered, merging.") is None
+    assert heads("Lander (session x). **Held;** no longer, merging once green.") is None
+    # The head named after a bare headline beats the weaker commit date.
+    hold = hpt.Event(NOW, "Lander (session x). **Held**, at `abcdef1`.", bot=False, trusted=True)
+    old = datetime(2026, 10, 28, 9, 0, 0, tzinfo=UTC)
+    assert hpt.classify("1234567" + "0" * 33, old, [hold]) == ("LANDER", ["new-commit"])
+
+
+def test_same_second_holds_naming_different_heads_are_ambiguous() -> None:
+    a = hpt.Event(NOW, "Lander (session x). **Held, at `abcdef1`.**", bot=False, trusted=True)
+    b = hpt.Event(NOW, "Lander (session x). **Held, at `1234567`.**", bot=False, trusted=True)
+    head = "abcdef1" + "0" * 33
+    assert hpt.classify(head, None, [a, b]) == ("LANDER", ["sha-ambiguous"])
+    assert hpt.classify(head, None, [b, a]) == ("LANDER", ["sha-ambiguous"])
+    # A tied hold naming no head brings the date check in, whatever the other names.
+    bare = hpt.Event(NOW, "Lander (session x). **Held.**", bot=False, trusted=True)
+    assert hpt.classify(head, None, [a, bare]) == ("LANDER", ["head-unknown", "date-fallback"])
+    assert hpt.classify(head, NOW, [bare, a]) == ("LANDER", ["new-commit", "date-fallback"])
+
+
+def test_undatable_comment_is_an_error_row_not_dropped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    undated = _pr(
+        113,
+        comments=[_hold("2026-10-28T12:00:00Z", _sha(113))],
+        reviews=[{"body": "Manager: fixed.", "state": "COMMENTED", "authorAssociation": "OWNER"}],
+    )
+    rows = _engine_rows(tmp_path, capsys, undated, _pr(114))
+    assert rows[113]["turn"] == "ERROR"
+    assert rows[114]["turn"] == "LANDER"
+
+
+def test_non_object_pr_node_is_an_error_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    page = _page([_pr(115)])
+    page["data"]["repository"]["pullRequests"]["nodes"].insert(0, None)
+    doc = {ENGINE: {"pages": [page], "required": ENGINE_REQUIRED}}
+    code, rows = _run(tmp_path, doc, capsys, "--repo", ENGINE)
+    assert code == 0
+    assert [r["turn"] for r in rows] == ["ERROR", "LANDER"]
+
+
+def test_listed_commit_not_the_head_names_why_green_is_unknown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr = _pr(116)
+    pr["headRefOid"] = _sha(999)
+    row = _engine_rows(tmp_path, capsys, pr)[116]
+    assert row["requiredGreen"] == "?"
+    assert "not the head" in row["required"]["reason"]
