@@ -207,11 +207,15 @@ that package's build code may run in CI:
 - **No lock**: `pip-audit -r requirements.txt --desc`, which resolves on Windows the closure your
   deployment installs, live and unhashed, and the job warns that it does.
 - **Hashed `requirements.lock` committed**: neither file is resolved or installed live.
-  - `requirements.txt` is audited as written, with `pip-audit --disable-pip --no-deps`. So each of
-    its requirements must be pinned with `==`, and that form of `pip-audit` refuses one that is
-    not. It skips an included file without a word, so the job refuses a `-r` line in
-    `requirements.txt`; list those pins in it instead. Its closure is audited through the lock, so
-    a lock that was not regenerated after `requirements.txt` changed audits the old closure.
+  - `requirements.txt` is audited as written, with `pip-audit --disable-pip --no-deps`. So pin
+    each requirement in it with `==`: a version range fails the step with an error that is not an
+    advisory. Read from pip-audit's source and not run here: that form, without `--strict`,
+    passes a URL or editable requirement unaudited. It skips an included file without a word
+    (measured), so the job refuses a line starting `-r` or `--requirement`, read as plain bytes:
+    a file with a byte-order mark, UTF-16, or an abbreviated option gets past that check. List
+    every pin in `requirements.txt` itself. Its closure is audited only through the lock, so a lock
+    that was not regenerated after `requirements.txt` changed audits the old closure, and nothing
+    in the job detects that.
   - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
     alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
     job says so and fails; pip refuses the pin if it carries no hash. No other locked package is

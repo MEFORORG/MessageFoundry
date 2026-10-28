@@ -65,8 +65,9 @@ rather than audit what it names (``uv export --no-emit-project`` writes none; a 
 write at least an index URL, ``--trusted-host`` and ``--find-links`` lines unless told not to); and
 a requirement that continues onto a line other than a hash, option or comment, where a marker
 would stay in place; and a ``--skip-private`` that names the engine, a package the lock does not
-pin, or every pin, or that comes after the lock. It does not judge whether a non-empty lock is complete; released-line-audit
-carries its own floor for that.
+pin, or every pin, or that comes after the lock as a word of its own (the ``=`` form or an
+abbreviation there reaches pip-audit, which fails on it as an unknown option). It does not judge
+whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
 before it (a line ending in a backslash continues, unless it is a comment), indented or not. A

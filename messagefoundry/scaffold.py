@@ -466,7 +466,7 @@ appending `--ignore-vuln <ID>` to each audit line that reports it, recorded per 
 It runs on **Windows**, the engine's only supported deployment platform: `pip-audit` skips a dependency
 whose environment marker does not match the runner, so a Linux runner never audits the engine's
 Windows-only dependencies. With a `requirements.lock` it audits `requirements.txt` as written, with
-no resolve, and runs the engine's own auditor
+no resolve, so pin each requirement there with `==`, and runs the engine's own auditor
 (`python -P -m messagefoundry.security.audit_all_platforms requirements.lock`), which audits every pin
 in the lock whatever its marker. The engine's `docs/ADOPTER-CI.md`, "Job 3", says what each step
 requires and refuses. The job
