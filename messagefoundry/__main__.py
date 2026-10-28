@@ -10490,6 +10490,7 @@ def _connection(args: argparse.Namespace) -> int:
         BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
         hop_posture_from_ai,
         insecure_bind_escape,
+        settings_file_path,
     )
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
@@ -10514,6 +10515,15 @@ def _connection(args: argparse.Namespace) -> int:
     # upsert / remove: validate the candidate dir against this instance's [egress] allowlist + active
     # environment before persisting, so a GUI edit pointing at a non-allowlisted host fails at edit
     # time exactly as it would at reload.
+    # A blank --service-config would name the working directory itself, and the open then fails
+    # with an OS error that does not say the name was blank. The IDE passes a blank
+    # messagefoundry.serviceConfig setting through (vault BACKLOG #2908), so refuse it by name.
+    if args.service_config is not None and not args.service_config.strip():
+        return _emit_error(
+            "--service-config is blank; name the instance's settings file "
+            "(in the VS Code extension, the messagefoundry.serviceConfig setting)",
+            as_json=args.json,
+        )
     # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
     settings, detail = _load_service_settings(args.service_config)
     if settings is None:
@@ -10585,33 +10595,42 @@ def _connection(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
     except WiringError as exc:
         message = str(exc)
-        # The deny default (vault BACKLOG #2605) refuses an unlisted outbound. With no
-        # --service-config, the IDE's usual call, the edit was checked against whatever settings
-        # load_settings found, so say where the list belongs rather than leave the analyst guessing.
-        # The keep-forever retention refusal (vault BACKLOG #2368) reads [security] the same way, so
-        # it gets the same account of which settings were read.
+        # At least these three refusals say which settings file the edit was checked against and
+        # what to change there: the deny default's unlisted outbound (vault BACKLOG #2605), the
+        # keep-forever retention refusal (vault BACKLOG #2368) and the exposure refusal. They say it
+        # whether or not --service-config named the file (vault BACKLOG #2908).
         advice = None
         if BLOCK_UNLISTED_OUTBOUND_IN_FORCE in message:
-            advice = "list the connection's host in that file's [egress] allowed_* list for its transport"
+            advice = "list the refused destination's host in that file's [egress] allowed_* list for its transport"
         elif BODY_ACKNOWLEDGEMENT_SETTING in message:
-            advice = "this edit is then checked against that instance's [security] settings"
+            advice = (
+                f"{BODY_ACKNOWLEDGEMENT_SETTING} and [security].enforcement are read from that file"
+            )
         elif INSECURE_BIND_FLAG in message:
             # BACKLOG #3063 item 7: the exposure refusal names serve's flag, which this command
             # does not take (item 1), so say which escape it does read and where it was read from.
             message = insecure_bind_note(message, "connection")
-            advice = "the cleartext escape is then read from that instance's [security] settings"
-        if args.service_config is None and advice is not None:
-            # load_settings falls back to ./messagefoundry.toml, so say which case this was.
-            local = Path("messagefoundry.toml")
-            read = (
-                f"against {local.resolve()}, the settings file in the working directory"
-                if local.is_file()
-                else "with no instance settings file, since none was found"
-            )
-            message += (
-                f". No --service-config was given, so this edit was checked {read}. Pass "
-                f"--service-config <path to the instance's messagefoundry.toml>, and {advice}"
-            )
+            advice = "the cleartext escape is read from that file's [security] settings"
+        if advice is not None:
+            # The path load_settings read, made absolute but not resolved: resolve() follows links
+            # and can turn a mapped drive into a UNC name the operator never typed.
+            read_from = settings_file_path(args.service_config).absolute()
+            if args.service_config is None:
+                # load_settings falls back to ./messagefoundry.toml, so say which case this was.
+                read = (
+                    f"against {read_from}, the settings file in the working directory"
+                    if read_from.is_file()
+                    else "with no instance settings file, since none was found"
+                )
+                message += (
+                    f". No --service-config was given, so this edit was checked {read}. Pass "
+                    f"--service-config <path to the instance's messagefoundry.toml>, and {advice}"
+                )
+            else:
+                message += (
+                    f". This edit was checked against {read_from}, the file --service-config "
+                    f"named, with any MEFOR_* environment override applied over it; {advice}"
+                )
         return _emit_error(message, as_json=args.json)
     except OSError as exc:
         return _emit_error(str(exc), as_json=args.json)

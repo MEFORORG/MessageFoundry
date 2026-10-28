@@ -505,10 +505,11 @@ def _no_egress_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_an_unlisted_outbound_edit_without_a_service_config_names_where_the_list_goes(
     cfg: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A `connection upsert` may name no --service-config: a hand-run one, or the IDE's where the
-    # workspace has no settings file yet, as here (vault BACKLOG #2908). Under the deny default (vault
-    # BACKLOG #2605) an unlisted outbound is refused, and the refusal must say which flag and which
-    # [egress] list fix it, rather than leave the analyst guessing which file was read.
+    # A `connection upsert` may name no --service-config: a hand-run one, or the IDE's when its
+    # serviceConfig setting is unset, here with no settings file (vault BACKLOG #2908). Under the
+    # deny default (vault BACKLOG #2605) an unlisted outbound is refused, and the refusal must say
+    # which flag and which [egress] list fix it, rather than leave the analyst guessing which file
+    # was read.
     monkeypatch.chdir(cfg)  # no messagefoundry.toml here, so no settings file is found
     rc, out = _upsert(cfg, _PARTNER_OUTBOUND, capsys)
     error = json.loads(out)["error"]
@@ -536,12 +537,34 @@ def test_the_hint_names_the_working_directory_file_it_read(
 
 
 @pytest.mark.usefixtures("_no_egress_env")
-def test_the_service_config_hint_is_absent_when_one_was_given(
+def test_the_service_config_hint_names_the_file_that_was_given(
     cfg: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Control: the same refusal with a service file named says nothing about passing one.
-    rc, out = _upsert(cfg, _PARTNER_OUTBOUND, capsys, svc=_svc(cfg))
+    # The same refusal with a service file named does not ask for one, but still names the file it
+    # read and the list to change there: the IDE names its setting's file (vault BACKLOG #2908).
+    svc = _svc(cfg)
+    rc, out = _upsert(cfg, _PARTNER_OUTBOUND, capsys, svc=svc)
     error = json.loads(out)["error"]
     assert rc != 0
     assert "block_unlisted_outbound" in error
-    assert "--service-config" not in error
+    assert "No --service-config was given" not in error
+    assert f"checked against {svc.absolute()}, the file --service-config named" in error
+    assert "[egress] allowed_*" in error
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_service_config_is_refused_by_name(
+    cfg: Path, capsys: pytest.CaptureFixture[str], blank: str
+) -> None:
+    # The IDE passes a blank messagefoundry.serviceConfig setting through rather than drop it
+    # (vault BACKLOG #2908). An empty name would otherwise reach the open as the working directory
+    # and fail with an OS error that does not say the name was blank.
+    data = json.dumps(_PARTNER_OUTBOUND)
+    rc = main(
+        ["connection", "upsert", "--config", str(cfg), "--data", data, "--json"]
+        + ["--service-config", blank]
+    )
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert rc != 0
+    assert error.startswith("--service-config is blank")
+    assert not (cfg / "connections.toml").exists()

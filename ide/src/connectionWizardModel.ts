@@ -8,9 +8,6 @@
 // `connection upsert|remove` argv builders here are shared with the webview form and the
 // connections.toml custom editor, so every IDE writer names the same settings file (BACKLOG #2908).
 
-import * as fs from "fs";
-import * as path from "path";
-
 import { type ConnObj, type SavePlan, planSave } from "./connectionMerge";
 
 /** The connection object the `connection upsert --data <json>` CLI consumes (ADR 0007). Mirrors the
@@ -159,43 +156,44 @@ export function buildConnObj(state: WizardState): WizardConnObj {
   return conn;
 }
 
-/** The file the CLI falls back to, in its working directory, when no `--service-config` is given
- *  (`_DEFAULT_FILE` in messagefoundry/config/settings.py). Not the IDE setting's default, though the
- *  two are the same name today. */
-const CLI_FALLBACK_SERVICE_CONFIG = "messagefoundry.toml";
-
 /**
- * The `--service-config` value a connection edit run in `workspace` passes, or `undefined` to leave
- * the flag off (BACKLOG #2908).
+ * The `--service-config` value a connection edit passes, or `undefined` to leave the flag off
+ * (BACKLOG #2908). `setting` is `messagefoundry.serviceConfig`; `isSet` says whether the operator
+ * set it anywhere, rather than leaving the manifest default.
  *
  * The CLI checks a connection edit against the named file, at least its `[egress]` allowlist, which
- * denies an unlisted outbound host by default. With no flag it reads `./messagefoundry.toml`, and
- * only if that file exists. A setting naming another file would then go unread. So the setting is
- * passed.
+ * denies an unlisted outbound host by default. With no flag it reads `./messagefoundry.toml` in the
+ * workspace, and only if that file exists.
  *
- * The flag is left off when neither the named file nor the fallback exists. The CLI refuses a named
- * file that is missing. Passing the flag there would block every edit in a workspace with no
- * settings file yet. Leaving it off reads no file either, as before this change.
+ * A set setting is always passed, whether or not its file exists, even where it spells the default
+ * name. The CLI then refuses a missing file and names it, rather than checking the edit against a
+ * file the setting did not name. A blank setting is passed as it is, and a non-string one as an
+ * empty string, and `connection` refuses both as blank. The alert and security editors pass the
+ * same setting unconditionally too, so no surface drops it.
  *
- * When only the fallback exists, the flag is still passed. The CLI then reports the missing file
- * instead of checking against a file the setting did not name. A blank or non-string setting names
- * no file, so it leaves the flag off too.
+ * Only an unset setting leaves the flag off. Its default names `messagefoundry.toml`, the same file
+ * the CLI falls back to, so the edit is checked against that file where it exists. Where it does
+ * not, the edit is checked against no file rather than refused, so a new workspace can still edit
+ * its connections.
  */
-export function connectionServiceConfig(
-  workspace: string,
-  setting: string,
-  exists: (p: string) => boolean = fs.existsSync,
-): string | undefined {
+export function connectionServiceConfig(setting: unknown, isSet: boolean): string | undefined {
+  if (!isSet) {
+    return undefined;
+  }
   // The manifest declares a string, but VS Code does not enforce it on a hand-edited settings.json.
-  if (typeof setting !== "string" || setting.trim() === "") {
-    return undefined;
-  }
-  const named = path.resolve(workspace, setting);
-  const fallback = path.resolve(workspace, CLI_FALLBACK_SERVICE_CONFIG);
-  if (!exists(named) && !exists(fallback)) {
-    return undefined;
-  }
-  return setting;
+  return typeof setting === "string" ? setting : "";
+}
+
+/**
+ * Whether a setting, as VS Code's `inspect()` reports it, is set in user or workspace settings
+ * rather than left at its default. A null there counts as set. `messagefoundry.serviceConfig`
+ * declares no scope, so it is window-scoped, and VS Code ignores a folder value for it; a folder
+ * value is not read here either.
+ */
+export function settingIsSet(
+  seen: { defaultValue?: unknown; globalValue?: unknown; workspaceValue?: unknown; workspaceFolderValue?: unknown } | undefined,
+): boolean {
+  return seen !== undefined && (seen.globalValue !== undefined || seen.workspaceValue !== undefined);
 }
 
 function serviceConfigArgs(serviceConfig: string | undefined): string[] {
