@@ -207,6 +207,7 @@ def test_a_poller_whose_dialect_is_an_env_value_still_counts_its_sslca(tmp_path:
 
     settings = {**_settings(_ca(tmp_path)), "dialect": EnvRef("DB_DIALECT")}
     assert ta.inbound_lane_reads_ca(ConnectorType.DATABASE, settings)
+    assert ta.lane_ca_setting(settings) == "odbc_params sslca"
     # The controls: no sslca, a literal SQL Server preset, and a blank sslca count for nothing.
     del settings["odbc_params"]["SSLCA"]
     assert not ta.inbound_lane_reads_ca(ConnectorType.DATABASE, settings)
@@ -457,8 +458,8 @@ def test_a_descriptor_fdopen_refuses_is_closed_by_the_anchor_read(
 def test_a_directory_leaves_no_descriptor_open(
     reader: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A directory opens on POSIX and is refused at the open on Windows; either way no descriptor
-    is left open. Red on POSIX with either reader back on ``os.fdopen(os.open(...))``."""
+    """A directory is judged by its stat and never opened, so no descriptor is left open. Red on
+    POSIX with either reader back on ``os.fdopen(os.open(...))`` and no stat first."""
     opened, closed = _recording_descriptors(monkeypatch)
     if reader == "anchor":
         with pytest.raises(OSError):
@@ -466,3 +467,19 @@ def test_a_directory_leaves_no_descriptor_open(
     else:
         assert f"SSLCA={{{tmp_path}}}" in _build_odbc_dsn(_settings(tmp_path), connection=_OUT)
     assert set(opened) <= set(closed)
+
+
+def test_a_path_like_value_is_checked_at_the_text_the_driver_is_sent(tmp_path: Path) -> None:
+    """The build sends ``str(value)``, so the check reads that file, and the remote screen judges
+    that text. Red with ``driver_file_spellings`` back on ``os.fspath``: the check reads a
+    different file from the one the driver is told to load."""
+    sent = str(_ca(tmp_path, name="sent.pem"))
+
+    class Split(os.PathLike[str]):
+        def __fspath__(self) -> str:
+            return str(tmp_path / "other.pem")
+
+        def __str__(self) -> str:
+            return sent
+
+    assert database.driver_file_spellings(Split()) == (sent,)

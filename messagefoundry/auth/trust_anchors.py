@@ -1035,30 +1035,41 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
 # --- evaluation + enforcement -------------------------------------------------------------------
 
 
-def _read_regular_file(path: str) -> bytes:
-    """The whole file at ``path``, opened once and judged by its own descriptor. Anything but a
-    regular file raises ``OSError``, which every caller reports as an anchor it cannot read.
-    ``O_NONBLOCK``, where the platform has it, keeps the open from waiting on a pipe with no
-    writer, so a pipe swapped in for a CA is refused rather than waited on (vault BACKLOG #3090).
-    ``O_NOCTTY`` keeps a terminal device named as a CA from becoming the engine's controlling
-    terminal. The descriptor is judged before :func:`os.fdopen` takes it, and closed here when it
-    is refused, since ``fdopen`` does not close a descriptor it refuses (a POSIX directory)."""
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_BINARY", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-        | getattr(os, "O_NOCTTY", 0)
-    )
+def read_if_regular(path: str, limit: int = -1) -> bytes | None:
+    """The bytes of the regular file at ``path``, at most ``limit`` of them, or ``None`` when the
+    path names anything else: a directory, a device or a pipe (vault BACKLOG #3090). A failure to
+    stat, open or read raises ``OSError``.
+
+    The path is stat'ed first, so a device or pipe in place is never opened, since opening some
+    devices has effects of its own. The file is then opened once and judged again by its own
+    descriptor, so nothing swapped in between is read. ``O_NONBLOCK``, where the platform has it,
+    keeps that open from waiting on a pipe with no writer, and ``O_NOCTTY`` keeps a terminal from
+    becoming the engine's controlling terminal. A regular file is read blocking. The descriptor is
+    closed here, once, whatever happens: ``fdopen`` never owns it."""
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        return None
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | nonblock | getattr(os, "O_NOCTTY", 0)
     fd = os.open(path, flags)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError(errno.EINVAL, "not a regular file")
-        handle = os.fdopen(fd, "rb")
-    except BaseException:
+            return None
+        if nonblock:
+            os.set_blocking(fd, True)  # a buffered read of a non-blocking descriptor may get None
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return handle.read(limit)
+    finally:
         os.close(fd)
-        raise
-    with handle:
-        return handle.read()
+
+
+def _read_regular_file(path: str) -> bytes:
+    """The whole file at ``path``, read by :func:`read_if_regular`. Anything but a regular file
+    raises ``OSError``, which every caller reports as an anchor it cannot read, so a pipe swapped
+    in for a CA is refused rather than waited on (vault BACKLOG #3090)."""
+    data = read_if_regular(path)
+    if data is None:
+        raise OSError(errno.EINVAL, "not a regular file")
+    return data
 
 
 def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
@@ -1612,18 +1623,22 @@ def inbound_lane_reads_ca(conn_type: object, settings: Mapping[str, Any]) -> boo
     never be checked, while an outbound with the same dialect is."""
     if conn_type is ConnectorType.REMOTEFILE:
         return bool(settings.get("tls_ca_file"))
-    if conn_type is not ConnectorType.DATABASE:
-        return False
+    return conn_type is ConnectorType.DATABASE and _names_lane_sslca(settings)
+
+
+def _names_lane_sslca(settings: Mapping[str, Any]) -> bool:
+    """Whether a DATABASE connection names a non-blank ``odbc_params`` ``sslca`` its lane check may
+    read. A ``dialect`` that is not yet text may resolve to ``generic``, so it is read as one."""
     if not isinstance(settings.get("dialect", "sqlserver"), str):
-        settings = {**settings, "dialect": "generic"}
+        settings = {**settings, "dialect": "generic"}  # only for an unresolved dialect
     return bool(_generic_odbc_param(settings, "sslca"))
 
 
 def lane_ca_setting(settings: Mapping[str, Any]) -> str:
     """The setting that names a lane's CA, for a refusal line that may not name the file:
-    ``tls_ca_file``, or a generic DATABASE lane's ``odbc_params sslca`` (module item 12). A blank
-    ``sslca`` names no CA, as :func:`inbound_lane_reads_ca` reads it."""
-    if not settings.get("tls_ca_file") and _generic_odbc_param(settings, "sslca"):
+    ``tls_ca_file``, or a generic DATABASE lane's ``odbc_params sslca`` (module item 12), read as
+    :func:`inbound_lane_reads_ca` reads it."""
+    if not settings.get("tls_ca_file") and _names_lane_sslca(settings):
         return "odbc_params sslca"
     return "tls_ca_file"
 
@@ -1776,9 +1791,8 @@ def connection_anchor_specs(
 
 
 #: The connection settings :func:`connection_anchor_spec`, :func:`outbound_anchor_spec` and
-#: :func:`database_ca_anchor_spec` read, and the only ones resolved for them. The middle group,
-#: with ``dialect`` and ``odbc_params`` for the ``sslmode`` case, is what :func:`unread_ca_reason`
-#: reads. ``odbc_params`` holds no ``env()`` value to resolve.
+#: :func:`database_ca_anchor_spec` read, and the only ones resolved for them. The first two, for
+#: the ``sslmode`` case, and the middle group are what :func:`unread_ca_reason` reads. ``odbc_params`` holds no ``env()`` value to resolve.
 _CONNECTION_ANCHOR_KEYS = (
     "dialect",
     "odbc_params",

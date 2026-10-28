@@ -195,8 +195,8 @@ def test_a_file_that_is_not_regular_is_not_read(
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes need POSIX mkfifo")
-def test_a_pipe_named_as_sslcert_is_not_opened(tmp_path: Path) -> None:
-    """Opening a pipe with no writer would wait, which is what the check exists to prevent."""
+def test_a_pipe_named_as_sslcert_is_left_to_the_driver_unread(tmp_path: Path) -> None:
+    """Reading a pipe with no writer would wait, which is what the check exists to prevent."""
     pipe = tmp_path / "client.pipe"
     os.mkfifo(pipe)
     assert f"sslcert={{{pipe}}}" in _build(str(pipe))
