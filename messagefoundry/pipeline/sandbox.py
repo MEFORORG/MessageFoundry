@@ -107,6 +107,7 @@ from messagefoundry.config.settings import (
     INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
     security_enforcement_env_names,
 )
+from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline._sandbox_codec import GraphShape, SandboxCodecError, SandboxError
@@ -229,8 +230,8 @@ def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
     ``bindings`` is compared over the inbounds the ENGINE holds. An engine shard holds only its
     own, while its worker loads the whole config, so the worker's other bindings are not a
     difference. ``code_digest`` is compared whenever the engine has one: a config module whose
-    bytes changed on disk since the engine loaded it differs there even when every name is the
-    same (vault BACKLOG #2724). A worker of the same build with no digest could not read its own
+    bytes differ from the ones the engine loaded differs there even when every name is the same
+    (vault BACKLOG #2724; since #2596 a worker runs the engine's snapshot, so this is a backstop). A worker of the same build with no digest could not read its own
     modules, so that is a difference too, never a pass."""
     found: list[str] = []
     sets = {
@@ -560,7 +561,8 @@ class SandboxWorkerRefused(SandboxError):
     engine graph is refused from the session's cached refusal with ``first`` False, so the runner
     raises its ``sandbox_worker_refused`` alert once per refusal, not once per message (vault
     BACKLOG #2724, owner ruling 2026-10-16). ``content_only`` is True when the config modules'
-    bytes are the only difference, so the cause is an edit on disk with no reload. ``graph`` is
+    bytes are the only difference: the worker ran other bytes than the engine loaded, which a
+    session sent the engine's snapshot cannot do (vault BACKLOG #2596). ``graph`` is
     the engine graph the worker was compared with, so the runner can tell a refusal against a
     graph it no longer serves. The defaults exist only so that a copy or an unpickle, which
     passes the message alone, still builds."""
@@ -597,8 +599,16 @@ class SandboxSession:
         env: str | None,
         graph: Callable[[], GraphShape] | None,
         code_sets: Mapping[str, CodeSet] | None = None,
+        snapshot: ConfigSnapshot | None = None,
     ) -> None:
         self.policy = policy
+        # The config bytes every worker of this session runs: the snapshot the engine's graph was
+        # loaded from (vault BACKLOG #2596). Sent in the boot frame, so a worker, a respawned one
+        # included, never reads the config directory and runs what the engine loaded, whatever is
+        # on disk by then. ``None`` (a caller holding a graph built in code): the session reads
+        # ``config_dir`` itself, once, with the load's trust check, at its first spawn, and every
+        # later respawn reuses those bytes.
+        self._snapshot = snapshot
         # How to read the graph the engine is serving NOW, which a worker's must match before it is
         # brought up. A callable, read at each spawn: a session can outlive a registry swap, and a
         # shape captured when the session was made would then be the wrong one to compare with.
@@ -616,9 +626,8 @@ class SandboxSession:
         self._inbound = inbound
         self._config_dir = str(Path(config_dir))
         # Kept for the caller's signature (``engine.py`` resolves it into the config source and
-        # ``wiring_runner._sandbox_for`` passes it here), but NOT marshalled: the
-        # worker never read it — `load_config()` takes only a directory — and a dead field on the wire
-        # is a field nobody validates.
+        # ``wiring_runner._sandbox_for`` passes it here), but NOT marshalled: the worker loads only
+        # the snapshot it is sent, and a dead field on the wire is a field nobody validates.
         self._env = env
         # The ENGINE's live code-set tables, sent once per spawn in the boot frame so the child serves
         # exactly what mode=off would rather than its own re-read of `codesets/` (see
@@ -659,6 +668,18 @@ class SandboxSession:
             raise SandboxWorkerRefused(
                 self._refused[1], first=False, content_only=self._refused[2], graph=engine_graph
             )
+        # The boot frame is built BEFORE the child exists, so a snapshot that cannot be read (a
+        # session given none reads its directory here) or a frame that cannot be encoded leaves no
+        # live child, job handle or drain thread behind.
+        try:
+            boot = codec.encode_boot(
+                snapshot=self._config_snapshot(),
+                forbidden=self.policy.forbidden_modules,
+                mem_mb=self.policy.mem_mb,
+                code_sets=self._code_sets,
+            )
+        except (OSError, ValueError, SandboxError) as exc:  # WiringError is a ValueError
+            raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
         # this generation's reads.
         self._responses = queue.Queue()
@@ -666,10 +687,11 @@ class SandboxSession:
         # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
         # environment (vault BACKLOG #2587). Two engine variables cross, and they are one
         # decision: the config-source escape and the enforcement dial that unlocks it (vault
-        # BACKLOG #2599). The child runs ``load_config`` itself, so with only the escape it
-        # would refuse a directory its parent loaded at ``warn``. The dial is a posture
-        # switch, not a secret, and every spelling of it the parent's check read crosses, so
-        # the child's check reads the same variables. The operator's
+        # BACKLOG #2599). They crossed because the child ran ``load_config`` on the directory
+        # itself, and with only the escape it would refuse a directory its parent loaded at
+        # ``warn``. Since vault BACKLOG #2596 the child loads the snapshot it is sent and runs no
+        # trust check of its own, so no code in it reads either; dropping them is a separate
+        # change. The dial is a posture switch, not a secret. The operator's
         # ``[sandbox].pass_environment`` names cross with them.
         # At most one glibc malloc arena besides the main one, where the worker's memory cap is
         # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
@@ -743,15 +765,7 @@ class SandboxSession:
         # not on what the parent's threads are doing.
         self._job = _assign_kill_on_close_job(proc)
         try:
-            _write_frame(
-                proc.stdin,
-                codec.encode_boot(
-                    config_dir=self._config_dir,
-                    forbidden=self.policy.forbidden_modules,
-                    mem_mb=self.policy.mem_mb,
-                    code_sets=self._code_sets,
-                ),
-            )
+            _write_frame(proc.stdin, boot)
         except (OSError, SandboxError) as exc:
             self._kill(proc)
             raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
@@ -779,20 +793,22 @@ class SandboxSession:
                 # FAIL CLOSED. A worker that loaded a different graph would answer for this inbound
                 # from that graph, and nothing in its answers would say so.
                 self._kill(proc)
-                # Only an edit on disk when the worker read its modules: a worker that could not
-                # read them reports no digest, and that is not an edit.
+                # Module bytes alone differ only when the worker read its modules: a worker that
+                # could not read them reports no digest, and that is not the same bytes.
                 content_only = worker_graph.code_digest is not None and all(
                     d.startswith(_CONTENT_DIFFERS) for d in differing
                 )
+                # A worker runs the snapshot it is sent and never reads the directory (vault
+                # BACKLOG #2596), so an edit on disk is not a cause any more, and a reload is no
+                # remedy for a graph that differs by name.
                 causes = (
-                    "The config files changed on disk since the engine loaded them: reload the "
+                    "The worker ran other config module bytes than the engine loaded: reload the "
                     "config."
                     if content_only
-                    else "Most often the config files changed on disk since the engine loaded "
-                    "them: reload the config. Or config code reads an environment variable the "
-                    "worker is not given, because the worker loads the config again under an "
-                    "allowlisted environment: name each such variable in "
-                    "[sandbox].pass_environment and restart."
+                    else "Config code most likely reads an environment variable the worker is "
+                    "not given, because the worker runs the config again under an allowlisted "
+                    "environment: name each such variable in [sandbox].pass_environment and "
+                    "restart."
                 )
                 # Short before the differences: a dead-lettered message keeps about the first 200
                 # characters of this, behind its stage prefix and the exception's type name.
@@ -806,6 +822,16 @@ class SandboxSession:
                 )
         self._refused = None
         self._proc = proc
+
+    def _config_snapshot(self) -> ConfigSnapshot:
+        """The snapshot this session's workers run: the engine's, or, when the session was given
+        none, one read here from ``config_dir`` once, under the load's own trust check, and kept, so
+        a respawn reuses the same bytes. Called from the worker thread, never the event loop."""
+        if self._snapshot is None:
+            from messagefoundry.config.wiring import read_trusted_snapshot
+
+            self._snapshot = read_trusted_snapshot(self._config_dir)
+        return self._snapshot
 
     def _reader_loop(self, stdout: Any, sink: queue.Queue[Any]) -> None:
         """Drain the child's stdout into ``sink`` — **framing only**, never decoding (see

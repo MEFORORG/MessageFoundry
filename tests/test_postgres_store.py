@@ -46,7 +46,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.queue_tag import queue_row_aad
-from messagefoundry.store.store import load_audit_chain
+from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -808,6 +808,7 @@ async def test_stats_and_metrics(store) -> None:
     # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
     # this guards every run.
     assert db.disk_free_bytes is None
+    assert db.disk_free_status is DiskFreeStatus.NOT_APPLICABLE  # stated, not inferred
     ok, _ = await store.integrity_check()
     assert ok is True
 

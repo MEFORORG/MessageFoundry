@@ -6,7 +6,8 @@ The code-first graph references environment-specific values via ``env("key")`` (
 :mod:`messagefoundry.config.wiring`); this module gathers those values for the running instance's
 environment. Non-secret values live in a flat TOML table ``<dir>/<env>.toml`` (versioned in the
 repo, diffable, reviewable); secrets are supplied as ``MEFOR_VALUE_<KEY>`` environment variables
-(never the file), and **env overrides the file**.
+or as files of that name in the secrets directory (never the file), and **env overrides the file**,
+and the secrets directory overrides both.
 
 This module only *gathers* the values; a referenced key that ends up undefined is surfaced **loud**
 later, when the engine builds the connector (:func:`messagefoundry.config.wiring.resolve_env_settings`)
@@ -27,12 +28,22 @@ from __future__ import annotations
 
 import logging
 import tomllib
+from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from messagefoundry.config.snapshot import ConfigSnapshot
+
+from messagefoundry.engine_secrets import VALUE_PREFIX, open_secrets_directory
 
 __all__ = [
     "VALUE_ENV_PREFIX",
+    "EnvironmentValuesReader",
+    "SnapshotEnvValuesProvider",
+    "ValuesRead",
+    "environment_values_from_bytes",
     "is_drive_relative",
     "load_environment_values",
     "resolve_values_base_dir",
@@ -40,9 +51,86 @@ __all__ = [
 ]
 
 #: Env-var prefix for environment values (esp. secrets): MEFOR_VALUE_EPIC_HOST -> key "epic_host".
-VALUE_ENV_PREFIX = "MEFOR_VALUE_"
+VALUE_ENV_PREFIX = VALUE_PREFIX
 
 _log = logging.getLogger(__name__)
+
+
+class SnapshotEnvValuesProvider(ABC):
+    """An engine ``env_values_provider`` that can also read a reload's values from that reload's
+    config snapshot (vault BACKLOG #2596). A provider opts in by subclassing, never by having a
+    method of the right name. ``serve``'s provider is one."""
+
+    __slots__ = ()
+
+    @abstractmethod
+    def __call__(self) -> Mapping[str, Any]:
+        """The values, read from disk: at start, and on a reload that read no snapshot."""
+
+    @abstractmethod
+    def from_snapshot(self, snapshot: ConfigSnapshot) -> Mapping[str, Any] | None:
+        """The values, with a value file ``snapshot`` covers parsed from its bytes, or ``None``
+        when the value file this provider reads is outside the snapshot
+        (:meth:`~messagefoundry.config.snapshot.ConfigSnapshot.covers_environment_file`). On
+        ``None`` the engine calls the provider plainly and, on a released reload, checks the digest
+        again."""
+
+
+class ValuesRead(Protocol):
+    """A read of one value file's environment values, from disk, or with ``snapshot`` from the
+    bytes it read, raising :class:`~messagefoundry.config.snapshot.NotInSnapshot` for a value file
+    outside it."""
+
+    def __call__(
+        self,
+        *,
+        base_dir: Path,
+        dir_name: str,
+        environment: str,
+        snapshot: ConfigSnapshot | None = None,
+    ) -> dict[str, Any]: ...
+
+
+class EnvironmentValuesReader(SnapshotEnvValuesProvider):
+    """A :class:`SnapshotEnvValuesProvider` over one value file,
+    ``<base_dir>/<dir_name>/<environment>.toml``, read by ``read``. ``serve`` passes its own read,
+    which vets the file's owner and access list and names the file in a refusal."""
+
+    __slots__ = ("_read", "base_dir", "dir_name", "environment")
+
+    def __init__(
+        self, read: ValuesRead, *, base_dir: Path, dir_name: str, environment: str
+    ) -> None:
+        self._read = read
+        self.base_dir = base_dir
+        self.dir_name = dir_name
+        self.environment = environment
+
+    def __call__(self) -> dict[str, Any]:
+        return self._read(
+            base_dir=self.base_dir, dir_name=self.dir_name, environment=self.environment
+        )
+
+    def from_snapshot(self, snapshot: ConfigSnapshot) -> dict[str, Any] | None:
+        from messagefoundry.config.snapshot import NotInSnapshot
+
+        try:
+            return self._read(
+                base_dir=self.base_dir,
+                dir_name=self.dir_name,
+                environment=self.environment,
+                snapshot=snapshot,
+            )
+        except NotInSnapshot:
+            # A path only, never a value. The default layout keeps the value file outside the
+            # config directory, so this is the usual line there, and it says why the release then
+            # takes a second digest.
+            _log.info(
+                "environment value file %s is outside the config snapshot; the reload reads it "
+                "from disk",
+                values_file_path(self.base_dir, self.dir_name, self.environment),
+            )
+            return None
 
 
 def is_drive_relative(value: str) -> bool:
@@ -108,15 +196,25 @@ def load_environment_values(
     """Resolve this instance's environment values.
 
     Reads ``<base_dir>/<dir_name>/<environment>.toml`` (a flat key→scalar table) if present, then
-    overlays ``MEFOR_VALUE_<KEY>`` env vars (env wins). A missing file is **not** an error here —
+    overlays ``MEFOR_VALUE_<KEY>`` env vars (env wins), then a ``MEFOR_VALUE_<KEY>`` file in the secrets
+    directory (the directory wins; :mod:`messagefoundry.engine_secrets`). A missing file is **not** an error here —
     referenced-but-undefined keys fail loud when a connector is built, not at gather time.
     """
-    values: dict[str, Any] = {}
-
     path = values_file_path(base_dir, dir_name, environment)
-    if path.is_file():
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
+    return environment_values_from_bytes(
+        path.read_bytes() if path.is_file() else None, path=path, environ=environ
+    )
+
+
+def environment_values_from_bytes(
+    file_bytes: bytes | None, *, path: Path, environ: Mapping[str, str]
+) -> dict[str, Any]:
+    """:func:`load_environment_values` over the value file's bytes already read, ``None`` when there
+    is no file. ``path`` only names the file in a warning. A released reload parses the bytes its
+    approval digest covered this way, rather than reading the file again (vault BACKLOG #2596)."""
+    values: dict[str, Any] = {}
+    if file_bytes is not None:
+        data = tomllib.loads(file_bytes.decode("utf-8"))
         for key, value in data.items():
             if isinstance(value, dict):
                 # Nested tables are reserved (future grouping); a value must be a scalar/array today.
@@ -139,5 +237,12 @@ def load_environment_values(
             key = name[len(VALUE_ENV_PREFIX) :].lower()
             if key:
                 values[key] = value  # env (incl. secrets) overrides the file
+
+    # The secrets directory overrides both (vault BACKLOG #2595, ADR 0214): a file named
+    # MEFOR_VALUE_<KEY> there supplies that value. Unset, nothing is read; unusable, it refuses.
+    directory = open_secrets_directory(environ)
+    if directory is not None:
+        for name, value in directory.read_values().items():
+            values[name[len(VALUE_ENV_PREFIX) :].lower()] = value
 
     return values

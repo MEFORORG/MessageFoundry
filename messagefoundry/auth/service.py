@@ -3284,6 +3284,13 @@ class AuthService:
         #: ``"fresh"``: no pass here saw a referral. ``"referred"``: one did. ``"forfeit"``: see
         #: `_forfeit_clears_on_attrition`. Only `_advance_referral_standing` moves it.
         self._reconcile_referral_standing: _ReferralStanding = "fresh"
+        #: Passes running that read the directory unreachable, whether the current run's page is
+        #: recorded, and whether any run paged in THIS process (BACKLOG #3709). In memory, so a
+        #: restart starts the count again and resolves no outage instance an earlier run opened.
+        #: `_note_directory_outage` and `_latch_outage_page` keep them.
+        self._reconcile_outage_passes = 0
+        self._reconcile_outage_run_paged = False
+        self._reconcile_outage_paged = False
         #: The accounts behind the trip, referral and hold now open, kept only so that a forfeited
         #: standing logs once per new one (BACKLOG #3083). Logging state: no decision reads it.
         #: Not `_reconcile_unconfirmed` or `_reconcile_referred`: those leave id-less rows out and
@@ -7649,7 +7656,8 @@ class AuthService:
             # answer, so it is FAULT and not UNAVAILABLE. verify_mfa refuses on it (fail closed),
             # the certificate path keeps its per-account fault logging, and the reconciler skips
             # this one account and alerts on every pass that probes it (`_record_reconcile_fault`).
-            # A pass of faults only is no longer read as a directory outage, which pages nobody.
+            # A pass of faults only is no longer read as a directory outage, which pages nobody
+            # until it lasts `[auth].ad_reconcile_outage_passes` passes (BACKLOG #3709).
             #
             # NOT LIKE #1639, AND THE COST IS NAMED. An unreadable userAccountControl is an answer
             # the directory gave, so it strikes as UNDETERMINED. This says nothing about the
@@ -7720,6 +7728,64 @@ class AuthService:
             ):
                 entered.append((probe.user_id, probe.username, probe.detail))
         return tuple(entered)
+
+    def _note_directory_outage(self, plan: reconcile.ReconcilePlan) -> reconcile.ReconcilePlan:
+        """Count the passes running that read the directory unreachable, and say on the plan
+        whether this one pages or clears (BACKLOG #3709).
+
+        Every outage pass is fail-open: it revokes nothing, so a directory disable or deletion
+        reaches no signed-in session while the outage lasts, and the pass is audited as skipped.
+        One such pass is a blip and pages nobody. Once the run is
+        ``[auth].ad_reconcile_outage_passes`` long, a pass pages, once per run: the page is latched
+        only once that pass's rows are written (:meth:`_latch_outage_page`), as a paging refusal's
+        is, so a pass that raises before then leaves the next pass to page. **Every cause counts**:
+        the plan reads an outage whenever every probe it asked came back UNAVAILABLE, whatever made
+        each one so, a group search refused for the engine's own bound included.
+
+        A pass that asked the directory anything and is not an outage reached it, even one that
+        judged nothing, such as a pass of referrals only, unless every probe failed or faulted
+        (``plan.probe_fault``), which leaves the run as it stands. It ends the run, and once a run here has
+        paged it marks ``outage_clear`` on every such pass, as the other clears are raised, so a
+        resolve that failed is retried. A pass that asked nothing, with nobody signed in or only
+        id-less rows, learned nothing about the directory and leaves the run as it stands.
+
+        Process-local, like the strikes. A restart starts the count again, so a standing outage
+        pages again after it, and resolves nothing an earlier run opened: ``_paged`` starts False,
+        and the lifespan task's inherited-instance and sole-reconciler gates drop the clear as they
+        drop every other (``_mark_reconcile_clears`` states that rule)."""
+        if plan.directory_outage:
+            self._reconcile_outage_passes += 1
+            page = (
+                not self._reconcile_outage_run_paged
+                and self._reconcile_outage_passes >= self._settings.ad_reconcile_outage_passes
+            )
+            return replace(plan, outage_passes=self._reconcile_outage_passes, outage_page=page)
+        if plan.asked == 0 or plan.probe_fault:
+            # Nothing was asked, or every probe asked failed or faulted: a fault the engine could
+            # not read says nothing about whether the directory was reached, so it neither ends
+            # nor extends the run.
+            return replace(plan, outage_passes=self._reconcile_outage_passes)
+        if self._reconcile_outage_run_paged:
+            _log.warning(
+                "directory reconcile: the directory was reached again after %d unreachable passes",
+                self._reconcile_outage_passes,
+            )
+        self._reconcile_outage_passes = 0
+        self._reconcile_outage_run_paged = False
+        return replace(plan, outage_clear=self._reconcile_outage_paged)
+
+    def _latch_outage_page(self, plan: reconcile.ReconcilePlan) -> None:
+        """Record that this run's outage page is raised, once its pass's rows are written (BACKLOG
+        #3709; :meth:`_note_directory_outage` says why it waits for them)."""
+        if not plan.outage_page:
+            return
+        self._reconcile_outage_run_paged = True
+        self._reconcile_outage_paged = True
+        _log.error(
+            "directory reconcile: the directory has been unreachable for %d passes running; no "
+            "directory disable or deletion reaches a signed-in session until a pass reaches it",
+            plan.outage_passes,
+        )
 
     async def _record_paging_refusals(self, plan: reconcile.ReconcilePlan) -> None:
         """Log, audit and latch each account entering the paging-refused state (vault BACKLOG
@@ -7931,6 +7997,8 @@ class AuthService:
         self._reconcile_hold_latched = plan.latched
         # Vault BACKLOG #3696. Before any return below, so an outage-shaped pass pages too.
         plan = replace(plan, paging_refused=self._note_paging_refusals(probes, plan.outcomes))
+        # BACKLOG #3709. Before any return below, so the outage's skipped row carries the count.
+        plan = self._note_directory_outage(plan)
         if plan.hold:
             self._advance_hold_standing("held")
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
@@ -7989,6 +8057,8 @@ class AuthService:
                 await self._record_reconcile_hold(plan)
                 plan = self._mark_reconcile_clears(plan, users)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
+            # BACKLOG #3709. Last, so any pass that raises before it leaves the next one to page.
+            self._latch_outage_page(plan)
             return plan
 
         self._reconcile_alert = None
@@ -8961,7 +9031,10 @@ class AuthService:
             )
             await self._audit_reconciler_row(
                 "auth.ad_reconcile_skipped",
-                detail=_json({"reason": plan.aborted, "asked": plan.asked}),
+                # BACKLOG #3709: the run's length, so the outage's page matches a row.
+                detail=_json(
+                    {"reason": plan.aborted, "asked": plan.asked, "passes": plan.outage_passes}
+                ),
             )
             return
         # The ceiling is taken over the breaker's own denominator, which counts held probes (ADR
@@ -9124,7 +9197,8 @@ class AuthService:
         It leaves that account unjudged: no strike and no revocation. A deleted or moved search base
         refuses every account on every pass, so while it lasts nothing is revoked and the sessions
         run to the absolute cap. Before #3010 such a search read as "not found", which tripped the
-        mass-revoke breaker on a large enough estate, and a plain outage would page nobody. So
+        mass-revoke breaker on a large enough estate, and a plain outage would page nobody until
+        it lasted ``[auth].ad_reconcile_outage_passes`` passes (BACKLOG #3709). So
         every pass with such a refusal latches the message, logs it at ERROR with the first
         refusal's text, and writes an ``auth.ad_reconcile_misconfigured`` row, and the lifespan
         task raises it as ``ad_reconcile_aborted`` with reason ``directory_misconfigured`` under its
@@ -13025,7 +13099,7 @@ class AuthService:
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
-        if session is None or session.revoked_at is not None:
+        if session is None:
             return Elevation()
         user = await self._load_user(session.user_id)
         if user is None or user.disabled or not user.totp_enabled:
@@ -13061,13 +13135,21 @@ class AuthService:
             # what was read before it may be stale: a session revoked meanwhile would still spend
             # its code, and a lock set by the attempt ahead in the queue would go unseen. A session
             # or account gone answers ``session_lost``, as the re-reads before and after this one
-            # do (BACKLOG #3068): the token no longer authenticates.
+            # do (BACKLOG #3068): the token no longer authenticates. Audited with the row
+            # :meth:`_factor_holder_current` writes (BACKLOG #3780), under the account's name as it
+            # is now when the row is still there (#2291 class). The account is read even when the
+            # session is gone, so a rename that came with the revocation names the row too.
             session = await self._load_session(hash_token(token))
-            if session is None or session.revoked_at is not None:
+            loaded = await self._load_user(user.id if session is None else session.user_id)
+            if session is None or loaded is None or loaded.disabled:
+                await self._audit_session_lost(
+                    "auth.mfa_failed",
+                    actor=(loaded or user).username,
+                    client=client,
+                    phase=None,
+                )
                 return Elevation(session_lost=True)
-            user = await self._load_user(session.user_id)
-            if user is None or user.disabled:
-                return Elevation(session_lost=True)
+            user = loaded
             if not user.totp_enabled:
                 return Elevation()
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
@@ -13326,7 +13408,7 @@ class AuthService:
         if floor <= 0:
             return False
         session = await self._load_session(hash_token(token))
-        if session is None or session.revoked_at is not None or session.mfa_verified_at is not None:
+        if session is None or session.mfa_verified_at is not None:
             return False
         if now - session.created_at >= floor:
             return False
@@ -13422,9 +13504,9 @@ class AuthService:
     ) -> None:
         """The ``session_lost`` row a factor leg writes when its session or account went: ``event``
         with ``reason=session_lost``, and ``phase`` when given. The one spelling
-        :meth:`_factor_holder_current` and :meth:`_refuse_lost_enrolment_session` share, so the row a
-        directory account's re-read writes and the one a local account's enrolment guard writes
-        cannot drift apart."""
+        :meth:`_factor_holder_current`, :meth:`_refuse_lost_enrolment_session` and
+        :meth:`verify_mfa`'s in-queue re-read share (BACKLOG #3780), so the rows each writes for
+        the same outcome cannot drift apart."""
         lost = {"reason": "session_lost"}
         if phase is not None:
             lost["phase"] = phase
@@ -13468,7 +13550,7 @@ class AuthService:
         spend (a challenge, a TOTP step, recovery codes, a stored credential), and after the cheap
         local refusals, so a caller already refused costs no lookup. Note that the re-read refuses
         a second-step-locked account."""
-        if user.auth_provider != AuthProvider.AD.value:
+        if not _is_directory_account(user):
             return user
         refusal = await self._directory_step_up_refusal(user)
         if refusal is not None:
@@ -13513,11 +13595,7 @@ class AuthService:
         ``session_lost`` row only, for the reason :meth:`_directory_vouches_for_factor` states. Only
         revocation is asked of the session, not its expiry."""
         session = await self._load_session(hash_token(token))
-        user = (
-            None
-            if session is None or session.revoked_at is not None
-            else (await self._load_user(session.user_id))
-        )
+        user = None if session is None else await self._load_user(session.user_id)
         if user is None or user.disabled:
             await self._audit_session_lost(event, actor=actor, client=client, phase=phase)
             return Elevation(session_lost=True)
@@ -14263,7 +14341,7 @@ class AuthService:
         if not token:
             return None
         session = await self._load_session(hash_token(token))
-        if session is None or session.revoked_at is not None:
+        if session is None:
             return None
         # Only passkeys the account's seal names are offered (BACKLOG #2592).
         user = await self._load_user(session.user_id)
@@ -14309,11 +14387,12 @@ class AuthService:
         ``directory_refusal`` and spends neither the challenge nor the sign count. The lookup
         runs only once a ceremony is staged for the session, so a post with nothing staged gets the
         plain ``expired`` refusal and costs no lookup (BACKLOG #3068). The session, the account and
-        the lock are read once more right before the factor is written."""
+        the lock are read once more right before the factor is written. A store fault in the
+        passkey re-read after that refuses, audited with ``reason=store_error`` (BACKLOG #3775)."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
-        if session is None or session.revoked_at is not None:
+        if session is None:
             return Elevation()
         user = await self._load_user(session.user_id)
         if user is None or user.disabled:
@@ -14415,7 +14494,26 @@ class AuthService:
         # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so the
         # passkey that signed may be gone. Asked after the holder re-read, as the last read before
         # the factor write. It decides the refusal only: the clone row, if owed, is written above.
-        standing = await self._passkey_held(user, cred)
+        try:
+            standing = await self._passkey_held(user, cred)
+        except AUDIT_WRITE_DEFECTS:
+            # SQLite's bad statement or bind is a defect, not a store refusal. On PostgreSQL and
+            # SQL Server a bad statement is a driver DatabaseError, so it is refused below.
+            raise
+        except _session_write_errors():
+            # BACKLOG #3775: after the sign-count write, a store fault here refuses with an audit
+            # row rather than raising past the ceremony with none. Soft, so a store that refuses
+            # that row too still gets the refusal back: the refusal is the fail-closed control,
+            # and the row only records it.
+            _log.exception("finish_webauthn_assertion: the passkey re-read raised")
+            await write_audit_soft(
+                lambda: self._assertion_refused(user, client, "store_error"),
+                log=_log,
+                message="the auth.webauthn_failed store_error audit row could not be written",
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+            return Elevation()
         if standing == "account_gone":
             # Deleted after the holder re-read: the token no longer authenticates, so the answer
             # is the lost session the re-read would have given, not a factor question.

@@ -1473,7 +1473,8 @@ async def test_audit_export_stop_reaches_the_server_as_an_abort(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The stop leaves the app as a raise. This pins the raise, NOT what the client receives: the
-    client still gets a short file that looks complete (BACKLOG #3381; see ``ExportStopped``)."""
+    client sees a failed transfer, which ``tests/test_export_stop_wire.py`` measures over a real
+    server (BACKLOG #3907; see ``ExportStopped``)."""
     with pytest.raises(ExportStopped):
         await _export_with_mid_stream_act(
             engine, monkeypatch, Role.AUDITOR, _revoke, raise_app_exceptions=True

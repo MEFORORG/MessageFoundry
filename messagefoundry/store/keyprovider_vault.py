@@ -37,6 +37,7 @@ from messagefoundry.config.tls_policy import (
     assert_hvac_tls_suites,
     vault_client_verify_kwargs,
 )
+from messagefoundry.engine_secrets import SecretsDirectoryError, secret_setting
 from messagefoundry.store.keyprovider import KeyProviderError, _split_retired
 
 if TYPE_CHECKING:
@@ -349,7 +350,7 @@ class VaultKeyProvider:
                 f"supply the Transit KEK name and the wrapped DEK via the environment."
             )
         addr = os.environ.get(_ENV_ADDR)
-        token = os.environ.get(_ENV_TOKEN)
+        token = store_token_setting()
         # OUTSIDE the try on purpose. The TLS suite assertion inside `_build_client` raises
         # ValueError, and the `except Exception` below would relabel it "could not envelope-decrypt
         # the store DEK" — turning a configuration refusal into what reads as a Vault-side failure,
@@ -428,6 +429,20 @@ def build_provider(
 TRANSIT_MOUNT = "transit"
 
 
+def store_token_setting() -> str | None:
+    """``MEFOR_STORE_VAULT_TOKEN`` through the one accessor: its file in the secrets directory, else
+    the environment (vault BACKLOG #2595). A directory that cannot be used raises
+    :class:`KeyProviderError`, so the store refuses to open as it does for any other bad Vault
+    setting. Shared with ``crypto_transit``, which reads the same token."""
+    # The refusal is raised outside the handler and carries only the message, so nothing the
+    # directory read held rides along on its chain (BACKLOG #2307 states the rule).
+    try:
+        return secret_setting(_ENV_TOKEN)
+    except SecretsDirectoryError as exc:
+        refusal = str(exc)
+    raise KeyProviderError(refusal)
+
+
 def _kek_name() -> str | None:
     """The KEK's Transit key name. One read for :meth:`VaultKeyProvider.active_key` and for
     :func:`kek_required_capabilities`, so the probe asks about the key the provider unwraps under."""
@@ -441,12 +456,12 @@ def store_vault_token() -> str:
     reads ``VAULT_TOKEN`` and then ``~/.vault-token``: in an operator's shell that is the operator's
     own token, and the check would judge it as the engine's. Raises :class:`KeyProviderError`,
     which the probe reports as not observed."""
-    token = os.environ.get(_ENV_TOKEN)
+    token = store_token_setting()
     if not token:
         raise KeyProviderError(
-            f"{_ENV_TOKEN} is not set, so the store token is not known. The check reads only the "
-            f"token named there, never VAULT_TOKEN or ~/.vault-token; run it with the service's "
-            f"environment"
+            f"{_ENV_TOKEN} is not set, in the secrets directory or the environment, so the store "
+            f"token is not known. The check reads only the token named there, never VAULT_TOKEN or "
+            f"~/.vault-token; run it with the service's environment"
         )
     return token
 

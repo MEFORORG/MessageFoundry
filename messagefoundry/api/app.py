@@ -291,6 +291,7 @@ from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
     MISCONFIGURED_ABORT,
+    OUTAGE_ABORT,
     PAGING_CAP,
     PAGING_DEADLINE,
     PROBE_FAULT_ABORT,
@@ -445,7 +446,11 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
-from messagefoundry.pipeline.engine import CONFIG_WRITE_ACTIONS, ConfigWriteAuditFailed
+from messagefoundry.pipeline.engine import (
+    CONFIG_WRITE_ACTIONS,
+    ConfigRefusedBeforeApprovalCheck,
+    ConfigWriteAuditFailed,
+)
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.security_signals import (
@@ -555,8 +560,8 @@ _NO_STORE_PREFIXES = ("/messages", "/dead-letters", "/search", "/logs", "/upload
 #:
 #: TEMPLATES, because ``/connections/{name}/events`` cannot be written as a prefix without blanketing
 #: the whole ``/connections`` dashboard family — most of which returns no classified column. The
-#: middleware reads the template off ``request.scope["route"]``, which the router populates during
-#: ``call_next``. An exact set is safe here only because
+#: middleware reads the template off ``request.scope["route"]``, which the router populates before
+#: the response starts. An exact set is safe here only because
 #: ``tests/test_no_store_phi_coverage.py`` selects routes by what their response model CARRIES rather
 #: than by what permission gates it: a new classified route that nobody adds here reds that guard.
 #:
@@ -596,9 +601,10 @@ _ReasonInfo = TypeVar("_ReasonInfo", ConnectionEventInfo, AlertInstanceInfo)
 def _matched_route_path(request: Request) -> str | None:
     """The matched route's path TEMPLATE (``/connections/{name}/events``), or ``None``.
 
-    The router writes the matched route into the request scope while ``call_next`` runs, so this is
-    readable in a middleware only AFTER the downstream call returns. ``None`` covers a 404 (nothing
-    matched) and a mount, neither of which is in :data:`_NO_STORE_ROUTE_PATHS`.
+    The router writes the matched route into the request scope before the endpoint runs, so a
+    middleware can read it from ``http.response.start`` on, never before it calls downstream.
+    ``None`` covers a 404 (nothing matched) and a mount, neither of which is in
+    :data:`_NO_STORE_ROUTE_PATHS`.
     """
     return getattr(request.scope.get("route"), "path", None)
 
@@ -2311,7 +2317,9 @@ async def _audit_refused_reload(
     ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
     BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
-    request whose digest cannot be taken is refused the same way, with no hold filed. A directory
+    request whose digest cannot be taken is refused the same way, with no hold filed. A release
+    refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
+    and adds ``approved_fingerprint`` and ``approval_digest_check`` ``not_reached``. A directory
     that cannot be resolved for another reason writes reason ``unreadable`` and answers 422; the
     engine logged why at WARNING. Any other ``Exception`` is a fault inside the reload, a plain
     ``FileNotFoundError`` from a runner start or swap among them (not a missing directory): it
@@ -2343,6 +2351,14 @@ async def _audit_refused_reload(
     (BACKLOG #3157)."""
     warn = _log.warning if reported is None else _log.debug
     detail: dict[str, object] = {"requested": requested, "dry_run": dry_run, **(extra or {})}
+    if isinstance(exc, ConfigRefusedBeforeApprovalCheck):
+        # A release refused before its digest check, such as by the trust check of a source whose
+        # permissions were loosened: the row names the approval and says the check was not
+        # reached, so it is not read as a refusal of the approved bytes (vault BACKLOG #2596). A
+        # digest and a marker only. Before the chain, which still sets the reason: it is a
+        # WiringError, and its kept cause tells trust_anchor and store_unavailable apart.
+        detail["approved_fingerprint"] = exc.approved
+        detail["approval_digest_check"] = "not_reached"
     if isinstance(exc, ConfigReloadDenied):
         action = "config_reload_denied"
         status, answer = 403, "config directory is not an allowed reload root"
@@ -2720,9 +2736,7 @@ async def _compare_start_config(
     digest, as main's did. The caller stops the process vouching for that digest only when both
     digests were taken over the same files and differ (:func:`_moved_during_load`): a first digest
     that failed, or two that left out different files, is marked here and still vouched for. Two
-    reads miss at least two cases: an edit that lands and is reverted between them, and
-    a module the loader runs from a still-valid ``__pycache__`` bytecode file rather than from the
-    source the digests hash.
+    reads miss at least an edit that lands and is reverted between them.
 
     A digest that left out files it could not read (:func:`digest_coverage`) is still compared. A
     start whose own digest is partial is ``partial_start_digest``, logged at WARNING with what it
@@ -4064,44 +4078,68 @@ def create_app(
     # One-shot XFP-omission tripwire state (L5b, ADR 0068 §8): fires at most once per process.
     xfp_tripwire_fired = False
 
-    @app.middleware("http")
-    async def _security_headers(request: Request, call_next: Any) -> Any:
+    # _security_headers and _limit_request_body are PURE ASGI, never ``@app.middleware("http")``
+    # (BACKLOG #3907): that decorator's BaseHTTPMiddleware ends a response cleanly before an inner
+    # raise leaves it, which turns a stopped export into a complete-looking short file. See
+    # ExportStopped. They are closure factories rather than classes because they share create_app
+    # locals, the tripwire's nonlocal flag among them.
+
+    def _security_headers(inner: ASGIApp) -> ASGIApp:
+        async def middleware(scope: Scope, receive: Receive, send: Send) -> None:
+            nonlocal xfp_tripwire_fired
+            if scope["type"] != "http":
+                await inner(scope, receive, send)
+                return
+            request = Request(scope)
+            if (
+                tls_terminated_upstream
+                and not xfp_tripwire_fired
+                and request.url.scheme == "http"
+                and (request.url.path == "/ui" or request.url.path.startswith("/ui/"))
+            ):
+                # A /ui request arrived with a cleartext scheme while a TLS-terminating proxy is
+                # DECLARED — either the proxy is not sending X-Forwarded-Proto, or its peer address
+                # is not matched by [api].trusted_proxies (including the ::1-vs-127.0.0.1
+                # mismatch). Cookie Secure/HSTS are forced by exposure_protected regardless, but
+                # the source-IP chain (audit, rate limits, new-IP step-up) is degraded until this
+                # is fixed.
+                xfp_tripwire_fired = True
+                _log.warning(
+                    "a /ui request arrived scheme=http while [api].tls_terminated_upstream is set "
+                    "— the proxy is not sending X-Forwarded-Proto, or its peer IP is not matched "
+                    "by [api].trusted_proxies (check ::1 vs 127.0.0.1). See "
+                    "docs/security/OFF-LOOPBACK-DEPLOYMENT.md."
+                )
+
+            async def send_with_headers(message: Message) -> None:
+                # The response start is where the router has run, so the matched route the
+                # no-store arm reads is in the scope by now.
+                if message["type"] == "http.response.start":
+                    _apply_security_headers(request, MutableHeaders(scope=message))
+                await send(message)
+
+            await inner(scope, receive, send_with_headers)
+
+        return middleware
+
+    def _apply_security_headers(request: Request, headers: MutableHeaders) -> None:
         # Defense-in-depth response headers (ASVS 3.4.4 / 3.4.5 / 3.2.1). The shipped operator client
         # is the browser web console at /ui, so these bind today, and they cost nothing on a JSON
         # API. HSTS is emitted over https OR when the operator declared the
         # browser-facing scheme https (exposure_protected — L5b, ADR 0068 §8: the per-request
         # scheme is unreliable behind a proxy that omits X-Forwarded-Proto).
-        nonlocal xfp_tripwire_fired
-        if (
-            tls_terminated_upstream
-            and not xfp_tripwire_fired
-            and request.url.scheme == "http"
-            and (request.url.path == "/ui" or request.url.path.startswith("/ui/"))
-        ):
-            # A /ui request arrived with a cleartext scheme while a TLS-terminating proxy is
-            # DECLARED — either the proxy is not sending X-Forwarded-Proto, or its peer address
-            # is not matched by [api].trusted_proxies (including the ::1-vs-127.0.0.1 mismatch).
-            # Cookie Secure/HSTS are forced by exposure_protected regardless, but the source-IP
-            # chain (audit, rate limits, new-IP step-up) is degraded until this is fixed.
-            xfp_tripwire_fired = True
-            _log.warning(
-                "a /ui request arrived scheme=http while [api].tls_terminated_upstream is set — "
-                "the proxy is not sending X-Forwarded-Proto, or its peer IP is not matched by "
-                "[api].trusted_proxies (check ::1 vs 127.0.0.1). See "
-                "docs/security/OFF-LOOPBACK-DEPLOYMENT.md."
-            )
-        response = await call_next(request)
+        #
         # The header names/values and the HSTS condition come from api/header_floor.py so this
         # middleware and the outermost floor that backstops it cannot drift apart. This one still
         # exists for the PATH-CONDITIONAL work below, which the floor deliberately does not duplicate.
         for name, value in BASELINE_SECURITY_HEADERS:
-            response.headers.setdefault(name, value)
+            headers.setdefault(name, value)
         # hsts_notable, NOT hsts_applies: this middleware is the INNERMOST writer, so it wins the
         # setdefault race against the floor. Leaving the bare scheme test here would put HSTS on
         # every routed response of the minted-certificate default and the floor could never take it
         # off again -- the guard has to hold at both emitters or it holds at neither.
         if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
-            response.headers.setdefault(HSTS_HEADER, HSTS_VALUE)
+            headers.setdefault(HSTS_HEADER, HSTS_VALUE)
         # /ui browser surface (ADR 0065 §5): a strict CSP (no unsafe-*) and no-store on every HTML
         # response; the vendored /ui/static assets keep StaticFiles' own cache. PHI JSON reads also get
         # no-store (every _NO_STORE_PREFIXES family, ASVS 14.2.2) so a browser/proxy never caches a
@@ -4117,18 +4155,27 @@ def create_app(
             # no-store still applies to any /ui path so a browser/proxy never caches HTML.
             ui_csp = getattr(request.app.state, "ui_csp", None)
             if ui_csp is not None:
-                response.headers["Content-Security-Policy"] = ui_csp
-            response.headers["Cache-Control"] = "no-store"
+                headers["Content-Security-Policy"] = ui_csp
+            headers["Cache-Control"] = "no-store"
         # Prefix test first: it is a C-level startswith over a 5-tuple and short-circuits the whole
         # PHI-read surface before the scope lookup is reached.
         elif path.startswith(_NO_STORE_PREFIXES) or (
             _matched_route_path(request) in _NO_STORE_ROUTE_PATHS
         ):
-            response.headers["Cache-Control"] = "no-store"
-        return response
+            headers["Cache-Control"] = "no-store"
 
-    @app.middleware("http")
-    async def _limit_request_body(request: Request, call_next: Any) -> Any:
+    def _limit_request_body(inner: ASGIApp) -> ASGIApp:
+        async def middleware(scope: Scope, receive: Receive, send: Send) -> None:
+            refusal = _body_refusal(Request(scope)) if scope["type"] == "http" else None
+            if refusal is None:
+                await inner(scope, receive, send)
+            else:
+                await refusal(scope, receive, send)
+
+        return middleware
+
+    def _body_refusal(request: Request) -> JSONResponse | None:
+        """The response refusing ``request``'s body before any route runs, or None to admit it."""
         # The HTTP API carries only small JSON (HL7 payloads arrive via MLLP/file, not here), so a
         # generous cap rejects oversized/abusive bodies early (API-INPUT).
         # Rejections are logged (ASVS 16.3.3) — these are control-bypass attempts (a pre-auth memory
@@ -4166,7 +4213,7 @@ def create_app(
                     {"detail": "chunked request bodies are not accepted; send a Content-Length"},
                     status_code=411,
                 )
-            return await call_next(request)
+            return None
         # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
         upload_store = getattr(request.app.state, "upload_store", None)
         cap = (
@@ -4182,7 +4229,13 @@ def create_app(
         if too_big:
             _log.warning("rejected oversized request body on %s from %s", request.url.path, client)
             return JSONResponse({"detail": "request body too large"}, status_code=413)
-        return await call_next(request)
+        return None
+
+    # add_middleware inserts at index 0, so registering in this order keeps _limit_request_body
+    # OUTSIDE _security_headers, as the two decorators did: its 400/411/413 refusals do not pass
+    # through _security_headers, and the outermost floor (registered below) is what covers them.
+    app.add_middleware(_security_headers)
+    app.add_middleware(_limit_request_body)
 
     @app.get("/health", response_model=Health)
     @public_route("liveness must answer a tokenless probe; the version needs a session")
@@ -6785,9 +6838,9 @@ def create_app(
         caller is re-resolved before each row. Once its standing fails, or its channel scope differs
         from the one it started with, wider or narrower, the stream records
         ``messages_export.stopped`` and raises :class:`ExportStopped` (BACKLOG #1154, #3381), which
-        does not reach the client as a failed download; see that class. Each streamed body is re-checked
-        against that row's per-channel scope, which is therefore the starting one (load-bearing for the
-        attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited
+        reaches the client as a failed download (BACKLOG #3907); see that class. Each streamed body
+        is re-checked against that row's per-channel scope, which is therefore the starting one
+        (load-bearing for the attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited
         (``auth.channel_denied``).
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
@@ -9152,6 +9205,7 @@ def create_app(
                 path=db.path,
                 size_bytes=db.size_bytes,
                 disk_free_bytes=db.disk_free_bytes,
+                disk_free_status=db.disk_free_status.value,
                 journal_mode=db.journal_mode,
                 messages=db.messages,
                 events=db.events,
@@ -10486,6 +10540,16 @@ _MISCONFIGURED_ALERT_SOURCE = "directory-reconciler-misconfigured"
 #: ``ad_session_revoked`` is keyed on the account: a second account entering inside the first's
 #: cooldown still pages.
 _PAGING_ALERT_SOURCE = "directory-reconciler-paging"
+#: The source label of a lasting directory outage's own ``ad_reconcile_aborted`` instance (BACKLOG
+#: #3709), apart from the others for the same reasons.
+_OUTAGE_ALERT_SOURCE = "directory-reconciler-outage"
+#: What the lasting outage tells the operator. Short, for the store's 200-character reason, and
+#: about probes rather than the network: a group search past the engine's own bound reads the same,
+#: and a disable still revokes that account on a pass that reaches its user search.
+_OUTAGE_ALERT_TEXT: Final[str] = (
+    "No directory probe succeeded in {passes} reconcile passes running, so the reconciler revoked "
+    "nothing. Check the directory, the path to it, and any group-search paging alert."
+)
 #: What each paging refusal cause tells the operator. Short, and the consequence first, because
 #: the store keeps only the first 200 characters of an instance's reason; the account is in the
 #: source.
@@ -10505,8 +10569,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_session_revoked`` alert, except a quiet one whose row was written, which the service
     leaves off the returned plan (BACKLOG #3085; ``AuthService._apply_reconcile_revocation`` says
     which are quiet). A whole-directory outage aborts too, but it is audited as
-    ``auth.ad_reconcile_skipped`` and pages nothing: the accounts are fine, the directory is not,
-    and the pass is fail-open.
+    ``auth.ad_reconcile_skipped``: the accounts are fine, the directory is not, and the pass is
+    fail-open. One such pass pages nothing. A run of ``[auth].ad_reconcile_outage_passes`` of them
+    pages once, as ``ad_reconcile_aborted`` with reason ``directory_unavailable`` under its own
+    source label (:data:`_OUTAGE_ALERT_SOURCE`), and the first pass that reaches the directory
+    resolves it (BACKLOG #3709; ``AuthService._note_directory_outage`` says when each is set).
 
     A referral (BACKLOG #2538) is NOT an outage: it recurs until a search base is fixed. Any pass
     with a referred probe is ``auth.ad_reconcile_referred`` and becomes one ``ad_reconcile_aborted``
@@ -10533,7 +10600,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_reconcile_aborted`` alert with reason ``directory_misconfigured``, under its own source
     label (:data:`_MISCONFIGURED_ALERT_SOURCE`). Like the fault's, it has no inverse. Before #3010
     such a base read as "not found" for every account, so it tripped the breaker on an estate
-    large enough; read as an outage, it would page nobody.
+    large enough; read as an outage, it would page only once the outage lasted (BACKLOG #3709).
 
     A paging refusal (vault BACKLOG #3696) pages once per account as it enters that state, after
     the revocations and on an outage-shaped pass too, matching its ``auth.ad_reconcile_paging_refused`` row;
@@ -10558,9 +10625,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     Each standing alert but the probe fault's, the configuration refusal's and a paging refusal's
     also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
     ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
-    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
+    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance, and
+    under the outage's source for the outage's (BACKLOG #3709). The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
-    ``plan.hold_clear``, ``plan.referral_clear``; see ``AuthService._mark_reconcile_clears``), so
+    ``plan.hold_clear``, ``plan.referral_clear``, ``plan.outage_clear``; see
+    ``AuthService._mark_reconcile_clears`` and ``AuthService._note_directory_outage``), so
     the alert and the service read one predicate. An outage or a pass with no signed-in account
     sets none. The inverse is raised on EVERY pass that sets its flag, not once per clear:
     resolving is an idempotent update, and a resolve the notifier failed to write is retried that
@@ -10571,6 +10640,15 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
         _alert_paging_refusals(plan, sink)
+        if plan.outage_page:
+            # BACKLOG #3709. After the paging refusals, which page once per account, so a sink that
+            # raises here cannot cost one.
+            sink.ad_reconcile_aborted(
+                _OUTAGE_ALERT_SOURCE,
+                reason=OUTAGE_ABORT,
+                probed=plan.asked,
+                detail=_OUTAGE_ALERT_TEXT.format(passes=plan.outage_passes),
+            )
         return
     if plan.aborted is not None and not plan.judged_nothing:
         # A breaker trip. A pass that judged nothing is not one: its alerts are the referral's, the
@@ -10628,6 +10706,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_hold_released("directory-reconciler")
     if plan.referral_clear:
         sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
+    if plan.outage_clear:
+        sink.ad_reconcile_breaker_cleared(_OUTAGE_ALERT_SOURCE)
 
 
 def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
@@ -10682,6 +10762,7 @@ _RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
     "breaker_clear": ("directory-reconciler", "ad_reconcile_aborted"),
     "hold_clear": ("directory-reconciler", "ad_reconcile_held"),
     "referral_clear": (_REFERRAL_ALERT_SOURCE, "ad_reconcile_aborted"),
+    "outage_clear": (_OUTAGE_ALERT_SOURCE, "ad_reconcile_aborted"),
 }
 
 
