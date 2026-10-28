@@ -1261,6 +1261,41 @@ matters most in the other direction: setting `mode="off"` because one Handler ne
 takes every other Router and Handler out of the sandbox too. To isolate some feeds and not others you
 need separate engine processes.
 
+**`mode="isolated"` is `subprocess` plus a lookup broker, and nothing more yet** ([ADR
+0147](adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md),
+vault BACKLOG #3131). It runs the same per-inbound worker, under the same caps and the same codec, and
+everything this section says about `subprocess` holds for it except the lookups:
+
+- **A Handler's `db_lookup`/`fhir_lookup` works.** The worker sends the call to the engine over the
+  worker pipe, and the engine answers it with the same lookup runner it uses at `mode="off"`, against
+  the same `DatabaseLookup`/`FhirLookup` connections. So a lookup there meets every check it meets
+  in-process, at least the `[egress]` host check made when the connection is built, the read-only
+  statement test, `max_rows` and the result timeout. Its result, or its error, reaches the Handler as
+  it would at `mode="off"`, so a Handler that catches `DbLookupError` or `FhirLookupError` still can.
+  A `Decimal` column value arrives as a `Decimal`. A value outside the worker pipe's types, such as a
+  `UUID`, fails that lookup with an error that says so.
+- **A lookup whose `[egress]` list is empty is refused,** `[egress].allowed_db` for `db_lookup` and
+  `[egress].allowed_http` for `fhir_lookup`. **That holds under the audited opt-out
+  `[security].block_unlisted_outbound = false` too,** where an empty list would otherwise mean
+  unrestricted, so the opt-out cannot open a lookup from the worker to an unlisted host. The first
+  refusal per inbound and connection logs a `WARNING`; each refused call fails like any lookup
+  error.
+- **It is still a Handler-only call.** A Router or an `accepts=` predicate that calls either lookup
+  fails as it does at `mode="off"`, and the engine refuses a brokered call bound to either of them.
+  The dry run has no lookup runner, so it fails there as in every mode.
+- **`wall_seconds` counts the lookups.** The cap bounds the whole call, including the time the engine
+  spends serving its lookups, so raise it for a feed whose lookups are slow. A lookup the engine is
+  serving finishes or times out on its own bound before the cap is checked, so one call can outrun
+  the cap by up to one lookup's timeout.
+- **It needs a config directory.** A graph built in code with none cannot start a worker. Under
+  `subprocess` such a graph quietly runs in-process; under `isolated` each of its messages fails
+  instead, because in-process its lookups would not go through the broker.
+
+**What `isolated` does not do yet:** confine the worker at the operating-system level. ADR 0147's
+Landlock and seccomp confinement on Linux and its AppContainer token on Windows are not built, so an
+`isolated` worker can still open files and sockets as the service account, exactly as a `subprocess`
+worker can. *What this boundary does NOT cover*, below, holds for both modes.
+
 **What turning it on costs you.** At least these things change relative to `mode="off"`:
 
 | | At `mode="subprocess"` |
@@ -1317,8 +1352,8 @@ under `serve`. And config code there sees the full environment, not the worker's
 of these. The dry run has no lookup runner, so the call raises there in every mode. Unless the
 Handler catches that error, the fixture records `ERROR`. The gate then fails unless its `.expect`
 file declares `ERROR`. Under `subprocess` that matches `serve`, which refuses the lookup; at
-`mode="off"` it does not, because `serve` runs the lookup there. And
-`[pipeline].fuse_thread_hops` is **hard-disabled** whenever `mode="subprocess"`: fusion runs
+`mode="off"` and `mode="isolated"` it does not, because `serve` runs the lookup there. And
+`[pipeline].fuse_thread_hops` is **hard-disabled** whenever `mode` is not `off`: fusion runs
 Router/Handler code in-process on an executor hop, so honouring both would silently unsandbox the code
 you asked to isolate. The runner fails closed to the async sandboxed path and logs it. To get fusion you
 must leave `mode="off"`.
@@ -1375,7 +1410,7 @@ on a live feed; a Router that only reads is unaffected. Grep your config for `os
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `mode` | enum | `off` | `off` (in-process, byte-identical, no subprocess) or `subprocess` (persistent per-inbound worker child). |
+| `mode` | enum | `off` | `off` (in-process, byte-identical, no subprocess), `subprocess` (persistent per-inbound worker child), or `isolated` (the same worker, with `db_lookup`/`fhir_lookup` brokered through the engine; see *`mode="isolated"`* above). Any other value refuses to load. |
 | `wall_seconds` | float (>0) | 5.0 | **Authoritative** wall-clock cap per Router/Handler call on **every** platform — the parent kills a worker that overruns it, so a pathological busy-loop can't wedge intake. The worker sets no `RLIMIT_CPU`, so CPU that admin code spends outside a call, such as a thread left running or a grandchild that leaves the worker's process group, has no bound at all ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md), amendment of 2026-10-07). |
 | `mem_mb` | int (≥1) or null | 512 | POSIX-only memory cap (MiB) inside the child (no-op on Windows). `null` disables it. **On Linux it is headroom above the loaded graph:** the worker measures its own `VmData` once `load_config` has built the graph, and sets `RLIMIT_DATA` to that plus `mem_mb`. So a graph bigger than `mem_mb` still starts, and address space a thread only reserves does not count. The worker also starts with `MALLOC_ARENA_MAX=2` unless you pass your own value through `pass_environment`, so threads cannot use up the headroom for the worker's whole life. On other POSIX systems it is an absolute `RLIMIT_AS` cap on the whole worker, and the worker logs a line saying so. A call that runs out of memory dead-letters with an error naming the memory cap, and its worker exits so the next message gets a fresh one ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md), amendment of 2026-10-11). |
 | `pass_environment` | list of names | `[]` | Extra environment variable **names** the worker is given, beyond its allowlist. Use it for a variable your config code reads. Names only; the value comes from the engine's own environment at worker start. **Refused at load** if a name is one of the engine's own: any `MEFOR_*` name, and `VAULT_TOKEN` or `PGPASSWORD`. Give a variable your config reads a name outside `MEFOR_`. Whatever you list is readable by every Router and Handler, so do not list a secret of your own either. Env: `MEFOR_SANDBOX_PASS_ENVIRONMENT`, comma-separated. |

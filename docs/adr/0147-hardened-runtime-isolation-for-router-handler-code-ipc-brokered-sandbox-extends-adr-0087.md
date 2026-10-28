@@ -174,8 +174,29 @@ unresearched.
 - [ ] The Landlock **network-allowlist kernel floor** (≥6.7 for net rules) + the seccomp profile; the
       degrade path on an older kernel (FS-only Landlock, or refuse `mode=isolated`).
 - [ ] A **throughput benchmark** of the broker round-trip + confinement vs the ADR 0087 subprocess baseline.
-- [ ] Whether this ships as `[sandbox].mode=isolated` (a third mode above `subprocess`) or a sub-flag on
-      `subprocess`.
+- [x] Whether this ships as `[sandbox].mode=isolated` (a third mode above `subprocess`) or a sub-flag on
+      `subprocess`. **Settled 2026-10-27: a third mode, `isolated`.** Decided by a Manager seat under
+      the owner's delegation, with two companion rulings: every check meaning "runs in a sandbox
+      worker" reads `is not SandboxMode.OFF`, and a brokered lookup refuses while its `[egress]` list
+      is empty, even under `[security].block_unlisted_outbound = false` (Amendment A's open AC-2
+      question). See *Build status* below.
 - [ ] (Added 2026-10-07, Amendment A.) How the AppContainer spawn fits the worker's suspended start and
       kill-on-close job (vault BACKLOG #3065).
 - [ ] A **WASI / CPython-on-WASM feasibility spike** (C-extension deps, throughput) before re-scoring option 3.
+
+## Build status (2026-10-28, vault BACKLOG #3131 slice A)
+
+**Built:** the `isolated` mode and decision (1), the parent-held broker. A Handler's
+`db_lookup`/`fhir_lookup` in the worker writes a `lookup` frame in the closed tag set, bound to the
+dispatch's `(id, phase, name)` triple and a per-dispatch sequence number (AC-6, for a per-inbound
+worker, whose lane the session already is). The parent answers it on the dispatch thread through the
+same accessor and runner the in-process path uses (AC-1, AC-2), refuses one bound to a Router or
+`accepts=` dispatch, and refuses one whose `[egress].allowed_db` or `[egress].allowed_http` is empty.
+A refused or failed lookup is the Handler's error, routed to `ERROR`/dead-letter post-ACK (AC-5, for
+the broker). `wall_seconds` bounds the whole dispatch, the brokered lookups included.
+
+**Not built:** decision (2), the OS confinement: AC-3 (Landlock and seccomp), AC-4 (the AppContainer
+token), and AC-7 (no opening or signalling the parent or a sibling). The first two open boxes above,
+the #3065 box and the throughput benchmark still gate them. AC-6's scoping for a pooled worker
+(ADR 0187) is not built either, because no pooled worker exists yet. Until AC-3 and AC-4 land, an
+`isolated` worker is confined exactly as a `subprocess` worker is.
