@@ -445,7 +445,11 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
-from messagefoundry.pipeline.engine import CONFIG_WRITE_ACTIONS, ConfigWriteAuditFailed
+from messagefoundry.pipeline.engine import (
+    CONFIG_WRITE_ACTIONS,
+    ConfigRefusedBeforeApprovalCheck,
+    ConfigWriteAuditFailed,
+)
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.security_signals import (
@@ -2311,7 +2315,9 @@ async def _audit_refused_reload(
     ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
     BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
-    request whose digest cannot be taken is refused the same way, with no hold filed. A directory
+    request whose digest cannot be taken is refused the same way, with no hold filed. A release
+    refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
+    and adds ``approved_fingerprint`` and ``approval_digest_check`` ``not_reached``. A directory
     that cannot be resolved for another reason writes reason ``unreadable`` and answers 422; the
     engine logged why at WARNING. Any other ``Exception`` is a fault inside the reload, a plain
     ``FileNotFoundError`` from a runner start or swap among them (not a missing directory): it
@@ -2343,6 +2349,14 @@ async def _audit_refused_reload(
     (BACKLOG #3157)."""
     warn = _log.warning if reported is None else _log.debug
     detail: dict[str, object] = {"requested": requested, "dry_run": dry_run, **(extra or {})}
+    if isinstance(exc, ConfigRefusedBeforeApprovalCheck):
+        # A release refused before its digest check, such as by the trust check of a source whose
+        # permissions were loosened: the row names the approval and says the check was not
+        # reached, so it is not read as a refusal of the approved bytes (vault BACKLOG #2596). A
+        # digest and a marker only. Before the chain, which still sets the reason: it is a
+        # WiringError, and its kept cause tells trust_anchor and store_unavailable apart.
+        detail["approved_fingerprint"] = exc.approved
+        detail["approval_digest_check"] = "not_reached"
     if isinstance(exc, ConfigReloadDenied):
         action = "config_reload_denied"
         status, answer = 403, "config directory is not an allowed reload root"
@@ -2720,9 +2734,7 @@ async def _compare_start_config(
     digest, as main's did. The caller stops the process vouching for that digest only when both
     digests were taken over the same files and differ (:func:`_moved_during_load`): a first digest
     that failed, or two that left out different files, is marked here and still vouched for. Two
-    reads miss at least two cases: an edit that lands and is reverted between them, and
-    a module the loader runs from a still-valid ``__pycache__`` bytecode file rather than from the
-    source the digests hash.
+    reads miss at least an edit that lands and is reverted between them.
 
     A digest that left out files it could not read (:func:`digest_coverage`) is still compared. A
     start whose own digest is partial is ``partial_start_digest``, logged at WARNING with what it

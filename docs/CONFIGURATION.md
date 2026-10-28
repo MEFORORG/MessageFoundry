@@ -1755,8 +1755,7 @@ started together, can each raise it; the alert list folds them into one instance
   still compared, on the fingerprint taken after the load. When both cover the same files and still
   differ, `GET /config/provenance` also has no loaded fingerprint to vouch for until the next
   reload, and the flag toggle rows that process writes are marked `baseline_unchecked`. The two
-  reads miss at least an edit that lands and is reverted between them, and a module the loader runs
-  from a still-valid `__pycache__` bytecode file rather than from its source.
+  reads miss at least an edit that lands and is reverted between them.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
   WARNING, and the start goes on.
 - A start that never checked its config, because its read failed or it took no fingerprint,

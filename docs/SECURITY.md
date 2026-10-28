@@ -2328,22 +2328,46 @@ it and does not compare against it. Only a committed reload or a flag toggle tha
 fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
 runs just before the write, so a change after it is not caught.
 
-**A released reload loads only the config its approval named (vault BACKLOG #2596, step 3).** When
+**A released reload loads only the config its approval named (vault BACKLOG #2596).** When
 dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 0041 D1 content
-digest of the target directory, taken at request time. An approver sees it in the queue. The
-release checks the directory against it before any config module runs. After a load that
-succeeds, it checks again, before the checks that refuse an invalid graph. It first takes the
-fail-closed digest. Then it compares the digest the `config_reload` row records, if the engine
-took one. After a load that fails as an invalid config, it checks the fail-closed digest once
-more. So an edit that also breaks the graph is recorded as an edit. If any check differs from the
-approved digest, nothing loads past that point and nothing swaps. The running graph keeps the
-environment values it had. A reload applies the values it re-read only with the swap, and a
+digest of the target directory, taken at request time. An approver sees it in the queue. At
+release the config source's trust check runs before the directory is read. It stats paths and
+reads no file's contents. The release then reads the directory once, into a snapshot, and checks
+that snapshot's digest against the approved one before any config module runs. The load compiles
+and runs that same snapshot, and the `config_reload` row records its digest. So the config
+modules, helpers and tables checked are the ones the loader runs, and an edit to them on disk
+during the load is neither run nor recorded. The limits below name at least one import that runs
+from disk instead. Where the environment value file sits in the config directory's
+`environments/` folder, `serve` parses it from the same snapshot, so an edit to it during the load
+does not apply, and a value file created or removed there since the snapshot is refused. Otherwise,
+at least where the value file sits elsewhere or an embedded engine has another value provider, the
+release reads the values from disk and then takes the digest again, which refuses a change made in
+between to a file the digest covers. If the digest differs, nothing loads and nothing swaps. The running graph keeps
+the environment values it had. A reload applies the values it re-read only with the swap, and a
 rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
 approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
 reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold whose
 params carry no digest is refused the same way, with reason `no_approved_digest`. A release that
 cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
 cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
+
+**A release refused before the digest check never reaches it.** At least the settings preflight
+and the config source's trust check run before it. So where the trust check refuses rather than
+warns, a tamper that also loosens the permissions on a file it covers, such as a config module,
+is refused as `invalid_config`, not `digest_mismatch`. A `WiringError` refusal made before the
+check, by those two or another step, writes a row carrying `approved_fingerprint`, the approval's
+digest, and `approval_digest_check` set to `not_reached`, and no `current_fingerprint`, because no
+digest was taken. A missing, unlistable or disallowed directory is refused before the check too,
+with its own reason and neither field. A refusal after the digest check passed carries neither
+field either, whether the approved bytes caused it or an input the digest does not cover, such as
+an environment value file outside the config directory or a connection's CA file. The second
+digest above is the exception: it refuses as `digest_mismatch` with both fields, or as at least
+`digest_unavailable` or `not_found`, as the first check does.
+
+**Every start and reload refuses a config directory holding a file the load reads that the engine
+cannot read, a `_` helper no module imports included.** An unreadable file or folder under
+`environments/` is left out, because the load never reads it. A released reload reads strictly, so
+it refuses that too, as `digest_unavailable`.
 
 This digest fails closed, unlike the provenance fingerprint, which skips what it cannot read. A
 file or folder it covers that cannot be read gives no digest at all, never the digest of the rest.
@@ -2352,7 +2376,7 @@ path too long for the filesystem, or a name Windows refuses. A directory removed
 listing is not refused as missing. The digest covers the files it still finds, down to an empty
 bundle. That digest does not match an approved bundle that held files, so the release is refused
 as `digest_mismatch`. A file that goes between its stat and its read gives `digest_unavailable`
-instead. After the load the release checks this digest first, and then the one the row records.
+instead.
 
 At least these requests file no hold, because their release could only be refused. Each is
 answered and audited at once, as an inline reload's refusal is:
@@ -2371,15 +2395,21 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   integrity seal, so a writer to the `pending_approvals` table who replaces the digest leaves a
   request the gate refuses. The seal does not stop an older sealed copy of the row being put back,
   and a keyless store checks nothing (vault BACKLOG #2592);
-- the digest covers what `config/fingerprint.py` hashes and no more. A planted `__pycache__` file
-  runs under an unchanged digest. So does an edit to an environment value file outside the config
-  directory, or to a `MEFOR_VALUE_*` variable. These gaps are closing step 1 of vault BACKLOG #2596;
-- each check samples the files. An edit that lands after the first check runs its module code
-  before the second check refuses it. An edit reverted while the release loads is not seen at all.
-  Hashing, compiling and running the same bytes is that same step 1;
+- the digest covers what `config/fingerprint.py` hashes and no more. The release reads a value
+  file outside the config directory's `environments/` folder after the digest check, and a
+  `MEFOR_VALUE_*` variable too, so an edit to either changes the values a release applies under an
+  unchanged digest. The second digest samples the files, so where an embedded engine's other value
+  provider reads a value file under the config directory, an edit to it reverted before that digest
+  is not seen. The second digest also refuses an edit to any covered file made after the first,
+  though the load runs the snapshot the first one checked.
+  The loader compiles each config module, and each `_` helper a config module imports with an
+  `import` statement, from the snapshot. A module reached through the ordinary import system runs
+  from disk, a matching `__pycache__` file included, so the bytes that run are not the bytes the
+  digest covers. At least `importlib.import_module`, and a sibling import while the config directory
+  is on `sys.path`, reach it that way;
 - the request-time digest is taken before the route checks its step-up proof;
 - the digest checks that each folder it reads can be listed, and then lists it again. A folder
-  that becomes unlistable between the two is left out of the digest;
+  removed between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
