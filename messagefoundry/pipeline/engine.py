@@ -78,6 +78,7 @@ from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
 from messagefoundry.pipeline.log_forward_watch import LogForwardWatch
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, RefusedBodyPolicy
 from messagefoundry.pipeline.remote_debug_watch import RemoteDebugRefusalWatch
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.secret_rotation import (
@@ -532,6 +533,8 @@ class Engine:
         ack_after_default: AckAfter | None = None,
         stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: streaming-detach concurrency budget ([inbound])
         max_staged_depth: int = 0,  # BACKLOG #290 slice 2: [inbound] staged-backlog intake pause (0=off)
+        # vault BACKLOG #2608: [inbound].refused_body_*
+        refused_body: RefusedBodyPolicy | None = None,
         priority_default: Priority | None = None,
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
@@ -793,6 +796,10 @@ class Engine:
         # from [retention].min_free_disk_mb, so it is off when no retention settings are passed.
         self._intake_gate = IntakeGate()
         self._max_staged_depth = max_staged_depth
+        # Vault BACKLOG #2608: ONE refused-body allowance for the process, created here for the same
+        # reason as the gate above: every runner a reload builds shares it, so a reload does not
+        # refill an allowance a reject flood spent. None takes the shipped defaults; it has no off.
+        self._refused_body_allowance = RefusedBodyAllowance(refused_body)
         self._intake_monitor: IntakeBoundMonitor | None = None
         # DR run-profile (#61, ADR 0048). The global [delivery].priority default a connection inherits
         # when it declares no priority= (every runner inherits it). The DR run-profile THRESHOLD is
@@ -952,6 +959,7 @@ class Engine:
         ack_after_default: AckAfter | None = None,
         stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105
         max_staged_depth: int = 0,  # BACKLOG #290 slice 2
+        refused_body: RefusedBodyPolicy | None = None,  # vault BACKLOG #2608
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
         cert_monitor_settings: CertMonitorSettings | None = None,
@@ -1015,6 +1023,7 @@ class Engine:
             ack_after_default=ack_after_default,
             stream_inflight_budget_bytes=stream_inflight_budget_bytes,
             max_staged_depth=max_staged_depth,
+            refused_body=refused_body,
             alert_sink=alert_sink,
             retention_settings=retention_settings,
             cert_monitor_settings=cert_monitor_settings,
@@ -1450,6 +1459,7 @@ class Engine:
             ack_after_default=self._ack_after_default,
             stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
             intake_gate=self._intake_gate,
+            refused_body_allowance=self._refused_body_allowance,
             priority_default=self._priority_default,
             dr_threshold=self._dr_run_threshold(),
             dr_standby=self._dr_standby_threshold(),

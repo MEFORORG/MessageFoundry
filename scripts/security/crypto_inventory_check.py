@@ -473,6 +473,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/secret_rotation.py": frozenset(
         {"hashlib", "hmac", "messagefoundry.store.crypto", "secrets"}
     ),
+    # Vault BACKLOG #2608: the refused-body allowance records the SHA-256 of each body refused before
+    # ingress, so an operator can match a row stored as a head against the sender's copy. An
+    # integrity fingerprint of message content, not a security control and not key material; it is
+    # stored ciphered in messages.metadata. The section 4 row "Refused inbound body fingerprint".
+    "messagefoundry/pipeline/refused_body.py": frozenset({"hashlib"}),
     # ADR 0049 (#60): the DR BackupRunner SHA-256s the consistent store snapshot (recorded in the
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
     # fingerprint via the backup codec; the AEAD itself is delegated to store/backup_codec.py — a
@@ -1373,6 +1378,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/pipeline/sandbox.py": frozenset({"csprng:secrets.token_hex"}),
+    # Vault BACKLOG #2608: the fingerprint of a refused inbound body; the INVENTORY row says why.
+    "messagefoundry/pipeline/refused_body.py": frozenset({"hash:hashlib.sha256"}),
     "messagefoundry/pipeline/secret_rotation.py": frozenset(
         {
             # BACKLOG #3472: each non-DEK fingerprint is sealed and opened as a store-cipher cell

@@ -447,6 +447,7 @@ from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.engine import CONFIG_WRITE_ACTIONS, ConfigWriteAuditFailed
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
+from messagefoundry.pipeline.refused_body import RefusedBodyPolicy
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.security_signals import (
     SecuritySignalThresholds,
@@ -10979,6 +10980,7 @@ def create_managed_app(
     ack_after_default: AckAfter | None = None,
     stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: [inbound].stream_inflight_budget_bytes
     max_staged_depth: int = 0,  # BACKLOG #290 slice 2: [inbound].max_staged_depth (0 = off)
+    refused_body: RefusedBodyPolicy | None = None,  # vault BACKLOG #2608: [inbound].refused_body_*
     max_correlation_depth: int = 8,
     per_lane_wake: bool = False,  # B12 (ADR 0061): per-lane wake events; default-OFF singleton wake
     claim_mode: str = "pooled",  # ADR 0066/#744: "pooled" (default) | "per_lane" (byte-identical opt-out)
@@ -11387,6 +11389,7 @@ def create_managed_app(
             ack_after_default=ack_after_default,
             stream_inflight_budget_bytes=stream_inflight_budget_bytes,
             max_staged_depth=max_staged_depth,
+            refused_body=refused_body,
             priority_default=priority_default,
             alert_sink=notifier,
             retention_settings=retention_settings,
