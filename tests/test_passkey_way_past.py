@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import time
+import types
 from typing import Any
 
 import pytest
@@ -48,7 +49,7 @@ def _service(store: MessageStore, **settings: Any) -> AuthService:
     administrator is covered by the requirement."""
     settings.setdefault("mfa_verify_min_elapsed_seconds", 0)
     settings.setdefault("login_rate_limit_enabled", False)
-    return AuthService(store, AuthSettings(**settings))
+    return AuthService(store, AuthSettings(**settings), way_past_rp_id=RP)
 
 
 async def _register(
@@ -163,6 +164,7 @@ async def test_a_second_delete_of_the_same_passkey_is_not_called_a_way_past_refu
             *,
             require_way_past: bool = False,
             totp_usable: Any = None,
+            passkey_counts: Any = None,
         ) -> bool:
             assert await real_delete(user_id, credential_id_hash)  # the other tab wins first
             return await real_delete(
@@ -202,6 +204,7 @@ async def test_a_sign_in_lock_notice_tells_a_passkey_owner_the_way_past() -> Non
                 lockout_threshold=3,
             ),
             security_notifier=_Notifier(),
+            way_past_rp_id=RP,
         )
         identity, token, _ = await login_admin(service)
         await _register(service, identity, token)
@@ -346,7 +349,7 @@ async def test_the_census_counts_a_discoverable_passkey_as_a_way_past() -> None:
         identity, token, _ = await login_admin(service)
         await _register(service, identity, token)
         await service.change_password(identity, _NEW_PASSWORD)
-        census = await lockable_account_census(store, AuthSettings())
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.no_way_past == () and census.clean
         assert census.passkey_only == (identity.username,)
     finally:
@@ -360,7 +363,7 @@ async def test_the_census_names_an_account_whose_only_passkey_is_not_discoverabl
         identity, token, _ = await login_admin(setup)
         await _register(setup, identity, token, resident_key=False)
         await setup.change_password(identity, _NEW_PASSWORD)
-        census = await lockable_account_census(store, AuthSettings())
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.no_way_past == (identity.username,) and census.passkey_only == ()
     finally:
         await store.close()
@@ -394,7 +397,7 @@ async def test_a_passkey_flipped_to_discoverable_outside_the_store_opens_nothing
             require_way_past=True,
             totp_usable=_opened_totp_state,
         )
-        census = await lockable_account_census(store, AuthSettings())
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.no_way_past == (identity.username,)
     finally:
         await store.close()
@@ -693,7 +696,7 @@ def test_the_pre_auth_pool_evicts_its_oldest_rather_than_refusing() -> None:
         pool.put(f"k{i}", bytes([i]))
     pool.put("k3", b"\x03")
     assert len(pool) == 3
-    assert pool.pop("k0") is None and pool.pop("k1") == b"\x01"
+    assert pool.pop("k0") is None and pool.pop("k1") == (b"\x01", None)  # (challenge, charge)
     assert pool.pop("k1") is None
     clock[0] += 10
     assert pool.pop("k2") is None and pool.pop("k3") is None
@@ -880,7 +883,7 @@ async def test_the_census_warns_that_a_reset_would_remove_a_working_passkey() ->
         await _register(service, identity, token)
         await service.change_password(identity, _NEW_PASSWORD)
         await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
-        census = await lockable_account_census(store, AuthSettings())
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.undecryptable_totp == (identity.username,)
         assert census.passkey_only == (identity.username,)
         assert census.reset_would_remove_a_passkey == (identity.username,)
@@ -928,6 +931,7 @@ async def test_a_lock_notice_names_the_passkey_way_past_beside_a_refused_totp() 
                 lockout_threshold=3,
             ),
             security_notifier=_Notifier(),
+            way_past_rp_id=RP,
         )
         identity, token, _ = await login_admin(service)
         await _register(service, identity, token)
@@ -1006,7 +1010,7 @@ async def test_a_passkey_under_a_refused_hash_scheme_is_no_way_past() -> None:
             require_way_past=True,
             totp_usable=_opened_totp_state,
         )
-        census = await lockable_account_census(store, AuthSettings())
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.no_way_past == (identity.username,) and census.passkey_only == ()
     finally:
         await store.close()
@@ -1483,7 +1487,7 @@ async def test_the_census_names_an_unknown_totp_as_unknown(
         await service.change_password(identity, _NEW_PASSWORD)
         await _enable_totp(store, identity.user_id, _USABLE_TOTP)
         _cipher_outage(store, monkeypatch)
-        census = await lockable_account_census(store, AuthSettings())
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.unknown_totp == (identity.username,)
         assert census.undecryptable_totp == (identity.username,)
         assert census.passkey_only == () and census.no_way_past == ()
@@ -1519,6 +1523,7 @@ async def test_a_lock_notice_beside_an_unknown_totp_says_so_and_names_the_passke
                 lockout_threshold=3,
             ),
             security_notifier=_Notifier(),
+            way_past_rp_id=RP,
         )
         identity, token, _ = await login_admin(service)
         await _register(service, identity, token)
@@ -1533,5 +1538,239 @@ async def test_a_lock_notice_beside_an_unknown_totp_says_so_and_names_the_passke
         _description, lines, _closing = _lock_lines(lock)
         text = " ".join(lines)
         assert "authenticator code" in text and "could not check" in text and "passkey" in text
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #3937: a passkey counts at a factor-drop gate only under the configured rp_id ---------
+
+
+def _gate_service(store: MessageStore, configured: str | None) -> AuthService:
+    """The service a deployment builds: ``configured`` is ``[api].public_origin``'s host, or None
+    when it is unset and each request names its own rp_id."""
+    return AuthService(
+        store,
+        AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False),
+        way_past_rp_id=configured,
+    )
+
+
+@pytest.mark.parametrize("configured", ["elsewhere.example", None])
+async def test_a_passkey_under_another_rp_id_does_not_free_totp(configured: str | None) -> None:
+    """Item 1: the sign-in keeps only the passkeys under the request's rp_id, so a passkey under
+    another one is no way past. ``disable_mfa`` refuses, in the service and in the store's own
+    write, and so does the ambiguous configuration (no public_origin), which counts none. The
+    control: under the configured rp_id the same account drops TOTP."""
+    store = await MessageStore.open(":memory:")
+    try:
+        setup = _service(store)
+        identity, token, _ = await login_admin(setup)
+        await _register(setup, identity, token)  # discoverable, under RP
+        await _enable_totp(store, identity.user_id, _USABLE_TOTP)
+        gate = _gate_service(store, configured)
+        with pytest.raises(ValueError) as refused:
+            await gate.disable_mfa(identity)
+        assert str(refused.value) == TOTP_REMOVAL_REFUSED
+        assert not await store.disable_totp(
+            identity.user_id,
+            require_way_past=True,
+            totp_usable=_opened_totp_state,
+            passkey_counts=gate._gate_counts,
+        ), "the store's write counted a passkey the gate does not"
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.totp_enabled
+
+        await _gate_service(store, RP).disable_mfa(identity)  # control
+        row = await store.get_user(identity.user_id)
+        assert row is not None and not row.totp_enabled
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("configured", ["elsewhere.example", None])
+async def test_a_passkey_under_another_rp_id_does_not_open_the_rotation_gate(
+    configured: str | None,
+) -> None:
+    """Item 1: the rotation gate, its store write and the census count no passkey outside the
+    configured rp_id, so a passkey-only account must enrol first and is named as having no way
+    past. The control: under the configured rp_id it rotates and is named passkey-only."""
+    store = await MessageStore.open(":memory:")
+    try:
+        setup = _service(store)
+        identity, token, _ = await login_admin(setup)
+        await _register(setup, identity, token)
+        gate = _gate_service(store, configured)
+        assert await gate.must_enrol_before_rotating(identity)
+        with pytest.raises(FactorEnrolmentRequired):
+            await gate.change_password(identity, _NEW_PASSWORD)
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=configured)
+        assert census.no_way_past == (identity.username,)
+        # The reset warning's question, which passkey may sign the holder in: with no configured
+        # rp_id the request's rp_id may still take this one; under another configured one it never
+        # can.
+        expected = (identity.username,) if configured is None else ()
+        assert census.passkey_only == expected
+
+        control = _gate_service(store, RP)
+        assert not await control.must_enrol_before_rotating(identity)
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert census.passkey_only == (identity.username,) and census.no_way_past == ()
+        assert await control.change_password(identity, _NEW_PASSWORD) == []
+    finally:
+        await store.close()
+
+
+async def test_the_last_passkey_under_the_configured_rp_id_cannot_go_beside_a_foreign_one() -> None:
+    """Item 1, the removal gate: an account whose only passkey under the configured rp_id sits
+    beside a discoverable one under another rp_id keeps the first, since the second could never
+    sign it in. The foreign one may go: it is no way past, so its removal is not refused for it."""
+    from messagefoundry.auth.tokens import credential_id_hash
+    from tests._webauthn_store_contract import _cred
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        await _register(service, identity, token, label="here")
+        foreign = _cred(
+            identity.user_id,
+            "there",
+            id_hash=credential_id_hash(b"foreign-credential"),
+            rp_id="elsewhere.example",
+            discoverable=True,
+        )
+        await store.add_webauthn_credential(foreign)
+        by_label = {c.label: c for c in await store.list_webauthn_credentials(identity.user_id)}
+        with pytest.raises(ValueError) as refused:
+            await service.delete_webauthn_credential(identity, by_label["here"].credential_id_hash)
+        assert str(refused.value) == PASSKEY_REMOVAL_REFUSED
+        assert await service.delete_webauthn_credential(identity, foreign.credential_id_hash)
+        (left,) = await store.list_webauthn_credentials(identity.user_id)
+        assert left.label == "here"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("holds_one", [False, True])
+async def test_a_seal_refusal_calls_a_passkey_sign_in_combined_only_where_it_was(
+    monkeypatch: pytest.MonkeyPatch, holds_one: bool
+) -> None:
+    """Item 3: the seal refusal's ``auth.login_failed`` row says ``combined`` only where the
+    account held a discoverable passkey under the request's rp_id, as the row a wrong credential
+    writes would. An assertion sent to an account with none is the password sign-in."""
+    from messagefoundry.store.row_seal import USER_KIND, RowSealError
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _lock_service(store)
+        identity, token, password = await login_admin(service)
+        auth = SoftAuthenticator(rp_id=RP, origin=ORIGIN, user_handle=identity.user_id.encode())
+        if holds_one:
+            auth, _ = await _register(service, identity, token)
+
+        async def refuse(*_a: object, **_k: object) -> object:
+            raise RowSealError(USER_KIND)
+
+        monkeypatch.setattr(service, "_register_failure", refuse)
+        out = await service.login(
+            identity.username, "wrong-" + password, passkey=_proof(service, auth)
+        )
+        assert not out.ok and out.error == "invalid credentials"
+        (row,) = await store.list_audit(action="auth.login_failed")
+        assert json.loads(row["detail"]).get("combined", False) is holds_one
+    finally:
+        await store.close()
+
+
+async def test_a_staged_challenge_renews_its_charge_and_cannot_be_banked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 2: taking a staged challenge MOVES the begin leg's control-2 hit to now rather than
+    skipping a charge, so a begin leg's budget cannot be spent in a later window. A challenge
+    lives longer than the window: one whose hit has aged out is not ``paid`` and the sign-in
+    charges afresh. A forged handle finds nothing."""
+    from messagefoundry.auth import webauthn as wa
+
+    clock = [1_000.0]
+    # The limiter module's own clock only: the event loop keeps the real one.
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", types.SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(
+            store,
+            login_rate_limit_enabled=True,
+            login_rate_limit_per_ip=2,
+            login_rate_limit_window_seconds=60.0,
+        )
+        service._preauth_challenges = wa.PreAuthChallengePool(clock=lambda: clock[0])
+        first = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.30")
+        second = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.30")
+        assert first is not None and second is not None
+        clock[0] += 59
+        taken = service.take_passkey_challenge(first[0])
+        assert taken is not None and taken.paid  # its hit now stands at t=59
+        clock[0] += 2  # t=61: the second begin's hit (t=0) has aged out; the challenge has not
+        taken = service.take_passkey_challenge(second[0])
+        assert taken is not None and not taken.paid
+        assert service.allow_login_attempt("192.0.2.30"), "the renewed hit was counted twice"
+        assert not service.allow_login_attempt("192.0.2.30"), "a banked charge was spent"
+        assert service.take_passkey_challenge(second[0]) is None, "a challenge was taken twice"
+        assert service.take_passkey_challenge("forged") is None
+    finally:
+        await store.close()
+
+
+def test_the_limiter_renews_only_a_hit_still_in_its_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``SlidingWindowRateLimiter.renew`` moves a live hit to now and counts nothing new; an aged
+    or unknown hit is not renewed."""
+    from messagefoundry.auth import ratelimit
+
+    clock = [0.0]
+    # The limiter module's own clock only: the event loop keeps the real one.
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", types.SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    limiter = ratelimit.SlidingWindowRateLimiter(per_key=1, glob=5, window_seconds=10.0)
+    stamp = limiter.allow_stamped("a")
+    assert stamp == 0.0 and not limiter.allow("a")
+    clock[0] = 9.0
+    assert limiter.renew("a", stamp)
+    assert not limiter.renew("a", stamp), "a renewed hit was renewed again"
+    clock[0] = 12.0  # the original stamp would have aged out; the renewed hit (t=9) has not
+    assert not limiter.allow("a")
+    clock[0] = 19.5
+    assert limiter.allow("a")
+    assert not limiter.renew("b", 19.5)
+
+
+def test_the_configured_rp_id_is_the_public_origin_host() -> None:
+    """Item 1: the one derivation the engine, ``verify`` and the console share."""
+    from messagefoundry.auth.webauthn import configured_rp_id
+
+    assert configured_rp_id("https://Ops.Example:8443") == "ops.example"
+    assert configured_rp_id(None) is None and configured_rp_id("") is None
+
+
+async def test_with_no_configured_rp_id_the_last_discoverable_passkey_still_needs_totp() -> None:
+    """Item 1, the removal gate with no configured rp_id: any discoverable passkey may be the way
+    past the sign-in uses, so removing one is guarded, and no other passkey counts as what remains.
+    Beside a passkey that is not discoverable it is refused; beside a usable TOTP it may go."""
+    store = await MessageStore.open(":memory:")
+    try:
+        setup = _service(store)
+        identity, token, _ = await login_admin(setup)
+        _, token = await _register(setup, identity, token, label="resident")
+        _, token = await _register(setup, identity, token, resident_key=False, label="plain")
+        gate = _gate_service(store, None)
+        by_label = {c.label: c for c in await store.list_webauthn_credentials(identity.user_id)}
+        with pytest.raises(ValueError) as refused:
+            await gate.delete_webauthn_credential(identity, by_label["resident"].credential_id_hash)
+        assert str(refused.value) == PASSKEY_REMOVAL_REFUSED
+        await _enable_totp(store, identity.user_id, _USABLE_TOTP)
+        assert await gate.delete_webauthn_credential(
+            identity, by_label["resident"].credential_id_hash
+        )
     finally:
         await store.close()

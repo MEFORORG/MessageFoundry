@@ -279,7 +279,7 @@ _ENV_PROBE = (
 
 
 def test_an_engine_secret_does_not_reach_pip_or_pip_audit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The real runner hands its children childenv.hook_environment, not the whole environment.
+    """The real runner hands its children childenv.non_engine_environment, not the whole environment.
 
     The control, a pip-style setting, must still arrive: pip reads its index and proxy from there.
     """

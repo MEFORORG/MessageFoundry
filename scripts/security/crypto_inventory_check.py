@@ -309,7 +309,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # settled. It measures the operator's proxy and carries NO application data; the contexts are built,
     # used for one handshake, and never returned. Not a data path — do not reuse these settings.
     "messagefoundry/config/tls_probe.py": frozenset({"ssl"}),
-    "messagefoundry/auth/ldap.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
+    # Vault BACKLOG #3533: tls_policy left with the posture keyword; the context is ldap_tls.py's.
+    "messagefoundry/auth/ldap.py": frozenset({"ssl"}),
     # BACKLOG #2494: the engine ldap3.Tls. It wraps each LDAPS socket with a context that
     # tls_policy.assert_ldap3_tls_suites built, narrowed and asserted.
     "messagefoundry/auth/ldap_tls.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
@@ -1550,9 +1551,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.store.store",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
-            # Vault BACKLOG #2223: connection_string parses the [store].ssl_root_cert pin (public
-            # certificate only) through pki.load_pinned_server_certificate to refuse one outside its
-            # validity period, since Encrypt=strict leaves that check to the engine.
+            # Vault BACKLOG #2223: check_pinned_certificate parses the [store].ssl_root_cert pin
+            # (public certificate only) through pki.pinned_server_certificate to refuse one outside
+            # its validity period. Why the engine makes that check: the ssl_root_cert row of
+            # docs/CONFIGURATION.md.
             "key_cert:via messagefoundry.pki",
             # Vault BACKLOG #2223: the same pin takes the trust-anchor preflight (enforced_anchor), which
             # fingerprints the public file (SHA-256). No pin is configured for it, so no compare runs.
@@ -1582,9 +1584,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     # BACKLOG #1352 / #1171: the generic dialect checks a driver client key's wrap (libpq sslkey)
     # before the DSN reaches the driver. Before this it was IMPORT_ONLY; that entry's point still
-    # stands and is kept here: it appends Encrypt= and TrustServerCertificate= to a DSN string and
-    # refuses an insecure hop, a first-party TLS posture decision with no crypto-shaped expression
-    # for any pattern instrument to match (an INSTRUMENT LIMIT, named in BACKLOG #1164).
+    # stands and is kept here: it refuses an insecure hop and has messagefoundry/odbc_dsn.py append
+    # Encrypt= and TrustServerCertificate= to a DSN string (BACKLOG #3714), a first-party TLS posture
+    # decision with no crypto-shaped expression for any pattern instrument to match (an INSTRUMENT
+    # LIMIT, named in BACKLOG #1164).
     "messagefoundry/transports/database.py": frozenset({"key_cert:via messagefoundry.keywrap"}),
     "messagefoundry/transports/dicom.py": frozenset(
         {

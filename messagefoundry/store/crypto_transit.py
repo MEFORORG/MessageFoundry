@@ -69,6 +69,7 @@ from messagefoundry.store.keyprovider_vault import (
     _build_client,
     is_vault_bad_request,
     require_transit_key_type,
+    store_token_setting,
     vault_failure_text,
 )
 
@@ -81,10 +82,10 @@ log = logging.getLogger(__name__)
 #: The `[store].cipher_provider` value that selects this cipher.
 PROVIDER_NAME = "vault_transit"
 
-# Connection reuses the shared Vault wiring (a deployment runs one Vault); the DATA key is distinct from
+# Connection reuses the shared Vault wiring (a deployment runs one Vault), and the token is read through
+# keyprovider_vault.store_token_setting, the one accessor (vault BACKLOG #2595); the DATA key is distinct from
 # keyprovider_vault's KEK (that unwraps a DEK; this one encrypts the data directly), so it has its own name.
 _ENV_ADDR = "MEFOR_STORE_VAULT_ADDR"
-_ENV_TOKEN = "MEFOR_STORE_VAULT_TOKEN"  # nosec B105 — env-var NAME, not a token value
 #: The Transit key the store data is encrypted/decrypted under (the isolated-module data key).
 _ENV_TRANSIT_KEY = "MEFOR_STORE_TRANSIT_KEY"
 #: The Transit key the audit-chain HMAC is computed under (ADR 0138 §To-resolve follow-up). Optional —
@@ -311,7 +312,7 @@ def build_transit_cipher(
     ``open_store`` refuses to start rather than degrading to plaintext."""
     key_name, audit_key = _key_names()
     addr = os.environ.get(_ENV_ADDR)
-    token = os.environ.get(_ENV_TOKEN)
+    token = store_token_setting()
     # OUTSIDE the try on purpose. `_build_client` asserts this hop's TLS suites (ADR 0180) and raises
     # ValueError; the `except Exception` below would relabel that "could not reach a Vault Transit
     # key", turning a configuration refusal into what reads as a connectivity failure. Fail-closed is

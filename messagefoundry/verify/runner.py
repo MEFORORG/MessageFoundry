@@ -330,7 +330,11 @@ def run_verify(
         else:
             results.append(check_store_connectivity(settings.store))
             # ADR 0197 Amendment A, AC-A9: the census of accounts with no way past a lock.
-            results.append(check_lockable_accounts(settings.store, settings.auth))
+            results.append(
+                check_lockable_accounts(
+                    settings.store, settings.auth, public_origin=settings.api.public_origin
+                )
+            )
             # ADR 0197 Amendment A, Manager decision 2026-09-29: a sibling check, not part of the
             # census -- it is about the policy, not about any account.
             results.append(check_credential_generation(settings.auth))

@@ -104,6 +104,9 @@ export function engineUrl(): string {
 export interface Shard {
   name: string;
   url: string;
+  /** Optional full path to a PEM to trust for this instance; falls back to its environment's. See
+   *  `trustPinsFor` in engineTrustModel.ts, which validates it (BACKLOG #1695). */
+  caFile?: unknown;
 }
 
 export interface EnvironmentTarget {
@@ -116,6 +119,13 @@ export interface EnvironmentTarget {
    * backward-compatible: an environment that omits `shards` is unchanged.
    */
   shards?: Shard[];
+  /**
+   * Optional full path to a PEM (the issuing CA, or the engine's own self-signed certificate) to
+   * trust for this environment's engine(s). Machine-scoped with the rest of the setting, so a
+   * workspace cannot set it. `unknown` because nothing has type-checked it yet: `trustPinsFor` in
+   * engineTrustModel.ts validates it and logs a refusal (BACKLOG #1695).
+   */
+  caFile?: unknown;
 }
 
 /** Drop malformed {name,url} entries from a raw config array (shared by environments()/shards()). */
@@ -134,7 +144,11 @@ export function environments(): EnvironmentTarget[] {
   const envs = validTargets<EnvironmentTarget>(config().get("environments", []));
   return envs.map((e) => {
     const shards = shardsOf(e);
-    return shards.length > 0 ? { ...e, shards } : { name: e.name, url: e.url };
+    const base: EnvironmentTarget = { name: e.name, url: e.url };
+    if (e.caFile !== undefined) {
+      base.caFile = e.caFile;
+    }
+    return shards.length > 0 ? { ...base, shards } : base;
   });
 }
 
@@ -165,8 +179,20 @@ export function workspaceDir(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
 
+/** Per-call options for {@link run} and {@link runJson}. */
+export interface RunOptions {
+  /**
+   * Kill the child after this many milliseconds; it then resolves as a non-zero exit. Omitted, there
+   * is no limit, which is every caller's behaviour before this option existed: an editor command the
+   * user started and is watching can take as long as it takes. A BACKGROUND caller that nobody watches
+   * and that others queue behind (engine trust's `cert inventory`) passes one, so a hung interpreter
+   * cannot stall it for the life of the window.
+   */
+  readonly timeoutMs?: number;
+}
+
 /** Run `python -m messagefoundry <args>` and resolve with stdout/stderr/exit code (never rejects). */
-export function run(args: string[], cwd?: string): Promise<CliResult> {
+export function run(args: string[], cwd?: string, opts: RunOptions = {}): Promise<CliResult> {
   if (isExecGated()) {
     // Untrusted workspace: refuse to exec any (possibly repo-supplied) interpreter (SEC-004). Return
     // a synthetic non-zero result; callers already treat a non-zero exit as the error path.
@@ -176,7 +202,7 @@ export function run(args: string[], cwd?: string): Promise<CliResult> {
     execFile(
       pythonPath(),
       ["-m", "messagefoundry", ...args],
-      { cwd, maxBuffer: 64 * 1024 * 1024 },
+      { cwd, maxBuffer: 64 * 1024 * 1024, timeout: opts.timeoutMs ?? 0 },
       (err, stdout, stderr) => {
         const code =
           err && typeof (err as { code?: unknown }).code === "number"
@@ -227,8 +253,8 @@ export function runWithStdin(args: string[], stdin: string, cwd?: string): Promi
  * (e.g. `validate` returns 1 when there are diagnostics), so we parse stdout regardless of code.
  * A failure's message never quotes the CLI's output; see cliJson.ts for why.
  */
-export async function runJson<T>(args: string[], cwd?: string): Promise<T> {
-  return parseJsonResult<T>(await run([...args, "--json"], cwd), args);
+export async function runJson<T>(args: string[], cwd?: string, opts?: RunOptions): Promise<T> {
+  return parseJsonResult<T>(await run([...args, "--json"], cwd, opts), args);
 }
 
 /**

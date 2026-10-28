@@ -359,7 +359,7 @@ class WebhookTransport:
         # Refuse a plaintext http:// webhook target unless the explicit dev escape is set: the alert
         # POST otherwise crosses the network in cleartext (ASVS 12.2.1 — no insecure fallback). https
         # is the only scheme accepted by default; http(s) remain the only schemes at all (see _post).
-        # Same refuse-unless-MEFOR_ALLOW_INSECURE_TLS pattern as LDAPS / SQL Server / MLLP. #329: read
+        # Same refuse-unless-MEFOR_ALLOW_INSECURE_TLS pattern as SQL Server / MLLP. #329: read
         # the escape through the ADR-0092 clamp (weakened_tls_escape_permitted) so on an enforcing-PHI
         # instance the blunt env var can never re-permit a cleartext alert POST. The webhook sink is
         # built out of the connector-construction gate (notifier_from_settings, in the app lifespan), so
@@ -536,6 +536,15 @@ def send_plain_email(
             "alerts SMTP sends AUTH credentials over cleartext (use_tls=false); refused — "
             "credentials require STARTTLS. Set [alerts].email_use_tls=true, or drop "
             "[alerts].email_username/email_password to send unauthenticated."
+        )
+    # Vault BACKLOG #3533 item 3: nor to a relay whose certificate is not verified. AlertsSettings
+    # refuses that pair at load; this repeats it for a caller that never built one, such as a
+    # direct EmailTransport or SecurityEventNotifier.
+    if username is not None and not tls_verify:
+        raise ValueError(
+            "alerts SMTP would send AUTH credentials to a relay whose certificate is not verified "
+            "(tls_verify=false); refused, with no escape. Set [alerts].email_tls_verify=true, or "
+            "drop [alerts].email_username/email_password to send unauthenticated."
         )
     # The Email destination's address rule, here at the chokepoint every caller passes, so a rule's
     # recipient override and a per-user notice address are held to it too. MAIL FROM and RCPT TO are
@@ -1215,7 +1224,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         # ADR 0079 mechanism 2: the mass-revoke breaker tripped and the pass applied nothing, or one
         # or more probes were referred (BACKLOG #2538), refused for the configuration (BACKLOG
-        # #3010) or faulted (BACKLOG #3100) and left unjudged; `reason` tells which. The
+        # #3010) or faulted (BACKLOG #3100) and left unjudged, or the directory stayed unreachable
+        # for a run of passes (BACKLOG #3709); `reason` tells which. The
         # fixed source label keys the throttle, so a standing misconfiguration that trips every pass
         # pages once per cooldown rather than once per pass. `detail` is the latched operator explanation,
         # and it is what the instance's reason column shows (detail wins over reason there).

@@ -406,7 +406,9 @@ def check_console_no_window() -> CheckResult:
     )
 
 
-def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckResult:
+def check_lockable_accounts(
+    store: StoreSettings, auth: AuthSettings, *, public_origin: str | None = None
+) -> CheckResult:
     """ADR 0197 Amendment A, AC-A9: name every account that is still lockable with no way past.
 
     Runs ``auth.service.lockable_account_census`` against the configured store: every local account
@@ -414,6 +416,8 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
     enabled TOTP secret the engine cannot decrypt. A finding FAILS this check, so an operator sees
     it, and it never stops ``serve`` -- the engine only warns and audits at startup. Usernames only;
     no secret is printed. A SQLite store that does not exist yet is SKIP, as nothing is at risk.
+    ``public_origin`` is ``[api].public_origin``: a passkey counts as a way past only under its host,
+    as the engine's gates count it (BACKLOG #3937).
 
     Imports lazily: ``--section host`` must not pull the store stack in (see ``smoke.py``)."""
     from messagefoundry.last_resort import run_guarded
@@ -434,13 +438,16 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
         LockableAccountCensus,
         lockable_account_census,
     )
+    from messagefoundry.auth.webauthn import configured_rp_id
     from messagefoundry.store.base import open_store
 
     async def _census() -> LockableAccountCensus:
         # Read-only (#1708): a census must not migrate or build the store it reads.
         handle = await open_store(store, read_only=True, keyless_chain_refusal=None)
         try:
-            return await lockable_account_census(handle, auth)
+            return await lockable_account_census(
+                handle, auth, way_past_rp_id=configured_rp_id(public_origin)
+            )
         finally:
             await handle.close()
 

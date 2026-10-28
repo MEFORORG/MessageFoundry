@@ -206,7 +206,9 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 - `messagefoundry.environments` (default `[]`) — named promote targets `[{ "name": "DEV", "url": … },
   { "name": "PROD", "url": … }]`; an entry may also list `shards` (engine instances), in which case
   promote asks which instance. When set, *Stage → Promote* asks which to target; each engine
-  resolves its own environment values. **Machine-scoped**, same reason as `engineUrl`.
+  resolves its own environment values. **Machine-scoped**, same reason as `engineUrl`. An entry or
+  an engine shard may also set `caFile`, a full path to a PEM to trust for that engine — see
+  *Trusting the engine's certificate* below.
 - `messagefoundry.messageSetsDir` (default `samples/messages`) — default folder for the Test Bench's
   *Load Message Set* dialog.
 - `messagefoundry.sourceControl.autoPrompt` (default `true`) — offer to set up version control +
@@ -234,13 +236,113 @@ the extension asks the engine where it is and verifies against it:
 **Verification is never disabled.** There is no "trust anyway" option, and the extension never imports
 anything into your OS certificate store. If it cannot verify, the request fails and says so.
 
-This happens at startup and again whenever you change `messagefoundry.engineUrl` or
-`messagefoundry.serviceConfig`. Every part of it fails soft — with no engine on `PATH`, an untrusted
+This happens at startup and again whenever you change `messagefoundry.engineUrl`,
+`messagefoundry.environments` or `messagefoundry.serviceConfig`. Every part of it fails soft — with no engine on `PATH`, an untrusted
 workspace, or a `serviceConfig` that names nothing, the extension simply trusts nothing extra.
 
 If a request reports that it cannot verify the certificate, check two things: that
 `messagefoundry.serviceConfig` names the settings TOML of the engine you are pointing at, and that
 that engine has run at least once (it mints its certificate on the first run, not at install).
+
+**Remote engines, and any engine you want to pin.** `messagefoundry.serviceConfig` describes the
+engine on this machine only, so it is used only for a loopback `engineUrl`. For any other engine,
+set `caFile` on its `messagefoundry.environments` entry (or on one engine shard):
+
+```json
+"messagefoundry.environments": [
+  { "name": "PROD", "url": "https://prod-host:8765", "caFile": "C:\\pki\\prod-issuing-ca.pem" }
+]
+```
+
+- `caFile` names the issuing CA's certificate, or the engine's own self-signed certificate, as PEM.
+  Requests to that `host:port` then verify against that file **instead of** the default roots. A pin
+  applies to every request to that `host:port`, including `messagefoundry.engineUrl` when it names
+  the same engine, and it wins over the certificate `messagefoundry.serviceConfig` names.
+- It must be a full path (a drive-letter or UNC path on Windows, an absolute path elsewhere); a
+  relative or root-relative path is refused, so a workspace can never choose the file. The setting
+  is machine-scoped, so a checked-in `.vscode/settings.json` cannot add or change a pin. An engine
+  shard without its own `caFile` uses its environment's.
+- **A host whose https entry sets any `caFile`, accepted or refused, never falls back to the default
+  CAs**, nor to the certificate `messagefoundry.serviceConfig` names. This holds from the moment the
+  setting names it, before any file is read. A request to that `host:port` is sent only with a
+  certificate read from an accepted `caFile`. Otherwise it is refused before it is sent. Its error
+  names the `caFile` in `messagefoundry.environments`. To fix it, correct the `caFile` or remove
+  it; where it was refused, remove every refused `caFile` for that `host:port`. An empty `caFile`
+  (`""`) or `null` counts as no `caFile`, and so does any entry the extension does not read at all
+  (one without a string `name` and `url`), so such an entry pins nothing.
+  - **Accepted, not read yet.** While no certificate from the file is held, because it has not been
+    read yet or holds no PEM certificate, the refusal tries to read the file again, waiting up to two
+    seconds, and if that read succeeds the request is sent once with it. A file slower than that is
+    left to a background pass, at most once a minute, with the longer wait a pass allows (see *Every
+    wait is bounded*). A certificate already read from the file stays in use when a later read
+    fails, as the next sections say.
+  - **Refused.** The request's error and the log say why; the status bar only points at the log.
+    Nothing is read while the value stays refused, because there is no file to read. Once you
+    correct it, the next request reads the new file and is sent with it. At least these are
+    refused: a value that is not a string, and a path that is not a full path. An engine shard
+    without its own `caFile` inherits a refused one from its environment. A second, different
+    `caFile` for a `host:port` an earlier entry pins is refused too, but there the earlier pin stays
+    in force and anchors the host.
+- The exception is a `caFile` on an `http://` entry, which has no certificate to pin. It is refused
+  and claims nothing, so an https engine on the same `host:port` is treated as if it were absent.
+- The pin covers the `host:port` exactly as the entry spells it: the same server reached under
+  another name or by its IP address is a different host here and is not pinned.
+- A refused or unreadable `caFile` is named in the **MessageFoundry Engine** log, and so is an https
+  target that has no anchor at all.
+
+**A renewed certificate is followed.** The engine renews its generated certificate at startup, into
+the same file. When a request fails verification, the extension re-reads the file its anchor came
+from (or a `caFile` it could not read earlier) and, if the certificate changed, retries that request
+once against the new one; that retry is made for a GET only, so a POST that failed is not sent
+twice. Such a POST fails with a message that says the certificate changed. It does not repeat the
+usual advice about `serviceConfig` or `caFile`. Check whether an action already took effect before
+you repeat it. The next request uses the new certificate. The file is read without blocking the
+editor. A request waits at most two seconds for that read, then fails as it would have. For a
+`caFile`, the read then goes on in the background for up to ten more seconds, and a later request
+uses the certificate it finds.
+
+Sometimes the loopback `messagefoundry.engineUrl` has no anchor yet, because the engine started
+after the window opened. If no https `caFile` covers that `host:port`, a failure asks the engine
+again in the background. This happens at most once a minute. A failure that arrives while the
+engine is already being asked waits for that answer. If the answer does not fix it, the engine is
+asked once more. The failed request is not retried; the status bar picks the certificate up when
+the answer arrives.
+
+**A failure that proves nothing keeps the anchor you had.** Each time the extension re-learns its
+anchors, it ends each engine one of three ways. A certificate it read replaces the anchor. An engine
+loses its anchor when nothing names a certificate for it any more. That includes at least these
+cases: you removed or broke its `caFile`; its `caFile` was read whole and holds something that is
+not a PEM certificate (DER, for example); you moved `messagefoundry.engineUrl`; the engine reported
+no certificate; or no trusted workspace is open to ask the engine. A failure that proves nothing
+keeps the anchor in force instead. That covers at least a file that could not be opened or read, was
+read too slowly, or was empty or held only the start of a `-----BEGIN CERTIFICATE-----` line (a
+file rewritten in place is caught that way for a moment), any file over 512
+KB or that is not a regular file, the engine's own certificate file caught mid-renewal, and an
+engine command that failed, did not answer, answered in a form this extension does not read, or was
+not started. A renewal a failing request followed meanwhile is kept too. A kept `caFile` anchor is
+always one read from the file the setting names now. A kept engine certificate is kept only while
+`engineUrl` still names that engine and no `caFile` claims it, even when
+`messagefoundry.serviceConfig` changed and the engine could not be asked about the new one. Dropping
+an anchor for such a failure would put that engine back on the default roots, which trust more than
+the anchor did. So a deleted, unreachable or emptied `caFile` does not by itself stop the extension
+trusting the certificate it last read from it; to stop trusting it, change or remove the setting.
+The log names each anchor it keeps.
+
+**Every wait is bounded.** The engine gets 35 seconds to answer. All the certificate files of one
+pass then get 10 seconds together, and a file not read by then counts as a failure that proves
+nothing. At most two certificate reads run at once, and a file whose read is still running is not
+opened again, so files on an unreachable share hold at most two of the threads the editor's
+extensions share. Past its 35 seconds an engine command may still be alive, because a process stuck
+on a dead share can outlive its kill. While it is, no second one starts, and a failure that would
+ask the engine is held instead. When that command finally exits, the extension re-learns its
+anchors once more if a settings change or such a failure arrived meanwhile. Verification stays on
+throughout.
+
+**The OS trust store.** Unmeasured. VS Code's `http.systemCertificates` (on by default) is meant to
+add the OS store to an extension's https requests. Reading the `@vscode/proxy-agent` 0.45.0 that VS
+Code 1.142.0 bundles, it does so only for a request that carries no CA of its own: so a target with
+no `caFile` and no local anchor should verify against a CA installed in the OS store, and a pinned
+target never consults the OS store. Nobody has yet run this against a real engine.
 
 Where a reverse proxy terminates TLS in front of the engine (`[api].tls_terminated_upstream`), the
 engine mints nothing and speaks plaintext behind the proxy. Point `messagefoundry.engineUrl` at the

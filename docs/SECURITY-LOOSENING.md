@@ -65,6 +65,8 @@ pointed at one of those levers.
 | `Rest`, `Soap`, `FHIR`, `DICOMweb`, `FhirLookup` | `verify_tls = false` on an `https` URL | turn `verify_tls` on; pin a private CA with `tls_ca_file` |
 | `Sftp` with a `password` | the server's host key is not in `known_hosts` | add the host key to `known_hosts` |
 | `[auth]` AD binds over LDAPS | `ad_tls_verify = false` | turn it on; pin a private CA with `ad_tls_ca_cert_file` |
+| `[auth]` AD binds | `ad_server` is a plain `ldap://` address, or a bare host (vault BACKLOG #3533) | use an `ldaps://` address; pin a private CA with `ad_tls_ca_cert_file` |
+| `[alerts]` SMTP relay login (`email_username`) | `email_use_tls = false` or `email_tls_verify = false`, refused at load (vault BACKLOG #3533) | turn both on; pin the relay's CA with `email_tls_ca_file`; or remove the login |
 | AI broker (`[ai].endpoint`) | the endpoint is plain `http` | use an `https` endpoint |
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
@@ -102,8 +104,6 @@ engine has not verified, when the lever named beside each is set:
 - the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;
-- the AD binds over plain `ldap://`, under `ad_allow_insecure_ldap = true`;
-- the `[alerts]` SMTP relay login, under `email_tls_verify = false`;
 - a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
   `[security].enforcement = warn`;
 - a credential header a Handler stamps per message under `dynamic_headers`, on a `verify_tls =
@@ -154,7 +154,6 @@ leaves the engine.
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`; `0` turns the reconciler off, and an interval above `300` s is named) |
 | | `[auth].ad_session_recheck_strikes`, `ad_session_recheck_max_users` | `2` / `200` (*conditional* — a loosening only while the reconciler runs; more strikes, or a smaller per-pass budget, is named) |
 | | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` | `5` / `0.34` (*conditional* — a loosening only while the reconciler runs; a value below its default aborts smaller waves of revocations, and is named. A higher one ends more sessions and keeps none, and is not named) |
-| | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
 | | `[auth].ad_connect_timeout`, `ad_receive_timeout`, `ad_group_search_deadline` | `10` s / `10` s / `120` s (*conditional* — a loosening only once `ad_enabled`; a value above its default is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
 | | `[auth].admin_new_ip_step_up` | `true` |
 | | `[auth].require_action_step_up` | `true` (`false` lets the action-bound step-up routes accept the session-wide step-up window) |
@@ -196,7 +195,7 @@ leaves the engine.
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[store].secure_delete`, `[auth].ad_session_recheck_seconds`,
-`[auth].ad_allow_insecure_ldap`, `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
+`[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
 `[auth].ad_group_search_deadline`, `[auth].admin_new_ip_step_up`, `[auth].require_action_step_up`, the three
 `[auth].password_check_*` keys, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
 keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
@@ -544,10 +543,13 @@ false premise.
   the ack was renamed from `allow_unencrypted_phi_in_production` by [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) when the dial moved from the `production` tier to `enforcement`).
 
 ### `allow_unverified_alert_smtp_tls = true` — permit an unauthenticated `[alerts]` SMTP hop
-- **What you lose:** the hop carrying operator alert bodies, **every per-user security-event email**
-  (lockout, password/roles change, new-IP admin action) and the SMTP login credential no longer
-  authenticates the mail relay. It covers **both** unauthenticated shapes: `[alerts].email_use_tls = false`
-  (cleartext) and `[alerts].email_tls_verify = false` (encrypted, but any certificate is accepted). An
+- **What you lose:** the hop carrying operator alert bodies and **every per-user security-event email**
+  (lockout, password/roles change, new-IP admin action) no longer authenticates the mail relay. It
+  covers **both** unauthenticated shapes: `[alerts].email_use_tls = false` (cleartext) and
+  `[alerts].email_tls_verify = false` (encrypted, but any certificate is accepted). It covers a hop
+  with **no login** only: with `[alerts].email_username` set, either shape is refused at load, at
+  every posture, so the SMTP AUTH password never crosses (vault BACKLOG #3533). CORRECTED
+  2026-10-27: this entry said the switch also let the SMTP login credential cross. An
   on-path attacker who can answer for the relay reads all of it — and, since stream 12 is the ASVS
   6.3.5/6.3.7 out-of-band channel, can also *deny* a user the notice that their account was just taken over.
 - **When acceptable:** a lab/dev relay with a self-signed certificate you cannot re-issue, on a trusted
@@ -589,9 +591,10 @@ is refused, so an opt-out does nothing and is not reported.
 ### `enforcement = warn` — warn instead of refuse on the PHI serve-gate floor
 - **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) blunt escapes
-  (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) and `[auth].ad_allow_insecure_ldap` are
-  **honoured** again, the first two only where the
-  code knows this posture. A check that reads no posture refuses the escape whatever the dial says
+  (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) are **honoured** again, only where the
+  code knows this posture. A plain `ldap://` AD bind is not: it is refused at every posture, and
+  the opt-in that this dial used to release, `[auth].ad_allow_insecure_ldap`, was removed (vault
+  BACKLOG #3533). A check that reads no posture refuses the escape whatever the dial says
   (vault BACKLOG #2354): at least the CLI commands that open the store without one.
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
   environment and not only in the settings file (its own entry below says why). This reproduces the
@@ -799,25 +802,6 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Compensating controls:** keep `[security].max_session_hours` and `sign_out_after_idle_minutes`
   short, and revoke sessions by hand on offboarding.
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
-
-### `[auth].ad_allow_insecure_ldap = true` **with a plain `ldap://` `ad_server`** — AD binds in cleartext
-> **Conditional**, and reachable only at `[security].enforcement = warn`. Under `enforce` the switch is
-> inert and the config is refused at load, as `MEFOR_ALLOW_INSECURE_TLS` is inert there (vault BACKLOG
-> #2354). A loopback `ldap://` address is refused too.
-> It is reported only while a plain bind is live, which needs at least `ad_enabled`
-> and an `ad_server` that is not `ldaps://`.
-- **What you lose:** the encryption and the server authentication on the AD hop. The binds that remain
-  include the service account's and the step-up re-bind a directory user makes to confirm a sensitive
-  action. Each is a SIMPLE bind, so the service-account password and the password of every user who
-  steps up cross the network in cleartext. Nothing proves the far end is your domain controller, so a host on the path
-  can read the passwords or answer as the directory.
-- **When acceptable:** a trusted-network dev or test box with a lab directory and throwaway accounts.
-  Never with a real domain account.
-- **Compensating controls:** none that substitute. Use `ldaps://`, and anchor an internal CA with
-  `ad_tls_ca_cert_file` rather than turning verification off. Startup logs a WARNING from the
-  authenticator, and `serve` and `GET /security/posture` name the switch on every boot. No audit row
-  is written, as for the other settings-scoped loosenings.
-- **Reversible:** yes, immediately — point `ad_server` at `ldaps://`, or delete the line, and restart.
 
 ### `[auth].ad_connect_timeout`, `ad_receive_timeout` or `ad_group_search_deadline` above its default **with `ad_enabled`** — a stalled directory call holds a thread longer
 > **Conditional** on `[auth].ad_enabled`, since nothing reads the timeouts with no directory (vault
@@ -2153,9 +2137,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **`service_environment_secret`: another engine secret is in that list.** The entry names each
   one it finds: the store password, the AD bind password, the OIDC client secret, the OIDC
   signing key and its passphrase, the SMTP password, the API TLS key passphrase, both Vault
-  tokens and the AI key. The same ruling would refuse them. No protected way in exists for them
-  yet, so a refusal would leave a Windows service no way to start with one, and the entry names
-  them instead. Refusing them waits on that way in.
+  tokens and the AI key. The same ruling would refuse them. The protected way in is the secrets
+  directory that `MEFOR_SECRETS_DIRECTORY` names, one restricted file per setting
+  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)): move each
+  one there and remove it from the list. A secret left in the list is still named and not refused;
+  the refusal is later work under vault BACKLOG #2595.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. A key in the service's own
@@ -2212,7 +2198,6 @@ chapter was not part of the verification above.
 | `[store].aad_bind` (at-rest cell binding) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(a)(2)(iv) Encryption and Decryption |
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
-| `[auth].ad_allow_insecure_ldap` (plain `ldap://` AD bind) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(d) Person or Entity Authentication |
 | `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`, `[auth].ad_group_search_deadline` (bound on one directory call) | V13 Configuration (13.1.3) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
 | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` (config-source check downgraded to a warning) | V13 Configuration | **CM-5** Access Restrictions for Change · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
