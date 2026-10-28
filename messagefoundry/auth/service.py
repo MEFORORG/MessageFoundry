@@ -14309,7 +14309,9 @@ class AuthService:
         ``directory_refusal`` and spends neither the challenge nor the sign count. The lookup
         runs only once a ceremony is staged for the session, so a post with nothing staged gets the
         plain ``expired`` refusal and costs no lookup (BACKLOG #3068). The session, the account and
-        the lock are read once more right before the factor is written."""
+        the lock are read once more right before the factor is written. A store fault in that
+        re-read or the passkey re-read after it refuses, audited with ``reason=store_error``
+        (BACKLOG #3775)."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
@@ -14398,24 +14400,41 @@ class AuthService:
             # window from a counter mismatch (BACKLOG #3774). Written before any other read, so no
             # refusal or store error below can drop it.
             await self._clone_suspected(user, cred, client, answer=answer)
-        # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
-        # account and its lock were last read, so a revocation, a disable or a lock that landed in
-        # between must stop the factor write, as on verify_mfa. Asked whatever the write answered,
-        # so each refusal is audited with its own reason.
-        fresh = await self._factor_holder_current(
-            token,
-            actor=user.username,
-            event="auth.webauthn_failed",
-            client=client,
-            report_lock=False,
-        )
-        if isinstance(fresh, Elevation):
-            return fresh
-        user = fresh
-        # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so the
-        # passkey that signed may be gone. Asked after the holder re-read, as the last read before
-        # the factor write. It decides the refusal only: the clone row, if owed, is written above.
-        standing = await self._passkey_held(user, cred)
+        # BACKLOG #3775: the sign count has moved by now, so a store fault in either re-read below
+        # refuses the sign-in with an audit row rather than raising past it with none. A defect
+        # outside the store's error classes still raises.
+        try:
+            # BACKLOG #3068: the passkey read and the sign-count write awaited since the session,
+            # the account and its lock were last read, so a revocation, a disable or a lock that
+            # landed in between must stop the factor write, as on verify_mfa. Asked whatever the
+            # write answered, so each refusal is audited with its own reason.
+            fresh = await self._factor_holder_current(
+                token,
+                actor=user.username,
+                event="auth.webauthn_failed",
+                client=client,
+                report_lock=False,
+            )
+            if isinstance(fresh, Elevation):
+                return fresh
+            user = fresh
+            # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so
+            # the passkey that signed may be gone. Asked after the holder re-read, as the last read
+            # before the factor write. It decides the refusal only: the clone row, if owed, is
+            # written above.
+            standing = await self._passkey_held(user, cred)
+        except _session_write_errors():
+            _log.exception("finish_webauthn_assertion: a re-read after the sign-count write raised")
+            # Soft, so a store that also refuses the audit write still answers the refusal rather
+            # than a 500: the refusal is the fail-closed control, and the row only records it.
+            await write_audit_soft(
+                lambda: self._assertion_refused(user, client, "store_error"),
+                log=_log,
+                message="the auth.webauthn_failed store_error audit row could not be written",
+                errors=_session_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+            return Elevation()
         if standing == "account_gone":
             # Deleted after the holder re-read: the token no longer authenticates, so the answer
             # is the lost session the re-read would have given, not a factor question.

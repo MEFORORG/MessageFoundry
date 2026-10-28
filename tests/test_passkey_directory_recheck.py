@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
@@ -1057,5 +1058,56 @@ async def test_an_account_deleted_after_the_holder_re_read_is_a_lost_session(key
         assert {"reason": "session_lost"} in failures
         assert not any(d.get("reason") in ("factor_removed", "factor_unverified") for d in failures)
         assert await store.list_audit(action="auth.webauthn_clone_suspected") == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "faulted",
+    [
+        ("get_session",),  # the holder re-read
+        ("list_webauthn_credentials",),  # _passkey_held's set read
+        ("list_webauthn_credentials", "record_audit"),  # and the audit write too
+    ],
+    ids=["holder-reread", "passkey-held", "audit-refused"],
+)
+async def test_a_store_fault_after_the_sign_count_moves_refuses_with_an_audit_row(
+    faulted: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3775. The sign count has moved, so a store fault in the re-reads before the factor
+    write must not end the attempt with no audit row. RED when: the fault raises past
+    ``finish_webauthn_assertion``, the factor is marked, or no ``auth.webauthn_failed`` row names
+    ``store_error`` (bar ``audit-refused``, where the store refuses that row too and the refusal
+    must still come back)."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, _user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+
+        async def _store_fault(*_args: Any, **_kwargs: Any) -> Any:
+            raise sqlite3.OperationalError("synthetic: the store refused the call")
+
+        async def _moved(*args: Any, **kwargs: Any) -> SignCountAnswer:
+            answer = await real_update(*args, **kwargs)
+            assert answer == "moved"
+            for name in faulted:
+                monkeypatch.setattr(store, name, _store_fault)
+            return answer
+
+        monkeypatch.setattr(store, "update_webauthn_sign_count", _moved)
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        monkeypatch.undo()
+        assert refused.ok is False and refused.session_lost is False
+        failures = await _audited_assertion_failures(store)
+        assert ({"reason": "store_error"} in failures) is ("record_audit" not in faulted)
+        assert await store.list_audit(action="auth.webauthn_verified") == []
+        assert await _clone_answers(store) == []
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.revoked_at is None
+        assert session.mfa_verified_at is None  # the factor was not marked
     finally:
         await store.close()
