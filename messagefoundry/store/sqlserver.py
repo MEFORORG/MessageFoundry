@@ -278,6 +278,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
     federated_bind,
@@ -14023,6 +14024,7 @@ class SqlServerStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -14034,27 +14036,50 @@ class SqlServerStore:
         than three; the same locked read carries the ``auth_provider`` that decides the escalation
         (ADR 0197), and for the SIGN-IN lock the TOTP's refusal is judged by ``totp_usable`` before
         the lock, only for a failure that would set a later-cycle lock, on a cell the locked row
-        must still hold (``store.escalation_verdict``, BACKLOG #3422). Returns ``(0, False, 0)`` for an unknown user."""
+        must still hold (``store.escalation_verdict``, BACKLOG #3422). The passkey half of the
+        escalation is ``store.escalation_passkeys`` (BACKLOG #3937 item 8). Returns
+        ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
-        change = lockout_increment(
+        totp_counts = await escalation_verdict(
+            self.get_user,
+            self.open_totp_secret,
+            user_id,
             counter,
+            totp_usable=totp_usable,
             threshold=threshold,
-            lockout_seconds=lockout_seconds,
-            max_lockout_seconds=max_lockout_seconds,
             now=now,
-            out=out,
-            totp_counts=await escalation_verdict(
-                self.get_user,
-                self.open_totp_secret,
-                user_id,
-                counter,
-                totp_usable=totp_usable,
-                threshold=threshold,
-                now=now,
-            ),
         )
-        written = await self._write_user_txn(user_id, change)
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                # The account row first, under UPDLOCK, so a concurrent passkey write waits; then
+                # the passkey set the escalation reads, in the write's own transaction (BACKLOG
+                # #3937 item 8).
+                passkeys = await escalation_passkeys(
+                    counter,
+                    passkey_escalates=passkey_escalates,
+                    threshold=threshold,
+                    now=now,
+                    read_record=lambda: self._read_user_record(cur, user_id),
+                    read_passkeys=lambda: self._account_passkeys(cur, user_id),
+                )
+                change = lockout_increment(
+                    counter,
+                    threshold=threshold,
+                    lockout_seconds=lockout_seconds,
+                    max_lockout_seconds=max_lockout_seconds,
+                    now=now,
+                    out=out,
+                    totp_counts=totp_counts,
+                    passkeys=passkeys,
+                    sealed=self._row_sealer is not None,
+                    passkey_escalates=passkey_escalates,
+                )
+                written = await self._write_user(cur, user_id, change)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
         return out[0] if written is not None else LockoutIncrement(0, False, 0)
 
     async def upsert_role(

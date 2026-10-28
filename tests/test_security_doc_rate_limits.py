@@ -2086,6 +2086,9 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
         # BACKLOG #3422 beside ADR 0197 Amendment A wave 2: the caller's rule for a usable TOTP;
         # the Local row and control 1 say a refused enrolment keeps the fixed lock.
         "totp_usable",
+        # BACKLOG #3937 item 8: the caller's rule for which passkey escalates the sign-in lock; the
+        # control 1 row and the Local row name the passkey account among those that escalate.
+        "passkey_escalates",
         "lockout_seconds",
         "max_lockout_seconds",
         "now",
@@ -2100,6 +2103,20 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
     assert not lockout_escalates("sign_in", auth_provider="local", totp_enabled=False)
     assert not lockout_escalates("sign_in", auth_provider="ad", totp_enabled=True)
     assert not lockout_escalates("second_step", auth_provider="ad", totp_enabled=True)
+    assert lockout_escalates(
+        "sign_in", auth_provider="local", totp_enabled=False, passkey_way_past=True
+    )
+    assert not lockout_escalates(
+        "sign_in", auth_provider="ad", totp_enabled=False, passkey_way_past=True
+    )
+    # The control 1 row names the passkey account among the sign-in locks that escalate.
+    control_1 = "  ".join(
+        next(r for r in _protection_rows()[1:] if "lockout_minutes" in "  ".join(r))
+    )
+    assert "discoverable passkey under the configured relying party" in control_1, (
+        "the 6.1.1 lockout row must name the passkey account whose sign-in lock escalates "
+        "(BACKLOG #3937)."
+    )
 
     tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
     register = named_func(tree, "_register_failure")
