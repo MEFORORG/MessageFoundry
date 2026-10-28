@@ -420,6 +420,11 @@ headroom denominator (in + out events, not messages). Exit codes match `--load`.
   backlog stayed low) so engine numbers are never silently the harness's own ceiling.
 - The `zero_loss` gate is **exact** by default (no message may be lost). At-least-once re-deliveries
   (`sink_received > engine_written`) are reported as a count and are *not* treated as loss.
+- **The connection-scale `zero_loss` is NOT fan-out-agnostic.** Unlike the load reconcile above, it
+  also requires `engine_written >= engine_read` (BACKLOG #3132): each connscale inbound routes to one
+  outbound, so a message read and never written (dead-lettered, refused by a worker, or NAKed after
+  its row was recorded) fails the step. The multishard and `connscale-remote` runs share that
+  reconcile, so point them only at a graph where every message read is delivered at least once.
 - **`intake_audit` (connection-scale runs only) is the per-MESSAGE companion to `zero_loss`, and it
   answers a question `zero_loss` cannot ask.** `zero_loss` compares COUNTS, so its
   `engine_read N < confirmed sent M (lost K on intake)` reads identically whether the engine lost an

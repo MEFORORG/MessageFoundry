@@ -766,7 +766,9 @@ def test_a_passing_reconcile_is_left_byte_identical() -> None:
     )
     rec = _record_with(audit, read=4, sent=4)
     assert rec.no_loss.ok
-    assert rec.no_loss.detail == "read>=sent, sink_received>=written, backlog drained"
+    assert (
+        rec.no_loss.detail == "read>=sent, written>=read, sink_received>=written, backlog drained"
+    )
 
 
 # --- the SLO: a green must not be earned by an audit that never ran ------------------------------
