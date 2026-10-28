@@ -2,16 +2,17 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """No document calls the exception-message convention THE control for a redaction residual (BACKLOG #3464).
 
-The "never put PHI in an exception message" convention binds only the people who write the engine, a
-Router or a Handler. A diagnostic can quote text a remote peer wrote, and no convention of ours binds
-that peer, so "the convention remains the control" was false for peer text. It was said in at least
-ten places across five files. docs/PHI.md section 7 now states the fact once, under *Who the
-exception-message convention binds*, and the other places point there.
+The "never put PHI in an exception message" convention binds only the engine's own authors, in text
+they write themselves. A diagnostic can quote text a remote peer wrote, which no convention of ours
+binds, so "the convention remains the control" was false for peer text. It was said in ten places
+across six files. docs/PHI.md section 7 now states the fact once, under *Who the exception-message
+convention binds*, and the other places point there.
 
-This pins the absence of the old claim over ``docs/``, ``messagefoundry/`` and ``tests/``, with the
-claim's own shipped wordings as the positive control, and pins that the statement the pointers cite
-still exists. A future ``CORRECTED`` note quoting the old wording would trip it too; quote it with a
-word changed instead.
+This pins the absence of the old claim, in the shapes the controls below hold, over ``docs/``,
+``messagefoundry/``, ``tests/``, ``packaging/``, ``harness/`` and ``scripts/``. It is a lexical floor:
+a paraphrase that never says "the control" passes it. It also pins that the statement the pointers
+cite is still in section 7. A future ``CORRECTED`` note quoting the old wording would trip it too;
+quote it with a word changed instead.
 """
 
 from __future__ import annotations
@@ -22,21 +23,23 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
-_SCANNED = ("docs", "messagefoundry", "tests")
+_SCANNED = ("docs", "messagefoundry", "tests", "packaging", "harness", "scripts")
 _SUFFIXES = frozenset({".md", ".py"})
 _STATEMENT = "**Who the exception-message convention binds.**"
 
-#: The claim, as it read before BACKLOG #3464, in each shape it took. Line breaks, comment markers and
-#: Markdown emphasis are folded away first, so a claim wrapped across lines is still one sentence.
+_CONTROL = r"\s+(?:remains|is)\s+(?:still\s+)?the\s+(?:only\s+)?\W{0,2}control\b"
+#: The claim, as it read before BACKLOG #3464. Line breaks and comment or quote markers are folded
+#: away first, so a claim wrapped across lines is still one sentence; up to four marks such as a
+#: closing quote or Markdown emphasis may sit between the convention's name and the verb.
 _CLAIM = re.compile(
-    r"convention(?:\s+above)?\s+(?:remains|is)\s+the\s+control"
-    r"|exception\s+message\W{0,4}\s+(?:remains|is)\s+the\s+control",
+    rf"exception\s+message\W{{0,4}}(?:\s+convention\W{{0,4}})?{_CONTROL}"
+    rf"|the\s+convention\s+above\W{{0,4}}{_CONTROL}",
     re.IGNORECASE,
 )
 _LINE_MARKER = re.compile(r"^\s*(?:#:?|>)?\s*", re.MULTILINE)
 #: A cheap first look on the raw text: ``\W+`` also spans a line break and its comment marker, so no
 #: file that :data:`_CLAIM` would match after folding is skipped. Most files fail it and skip the fold.
-_MAYBE = re.compile(r"the\W+control", re.IGNORECASE)
+_MAYBE = re.compile(r"the\W+(?:only\W+)?control", re.IGNORECASE)
 
 
 def _folded(text: str) -> str:
@@ -60,18 +63,26 @@ def _claims(text: str) -> list[str]:
         '> for which *"never put PHI in an exception message"*\n> remains the control. So',
         # tests/test_logging.py, a ``#`` comment
         '# the "never put PHI in an\n# exception message" convention is the control. Pin it.',
+        # variants a reword could reach for
+        'the "never put PHI in an exception message" convention is still the only control',
+        'the "never put PHI in an exception message" convention** remains the **control**',
     ],
 )
 def test_the_scan_finds_each_shipped_wording(shipped: str) -> None:
     assert _claims(shipped), shipped
 
 
-def test_the_scan_passes_the_corrected_wording() -> None:
-    corrected = (
+@pytest.mark.parametrize(
+    "prose",
+    [
         'The "never put PHI in an exception message" convention covers it only in text the '
-        "engine's own authors write."
-    )
-    assert _claims(corrected) == []
+        "engine's own authors write.",
+        "the SPDX header convention is the control here",  # another convention
+        'the "never put PHI in an exception message" convention is the controller',
+    ],
+)
+def test_the_scan_passes_other_prose(prose: str) -> None:
+    assert _claims(prose) == []
 
 
 def _sources() -> list[Path]:
@@ -99,6 +110,8 @@ def test_no_document_names_the_convention_as_the_control() -> None:
     )
 
 
-def test_the_statement_the_pointers_cite_exists() -> None:
+def test_the_statement_the_pointers_cite_is_in_section_7() -> None:
     phi = (_ROOT / "docs" / "PHI.md").read_text(encoding="utf-8")
     assert phi.count(_STATEMENT) == 1
+    section_7 = phi.split("\n## 7.", 1)[1].split("\n## 8.", 1)[0]
+    assert _STATEMENT in section_7

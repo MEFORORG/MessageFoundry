@@ -563,13 +563,16 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
         ("x Mary Ann Jo Lee Smith y", "x [redacted] Smith y"),
         ("x MARY ANN JO LEE SMITH y", "x [redacted] SMITH y"),
         ("x Mary Ann Jo Lee Smith Doe y", "x [redacted] [redacted] y"),  # six: four, then two
+        ("x Aaron Bobby Carl Dave Eve, Jane y", "x Aaron [redacted] y"),  # comma: the FIRST
+        ("x Doe, Aaron Bobby Carl Dave Eve y", "x [redacted] Eve y"),  # comma: the last
     ],
 )
-def test_a_five_token_name_keeps_its_fifth_token(text: str, expected: str) -> None:
+def test_a_five_token_name_keeps_one_token(text: str, expected: str) -> None:
     """DOCUMENTED RESIDUAL (BACKLOG #2079), pinned so a change to it is deliberate.
 
     Each ``_NAME_RUN`` arm takes two to four tokens and the scan resumes after a match, so a run of
-    five leaves its fifth token alone. The comment above ``_NAME_RUN`` states it."""
+    five leaves its fifth token alone. ``_COMMA_NAME_RUN`` has the same bound a side and runs first,
+    so five before its comma leave the first. The comment above ``_NAME_RUN`` states both."""
     assert redact(text) == expected
 
 

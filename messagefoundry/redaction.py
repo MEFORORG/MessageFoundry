@@ -347,10 +347,12 @@ _SSN_RUN = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
 #: arm in at least the message shapes it scans; its docstring names the ones it does not.
 #:
 #: **Residual, accepted (BACKLOG #2079): a longer run is taken four tokens at a time, so a run of five
-#: keeps its fifth token.** Each arm stops at four, and the scan resumes after the match, so a run of
+#: keeps its fifth token.** A real name can be that long, so this needs no adversary. Each arm stops at four, and the scan resumes after the match, so a run of
 #: 4k+1 tokens leaves its last one alone: ``Mary Ann Jo Lee Smith`` reaches the log as ``[redacted]
-#: Smith``. :data:`_COMMA_NAME_RUN` has the same bound on each side of its comma, so a fifth token
-#: before the comma survives too. Neither bound was widened; this is a stated residual, not a fix.
+#: Smith``. :data:`_COMMA_NAME_RUN` has the same bound on each side of its comma, and it runs first.
+#: Five tokens before the comma keep the FIRST one, because the match starts at the second:
+#: ``Aaron Bobby Carl Dave Eve, Jane`` becomes ``Aaron [redacted]``. Five after it keep the last.
+#: Neither bound was widened; this is a stated residual, not a fix.
 _NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
 #: A **name written family-comma-given**: ``Doe, Jane`` or ``DOE, JANE`` (vault BACKLOG #2784).
 #: :data:`_NAME_RUN` joins its tokens with whitespace alone, so the comma split this into two single
@@ -1706,7 +1708,8 @@ def redact(text: str) -> str:
     see delimiter-free text. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
     XML elements) run after those within each round, so they can only add redaction to what the others left (the section
     comment above them says what running them first cost). The free-text heuristic narrows the prior
-    residual to adversarial *single-token* identifiers (a lone name with no second token, no date),
+    residual to, at least, *single-token* identifiers (a lone name with no second token, no date) and
+    the shapes the module docstring and :data:`_NAME_RUN` name,
     which the "never put PHI in an exception message" convention covers only in text the engine's own
     authors write (docs/PHI.md section 7, *Who the exception-message convention binds*). The percent-encoded run (:data:`_HL7_ENCODED_FIELD_RUN`) comes
     after all of them, as the last paragraph here says. Meant to be idempotent, since the literal ``[redacted]`` substituted

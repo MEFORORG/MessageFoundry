@@ -1579,8 +1579,8 @@ date (`19800505123000-0500`, fraction included), an ISO date-time in either form
 `19800505T123000`, with `Z` or a numeric offset), a family-comma-given name (`Doe, Jane`,
 `DOE, JANE`, up to four tokens a side) and a dashed SSN (`123-45-6789`). It still does NOT take, at
 least: a US `MM/DD/YYYY` date with a time glued to it, an undashed or spaced SSN, a name with an
-apostrophe or an inner capital (`O'Brien`, `McDoe`), and the fifth token of a five-token name (the
-`_NAME_RUN` comment in `redaction.py` says why). One engine-owned shape is carved out by name: a
+apostrophe or an inner capital (`O'Brien`, `McDoe`), and one token of a name of five or more
+tokens (the `_NAME_RUN` comment in `redaction.py` says which, and why). One engine-owned shape is carved out by name: a
 backup archive's stamp followed by `.mfbak`. The price is over-redaction of a 10-, 12- or 14-digit
 number opening `19` or `20`, of any ISO time in a message, and of upper-case codes joined with a
 comma. Engine text works around that at its source, which is a convention and not a guarantee:
@@ -1606,12 +1606,17 @@ the built-in parser logs no field value, so that silencer went with it (ADR 0054
 
 **Who the exception-message convention binds.** Where this file or the redaction code names the
 "never put PHI in an exception message" convention for a redaction residual, the convention binds
-only the people who write the engine, a Router or a Handler. It does not bind a remote peer. A
-diagnostic can quote text a peer wrote, at least a reply field or a negative acknowledgment. For
-that text, no control covers the residuals this section names, so on a first deployment such a
-value would reach a log line unredacted. A stored error column would hold it unredacted too,
-under the encryption at rest §3 describes. For the engine's own authors the convention is a rule,
-not a check: the `raise-fstring` lint above is a nudge, and nothing refuses text that breaks it.
+only the engine's own authors: the people who write the engine, a Router or a Handler, and only in
+text they write themselves. It does not bind a remote peer. A diagnostic can quote text a peer
+wrote, at least a reply field or a negative acknowledgment. Nor does it bind a library or the
+runtime, whose own exception text can quote a received value: at least `int()` and
+`datetime.strptime()` do, and `safe_exc()` keeps `invalid literal for int() with base 10:
+'MRN12345'` whole. For text of either kind, no redaction control covers the residuals this
+section names, so on a first deployment such a value would reach a log line unredacted. A stored
+error column would hold it unredacted too; what still guards that column is the encryption at
+rest §3 describes and the read-side field gate in [SECURITY.md](SECURITY.md), and neither reaches
+a log line. For the engine's own authors the convention is a rule, not a check: the
+`raise-fstring` lint above is a nudge, and nothing refuses text that breaks it.
 
 **Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** **Four** handler filters run, **on every record emitted by the engine process and by the ADR 0087 sandbox worker child**, in this
 order, on **every** emitted record and on **every** handler — stdout *and* the off-box forwarder —
@@ -1708,7 +1713,7 @@ not see a codec call made inside a function the `try` body calls, so most broad 
 it.
 
 **A second residual, from the same honesty rule (BACKLOG #1572):** the delimiter sniff reads MSH-1 and
-MSH-2, so a **headerless** custom-delimiter fragment declares nothing and passes through — `mrn
+MSH-2, so a **headerless** custom-delimiter fragment declares nothing and passes through — `id
 MRN123$$$H$MR here` still survives. So does a message whose MSH-2 is shorter than its conformant width.
 Neither is a completeness claim. The convention above covers both only in text the engine's own
 authors write; *Who the exception-message convention binds* says what it leaves.
