@@ -447,7 +447,7 @@ from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.engine import CONFIG_WRITE_ACTIONS, ConfigWriteAuditFailed
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
-from messagefoundry.pipeline.refused_body import RefusedBodyPolicy
+from messagefoundry.pipeline.refused_body import RefusedBodyPolicy, head_only_resubmit_refusal
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.security_signals import (
     SecuritySignalThresholds,
@@ -7643,6 +7643,9 @@ def create_app(
         be proved after retention has blanked both bodies (vault BACKLOG #2615,
         :func:`_edit_resend_provenance`).
 
+        A refused body whose row stored only its head is refused 409 in both modes, since its body is
+        cut (vault BACKLOG #2608, :func:`head_only_resubmit_refusal`).
+
         The step-up proof is spent in this route, after FastAPI has validated the body, so a 422
         costs no proof (owner ruling 2026-10-13, #3241 R1 and R2); a refusal raised before the
         store write gives the proof back."""
@@ -7650,6 +7653,15 @@ def create_app(
         return await _edit_resend_core(
             message_id, body=body, engine=engine, identity=identity, request=request
         )
+
+    def _refuse_head_only(message_id: str, row: Mapping[str, Any]) -> None:
+        """409 when ``row`` is a refused body stored only as its head; :func:`head_only_resubmit_refusal`
+        says why (vault BACKLOG #2608). It reads the metadata the scoped read already decrypted. Each
+        mode calls it last before its store write, after the ingress guards, so every refusal the
+        route made before this check keeps its order and its audit row."""
+        refusal = head_only_resubmit_refusal(message_id, row.get("metadata"))
+        if refusal is not None:
+            raise HTTPException(409, refusal)
 
     async def _edit_resend_core(
         message_id: str,
@@ -7711,6 +7723,7 @@ def create_app(
                     channel_id=row["channel_id"],
                     detail={"message_id": message_id, "mode": "direct", "to": body.to},
                 )
+                _refuse_head_only(message_id, row)
                 client = client_ip(request)
 
                 direct_provenance = await _edit_resend_provenance(engine, row, admitted)
@@ -7787,6 +7800,7 @@ def create_app(
                 channel_id=row["channel_id"],
                 detail={"message_id": message_id, "mode": "reroute"},
             )
+            _refuse_head_only(message_id, row)
             client = client_ip(request)
             reroute_provenance = await _edit_resend_provenance(engine, row, admitted)
 

@@ -164,6 +164,8 @@ async def test_a_reject_flood_stores_heads_past_the_allowance_and_counts_every_r
         rec = await _record(store, r["id"])
         assert rec["bytes"] == len(body) and rec["sha256"] == digest
         assert rec["stored"] == ("whole" if r in whole else "head")
+        # A head records the bound it was cut to; the edit-and-resubmit refusal names it.
+        assert rec.get("head_bytes") == (None if r in whole else policy.head_bytes)
         # Engine-internal: the API's user-metadata view never shows it.
         assert user_metadata(await store.message_metadata_json(r["id"])) is None
 

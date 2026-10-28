@@ -14,7 +14,8 @@ What this bounds is the BYTES each refusal stores, never the count of refusals:
 * Every refused body's length and SHA-256 are always recorded, in the message's engine-internal
   metadata under :data:`METADATA_KEY`, so an operator can still match it against the sender's copy.
 * The whole body is stored only while its inbound's rolling byte allowance covers it. Past that,
-  the first ``head_bytes`` of it are stored, and the stored ``error`` says so.
+  the first ``head_bytes`` of it are stored, and the stored ``error`` says so. The API refuses to
+  edit and resubmit a row stored that way (:func:`head_only_resubmit_refusal`), since its body is cut.
 * A body whose head would be the whole of it is always stored whole and charges nothing: storing
   it costs no more than storing its head would.
 
@@ -63,6 +64,7 @@ __all__ = [
     "BoundedRefusal",
     "RefusedBodyAllowance",
     "RefusedBodyPolicy",
+    "head_only_resubmit_refusal",
 ]
 
 #: The engine-internal metadata key. ``store.metadata.user_metadata`` exposes only the ``user`` bag,
@@ -168,16 +170,55 @@ class RefusedBodyAllowance:
             stored = _head(wire, text, content_type, head_bytes)
             note = f"[refused-body allowance spent: stored only the head of a {len(wire):,}-byte body] "
             error = _with_note(note, error)
-        metadata = json.dumps(
-            {
-                METADATA_KEY: {
-                    "bytes": len(wire),
-                    "sha256": digest,
-                    "stored": "whole" if whole else "head",
-                }
-            }
-        )
+        record: dict[str, object] = {
+            "bytes": len(wire),
+            "sha256": digest,
+            "stored": "whole" if whole else "head",
+        }
+        if not whole:
+            # The bound this head was cut to, kept because the policy may change before anyone reads
+            # it: the edit-and-resubmit refusal names it (:func:`head_only_resubmit_refusal`).
+            record["head_bytes"] = head_bytes
+        metadata = json.dumps({METADATA_KEY: record})
         return BoundedRefusal(raw=stored, error=error, metadata=metadata)
+
+
+def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | None:
+    """Why an edit-and-resubmit of ``message_id`` must be refused, or ``None`` when it may proceed.
+
+    ``metadata`` is the message's decrypted metadata JSON, as the store's own read returns it. The
+    answer is a refusal only when that metadata records a refused body of which only the head was
+    stored. Such a row's ``raw`` is cut at a byte or character offset, and a cut HL7 body can still
+    parse, so resubmitting it could route a message with its tail missing as if it were whole.
+
+    A whole-stored refusal, any other row, and metadata that is absent (a retention purge nulls it
+    with the body) or unreadable all answer ``None``, as before this check existed. The text names
+    lengths and ids only, never a byte of the body."""
+    if not metadata:
+        return None
+    try:
+        parsed = json.loads(metadata)
+    except (TypeError, ValueError):
+        return None
+    record = parsed.get(METADATA_KEY) if isinstance(parsed, dict) else None
+    if not isinstance(record, dict) or record.get("stored") != "head":
+        return None
+    total = _count(record.get("bytes"))
+    head = _count(record.get("head_bytes"))
+    body = f"this {total:,}-byte refused body" if total is not None else "this refused body"
+    # The bound, not a count of the sender's bytes: a decoded head is cut to this much UTF-8.
+    kept = f", cut to a {head:,}-byte head bound" if head is not None else ""
+    return (
+        f"message {message_id} stored only the head of {body}{kept}, so it cannot be edited and"
+        " resubmitted from this copy; have the sender send its own copy again"
+    )
+
+
+def _count(value: object) -> int | None:
+    """``value`` when it is a non-negative int (never a bool), else ``None``."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
 
 
 def _stored_form(wire: bytes, text: str | None) -> tuple[bool, int]:
