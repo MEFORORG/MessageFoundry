@@ -49,6 +49,11 @@ param(
     [string]$Summary
 )
 
+# The circuit breaker (CLAUDE.md section 5): this rig changes the host and undoes almost none of
+# it, so it refuses anywhere but a GitHub-hosted runner. No machine name serves, since a hosted
+# runner's changes per job; these two variables are what the runner sets for every step.
+if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') { & { $ErrorActionPreference = 'Stop'; throw "STOP     this must run on a GitHub-hosted runner, but this is $([Environment]::MachineName); nothing ran" } }
+
 # As install-service.ps1 sets it, and no strict mode, which that script does not set either: the
 # definitions lifted from it below run here under the conditions they run under there.
 $ErrorActionPreference = "Stop"
@@ -228,7 +233,8 @@ try {
         & sc.exe delete $Service | Out-Null
     }
 }
-if ($judged -eq 1) { throw "the judge found an answer the instrument could not give; read the APPCONTAINER-SPIKE lines" }
+# 3 is the judge's EXIT_UNANSWERED; CPython exits 1 on a traceback, which is the next line's case.
+if ($judged -eq 3) { throw "the judge found an answer the instrument could not give; read the APPCONTAINER-SPIKE lines" }
 if ($judged -ne 0) { throw "the judge itself failed (exit $judged), so no answer was judged; read its output above" }
 # The runner's powershell wrapper exits with $LASTEXITCODE, which the tidy-up's sc.exe set last. The
 # answers are in; a failed tidy-up on a runner about to be thrown away must not turn them red.

@@ -105,6 +105,7 @@ def _good() -> dict[str, Any]:
         "owner_absent_key": {"open": _status(BAD_KEYSET)},
         "profile": {"name": W.PROFILE, "created": True, "sid": PACKAGE},
         "launch": {"started": True, "pid": 7, "exit_code": 0, "exit_text": "0x00000000"},
+        "container_fatal": False,
         "container_signature_verified": OK,
     }
     container = {
@@ -117,6 +118,7 @@ def _good() -> dict[str, Any]:
             "matches": False,
             "error": "DpapiError: CryptUnprotectData failed (Win32 error 13)",
         },
+        "own_roundtrip": {"ok": True, "error": None, "matches": True, "stage": "unprotect"},
         "read_denied": {"ok": False, "error": "CreateFileW failed (win32 error 5)", "win32": 5},
         "read_granted": {"ok": True, "error": None, "win32": None, "matches": True},
         "provider": OK,
@@ -197,6 +199,7 @@ def test_the_all_good_reports_answer_yes_four_times() -> None:
         ),
         ("container.key", {"open": _status(NOT_FOUND)}, "Q4", "nobody made"),
         ("container.key", {"open": _status(0x80090010)}, "Q4", "NTE_PERM"),
+        ("container.key", {"open": _status(0x80070005)}, "Q4", "E_ACCESSDENIED"),
         ("container.key", {"open": OK, "sign": _status(0x80090010)}, "Q4", "signing refused"),
     ],
 )
@@ -206,7 +209,7 @@ def test_a_refusal_beside_every_control_is_a_no(
     judged = _judge(_mutate(path, value))
     assert {k: a.answer for k, a in judged.items()} == {**ALL_YES, key: "NO"}
     assert detail in judged[key].detail
-    if value.get("open", {}).get("status") == 0x80090010:
+    if value.get("open", {}).get("status") in (0x80090010, 0x80070005):
         # A status the absent name did not give is not the "store does not hold it" reading.
         assert "nobody made" not in judged[key].detail
 
@@ -218,10 +221,17 @@ def test_a_refusal_beside_every_control_is_a_no(
             {"started": False, "error": "CreateProcessW failed (win32 error 5)", "win32": 5},
             "could not start",
         ),
+        # STATUS_DLL_NOT_FOUND: the interpreter itself did not load.
         (
-            {"started": True, "exit_code": 2, "exit_text": "0x00000002", "timed_out": False},
+            {
+                "started": True,
+                "exit_code": 0xC0000135,
+                "exit_text": "0xC0000135",
+                "timed_out": False,
+            },
             "no report",
         ),
+        ({"started": True, "exit_code": 1, "timed_out": True}, "timed out=True"),
     ],
 )
 def test_a_container_the_service_could_not_run_is_a_no_and_the_rest_are_not_run(
@@ -237,6 +247,36 @@ def test_a_container_the_service_could_not_run_is_a_no_and_the_rest_are_not_run(
         "Q4": "NOT RUN",
     }
     assert detail in judged["Q1"].detail
+
+
+@pytest.mark.parametrize(
+    ("launch", "fatal"),
+    [
+        # The script crashed inside the container: an instrument defect, not the account's answer.
+        ({"started": True, "exit_code": 1, "timed_out": False}, True),
+        # The owner never looked for a crash file, so a missing report cannot be read either way.
+        ({"started": True, "exit_code": 1, "timed_out": False}, _DELETE),
+        # The launcher failed before CreateProcessW: no "started" at all.
+        ({"error": "UpdateProcThreadAttribute(0x20009) failed (win32 error 87)"}, False),
+    ],
+)
+def test_a_missing_report_the_instrument_explains_is_unanswered(
+    launch: dict[str, Any], fatal: Any
+) -> None:
+    case = _mutate("owner.container_fatal", fatal)
+    case["owner"]["launch"] = launch
+    case["container"] = None
+    assert _answers(case) == dict.fromkeys(ALL_YES, "UNANSWERED")
+
+
+def test_the_arguments_the_owner_hands_the_container_parse() -> None:
+    # A container that cannot parse its arguments exits before it writes a report, which would
+    # read as the account's NO; this runs the same parser on the owner's own argument list.
+    extra = W.container_args(b"\x01\x02\x03", Path("o") / W.DENIED_BLOB, Path("s"))
+    args = W.build_parser().parse_args(["container", "--shared", "s", *extra])
+    assert bytes.fromhex(args.blob_hex) == b"\x01\x02\x03"
+    assert bytes.fromhex(args.tampered_hex) == b"\x01\x02\x02"
+    assert Path(args.denied).name == W.DENIED_BLOB and Path(args.granted).name == W.GRANTED_BLOB
 
 
 @pytest.mark.parametrize(
@@ -274,6 +314,14 @@ def test_a_container_the_service_could_not_run_is_a_no_and_the_rest_are_not_run(
         ("container.unprotect_tampered", {"ok": False, "error": "MemoryError: "}, "Q2"),
         ("container.unprotect_given", {"ok": False, "error": "MemoryError: "}, "Q2"),
         ("container.unprotect_given", {"ok": True, "matches": False, "error": None}, "Q2"),
+        # DPAPI that fails for every input would refuse the tamper too; its own blob shows it works.
+        (
+            "container.own_roundtrip",
+            {"ok": False, "error": "DpapiError: x", "stage": "protect"},
+            "Q2",
+        ),
+        ("container.own_roundtrip", {"ok": True, "matches": False, "stage": "unprotect"}, "Q2"),
+        ("container.own_roundtrip", None, "Q2"),
         # Q3: a refusal counts only beside a granted read and the access lists it rests on.
         ("owner.owner_read_denied", {"ok": False, "win32": 5}, "Q3"),
         ("acl.denied", _sddl("SY", OWNER_SID, "AC"), "Q3"),
@@ -302,6 +350,10 @@ def test_a_container_the_service_could_not_run_is_a_no_and_the_rest_are_not_run(
         ("owner.container_signature_verified", _DELETE, "Q4"),
         ("container.key", None, "Q4"),
         ("container.key", {"open": OK}, "Q4"),
+        # A failure that is not a refusal is not a NO: a bad parameter, or an RPC that went away.
+        ("container.key", {"open": _status(0x80090027)}, "Q4"),
+        ("container.key", {"open": _status(0x800706BA)}, "Q4"),
+        ("container.key", {"open": OK, "sign": _status(0x80090028)}, "Q4"),
     ],
 )
 def test_one_broken_input_makes_only_its_answer_unanswered(
@@ -410,7 +462,9 @@ def test_the_judge_reads_the_files_and_a_no_is_still_a_green_run(tmp_path: Path)
 def test_an_unanswered_question_makes_the_run_red(tmp_path: Path) -> None:
     case = _good()
     case["acl"] = None
-    assert _run_main(_write_tree(tmp_path, case), tmp_path / "summary.md") == 1
+    # Its own code, not 1, which CPython exits with on a traceback.
+    assert _run_main(_write_tree(tmp_path, case), tmp_path / "summary.md") == W.EXIT_UNANSWERED == 3
+    assert "($judged -eq 3)" in _RIG.read_text(encoding="utf-8")
     assert ": UNANSWERED" in (tmp_path / "summary.md").read_text(encoding="utf-8")
 
 

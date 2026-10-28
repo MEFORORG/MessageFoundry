@@ -95,6 +95,15 @@ LOW_INTEGRITY = "S-1-16-4096"
 _ADMINISTRATORS = "S-1-5-32-544"
 _ERROR_ACCESS_DENIED = 5
 _WAIT_SECONDS = 60
+#: No call may wait on a prompt: a session-0 service and a container can show none, so a call that
+#: wanted one would block until the owner's wait ran out, and read as a container that never ran.
+_NCRYPT_SILENT_FLAG = 0x40
+#: The statuses that are a REFUSAL of a key open or a signature. Any other non-zero status is a
+#: failure the instrument cannot attribute, so it is UNANSWERED, as a read that fails with anything
+#: but access denied is for Q3. 0x80070002 is what an AppContainer's open of an absent name
+#: returned when this was first run, on Windows 11 build 26300.
+_KEY_OPEN_REFUSALS = frozenset({0x80090016, 0x80070002, 0x80090011, 0x80090010, 0x80070005})
+_SIGN_REFUSALS = frozenset({0x80090010, 0x80070005})
 #: The digest the owner and the container sign, and the owner checks.
 _DIGEST = hashlib.sha256(PAYLOAD).digest()
 
@@ -432,7 +441,7 @@ class _NCrypt:
         )
         if status:
             return status, None
-        status = self._call("NCryptFinalizeKey", key, 0)
+        status = self._call("NCryptFinalizeKey", key, _NCRYPT_SILENT_FLAG)
         if status:
             self._call("NCryptFreeObject", key)
             return status, None
@@ -440,14 +449,22 @@ class _NCrypt:
 
     def open(self, prov: int, name: str) -> tuple[int, int | None]:
         key = ctypes.c_size_t(0)
-        status = self._call("NCryptOpenKey", prov, ctypes.byref(key), name, 0, 0)
+        status = self._call("NCryptOpenKey", prov, ctypes.byref(key), name, 0, _NCRYPT_SILENT_FLAG)
         return status, (key.value if status == 0 else None)
 
     def sign(self, key: int) -> tuple[int, bytes | None]:
         out = ctypes.create_string_buffer(256)
         size = self.win.w.DWORD(0)
         status = self._call(
-            "NCryptSignHash", key, None, _DIGEST, len(_DIGEST), out, len(out), ctypes.byref(size), 0
+            "NCryptSignHash",
+            key,
+            None,
+            _DIGEST,
+            len(_DIGEST),
+            out,
+            len(out),
+            ctypes.byref(size),
+            _NCRYPT_SILENT_FLAG,
         )
         return status, (out.raw[: size.value] if status == 0 else None)
 
@@ -668,9 +685,12 @@ def launch_in_appcontainer(sid: int, argv: list[str], cwd: Path, log: Path) -> d
                 return record
             try:
                 record.update(started=True, pid=int(proc.dwProcessId))
-                waited = k32.WaitForSingleObject(proc.hProcess, _WAIT_SECONDS * 1000)
+                waited = int(k32.WaitForSingleObject(proc.hProcess, _WAIT_SECONDS * 1000))
                 record["timed_out"] = waited == _WAIT_TIMEOUT
-                if record["timed_out"]:
+                if waited != 0:
+                    # A timeout or a failed wait: either way the container may still run, so it
+                    # is stopped before anything reads what it wrote.
+                    record["wait_status"] = status_text(waited)
                     k32.TerminateProcess(proc.hProcess, 1)
                     k32.WaitForSingleObject(proc.hProcess, 5000)
                 code_out = wintypes.DWORD(0)
@@ -721,6 +741,35 @@ def _header(role: str) -> dict[str, Any]:
     return {"role": role, "pid": os.getpid(), "facts": read_container_facts()}
 
 
+def container_args(blob: bytes, denied: Path, shared: Path) -> list[str]:
+    """What the owner hands ``container`` mode after ``--shared``. The test parses it with
+    :func:`build_parser`, since a container that cannot parse its arguments writes no report."""
+    # One byte changed near the end, where the blob's integrity check sits.
+    tampered = blob[:-1] + bytes([blob[-1] ^ 0x01])
+    return [
+        *("--blob-hex", blob.hex(), "--tampered-hex", tampered.hex()),
+        *("--denied", str(denied), "--granted", str(shared / GRANTED_BLOB)),
+    ]
+
+
+def _check_signature(nc: _NCrypt, prov: int, container: dict[str, Any] | None) -> Any:
+    """The container's signature, checked with the service's own key, or None with none to check."""
+    signature = _get(container, "key", "sign", "signature_hex")
+    if not isinstance(signature, str):
+        return None
+    try:
+        raw = bytes.fromhex(signature)
+    except ValueError:
+        return {"ok": False, "status_text": "the container's signature is not hex"}
+    status, key = nc.open(prov, KEY_NAME)
+    if key is None:
+        return _record(status, stage="reopen")
+    try:
+        return _record(nc.verify(key, raw))
+    finally:
+        nc.free(key)
+
+
 def run_owner(folder: Path, shared: Path) -> dict[str, Any]:
     report = _header("owner")
     try:
@@ -731,66 +780,83 @@ def run_owner(folder: Path, shared: Path) -> dict[str, Any]:
     # The blob: user scope, written to a file that names no package and to one that does.
     protect, blob = _attempt(lambda: _dpapi().dpapi_protect(PAYLOAD, machine_scope=False))
     report["protect"] = protect
-    extra: list[str] = []
     if blob is not None:
         report["blob_sha256"] = hashlib.sha256(blob).hexdigest()
         (folder / DENIED_BLOB).write_bytes(blob)
         (shared / GRANTED_BLOB).write_bytes(blob)
         report["owner_unprotect"] = _unprotect(blob)
         report["owner_read_denied"] = _read(folder / DENIED_BLOB, blob)
-        # One byte changed near the end, where the blob's integrity check sits.
-        tampered = blob[:-1] + bytes([blob[-1] ^ 0x01])
-        extra += ["--blob-hex", blob.hex(), "--tampered-hex", tampered.hex()]
-        extra += ["--denied", str(folder / DENIED_BLOB), "--granted", str(shared / GRANTED_BLOB)]
 
     nc = _NCrypt()
     with nc.provider() as (prov_status, prov):
         report["provider"] = _record(prov_status)
         made = False
-        if prov is not None:
-            status, key = nc.create(prov, KEY_NAME)
-            report["key_create"] = _record(status)
-            made = key is not None
-            if key is not None:
-                nc.free(key)
-                # Reopened by name in a fresh handle: the same call the container makes.
-                report["owner_key"] = _key_trial(nc, prov, KEY_NAME)
-            report["owner_absent_key"] = {"open": _record(nc.open(prov, ABSENT_KEY_NAME)[0])}
-        if blob is not None:
-            report.update(_launch(PROFILE, shared, extra))
-        signature = _get(_load(shared / CONTAINER_REPORT), "key", "sign", "signature_hex")
-        if prov is not None and made:
-            _, key = nc.open(prov, KEY_NAME)
-            if key is not None:
-                if signature:
-                    report["container_signature_verified"] = _record(
-                        nc.verify(key, bytes.fromhex(signature))
-                    )
-                report["key_delete"] = status_text(nc.delete(key))
+        try:
+            if prov is not None:
+                status, key = nc.create(prov, KEY_NAME)
+                report["key_create"] = _record(status)
+                made = key is not None
+                if key is not None:
+                    nc.free(key)
+                    # Reopened by name in a fresh handle: the same call the container makes.
+                    report["owner_key"] = _key_trial(nc, prov, KEY_NAME)
+                report["owner_absent_key"] = {"open": _record(nc.open(prov, ABSENT_KEY_NAME)[0])}
+            if blob is not None:
+                report.update(
+                    _launch(PROFILE, shared, container_args(blob, folder / DENIED_BLOB, shared))
+                )
+                report["container_fatal"] = (shared / "container-fatal.txt").is_file()
+            if made and prov is not None:
+                report["container_signature_verified"] = _check_signature(
+                    nc, prov, _load(shared / CONTAINER_REPORT)
+                )
+        finally:
+            # Whatever happened above, the key the run made does not outlive it.
+            if made and prov is not None:
+                status, key = nc.open(prov, KEY_NAME)
+                report["key_delete"] = status_text(nc.delete(key) if key is not None else status)
     report["profile_delete"] = delete_appcontainer_profile(PROFILE)
     _write_report(folder / OWNER_REPORT, report)
     return report
 
 
 def run_container(args: argparse.Namespace) -> dict[str, Any]:
-    shared = Path(args.shared)
+    out = Path(args.shared) / CONTAINER_REPORT
+    # Written first and again after each step, so a step that hangs or crashes still leaves the
+    # proof that the script ran in here, which is Q1, and the steps that finished before it.
     report = _header("container")
+    _write_report(out, report)
     if args.blob_hex:
         blob = bytes.fromhex(args.blob_hex)
         report["given_sha256"] = hashlib.sha256(blob).hexdigest()
-        report["unprotect_given"] = _unprotect(blob)
-        report["unprotect_tampered"] = _unprotect(bytes.fromhex(args.tampered_hex))
-        report["read_denied"] = _read(Path(args.denied), blob)
-        report["read_granted"] = _read(Path(args.granted), blob)
+        steps: list[tuple[str, Callable[[], Any]]] = [
+            ("unprotect_given", lambda: _unprotect(blob)),
+            ("unprotect_tampered", lambda: _unprotect(bytes.fromhex(args.tampered_hex))),
+            ("own_roundtrip", _own_roundtrip),
+            ("read_denied", lambda: _read(Path(args.denied), blob)),
+            ("read_granted", lambda: _read(Path(args.granted), blob)),
+        ]
+        for key, step in steps:
+            report[key] = step()
+            _write_report(out, report)
         nc = _NCrypt()
         with nc.provider() as (prov_status, prov):
             report["provider"] = _record(prov_status)
             if prov is not None:
                 report["key"] = _key_trial(nc, prov, KEY_NAME)
+                _write_report(out, report)
                 report["absent_key"] = {"open": _record(nc.open(prov, ABSENT_KEY_NAME)[0])}
                 report["ephemeral"] = _ephemeral_trial(nc, prov)
-    _write_report(shared / CONTAINER_REPORT, report)
+        _write_report(out, report)
     return report
+
+
+def _own_roundtrip() -> dict[str, Any]:
+    """DPAPI works at all in this process: a user-scope blob of its own, made and opened."""
+    record, blob = _attempt(lambda: _dpapi().dpapi_protect(PAYLOAD, machine_scope=False))
+    if blob is None:
+        return {**record, "stage": "protect"}
+    return {**_unprotect(blob), "stage": "unprotect"}
 
 
 def run_control(folder: Path) -> dict[str, Any]:
@@ -1014,6 +1080,14 @@ def judge_reports(
             )
     elif launch.get("started") is False:
         q1, q1_detail = NO, f"the service could not start the container: {launch.get('error')}"
+    elif o.get("container_fatal") is not False:
+        # The container writes its report before anything else, so a crash file with no report is
+        # this script failing inside the container, not the account refusing to run it.
+        q1 = UNANSWERED
+        q1_detail = (
+            "no report, and the worker crashed inside the container or its crash file was not "
+            f"looked for (container_fatal={o.get('container_fatal')}); read container-fatal.txt"
+        )
     elif launch.get("started") is True:
         q1 = NO
         q1_detail = (
@@ -1050,6 +1124,11 @@ def judge_reports(
             "the container was refused one changed byte, by DPAPI",
             _dpapi_refused(c.get("unprotect_tampered")),
             _why(c.get("unprotect_tampered")),
+        ),
+        (
+            "DPAPI works inside the container: a user-scope blob of its own, made and opened",
+            _ok(c.get("own_roundtrip")) and _get(c, "own_roundtrip", "matches") is True,
+            f"stage {_get(c, 'own_roundtrip', 'stage')}, {_why(c.get('own_roundtrip'))}",
         ),
     ]
     if not _held(q2_controls):
@@ -1143,15 +1222,28 @@ def judge_reports(
                 "the container signed with a key of that name, but the service's key does not check "
                 f"it: {_why(o.get('container_signature_verified'))}"
             )
-    elif isinstance(key_open, dict) and not _ok(key_open):
+    elif isinstance(key_open, dict) and key_open.get("status") in _KEY_OPEN_REFUSALS:
         q4 = NO
-        q4_detail = f"open refused: {key_open.get('status_text')}" + (
-            "; the same status as a name nobody made, so the container's key store does not hold it"
-            if same_as_absent
-            else ""
+        q4_detail = (
+            f"open refused: {key_open.get('status_text')}"
+            + (
+                "; the same status as a name nobody made, so the container's key store does not "
+                "hold it"
+                if same_as_absent
+                else ""
+            )
+            + f"; profile created={_get(o, 'profile', 'created')}"
         )
-    elif _ok(key_open) and isinstance(key_sign, dict):
+    elif _ok(key_open) and isinstance(key_sign, dict) and key_sign.get("status") in _SIGN_REFUSALS:
         q4, q4_detail = NO, f"opened, but signing refused: {key_sign.get('status_text')}"
+    elif isinstance(key_open, dict) and not _ok(key_open):
+        q4, q4_detail = (
+            UNANSWERED,
+            f"open failed, but not as a refusal: {key_open.get('status_text')}",
+        )
+    elif isinstance(key_sign, dict) and not _ok(key_sign):
+        q4 = UNANSWERED
+        q4_detail = f"signing failed, but not as a refusal: {key_sign.get('status_text')}"
     else:
         q4, q4_detail = (
             UNANSWERED,
@@ -1252,11 +1344,15 @@ def run_judge(args: argparse.Namespace) -> int:
         with open(args.summary, "a", encoding="utf-8") as fh:
             fh.write(text + "\n")
     # A NO is a finding and the spike did its job. Only an answer the instrument could not give
-    # turns the job red.
-    return 1 if any(a.answer == UNANSWERED for a in answers) else 0
+    # turns the job red, and with its own code: CPython exits 1 on a traceback.
+    return EXIT_UNANSWERED if any(a.answer == UNANSWERED for a in answers) else 0
 
 
-def main(argv: list[str] | None = None) -> int:
+#: The judge's exit code when an answer is UNANSWERED. The rig reads it.
+EXIT_UNANSWERED = 3
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     sub = parser.add_subparsers(dest="mode", required=True)
     p = sub.add_parser("owner")
@@ -1275,7 +1371,11 @@ def main(argv: list[str] | None = None) -> int:
     j.add_argument("--owner-account", required=True, help="for the summary only")
     j.add_argument("--privilege", action="append", required=True)
     j.add_argument("--summary")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     if args.mode == "judge":
         return run_judge(args)
 
