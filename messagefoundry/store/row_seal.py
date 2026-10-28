@@ -51,6 +51,7 @@ import time
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Final
 
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.store.crypto import (
     AUDIT_MAC_HEX_LEN,
     AUDIT_TRANSIT_HASH_ALGO,
@@ -628,10 +629,11 @@ def alert_unverifiable_row(sealer: Sealer | None, row: str, reason: str) -> None
     unverifiable cause with ``row`` appended, with no throttle here (BACKLOG #2592). ``row`` is the
     row's kind and id, so the page's subject is the row's own and a sink's per-subject throttle
     never mutes another row's page. The caller throttles per row. The cause keeps a flood of them
-    off a forgery's subject. ``row`` and ``reason`` name the row by an id, never a row value.
-    Nothing for a local sealer, which never refuses a check, or with no hook armed."""
+    off a forgery's subject. ``row`` and ``reason`` name the row by an id, never a row value; the
+    id came from a stored row, so ``row`` is scrubbed of control characters before it becomes a
+    subject. Nothing for a local sealer, which never refuses a check, or with no hook armed."""
     if isinstance(sealer, TransitRowSealer) and sealer._alert is not None:
-        sealer._alert(f"{TRANSIT_UNVERIFIABLE_CAUSE}:{row}", reason)
+        sealer._alert(f"{TRANSIT_UNVERIFIABLE_CAUSE}:{scrub_log_argument(row)}", reason)
 
 
 class TransitSealStartRefusedError(RuntimeError):

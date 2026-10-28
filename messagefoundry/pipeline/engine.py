@@ -1827,8 +1827,10 @@ class Engine:
         It also arms the Transit row sealer's alert hook (BACKLOG #2592), before the early return a
         cipher without a refusal hook takes."""
         sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
-        # BACKLOG #2592: a Transit row seal that cannot be made or checked logs a throttled ERROR;
-        # the same report reaches the sink. Called on the loop's thread, so no hop is needed.
+        # BACKLOG #2592: a Transit row seal that cannot be made because Vault did not answer logs a
+        # throttled ERROR, and the same report reaches the sink; a seal Transit refused to check
+        # pages only per row, from the reader that reports it. Called on the loop's thread, so no
+        # hop is needed.
         sealer = store_transit_sealer(self.store)
         if sealer is not None:
             sealer.set_alert_hook(transit_seal_alert(sink))

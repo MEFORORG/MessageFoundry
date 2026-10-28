@@ -11541,8 +11541,9 @@ def create_managed_app(
             # BACKLOG #2131 moved initialize() and the notice gate up here too, below.
             # BACKLOG #2592: under vault_transit, arm the row sealer's alert hook and probe Transit
             # before initialize() reads the first authority row. So a token that cannot verify is
-            # refused here with the start refusal's text, and a seal refused before engine.start()
-            # still alerts. engine.start() probes again and re-arms the hook with its own sink.
+            # refused here with the start refusal's text, and an outage, or a row a reader reports
+            # unverifiable, before engine.start() still alerts. engine.start() probes again and
+            # re-arms the hook with its own sink.
             transit_sealer = store_transit_sealer(store)
             if transit_sealer is not None:
                 transit_sealer.set_alert_hook(transit_seal_alert(notifier or LoggingAlertSink()))
