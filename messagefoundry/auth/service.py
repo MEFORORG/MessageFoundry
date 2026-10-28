@@ -14082,8 +14082,9 @@ class AuthService:
         # console's finish route rides the action-less gate. After the peek, so "ceremony expired"
         # still answers first; before the floor, so this refusal reads the same at any elapsed time.
         # It kills the stale ceremony, and is audited as the begin gate's refusal is. It is asked
-        # once more after the directory lookup below. Read-then-act: a factor bound between that
-        # second ask and the stamp below is not caught, as the begin gate's is not.
+        # once more after the directory lookup below, and a third time by the store inside the
+        # insert's own transaction (BACKLOG #3690 item 1), so a factor bound between the second ask
+        # and the insert is refused there too.
         # The session is read first because the check fails closed on a dead one, which is a lost
         # session to the caller, not a factor it owes. Audited, as the second guard below is.
         if await self._refuse_lost_enrolment_session(
@@ -14190,7 +14191,11 @@ class AuthService:
             discoverable=discoverable,
         )
         try:
-            await self._store.add_webauthn_credential(cred)
+            # Conditional (BACKLOG #3014, #3690 item 1): the store asks the factor-binding question
+            # again inside the insert's own transaction, with the account row locked, so a factor
+            # bound on another session after the second ask above is refused here rather than
+            # promoting this session below.
+            bound = await self._store.add_webauthn_credential(cred, for_session=hash_token(token))
         except Exception as exc:
             # A concurrent enrolment raced this one past the pre-checks above (ADR 0068 §4): each
             # backend raises its own integrity class (sqlite3.IntegrityError, asyncpg
@@ -14210,6 +14215,19 @@ class AuthService:
             if await self._store.get_webauthn_credential(credential_id_hash) is not None:
                 raise ValueError("this passkey is already enrolled") from exc
             raise ValueError("label already in use") from exc
+        if not bound:
+            # The store fails closed on a dead session and a missing account too, so those are told
+            # apart first, by re-reading, and answered as the guards above answer them. What is left
+            # is the factor refusal, audited as the checks above audit it. Nothing was stored and
+            # the session is not stamped; the challenge was popped before the verify.
+            if await self._refuse_lost_enrolment_session(
+                token, actor=identity.username, event="auth.webauthn_failed", client=client
+            ):
+                return Elevation(session_lost=True)
+            if await self._load_user(user.id) is None:
+                raise ValueError("no such user")
+            await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
+            raise ValueError(self._FACTOR_PRESENT)
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
         # rotated — the reverse order writes nothing and still reports success.

@@ -14,16 +14,20 @@ factor. A local sign-in that owes nothing mints stamped, so it does not reach th
 data is synthetic.
 
 BACKLOG #3061 added a second ask on both enrolment legs, after the directory lookup each awaits.
-The test at the end pins its TOTP mirror on ``confirm_mfa_enrollment``, whose first ask is its
+BACKLOG #3690 item 1 made the insert itself conditional: the store asks the same rule inside the
+insert's transaction, so a factor bound after the second ask is refused too. The test at the end
+pins its TOTP mirror on ``confirm_mfa_enrollment``, whose first ask is its
 route's gate; the mirror's tests that need no passkey are in
 ``tests/test_enrolment_directory_recheck.py``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -37,7 +41,7 @@ from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProb
 from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
-from messagefoundry.store.store import MessageStore, UserRecord  # noqa: E402
+from messagefoundry.store.store import MessageStore, UserRecord, WebAuthnCredential  # noqa: E402
 from tests._admin_account import login_admin  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 from tests._totp_clock import pin_totp_clock  # noqa: E402
@@ -263,6 +267,71 @@ async def test_a_session_revoked_between_the_two_asks_is_lost_not_owing_a_factor
     assert {"reason": "session_lost", "phase": "enroll"} in [json.loads(r["detail"]) for r in rows]
     # A dead session can never finish the ceremony, so the lost answer ends it.
     assert service._webauthn_challenges.peek((hash_token(token), "register")) is None
+
+
+async def test_a_totp_bound_after_the_last_ask_is_refused_by_the_store_write(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3690 item 1: both service asks are read-then-act, so a TOTP confirmed on another
+    session after the second ask and before the insert must be refused by the insert itself. The
+    TOTP is confirmed inside the store call, after both asks answered "not blocked". RED when: the
+    service calls the store's insert unconditionally, so the passkey binds and the session is
+    stamped MFA-verified without proving the TOTP the account now holds."""
+    t0 = time.time()
+    pin_totp_clock(monkeypatch, t0)
+    service = await _service(store, require_mfa=False)
+    identity, token = await _sign_in(service)
+    response = await _stage_passkey(service, identity, token)
+    real_add = store.add_webauthn_credential
+    confirmed: list[str] = []
+
+    async def _add_after_a_totp_confirms(cred: WebAuthnCredential, **kwargs: Any) -> bool:
+        confirmed.append(await _enrol_totp_elsewhere(service, t0))
+        return await real_add(cred, **kwargs)
+
+    monkeypatch.setattr(store, "add_webauthn_credential", _add_after_a_totp_confirms)
+
+    with pytest.raises(ValueError, match="already has a second factor"):
+        await _finish(service, identity, token, response)
+
+    assert len(confirmed) == 1  # the injection ran inside the store call, after both asks
+    user = await store.get_user(identity.user_id)
+    assert user is not None and user.totp_enabled  # the racing factor really is bound
+    assert await store.list_webauthn_credentials(identity.user_id) == []
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.revoked_at is None and session.mfa_verified_at is None
+    assert await service.mfa_satisfied(token) is False
+    # Audited as the two service asks audit their refusal, and only once: neither ask refused.
+    rows = await store.list_audit(action="auth.mfa_denied")
+    assert len(rows) == 1
+    assert json.loads(rows[0]["detail"]) == {"path": "finish_webauthn_registration"}
+
+
+async def test_a_stamped_session_still_binds_when_a_factor_lands_during_the_write(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's check is session-relative, like the service's: a session already stamped
+    MFA-verified may add a passkey beside a factor bound meanwhile. RED when: the conditional
+    insert refuses on "the account holds a factor" rather than "a factor this session has not
+    proven"."""
+    service = await _service(store, require_mfa=False)
+    identity, token, _password = await login_admin(service)  # a local sign-in mints stamped
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.mfa_verified_at is not None
+    response = await _stage_passkey(service, identity, token)
+    real_add = store.add_webauthn_credential
+
+    async def _add_after_another_passkey_binds(cred: WebAuthnCredential, **kwargs: Any) -> bool:
+        assert kwargs.get("for_session") == hash_token(token)  # the service asked conditionally
+        await real_add(dataclasses.replace(cred, credential_id_hash="other-key", label="other tab"))
+        return await real_add(cred, **kwargs)
+
+    monkeypatch.setattr(store, "add_webauthn_credential", _add_after_another_passkey_binds)
+
+    enrolled = await _finish(service, identity, token, response)
+
+    assert enrolled.ok is True
+    assert len(await store.list_webauthn_credentials(identity.user_id)) == 2
 
 
 # --- the TOTP mirror: confirm_mfa_enrollment ---------------------------------------------------
