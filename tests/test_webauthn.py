@@ -931,6 +931,7 @@ async def test_a_racing_removal_of_the_other_passkey_does_not_claim_a_factor_rem
             *,
             require_way_past: bool = False,
             totp_usable: Any = None,
+            passkey_counts: Any = None,
         ) -> bool:
             await real_delete(user_id, creds[1].credential_id_hash)  # the other caller wins first
             return await real_delete(

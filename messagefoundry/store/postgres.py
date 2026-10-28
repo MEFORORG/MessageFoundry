@@ -236,6 +236,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
+    PasskeyCounts,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -9065,6 +9066,7 @@ class PostgresStore:
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -9088,6 +9090,7 @@ class PostgresStore:
                 passkeys=await self._account_passkeys(conn, user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             return await self._write_user(conn, user_id, change) is not None
 
@@ -9169,6 +9172,7 @@ class PostgresStore:
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         require_totp_rule(require_way_past, totp_usable)
@@ -9190,6 +9194,7 @@ class PostgresStore:
                 passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             return await self._write_user(conn, user_id, change) is not None
 
@@ -9332,6 +9337,7 @@ class PostgresStore:
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
@@ -9352,6 +9358,7 @@ class PostgresStore:
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 ):
                     return False
             count = await self._write_passkeys(

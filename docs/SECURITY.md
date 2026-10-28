@@ -3293,7 +3293,13 @@ offers every caller a passkey button. `POST /ui/login/passkey` charges the sign-
 2) first, then stages an assertion challenge with **no username and an empty `allowCredentials`
 list**, so the options say nothing about any account. Its handle goes back as an HttpOnly,
 `SameSite=Strict` cookie, never keyed by client address. `POST /ui/login` then carries the password
-and the assertion together; the engine pops the challenge on arrival, whatever the outcome. The path
+and the assertion together. **One passkey sign-in costs one unit of control 2, as a password
+sign-in does** (BACKLOG #3937). The route pops the challenge on arrival, whatever the outcome,
+before it charges the sign-in limiter. Where the begin leg's hit is still in the window, popping
+MOVES that hit to now instead of charging a second one, so the sign-in is counted from the moment
+it is spent and a begin leg's budget cannot be spent in a later window. A challenge outlives the
+window (120 seconds against 60 by default); one whose hit has aged out is charged afresh, and so is
+a forged, expired or absent handle, which finds nothing. The path
 runs only when the account row read before any verify holds a discoverable passkey under the
 request's `rp_id`, and the sign-in lock does not refuse it, as it does not refuse option E's
 combined sign-in. The assertion must come from one of the named account's own passkeys under that
@@ -3340,15 +3346,23 @@ unlock lifted before the write; and, at a `lockout_threshold` of 1, an unlock or
 rotation landing after a read that saw a live lock. So the fixed-length lock beside a refused enrolment holds only for serial failures that no
 write races.
 
-**Two limits of the passkey way past, stated.** At least these:
+**Limits of the passkey way past, stated.** At least these:
 
-- The rotation gate, the removal guards and the census count a discoverable passkey under **any**
-  `rp_id`, while the sign-in accepts only one minted under the request's. After an origin change
+- The factor-drop gates count a discoverable passkey as a way past only under the `rp_id` the
+  configuration names, `[api].public_origin`'s host. At least these ask it: the TOTP removal, the
+  passkey removal, the rotation gate, the store's conditional writes behind them, and the census's
+  `no_way_past` (BACKLOG #3937). The sign-in accepts only a passkey minted under the request's
+  `rp_id`, and outside a request the engine knows no other. **With `public_origin` unset the
+  `rp_id` comes from each request, so no passkey counts as what remains at those gates**: a covered
+  account keeps its TOTP, removing any discoverable passkey needs a TOTP that is a way past, and
+  a passkey-only account must enrol TOTP before it rotates and is named in `no_way_past`. That is
+  the shipped default on a loopback bind. The census's reset warning
+  (`reset_would_remove_a_passkey`) counts a passkey under the configured `rp_id` too, and any
+  discoverable passkey when none is configured, since it asks whether a reset would remove one that
+  may sign the holder in. After a change from one configured origin to another
   ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
-  visibly unusable) an account whose only way past is such a passkey is lockable with no way past
-  until it registers a passkey again or enrols TOTP; the census does not name it.
-- One passkey sign-in charges the sign-in window twice, at the begin leg and at the sign-in, so the
-  owner's way past gets half the per-address budget a password sign-in gets.
+  visibly unusable) a passkey under the old `rp_id` no longer counts at the gates, so the census
+  names an account whose only way past it was.
 - Without the `[webauthn]` extra no passkey is a way past: the gates and the census do not count
   one, and the sign-in treats an assertion as absent. `POST /users/{id}/reset-mfa` clears passkeys alongside TOTP — the
 always-available recovery, because passkeys mint **no recovery codes by design** (codes are phishable
@@ -5048,8 +5062,8 @@ the console, through `POST /ui/reauth/webauthn`, because the JSON plane has no p
 JSON-only client cannot rotate it. Before this change such a client could rotate it and then do
 nothing else. Its next sign-in was pending, with no way to prove a passkey there. Under
 `[security].require_mfa` a covered passkey-only account rotates only once it holds a way past
-the sign-in lock: `_has_way_past` counts TOTP or a passkey recorded as discoverable (ADR 0197
-Amendment A, wave 2). One whose passkeys are not discoverable must also enrol a factor that is
+the sign-in lock: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
+configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). One whose passkeys are not discoverable must also enrol a factor that is
 before it rotates, so after the passkey it goes to the enrolment page, and only then to the password
 page. Such an account exists only where its passkey came before the requirement covered it, or
 before wave 2: a store from before ADR 0197 Amendment A, a site that turned `require_mfa` on or
@@ -5913,7 +5927,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /auth/negotiate` | sign-in window | |
 | `POST /auth/mfa-verify` | sign-in window | an **authenticated** route drawing the sign-in budget (it is a mid-login challenge); also feeds the per-account lockout |
 | `POST /ui/login` | sign-in window | 429 carries a `Retry-After` of the whole sign-in window |
-| `POST /ui/login/passkey` | sign-in window | the passkey sign-in's begin leg (ADR 0197 Amendment A wave 2), charged **before** it stages a challenge; one passkey sign-in charges the window twice, here and at `POST /ui/login`. 429 as `POST /ui/login` |
+| `POST /ui/login/passkey` | sign-in window | the passkey sign-in's begin leg (ADR 0197 Amendment A wave 2), charged **before** it stages a challenge; `POST /ui/login` then renews that hit rather than charging again when it is still in the window (`StagedChallenge.paid`), so one passkey sign-in charges the window once. 429 as `POST /ui/login` |
 | `GET /ui/sso` | sign-in window | the token-bearing leg only; the RFC 4559 challenge leg is deliberately unthrottled |
 | `POST /ui/oidc/start`, `GET /ui/oidc/callback` | sign-in window; the callback's step-up return draws the per-actor ceremony budget instead | one browser login charges it **twice**. The callback reads the flow its cookie names first: a live step-up flow's return charges a key of its own for the user that flow names, as the `POST /ui/reauth/oidc` row says, and every other callback charges the sign-in window (BACKLOG #3374). **Note the verb, and the condition on the GET.** The start leg is a **POST** since the ASVS 3.7.3 interstitial. By default `GET /ui/oidc/start` renders the "you are leaving this site" page, stages **no** flow and charges **no** limiter; the flow starts only when the operator confirms with the POST. **The GET skips that page** when `[security].external_link_interstitial` is off, or when the IdP's authorization host is inside `[security].organization_domains` or on `[security].external_link_allowlist` (`_interstitial_needed()` false). It then runs the POST leg itself (`ui_oidc_start`): the same-origin check, this limiter, the `Sec-Fetch-Mode` check and a staged flow, with the same 303 on a throttle. So the GET charges the window and stages a flow exactly when the interstitial is skipped. |
 | `POST /me/password` | per-actor ceremony budget | **not** the sign-in window |

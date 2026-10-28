@@ -95,6 +95,7 @@ from messagefoundry.store.store import (
     OperatorAudit,
     OutboxItem,
     OwnedLanes,
+    PasskeyCounts,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -2226,6 +2227,7 @@ class AuthStore(Protocol):
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool: ...
 
@@ -2365,6 +2367,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool: ...
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]: ...
@@ -2406,7 +2409,9 @@ class AuthStore(Protocol):
     # ``totp_usable`` (BACKLOG #3422) is the caller's rule for what an OPENED TOTP secret is
     # (``TotpState``); the conditional writes count TOTP as a way past unless it is a KNOWN refusal,
     # so an unknown one counts as the plain enabled-TOTP rule counts it. The same keyword on
-    # ``set_password``.
+    # ``set_password``. ``passkey_counts`` (BACKLOG #3937) is the caller's rule for which passkey
+    # counts, the auth service's narrowing to the configured relying party; ``None`` is
+    # ``passkey_is_way_past`` alone. The same keyword on ``set_password`` and ``disable_totp``.
     async def delete_webauthn_credential(
         self,
         user_id: str,
@@ -2414,6 +2419,7 @@ class AuthStore(Protocol):
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool: ...
 
     async def rehash_webauthn_credential(

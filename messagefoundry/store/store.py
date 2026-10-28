@@ -2742,17 +2742,37 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
         return False
 
 
+#: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
+#: the auth service narrows :func:`passkey_is_way_past` to the relying party the configuration
+#: names, since the sign-in accepts only a passkey under the request's. ``None`` is
+#: :func:`passkey_is_way_past` alone.
+PasskeyCounts = Callable[[WebAuthnCredential], bool]
+
+
+def passkey_is_way_past_under(cred: WebAuthnCredential, rp_id: str | None) -> bool:
+    """:func:`passkey_is_way_past`, narrowed to a passkey minted under ``rp_id``, the relying
+    party the configuration names (BACKLOG #3937). ``None``, no configured one, counts no passkey:
+    the factor-drop gates and the census that ask this then keep TOTP rather than trust a passkey
+    the sign-in might not accept."""
+    return rp_id is not None and cred.rp_id == rp_id and passkey_is_way_past(cred)
+
+
 def discoverable_way_past(
-    passkeys: Sequence[WebAuthnCredential], cred_digest: str, *, sealed: bool
+    passkeys: Sequence[WebAuthnCredential],
+    cred_digest: str,
+    *,
+    sealed: bool,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
-    """Whether ``passkeys`` hold one that is a way past (:func:`passkey_is_way_past`), the passkey
-    half of
+    """Whether ``passkeys`` hold one that is a way past (:func:`passkey_is_way_past`, or
+    ``passkey_counts`` where the caller narrows it), the passkey half of
     :func:`holds_way_past` (ADR 0197 Amendment A, wave 2). On a ``sealed`` store a set that does not
     match ``cred_digest``, the digest the account's seal covers, counts for nothing: a passkey row
     written or flipped outside the store must not count. The census asks it too."""
     if sealed and passkey_digest(passkeys) != cred_digest:
         return False
-    return any(passkey_is_way_past(c) for c in passkeys)
+    counts = passkey_counts or passkey_is_way_past
+    return any(counts(c) for c in passkeys)
 
 
 #: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
@@ -2919,15 +2939,18 @@ def holds_way_past(
     *,
     sealed: bool,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
     """Whether ``record`` holds a factor with a way past the sign-in lock (ADR 0197 Amendment A):
     a TOTP not known to be refused (:func:`_totp_is_way_past`), or a passkey recorded as
-    discoverable (wave 2).
+    discoverable (wave 2) that ``passkey_counts`` counts.
     ``passkeys`` is the account's set, read in the same transaction as the write that asks
     (:func:`discoverable_way_past` says how it is trusted)."""
     if _totp_is_way_past(record, totp_counts):
         return True
-    return discoverable_way_past(passkeys, record.row.cred_digest, sealed=sealed)
+    return discoverable_way_past(
+        passkeys, record.row.cred_digest, sealed=sealed, passkey_counts=passkey_counts
+    )
 
 
 def removal_keeps_way_past(
@@ -2938,18 +2961,20 @@ def removal_keeps_way_past(
     drop_totp: bool = False,
     drop_passkey: str | None = None,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
     """Whether ``record`` still holds a way past the sign-in lock once TOTP (``drop_totp``) or the
     passkey with id hash ``drop_passkey`` is removed (ADR 0197 Amendment A, AC-A3a, wave 2).
     ``passkeys`` is the whole set before the removal, trusted as :func:`discoverable_way_past`
     trusts it, so a set that fails its digest leaves nothing. TOTP counts as
-    :func:`_totp_is_way_past` says."""
+    :func:`_totp_is_way_past` says, a passkey as ``passkey_counts`` does."""
     row = record.row
     if not drop_totp and _totp_is_way_past(record, totp_counts):
         return True
     remaining = [c for c in passkeys if c.credential_id_hash != drop_passkey]
     trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
-    return trusted and any(passkey_is_way_past(c) for c in remaining)
+    counts = passkey_counts or passkey_is_way_past
+    return trusted and any(counts(c) for c in remaining)
 
 
 def totp_removal(
@@ -2959,6 +2984,7 @@ def totp_removal(
     passkeys: Sequence[WebAuthnCredential] = (),
     sealed: bool = False,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> UserChange:
     """What ``disable_totp`` writes (:func:`totp_disable`). With ``require_way_past`` it is declined
     when the TOTP on the row AT WRITE TIME is a way past (``totp_counts``: usable, or UNKNOWN, as the
@@ -2973,7 +2999,7 @@ def totp_removal(
             if isinstance(totp_counts, TotpJudgement) and totp_counts.moved(r):
                 return None
             if _totp_is_way_past(r, totp_counts) and not removal_keeps_way_past(
-                r, passkeys, sealed=sealed, drop_totp=True
+                r, passkeys, sealed=sealed, drop_totp=True, passkey_counts=passkey_counts
             ):
                 return None
         return totp_disable(r, now)
@@ -2991,6 +3017,7 @@ def password_change(
     passkeys: Sequence[WebAuthnCredential] = (),
     sealed: bool = False,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> UserChange:
     """What ``set_password`` writes (ADR 0197 Decision item 8, BACKLOG #1245).
 
@@ -3015,7 +3042,7 @@ def password_change(
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
         if require_way_past and not holds_way_past(
-            r, passkeys, sealed=sealed, totp_counts=totp_counts
+            r, passkeys, sealed=sealed, totp_counts=totp_counts, passkey_counts=passkey_counts
         ):
             return None
         claimed = r.row.password_claimed_at
@@ -15656,6 +15683,7 @@ class MessageStore:
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -15677,6 +15705,7 @@ class MessageStore:
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15840,6 +15869,7 @@ class MessageStore:
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes). With
         ``require_way_past``, a TOTP that is a way past (``totp_usable``) goes only while a
@@ -15862,6 +15892,7 @@ class MessageStore:
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15985,6 +16016,7 @@ class MessageStore:
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
@@ -16006,6 +16038,7 @@ class MessageStore:
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 ):
                     return False
             count = await self._write_passkeys(
