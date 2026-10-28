@@ -318,6 +318,7 @@ from messagefoundry.auth.trust_anchors import (
     run_anchor_preflight,
     smtp_hop_anchor_spec,
 )
+from messagefoundry.auth.webauthn import configured_rp_id
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -11767,6 +11768,9 @@ def create_managed_app(
                     admin_grant_alert=administrator_granted_alert(
                         notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
                     ),
+                    # BACKLOG #3937: the relying party a passkey must be under to count as a way
+                    # past the sign-in lock at the factor-drop gates; None counts none.
+                    way_past_rp_id=configured_rp_id(public_origin),
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:

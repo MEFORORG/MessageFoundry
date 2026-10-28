@@ -86,6 +86,7 @@ from messagefoundry.logging_setup import (  # noqa: E402
     LogFile,
     SyslogForward,
     configure_logging,
+    install_filtered_last_resort,
     level_refused_on_production,
     query_sntp_offset,
 )
@@ -2005,8 +2006,8 @@ def _forwarder_posture_refused(
     # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186), so a dev, loopback or
     # staging instance is held to it exactly as a production one is.
     if not deny_written:
-        # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
-        # like the sibling posture gates rather than logging.info.
+        # In `serve` configure_logging has not run yet (its filtered lastResort drops < WARNING), so
+        # announce on stderr like the sibling posture gates rather than logging.info.
         print(
             f"info: [security].block_unlisted_outbound defaulted ON for a "
             f"{'production ' if production else ''}PHI instance "
@@ -2018,7 +2019,7 @@ def _forwarder_posture_refused(
     elif not settings.egress.deny_by_default:
         # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
         # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
-        # line is WARNING-level so the root lastResort handler still surfaces it before
+        # line is WARNING-level so `serve`'s filtered lastResort still surfaces it before
         # configure_logging.
         logging.getLogger(__name__).warning(
             "AUDIT: [security].block_unlisted_outbound=false on a %sPHI instance (environment %r) — "
@@ -2254,8 +2255,8 @@ def _start_logging(
             )
             return 2
         if _forward_hop is HopDisposition.WARN:
-            # Crossed, but never silent — the point of the fix. WARNING surfaces via the root
-            # lastResort handler even though configure_logging has not run yet.
+            # Crossed, but never silent — the point of the fix. In `serve` the WARNING surfaces via
+            # the filtered lastResort even though configure_logging has not run yet.
             logging.getLogger(__name__).warning(
                 "AUDIT: off-box log/audit forwarding to %s:%d is NOT a verified-TLS hop (%s), so the "
                 "evidence stream crosses the network unprotected on a PHI instance. Set "
@@ -2276,10 +2277,10 @@ def _start_logging(
     # opens no spool and contacts no collector.
     #
     # Vault BACKLOG #2375: the gate's own-host check FAILS OPEN and logs a WARNING when it does,
-    # which ADR 0200 Amendment A calls the record of that pass. Logged here it would reach bare
-    # stderr only in `serve`, where configure_logging has not run, and in `supervise` it would
-    # reach stdout but never the forwarder. So the gate hands the notes back as text and each is
-    # written TWICE, as the #1989 static-credential lines are: to stderr now, and to the
+    # which ADR 0200 Amendment A calls the record of that pass. Logged here it would reach the
+    # filtered lastResort only in `serve`, where configure_logging has not run, and in `supervise`
+    # it would reach stdout but never the forwarder. So the gate hands the notes back as text and
+    # each is written TWICE, as the #1989 static-credential lines are: to stderr now, and to the
     # configured handlers once `configure` below has returned.
     _forwarding_gap, _gate_notes = forwarding_gate_check(settings.logging)
     for _gate_note in _gate_notes:
@@ -2336,8 +2337,8 @@ def _start_logging(
 
     _forward_ca = log_forward_anchor_spec(settings.logging)
     # Under `warn` the check warns rather than refuses. Its text quotes a configured path, so it is
-    # taken here and printed scrubbed, as the #2375 gate notes above are: no handler is installed
-    # yet, so a logged warning would reach bare stderr with any newline in the path intact.
+    # taken here and printed with its control characters scrubbed, as the #2375 gate notes above
+    # are, so a newline in the path cannot forge a line.
     _ca_notes: list[str] = []
     _ca_refusal = (
         anchor_refusal(_forward_ca, enforcing=enforcing, warn=_ca_notes.append)
@@ -2662,6 +2663,10 @@ def _serve(args: argparse.Namespace) -> int:
     # A no-op where the interpreter was started with remote debugging disabled, which is every
     # engine shard under `supervise`.
     install_remote_debug_guard()
+    # BACKLOG #3768: configure_logging runs only after the gates below, so until then a record no
+    # handler takes goes to `logging.lastResort`. This gives it the filter chain; the function
+    # says what else it keeps. The comments below that name the filtered lastResort rely on it.
+    install_filtered_last_resort()
 
     import uvicorn
 
@@ -2702,9 +2707,10 @@ def _serve(args: argparse.Namespace) -> int:
     # deleted 4.0.3 V8.3.6 and kept 11.7.1); this is worth doing on its own merits only.
     #
     # APPLIED here, REPORTED after configure_logging (below). The call must run before PHI can be
-    # resident; the report must not, because at this point the root logger still has no handlers and
-    # every record is serviced by logging.lastResort — which drops < WARNING at ANY --log-level and
-    # reaches none of the handlers/filters/off-box forwarder the operator configured. A hardened
+    # resident; the report must not, because in a real process the root logger still has no
+    # handlers here and every record is serviced by the filtered logging.lastResort above — which
+    # drops < WARNING at ANY --log-level and reaches none of the handlers or the off-box forwarder
+    # the operator configured. A hardened
     # container (RLIMIT_MEMLOCK=0) would otherwise print a WARNING to stderr on every start that no
     # log level could suppress and no SIEM would ever receive.
     _dumps = suppress_crash_dumps()
@@ -2873,8 +2879,8 @@ def _serve(args: argparse.Namespace) -> int:
     # here, before anything starts; the GRAPH half is checked by the registry guard below at the first graph load and
     # on every /config/reload, because the graph is not loaded in this function (load_config executes
     # operator code, so it is not run twice). Same refuse/warn split as require_managed_identity above.
-    # Each honoured opt-out is an audit line at WARNING. Logged here, it would reach only the root
-    # lastResort handler on stderr, never the log file or the off-box forwarder, because
+    # Each honoured opt-out is an audit line at WARNING. Logged here, it would reach only the
+    # filtered lastResort on stderr, never the log file or the off-box forwarder, because
     # configure_logging has not run. So each line is written TWICE (BACKLOG #1989): to stderr now,
     # which every exit before configure_logging still sees and no log level can filter, and to the
     # configured handlers after configure_logging below. Under NSSM both streams are captured, so a
@@ -2955,10 +2961,11 @@ def _serve(args: argparse.Namespace) -> int:
             return 2
         # Explicit, audited override: start keyless on a PHI instance. Emit a loud warning AND a
         # WARNING-level audit record (captured by NSSM stdout/SIEM) so the deliberate weakening is
-        # never silent. (Logging isn't configured yet here, so this goes through the root logger,
-        # which emits >=WARNING to stderr by default — a durable startup audit line.) Under strict
-        # enforcement the second ack ([security].allow_unencrypted_phi_under_strict_enforcement=true)
-        # was verified above, so the AUDIT line names it too; the warn posture names the opt-out alone.
+        # never silent. (Logging isn't configured yet here, so this goes to the filtered
+        # lastResort, which emits >=WARNING to stderr through the filter chain — a durable startup
+        # audit line.) Under strict enforcement the second ack
+        # ([security].allow_unencrypted_phi_under_strict_enforcement=true) was verified above, so
+        # the AUDIT line names it too; the warn posture names the opt-out alone.
         # The opt-out is named as the operator wrote it (vault BACKLOG #2340).
         logging.getLogger(__name__).warning(
             "AUDIT: starting keyless on a %sPHI instance (environment %r) because "
@@ -3067,8 +3074,8 @@ def _serve(args: argparse.Namespace) -> int:
     ) is not None:
         logging.getLogger(__name__).warning("%s", _rd_audit)
     # Vault BACKLOG #2600: the unread-variable warnings load_settings logged before logging was
-    # configured, so to bare stderr only. Logged again here, under the settings logger they came
-    # from, for the same reason. (_start_logging above re-logs the #2375 gate notes.)
+    # configured, so to the filtered lastResort only. Logged again here, under the settings logger
+    # they came from, for the same reason. (_start_logging above re-logs the #2375 gate notes.)
     from messagefoundry.config.settings import unread_env_warnings
 
     for _env_line in unread_env_warnings(settings):
@@ -7929,6 +7936,7 @@ def _build_provision_auth_service(
     """
     from messagefoundry.auth.ldap import LdapError
     from messagefoundry.auth.service import AuthService
+    from messagefoundry.auth.webauthn import configured_rp_id
     from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
     from messagefoundry.config.tls_policy import InsecureHopRefused
@@ -7949,6 +7957,8 @@ def _build_provision_auth_service(
             secret_provider=secret_provider,
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
             hop_posture=posture,
+            # BACKLOG #3937: as the serving engine passes it, so a gate here counts the same passkeys.
+            way_past_rp_id=configured_rp_id(settings.api.public_origin),
         )
     except SecretProviderError as exc:
         # BACKLOG #2317: the Vault provider raises a cleartext-address refusal as its own type.
@@ -11231,11 +11241,10 @@ def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
 #: Adding a name here takes a subcommand OUT of that default. `tests/test_cli.py` pins this set and
 #: checks that each member really calls `configure_logging`.
 #:
-#: KNOWN RESIDUAL, NOT FIXED HERE: `serve` calls `configure_logging` only after its settings, key
-#: and egress gates run, and its WARNINGs in that window still go through the unfiltered
-#: `logging.lastResort`. The comments inside `_serve` rely on that path by name. `supervise` calls it
-#: on its first line, so it has no such window. Whether `serve` should take run_cli()'s sink for
-#: that window is an open question, deliberately not decided by the change that added this set.
+#: `serve` calls `configure_logging` only after its settings, key and egress gates run. For that
+#: window `_serve` calls `install_filtered_last_resort` near its start (BACKLOG #3768), whose
+#: docstring says what it covers. `supervise` calls
+#: `configure_logging` on its first line, so it has no such window.
 _CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
 
 _DISPATCH = {

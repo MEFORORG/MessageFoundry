@@ -2451,6 +2451,39 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
 
 
+def session_owes_unproven_factor(
+    sealer: RowSealer | None,
+    session: SessionRecord | None,
+    record: UserAuthzRecord,
+    passkeys: Sequence[WebAuthnCredential],
+) -> bool:
+    """Whether binding a new factor for ``record``'s account from ``session`` must be refused,
+    because the account holds a second factor this session has not proven (BACKLOG #3014, #3690).
+
+    The store-side twin of ``AuthService._factor_binding_is_blocked``, asked inside the write's own
+    transaction so a factor bound on another session after the service asked is still seen. It is
+    session-relative: a session stamped MFA-verified binds beside the factors it proved, and an
+    account with no factor at all binds its first one from a pending session. So it encodes "no
+    unproven factor", never "zero factors". Each factor term can only add a factor, as
+    ``_second_factor_enrolled`` reads them: TOTP, a sealed passkey digest, or any passkey row.
+
+    Fails closed (True) on a missing, revoked, foreign, stale-epoch or unsealed session, and on an
+    unsealed account: nothing there can be shown to owe nothing. A missing account is the caller's
+    to handle: the insert's foreign key already refuses it (BACKLOG #1807)."""
+    if (
+        session is None
+        or session.revoked_at is not None
+        or session.user_id != record.row.id
+        or session.user_epoch != record.row.session_epoch
+        or not session_seal_ok(sealer, session)
+        or not user_seal_ok(sealer, record)
+    ):
+        return True
+    if session.mfa_verified_at is not None:
+        return False
+    return record.row.totp_enabled or record.row.cred_digest != "" or bool(passkeys)
+
+
 def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
     """``record`` with its seal set: the sealer's seal over it under the active key, or empty on a
     store with no sealer (BACKLOG #2592)."""
@@ -2709,17 +2742,37 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
         return False
 
 
+#: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
+#: the auth service narrows :func:`passkey_is_way_past` to the relying party the configuration
+#: names, since the sign-in accepts only a passkey under the request's. ``None`` is
+#: :func:`passkey_is_way_past` alone.
+PasskeyCounts = Callable[[WebAuthnCredential], bool]
+
+
+def passkey_is_way_past_under(cred: WebAuthnCredential, rp_id: str | None) -> bool:
+    """:func:`passkey_is_way_past`, narrowed to a passkey minted under ``rp_id``, the relying
+    party the configuration names (BACKLOG #3937). ``None``, no configured one, counts no passkey:
+    the factor-drop gates and the census that ask this then keep TOTP rather than trust a passkey
+    the sign-in might not accept."""
+    return rp_id is not None and cred.rp_id == rp_id and passkey_is_way_past(cred)
+
+
 def discoverable_way_past(
-    passkeys: Sequence[WebAuthnCredential], cred_digest: str, *, sealed: bool
+    passkeys: Sequence[WebAuthnCredential],
+    cred_digest: str,
+    *,
+    sealed: bool,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
-    """Whether ``passkeys`` hold one that is a way past (:func:`passkey_is_way_past`), the passkey
-    half of
+    """Whether ``passkeys`` hold one that is a way past (:func:`passkey_is_way_past`, or
+    ``passkey_counts`` where the caller narrows it), the passkey half of
     :func:`holds_way_past` (ADR 0197 Amendment A, wave 2). On a ``sealed`` store a set that does not
     match ``cred_digest``, the digest the account's seal covers, counts for nothing: a passkey row
     written or flipped outside the store must not count. The census asks it too."""
     if sealed and passkey_digest(passkeys) != cred_digest:
         return False
-    return any(passkey_is_way_past(c) for c in passkeys)
+    counts = passkey_counts or passkey_is_way_past
+    return any(counts(c) for c in passkeys)
 
 
 #: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
@@ -2886,15 +2939,18 @@ def holds_way_past(
     *,
     sealed: bool,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
     """Whether ``record`` holds a factor with a way past the sign-in lock (ADR 0197 Amendment A):
     a TOTP not known to be refused (:func:`_totp_is_way_past`), or a passkey recorded as
-    discoverable (wave 2).
+    discoverable (wave 2) that ``passkey_counts`` counts.
     ``passkeys`` is the account's set, read in the same transaction as the write that asks
     (:func:`discoverable_way_past` says how it is trusted)."""
     if _totp_is_way_past(record, totp_counts):
         return True
-    return discoverable_way_past(passkeys, record.row.cred_digest, sealed=sealed)
+    return discoverable_way_past(
+        passkeys, record.row.cred_digest, sealed=sealed, passkey_counts=passkey_counts
+    )
 
 
 def removal_keeps_way_past(
@@ -2905,18 +2961,20 @@ def removal_keeps_way_past(
     drop_totp: bool = False,
     drop_passkey: str | None = None,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
     """Whether ``record`` still holds a way past the sign-in lock once TOTP (``drop_totp``) or the
     passkey with id hash ``drop_passkey`` is removed (ADR 0197 Amendment A, AC-A3a, wave 2).
     ``passkeys`` is the whole set before the removal, trusted as :func:`discoverable_way_past`
     trusts it, so a set that fails its digest leaves nothing. TOTP counts as
-    :func:`_totp_is_way_past` says."""
+    :func:`_totp_is_way_past` says, a passkey as ``passkey_counts`` does."""
     row = record.row
     if not drop_totp and _totp_is_way_past(record, totp_counts):
         return True
     remaining = [c for c in passkeys if c.credential_id_hash != drop_passkey]
     trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
-    return trusted and any(passkey_is_way_past(c) for c in remaining)
+    counts = passkey_counts or passkey_is_way_past
+    return trusted and any(counts(c) for c in remaining)
 
 
 def totp_removal(
@@ -2926,6 +2984,7 @@ def totp_removal(
     passkeys: Sequence[WebAuthnCredential] = (),
     sealed: bool = False,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> UserChange:
     """What ``disable_totp`` writes (:func:`totp_disable`). With ``require_way_past`` it is declined
     when the TOTP on the row AT WRITE TIME is a way past (``totp_counts``: usable, or UNKNOWN, as the
@@ -2940,7 +2999,7 @@ def totp_removal(
             if isinstance(totp_counts, TotpJudgement) and totp_counts.moved(r):
                 return None
             if _totp_is_way_past(r, totp_counts) and not removal_keeps_way_past(
-                r, passkeys, sealed=sealed, drop_totp=True
+                r, passkeys, sealed=sealed, drop_totp=True, passkey_counts=passkey_counts
             ):
                 return None
         return totp_disable(r, now)
@@ -2958,6 +3017,7 @@ def password_change(
     passkeys: Sequence[WebAuthnCredential] = (),
     sealed: bool = False,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> UserChange:
     """What ``set_password`` writes (ADR 0197 Decision item 8, BACKLOG #1245).
 
@@ -2982,7 +3042,7 @@ def password_change(
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
         if require_way_past and not holds_way_past(
-            r, passkeys, sealed=sealed, totp_counts=totp_counts
+            r, passkeys, sealed=sealed, totp_counts=totp_counts, passkey_counts=passkey_counts
         ):
             return None
         claimed = r.row.password_claimed_at
@@ -15623,6 +15683,7 @@ class MessageStore:
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -15644,6 +15705,7 @@ class MessageStore:
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15807,6 +15869,7 @@ class MessageStore:
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes). With
         ``require_way_past``, a TOTP that is a way past (``totp_usable``) goes only while a
@@ -15829,6 +15892,7 @@ class MessageStore:
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15871,16 +15935,45 @@ class MessageStore:
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
         """Persist one enrolled passkey. Public keys are plaintext by design (see the
         ``_CIPHER_COLUMNS`` note). sqlite3.IntegrityError is raised for at least a duplicate
         ``(user_id, label)``, a credential id already held and an account that does not exist; the
         caller tells them apart by re-reading, as ``AuthService.finish_webauthn_registration`` says
         (ADR 0068 §4, BACKLOG #2733). The account is re-sealed over its new passkey digest in the
-        same transaction (BACKLOG #2592)."""
-        async with _writer_guard(self._db, self._lock):
+        same transaction (BACKLOG #2592). See :meth:`AuthStore.add_webauthn_credential` for
+        ``for_session``: here the check and the insert share one ``BEGIN``, under the writer lock,
+        so no writer of this process runs between them, and a writer in another process that
+        commits between them fails this transaction's write rather than going unseen."""
+        if for_session is None:
+            async with _writer_guard(self._db, self._lock):
+                await self._write_passkeys(
+                    cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred)
+                )
+                await self._commit()
+            return True
+        async with _writer_txn(self._db, self._lock):
+            record = await self._read_user_record(cred.user_id)
+            # No account: the insert below meets the foreign key, as it always did (BACKLOG #1807).
+            if record is not None and session_owes_unproven_factor(
+                self._row_sealer,
+                await self._read_session_row(for_session),
+                record,
+                await self._account_passkeys(cred.user_id),
+            ):
+                await self._db.rollback()  # only read; this closes the transaction
+                return False
             await self._write_passkeys(cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred))
             await self._commit()
+        return True
+
+    async def _read_session_row(self, token_hash: str) -> SessionRecord | None:
+        """The session row, read on the writer connection inside the caller's transaction."""
+        cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
+        row = await cur.fetchone()
+        return SessionRecord.from_mapping(dict(row)) if row else None
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's enrolled passkeys, oldest first."""
@@ -15923,6 +16016,7 @@ class MessageStore:
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
@@ -15944,6 +16038,7 @@ class MessageStore:
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 ):
                     return False
             count = await self._write_passkeys(

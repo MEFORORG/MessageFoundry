@@ -234,6 +234,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
+    PasskeyCounts,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -323,6 +324,7 @@ from messagefoundry.store.store import (
     seal_session,
     seal_user,
     session_insert_params,
+    session_owes_unproven_factor,
     session_reseal_params,
     session_seal_ok,
     settle_newest_keyed_audit_row,
@@ -13400,6 +13402,7 @@ class SqlServerStore:
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -13427,6 +13430,7 @@ class SqlServerStore:
                     passkeys=await self._account_passkeys(cur, user_id) if require_way_past else (),
                     sealed=self._row_sealer is not None,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13531,6 +13535,7 @@ class SqlServerStore:
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         require_totp_rule(require_way_past, totp_usable)
@@ -13553,6 +13558,7 @@ class SqlServerStore:
                     passkeys=passkeys,
                     sealed=self._row_sealer is not None,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13587,17 +13593,51 @@ class SqlServerStore:
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
         material, not a secret — excluded from cipher + rekey). pyodbc's IntegrityError is raised
         for at least a duplicate ``(user_id, label)`` (``ux_webauthn_label``), a credential id
         already held (the primary key) and an account that does not exist
         (``fk_webauthn_credentials_user``, BACKLOG #2733); the caller tells them apart by
         re-reading, as ``AuthService.finish_webauthn_registration`` says. The account is re-sealed
-        over its new passkey digest in the same transaction (BACKLOG #2592)."""
-        await self._write_passkeys_txn(
-            cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
-        )
+        over its new passkey digest in the same transaction (BACKLOG #2592). See
+        :meth:`AuthStore.add_webauthn_credential` for ``for_session``: the account row is taken
+        under ``UPDLOCK, ROWLOCK`` before the check, as every factor write here takes it, so a
+        factor bound elsewhere either committed before the check reads it or waits until this
+        transaction ends. The session row is taken the same way after it, users then sessions, so
+        a revoke of that session cannot land between the check and the commit either."""
+        if for_session is None:
+            await self._write_passkeys_txn(
+                cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
+            )
+            return True
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                record = await self._read_user_record(cur, cred.user_id)  # UPDLOCK, ROWLOCK
+                await cur.execute(
+                    "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?",
+                    (for_session,),
+                )
+                session = await self._fetch_dicts(cur)
+                # No account: the insert below meets the foreign key (BACKLOG #1807).
+                if record is not None and session_owes_unproven_factor(
+                    self._row_sealer,
+                    SessionRecord.from_mapping(session[0]) if session else None,
+                    record,
+                    await self._account_passkeys(cur, cred.user_id),
+                ):
+                    await conn.rollback()  # only read; this releases the lock
+                    return False
+                await self._write_passkeys(
+                    cur, cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
+                )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return True
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's enrolled passkeys, oldest first."""
@@ -13633,6 +13673,7 @@ class SqlServerStore:
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The account
@@ -13659,6 +13700,7 @@ class SqlServerStore:
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 ):
                     await conn.rollback()
                     return False

@@ -76,6 +76,7 @@ from .._auth import (
     login_redirect_response,
     lookup_ui_action,
     must_change_target,
+    must_enrol_first,
     passkey_sign_in_cookie_name,
     proof_spent_for,
     proxied_loopback_host,
@@ -726,7 +727,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if auth is None:
             raise HTTPException(503, "authentication is not configured")
         client = client_ip(request)
-        if not auth.allow_login_attempt(client):
+        # ADR 0197 Amendment A, wave 2: the combined passkey sign-in's challenge, named by the
+        # handle cookie the begin leg set. ALWAYS popped here, never peeked, and before the limiter:
+        # ``paid`` means the engine moved the begin leg's control-2 hit to now, so this sign-in is
+        # not charged twice (BACKLOG #3937 item 2; docs/SECURITY.md states the rule). Anything
+        # else, a forged, expired or absent handle included, is charged like any other request.
+        handle = request.cookies.get(passkey_sign_in_cookie_name(request))
+        staged = auth.take_passkey_challenge(handle) if handle else None
+        paid = staged is not None and staged.paid
+        if not paid and not auth.allow_login_attempt(client):
             # BACKLOG #3293, owner ruling 2026-10-20: the whole sign-in window, never the bucket's
             # own wait, so an unauthenticated caller reads no other caller's timing.
             raise HTTPException(
@@ -750,7 +759,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,
         # the handle of its challenge the cookie the begin leg set; both or neither. Clamped, so an
         # oversized assertion is simply an invalid one.
-        handle = request.cookies.get(passkey_sign_in_cookie_name(request))
         assertion = form.get("passkey_assertion", "")[:_PASSKEY_ASSERTION_MAX_CHARS]
         rp = webauthn_rp(request)
         passkey = (
@@ -772,6 +780,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # it valid and unreachable until it expires. A failed sign-in ends nothing.
             supersedes=session_token(request),
             passkey=passkey,
+            passkey_challenge=staged.challenge if staged is not None else None,
         )
         if not outcome.ok or outcome.token is None:
             refused = RedirectResponse("/ui/login?e=bad", status_code=303)
@@ -1773,7 +1782,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or identity is None:
             return login_redirect_response()
-        if await rotation_comes_first(auth, identity.must_change_password, token):
+        if await rotation_comes_first(auth, identity.must_change_password, token, request=request):
             # must_change outranks MFA for an account with no factor, mirroring require()/require_ui:
             # a fresh account is both, and only rotation is reachable until it happens. One that
             # still owes an enrolled factor stays here to answer it (BACKLOG #1954), and one that
@@ -1807,7 +1816,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or not token or identity is None:
             return login_redirect_response()
-        if await rotation_comes_first(auth, identity.must_change_password, token):
+        if await rotation_comes_first(auth, identity.must_change_password, token, request=request):
             return RedirectResponse("/ui/account/password", status_code=303)
         client = client_ip(request)
         if not allow_reauth_attempt(auth, identity):
@@ -1878,11 +1887,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # The session ended under the operator (expiry / revoke) — a post-termination landing
             # like any other, so it carries Clear-Site-Data + the explanatory code (14.3.1).
             return login_redirect_response()
-        if identity.must_change_password and not await auth.must_enrol_before_rotating(identity):
+        if identity.must_change_password and not await must_enrol_first(auth, identity, request):
             # Mirror require_ui's confinement (L4b): rotate, or first prove an owed factor (#1954).
             # A session that must enrol before rotating (ADR 0197 Amendment A) re-proves its
             # password here to reach the TOTP enrolment, so it is let through.
-            return RedirectResponse(await must_change_target(auth, token), status_code=303)
+            return RedirectResponse(
+                await must_change_target(auth, token, request=request), status_code=303
+            )
         mfa = await auth.mfa_status(identity)
         if await auth.session_steps_up_at_idp(token):
             # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at
@@ -1920,11 +1931,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or not token or identity is None:
             return login_redirect_response()  # session ended mid-ceremony — see ui_reauth_form
-        if identity.must_change_password and not await auth.must_enrol_before_rotating(identity):
+        if identity.must_change_password and not await must_enrol_first(auth, identity, request):
             # Mirror require_ui's confinement (L4b): rotate, or first prove an owed factor (#1954).
             # A session that must enrol before rotating (ADR 0197 Amendment A) re-proves its
             # password here to reach the TOTP enrolment, so it is let through.
-            return RedirectResponse(await must_change_target(auth, token), status_code=303)
+            return RedirectResponse(
+                await must_change_target(auth, token, request=request), status_code=303
+            )
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         next_ = form.get("next", "")
         action = lookup_ui_action(next_)
