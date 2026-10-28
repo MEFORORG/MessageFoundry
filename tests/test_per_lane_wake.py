@@ -285,11 +285,13 @@ def _delivery_registry(inbox: Path, out_a: Path, out_b: Path) -> Registry:
 
 
 # How long _until waits, in wall-clock seconds. A passing run ends the wait as soon as its condition
-# holds, so this is a ceiling, not a speed assertion. It sits BELOW the per-lane idle backstop on
-# purpose: with wake ON, a lost wake parks its lane until that backstop, so a ceiling under it keeps
-# a lost wake red instead of letting the backstop rescue it. The 3s it replaces (counted in sleeps,
-# not wall time) failed on a windows-2025 runner under a full parallel suite (BACKLOG #3456).
-_UNTIL_CEILING_SECONDS = _PER_LANE_IDLE_BACKSTOP_SECONDS / 2
+# holds, so this is a ceiling, not a speed assertion. The 3s it replaces (counted in sleeps, not
+# wall time) failed on a windows-2025 runner under a full parallel suite (BACKLOG #3456). It must
+# stay BELOW the per-lane idle backstop, which the test after _until pins: with wake ON, a lane
+# whose wakes are all lost sleeps until that backstop, and a ceiling under it keeps that red. A
+# lost wake followed by a later one on the same lane is NOT caught here, because the later set
+# wakes the worker and it claims everything pending.
+_UNTIL_CEILING_SECONDS = 15.0
 
 
 async def _until(predicate: Any, timeout: float = _UNTIL_CEILING_SECONDS) -> None:
@@ -299,6 +301,12 @@ async def _until(predicate: Any, timeout: float = _UNTIL_CEILING_SECONDS) -> Non
         if loop.time() >= deadline:
             raise AssertionError(f"condition not met within {timeout:g}s")
         await asyncio.sleep(0.02)
+
+
+def test_until_ceiling_sits_below_the_idle_backstop() -> None:
+    """At or above the backstop, the backstop delivers a lane whose wakes were all lost before the
+    ceiling expires, and the end-to-end tests below pass with per-lane wake broken."""
+    assert _UNTIL_CEILING_SECONDS < _PER_LANE_IDLE_BACKSTOP_SECONDS
 
 
 @pytest.mark.parametrize("per_lane_wake", [False, True])

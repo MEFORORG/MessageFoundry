@@ -27,34 +27,30 @@ from messagefoundry.pipeline import Engine
 from tests.test_dr_running_config_dir import _BOTH_OUTBOUNDS, _CRIT, _NORM, _free_ports
 from tests.test_dr_running_config_dir import _write_tiered_graph as _write_graph
 
+# A ceiling, not a speed assertion: a probe returns as soon as the connect lands or is refused
+# (Windows takes about 2s to refuse on loopback). It used to be a 2s bound whose timeout read as
+# "not bound", so a starved runner turned a bound port into an unbound one: a positive control
+# went red, and a negative assertion could pass with the port bound (BACKLOG #3456).
+_PROBE_CEILING_SECONDS = 20.0
+
 
 async def _accepts(port: int) -> bool:
     """Whether anything on this box accepts a TCP connection on ``port``: what an L4 health check
-    asks."""
+    asks. True when the connect lands and False only when it is refused. A connect that does
+    neither within the ceiling is no answer, so it fails the test instead of reading as either."""
     try:
         _reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", port), timeout=2.0
+            asyncio.open_connection("127.0.0.1", port), timeout=_PROBE_CEILING_SECONDS
         )
-    except (OSError, TimeoutError):
+    except ConnectionRefusedError:
         return False
+    except TimeoutError as exc:
+        raise AssertionError(
+            f"port {port} neither accepted nor refused within {_PROBE_CEILING_SECONDS:g}s"
+        ) from exc
     writer.close()
     with contextlib.suppress(OSError):
         await writer.wait_closed()
-    return True
-
-
-async def _comes_up(port: int, *, ceiling: float = 20.0) -> bool:
-    """Whether ``port`` accepts within ``ceiling`` wall-clock seconds, retrying a refused or slow
-    connect. For a control that expects a bound listener only: the first try lands when the runner
-    is not starved, so the ceiling is never slept on in a passing run. One 2s connect is a speed
-    assertion on a loaded runner (BACKLOG #3456). An assertion that a port is NOT bound keeps the
-    single probe, since retrying it would only wait longer to read the same False."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + ceiling
-    while not await _accepts(port):
-        if loop.time() >= deadline:
-            return False
-        await asyncio.sleep(0.05)
     return True
 
 
@@ -85,6 +81,27 @@ async def test_a_box_that_is_not_a_dr_standby_binds_both_listeners(tmp_path: Pat
     crit_port, norm_port = _write_graph(cfg, tmp_path)
     async with _served(tmp_path, cfg, DrSettings()):
         assert await _accepts(crit_port) and await _accepts(norm_port)
+
+
+async def test_a_slow_connect_to_a_bound_port_reads_as_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe's own control (BACKLOG #3456). Red with the old 2s bound, whose timeout read as
+    "not bound": this connect lands after it, the way one does on a starved runner."""
+    server = await asyncio.start_server(lambda _r, w: w.close(), "127.0.0.1", 0)
+    port = int(server.sockets[0].getsockname()[1])
+    real_open = asyncio.open_connection
+
+    async def slow_open(host: str, to: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        await asyncio.sleep(2.5)
+        return await real_open(host, to)
+
+    monkeypatch.setattr(asyncio, "open_connection", slow_open)
+    try:
+        assert await _accepts(port)
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 async def test_a_passive_standby_binds_nothing_and_an_activation_binds_the_critical_feed(
@@ -341,10 +358,7 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
         assert rr is not None
         if not norm_auto_start:
             await rr.start_inbound(_NORM, operator=True)
-            # The runner's own record of the bind first, so a red here says whether the start
-            # bound nothing or only the probe missed a bound feed.
-            assert rr.inbound_running(_NORM) and rr.inbound_failed(_NORM) is None
-            assert await _comes_up(norm_port)  # control: the probe sees a bound feed
+            assert await _accepts(norm_port)  # control: the probe sees a bound feed
             await engine.reload_detail(cfg)
         assert rr.inbound_filtered(_NORM) is not None and not await _accepts(norm_port)
 
