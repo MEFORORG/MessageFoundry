@@ -2951,19 +2951,6 @@ class UnreadablePasskeys(Enum):
 _SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
 
 
-def _unreadable_passkey_set(
-    exc: PasskeyRowMalformed | UnicodeDecodeError | sqlite3.OperationalError,
-) -> bool:
-    """Whether ``exc``, raised by a backend's passkey read, says the set cannot be read rather than
-    that the read itself failed: a row that does not parse (:class:`PasskeyRowMalformed`), or a
-    cell the driver cannot decode while fetching, before any row is parsed. At least two drivers
-    raise the second differently: sqlite3 an ``OperationalError`` told apart only by its message,
-    asyncpg and pyodbc a ``UnicodeDecodeError``. Any other driver error is not this."""
-    if isinstance(exc, sqlite3.OperationalError):
-        return str(exc).startswith(_SQLITE_DECODE_FAILURE)
-    return True
-
-
 async def escalation_passkeys(
     counter: LockoutCounter,
     *,
@@ -2980,8 +2967,12 @@ async def escalation_passkeys(
     ``read_passkeys`` run, so a racing failure cannot make the gate stale, a passkey write waits,
     and a wrong password below the threshold costs no passkey read.
 
-    A set that cannot be read (:func:`_unreadable_passkey_set`) answers
-    :attr:`UnreadablePasskeys.UNREADABLE`, logged, and the lock escalates on it. Raising here would
+    A set that cannot be read answers :attr:`UnreadablePasskeys.UNREADABLE`, logged, and the lock
+    escalates on it. That is a row that does not parse (:class:`PasskeyRowMalformed`), or a cell
+    the driver cannot decode while fetching, before any row is parsed: sqlite3 raises an
+    ``OperationalError`` told apart only by its message, and pyodbc a ``UnicodeDecodeError``
+    (asyncpg is expected to raise the same; no test plants the cell there, since a UTF8 database
+    refuses it at write time). Raising here would
     roll the count back, and the account would then never lock; the fixed length would let a
     corrupt row shorten the lock. Any other error is raised, and rolls the write back as it would
     anywhere else."""
@@ -2992,16 +2983,19 @@ async def escalation_passkeys(
         return None
     try:
         return await read_passkeys()
-    except (PasskeyRowMalformed, UnicodeDecodeError, sqlite3.OperationalError) as exc:
-        if not _unreadable_passkey_set(exc):
+    except (PasskeyRowMalformed, UnicodeDecodeError) as exc:
+        failure = type(exc).__name__
+    except sqlite3.OperationalError as exc:
+        if not str(exc).startswith(_SQLITE_DECODE_FAILURE):
             raise
-        # The class name only: a decode error's message and arguments quote the cell.
-        log.warning(
-            "the passkeys of user %s could not be read (%s); its sign-in lock escalates",
-            record.row.id,
-            type(exc).__name__,
-        )
-        return UnreadablePasskeys.UNREADABLE
+        failure = type(exc).__name__
+    # The class name only: a decode error's message and arguments quote the cell.
+    log.warning(
+        "the passkeys of user %s could not be read (%s); its sign-in lock escalates",
+        record.row.id,
+        failure,
+    )
+    return UnreadablePasskeys.UNREADABLE
 
 
 @dataclass(frozen=True)
@@ -15623,10 +15617,12 @@ class MessageStore:
         return updated
 
     async def _account_passkeys(self, user_id: str) -> list[WebAuthnCredential]:
-        rows = await self._db.execute(
+        # Closed on the way out, a failed fetch included: escalation_passkeys survives a cell that
+        # does not decode, and an open statement would hold back a WAL checkpoint until GC.
+        async with self._db.execute(
             "SELECT * FROM webauthn_credentials WHERE user_id=?", (user_id,)
-        )
-        return [WebAuthnCredential.from_mapping(dict(r)) for r in await rows.fetchall()]
+        ) as rows:
+            return [WebAuthnCredential.from_mapping(dict(r)) for r in await rows.fetchall()]
 
     async def _write_passkeys(
         self,

@@ -442,7 +442,9 @@ async def _assert_an_unreadable_passkey_set_counts_and_escalates(
                 "resident",
                 id_hash=credential_id_hash(user_id.encode()),
                 rp_id="t",
-                discoverable=True,
+                # Not discoverable: read cleanly it would keep the fixed length, so only the
+                # unreadable path can escalate, and a corruption that did not land fails the arm.
+                discoverable=False,
             )
         )
         await corrupt(user_id)

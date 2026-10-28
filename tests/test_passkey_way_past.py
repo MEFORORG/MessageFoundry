@@ -1856,9 +1856,11 @@ async def test_an_unreadable_passkey_row_counts_the_failure_and_escalates_the_lo
         warned = [
             r.getMessage()
             for r in caplog.records
-            if r.levelname == "WARNING" and identity.user_id in r.getMessage()
+            if r.levelname == "WARNING"
+            and identity.user_id in r.getMessage()
+            and "could not be read" in r.getMessage()
         ]
-        assert warned, "no warning named the account"
+        assert warned, "the escalation logged no warning naming the account"
         assert all(m.isascii() and "json" not in m for m in warned), warned
     finally:
         await store.close()
