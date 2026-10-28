@@ -180,6 +180,7 @@ from messagefoundry.store.store import (
     LockoutCounter,
     LockoutIncrement,
     PasskeyCounts,
+    PasskeyRowMalformed,
     RoleRow,
     SessionRecord,
     TotpState,
@@ -2621,7 +2622,13 @@ async def lockable_account_census(
             continue
         # Wave 2: a passkey recorded as discoverable is a way past, read from the set the account's
         # seal covers. A set that fails its digest counts for nothing, so the account is named.
-        creds = await store.list_webauthn_credentials(user.id) if any_passkeys else []
+        # A set with a row that does not parse counts for nothing too, so the account is named
+        # rather than the census lost (BACKLOG #3937).
+        try:
+            creds = await store.list_webauthn_credentials(user.id) if any_passkeys else []
+        except PasskeyRowMalformed as exc:
+            _log.warning("a passkey row of user %s did not parse (%s)", user.id, exc)
+            creds = []
         digest = user.row.cred_digest if user.row is not None else ""
         # Two questions, two rules (BACKLOG #3937). Whether a reset would remove a passkey that
         # may still sign the holder in asks ``sign_in_counts``. Whether the account holds a way
@@ -5131,6 +5138,16 @@ class AuthService:
             # BACKLOG #3422: the sign-in lock keeps its fixed length beside a TOTP the store KNOWS
             # is refused, judged on the locked row's cell; otherwise totp_enabled decides, as before.
             totp_usable=_opened_totp_state,
+            # BACKLOG #3937 item 8: a discoverable passkey under the configured relying party is a
+            # way past the sign-in lock too, so that lock escalates beside one. The factor-drop
+            # gates' rule (_gate_counts), not the sign-in's: with no configured rp_id a passkey
+            # pinned to another hostname is no way past, and a longer lock must not rest on a
+            # passkey the owner may not be able to use. Without the [webauthn] extra none counts.
+            passkey_escalates=(
+                self._gate_counts
+                if self.passkeys_count_as_way_past() and webauthn.available()
+                else None
+            ),
             counter=counter,
             threshold=self._policy.lockout_threshold,
             lockout_seconds=self._policy.lockout_minutes * 60,
@@ -10444,14 +10461,28 @@ class AuthService:
         """The account's passkeys, or ``None`` when they do not match the digest its seal covers
         (BACKLOG #2592), which is reported like a failing record and denies every passkey
         ceremony. On a keyless store there is no digest to check. A mismatch is read once more,
-        account and passkeys, before it is reported, for the reason :meth:`_verified` gives."""
-        creds = await self._store.list_webauthn_credentials(user.id)
-        if self._store.row_sealer() is None or passkey_digest(creds) == user.cred_digest:
-            return creds
-        fresh = await self._load_user(user.id)
-        if fresh is None:
-            return None  # gone, or failing its own seal, which _verified has reported
-        creds = await self._store.list_webauthn_credentials(user.id)
+        account and passkeys, before it is reported, for the reason :meth:`_verified` gives.
+
+        A passkey row that does not parse is ``None`` too, never an exception: every caller
+        already denies on ``None``, and several answer a caller who has proved nothing (the sign-in
+        and its lock notice, BACKLOG #3937), where a 500 would name the account as one holding a
+        passkey. The store never writes such a row, so on a sealed store it is reported as the set
+        failing its seal; on a keyless store it is logged, at most once per report interval."""
+        try:
+            creds = await self._store.list_webauthn_credentials(user.id)
+            if self._store.row_sealer() is None or passkey_digest(creds) == user.cred_digest:
+                return creds
+            fresh = await self._load_user(user.id)
+            if fresh is None:
+                return None  # gone, or failing its own seal, which _verified has reported
+            creds = await self._store.list_webauthn_credentials(user.id)
+        except PasskeyRowMalformed as exc:
+            if self._store.row_sealer() is not None:
+                _log.debug("a passkey row of user %s did not parse (%s)", user.id, exc)
+                await self._user_seal_failed(user.id, part="passkeys")
+            elif self._seal_failures_reported.due(f"passkey-parse:{user.id}"):
+                _log.warning("a passkey row of user %s did not parse (%s)", user.id, exc)
+            return None
         if passkey_digest(creds) == fresh.cred_digest:
             return creds
         await self._user_seal_failed(user.id, part="passkeys")

@@ -88,6 +88,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.crypto_transit import build_transit_cipher
+from messagefoundry.store.store import PasskeyRowMalformed, WebAuthnCredential
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import _bind_params, _lookup_max_rows
@@ -944,3 +945,50 @@ async def test_an_integrity_refused_message_423_carries_no_chain(
         await read_scoped_message(engine, outsider, "m-1", request, refuse_integrity=True) is None
     )
     assert denied == ["IB_A"]
+
+
+# ---- store/store.py WebAuthnCredential.from_mapping: a malformed passkey row (BACKLOG #3937) ------
+
+
+def _passkey_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "credential_id_hash": "h",
+        "credential_id": "c",
+        "user_id": "u",
+        "rp_id": "localhost",
+        "public_key": "k",
+        "sign_count": 0,
+        "transports": '["usb"]',
+        "device_type": "single_device",
+        "backed_up": 0,
+        "label": "key",
+        "aaguid": None,
+        "created_at": 1.0,
+    }
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "failure"),
+    [
+        ("transports", '["' + _PLANTED, "JSONDecodeError"),  # .doc holds the whole cell
+        ("sign_count", _PLANTED, "ValueError"),  # int() quotes the value
+        ("created_at", _PLANTED, "ValueError"),  # float() quotes the value
+        ("last_used_at", _PLANTED, "ValueError"),  # float() again, through _opt_float
+        # A bytes cell that is not UTF-8: UnicodeDecodeError.object holds all of it.
+        ("transports", _PLANTED.encode() + b"\xff", "UnicodeDecodeError"),
+    ],
+)
+def test_a_malformed_passkey_row_keeps_the_row_off_the_chain(
+    column: str, value: str | bytes, failure: str
+) -> None:
+    with pytest.raises(PasskeyRowMalformed) as caught:
+        WebAuthnCredential.from_mapping(_passkey_row(**{column: value}))
+    assert caught.value.args == (failure,)
+    _assert_bare(caught.value)
+
+
+def test_a_well_formed_passkey_row_still_parses() -> None:
+    cred = WebAuthnCredential.from_mapping(_passkey_row())
+    assert cred.transports == ["usb"] and cred.sign_count == 0
