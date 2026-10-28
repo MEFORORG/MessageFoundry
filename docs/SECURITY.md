@@ -5205,7 +5205,8 @@ checks is recorded `revoked`. So is a session minted under an older session epoc
 account's, which a gate would end: the sign-out reads the account after its revoke, so a
 whole-account revoke landing between the two would make a session that was live look stale. The
 owner is read through the ended row's `user_id`, which the revoke does not check against the row's
-seal (BACKLOG #3716), so a tampered row could put both rows, and the outcome, on another account.
+seal (BACKLOG #3716), so a tampered row could put the lapse row, and the outcome, on another
+account, and on `/ui/logout`, which names no caller, the `auth.logout` row's actor too.
 
 **A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
 clears the cookie. That row is then missing, with an ERROR log line; the line names the session
@@ -6125,9 +6126,9 @@ In their place, every refused sign-in on an existing, enabled local account writ
 whether a wrong credential or a live lock refused it. Two refusals keep their own rows: an unknown or
 disabled name (`reason: unknown_or_disabled`), and a right password on an expired temporary
 credential (`auth.temp_password_expired`). That action also records a session ended because its
-temporary credential lapsed: with `"at": "session"` and no sign-in attempt behind it, with
-`"at": "logout"` at a sign-out, or with `"at": "superseded"` at another sign-in on the same
-browser, which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
+temporary credential lapsed, with at least these `at` values: `"session"` with no sign-in attempt
+behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on the same browser,
+which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
 `users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
 never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
 selects rows by the caller's own username, so it shows the holder their own lock and no one else's.
