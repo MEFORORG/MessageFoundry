@@ -873,6 +873,13 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/chat.ts": Site(1, INTERNAL, _IDE_MEDIA),
     "ide/src/cli.ts": Site(2, OPERATOR, "Fixed venv interpreter paths under the workspace."),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/connectionWizardModel.ts": Site(
+        2,
+        REVIEWED,
+        "connectionServiceConfig resolves the service-config setting and the CLI's fixed fallback "
+        "name under the workspace only to test that they exist; the setting itself, not either "
+        "resolved path, is what it returns for the CLI's --service-config.",
+    ),
     "ide/src/editorToolbar.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/engineTrustModel.ts": Site(
         1, OPERATOR, "The trust anchor setting, resolved under the workspace."
