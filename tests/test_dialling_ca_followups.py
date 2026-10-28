@@ -26,7 +26,12 @@ import pytest
 
 import messagefoundry.auth.trust_anchors as ta
 from messagefoundry.api.app import _ANCHOR_REFUSED_DETAIL, _run_connection_test
-from messagefoundry.auth.trust_anchors import TrustAnchorError
+from messagefoundry.auth.trust_anchors import (
+    AnchorSettingRefused,
+    AnchorStoreUnavailable,
+    TrustAnchorError,
+    trust_anchor_cause,
+)
 from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import DrSettings, EgressSettings
 from messagefoundry.config.wiring import (
@@ -37,7 +42,7 @@ from messagefoundry.config.wiring import (
     env,
 )
 from messagefoundry.pipeline import Engine, wiring_runner
-from messagefoundry.pipeline.dr import DrActivationError, _caused_by_trust_anchor
+from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from tests.test_dr_outlive_deadline import _admin_client, _coordinator, _rows, _seed
@@ -47,8 +52,10 @@ from tests.test_trust_anchors import _block, _path_ok
 
 _IB = "IB_FTPS"
 _PIN_MISMATCH = "does not match its configured SHA-256 pin"
-#: What a step-4 abort says in place of the refusal's own text.
+#: What a step-4 abort says in place of the refusal's own text, when the refusal names no setting.
 _ABORT_LINE = "a trust anchor was refused; the server log says which one and why"
+#: What it says when the refusal names its setting (vault BACKLOG #3498).
+_NAMED_ABORT_LINE = f"a trust anchor was refused (inbound connection '{_IB}' tls_ca_file)"
 #: A pin no file here has, so the lane check refuses the CA.
 _WRONG_PIN = "00" * 32
 
@@ -68,7 +75,7 @@ async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
 
 
 def _poller_graph(
-    ca: Path, pin: Any, *, deployed: bool = True, auto_start: bool = True
+    ca: Path, pin: Any, *, deployed: bool = True, auto_start: bool = True, name: str = _IB
 ) -> Registry:
     """One critical inbound ``Ftp`` poller over FTPS, on a dead loopback port and routed nowhere.
     It is the one inbound that dials out, so the runner checks its CA lane by lane."""
@@ -83,7 +90,7 @@ def _poller_graph(
     )
     reg.add_inbound(
         build_inbound_connection(
-            _IB,
+            name,
             spec,
             router="r",
             priority=Priority.CRITICAL,
@@ -149,7 +156,10 @@ async def test_a_dr_activation_a_poller_ca_refuses_answers_and_records_no_path(
 ) -> None:
     """The reload's lane check refuses the poller's CA, which refuses the activation, and the
     route answers 503. Red under: step 4 of ``DrCoordinator._activate_locked`` taking
-    ``safe_exc(exc)`` for every error, as it did before."""
+    ``safe_exc(exc)`` for every error, as it did before.
+
+    The line names the connection and its setting, and still no part of the path (vault
+    BACKLOG #3498). Red under: step 4 taking the unnamed line for every refusal."""
     ca = _short_ca(tmp_path, monkeypatch)
     dr_engine.add_registry(_poller_graph(ca, _WRONG_PIN))
     await dr_engine.start()
@@ -164,7 +174,7 @@ async def test_a_dr_activation_a_poller_ca_refuses_answers_and_records_no_path(
     assert row["kind"] == "profile"
     for text in (detail, str(row["reason"])):
         assert _leaks(ca, text) == [], text
-        assert _ABORT_LINE in text
+        assert _NAMED_ABORT_LINE in text
         assert "could not bind the priority feeds" in text  # the reload refused, not the preflight
     # The control for the two zeros above: the same needles find the path in the server log,
     # which keeps the refusal's own text.
@@ -237,20 +247,52 @@ async def test_a_dr_activation_refused_by_anything_else_keeps_its_own_text(
 
 
 def test_the_chain_walk_follows_explicit_causes_only_and_ends_on_a_cycle() -> None:
-    """``_caused_by_trust_anchor`` on each shape step 4 can be handed."""
+    """``trust_anchor_cause`` on each shape step 4 can be handed. It is the one copy the DR
+    abort and the API's routes share (vault BACKLOG #3498)."""
     refusal = TrustAnchorError("refused")
-    assert _caused_by_trust_anchor(refusal)
+    assert trust_anchor_cause(refusal) is refusal
     wrapped = ta.refused_connection_anchor(refusal)
-    assert wrapped.__cause__ is refusal and _caused_by_trust_anchor(wrapped)
+    assert wrapped.__cause__ is refusal and trust_anchor_cause(wrapped) is refusal
     # A blank pin is a ValueError, which the reload check wraps in a TrustAnchorError first.
-    assert _caused_by_trust_anchor(ta.refused_connection_anchor(ValueError("a blank pin")))
-    assert not _caused_by_trust_anchor(WiringError("a listener could not bind"))
+    blank = ta.refused_connection_anchor(ValueError("a blank pin"), setting="a lane")
+    assert (found := trust_anchor_cause(blank)) is not None and found.setting == "a lane"
+    assert trust_anchor_cause(WiringError("a listener could not bind")) is None
     looped, other = RuntimeError("a"), RuntimeError("b")
     looped.__cause__, other.__cause__ = other, looped
-    assert not _caused_by_trust_anchor(looped)
+    assert trust_anchor_cause(looped) is None
+
+
+async def test_the_lane_check_names_the_setting_it_refused(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """The lane check says which kind of refusal it raised, and names the setting with no path
+    (vault BACKLOG #3498). A refused file carries its spec's setting, from the audited check and
+    from the remembered repeat alike. A refused setting is an ``AnchorSettingRefused``. Red
+    under: ``_preflight_one`` not setting ``setting``, the repeat not setting it, or the spec's
+    ``ValueError`` raised bare."""
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    ca = _ca(tmp_path)
+    settings = {"tls_ca_file": str(ca), "tls_ca_pin": _WRONG_PIN}
+    for _ in range(2):  # the audited check, then the repeat it remembers
+        with pytest.raises(TrustAnchorError, match=_PIN_MISMATCH) as refused:
+            await check("inbound", _IB, settings)
+        assert refused.value.setting == f"inbound connection '{_IB}' tls_ca_file"
+        assert ca.name in str(refused.value)  # the control: the refusal's own text has the file
+    with pytest.raises(AnchorSettingRefused):
+        await check("inbound", _IB, {**settings, "tls_ca_pin": " "})
 
 
 # --- item 5: the advice a refused setting gets, and a kept failure that stops resolving --------
+
+
+def _raising(exc: BaseException) -> Any:
+    """A lane check that raises ``exc`` for every lane."""
+
+    async def check(_direction: str, _name: str, _settings: object) -> None:
+        raise exc
+
+    return check
+
 
 _FIX_THE_FILE = "Fix the file"
 
@@ -315,10 +357,8 @@ async def test_a_passive_check_that_could_not_run_is_not_told_to_fix_the_file(
     """Nothing read the file, so nothing says it is at fault. Red under: the could-not-be-checked
     arm of ``_preflight_passive_lanes`` given the refused file's advice again."""
 
-    async def cannot_run(_direction: str, _name: str, _settings: object) -> None:
-        raise RuntimeError("the audit store did not answer")
-
     reg = _poller_graph(_ca(tmp_path), _WRONG_PIN)
+    cannot_run = _raising(RuntimeError("the audit store did not answer"))
     runner = _runner(store, reg, lane_anchor_check=cannot_run, dr_standby=Priority.CRITICAL)
     await runner.start()
     try:
@@ -326,6 +366,73 @@ async def test_a_passive_check_that_could_not_run_is_not_told_to_fix_the_file(
         assert _PASSIVE_UNCHECKED in reason
         assert "reload once the cause is fixed" in reason
         assert _FIX_THE_FILE not in reason
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("passive", [False, True], ids=["start", "passive"])
+async def test_only_the_check_says_a_setting_was_refused(
+    store: MessageStore, tmp_path: Path, passive: bool
+) -> None:
+    """A ``WiringError`` is a ``ValueError`` too, and it used to take the setting's line. Only
+    the check's own ``AnchorSettingRefused`` does now (vault BACKLOG #3498). Red under:
+    ``_lane_anchor_fault`` reading any ``ValueError`` as a setting."""
+
+    reg = _poller_graph(_ca(tmp_path), _WRONG_PIN)
+    standby = {"dr_standby": Priority.CRITICAL} if passive else {}
+    refuses = _raising(WiringError("a refusal that is no setting"))
+    runner = _runner(store, reg, lane_anchor_check=refuses, **standby)
+    await runner.start()
+    try:
+        reason = runner.inbound_failed(_IB) or ""
+        assert "its tls_ca_file was refused" in reason and _FIX_THE_FILE in reason
+        assert "setting was refused" not in reason
+    finally:
+        await runner.stop()
+
+
+#: A connection name of an ordinary length that the old 200-character cut could not take whole,
+#: and the longest name ``CONNECTION_NAME_PATTERN`` allows.
+_LONG_NAMES = ["IB_REGIONAL_LAB_RESULTS_FTPS_POLL", "IB_" + "X" * 253]
+
+
+@pytest.mark.parametrize("name", _LONG_NAMES, ids=["ordinary", "longest"])
+@pytest.mark.parametrize(
+    ("raised", "passive", "ending"),
+    [
+        (TrustAnchorError("refused"), False, "the auth.trust_anchor audit rows say why"),
+        (AnchorSettingRefused("blank"), False, "and start the connection; the server log says why"),
+        (AnchorStoreUnavailable("down"), False, "once the store is back; the server log says why"),
+        (TrustAnchorError("refused"), True, "the auth.trust_anchor audit rows say why"),
+        (
+            AnchorSettingRefused("blank"),
+            True,
+            "Fix the setting, then reload; the server log says why",
+        ),
+        (RuntimeError("no answer"), True, "reload once the cause is fixed"),
+    ],
+    ids=["file", "setting", "store", "passive-file", "passive-setting", "passive-unchecked"],
+)
+async def test_a_lane_ca_line_is_kept_whole(
+    store: MessageStore,
+    tmp_path: Path,
+    raised: Exception,
+    passive: bool,
+    ending: str,
+    name: str,
+) -> None:
+    """Every fixed CA line reaches the lane's status whole, advice included, up to the longest
+    connection name (vault BACKLOG #3498). ``safe_exc``'s 200 characters cut the passive lines
+    for any name, and the store's line too. Red under: ``_record_failed`` taking ``safe_exc``'s
+    default for a ``_LaneAnchorLine``."""
+    reg = _poller_graph(_ca(tmp_path), None, name=name)
+    standby = {"dr_standby": Priority.CRITICAL} if passive else {}
+    runner = _runner(store, reg, lane_anchor_check=_raising(raised), **standby)
+    await runner.start()
+    try:
+        reason = runner.inbound_failed(name) or ""
+        assert reason.startswith(f"TrustAnchorError: inbound connection '{name}': its ")
+        assert reason.endswith(ending) and len(reason) > 200, reason
     finally:
         await runner.stop()
 
@@ -416,7 +523,10 @@ async def test_flipping_a_flag_back_ends_a_kept_ca_failure(
     try:
         assert sink.stopped == [_IB]
         await runner.reload(up)  # the control: with nothing changed the failure is kept
-        await runner.reload(_poller_graph(ca, _WRONG_PIN, **{flag: False}))
+        down = _poller_graph(
+            ca, _WRONG_PIN, deployed=flag != "deployed", auto_start=flag != "auto_start"
+        )
+        await runner.reload(down)
         assert runner.inbound_failed(_IB) is not None  # still recorded, so only the flag differs
         with pytest.raises(WiringError, match=_PIN_MISMATCH):
             await runner.reload(_poller_graph(ca, _WRONG_PIN))

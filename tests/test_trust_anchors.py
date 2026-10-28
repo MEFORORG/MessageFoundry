@@ -2821,9 +2821,9 @@ _AUDIT_FAULTS = pytest.mark.parametrize("fail", ["list_audit", "record_audit"])
 
 def _no_anchor_refusal_in(exc: BaseException) -> None:
     """Nothing on the explicit cause chain is an anchor refusal, and the store's OSError is its root."""
-    from messagefoundry.api.app import _caused_by_trust_anchor
+    from messagefoundry.auth.trust_anchors import trust_anchor_cause
 
-    assert not _caused_by_trust_anchor(exc)
+    assert trust_anchor_cause(exc) is None
     root = exc
     while root.__cause__ is not None:
         root = root.__cause__

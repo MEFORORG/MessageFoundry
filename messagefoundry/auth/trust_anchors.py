@@ -285,9 +285,46 @@ class TrustAnchorError(Exception):
     preflight refused the anchor while the store refused one of its ``auth.trust_anchor`` rows
     (BACKLOG #3091). The other is when a check before the store opened refused an anchor that the
     preflight then passed (BACKLOG #3470, module item 10). False does not prove a row exists: a
-    file that cannot be read is refused before any row is written."""
+    file that cannot be read is refused before any row is written.
+
+    ``setting`` names what was refused the way :attr:`AnchorSpec.setting` does, such as
+    ``inbound connection 'IB_X' tls_ca_file``, with no path. The audited check sets it
+    (:func:`_preflight_one`), and so does a reload's lane check (:func:`refused_connection_anchor`).
+    ``None`` where the raiser did not know it. A caller that may not show the refusal's own text,
+    such as a DR activation's abort, shows this instead (vault BACKLOG #3498)."""
 
     unaudited: bool = False
+
+    def __init__(self, *args: object, setting: str | None = None) -> None:
+        super().__init__(*args)
+        self.setting = setting
+
+
+class AnchorSettingRefused(ValueError):
+    """A lane's CA settings were refused before any file was read: at least a ``tls_ca_pin`` that
+    is blank, not text, or set beside a CA the hop never reads. :func:`make_lane_anchor_check`
+    raises it, since that check knows which of its steps refused, so a caller tells a setting to
+    fix from a file to fix by this class and not by a bare ``ValueError``, which a ``WiringError``
+    also is (vault BACKLOG #3498). A malformed pin is still a :class:`TrustAnchorError` from the
+    file check, so it is not one of these."""
+
+
+def trust_anchor_cause(exc: BaseException) -> TrustAnchorError | None:
+    """The first :class:`TrustAnchorError` on ``exc``'s explicit ``__cause__`` chain, ``exc``
+    itself included, or ``None``. It is how the settings, registry and lane checks raise a
+    refusal, and how ``build_test_connector`` wraps one.
+
+    An implicit ``__context__`` is not followed: an unrelated error raised while a refusal was
+    being handled would then lose its own text. A cycle ends the walk. The DR activation's abort
+    and the API's reload and connection-test routes share it (vault BACKLOG #3498)."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, TrustAnchorError):
+            return cur
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return None
 
 
 class AnchorStoreUnavailable(Exception):
@@ -2256,7 +2293,20 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     :class:`TrustAnchorError` that names the setting (:func:`_unreadable_anchor`). A store call that
     fails raises :class:`AnchorStoreUnavailable` instead, so a store fault no longer reads as a
     refused anchor. An anchor the verdict refuses is still refused as one when a store call fails,
-    since the verdict is reached first."""
+    since the verdict is reached first.
+
+    Every refusal it raises carries ``spec.setting`` as its :attr:`TrustAnchorError.setting`, a
+    malformed pin's included (vault BACKLOG #3498)."""
+    try:
+        return await _preflight_checks(store, spec, enforcing=enforcing)
+    except TrustAnchorError as refusal:
+        if refusal.setting is None:
+            refusal.setting = spec.setting
+        raise
+
+
+async def _preflight_checks(store: Store, spec: AnchorSpec, *, enforcing: bool) -> str:
+    """The body of :func:`_preflight_one`, whose docstring says what it checks."""
     shape_error: TrustAnchorError | None = None
     try:
         verdict = await asyncio.to_thread(evaluate_anchor, spec)
@@ -2430,7 +2480,7 @@ def anchor_store_refusal(exc: AnchorStoreUnavailable) -> WiringError:
     return error
 
 
-def refused_connection_anchor(exc: Exception) -> WiringError:
+def refused_connection_anchor(exc: Exception, *, setting: str | None = None) -> WiringError:
     """A connection CA refusal as the ``WiringError`` a reload answers with 422 (BACKLOG #2183).
 
     Its cause is always a :class:`TrustAnchorError`, so the reload routes audit
@@ -2439,13 +2489,20 @@ def refused_connection_anchor(exc: Exception) -> WiringError:
     :class:`AnchorStoreUnavailable`, which is not a refusal: it is answered by
     :func:`anchor_store_refusal`, so the routes audit ``reason="store_unavailable"`` (BACKLOG
     #3091). Raise it ``from`` its own ``__cause__``, which keeps that chain. Shared by the registry
-    preflight and the runner's reload check of the lane CAs (vault BACKLOG #2371)."""
+    preflight and the runner's reload check of the lane CAs (vault BACKLOG #2371).
+
+    ``setting`` fills in :attr:`TrustAnchorError.setting` where the refusal carries none, as a
+    wrapped ``ValueError`` never does. The runner passes the lane's connection (vault BACKLOG
+    #3498)."""
     from messagefoundry.config.wiring import WiringError
 
     if isinstance(exc, AnchorStoreUnavailable):
         return anchor_store_refusal(exc)
-    refused = exc if isinstance(exc, TrustAnchorError) else TrustAnchorError(str(exc))
-    if refused is not exc:
+    if isinstance(exc, TrustAnchorError):
+        refused = exc
+        refused.setting = refused.setting or setting
+    else:
+        refused = TrustAnchorError(str(exc), setting=setting)
         refused.__cause__ = exc
     error = WiringError(f"a connection trust anchor was refused: {refused}")
     error.__cause__ = refused
@@ -2505,8 +2562,9 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
     that reload builds or keeps running, and a refusal refuses the reload. Each label is
     :func:`lane_anchor_spec`'s.
 
-    It raises :class:`TrustAnchorError` for a refused or unreadable file, and ``ValueError`` for a
-    blank or unread ``tls_ca_pin``. Each names the connection. A lane with no CA it reads is a
+    It raises :class:`TrustAnchorError` for a refused or unreadable file, and
+    :class:`AnchorSettingRefused`, a ``ValueError``, for a blank or unread ``tls_ca_pin``. Each
+    names the connection. A lane with no CA it reads is a
     no-op: no store call, no audit row. A store that refuses the audit read or write raises
     :class:`AnchorStoreUnavailable`, which is not a refusal and is not remembered below, so the
     next check reads the file again (BACKLOG #3091).
@@ -2528,10 +2586,14 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
     async def check(direction: str, name: str, settings: Mapping[str, Any]) -> None:
         # A DATABASE lane's spec stats its sslca path (database_ca_anchor_spec), so it is built
         # off the loop; any other lane's spec reads only the settings.
-        if settings.get("odbc_params"):
-            spec = await asyncio.to_thread(lane_anchor_spec, direction, name, settings)
-        else:
-            spec = lane_anchor_spec(direction, name, settings)
+        try:
+            if settings.get("odbc_params"):
+                spec = await asyncio.to_thread(lane_anchor_spec, direction, name, settings)
+            else:
+                spec = lane_anchor_spec(direction, name, settings)
+        except ValueError as exc:
+            # No file was read, so this is a refused setting, and the class says so.
+            raise AnchorSettingRefused(str(exc)) from exc
         if spec is None:
             refused.pop(f"{direction}:{name}", None)
             return
@@ -2539,7 +2601,7 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
         prior = refused.pop(spec.label, None)
         if prior is not None and prior[0] == now:
             refused[spec.label] = prior
-            raise TrustAnchorError(prior[1])
+            raise TrustAnchorError(prior[1], setting=spec.setting)
         try:
             await _preflight_one(store, spec, enforcing=enforcing)
         except TrustAnchorError as exc:

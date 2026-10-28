@@ -63,14 +63,14 @@ from pathlib import Path
 from typing import NoReturn
 
 from messagefoundry import proctree
-from messagefoundry.auth.trust_anchors import TrustAnchorError
+from messagefoundry.auth.trust_anchors import trust_anchor_cause
 from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import Store
 from messagefoundry.store.store import OwnedLanes
 
@@ -103,28 +103,23 @@ def _vip_note(cause: str) -> str:
 #: What a step-4 abort says in place of a trust-anchor refusal's own text (vault BACKLOG #3224).
 #: That text names the CA's path, the folders above it and its SHA-256. The server log comes
 #: first because it always has the refusal: a refused setting, such as a blank ``tls_ca_pin``,
-#: writes no audit row. The connection's name is lost with the text, which is where it lives.
+#: writes no audit row. :func:`_anchor_refused` puts the refused setting in, when known.
 _ANCHOR_REFUSED = (
     "a trust anchor was refused; the server log says which one and why, and a refused file has "
     "auth.trust_anchor audit rows too"
 )
 
 
-def _caused_by_trust_anchor(exc: BaseException) -> bool:
-    """Whether ``exc`` is a :class:`TrustAnchorError` or wraps one through its explicit
-    ``__cause__`` chain, the way the settings, registry and lane checks raise a refusal.
-
-    An implicit ``__context__`` is not followed: an unrelated error raised while a refusal was
-    being handled would then lose its own text. The API's connection-test route walks the chain
-    the same way; ``pipeline/`` cannot import it from there."""
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, TrustAnchorError):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__
-    return False
+def _anchor_refused(setting: str | None) -> str:
+    """:data:`_ANCHOR_REFUSED`, naming the refused setting and its connection when the refusal
+    carries them (:attr:`TrustAnchorError.setting`, vault BACKLOG #3498). That names no path, so
+    an operator reading the 503 or the audit row knows which connection to fix."""
+    if not setting:
+        return _ANCHOR_REFUSED
+    return (
+        f"a trust anchor was refused ({safe_text(setting, limit=120)}); the server log says why, "
+        "and a refused file has auth.trust_anchor audit rows too"
+    )
 
 
 #: The one answer for every refused request archive, whichever check refused it. It names the
@@ -472,8 +467,8 @@ class DrCoordinator:
             await self._activate_profile()
         except Exception as exc:
             self._active = False
-            anchored = _caused_by_trust_anchor(exc)
-            if anchored:
+            refusal = trust_anchor_cause(exc)
+            if refusal is not None:
                 # The refusal's own text goes to the server log only. The reason below reaches
                 # the API caller and the dr_activation_aborted row, which is teed off the box
                 # (vault BACKLOG #3224; BACKLOG #1142 for the connection-test route's same rule).
@@ -487,14 +482,14 @@ class DrCoordinator:
                 if progress.in_preflight
                 else "DR run-profile activation failed (the engine could not bind the priority "
                 "feeds)"
-            ) + f": {_ANCHOR_REFUSED if anchored else safe_exc(exc)}"
+            ) + f": {_anchor_refused(refusal.setting) if refusal is not None else safe_exc(exc)}"
             if progress.hook_ran:
                 reason += _vip_note("The takeover hook ran")
             # The marker this attempt wrote stays, as audit rows do. Naming it here ties it to this
             # abort, so a retry's own marker reads as a second attempt (vault BACKLOG #3094, item
             # 11). The takeover is not undone: a release hook could hand the address to a primary
             # that is down, so the runbook leaves that to the operator.
-            if anchored:
+            if refusal is not None:
                 anchor_abort = reason
             else:
                 await self._record_aborted("profile", reason, actor, now)

@@ -317,6 +317,7 @@ from messagefoundry.auth.trust_anchors import (
     make_settings_anchor_preflight,
     run_anchor_preflight,
     smtp_hop_anchor_spec,
+    trust_anchor_cause,
 )
 from messagefoundry.auth.webauthn import configured_rp_id
 from messagefoundry.config.ai_policy import (
@@ -2426,7 +2427,9 @@ async def _audit_refused_reload(
         status = 503
         answer = "the engine could not reach its store to check a trust anchor; see the engine log"
     elif isinstance(exc, WiringError):
-        anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+        # The whole explicit chain, as the connection-test route and a DR abort read it (vault
+        # BACKLOG #3498); one level saw only the refusal refused_connection_anchor wraps.
+        anchor_refused = trust_anchor_cause(exc) is not None
         warn(
             "config reload %s: %s",
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
@@ -3564,22 +3567,6 @@ async def _audit_alert_rules_withheld(
 _ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
 
 
-def _caused_by_trust_anchor(exc: BaseException) -> bool:
-    """Whether ``exc`` wraps a :class:`TrustAnchorError` through its explicit ``__cause__`` chain.
-
-    Only ``raise ... from``, the way ``build_test_connector`` wraps a build failure. An implicit
-    ``__context__`` is not followed: an unrelated error raised while handling an anchor refusal
-    would then be hidden as one."""
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, TrustAnchorError):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__
-    return False
-
-
 async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
@@ -3629,7 +3616,7 @@ async def _run_connection_test(
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
         # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
         # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
-        if _caused_by_trust_anchor(exc):
+        if trust_anchor_cause(exc) is not None:
             # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
             # full text goes to the operator log, as the reload route's does; the caller and the
             # audit row get a fixed line (BACKLOG #1142).
