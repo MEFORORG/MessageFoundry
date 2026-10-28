@@ -2155,7 +2155,8 @@ Properties of the anonymizer:
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
   scrubbed dataset stays structurally realistic.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
-  loose string search.
+  loose string search. With no site prefix loaded it matches nothing, and
+  `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
   reach. Plain `anonymize` and `anonymize_checked` both refuse it, on the engine and on the tee.

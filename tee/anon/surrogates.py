@@ -125,6 +125,15 @@ def reload_site_prefixes() -> None:
 reload_site_prefixes()
 
 
+def site_prefixes_loaded() -> bool:
+    """True when at least one site-code prefix loaded, so the site-code scrub can match anything.
+
+    False whatever the cause: no token source, a file that could not be read, or a source with no
+    two-digit entry under ``[site_prefix]``. A caller with a console of its own says so there,
+    because nothing here logs it (BACKLOG #3516)."""
+    return bool(_SITE_PREFIXES)
+
+
 #: What :class:`SurrogateKind.FREETEXT` collapses a narrative field to. Free text routinely embeds
 #: identifiers (a name/MRN/DOB in prose) that field-level surrogation cannot reach and the leak-check
 #: only catches as known tokens — so the default is a blunt full-redact (ADR 0030 §3).

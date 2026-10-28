@@ -50,6 +50,7 @@ from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
 from tee.anon.leak import CoverageTally
 from tee.anon.rules import AnonError, RuleError, kept_defaults, load_rules, retargeted_defaults
+from tee.anon.surrogates import site_prefixes_loaded
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -659,6 +660,18 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     except RuleError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    # Printed whatever the cause, and before the store is read, so every run says it. With no
+    # prefix the site-code scrub matches nothing, and the leak-check's live-tables field does not
+    # name the prefix. A warning, not a refusal: a token-less public build loads none (BACKLOG #3516).
+    if not site_prefixes_loaded():
+        print(
+            "warning: no site prefix loaded, so no site code is scrubbed. The token source "
+            "(MEFOR_FORBIDDEN_TOKENS, or else scripts/security/scan-tokens.local.txt in the "
+            "checkout that holds the tee) is unset, missing or unreadable, or has no two-digit "
+            "entry under [site_prefix]",
+            file=sys.stderr,
+        )
 
     # The store is read AFTER both checks above. Read before them, a run with no captured bodies
     # returned here and never read the overlay, so a bad one stayed hidden until a run that had
