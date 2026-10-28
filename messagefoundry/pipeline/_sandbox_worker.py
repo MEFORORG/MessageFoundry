@@ -211,16 +211,19 @@ def _install_import_guard(forbidden: tuple[str, ...]) -> None:
 class _Broker:
     """The worker's half of the ``mode=isolated`` lookup broker (ADR 0147).
 
-    Its two runners stand in for the engine's while a Handler runs: each writes one ``lookup`` frame
-    to the parent and blocks on the parent's one reply, so a ``db_lookup``/``fhir_lookup`` call
-    returns what the parent's own runner returned, or raises the lookup's own error type with the
-    parent's reason. The parent decides every call; this side only asks.
+    :meth:`runners` hands out a dispatch's two runners, which stand in for the engine's while its
+    Handler runs: each writes one ``lookup`` frame to the parent and blocks on the parent's one reply,
+    so a ``db_lookup``/``fhir_lookup`` call returns what the parent's own runner returned, or raises the
+    lookup's own error type with the parent's reason. The parent decides every call; this side only
+    asks.
 
-    Calls are serialized under one lock, because the pipe carries one exchange at a time. A call made
-    while no dispatch is in flight, such as from a thread a Handler left running, is refused rather
-    than written: the parent would read the frame as unsolicited and drop the worker, and its read of
-    stdin would take the next request frame as its reply. A desynchronized or closed pipe marks the
-    broker broken, and :func:`main` exits after the dispatch, so the parent starts a fresh worker."""
+    Calls are serialized under one lock, because the pipe carries one exchange at a time. A runner
+    serves only the dispatch it was handed out for. A call from anywhere else, such as a thread a
+    Handler left running that holds an earlier dispatch's runner, is refused rather than written:
+    between dispatches the parent would read the frame as unsolicited and drop the worker, and during
+    another dispatch the lookup would be charged to that message. A desynchronized or closed pipe marks
+    the broker broken, and :func:`main` then exits without answering, so the message whose exchange
+    broke is the one that fails and the parent starts a fresh worker for the next."""
 
     def __init__(self, stdin: Any, stdout: Any) -> None:
         self._stdin = stdin
@@ -240,20 +243,36 @@ class _Broker:
         with self._lock:
             self._req = None
 
-    def db(self, connection: str, statement: str, params: Any = None) -> Any:
+    def runners(self, req: Any) -> tuple[Any, Any]:
+        """The ``(db_lookup, fhir_lookup)`` runners for dispatch ``req`` alone."""
         from messagefoundry.config.db_lookup import DbLookupError
-        from messagefoundry.pipeline._sandbox_codec import LOOKUP_DB
-
-        return self._ask(LOOKUP_DB, DbLookupError, "db_lookup", connection, statement, params)
-
-    def fhir(self, connection: str, query: str, params: Any = None) -> Any:
         from messagefoundry.config.fhir_lookup import FhirLookupError
-        from messagefoundry.pipeline._sandbox_codec import LOOKUP_FHIR
+        from messagefoundry.fhirsearch import resolve_search_pairs
+        from messagefoundry.pipeline._sandbox_codec import LOOKUP_DB, LOOKUP_FHIR
 
-        return self._ask(LOOKUP_FHIR, FhirLookupError, "fhir_lookup", connection, query, params)
+        def db(connection: str, statement: str, params: Any = None) -> Any:
+            return self._ask(
+                req, LOOKUP_DB, DbLookupError, "db_lookup", connection, statement, params
+            )
+
+        def fhir(connection: str, query: str, params: Any = None) -> Any:
+            if params is not None:
+                # fhirsearch's own check, so a value of the wrong kind or carrying a separator fails
+                # with the words the engine's executor would give it at mode=off. The engine checks
+                # again on its side.
+                try:
+                    resolve_search_pairs(params)
+                except ValueError as exc:
+                    raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from None
+            return self._ask(
+                req, LOOKUP_FHIR, FhirLookupError, "fhir_lookup", connection, query, params
+            )
+
+        return db, fhir
 
     def _ask(
         self,
+        req: Any,
         kind: str,
         error: type[Exception],
         fn: str,
@@ -262,13 +281,12 @@ class _Broker:
         params: object,
     ) -> Any:
         from messagefoundry.pipeline import _sandbox_codec as codec
-        from messagefoundry.pipeline._sandbox_codec import SandboxError
+        from messagefoundry.pipeline._sandbox_codec import MAX_FRAME, SandboxError
         from messagefoundry.pipeline.sandbox import _read_frame_bytes, _write_frame
 
         with self._lock:
-            req = self._req
-            if req is None or self.broken:
-                raise error(f"{fn}: no Handler dispatch is in flight in this sandbox worker")
+            if self._req is not req or self.broken:
+                raise error(f"{fn}: called outside the Handler dispatch it was published for")
             self._seq += 1
             seq = self._seq
             try:
@@ -282,9 +300,12 @@ class _Broker:
                     target=target,
                     params=params,
                 )
+                if len(frame) > MAX_FRAME:
+                    raise SandboxError(f"the lookup frame is {len(frame)} bytes, over the cap")
             except SandboxError as exc:
-                # A bad argument fails as the call would in-process: the lookup's own error, and the
-                # pipe untouched. Nothing was written.
+                # A bad or oversized argument fails as the call would in-process: the lookup's own
+                # error. Nothing was written, so the pipe is still in step; the next call reuses seq.
+                self._seq -= 1
                 raise error(f"{fn}: its arguments cannot cross the sandbox: {exc}") from None
             try:
                 _write_frame(self._stdout, frame)
@@ -295,9 +316,8 @@ class _Broker:
                     body, request_id=req.request_id, phase=req.phase, name=req.name, seq=seq
                 )
             except (OSError, SandboxError) as exc:
-                # An over-cap frame raises before a byte is written, so only a pipe the parent
-                # abandoned, or a reply that does not answer this call, gets here. Either way the
-                # pipe no longer lines up with the protocol.
+                # A pipe the parent abandoned, or a reply that does not answer this call: the pipe no
+                # longer lines up with the protocol.
                 self.broken = True
                 raise error(f"{fn}: the sandbox lookup broker failed: {exc}") from None
         if not ok:
@@ -353,12 +373,14 @@ def _run_one(
 
     # The brokered runners exist only for a Handler: a Router or an accepts= predicate finds no
     # runner, so its lookup raises the "unavailable here" error it raises at mode=off.
-    brokered = broker is not None and phase == "transform"
+    db_runner, fhir_runner = (
+        broker.runners(req) if broker is not None and phase == "transform" else (None, None)
+    )
     try:
         with (
             run_contexts(run_context, phase=phase_key),
-            db_lookup_mod.activated(broker.db if brokered and broker else None),
-            fhir_lookup_mod.activated(broker.fhir if brokered and broker else None),
+            db_lookup_mod.activated(db_runner),
+            fhir_lookup_mod.activated(fhir_runner),
         ):
             result = fn(req.payload)
             if phase == "transform":
@@ -500,10 +522,6 @@ def main() -> int:
     # mode=isolated (ADR 0147): a Handler's lookups are asked of the parent over this same pipe.
     broker = _Broker(stdin, stdout) if boot.broker else None
     while True:
-        if broker is not None and broker.broken:
-            # A lookup exchange went out of step with the protocol; the next request frame cannot be
-            # trusted to line up either. The parent reads EOF and starts a fresh worker.
-            return 1
         frame = _read_frame_bytes(stdin)
         if frame is None:
             return 0  # parent closed the pipe — clean shutdown
@@ -527,6 +545,11 @@ def main() -> int:
             resp, detail = None, _error_text(exc)
         if broker is not None:
             broker.end()  # before the answer: no lookup frame may follow it
+            if broker.broken:
+                # A lookup exchange went out of step. Exit WITHOUT answering, so the parent reads EOF
+                # and fails THIS message, rather than answer and leave the next message to find a
+                # worker on its way out.
+                return 1
         if resp is None:
             # A call that ran out of memory may leave memory held (a module global, a cache, a
             # fragmented heap), and the next innocent message would pay for it. Answer, then exit so

@@ -1299,6 +1299,13 @@ def decode_response(body: bytes, *, request_id: str, phase: str, name: str) -> R
     :meth:`sandbox.SandboxSession.dispatch` supplies the other half — an unsolicited frame queued
     before or after a dispatch is fatal to the worker — so a pre-staged answer has no window at all."""
     header, reader, kind = _open(body, ("ok", "fail"))
+    return _answer(header, reader, kind, request_id=request_id, phase=phase, name=name)
+
+
+def _answer(
+    header: dict[str, Any], reader: _Reader, kind: str, *, request_id: str, phase: str, name: str
+) -> Response:
+    """The ``ok``/``fail`` body of :func:`decode_response`, on a frame already opened."""
     _check_binding(header, request_id, phase, name)
     if kind == "ok":
         if "result" not in header:
@@ -1312,6 +1319,18 @@ def decode_response(body: bytes, *, request_id: str, phase: str, name: str) -> R
     error = reader.text(header.get("error"))
     reader.finish()
     return Response(ok=False, result=None, kind=fail_kind, error=error)
+
+
+def _check_binding(header: dict[str, Any], request_id: str, phase: str, name: str) -> None:
+    """Refuse a frame whose ``(id, phase, name)`` is not the dispatch's (see :func:`decode_response`)."""
+    if _req_str(header.get("id"), "response id") != request_id:
+        raise SandboxCodecError(
+            f"sandbox response correlation mismatch (expected request {request_id!r})"
+        )
+    if _req_str(header.get("phase"), "response phase") != phase:
+        raise SandboxCodecError(f"sandbox response phase mismatch (expected {phase!r})")
+    if _req_str(header.get("name"), "response name") != name:
+        raise SandboxCodecError(f"sandbox response name mismatch (expected {name!r})")
 
 
 # --- the lookup broker (mode=isolated, ADR 0147) ------------------------------
@@ -1328,21 +1347,21 @@ LOOKUP_FHIR: Final = "fhir"
 
 @dataclass(frozen=True)
 class LookupRequest:
-    """One decoded ``lookup`` frame (parent side). ``statement`` is set for a db lookup and
-    ``query`` for a fhir one; ``params`` is rebuilt as the in-process call would have received it."""
+    """One decoded ``lookup`` frame (parent side). ``target`` is the statement of a db lookup or the
+    query of a fhir one; ``params`` is rebuilt as the in-process call would have received it."""
 
     seq: int
     kind: str
     connection: str
-    statement: str | None
-    query: str | None
+    target: str
     params: Any
 
 
 def _enc_fhir_params(params: object, blobs: _Blobs) -> Any:
     """A ``fhir_lookup`` ``params`` mapping in its own small grammar: ``[key, is_list, items]`` per
     key, each item ``{"s": str}``, ``{"k": [system, code]}`` or ``{"r": raw}``. Only the three kinds
-    :mod:`messagefoundry.fhirsearch` takes cross; the parent's own executor screens their content."""
+    :mod:`messagefoundry.fhirsearch` takes cross. The worker runs fhirsearch's own check before it
+    gets here, so a refusal below is a backstop; the parent's executor screens the content."""
     if params is None:
         return None
     if not isinstance(params, Mapping):
@@ -1363,11 +1382,8 @@ def _enc_fhir_params(params: object, blobs: _Blobs) -> Any:
             elif isinstance(one, FhirRaw):
                 items.append({"r": blobs.ref(one.value)})
             else:
-                # The words fhirsearch's own refusal uses; the value is withheld, as there.
                 raise SandboxCodecError(
-                    f"FHIR search parameter {key!r}: a search value must be a str (data), a "
-                    f"FhirToken(system, code), or a FhirRaw(...) author-syntax value -- got "
-                    f"{type(one).__name__}. (The value is withheld: it may carry PHI.)"
+                    f"FHIR search parameter {key!r}: a {type(one).__name__} is not a search value"
                 )
         out.append([key, is_list, items])
     return out
@@ -1422,6 +1438,11 @@ def encode_lookup(
     fhir one. Raises :class:`SandboxCodecError` for an argument outside the grammar, which the worker
     turns into the lookup's own error type, as the in-process call would fail on a bad argument."""
     blobs = _Blobs()
+    # Segment order IS walk order (see _Reader): connection, then target, then params, the order
+    # decode_answer reads them in. Building params first would number its segments ahead of the
+    # other two, and any lookup with a long params value and a long statement would not decode.
+    conn_ref = blobs.ref(connection)
+    target_ref = blobs.ref(target)
     if kind == LOOKUP_DB:
         if params is not None and not isinstance(params, Mapping):
             raise SandboxCodecError(
@@ -1439,25 +1460,13 @@ def encode_lookup(
             "name": name,
             "seq": seq,
             "kind": kind,
-            "connection": blobs.ref(connection),
-            "target": blobs.ref(target),
+            "connection": conn_ref,
+            "target": target_ref,
             "params": enc_params,
         },
         "lookup",
     )
     return encode_frame(header, blobs.items)
-
-
-def _check_binding(header: dict[str, Any], request_id: str, phase: str, name: str) -> None:
-    """Refuse a frame whose ``(id, phase, name)`` is not the dispatch's (see :func:`decode_response`)."""
-    if _req_str(header.get("id"), "response id") != request_id:
-        raise SandboxCodecError(
-            f"sandbox response correlation mismatch (expected request {request_id!r})"
-        )
-    if _req_str(header.get("phase"), "response phase") != phase:
-        raise SandboxCodecError(f"sandbox response phase mismatch (expected {phase!r})")
-    if _req_str(header.get("name"), "response name") != name:
-        raise SandboxCodecError(f"sandbox response name mismatch (expected {name!r})")
 
 
 def decode_answer(
@@ -1469,7 +1478,7 @@ def decode_answer(
     mode can be talked into brokering a lookup."""
     header, reader, kind = _open(body, ("ok", "fail", "lookup"))
     if kind != "lookup":
-        return decode_response(body, request_id=request_id, phase=phase, name=name)
+        return _answer(header, reader, kind, request_id=request_id, phase=phase, name=name)
     _check_binding(header, request_id, phase, name)
     seq = _req_int(header.get("seq"), "lookup seq")
     lookup_kind = header.get("kind")
@@ -1488,12 +1497,7 @@ def decode_answer(
         params = _dec_fhir_params(header.get("params"), reader)
     reader.finish()
     return LookupRequest(
-        seq=seq,
-        kind=lookup_kind,
-        connection=connection,
-        statement=target if lookup_kind == LOOKUP_DB else None,
-        query=target if lookup_kind == LOOKUP_FHIR else None,
-        params=params,
+        seq=seq, kind=lookup_kind, connection=connection, target=target, params=params
     )
 
 

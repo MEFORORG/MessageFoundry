@@ -1288,7 +1288,7 @@ everything this section says about `subprocess` holds for it except the lookups:
   serving finishes or times out on its own bound before the cap is checked, so one call can outrun
   the cap by up to one lookup's timeout.
 - **It needs a config directory.** A graph built in code with none cannot start a worker. Under
-  `subprocess` such a graph quietly runs in-process; under `isolated` each of its messages fails
+  `subprocess` such a graph quietly runs in-process; under `isolated` the runner refuses to be built
   instead, because in-process its lookups would not go through the broker.
 
 **What `isolated` does not do yet:** confine the worker at the operating-system level. ADR 0147's

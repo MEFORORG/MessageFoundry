@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -342,7 +343,7 @@ def test_the_parent_refuses_a_lookup_bound_to_a_router_dispatch(tmp_path: Path) 
     # The worker has no runner on a Router, so it never asks; the parent refuses one anyway.
     session = _session(str(tmp_path), SandboxMode.ISOLATED)
     lookup = codec.LookupRequest(
-        seq=1, kind=codec.LOOKUP_DB, connection="LK", statement="SELECT 1", query=None, params=None
+        seq=1, kind=codec.LOOKUP_DB, connection="LK", target="SELECT 1", params=None
     )
     for phase in ("router", "accepts"):
         refusal = session._lookup_refusal(phase, lookup)
@@ -365,7 +366,7 @@ def test_a_lookup_frame_drops_a_subprocess_worker() -> None:
     with pytest.raises(codec.SandboxCodecError, match="unexpected sandbox frame type 'lookup'"):
         codec.decode_response(frame, request_id="r1", phase="transform", name="h")
     answer = codec.decode_answer(frame, request_id="r1", phase="transform", name="h")
-    assert isinstance(answer, codec.LookupRequest) and answer.statement == "SELECT 1"
+    assert isinstance(answer, codec.LookupRequest) and answer.target == "SELECT 1"
     # Bound to the dispatch in flight (ADR 0147 AC-6): another dispatch's id is refused.
     with pytest.raises(codec.SandboxCodecError, match="correlation mismatch"):
         codec.decode_answer(frame, request_id="r2", phase="transform", name="h")
@@ -537,23 +538,30 @@ async def test_a_brokered_write_is_refused_by_the_executors_read_only_test(
 def test_isolated_with_no_config_dir_refuses_rather_than_run_in_process(tmp_path: Path) -> None:
     from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
-    registry = Registry()  # a graph built in code: no source_dir, no snapshot
-    runner = RegistryRunner(
-        registry,
-        object(),  # type: ignore[arg-type]
-        sandbox_policy=SandboxPolicy(mode=SandboxMode.ISOLATED),
-        egress=EgressSettings(deny_by_default=False),
-    )
+    def runner_for(mode: SandboxMode) -> RegistryRunner:
+        return RegistryRunner(
+            Registry(),  # a graph built in code: no source_dir, no snapshot
+            object(),  # type: ignore[arg-type]
+            sandbox_policy=SandboxPolicy(mode=mode),
+            sandbox_config_source=(None, None),
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+    # Refused at construction, before anything is received.
+    with pytest.raises(ValueError, match="never runs a Router or Handler in the engine"):
+        runner_for(SandboxMode.ISOLATED)
+    # mode=subprocess keeps its documented degradation to in-process for such a graph.
+    runner = runner_for(SandboxMode.SUBPROCESS)
+    assert runner._sandbox_for("IB_ANY") is None
+    # And the per-message backstop, for a policy that reaches the runner by another route.
+    runner._sandbox_policy = SandboxPolicy(mode=SandboxMode.ISOLATED)
     with pytest.raises(SandboxError, match="never runs a Router or Handler in the engine"):
         runner._sandbox_for("IB_ANY")
-    # mode=subprocess keeps its documented degradation to in-process for such a graph.
-    runner._sandbox_policy = SandboxPolicy(mode=SandboxMode.SUBPROCESS)
-    assert runner._sandbox_for("IB_ANY") is None
 
 
 @pytest.mark.parametrize("mode", [SandboxMode.SUBPROCESS, SandboxMode.ISOLATED])
 async def test_fusion_is_disabled_in_every_worker_mode(
-    mode: SandboxMode, caplog: pytest.LogCaptureFixture
+    mode: SandboxMode, caplog: pytest.LogCaptureFixture, tmp_path: Path
 ) -> None:
     from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
@@ -561,9 +569,149 @@ async def test_fusion_is_disabled_in_every_worker_mode(
         Registry(),
         object(),  # type: ignore[arg-type]
         sandbox_policy=SandboxPolicy(mode=mode),
+        sandbox_config_source=(str(tmp_path), None),
         egress=EgressSettings(deny_by_default=False),
     )
     runner._fuse_thread_hops = True
     with caplog.at_level("WARNING"):
         assert await runner._activate_fusion() is False
     assert any(f"[sandbox].mode={mode.value}" in r.getMessage() for r in caplog.records)
+
+
+# --- 5. round-one review fixes ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", [codec.LOOKUP_DB, codec.LOOKUP_FHIR])
+def test_a_lookup_with_long_arguments_round_trips(kind: str) -> None:
+    # Every slot past the inline threshold rides a segment, and segments must be numbered in the
+    # order the decoder reads them: connection, target, then params.
+    long = "x" * 5000
+    params: Any = {"k": long} if kind == codec.LOOKUP_DB else {"identifier": FhirToken("S", long)}
+    frame = codec.encode_lookup(
+        request_id="r1",
+        phase="transform",
+        name="h",
+        seq=1,
+        kind=kind,
+        connection="C" * 5000,
+        target="SELECT " + long if kind == codec.LOOKUP_DB else "Patient" + long,
+        params=params,
+    )
+    answer = codec.decode_answer(frame, request_id="r1", phase="transform", name="h")
+    assert isinstance(answer, codec.LookupRequest)
+    assert answer.connection == "C" * 5000 and answer.params == params
+
+
+def _worker_broker() -> Any:
+    """The worker's ``_Broker``. Importing the worker installs a stderr root handler, which is right
+    in its child process and wrong here, so the root logger is restored after the import, as the
+    ``sandbox_run_one`` fixture in tests/test_db_lookup.py does."""
+    import logging
+
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    try:
+        from messagefoundry.pipeline import _sandbox_worker
+    finally:
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        for h in handlers:
+            root.addHandler(h)
+        root.setLevel(level)
+    return _sandbox_worker._Broker
+
+
+def test_a_runner_serves_only_the_dispatch_it_was_published_for() -> None:
+    import io
+    from types import SimpleNamespace
+
+    from messagefoundry.config.db_lookup import DbLookupError
+
+    broker_cls = _worker_broker()
+    out = io.BytesIO()
+    broker = broker_cls(io.BytesIO(), out)
+    first = SimpleNamespace(request_id="a", phase="transform", name="h")
+    second = SimpleNamespace(request_id="b", phase="transform", name="h")
+    broker.begin(first)
+    stale_db, _ = broker.runners(first)
+    broker.end()
+    broker.begin(second)
+    # A thread left over from the first message still holds its runner: refused, nothing written.
+    with pytest.raises(DbLookupError, match="outside the Handler dispatch"):
+        stale_db("LK", "SELECT 1", None)
+    assert out.getvalue() == b""
+    assert not broker.broken
+
+
+def test_an_oversized_lookup_fails_the_call_and_keeps_the_pipe_in_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    from types import SimpleNamespace
+
+    from messagefoundry.config.db_lookup import DbLookupError
+
+    monkeypatch.setattr(codec, "MAX_FRAME", 1024)
+    broker_cls = _worker_broker()
+    out = io.BytesIO()
+    broker = broker_cls(io.BytesIO(), out)
+    req = SimpleNamespace(request_id="a", phase="transform", name="h")
+    broker.begin(req)
+    db, _ = broker.runners(req)
+    with pytest.raises(DbLookupError, match="cannot cross the sandbox"):
+        db("LK", "SELECT 1", {"k": "x" * 4096})
+    assert out.getvalue() == b"" and not broker.broken
+
+
+def test_a_worker_that_stops_reading_cannot_hold_the_dispatch_past_the_cap(
+    graph: tuple[Registry, str],
+) -> None:
+    # A Handler forges a lookup whose reply is far larger than the pipe buffer, then sleeps instead
+    # of reading it. Unbounded, the parent's write of the reply blocks with the session lock held,
+    # and the wall cap never fires. The cap must still end the dispatch.
+    def big(connection: str, statement: str, params: Any) -> list[dict[str, Any]]:
+        return [{"v": "x" * 2_000_000}]
+
+    _, config_dir = graph
+    source = (Path(config_dir) / "graph.py").read_text(encoding="utf-8") + _FORGER
+    (Path(config_dir) / "graph.py").write_text(source, encoding="utf-8")
+    registry = load_config(config_dir)
+    session = SandboxSession(
+        SandboxPolicy(
+            mode=SandboxMode.ISOLATED, wall_seconds=3.0, lookup_allowed_db=("db.example",)
+        ),
+        inbound="IB_I",
+        config_dir=config_dir,
+        env=None,
+        graph=None,
+    )
+    try:
+        started = time.monotonic()
+        with db_lookup_mod.activated(big), pytest.raises(SandboxError, match="wall cap"):
+            _bodies(registry, "h_forge_lookup", session)
+        assert time.monotonic() - started < 30
+    finally:
+        session.close()
+
+
+_FORGER = """
+
+@handler("h_forge_lookup")
+def h_forge_lookup(msg):
+    import os, sys, time
+
+    from messagefoundry.pipeline import _sandbox_codec as codec
+
+    # The dispatch's request object is a local of the worker's main loop.
+    frame = sys._getframe()
+    while frame is not None and "req" not in frame.f_locals:
+        frame = frame.f_back
+    req = frame.f_locals["req"]
+    body = codec.encode_lookup(
+        request_id=req.request_id, phase=req.phase, name=req.name, seq=1, kind="db",
+        connection="LK", target="SELECT 1", params=None,
+    )
+    os.write(1, len(body).to_bytes(4, "big") + body)
+    time.sleep(60)  # never reads the reply
+    return Send("OB_I", "unreachable")
+"""

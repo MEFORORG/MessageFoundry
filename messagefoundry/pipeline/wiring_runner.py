@@ -1317,6 +1317,18 @@ class RegistryRunner:
         # construction (a /config/reload does NOT re-read it — restart to change, like claim_mode).
         self._sandbox_policy = sandbox_policy
         self._sandbox_config_source = sandbox_config_source
+        if (
+            sandbox_policy is not None
+            and sandbox_policy.mode is SandboxMode.ISOLATED
+            and registry.source_dir is None
+            and (sandbox_config_source is None or sandbox_config_source[0] is None)
+        ):
+            # Refused here, before a listener ACKs anything, rather than once per message by
+            # _sandbox_for, whose refusal stays as the backstop for a reload (vault BACKLOG #3131).
+            raise ValueError(
+                "[sandbox].mode=isolated needs a config directory for its workers to load, and "
+                "this graph has none: it never runs a Router or Handler in the engine process"
+            )
         self._sandbox_sessions: dict[str, SandboxSession] = {}
         self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # Sessions read that cache from their worker threads. Two building it at once would each
