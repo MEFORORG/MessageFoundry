@@ -499,6 +499,9 @@ def test_each_residual_prints_as_the_rule_off_redactor_does() -> None:
     on = [_all_paths(text) for text in texts]
     with _rule_off():
         off = [_all_paths(text) for text in texts]
+    # The floor the vacuous-absence lint reads: the walk below compares something. The exact count
+    # above already implies it, but an ``==`` is not a shape that lint accepts as a guard.
+    assert len(texts) > 0
     changed = [text for text, a, b in zip(texts, on, off, strict=True) if a != b]
     assert not changed, changed[:5]
 
