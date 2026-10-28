@@ -200,72 +200,100 @@ def test_the_privilege_probe_keeps_no_password_in_its_problems_or_log(
     ],
 )
 def test_the_check_agrees_with_requests_own_reads(form: str) -> None:
-    """The check refuses exactly the URLs a plain requests session fails on before it dials. A
-    plain session with the URL as its proxy, aimed at a closed port, fails on its own reads, or
-    gets as far as the dial and gets a ``ConnectionError``. Mutation: drop the Latin-1 encode from
-    the check; red on the last unsendable row. Drop the raw ``urlparse``; red on the first. Read
-    on requests 2.34.2; a requests that reads the
-    URL differently goes red here rather than leaving the check out of step."""
+    """On each row, the check refuses the URL exactly when a plain requests session fails on it
+    before it dials. A plain session with the URL as its proxy, aimed at a closed port, fails on its
+    own reads, or gets as far as the dial and gets a ``ConnectionError``. Not every shape agrees: a
+    URL with no host fails requests' host check, whose error is fixed text, and passes the check.
+    Mutation: drop the Latin-1 encode from the check; red on the last unsendable row. Drop the raw
+    ``urlparse``; red on the first. Read on requests 2.34.2; a requests that reads these URLs
+    differently goes red here rather than leaving the check out of step."""
     import requests
 
     from messagefoundry.transports.strict_requests import _proxy_url_requests_cannot_send
 
     proxy = form.format(port=_closed_port())
-    session = requests.Session()
-    session.trust_env = False  # only the proxy passed below applies
-    try:
-        session.get(_HTTPS_VAULT, proxies={"https": proxy}, timeout=5)
-    except requests.exceptions.ConnectionError:
-        dialled = True
-    except (ValueError, TypeError, requests.exceptions.RequestException):
-        dialled = False
-    else:
-        pytest.fail("a closed port answered")
+    with requests.Session() as session:
+        session.trust_env = False  # only the proxy passed below applies
+        try:
+            session.get(_HTTPS_VAULT, proxies={"https": proxy}, timeout=5)
+        except requests.exceptions.ConnectionError:
+            dialled = True
+        except (ValueError, TypeError, requests.exceptions.RequestException):
+            dialled = False
+        else:
+            pytest.fail("a closed port answered")
     assert _proxy_url_requests_cannot_send(proxy) is not dialled
 
 
-def test_the_build_refuses_it_before_the_unverifiable_leg_check() -> None:
-    """At construction the check runs in the send-time order: after the cleartext-credential
+@pytest.mark.parametrize(
+    ("proxy", "expected"),
+    [
+        # An https:// proxy in front of an http:// Vault: the unverifiable-leg check would refuse
+        # it too, so this pins the new check ahead of that one.
+        (_UNSENDABLE[0], "_UNSENDABLE_PROXY_URL"),
+        # The same URL as an http:// proxy: the cleartext-credential check comes first.
+        ("http" + _UNSENDABLE[0].removeprefix("https"), "_CLEARTEXT_PROXY_CREDENTIALS"),
+    ],
+    ids=["before-the-leg-check", "after-the-credential-check"],
+)
+def test_the_build_runs_the_check_in_the_send_time_order(proxy: str, expected: str) -> None:
+    """At construction the check runs where it runs on a send: after the cleartext-credential
     check, before the https-proxy-for-an-http-Vault check. So a hop gets one refusal at both
-    points."""
+    points. The Vault is loopback http, which every one of the three checks would refuse.
+    Mutation: move the new check below the leg check; red on the first row. Move it above the
+    credential check; red on the second."""
     import requests
 
-    from messagefoundry.transports.strict_requests import (
-        _UNSENDABLE_PROXY_URL,
-        VaultHopRefused,
-        _refuse_an_insecure_vault_hop,
-    )
+    from messagefoundry.transports import strict_requests
 
-    session = requests.Session()
-    session.trust_env = False
-    with pytest.raises(VaultHopRefused) as caught:
-        _refuse_an_insecure_vault_hop(
-            session,
-            _HTTPS_VAULT,
-            connector="Vault test hop",
-            request_proxies={"https": _UNSENDABLE[0].format(port=_closed_port())},
-        )
-    assert str(caught.value) == f"Vault test hop: {_UNSENDABLE_PROXY_URL}"
+    with requests.Session() as session:
+        session.trust_env = False
+        with pytest.raises(strict_requests.VaultHopRefused) as caught:
+            strict_requests._refuse_an_insecure_vault_hop(
+                session,
+                "http://127.0.0.1:8200",
+                connector="Vault test hop",
+                request_proxies={"http": proxy.format(port=_closed_port())},
+            )
+    assert str(caught.value) == f"Vault test hop: {getattr(strict_requests, expected)}"
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
-def test_proxy_manager_for_refuses_it_on_its_own() -> None:
-    """The second send-time check, for a requests too old to call the hook. Mutation: drop it;
-    red."""
+def _adapter() -> Any:
     import ssl
 
-    from messagefoundry.transports.strict_requests import (
-        _UNSENDABLE_PROXY_URL,
-        StrictReplyAdapter,
-    )
+    from messagefoundry.transports.strict_requests import StrictReplyAdapter
 
-    adapter = StrictReplyAdapter(
+    return StrictReplyAdapter(
         connector="Vault test hop",
         ssl_context_factory=ssl.create_default_context,
         revocation_attested=True,
         attestation_section="secrets",
     )
+
+
+def test_proxy_manager_for_refuses_it_on_its_own() -> None:
+    """A send-time check for a requests too old to call the hook. Mutation: drop it; red."""
+    from messagefoundry.transports.strict_requests import _UNSENDABLE_PROXY_URL
+
+    adapter = _adapter()
     with pytest.raises(InsecureHopRefused) as caught:
-        adapter.proxy_manager_for(_UNSENDABLE[1].format(port=3128))
+        adapter.proxy_manager_for(_UNSENDABLE[3].format(port=3128))
     assert str(caught.value) == f"Vault test hop: {_UNSENDABLE_PROXY_URL}"
     assert adapter.proxy_manager == {}, "a manager was built for the refused proxy"
+
+
+def test_request_url_refuses_it_on_its_own() -> None:
+    """requests reads the raw proxy URL in ``request_url``, after the pool is built, and only that
+    read fails on the first row: ``proxy_manager_for`` gets the URL with that character already
+    percent-encoded. Mutation: drop the check in ``request_url``; red, requests' error quotes the
+    password."""
+    import requests
+
+    from messagefoundry.transports.strict_requests import _UNSENDABLE_PROXY_URL
+
+    prepared = requests.Request("GET", _HTTPS_VAULT + "/v1/sys/health").prepare()
+    with pytest.raises(InsecureHopRefused) as caught:
+        _adapter().request_url(prepared, {"https": _UNSENDABLE[0].format(port=3128)})
+    assert str(caught.value) == f"Vault test hop: {_UNSENDABLE_PROXY_URL}"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None

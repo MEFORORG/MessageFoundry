@@ -111,33 +111,18 @@ def _why(exc: BaseException) -> str:
     # hvac maps a 403 to Forbidden; say what it means without importing hvac here.
     if name == "Forbidden":
         return f"permission denied ({name})"
+    from messagefoundry.config.wiring import _raised_by_the_engine
+
+    # Exactly ValueError, not a subclass: the probe's own shape refusals and the TLS-suite
+    # assertion raise it with engine-written text. A subclass, such as a JSON decode error, can
+    # quote what the server sent, so it keeps the type name alone. So does a ValueError a library
+    # raised (vault BACKLOG #3454): urllib.parse's quotes a whole proxy URL. The rule reads the
+    # innermost frame, not who wrote the text, so it does not catch a ValueError a C builtin such
+    # as int() raises inside engine code, nor engine code that copies a library's text. An
+    # exception never raised has no frame, and keeps its type name alone.
     if type(exc) is ValueError and _raised_by_the_engine(exc):
-        # Exactly ValueError, not a subclass: the probe's own shape refusals and the TLS-suite
-        # assertion raise it with engine-written text. A subclass, such as a JSON decode error,
-        # can quote what the server sent, so it keeps the type name alone. So does a ValueError a
-        # library raised (vault BACKLOG #3454): urllib.parse's quotes a whole proxy URL.
         return f"{name}: {strip_control_chars(str(exc))[:200]}"
     return name
-
-
-def _raised_by_the_engine(exc: BaseException) -> bool:
-    """Whether the innermost Python frame ``exc`` was raised from is in a ``messagefoundry``
-    module (vault BACKLOG #3454).
-
-    ``False`` for an exception never raised, which has no traceback to read. **It reads the frame,
-    not who wrote the text.** A builtin written in C, such as ``int()``, has no Python frame, so a
-    ``ValueError`` it raises inside engine code reads as the engine's, quoting its argument. So
-    does engine code that copies a library error's text into its own ``ValueError``. This check
-    catches neither; it narrows what :func:`_why` trusted before, and widens nothing."""
-    tb = exc.__traceback__
-    if tb is None:
-        return False
-    while tb.tb_next is not None:
-        tb = tb.tb_next
-    module = tb.tb_frame.f_globals.get("__name__")
-    return isinstance(module, str) and (
-        module == "messagefoundry" or module.startswith("messagefoundry.")
-    )
 
 
 def _strings(value: object) -> tuple[str, ...]:
