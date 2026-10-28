@@ -50,6 +50,7 @@ from messagefoundry.config.settings import (
     AuthSettings,
     EgressSettings,
     LoggingSettings,
+    StoreSettings,
     TlsSettings,
 )
 from messagefoundry.config.wiring import WiringError
@@ -287,9 +288,9 @@ async def test_the_reload_audit_takes_no_fingerprint_after_the_swap(
     calls: list[object] = []
     real = fp_mod.config_fingerprint_detail
 
-    def _counting(path: Path) -> dict[str, object]:
+    def _counting(path: Path, **kwargs: Any) -> dict[str, object]:
         calls.append(path)
-        return real(path)
+        return real(path, **kwargs)
 
     service = await _service(engine)
     await _add(service, "deployer", Role.ADMINISTRATOR)
@@ -638,6 +639,8 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
     """Before BACKLOG #2034 only the inline route ran the settings-anchor preflight, so a reload held
     for a second approver went live on a substituted anchor when it was released. The engine now
     runs it on every real reload. The control is a release before the swap, which goes live."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+
     good = _block(b"good")
     anchor = tmp_path / "ad-ca.pem"
     anchor.write_bytes(good)
@@ -658,6 +661,7 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
             tls=TlsSettings(),
             alerts=AlertsSettings(),
             log_settings=LoggingSettings(),
+            store=StoreSettings(),
         ),
         store,
         enforcing=True,
@@ -699,7 +703,17 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
         rows = await store.list_audit(limit=100)
         assert "approval.failed" in [r["action"] for r in rows]
         failed = [json.loads(r["detail"]) for r in rows if r["action"] == "config_reload_failed"]
-        assert failed == [{"requested": None, "dry_run": False, "reason": "trust_anchor"}]
+        # The settings preflight runs before the digest check, so the row says it was not reached
+        # and names the approval it stopped (vault BACKLOG #2596).
+        assert failed == [
+            {
+                "requested": None,
+                "dry_run": False,
+                "approved_fingerprint": config_fingerprint(cfg),
+                "approval_digest_check": "not_reached",
+                "reason": "trust_anchor",
+            }
+        ]
         events = [json.loads(r["detail"])["event"] for r in rows if r["action"] == ta.AUDIT_ACTION]
         assert "pin_mismatch" in events
     finally:
@@ -724,6 +738,7 @@ async def test_a_released_reload_names_a_changed_settings_anchor_it_cannot_apply
         tls=TlsSettings(),
         alerts=AlertsSettings(),
         log_settings=LoggingSettings(),
+        store=StoreSettings(),
     )
     (spec,) = specs
     # The consumer's load, which the restart report compares against.
@@ -1187,16 +1202,14 @@ def _edit_with_marker(cfg: Path, marker: Path) -> None:
     )
 
 
-def _editing_load(cfg: Path, marker: Path, *, then_raise: bool = False) -> Any:
-    """A ``load_config`` that loads ``cfg``, then edits it as a writer would mid-release."""
+def _editing_load(cfg: Path, marker: Path) -> Any:
+    """A ``load_config`` that edits ``cfg`` as a writer would mid-release, after the release read
+    its snapshot, then loads what the release hands it."""
     from messagefoundry.config.wiring import load_config
 
-    def _load(path: Path) -> Any:
-        registry = load_config(path)
+    def _load(path: Path, **kwargs: Any) -> Any:
         _edit_with_marker(cfg, marker)
-        if then_raise:
-            raise WiringError("the edited module does not load")
-        return registry
+        return load_config(path, **kwargs)
 
     return _load
 
@@ -1266,26 +1279,32 @@ async def test_a_release_after_the_config_was_edited_is_refused_before_any_of_it
     assert any("changed after its approval" in rec.getMessage() for rec in caplog.records)
 
 
-async def test_an_edit_made_while_the_release_loads_is_refused_before_the_swap(
+async def test_an_edit_made_while_the_release_loads_neither_runs_nor_is_recorded(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The second check: the bytes matched before load_config and changed during it. The digest
-    taken before the swap, the one the audit row records, must still be the approved one."""
-    editing = _editing_load(tmp_path / "cfg", tmp_path / "unused.txt")
+    """Vault BACKLOG #2596 step 1. The release reads the directory once, checks that snapshot
+    against the approval, and loads the snapshot, so an edit after that read never runs and the
+    audit row names the approved bytes. Before, the edit ran its module code and a second check
+    refused it after the fact. The control loads the edited directory afresh: its marker appears."""
+    from messagefoundry.config.wiring import load_config
+
+    cfg, marker = tmp_path / "cfg", tmp_path / "ran.txt"
+    editing = _editing_load(cfg, marker)
     service = await _service(engine)
-    live = engine.registry_runner
-    before = live.registry if live is not None else None
-    _approval_id, r = await _hold_then_release(
+    approval_id, r = await _hold_then_release(
         engine,
         service,
         {},
         between=lambda: monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", editing),
     )
-    assert r.status_code == 422, r.text
-    rr = engine.registry_runner
-    assert (rr.registry if rr is not None else None) is before  # nothing swapped
-    assert len(await _digest_mismatch_rows(engine)) == 1
-    assert await engine.store.list_audit(action="config_reload") == []
+    assert r.status_code == 200, r.text
+    assert not marker.exists(), "the edit made after the release read the config ran"
+    approved = _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"]
+    rows = await engine.store.list_audit(action="config_reload")
+    assert [json.loads(row["detail"])["fingerprint"] for row in rows] == [approved]
+    assert await _digest_mismatch_rows(engine) == []
+    load_config(cfg)  # the control
+    assert marker.exists()
 
 
 async def test_a_hold_that_captured_no_digest_is_refused_at_release(
@@ -1374,8 +1393,6 @@ async def test_a_release_refused_at_the_second_check_keeps_the_running_env_value
 ) -> None:
     """The release re-reads the environment's values before it loads. A refusal after that read
     must not leave the new values on the running graph, which no approver saw."""
-    from messagefoundry.config.wiring import load_config
-
     values = {"HOST": "approved.example.invalid"}
     monkeypatch.setattr(engine, "_env_values_provider", lambda: dict(values))
     await engine.reload_detail(dry_run=False)  # a live runner, on the first values
@@ -1383,20 +1400,22 @@ async def test_a_release_refused_at_the_second_check_keeps_the_running_env_value
     assert runner is not None
     eng_any, runner_any = cast(Any, engine), cast(Any, runner)
     assert eng_any._env_values == runner_any._env_values == {"HOST": "approved.example.invalid"}
-    editing = _editing_load(tmp_path / "cfg", tmp_path / "unused.txt")
+
+    async def _refusing_preflight(_registry: object, _values: object) -> None:
+        raise WiringError("the graph is refused after the values were read")
 
     def _between() -> None:
         values["HOST"] = "unreviewed.example.invalid"
-        monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", editing)
+        monkeypatch.setattr(engine, "_registry_preflight", _refusing_preflight)
 
     service = await _service(engine)
     _approval_id, r = await _hold_then_release(engine, service, {}, between=_between)
     assert r.status_code == 422, r.text
-    assert len(await _digest_mismatch_rows(engine)) == 1
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
     assert engine.registry_runner is runner
     assert eng_any._env_values == runner_any._env_values == {"HOST": "approved.example.invalid"}
     # The control: an unrefused reload does apply the new values, so the assert above can fail.
-    monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", load_config)
+    monkeypatch.setattr(engine, "_registry_preflight", None)
     await engine.reload_detail(dry_run=False)
     assert eng_any._env_values == runner_any._env_values == {"HOST": "unreviewed.example.invalid"}
 
@@ -1457,42 +1476,13 @@ async def test_a_dry_run_checks_the_new_env_values_without_applying_them(
     assert eng_any._env_values == runner_any._env_values == {"HOST": "first.example.invalid"}
 
 
-@pytest.mark.parametrize("breaks_at", ["load", "preflight"])
-async def test_a_tamper_that_also_breaks_the_graph_is_audited_as_a_digest_mismatch(
-    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, breaks_at: str
-) -> None:
-    """An edit during the release that leaves a bad graph was audited as ``invalid_config``, so an
-    audit filter on ``digest_mismatch`` never saw the tamper. ``load``: the edited module fails to
-    load. ``preflight``: it loads, and a later check would refuse it; that check must not run."""
-    editing = _editing_load(
-        tmp_path / "cfg", tmp_path / "unused.txt", then_raise=breaks_at == "load"
-    )
-    preflights: list[object] = []
-
-    async def _refusing_preflight(registry: object, _values: object) -> None:
-        preflights.append(registry)
-        raise WiringError("the edited graph is refused")
-
-    def _between() -> None:
-        monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", editing)
-        monkeypatch.setattr(engine, "_registry_preflight", _refusing_preflight)
-
-    service = await _service(engine)
-    _approval_id, r = await _hold_then_release(engine, service, {}, between=_between)
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"] == (
-        "the config changed after this reload was requested; request the reload again"
-    )
-    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["digest_mismatch"]
-    assert preflights == []
-
-
 async def test_a_load_failure_on_the_approved_bytes_is_still_invalid_config(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The control for the test above: with nothing edited, a bad graph is a bad graph."""
+    """A load failure of the approved bytes is a bad graph, not an edit: the load runs the
+    snapshot the release checked, so no edit can have caused it (vault BACKLOG #2596)."""
 
-    def _fails(_path: Path) -> Any:
+    def _fails(_path: Path, **_kwargs: Any) -> Any:
         raise WiringError("bad graph")
 
     service = await _service(engine)
@@ -1504,7 +1494,55 @@ async def test_a_load_failure_on_the_approved_bytes_is_still_invalid_config(
     )
     assert r.status_code == 422, r.text
     assert r.json()["detail"] == "invalid configuration"
-    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
+    # The digest check ran and passed, so the row carries no not-reached marker.
+    assert await _failed_reload_rows(engine) == [
+        {"requested": None, "dry_run": False, "reason": "invalid_config"}
+    ]
+
+
+async def test_a_release_refused_by_the_source_trust_check_names_its_approval(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tamper that also loosens the config directory's permissions is refused by the trust check,
+    which runs before the digest check, so its row reads ``invalid_config`` and not
+    ``digest_mismatch``. The row now names the approval's digest and says the digest check was not
+    reached, so it is not read as a refusal of the approved bytes (vault BACKLOG #2596). The
+    loosening is the trust check's own refusal, stubbed, as a permission change cannot be made the
+    same way on every platform; the stub is the name the snapshot read calls."""
+    from messagefoundry.config import wiring
+    from messagefoundry.config.fingerprint import config_fingerprint
+
+    cfg, marker = tmp_path / "cfg", tmp_path / "ran.txt"
+    approved = config_fingerprint(cfg)
+
+    def _loosened(directory: Path) -> None:
+        raise WiringError(f"refusing to load config from {directory}: it is writable by others")
+
+    def _tamper() -> None:
+        _edit_with_marker(cfg, marker)
+        monkeypatch.setattr(wiring, "_assert_safe_config_source", _loosened)
+
+    service = await _service(engine)
+    live = engine.registry_runner
+    before = live.registry if live is not None else None
+    approval_id, r = await _hold_then_release(engine, service, {}, between=_tamper)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == "invalid configuration"
+    assert not marker.exists(), "the edited module ran before the refusal"
+    rr = engine.registry_runner
+    assert (rr.registry if rr is not None else None) is before  # nothing swapped
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "failed"
+    # Digests and the marker only: the row's exact keys show no path or file content entered it.
+    assert await _failed_reload_rows(engine) == [
+        {
+            "requested": None,
+            "dry_run": False,
+            "approved_fingerprint": approved,
+            "approval_digest_check": "not_reached",
+            "reason": "invalid_config",
+        }
+    ]
 
 
 async def test_a_digest_that_cannot_be_taken_at_release_says_so(
@@ -1642,33 +1680,246 @@ async def test_a_target_the_engine_cannot_list_is_unreadable_not_missing(
     assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
 
 
-async def test_a_file_added_during_the_load_and_left_unreadable_is_not_released(
+async def test_a_file_added_during_the_load_is_not_released_with_it(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The digest the audit row records skips a file it cannot read, so on its own it matched the
-    approval with the added file unbound. The fail-closed digest runs first."""
+    """Round 3 refused this release because a later digest could not read the added file. Since
+    vault BACKLOG #2596 the release loads the snapshot it checked, so the added module never runs
+    and the row names the approved digest."""
     from messagefoundry.config.wiring import load_config
 
-    cfg = tmp_path / "cfg"
-    unreadable = {"on": False}
-    _unreadable(monkeypatch, "extra.py", when=unreadable)
+    cfg, marker = tmp_path / "cfg", tmp_path / "extra-ran.txt"
 
-    def _load(path: Path) -> Any:
-        registry = load_config(path)
-        (cfg / "extra.py").write_text("X = 1\n", encoding="utf-8")
-        unreadable["on"] = True
-        return registry
+    def _load(path: Path, **kwargs: Any) -> Any:
+        (cfg / "extra.py").write_text(
+            f"open({str(marker)!r}, 'w').write('ran')\n", encoding="utf-8"
+        )
+        return load_config(path, **kwargs)
 
     service = await _service(engine)
-    _approval_id, r = await _hold_then_release(
+    approval_id, r = await _hold_then_release(
         engine,
         service,
         {},
         between=lambda: monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", _load),
     )
-    assert r.status_code == 422, r.text
-    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["digest_unavailable"]
-    assert await engine.store.list_audit(action="config_reload") == []
+    assert r.status_code == 200, r.text
+    assert not marker.exists(), "a module added after the release read the config ran"
+    approved = _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"]
+    rows = await engine.store.list_audit(action="config_reload")
+    assert [json.loads(row["detail"])["fingerprint"] for row in rows] == [approved]
+
+
+# --- vault BACKLOG #2596: the environment value file under the config directory ------------------
+
+_APPROVED_VALUES = 'HOST = "approved.example.invalid"\n'
+_UNREVIEWED_VALUES = 'HOST = "unreviewed.example.invalid"\n'
+
+
+def _serve_values_provider(cfg: Path) -> Any:
+    """The value provider ``serve`` builds, anchored at the config directory, so the value file it
+    reads is the ``environments/dev.toml`` the approval digest covers."""
+    from messagefoundry.__main__ import _environment_values_reader
+
+    return _environment_values_reader(base_dir=cfg, dir_name="environments", environment="dev")
+
+
+def _opaque_values_provider(cfg: Path) -> Callable[[], dict[str, Any]]:
+    """An embedder's provider that reads the same file itself, so the engine cannot hand it the
+    snapshot's bytes."""
+    from messagefoundry.config.environments import load_environment_values
+
+    def _read() -> dict[str, Any]:
+        return load_environment_values(
+            base_dir=cfg, dir_name="environments", environment="dev", environ={}
+        )
+
+    return _read
+
+
+async def _values_engine(
+    tmp_path: Path, approved_text: str | None, provider: Callable[[Path], Any]
+) -> tuple[Engine, Path]:
+    """The ``engine`` fixture's engine, given ``provider`` over a config directory whose
+    ``environments/dev.toml`` holds ``approved_text``, or does not exist when it is ``None``."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    values_file = cfg / "environments" / "dev.toml"
+    if approved_text is not None:
+        values_file.parent.mkdir()
+        values_file.write_text(approved_text, encoding="utf-8")
+    engine = await Engine.create(
+        tmp_path / "dc.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+        env_values_provider=provider(cfg),
+    )
+    return engine, values_file
+
+
+def _edit_values_after_the_snapshot(
+    monkeypatch: pytest.MonkeyPatch, values_file: Path, text: str
+) -> None:
+    """Write ``text`` to ``values_file`` right after the release reads its snapshot, and so before
+    the value provider reads the file: the window a writer to the config directory would use."""
+    from messagefoundry.config.wiring import read_trusted_snapshot
+
+    def _read_then_edit(directory: Path, **kwargs: Any) -> Any:
+        snapshot = read_trusted_snapshot(directory, **kwargs)
+        values_file.parent.mkdir(exist_ok=True)
+        values_file.write_text(text, encoding="utf-8")
+        return snapshot
+
+    monkeypatch.setattr("messagefoundry.pipeline.engine.read_trusted_snapshot", _read_then_edit)
+
+
+async def test_a_value_file_edited_after_the_release_read_its_snapshot_never_applies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2596. The approval digest covers ``environments/dev.toml`` under the config
+    directory. ``serve``'s provider reads the snapshot's bytes for it on a reload, so an edit made
+    between the release's read and the provider's read never applies, and the release goes on with
+    the approved values. Before, the provider read the file from disk again, and the edited values
+    applied under the approved digest."""
+    engine, values_file = await _values_engine(tmp_path, _APPROVED_VALUES, _serve_values_provider)
+    approved_values = {"host": "approved.example.invalid"}
+    try:
+        assert cast(Any, engine)._env_values == approved_values
+        service = await _service(engine)
+        approval_id, r = await _hold_then_release(
+            engine,
+            service,
+            {},
+            between=lambda: _edit_values_after_the_snapshot(
+                monkeypatch, values_file, _UNREVIEWED_VALUES
+            ),
+        )
+        assert r.status_code == 200, r.text
+        assert cast(Any, engine)._env_values == approved_values
+        runner = engine.registry_runner
+        assert runner is not None and cast(Any, runner)._env_values == approved_values
+        approved = _held_params(await engine.store.get_pending_approval(approval_id))
+        rows = await engine.store.list_audit(action="config_reload")
+        assert [json.loads(row["detail"])["fingerprint"] for row in rows] == [
+            approved["fingerprint"]
+        ]
+        # The control: a reload that reads the directory afresh applies the edited file.
+        monkeypatch.undo()
+        await engine.reload_detail(dry_run=False)
+        assert cast(Any, engine)._env_values == {"host": "unreviewed.example.invalid"}
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.parametrize("approved_text", [None, _APPROVED_VALUES], ids=["created", "removed"])
+async def test_a_value_file_created_or_removed_after_the_snapshot_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved_text: str | None
+) -> None:
+    """Vault BACKLOG #2596. The snapshot's bytes cannot stand for a value file created since, nor
+    for one removed since, whose access list can no longer be vetted. ``serve``'s provider refuses
+    both, with nothing swapped and the running values kept."""
+    engine, values_file = await _values_engine(tmp_path, approved_text, _serve_values_provider)
+    try:
+        await engine.reload_detail(dry_run=False)  # a live runner, on the approved values
+        runner = engine.registry_runner
+        assert runner is not None
+        approved_values = {"host": "approved.example.invalid"} if approved_text else {}
+        assert cast(Any, engine)._env_values == approved_values
+        from messagefoundry.config.wiring import read_trusted_snapshot
+
+        def _read_then_change(directory: Path, **kwargs: Any) -> Any:
+            snapshot = read_trusted_snapshot(directory, **kwargs)
+            if approved_text is None:
+                values_file.parent.mkdir(exist_ok=True)
+                values_file.write_text(_UNREVIEWED_VALUES, encoding="utf-8")
+            else:
+                values_file.unlink()
+            return snapshot
+
+        service = await _service(engine)
+        _approval_id, r = await _hold_then_release(
+            engine,
+            service,
+            {},
+            between=lambda: monkeypatch.setattr(
+                "messagefoundry.pipeline.engine.read_trusted_snapshot", _read_then_change
+            ),
+        )
+        assert r.status_code == 422, r.text
+        assert engine.registry_runner is runner  # nothing swapped
+        assert cast(Any, engine)._env_values == approved_values
+        assert cast(Any, runner)._env_values == approved_values
+        assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
+    finally:
+        await engine.stop()
+
+
+async def test_an_opaque_provider_s_value_file_edited_during_the_release_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2596. A provider the engine cannot hand the snapshot reads the file from
+    disk, so the release takes the digest again after that read, and refuses an edit made in the
+    window as ``digest_mismatch``, with nothing swapped and the running values kept."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+
+    engine, values_file = await _values_engine(tmp_path, _APPROVED_VALUES, _opaque_values_provider)
+    cfg = values_file.parent.parent
+    try:
+        await engine.reload_detail(dry_run=False)  # a live runner, on the approved values
+        runner = engine.registry_runner
+        assert runner is not None
+        approved_values = {"host": "approved.example.invalid"}
+        assert cast(Any, engine)._env_values == approved_values
+        approved = config_fingerprint(cfg)
+        service = await _service(engine)
+        _approval_id, r = await _hold_then_release(
+            engine,
+            service,
+            {},
+            between=lambda: _edit_values_after_the_snapshot(
+                monkeypatch, values_file, _UNREVIEWED_VALUES
+            ),
+        )
+        assert r.status_code == 422, r.text
+        assert engine.registry_runner is runner  # nothing swapped
+        assert cast(Any, engine)._env_values == approved_values
+        assert cast(Any, runner)._env_values == approved_values
+        assert await _digest_mismatch_rows(engine) == [
+            {
+                "requested": None,
+                "dry_run": False,
+                "reason": "digest_mismatch",
+                "approved_fingerprint": approved,
+                "current_fingerprint": config_fingerprint(cfg),
+            }
+        ]
+    finally:
+        await engine.stop()
+
+
+async def test_a_provider_with_a_from_snapshot_method_of_its_own_is_not_handed_the_snapshot(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider opts in to the snapshot by subclassing ``SnapshotEnvValuesProvider``. One that
+    merely has a method of that name, such as an alternate constructor, is called plainly, so the
+    release still checks the digest again after it reads."""
+    calls: list[str] = []
+
+    class _Provider:
+        def __call__(self) -> dict[str, Any]:
+            calls.append("plain")
+            return {}
+
+        def from_snapshot(self, _snapshot: object) -> dict[str, Any]:
+            calls.append("from_snapshot")
+            return {}
+
+    monkeypatch.setattr(engine, "_env_values_provider", _Provider())
+    service = await _service(engine)
+    _approval_id, r = await _hold_then_release(engine, service, {})
+    assert r.status_code == 200, r.text
+    assert calls == ["plain"]
 
 
 async def test_a_directory_moved_away_after_the_resolve_is_refused_as_missing(
@@ -1829,27 +2080,6 @@ async def test_a_first_load_whose_runner_cannot_be_built_restores_the_env_values
     monkeypatch.setattr(engine, "add_registry", real_add)
     await engine.reload_detail(dry_run=False)
     assert eng_any._env_values == new
-
-
-async def test_a_digest_refusal_after_a_failed_load_does_not_carry_the_load_error(
-    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Round 2 raises the digest refusal after the load's handler, so the load error rides neither
-    ``__cause__`` nor ``__context__``, where a TOMLDecodeError would keep a whole value file
-    (BACKLOG #2307)."""
-    from messagefoundry.config.fingerprint import config_fingerprint
-    from messagefoundry.pipeline import ApprovedConfig, ConfigDigestMismatch
-
-    cfg = tmp_path / "cfg"
-    approval = ApprovedConfig(config_fingerprint(cfg))
-    monkeypatch.setattr(
-        "messagefoundry.pipeline.engine.load_config",
-        _editing_load(cfg, tmp_path / "unused.txt", then_raise=True),
-    )
-    with pytest.raises(ConfigDigestMismatch) as refused:
-        await engine.reload_detail(dry_run=False, approval=approval)
-    assert refused.value.__cause__ is None
-    assert refused.value.__context__ is None
 
 
 # --- vault BACKLOG #2596, PR 2239 review: a name no directory can have is missing -------------

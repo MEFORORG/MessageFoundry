@@ -54,9 +54,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -1279,7 +1280,12 @@ class DrCoordinator:
             # left taking the address. A release hook is left to finish late, as before, since
             # killing it partway could strand the address on this box (vault BACKLOG #2622).
             ok = await asyncio.wait_for(
-                _run_command(command, stop_kills=phase == "takeover", on_start=mark_started),
+                _run_command(
+                    command,
+                    stop_kills=phase == "takeover",
+                    on_start=mark_started,
+                    pass_environment=self._settings.pass_environment,
+                ),
                 timeout=self._settings.takeover_timeout_seconds,
             )
         except TimeoutError:
@@ -1291,7 +1297,7 @@ class DrCoordinator:
             ok = False
             reason = f"VIP {phase} hook errored: {safe_exc(exc)}"
         else:
-            reason = "" if ok else f"VIP {phase} hook exited non-zero"
+            reason = "" if ok else f"VIP {phase} hook exited non-zero{_HOOK_ENVIRONMENT_HINT}"
         if not ok:
             if phase == "takeover":
                 # A hook that ran and then failed or was killed may have moved the address before
@@ -1366,17 +1372,39 @@ class DrCoordinator:
             log.warning("DR: %s alert failed", event, exc_info=True)
 
 
+#: Appended to a failed hook's reason: its output is discarded, and a variable it read that nobody
+#: listed in `[dr].pass_environment` is the cause the allowlist adds (vault BACKLOG #2587).
+_HOOK_ENVIRONMENT_HINT = (
+    " (a hook gets only the variables childenv.hook_environment allows; add one it reads to "
+    "[dr].pass_environment and restart)"
+)
+
+
+def warn_unset_pass_environment(names: Collection[str]) -> None:
+    """Log, by name only, each ``[dr].pass_environment`` name the engine's environment lacks."""
+    unset = [name for name in names if name not in os.environ]
+    if unset:
+        log.warning("DR: [dr].pass_environment names a variable that is not set: %s", unset)
+
+
 async def _run_command(
-    command: str, *, stop_kills: bool = True, on_start: Callable[[], None] | None = None
+    command: str,
+    *,
+    stop_kills: bool = True,
+    on_start: Callable[[], None] | None = None,
+    pass_environment: Collection[str],
 ) -> bool:
     """Run an operator-supplied shell command OFF the event loop and return whether it exited 0. Uses the
     asyncio subprocess API (never blocks the loop). The command is operator-configured (``[dr]``), not
     request-derived, so it is run via the shell exactly as the operator wrote it (parity with the way the
     backup destination / other operator-configured paths are trusted).
 
-    Its environment is :func:`messagefoundry.childenv.hook_environment`: the operator's ordinary
-    variables, without the engine's own (vault BACKLOG #2587). ``on_start`` is called once the
-    hook's process has been let run, and never for one that was not (vault BACKLOG #3094).
+    Its environment is the allowlist :func:`messagefoundry.childenv.hook_environment` builds, with
+    ``pass_environment`` (``[dr].pass_environment``) as its extras (vault BACKLOG #2587). It is
+    required, so a caller cannot run a hook without the operator's names by forgetting it. A listed
+    name the engine's environment does not hold is logged, by name only, since the hook's output
+    is discarded and an aborted activation would otherwise not point at it. ``on_start`` is called
+    once the hook's process has been let run, and never for one that was not (vault BACKLOG #3094).
 
     **Stopping it stops the whole hook, when** ``stop_kills`` (vault BACKLOG #2622). The caller
     bounds this with ``wait_for``, which stops it by cancelling it. Cancelling only the wait would
@@ -1389,12 +1417,13 @@ async def _run_command(
     processes, such as a service wrapper's tree kill or a signal to the engine's process group,
     can still end it. A hook that finishes on its own is left alone either way, including
     anything it left running."""
+    warn_unset_pass_environment(pass_environment)
     spawn = asyncio.ensure_future(
         asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
-            env=hook_environment(),
+            env=hook_environment(extra_names=pass_environment),
             creationflags=proctree.ADOPT_CREATIONFLAGS if stop_kills else 0,
             start_new_session=proctree.ADOPT_NEW_SESSION and stop_kills,
         )

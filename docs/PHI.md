@@ -194,7 +194,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `queue.handler_name` / `destination_name` / `channel_id` | all three | No — names, not bodies | No (metadata, deliberately not ciphered) | **PL-4** | The handler the transform worker runs; the destination the delivery worker drains | `n/a — not PHI` |
 | `messages.control_id`, `messages.message_type` | all three | Low (MSH-10/MSH-9) | **No** — plaintext by design | **PL-4** | Needed plaintext for dedup/routing/indexes (`ix_messages_control`). Covered only by the whole-DB / volume layer | `keep-forever by design` — dedup/routing keys that live and die with the message row |
 | `messages.origin`, `messages.origin_actor` (vault BACKLOG #2615) | all three | **No** — a fixed label and a username, never message content | **No** — plaintext by design | **PL-4** | How the row came to exist: `partner`, `operator_edit`, `operator_upload` or `reingress`, and for the two operator origins the acting user. Written at insert and never updated. Plain on purpose, because it must outlive the body and the ciphered `metadata`, which retention blanks. `NULL` on a row written before the column existed means not recorded. See [§6](#6-audit--accountability) | `keep-forever by design` — provenance that lives and dies with the message row |
-| `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access* and other actions, not the PHI itself. Its writers store at least filter shapes, counts and ids. Some also store more: an edit-resend row holds **keyed** HMAC-SHA256 digests of the original and the edited body, and an upload-inject row one of the injected body. Without the store key a digest cannot be recovered or tested against a guess ([§6](#6-audit--accountability), vault BACKLOG #2615). And some store bounded engine-authored text: at least the `connection_test` and `connection_credential_test` rows carry the probe outcome, a fixed line or `safe_text()`/`safe_exc()`-scrubbed connector error text (BACKLOG #2372). Some store a client address beside the row's own `client`: at least the federated step-up's `auth.reauth` row, whose `start_client` is the address that started the step-up and whose `client_moved` says whether the callback came from another host (BACKLOG #2160, vault BACKLOG #3145). None stores a message body. *Corrected 2026-10-07:* this said the writers "only ever store filter shapes, counts and ids" | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
+| `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access* and other actions, not the PHI itself. Its writers store at least filter shapes, counts and ids. Some also store more: an edit-resend row holds **keyed** HMAC-SHA256 digests of the original and the edited body, and an upload-inject row one of the injected body. Without the store key a digest cannot be recovered or tested against a guess ([§6](#6-audit--accountability), vault BACKLOG #2615). And some store bounded engine-authored text: at least the `connection_test` and `connection_credential_test` rows carry the probe outcome, a fixed line or `safe_text()`/`safe_exc()`-scrubbed connector error text (BACKLOG #2372). Some store a client address beside the row's own `client`: at least the federated step-up's `auth.reauth` row, whose `start_client` is the address that started the step-up and whose `client_moved` says whether the callback came from another host (BACKLOG #2160, vault BACKLOG #3145). And once its build lands, the directory enrolment code's `auth.enrolment_code_spent_notice` row, written under the issuing Administrator's name, would name the client address the spend came from ([ADR 0207](adr/0207-a-single-use-enrolment-code-for-a-directory-account-s-first-engine-factor.md) Amendment A, vault BACKLOG #2609). None stores a message body. *Corrected 2026-10-07:* this said the writers "only ever store filter shapes, counts and ids" | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
 | `audit_log.client` (ADR 0150) | all three | **No** — a network address; identifies a *host*, not a patient | No (metadata, deliberately not ciphered) | **PL-4** | The caller's client address — the "from where" of an audited action; `NULL` for engine-internal/`system` writes. **Personal data, but not PHI**, and exactly what HIPAA §164.312(b) audit controls exist to capture. Plaintext by decision: it must stay greppable/indexable for incident response, it already appears in the clear in `sessions.client`, and it is folded **inside** the tamper-evident hash chain — so it carries **integrity** protection even without confidentiality. Widens a store-file compromise from *who did what* to *who did what from where*; volume encryption + owner-only ACLs on whichever host owns the files — the engine's own `_secure_file` covers the **SQLite** store only ([§10](#10-secure-deployment--operations-checklist)) — are the control | `keep-forever by design` — same `audit_log` row lifetime as `detail`; the value is folded **inside** the hash chain |
 | `delivered_keys` (H2 idempotency ledger) | all three | **No** — hashes + ids only | No (deliberately not ciphered — nothing to protect) | **PL-4** | One row per completed outbound delivery: a SHA-256 `delivery_key` over non-PHI ids + a replay-stable seq, plus `outbox_id`/`message_id`/`destination_name`/`delivery_seq`. **Never a body or any PHI** — `control_id` is only *folded into the hash input*, never stored in the clear here. Lets the FIFO claim skip-and-complete a re-claimed already-delivered head without re-sending | `keep-forever by design` — the idempotency ledger a re-claimed already-delivered row checks instead of re-sending |
 | `state.namespace` / `state.key` | all three | **Possibly** — a Handler that keys correlation state on a raw MRN stores that identifier here in the clear | **No** — plaintext by construction: the pair is the composite primary key **and** the AAD input for `state.value`, so it cannot be ciphered without losing the lookup | **PL-4** | Authors must key state on a **surrogate, never a raw identifier**. Covered only by the whole-DB / volume layer. Rides `[retention].state_max_age_days` with its value | ``rides `[retention].state_max_age_days` `` |
@@ -2155,7 +2155,8 @@ Properties of the anonymizer:
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
   scrubbed dataset stays structurally realistic.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
-  loose string search.
+  loose string search. With no site prefix loaded it matches nothing, and
+  `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
   reach. Plain `anonymize` and `anonymize_checked` both refuse it, on the engine and on the tee.
@@ -2177,8 +2178,8 @@ both are described below:
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IP address, survives | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
-| A dashed SSN (`NNN-NN-NNNN`) appears whole inside one field | Fields no rule maps |
-| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears whole inside one field | Fields no rule maps |
+| A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps. A cut shape counts when at least one of its fields is one no rule maps |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps. A cut shape counts when at least one of its fields is one no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it as `PV2 (line with no fields)` | Every line but the header. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
@@ -2188,13 +2189,28 @@ a bare ten-digit phone number, an account number and a free-text note. A Z-segme
 case, since no default rule names one. A name in `PV1-11`, the temporary location, passes the same
 way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
 
-**A shape split across fields by the message's own field separator passes.** The detectors read
-one field at a time, after the message is split on the separator its header declares. Under a
-field separator of `-`, at least the lines `ZZZ-1-123-45-6789` and `ZZZ-1-555-555-0100` would
-pass `anonymize_checked` on both anonymizers. The message itself cuts each value into three
-fields. Under `|`, the same two values are refused. With `require_full_coverage` on, such a
-message is refused only because nobody decided the `ZZZ` fields. A `keep` on each of them would
-let it through.
+**A shape cut across fields by the message's own field separator is refused, but not in every
+form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three
+fields, and none of them holds the shape. The check also reads each line as written, so both
+anonymizers refuse it, naming the fields: `unmapped SSN-shaped value across ZZZ-2 to ZZZ-4, cut
+by the field separator` (vault BACKLOG #3465). A match whose every field a rule rewrites is not
+a hit. The cost: under `-`, numeric fields side by side that read as such a shape are refused
+whatever they hold, so `OBR-1-123-45-6789` is refused as an SSN in `OBR-2` to `OBR-4`. At least
+these still get through, on both anonymizers:
+
+- The rest of a shape whose first or last part a rule scrubbed, which is no shape. Under `OBX-5`
+  typed `ST`, `OBX-1-ST-8480^S^LN--123-45-6789` leaves as `...--[REDACTED]-45-6789`, and
+  `OBX-1-ST-123-45-6789` as `OBX-1-ST-123-45-[REDACTED]`. `NTE-3` and `OBX-5` typed `TX` leave
+  such a rest too.
+- A shape whose separators the sender escaped, as HL7 asks: `123\F\45\F\6789`. No detector
+  decodes an escape.
+- A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
+  it. The detectors read that digit as part of a longer number.
+- A shape in the header line, which the check skips whole.
+
+With `require_full_coverage` on, such a message is refused for as long as nobody decides the
+fields that carry the rest of the shape. A `keep` on each of them would let it through. That
+switch skips the header line too, so it does not refuse a shape there.
 
 **A wrapped line can still look like a segment, but its id is never printed.** A line such as
 `KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id
@@ -2373,8 +2389,11 @@ What the `date` kind does to a value:
   one timestamp, and a second one after the component separator is not a precision code.
 - An `OBX-5` result whose `OBX-2` type is `DT` or `TS`, such as a last menstrual period, takes the
   `date` kind too: the year stays, and a value that is not a valid timestamp is scrubbed to
-  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is still
-  kept whole, and one sent as `DTM` or `ST` is redacted whole.
+  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is kept
+  whole whenever it fits the `NM` grammar below. At least these fit: digits alone, such as
+  `20110715`, even after a sign or a comparator; one decimal point, such as `2011.07`; and a date
+  split across repetitions. A dash or a slash inside the date, as in `2011-07-15`, does not fit,
+  so that one is redacted whole, as is one sent as `DTM` or `ST`.
 - An `OBX-5` result whose `OBX-2` type is `NM`, `SN` or `TM` is kept whole only when it fits the
   grammar of that type (vault BACKLOG #2961). `NM` is an optional comparator, an optional sign,
   digits and at most one decimal point. `SN` is a comparator, a number, a separator and a second
@@ -2382,17 +2401,17 @@ What the `date` kind does to a value:
   becomes `[REDACTED]`. So `123-45-6789` or `555-555-0100` under a numeric label would no longer
   leave whole, and neither would an eight-digit date under `TM`. **The grammar cannot tell a
   number from an identifier written as a number.** At least these would still leave whole under
-  `NM`, and in a number part of an `SN`: an undashed nine-digit number, which is the shape of an
-  SSN; an undashed ten-digit number, or eleven digits after a `+`, which is the shape of a phone
-  number; an eight-digit number that reads as a date; and an identifier split across repetitions.
+  `NM`, and in a number part of an `SN`. An undashed nine-digit number has the shape of an SSN.
+  An undashed ten-digit number, or eleven digits after a `+`, has the shape of a phone number. An
+  eight-digit number can read as a date. And an identifier can be split across repetitions.
   Under `TM`, at least a six-digit date whose parts are in range for a time would still leave
   whole: `150312` reads as 15:03:12. The leak-check's shape detectors do not scan `OBX-5`,
   because a rule maps it, so nothing refuses these. A message that declares a digit or one of
   `+ - . : / < > =` as its component, repetition or subcomponent separator keeps no numeric
-  `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, at
-  least a value such as `000-12-3456` would still leave whole. The message itself splits it
-  across `OBX-5`, `OBX-6` and `OBX-7`. The first part is a valid number, and no rule maps the
-  other two fields. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
+  `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, a
+  value such as `000-12-3456` is split by the message itself across `OBX-5`, `OBX-6` and `OBX-7`.
+  The first part is a valid number, so the guard keeps it, and the leak-check refuses the cut
+  shape, as *What the leak-check refuses, and what it lets through* says. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
   under one of them, such as a surname, would still leave whole.
 - When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
   site code. The site-code pass and the leak-check's site-code test skip a field that the `date`

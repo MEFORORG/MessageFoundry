@@ -174,6 +174,8 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
     pip = python_module_argv("pip")
     assert check[: len(pip) + 1] == [*pip, "install"]
     assert {"--dry-run", "--ignore-installed", "--require-hashes"} <= set(check)
+    # Wheels only, set by the auditor itself rather than left to the caller's environment.
+    assert check[check.index("--only-binary") + 1] == ":all:"
     assert checked == LOCK
     # 2. The audit, on the marker-free copy, with pip out of the loop and skips refused.
     pip_audit = python_module_argv("pip_audit")
@@ -214,7 +216,7 @@ _ENV_PROBE = (
 
 
 def test_an_engine_secret_does_not_reach_pip_or_pip_audit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The real runner hands its children childenv.hook_environment, not the whole environment.
+    """The real runner hands its children childenv.non_engine_environment, not the whole environment.
 
     The control, a pip-style setting, must still arrive: pip reads its index and proxy from there.
     """

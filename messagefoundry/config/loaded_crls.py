@@ -187,11 +187,14 @@ def first_unconfirmed_signature(
     ``finding`` is what a start could not confirm about the signatures of the CRLs in the file:
     one state per CRL, or a note that the judgment itself failed. ``harden_crl_check`` logs only
     when this is True. It runs once per TLS context, and the Postgres store builds a context per
-    connection, so a line per call
-    would repeat for as long as the engine runs. This keeps it to one line per process for each
-    version of the file and each finding. Hops with different CA lists can reach different
-    findings for one file, and each of those is logged once. The state is in memory, so every
-    start logs again, and each engine shard logs its own line."""
+    connection, so a line per call would repeat for as long as the engine runs. This keeps the
+    findings of one version of the file, the last one it was asked about, and logs each of them
+    once. So a version that returns after another was asked about is logged again (vault BACKLOG
+    #3506). It is asked only when there is a line to log, so a version that logged nothing does
+    not reset it. Hops with different CA lists can reach different findings for one file, and
+    each of those is logged once. The record is per file, not per setting: a second setting that
+    names the same file and reaches the same finding logs no line of its own. The state is in
+    memory, so every start logs again, and each engine shard logs its own line."""
     key = _path_key(path)
     with _LOCK:
         seen = _UNCONFIRMED.get(key)

@@ -76,6 +76,7 @@ def _client(engine: Engine, svc: AuthService, cfg: ServiceStatusSettings) -> htt
 def test_is_safe_service_name() -> None:
     assert service_status.is_safe_service_name("MessageFoundry")
     assert service_status.is_safe_service_name("MEFOR_Engine 1.0-x")
+    assert service_status.is_safe_service_name("MessageFoundry Prod")  # the net-helper example
     assert not service_status.is_safe_service_name("")  # empty = not a name
     for bad in ("svc & calc", "a|b", 'a"b', "a;b", "a`b", "a$b", "a\\b", "a/b"):
         assert not service_status.is_safe_service_name(bad), bad
@@ -83,6 +84,11 @@ def test_is_safe_service_name() -> None:
     # is rejected (review hardening).
     for bad in ("-config", "--help", " leadingspace", "   ", " "):
         assert not service_status.is_safe_service_name(bad), bad
+    # Matched whole: `$` with `.match` also accepted a name ending in a line feed (BACKLOG #1680).
+    for bad in ("MessageFoundry\n", "MessageFoundry\r\n", "MessageFoundry\nx"):
+        assert not service_status.is_safe_service_name(bad), repr(bad)
+    # A non-str from an untyped caller is refused, not raised: query_service_state never raises.
+    assert not service_status.is_safe_service_name(None)  # type: ignore[arg-type]
 
 
 def test_parse_service_state() -> None:

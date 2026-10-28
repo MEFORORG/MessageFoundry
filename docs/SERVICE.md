@@ -23,9 +23,10 @@ venv interpreter) and the per-connection firewall openings the service needs.
 
 1. **The engine, installed where only administrators can write.** The installer's default is
    `C:\Program Files\MessageFoundry\engine`, built from the engine wheel and never editable.
+   The installer builds it when you pass the wheel, as
    [Install the engine where only administrators can write](#install-the-engine-where-only-administrators-can-write)
-   builds it. The installer checks that folder and does not build it. It refuses any other
-   install, such as a checkout's venv, that anyone but administrators can write.
+   shows, and refuses any install, such as a checkout's venv, that anyone but administrators can
+   write.
 2. **NSSM** — provisioned automatically. `install-service.ps1` keeps the `nssm.exe` the service
    runs in `-NssmDir`, `C:\Program Files\MessageFoundry\nssm` by default. It refuses a folder that
    anyone but administrators can write to or owns, because it runs that file as administrator. It
@@ -55,32 +56,56 @@ change. So the installer's default engine is a virtual environment under Program
 the engine wheel (vault BACKLOG #2626). An editable install in a checkout is code its developers can
 change, and the service would run their next edit.
 
-1. Get the engine wheel. Take a release wheel and verify it as
-   [INSTALL-GUIDE.md](INSTALL-GUIDE.md) shows, or build one from a checkout as yourself, not
-   elevated: `python -m pip wheel --no-deps -w dist .`
-2. In an elevated PowerShell, in the folder that holds the wheel and the release's
-   `requirements.lock`, build the install:
+1. Get the engine wheel and the `requirements.lock` of the same release into one folder. Take a
+   release wheel and verify it as [INSTALL-GUIDE.md](INSTALL-GUIDE.md) shows, with the lock from
+   that release's tag, or build a wheel from a checkout as yourself, not elevated:
+   `python -m pip wheel --no-deps -w dist .`
+2. Take the SHA-256 of each: `(Get-FileHash -Algorithm SHA256 <file>).Hash`. The lock pins every
+   dependency by hash, but not the engine wheel. No signature covers the lock, so compare it with
+   the release tag's copy (`git show v<version>:requirements.lock`) before you hash it: its pin
+   shows only that pip reads the file you hashed.
+3. Pass them to the installer, elevated, with the options [Install](#install) names:
    ```powershell
-   $Root = "$env:ProgramFiles\MessageFoundry\engine"
-   python -m venv $Root
-   & "$Root\Scripts\python.exe" -m pip install --require-hashes -r requirements.lock
-   & "$Root\Scripts\python.exe" -m pip install --no-deps (Get-Item .\messagefoundry-*.whl).FullName
+   .\scripts\service\install-service.ps1 -EngineWheel D:\release\messagefoundry-0.5.2-py3-none-any.whl `
+       -EngineWheelSha256 <wheel hash> -RequirementsLockSha256 <lock hash> `
+       -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml
    ```
-   `requirements.lock` is the SHA-256-pinned export checked in sync and audited in CI (DEP-1).
-   Install the web console wheel the same way if the service serves `/ui`.
-3. Make the folder and the folder above it administrator-only, owner included:
-   ```powershell
-   $Parent = Split-Path -Parent $Root
-   foreach ($Folder in $Parent, $Root) {
-       icacls $Folder /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" `
-           "*S-1-5-32-545:(OI)(CI)RX" "*S-1-5-11:(OI)(CI)RX"
-   }
-   icacls $Parent /setowner "*S-1-5-32-544"
-   icacls $Root /setowner "*S-1-5-32-544" /T /C
-   ```
-   A new folder under Program Files can be owned by the administrator who made it, with full
-   control through `CREATOR OWNER`. That administrator's own account then counts as another
-   account that can write it.
+
+**With `-EngineWheel`, the installer builds the root before it checks it** (vault BACKLOG #2626).
+Without it, the installer builds nothing and checks the root that is there; it never falls back to
+an editable install. It makes the root administrator-only before pip runs, and refuses, installing
+nothing, when the copy of the wheel or the lock pip would read misses its pin. It installs the lock
+with `--require-hashes` and binary wheels only, and the engine wheel with `--no-deps`, with pip
+reading no configuration file or `PIP_` variable. So pip needs `pypi.org` for the dependencies:
+it reads no mirror or proxy a `pip.ini` names. `Build-EngineInstall` in the script is the source
+of record for the steps and their order.
+
+It refuses to build into a root that already exists, so it never upgrades in place; see
+[Update to a new build](#update-to-a-new-build-restart-vs-reinstall). An unfinished build deletes
+the root. NSSM is fetched and checked before the build, so a refused `-NssmPath` or `-NssmDir`, or
+a failed download, leaves no root. When a step after the build fails, such as the service
+registration, re-run with `-EngineWheel` left out to use the root it built.
+`-RequirementsLock` defaults to `requirements.lock` beside the wheel. `-BasePython` defaults to the first `python` on `PATH`; `Get-EngineBuildProblem` in the script lists what it
+refuses there, at least a launcher, a shim, a venv's interpreter, a Python older than 3.14 and
+one anyone but administrators can write. The installer installs the engine wheel only. Install
+the web console wheel by hand if the service serves `/ui`, then reset the owner as below.
+
+**To reset an existing root's access list and owner**, such as after an update by hand:
+
+```powershell
+$Root = "$env:ProgramFiles\MessageFoundry\engine"
+$Parent = Split-Path -Parent $Root
+foreach ($Folder in $Parent, $Root) {
+    icacls $Folder /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" `
+        "*S-1-5-32-545:(OI)(CI)RX" "*S-1-5-11:(OI)(CI)RX"
+}
+icacls $Parent /setowner "*S-1-5-32-544"
+icacls $Root /setowner "*S-1-5-32-544" /T /C
+```
+
+A file an administrator creates there can be owned by that administrator's own account, under the
+"Object creator" default-owner policy. That account then counts as another account that can write
+it, and the installer refuses the install.
 
 **The installer refuses an engine install anyone but administrators can write** (vault BACKLOG
 #2626). That holds for the default root and for one you pass with `-AppExe` or `-PythonExe`. It
@@ -248,8 +273,11 @@ Restart-Service MessageFoundry
 curl.exe --cacert C:\ProgramData\MessageFoundry\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
-Install the release's `requirements.lock` first when its dependencies changed. The installer
-refuses an editable install, so a restart never runs whatever branch a checkout has.
+Install the release's `requirements.lock` first when its dependencies changed, then reset the
+owner as
+[Install the engine where only administrators can write](#install-the-engine-where-only-administrators-can-write)
+shows. The installer refuses an editable install, so a restart never runs whatever branch a
+checkout has.
 
 **Reinstall** instead when paths or flags change (port, config dir, data dir) or the service
 definition drifted — the install script is idempotent (it stops and reconfigures in place):
@@ -589,6 +617,20 @@ environment.
   not refused. What the engine reads, what it names and what it does not cover are in
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment).
 
+- **The other secrets: a secrets directory (any platform).** At least the engine's own secret
+  settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
+  value can each come from a file instead of the service's NSSM list. A variable an operator names
+  as a `[secrets].provider = "env"` reference, and one a library reads for itself, are not read
+  from it. Point `MEFOR_SECRETS_DIRECTORY` at a directory only
+  SYSTEM, Administrators and the service account can reach, with one file per setting, named as
+  its variable. A path in the NSSM list is not a secret. The engine refuses a directory or file a
+  broad group can read or change. The files are plain, protected by their access list alone, and
+  nothing creates the directory yet, so you create it. Which settings it supplies, and the rules,
+  are stated once, in
+  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). This is the
+  first part of the protected channel vault BACKLOG #2595 asks for, not the whole of it: a secret
+  left in the NSSM list is still named, not refused.
+
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:
 >
@@ -712,9 +754,11 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       run `namei -l` on every file there that is a link. Each directory those commands list must be owned by root, or by the engine's own
       account for the config directory itself, with no group or other write bit. The shipped
       image's `/config` sits directly under `/`, which is root-owned.
-  - **The cache folder is checked because it runs.** Python's source loader runs a matching
-    `__pycache__\*.pyc` in place of the `.py` beside it and never compares the two. A cache file
-    the check did not read could run under a source it passed (vault BACKLOG #2596).
+  - **The cache folder is checked because a cache file there can still run.** The loader compiles
+    each config module, and each `_` helper imported with an `import` statement, from the bytes it
+    read, so neither runs from `__pycache__`. A module reached through the ordinary import system
+    still can, at least through `importlib.import_module` or a sibling import while the config
+    directory is on `sys.path`, and so can tools such as `python -m` (vault BACKLOG #2596).
   - **At start, `serve` checks two more files the same way, each with the folder it sits in**: the
     service settings file it read (`--service-config`, else `.\messagefoundry.toml`) and the value
     file `environments\<env>.toml`. It refuses to start when another account can write either one
