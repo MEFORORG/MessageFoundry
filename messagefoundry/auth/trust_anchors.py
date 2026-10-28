@@ -198,7 +198,10 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
     build leaves to the driver, or a value that can name another host, which the build refuses.
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
-    that holds for every anchor here since vault BACKLOG #3090.
+    that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
+    the stat that judges the path opens it there, so a named pipe's server sees a connect first
+    (:func:`read_if_regular`). Only a driver file's spellings are screened for another host before
+    that stat; a ``tls_ca_file`` is not.
 
     **Not covered**, at least, as in item 9: the driver reads the file by path, at every connect
     its pool opens. A running lane is not stopped when its file fails a later check: its pool goes on
@@ -1038,18 +1041,19 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
 def read_if_regular(path: str, limit: int = -1) -> bytes | None:
     """The bytes of the regular file at ``path``, at most ``limit`` of them, or ``None`` when the
     path names anything else: a directory, a device or a pipe (vault BACKLOG #3090). A failure to
-    stat, open or read raises ``OSError``, and a path holding a NUL raises ``ValueError``, as
-    ``os.stat`` does.
+    stat, open or read raises ``OSError``. A path ``os.stat`` cannot take raises ``ValueError``,
+    as it does: at least a path holding a NUL, and on POSIX one with a character the filesystem
+    encoding cannot spell.
 
     The path is stat'ed first, so on POSIX a device or pipe in place is never opened, since
     opening some devices has effects of its own. On Windows that stat is not such a control:
     ``os.stat`` opens the path itself, so a named pipe's server sees a client connect and a device
     name is opened, before this function can judge either. The file is then opened once and
     judged again by its own descriptor, so nothing swapped in between is read. ``O_NONBLOCK``,
-    where the platform has it,
-    keeps that open from waiting on a pipe with no writer, and ``O_NOCTTY`` keeps a terminal from
-    becoming the engine's controlling terminal. A regular file is read blocking. The descriptor is
-    closed here, once, whatever happens: ``fdopen`` never owns it."""
+    where the platform has it, keeps that open from waiting on a pipe with no writer, and
+    ``O_NOCTTY`` keeps a terminal from becoming the engine's controlling terminal. A regular file
+    is read blocking. The descriptor is closed here, once, whatever happens: ``fdopen`` never
+    owns it."""
     if not stat.S_ISREG(os.stat(path).st_mode):
         return None
     nonblock = getattr(os, "O_NONBLOCK", 0)

@@ -395,21 +395,27 @@ def test_a_pipe_swapped_in_after_the_stat_is_opened_without_waiting(
     real_stat = os.stat
 
     def as_regular(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
-        if os.fspath(path) == pipe:
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path) == pipe:
             return real_stat(regular)
         return real_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "stat", as_regular)
-    result: dict[str, bytes | None] = {}
-    reader = threading.Thread(
-        target=lambda: result.update(data=ta.read_if_regular(pipe)), daemon=True
-    )
+    result: dict[str, object] = {}
+
+    def read() -> None:
+        try:
+            result["data"] = ta.read_if_regular(pipe)
+        except BaseException as exc:  # reported below, not lost in the thread
+            result["error"] = exc
+
+    reader = threading.Thread(target=read, daemon=True)
     reader.start()
     reader.join(10)
     if reader.is_alive():
         os.close(os.open(pipe, os.O_WRONLY))  # a writer releases the waiting open
         reader.join(10)
         pytest.fail("read_if_regular waited on a pipe with no writer")
+    assert "error" not in result, result["error"]
     assert result == {"data": None}
 
 

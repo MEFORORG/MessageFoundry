@@ -637,6 +637,9 @@ _MAX_DRIVER_CA_FILE_BYTES = 1 << 20
 #: ``ERROR_INVALID_NAME``: Windows' answer for a path it cannot spell, such as one with a leading
 #: space before the drive letter.
 _WINDOWS_INVALID_NAME = 123
+#: ``ERROR_BAD_NETPATH`` and ``ERROR_BAD_NET_NAME``: a share Windows could not reach, which
+#: CPython raises as ``FileNotFoundError`` though a file may be there.
+_WINDOWS_UNREACHABLE = frozenset({53, 67})
 
 
 def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | None = None) -> None:
@@ -721,8 +724,8 @@ def _read_driver_file(
     how a device or pipe is judged without being read, or waited on."""
     try:
         data = read_if_regular(path, _MAX_DRIVER_CA_FILE_BYTES + 1)
-    except (FileNotFoundError, ValueError):
-        # No such file, or a NUL in the path: the driver cannot load it either.
+    except ValueError:
+        # A path os.stat cannot take, such as one holding a NUL: the driver cannot load it either.
         logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
         return None
     except OSError as exc:
@@ -733,10 +736,7 @@ def _read_driver_file(
         if os.path.isdir(path) or isinstance(exc, NotADirectoryError):
             _irregular(setting, what, checked_for, error, leave_irregular)
             return None
-        if getattr(exc, "winerror", None) == _WINDOWS_INVALID_NAME:
-            # A name Windows cannot spell, such as a padded path: no such file. Only that Win32
-            # code: CPython maps every Win32 error it has no errno for to EINVAL, so testing
-            # errno would leave a real read failure unchecked.
+        if _names_no_file(exc):
             logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
             return None
         raise error(
@@ -752,6 +752,23 @@ def _read_driver_file(
             f"the engine reads to check {checked_for}"
         )
     return data
+
+
+def _names_no_file(exc: OSError) -> bool:
+    """Whether a failure to read one spelling of a driver file says no file is there, so the
+    driver cannot load it either, rather than that a file is there the engine cannot check.
+
+    A missing name counts, unless Windows reports it for a share it could not reach (53 and 67,
+    as :mod:`messagefoundry.config.key_file_access` reads them): the driver may reach that file
+    at a later connect. So does Windows' ``ERROR_INVALID_NAME``, a padded path for one, and only
+    by that Win32 code: CPython maps every Win32 error it has no errno for to EINVAL, so testing
+    errno would leave a real read failure unchecked. On POSIX an EINVAL is refused too, even from
+    a filesystem that rejects a padded spelling with it, because errno cannot tell that from a
+    failed read; that refuses the build rather than check the trimmed spelling."""
+    winerror = getattr(exc, "winerror", None)
+    if isinstance(exc, FileNotFoundError):
+        return winerror not in _WINDOWS_UNREACHABLE
+    return winerror == _WINDOWS_INVALID_NAME
 
 
 def _irregular(

@@ -219,35 +219,66 @@ def test_an_sslcert_past_the_read_cap_is_refused(
 class _WindowsReadError(OSError):
     """An ``OSError`` carrying a Win32 code on any platform, as CPython raises one on Windows."""
 
-    winerror: int = 0  # 0: no Win32 code, as on POSIX
+    winerror: int = 0
+
+
+class _WindowsNotFound(FileNotFoundError):
+    """A ``FileNotFoundError`` carrying a Win32 code on any platform."""
+
+    winerror: int = 0
+
+
+def _read_failure(shape: str) -> OSError:
+    """One failure ``read_if_regular`` can raise, by the shape a test names."""
+    kind, _, code = shape.partition(":")
+    if kind == "einval" and not code:
+        # A CRT or POSIX EINVAL: winerror is None on Windows and absent on POSIX.
+        return OSError(errno.EINVAL, "Invalid argument")
+    if kind == "einval":
+        einval = _WindowsReadError(errno.EINVAL, "Invalid argument")
+        einval.winerror = int(code)
+        return einval
+    if not code:
+        return FileNotFoundError(errno.ENOENT, "No such file or directory")
+    missing = _WindowsNotFound(errno.ENOENT, "No such file or directory")
+    missing.winerror = int(code)
+    return missing
 
 
 @pytest.mark.parametrize(
-    ("winerror", "refused"),
-    [(0, True), (1920, True), (1117, True), (123, False)],
+    ("shape", "refused"),
+    [
+        ("einval", True),
+        ("einval:1920", True),
+        ("einval:1117", True),
+        ("einval:123", False),
+        ("notfound:53", True),
+        ("notfound:67", True),
+        ("notfound", False),
+    ],
 )
-def test_a_read_failure_reported_as_einval_is_still_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int, refused: bool
+def test_a_read_failure_that_names_no_file_is_the_only_one_left_to_the_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str, refused: bool
 ) -> None:
     """CPython maps every Win32 error it has no errno for to EINVAL, so a real failure to read the
-    key (1920, ERROR_CANT_ACCESS_FILE; 1117, ERROR_IO_DEVICE) arrives as EINVAL. Only 123,
-    ERROR_INVALID_NAME, names no file and is left to the driver. Red with ``_read_driver_file``
-    leaving any EINVAL to the driver: the unreadable key is never checked."""
+    key (1920, ERROR_CANT_ACCESS_FILE; 1117, ERROR_IO_DEVICE) arrives as EINVAL, as a CRT or POSIX
+    EINVAL does, and is refused. Only 123, ERROR_INVALID_NAME, names no file. A share Windows could
+    not reach (53, 67) arrives as FileNotFoundError, and is refused too, since the driver may reach
+    the file later. Red with ``_read_driver_file`` leaving any EINVAL, or any FileNotFoundError, to
+    the driver: the unreadable key is never checked."""
     path = _write(tmp_path, b"unread")
-    error = _WindowsReadError(errno.EINVAL, "Invalid argument")
-    error.winerror = winerror
+    error = _read_failure(shape)
 
     def failing(*_args: Any) -> bytes | None:
         raise error
 
     monkeypatch.setattr(database, "read_if_regular", failing)
+    plain = _write(tmp_path, b"plain", "plain.pem")
     if refused:
         with pytest.raises(KeyWrapRefused, match="could not be read"):
-            _build(_write(tmp_path, b"plain", "plain.pem"), extra={"sslkey": path})
+            _build(plain, extra={"sslkey": path})
     else:
-        assert f"sslkey={{{path}}}" in _build(
-            _write(tmp_path, b"plain", "plain.pem"), extra={"sslkey": path}
-        )
+        assert f"sslkey={{{path}}}" in _build(plain, extra={"sslkey": path})
 
 
 def test_with_sslkey_set_sslcert_is_not_read(tmp_path: Path, client: _Client) -> None:
