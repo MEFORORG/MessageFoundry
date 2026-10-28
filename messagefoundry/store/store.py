@@ -2218,13 +2218,12 @@ class WebAuthnCredential:
         so a caller that must survive one (the sign-in lock's escalation and its notice, BACKLOG
         #3937) catches that alone and not every ``TypeError`` or ``KeyError`` beside it. A
         ``transports`` value that is JSON but not a list does not parse either."""
-        failure = ""
         try:
             raw = d.get("transports")
             transports = json.loads(raw) if raw else None
             if raw and not isinstance(transports, list):  # ``null`` included
                 raise TypeError("transports is not a list")
-            return cls(
+            cred = cls(
                 credential_id_hash=d["credential_id_hash"],
                 credential_id=d["credential_id"],
                 user_id=d["user_id"],
@@ -2246,9 +2245,13 @@ class WebAuthnCredential:
             # Keep only the class name, and raise once the handler has ended. The caught error can
             # quote the row's value (``JSONDecodeError.doc`` holds the whole ``transports`` text,
             # ``int()`` and ``float()`` quote theirs), and ``from None`` would only set
-            # ``__suppress_context__``: ``__context__`` would still hold it. A raise outside the
-            # handler leaves both chains empty (tests/test_from_none_is_not_redaction.py).
+            # ``__suppress_context__``: ``__context__`` would still hold it. Raised here, the caught
+            # error is on neither chain (tests/test_from_none_is_not_redaction.py). Two things this
+            # does not do: a caller that calls this inside its own handler still gets ITS error on
+            # ``__context__``, and the traceback's frame still holds ``d``, the whole row.
             failure = type(exc).__name__
+        else:
+            return cred
         raise PasskeyRowMalformed(failure)
 
 

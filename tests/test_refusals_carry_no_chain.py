@@ -953,10 +953,10 @@ async def test_an_integrity_refused_message_423_carries_no_chain(
 def _passkey_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "credential_id_hash": "h",
-        "credential_id": b"c",
+        "credential_id": "c",
         "user_id": "u",
         "rp_id": "localhost",
-        "public_key": b"k",
+        "public_key": "k",
         "sign_count": 0,
         "transports": '["usb"]',
         "device_type": "single_device",
@@ -975,10 +975,13 @@ def _passkey_row(**overrides: object) -> dict[str, object]:
         ("transports", '["' + _PLANTED, "JSONDecodeError"),  # .doc holds the whole cell
         ("sign_count", _PLANTED, "ValueError"),  # int() quotes the value
         ("created_at", _PLANTED, "ValueError"),  # float() quotes the value
+        ("last_used_at", _PLANTED, "ValueError"),  # float() again, through _opt_float
+        # A bytes cell that is not UTF-8: UnicodeDecodeError.object holds all of it.
+        ("transports", _PLANTED.encode() + b"\xff", "UnicodeDecodeError"),
     ],
 )
 def test_a_malformed_passkey_row_keeps_the_row_off_the_chain(
-    column: str, value: str, failure: str
+    column: str, value: str | bytes, failure: str
 ) -> None:
     with pytest.raises(PasskeyRowMalformed) as caught:
         WebAuthnCredential.from_mapping(_passkey_row(**{column: value}))
