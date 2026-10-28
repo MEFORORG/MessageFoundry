@@ -30,6 +30,7 @@ from messagefoundry.store import keyprovider_vault
 from messagefoundry.store.keyprovider import KeyProviderError
 from tests._ast_sites import call_sites, callee_name, parse_source
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
+from tests._vault_hop_env import STORE, supply_vault_hop
 
 #: ``strict_requests`` imports ``requests`` and ``urllib3`` at module scope.
 _needs_the_vault_extra = pytest.mark.skipif(
@@ -280,6 +281,7 @@ class _Client:
 def _active_key_failure(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> str:
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "synthetic-kek")
     monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
+    supply_vault_hop(monkeypatch, STORE)  # required since BACKLOG #2851
     monkeypatch.setattr(keyprovider_vault, "_build_client", lambda addr, token, **_: _Client(exc))
     with pytest.raises(KeyProviderError) as caught:
         keyprovider_vault.VaultKeyProvider(StoreSettings()).active_key()

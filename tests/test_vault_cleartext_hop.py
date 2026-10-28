@@ -171,16 +171,106 @@ def test_a_direct_http_address_is_refused_before_anything_is_sent(
     assert dials == []
 
 
+#: Each entry point's own address and token variables (BACKLOG #2851).
+_OWN_VARIABLES: dict[Any, tuple[str, str]] = {
+    _kv: ("MEFOR_SECRETS_VAULT_ADDR", "MEFOR_SECRETS_VAULT_TOKEN"),
+    _kek: ("MEFOR_STORE_VAULT_ADDR", "MEFOR_STORE_VAULT_TOKEN"),
+    _transit: ("MEFOR_STORE_VAULT_ADDR", "MEFOR_STORE_VAULT_TOKEN"),
+}
+
+_OPERATOR_TOKEN = "hvs.synthetic-operator-token"  # nosec B105 - a made-up test value
+
+
 @_ENTRY_POINTS
-def test_hvacs_own_vault_addr_fallback_is_checked_too(
+@pytest.mark.parametrize("unset", [None, ""], ids=["unset", "empty"])
+def test_an_unset_address_is_refused_and_vault_addr_is_never_read(
+    entry: EntryPoint, unset: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2851. RED before the change: with the MEFOR_* address unset or empty, hvac read
+    ``VAULT_ADDR``, which in an operator's shell may be another Vault, and only the #2317
+    cleartext refusal stood between it and the engine's token. Now the provider refuses first, as
+    its own fail-closed type, naming the variable and nothing it would have read."""
+    address_variable, _ = _OWN_VARIABLES[entry]
+    if unset is not None:
+        monkeypatch.setenv(address_variable, unset)
+    monkeypatch.setenv("VAULT_ADDR", _REMOTE_HTTP)
+    dials = _no_dial(monkeypatch)
+    with pytest.raises(_FAIL_CLOSED, match=f"{address_variable} is not set") as caught:
+        entry(monkeypatch, None)
+    assert type(caught.value) is _OWN_TYPE[entry]
+    assert "synthetic.test" not in str(caught.value)
+    assert dials == []
+
+
+@_ENTRY_POINTS
+@pytest.mark.parametrize("unset", [None, ""], ids=["unset", "empty"])
+def test_an_unset_token_is_refused_and_vault_token_is_never_read(
+    entry: EntryPoint,
+    unset: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """BACKLOG #2851. RED before the change: with the MEFOR_* token unset, hvac read
+    ``VAULT_TOKEN`` and then ``~/.vault-token``, the operator's own token, and sent it to the
+    engine's Vault. Now the provider refuses before any client is built. A home directory holding
+    a ``.vault-token`` is planted too, so neither fallback can supply one. The empty case was never
+    a fallback (hvac substitutes only for ``None``); it pins that an empty token refuses too,
+    rather than build a client that sends no token."""
+    _, token_variable = _OWN_VARIABLES[entry]
+    if unset is None:
+        monkeypatch.delenv(token_variable)
+    else:
+        monkeypatch.setenv(token_variable, unset)
+    monkeypatch.setenv("VAULT_TOKEN", _OPERATOR_TOKEN)
+    (tmp_path / ".vault-token").write_text(_OPERATOR_TOKEN, encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    dials = _no_dial(monkeypatch)
+    with pytest.raises(_FAIL_CLOSED, match=f"{token_variable} is not set") as caught:
+        entry(monkeypatch, _HTTPS_VAULT)
+    assert type(caught.value) is _OWN_TYPE[entry]
+    assert _OPERATOR_TOKEN not in str(caught.value)
+    assert dials == []
+
+
+@_ENTRY_POINTS
+def test_one_refusal_names_both_when_both_are_unset(
     entry: EntryPoint, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With the MEFOR_* address unset, hvac reads ``VAULT_ADDR``. The check reads the address the
-    client actually holds, so the fallback cannot route around it."""
-    monkeypatch.setenv("VAULT_ADDR", _REMOTE_HTTP)
-    with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
+    """BACKLOG #2851: a hop missing both variables says so in one refusal, as ``check-privileges``
+    does, rather than naming the address, then the token on the next start."""
+    address_variable, token_variable = _OWN_VARIABLES[entry]
+    monkeypatch.delenv(token_variable)
+    with pytest.raises(_FAIL_CLOSED) as caught:
         entry(monkeypatch, None)
-    _assert_refused(caught, entry)
+    assert type(caught.value) is _OWN_TYPE[entry]
+    assert f"{address_variable} is not set" in str(caught.value)
+    assert f"{token_variable} is not set" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("module", "own_type"),
+    [
+        ("messagefoundry.config.secretprovider_vault", SecretProviderError),
+        ("messagefoundry.store.keyprovider_vault", KeyProviderError),
+    ],
+    ids=["kv-secret", "store"],
+)
+def test_the_client_builder_refuses_an_empty_address_or_token_itself(
+    module: str, own_type: type[Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backstop at the one construction point each hop has: a caller that skipped the
+    refusing readers still cannot hand hvac an empty value, which hvac would replace with
+    ``VAULT_ADDR`` (an empty address) (BACKLOG #2851)."""
+    import importlib
+
+    build = importlib.import_module(module)._build_client
+    monkeypatch.setenv("VAULT_ADDR", _REMOTE_HTTP)
+    monkeypatch.setenv("VAULT_TOKEN", _OPERATOR_TOKEN)
+    with pytest.raises(own_type, match="_VAULT_ADDR is not set"):
+        build("", _TOKEN, revocation_attested=False)
+    with pytest.raises(own_type, match="_VAULT_TOKEN is not set"):
+        build(_HTTPS_VAULT, "", revocation_attested=False)
 
 
 @_ENTRY_POINTS

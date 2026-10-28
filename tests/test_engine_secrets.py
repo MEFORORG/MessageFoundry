@@ -43,6 +43,7 @@ from messagefoundry.engine_secrets import (
 from messagefoundry.restricted_file import broad_access_problem, write_restricted_file
 from messagefoundry.store import store as store_mod
 from messagefoundry.store.keyprovider import KeyProviderError
+from tests._vault_hop_env import SYNTHETIC_VAULT_ADDR
 
 _REPO = Path(__file__).resolve().parents[1]
 _USERS = "S-1-5-32-545"
@@ -332,6 +333,8 @@ def test_the_transit_cipher_reads_its_token_through_the_accessor(
         raise RuntimeError("stop before any Vault call")
 
     monkeypatch.setattr(crypto_transit, "_build_client", _record)
+    # Required since BACKLOG #2851: an unset address refuses before the client is built.
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", SYNTHETIC_VAULT_ADDR)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TOKEN", _FROM_ENV)
     from messagefoundry.config.settings import StoreSettings
 
@@ -342,6 +345,70 @@ def test_the_transit_cipher_reads_its_token_through_the_accessor(
     with pytest.raises(RuntimeError, match="stop before"):
         crypto_transit.build_transit_cipher(StoreSettings())
     assert seen == [_FROM_ENV, _FROM_FILE]
+
+
+@pytest.mark.parametrize("hop", ["store", "transit", "secrets"])
+def test_a_vault_token_in_neither_the_directory_nor_the_environment_is_refused(
+    hop: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2851: a configured secrets directory with no file for the token, and no variable
+    either, refuses, naming the setting. Neither ``VAULT_TOKEN`` nor ``~/.vault-token`` stands in."""
+    from messagefoundry.config import secretprovider_vault
+    from messagefoundry.config.settings import SecretsSettings, StoreSettings
+    from messagefoundry.store import crypto_transit, keyprovider_vault
+
+    _directory_in_process(tmp_path, monkeypatch)
+    for name in ("MEFOR_STORE_VAULT_TOKEN", "MEFOR_SECRETS_VAULT_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("VAULT_TOKEN", "hvs.synthetic-operator-token")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", SYNTHETIC_VAULT_ADDR)
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", SYNTHETIC_VAULT_ADDR)
+    monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "synthetic-transit-key")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "synthetic-kek")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
+
+    def _never(*_a: object, **_kw: object) -> object:
+        raise AssertionError("a client was built with no token")
+
+    for module in (keyprovider_vault, crypto_transit, secretprovider_vault):
+        monkeypatch.setattr(module, "_build_client", _never)
+    if hop == "store":
+        with pytest.raises(KeyProviderError, match="MEFOR_STORE_VAULT_TOKEN is not set"):
+            keyprovider_vault.VaultKeyProvider(StoreSettings()).active_key()
+    elif hop == "transit":
+        with pytest.raises(KeyProviderError, match="MEFOR_STORE_VAULT_TOKEN is not set"):
+            crypto_transit.build_transit_cipher(StoreSettings())
+    else:
+        with pytest.raises(SecretProviderError, match="MEFOR_SECRETS_VAULT_TOKEN is not set"):
+            secretprovider_vault.VaultSecretProvider(SecretsSettings()).resolve("mefor/ad")
+
+
+def test_an_unusable_directory_and_an_unset_address_are_refused_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2851: the hop's one refusal names an unset address beside the directory's own
+    refusal, so an operator does not fix the directory only to meet the address on the next start."""
+    from messagefoundry.config.secretprovider_vault import secrets_vault_hop
+    from messagefoundry.store.keyprovider_vault import store_vault_hop
+
+    directory = _directory_in_process(tmp_path, monkeypatch)
+    _put(directory, "MEFOR_STORE_VAULT_TOKEN", _FROM_FILE)
+    _put(directory, "MEFOR_SECRETS_VAULT_TOKEN", _FROM_FILE)
+    _broaden(directory)
+    for name in ("MEFOR_STORE_VAULT_ADDR", "MEFOR_SECRETS_VAULT_ADDR"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(KeyProviderError) as store_refusal:
+        store_vault_hop()
+    with pytest.raises(SecretProviderError) as connector_refusal:
+        secrets_vault_hop()
+    for caught, variable in (
+        (store_refusal, "MEFOR_STORE_VAULT_ADDR"),
+        (connector_refusal, "MEFOR_SECRETS_VAULT_ADDR"),
+    ):
+        assert f"{variable} is not set" in str(caught.value)
+        assert "is not restricted" in str(caught.value)
+        assert _FROM_FILE not in str(caught.value)
+        assert caught.value.__context__ is None
 
 
 def test_the_connector_vault_token_reads_the_environment_then_prefers_the_file(

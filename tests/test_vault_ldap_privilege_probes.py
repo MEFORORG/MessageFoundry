@@ -66,6 +66,7 @@ from messagefoundry.store import crypto_transit, keyprovider_vault
 from messagefoundry.store.crypto import cell_aad
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.privilege import StorePrivilegeReport
+from tests._vault_hop_env import SECRETS, STORE, supply_vault_hop
 
 #: Synthetic, never a real credential. The assertions check none of them reaches the output.
 _TOKEN = "hvs.synthetic-not-a-token-305"
@@ -507,6 +508,7 @@ class _TransitClient:
 
 def test_the_kek_paths_are_the_ones_the_key_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     transit = _RecordingTransit()
+    supply_vault_hop(monkeypatch, STORE)  # required since BACKLOG #2851
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", _KEK)
     monkeypatch.setenv(
         "MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:" + base64.b64encode(b"k" * 32).decode()
@@ -523,6 +525,7 @@ def test_the_transit_paths_are_the_ones_the_cipher_calls(
     monkeypatch: pytest.MonkeyPatch, audit_key: str | None
 ) -> None:
     transit = _RecordingTransit()
+    supply_vault_hop(monkeypatch, STORE)  # required since BACKLOG #2851
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor-data")
     if audit_key is None:
         monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
@@ -547,6 +550,7 @@ def test_the_kv_paths_are_the_ones_the_secret_provider_reads(
             return {"data": {"data": {"value": "synthetic", "pw": "synthetic"}}}
 
     client = type("C", (), {"secrets": type("S", (), {"kv": type("K", (), {"v2": _V2()})()})()})()
+    supply_vault_hop(monkeypatch, SECRETS)  # required since BACKLOG #2851
     monkeypatch.setenv("MEFOR_SECRETS_VAULT_KV_MOUNT", "kv-mefor")
     monkeypatch.setattr(secretprovider_vault, "_build_client", lambda a, t, **_: client)
     refs = ["mefor/ad", "mefor/smtp#pw"]
