@@ -379,9 +379,15 @@ async def test_last_received_read_seeks_the_channel_index_and_scans_no_messages(
     # "SCAN m" covers both the table name and the subqueries' alias.
     assert not any(line.startswith("SCAN m") for line in plan), plan
     assert not any("TEMP B-TREE" in line for line in plan), plan
-    seeks = [line for line in plan if "USING COVERING INDEX ix_messages_channel" in line]
-    assert any("(channel_id>?)" in line for line in seeks), plan  # the hop to the next channel
-    assert any("(channel_id=?)" in line for line in seeks), plan  # that channel's MAX
+    # The hop to the next channel may seek either channel_id-leading index (ix_messages_control
+    # serves a MIN as well, and the planner's tie-break is not the property); the per-channel MAX
+    # needs received_at second, so only ix_messages_channel serves it.
+    assert any(
+        "USING COVERING INDEX ix_messages_" in line and "(channel_id>?)" in line for line in plan
+    ), plan
+    assert any(
+        "USING COVERING INDEX ix_messages_channel (channel_id=?)" in line for line in plan
+    ), plan
     # Control: the old form reads the whole of messages (by index) rather than seeking it.
     old_plan = await _plan(store, _OLD_LAST_RECEIVED_SQL, ())
     assert any(line.startswith("SCAN messages") for line in old_plan), old_plan
