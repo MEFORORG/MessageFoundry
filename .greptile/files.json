@@ -18,7 +18,7 @@
     },
     {
       "path": "docs/PHI.md",
-      "description": "PHI threat model, logging inventory and redaction rules, attached for de-identification code. The synthetic-test-data rule covers tests and samples.",
+      "description": "PHI threat model, logging inventory and redaction rules, attached for the de-identification framework and the tee harness.",
       "scope": [
         "messagefoundry/anon/**",
         "tee/**"
