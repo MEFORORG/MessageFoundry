@@ -3284,6 +3284,11 @@ class AuthService:
         #: ``"fresh"``: no pass here saw a referral. ``"referred"``: one did. ``"forfeit"``: see
         #: `_forfeit_clears_on_attrition`. Only `_advance_referral_standing` moves it.
         self._reconcile_referral_standing: _ReferralStanding = "fresh"
+        #: Passes running that read the directory unreachable, and whether a run of them paged in
+        #: THIS process (BACKLOG #3709). In memory, so a restart starts the count again and
+        #: resolves no outage instance an earlier run opened. `_note_directory_outage` keeps both.
+        self._reconcile_outage_passes = 0
+        self._reconcile_outage_paged = False
         #: The accounts behind the trip, referral and hold now open, kept only so that a forfeited
         #: standing logs once per new one (BACKLOG #3083). Logging state: no decision reads it.
         #: Not `_reconcile_unconfirmed` or `_reconcile_referred`: those leave id-less rows out and
@@ -7721,6 +7726,50 @@ class AuthService:
                 entered.append((probe.user_id, probe.username, probe.detail))
         return tuple(entered)
 
+    def _note_directory_outage(self, plan: reconcile.ReconcilePlan) -> reconcile.ReconcilePlan:
+        """Count the passes running that read the directory unreachable, and say on the plan
+        whether this one pages or clears (BACKLOG #3709).
+
+        Every outage pass is fail-open: it revokes nothing, so a directory disable or deletion
+        reaches no signed-in session while the outage lasts, and the pass is audited as skipped.
+        One such pass is a blip and pages nobody. The pass that makes the run
+        ``[auth].ad_reconcile_outage_passes`` long pages, once: the passes after it in the same run
+        do not. **Every cause counts**: the plan reads an outage whenever every probe it asked came
+        back UNAVAILABLE, whatever made each one so.
+
+        A pass that asked the directory anything and is not an outage reached it, even one that
+        judged nothing, such as a pass of referrals only. It ends the run, and once a run here has
+        paged it marks ``outage_clear`` on every such pass, as the other clears are raised, so a
+        resolve that failed is retried. A pass that asked nothing, with nobody signed in or only
+        id-less rows, learned nothing about the directory and leaves the run as it stands.
+
+        Process-local, like the strikes. A restart starts the count again, so a standing outage
+        pages again after it, and resolves nothing an earlier run opened: ``_paged`` starts False,
+        and the lifespan task's inherited-instance and sole-reconciler gates drop the clear as they
+        drop every other (``_mark_reconcile_clears`` states that rule)."""
+        if plan.directory_outage:
+            self._reconcile_outage_passes += 1
+            page = self._reconcile_outage_passes == self._settings.ad_reconcile_outage_passes
+            if page:
+                self._reconcile_outage_paged = True
+                _log.error(
+                    "directory reconcile: the directory has been unreachable for %d passes running; "
+                    "no directory disable or deletion reaches a signed-in session until a pass "
+                    "reaches it",
+                    self._reconcile_outage_passes,
+                )
+            return replace(plan, outage_passes=self._reconcile_outage_passes, outage_page=page)
+        if plan.asked == 0:
+            return replace(plan, outage_passes=self._reconcile_outage_passes)
+        if self._reconcile_outage_passes:
+            _log.warning(
+                "directory reconcile: the directory was reached again after %d unreachable "
+                "pass(es)",
+                self._reconcile_outage_passes,
+            )
+        self._reconcile_outage_passes = 0
+        return replace(plan, outage_clear=self._reconcile_outage_paged)
+
     async def _record_paging_refusals(self, plan: reconcile.ReconcilePlan) -> None:
         """Log, audit and latch each account entering the paging-refused state (vault BACKLOG
         #3696).
@@ -7931,6 +7980,8 @@ class AuthService:
         self._reconcile_hold_latched = plan.latched
         # Vault BACKLOG #3696. Before any return below, so an outage-shaped pass pages too.
         plan = replace(plan, paging_refused=self._note_paging_refusals(probes, plan.outcomes))
+        # BACKLOG #3709. Before any return below, so the outage's skipped row carries the count.
+        plan = self._note_directory_outage(plan)
         if plan.hold:
             self._advance_hold_standing("held")
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
@@ -8961,7 +9012,10 @@ class AuthService:
             )
             await self._audit_reconciler_row(
                 "auth.ad_reconcile_skipped",
-                detail=_json({"reason": plan.aborted, "asked": plan.asked}),
+                # BACKLOG #3709: the run's length, so the outage's page matches a row.
+                detail=_json(
+                    {"reason": plan.aborted, "asked": plan.asked, "passes": plan.outage_passes}
+                ),
             )
             return
         # The ceiling is taken over the breaker's own denominator, which counts held probes (ADR

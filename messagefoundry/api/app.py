@@ -10486,6 +10486,9 @@ _MISCONFIGURED_ALERT_SOURCE = "directory-reconciler-misconfigured"
 #: ``ad_session_revoked`` is keyed on the account: a second account entering inside the first's
 #: cooldown still pages.
 _PAGING_ALERT_SOURCE = "directory-reconciler-paging"
+#: The source label of a lasting directory outage's own ``ad_reconcile_aborted`` instance (BACKLOG
+#: #3709), apart from the others for the same reasons.
+_OUTAGE_ALERT_SOURCE = "directory-reconciler-outage"
 #: What each paging refusal cause tells the operator. Short, and the consequence first, because
 #: the store keeps only the first 200 characters of an instance's reason; the account is in the
 #: source.
@@ -10505,8 +10508,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_session_revoked`` alert, except a quiet one whose row was written, which the service
     leaves off the returned plan (BACKLOG #3085; ``AuthService._apply_reconcile_revocation`` says
     which are quiet). A whole-directory outage aborts too, but it is audited as
-    ``auth.ad_reconcile_skipped`` and pages nothing: the accounts are fine, the directory is not,
-    and the pass is fail-open.
+    ``auth.ad_reconcile_skipped``: the accounts are fine, the directory is not, and the pass is
+    fail-open. One such pass pages nothing. A run of ``[auth].ad_reconcile_outage_passes`` of them
+    pages once, as ``ad_reconcile_aborted`` with reason ``directory_unavailable`` under its own
+    source label (:data:`_OUTAGE_ALERT_SOURCE`), and the first pass that reaches the directory
+    resolves it (BACKLOG #3709; ``AuthService._note_directory_outage`` says when each is set).
 
     A referral (BACKLOG #2538) is NOT an outage: it recurs until a search base is fixed. Any pass
     with a referred probe is ``auth.ad_reconcile_referred`` and becomes one ``ad_reconcile_aborted``
@@ -10558,9 +10564,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     Each standing alert but the probe fault's, the configuration refusal's and a paging refusal's
     also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
     ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
-    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
+    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance, and
+    under the outage's source for the outage's (BACKLOG #3709). The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
-    ``plan.hold_clear``, ``plan.referral_clear``; see ``AuthService._mark_reconcile_clears``), so
+    ``plan.hold_clear``, ``plan.referral_clear``, ``plan.outage_clear``; see
+    ``AuthService._mark_reconcile_clears`` and ``AuthService._note_directory_outage``), so
     the alert and the service read one predicate. An outage or a pass with no signed-in account
     sets none. The inverse is raised on EVERY pass that sets its flag, not once per clear:
     resolving is an idempotent update, and a resolve the notifier failed to write is retried that
@@ -10568,6 +10576,19 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     earlier run left open (:func:`_without_inherited_clears` drops that clear);
     ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
+        if plan.outage_page:
+            # BACKLOG #3709. One pass is a blip; the pass whose run reached the setting pages once.
+            sink.ad_reconcile_aborted(
+                _OUTAGE_ALERT_SOURCE,
+                # Never None on an outage; the fallback is only for the type checker.
+                reason=plan.aborted or "directory_unavailable",
+                probed=plan.asked,
+                detail=(
+                    f"The directory has been unreachable for {plan.outage_passes} reconcile passes "
+                    "running. No directory disable or deletion reaches a signed-in session until a "
+                    "pass reaches it. Check [auth].ad_server and the network path to it."
+                ),
+            )
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
         _alert_paging_refusals(plan, sink)
@@ -10628,6 +10649,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_hold_released("directory-reconciler")
     if plan.referral_clear:
         sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
+    if plan.outage_clear:
+        sink.ad_reconcile_breaker_cleared(_OUTAGE_ALERT_SOURCE)
 
 
 def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
@@ -10682,6 +10705,7 @@ _RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
     "breaker_clear": ("directory-reconciler", "ad_reconcile_aborted"),
     "hold_clear": ("directory-reconciler", "ad_reconcile_held"),
     "referral_clear": (_REFERRAL_ALERT_SOURCE, "ad_reconcile_aborted"),
+    "outage_clear": (_OUTAGE_ALERT_SOURCE, "ad_reconcile_aborted"),
 }
 
 

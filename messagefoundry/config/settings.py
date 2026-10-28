@@ -3422,6 +3422,13 @@ class AuthSettings(_Section):
     # by the following passes (least-recently-probed first), so a very large estate degrades to a longer
     # effective interval instead of a bind storm against the DC.
     ad_session_recheck_max_users: int = 200
+    # How many CONSECUTIVE passes must read the directory unreachable before the reconciler pages
+    # (BACKLOG #3709). Every such pass is fail-open: it revokes nothing, so a disable or deletion
+    # does not reach a signed-in session while it lasts. One pass is a blip and pages nobody; a run
+    # of them pages once, as `ad_reconcile_aborted` under its own source, and the first pass that
+    # reaches the directory resolves it. At least 2, so a single blip never pages. The count is
+    # process-local, like the strikes, so a restart starts it again.
+    ad_reconcile_outage_passes: int = 3
     # --- mass-revoke circuit breaker ---
     # A search base that names the wrong OU, an OU reorganisation that moves the users out of it, or
     # a service account that lost read rights on the entries while it can still read the base returns
@@ -3958,6 +3965,14 @@ class AuthSettings(_Section):
     def _check_ad_recheck_max_users(cls, value: int) -> int:
         if value < 1:
             raise ValueError("ad_session_recheck_max_users must be >= 1")
+        return value
+
+    @field_validator("ad_reconcile_outage_passes")
+    @classmethod
+    def _check_ad_reconcile_outage_passes(cls, value: int) -> int:
+        # >=2: one unreachable pass is a blip, and paging on it would page on every blip.
+        if value < 2:
+            raise ValueError("ad_reconcile_outage_passes must be >= 2")
         return value
 
     @field_validator("ad_session_revoke_max")

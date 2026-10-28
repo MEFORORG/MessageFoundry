@@ -332,12 +332,24 @@ class ReconcilePlan:
     #: :data:`PAGING_DEADLINE` or :data:`PAGING_CAP`. An account already in that state is not
     #: here, so each pages once per state change. Set on every pass, an outage-shaped one included.
     paging_refused: tuple[tuple[str, str, str], ...] = ()
+    #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709): how many
+    #: passes running, this one included, have read the directory unreachable
+    #: (:attr:`directory_outage`), in this process. 0 on a pass that reached it, and unchanged by
+    #: a pass that asked the directory nothing. ``AuthService._note_directory_outage`` keeps it.
+    outage_passes: int = 0
+    #: Whether this pass is the one whose outage run reached ``[auth].ad_reconcile_outage_passes``,
+    #: so the lifespan task pages, once per run (BACKLOG #3709).
+    outage_page: bool = False
+    #: Whether this pass reached the directory after a run that paged, in this process (BACKLOG
+    #: #3709). Read like the other ``*_clear`` flags: the caller resolves the outage's instance on it.
+    outage_clear: bool = False
 
     @property
     def directory_outage(self) -> bool:
         """True when the pass aborted because the directory, not the accounts, failed. The auth
         service audits this as skipped rather than aborted, and the lifespan task pages nobody for
-        it. Both read this one predicate, so the audit row and the alert cannot disagree."""
+        one such pass, only for a run of them (BACKLOG #3709, ``outage_page``). Both read this one
+        predicate, so the audit row and the alert cannot disagree."""
         return self.aborted == "directory_unavailable"
 
     @property

@@ -4792,8 +4792,10 @@ the right one*:
   set exceeds **both** `ad_session_revoke_max` (5) **and** `ad_session_revoke_max_fraction` (0.34) of
   the probed population **aborts**: nothing is revoked, nothing is written, the engine logs at ERROR
   and audits `auth.ad_reconcile_aborted`, raises the `ad_reconcile_aborted` alert, and the condition
-  latches until a clean pass. A whole-directory outage audits `auth.ad_reconcile_skipped` instead and
-  raises no alert. Both thresholds
+  latches until a clean pass. A whole-directory outage audits `auth.ad_reconcile_skipped` instead, and
+  one such pass raises no alert. A run of `ad_reconcile_outage_passes` of them (3 by default) pages
+  once, and the first pass that reaches the directory resolves it (BACKLOG #3709;
+  [CONFIGURATION.md](CONFIGURATION.md) has the row). Both thresholds
   must be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
 
