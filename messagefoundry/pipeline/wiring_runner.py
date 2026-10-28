@@ -3719,8 +3719,8 @@ class RegistryRunner:
         log only, as the connection-test route keeps it from API callers (BACKLOG #1142). The lane
         status and the ``connection_stopped`` alert carry the fixed line (:func:`_lane_anchor_line`).
         An :class:`AnchorSettingRefused` is a refused setting, not a refused file, and its line
-        says so (vault BACKLOG #3224, #3498). A pin that is not a SHA-256 is still a
-        ``TrustAnchorError`` from the file check, so it takes the file's line."""
+        says so (vault BACKLOG #3224, #3498). That includes an ``env()`` pin that resolves but
+        does not parse: the check refuses it before it writes any audit row."""
         if self._lane_anchor_check is None:
             return
         try:

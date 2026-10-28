@@ -296,12 +296,41 @@ async def test_the_lane_check_takes_a_path_the_os_refuses_as_a_setting(
 async def test_a_pin_that_does_not_parse_names_the_pin(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
-    """A malformed pin's refusal names the pin's setting, not the file's (vault BACKLOG #3498).
-    Red under: ``evaluate_anchor`` raising it with no ``setting``."""
+    """A malformed pin, as an ``env()`` value can resolve to, is a setting the lane check refuses
+    before any audit row is written. Its cause, ``evaluate_anchor``'s refusal, names the pin's
+    setting, not the file's, as the audited check's does (vault BACKLOG #3498). Red under: the
+    lane check letting that ``TrustAnchorError`` out bare, or ``evaluate_anchor`` raising it with
+    no ``setting``."""
     check = ta.make_lane_anchor_check(store, enforcing=True)
-    with pytest.raises(TrustAnchorError) as refused:
-        await check("outbound", "OB_X", {"tls_ca_file": str(_ca(tmp_path)), "tls_ca_pin": "zz"})
-    assert refused.value.setting == "outbound connection 'OB_X' tls_ca_pin"
+    settings = {"tls_ca_file": str(_ca(tmp_path)), "tls_ca_pin": "zz"}
+    with pytest.raises(AnchorSettingRefused) as refused:
+        await check("outbound", "OB_X", settings)
+    cause = refused.value.__cause__
+    assert isinstance(cause, TrustAnchorError)
+    assert cause.setting == "outbound connection 'OB_X' tls_ca_pin"
+    assert await store.list_audit(action="auth.trust_anchor", limit=5) == []
+    spec = ta.lane_anchor_spec("outbound", "OB_X", settings)
+    assert spec is not None
+    with pytest.raises(TrustAnchorError) as audited:
+        await ta._preflight_one(store, spec, enforcing=True)
+    assert audited.value.setting == "outbound connection 'OB_X' tls_ca_pin"
+
+
+async def test_an_env_pin_that_does_not_parse_is_told_to_fix_the_setting(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """An ``env()`` pin that resolves but does not parse wrote no audit row, so its line is the
+    setting's, not the file's, which names audit rows (vault BACKLOG #3498). Red under: the lane
+    check letting ``evaluate_anchor``'s ``TrustAnchorError`` out bare."""
+    reg = _poller_graph(_ca(tmp_path), env("ftps_ca_pin"))
+    runner = _runner(store, reg, env_values={"ftps_ca_pin": "zz"})
+    await runner.start()
+    try:
+        reason = runner.inbound_failed(_IB) or ""
+        assert "its tls_ca_pin or tls_ca_file setting was refused. Fix the setting" in reason
+        assert _FIX_THE_FILE not in reason and "audit rows" not in reason
+    finally:
+        await runner.stop()
 
 
 def test_a_dr_abort_names_a_long_connection_whole() -> None:
@@ -320,8 +349,9 @@ def test_a_dr_abort_names_a_long_connection_whole() -> None:
 async def test_the_reload_route_reads_a_cause_below_the_first(
     store: MessageStore, cause: type[Exception], reason: str, status: int
 ) -> None:
-    """A store fault or a refusal two wrappers down is still read as one: both arms walk the
-    explicit chain (vault BACKLOG #3498). Red under: either arm reading one level only."""
+    """A store fault or a refusal two ``WiringError`` wrappers down is still read as one: the
+    store arm walks the explicit chain, and the anchor arm walks its ``WiringError`` links (vault
+    BACKLOG #3498). Red under: either arm reading one level only."""
     from messagefoundry.api.app import _audit_refused_reload
 
     inner = WiringError("inner")
@@ -335,6 +365,63 @@ async def test_the_reload_route_reads_a_cause_below_the_first(
     rows = await store.list_audit(action="config_reload_failed", limit=5)
     assert answered == status
     assert [json.loads(r["detail"])["reason"] for r in rows] == [reason]
+
+
+async def test_a_reload_with_a_typo_in_a_literal_pin_is_an_invalid_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo in a literal ``tls_ca_pin`` is refused by the factory as a ``ValueError``, whose own
+    cause is ``parse_anchor_pin``'s ``TrustAnchorError``. That is a config to fix, audited
+    ``invalid_config`` as before the chain walk; only the shape a trust-anchor check raises is
+    ``trust_anchor`` (vault BACKLOG #3498). The control is a CA the registry preflight refuses,
+    in the same route. Red under: the anchor arm walking the whole cause chain."""
+    import httpx
+
+    from messagefoundry.api import create_app
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    ca = tmp_path / "anchor.pem"
+    ca.write_bytes(_block(b"ca"))
+    out = str(tmp_path / "out")
+    head = "from messagefoundry import MLLP, File, Rest, Send, handler, inbound, outbound, router\n"
+    tail = (
+        f"outbound('OUT', File(directory={out!r}))\n"
+        "@router('r')\ndef route(msg):\n    return ['h']\n"
+        "@handler('h')\ndef handle(msg):\n    return Send('OUT', msg)\n"
+    )
+    typo, refused = tmp_path / "typo", tmp_path / "refused"
+    typo.mkdir()
+    refused.mkdir()
+    (typo / "feed.py").write_text(
+        head + "inbound('ADT_IN', MLLP(port=21575), router='r')\n"
+        f"outbound('OB_REST', Rest(url='https://example.test/x', tls_ca_file={str(ca)!r}, "
+        f"tls_ca_pin={'3g' * 32!r}))\n" + tail,
+        encoding="utf-8",
+    )
+    (refused / "feed.py").write_text(
+        head + f"inbound('ADT_IN', MLLP(port=21575, tls=True, tls_cert_file={str(ca)!r}, "
+        f"tls_ca_file={str(ca)!r}), router='r')\n" + tail,
+        encoding="utf-8",
+    )
+    store = await MessageStore.open(tmp_path / "e.db")
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            reasons = []
+            for target in (typo, refused):
+                r = await client.post("/config/reload", json={"config_dir": str(target)})
+                assert r.status_code == 422, r.text
+                (row,) = await store.list_audit(action="config_reload_failed", limit=1)
+                reasons.append(json.loads(row["detail"])["reason"])
+        assert reasons == ["invalid_config", "trust_anchor"]
+    finally:
+        await engine.stop()  # closes the store too
 
 
 # --- item 5: the advice a refused setting gets, and a kept failure that stops resolving --------
@@ -354,7 +441,8 @@ _FIX_THE_FILE = "Fix the file"
 
 def _blank_pin_runner(store: MessageStore, tmp_path: Path, **kw: Any) -> RegistryRunner:
     """A poller whose ``tls_ca_pin`` is an ``env()`` value set to nothing. A blank literal
-    refuses when the graph loads; this one reaches the lane check, which raises ``ValueError``."""
+    refuses when the graph loads; this one reaches the lane check, which raises
+    ``AnchorSettingRefused``."""
     reg = _poller_graph(_ca(tmp_path), env("ftps_ca_pin"))
     return _runner(store, reg, env_values={"ftps_ca_pin": ""}, **kw)
 
@@ -363,7 +451,7 @@ async def test_a_refused_pin_setting_is_not_told_to_fix_the_file(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
     """A blank pin is a setting to change, and a start reads the same setting again. Red under:
-    the ``ValueError`` arm of ``_check_lane_anchor`` removed."""
+    ``_lane_anchor_fault`` not reading an ``AnchorSettingRefused`` as a setting."""
     runner = _blank_pin_runner(store, tmp_path)
     await runner.start()
     try:
@@ -394,8 +482,8 @@ async def test_a_refused_file_is_still_told_to_fix_the_file(
 async def test_a_passive_standby_does_not_tell_a_refused_setting_to_fix_the_file(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
-    """The passive start's own line. Red under: the ``ValueError`` arm of
-    ``_preflight_passive_lanes`` removed."""
+    """The passive start's own line. Red under: ``_lane_anchor_fault`` not reading an
+    ``AnchorSettingRefused`` as a setting."""
     runner = _blank_pin_runner(store, tmp_path, dr_standby=Priority.CRITICAL)
     await runner.start()
     try:
@@ -479,7 +567,7 @@ async def test_a_lane_ca_line_is_kept_whole(
     """Every fixed CA line reaches the lane's status whole, advice included, up to the longest
     connection name (vault BACKLOG #3498). ``safe_exc``'s 200 characters cut the passive lines
     for any name, and the store's line too. Red under: ``_record_failed`` taking ``safe_exc``'s
-    default for a ``_LaneAnchorLine``."""
+    default for a ``fixed_text`` line."""
     reg = _poller_graph(_ca(tmp_path), None, name=name)
     standby = {"dr_standby": Priority.CRITICAL} if passive else {}
     runner = _runner(store, reg, lane_anchor_check=_raising(raised("x")), **standby)

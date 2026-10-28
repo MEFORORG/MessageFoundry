@@ -307,13 +307,13 @@ class TrustAnchorError(Exception):
 
 
 class AnchorSettingRefused(ValueError):
-    """A lane's CA settings were refused before any file was read: at least a ``tls_ca_pin`` that
-    is blank, not text, or set beside a CA the hop never reads, and a CA path the OS will not
-    take, such as one holding a NUL. :func:`make_lane_anchor_check`
-    raises it, since that check knows which of its steps refused, so a caller tells a setting to
-    fix from a file to fix by this class and not by a bare ``ValueError``, which a ``WiringError``
-    also is (vault BACKLOG #3498). A malformed pin is still a :class:`TrustAnchorError` from the
-    file check, so it is not one of these, though its ``setting`` names the pin."""
+    """A lane's CA settings were refused before any audit row was written: at least a
+    ``tls_ca_pin`` that is blank, not text, does not parse, or is set beside a CA the hop never
+    reads, and a CA path the OS will not take, such as one holding a NUL.
+    :func:`make_lane_anchor_check` raises it, since that check knows which of its steps refused,
+    so a caller tells a setting to fix from a file to fix by this class and not by a bare
+    ``ValueError``, which a ``WiringError`` also is (vault BACKLOG #3498). A pin that does not
+    parse is raised from the :class:`TrustAnchorError` naming the pin's setting."""
 
 
 def explicit_cause[E: BaseException](exc: BaseException, kind: type[E]) -> E | None:
@@ -2578,11 +2578,11 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
     :func:`lane_anchor_spec`'s.
 
     It raises :class:`TrustAnchorError` for a refused or unreadable file, and
-    :class:`AnchorSettingRefused`, a ``ValueError``, for a blank or unread ``tls_ca_pin``. Each
-    names the connection. A lane with no CA it reads is a
-    no-op: no store call, no audit row. A store that refuses the audit read or write raises
-    :class:`AnchorStoreUnavailable`, which is not a refusal and is not remembered below, so the
-    next check reads the file again (BACKLOG #3091).
+    :class:`AnchorSettingRefused`, a ``ValueError``, for a ``tls_ca_pin`` that is blank, unread or
+    does not parse, or a CA path the OS will not take. Each names the connection. A lane with no
+    CA it reads is a no-op: no store call, no audit row. A store that refuses the audit read or
+    write raises :class:`AnchorStoreUnavailable`, which is not a refusal and is not remembered
+    below, so the next check reads the file again (BACKLOG #3091).
 
     **A repeat of the last refusal writes no rows.** A scheduled poller retries its bind at every
     window tick, and each audited refusal would add rows. Enough of them would push a quiet
@@ -2614,8 +2614,10 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
             return
         try:
             now = await asyncio.to_thread(state, spec)
-        except ValueError as exc:
-            # A path the OS will not take, such as one holding a NUL: no file was read.
+        except (ValueError, TrustAnchorError) as exc:
+            # A path the OS will not take, such as one holding a NUL, or an env() pin that
+            # resolved but does not parse, the one TrustAnchorError evaluate_anchor raises. Each
+            # is a setting refused before any audit row was written (vault BACKLOG #3498).
             raise AnchorSettingRefused(str(exc)) from exc
         prior = refused.pop(spec.label, None)
         if prior is not None and prior[0] == now:

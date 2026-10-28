@@ -2298,6 +2298,23 @@ async def _answer_refused_reload(
     raise HTTPException(status, answer) from exc
 
 
+def _refused_by_trust_anchor(exc: WiringError) -> bool:
+    """Whether a refused reload's ``WiringError`` is a trust-anchor check's refusal: its explicit
+    cause, under any further ``WiringError`` wrappers, is a :class:`TrustAnchorError`. That is
+    the shape the settings preflight and ``refused_connection_anchor`` raise.
+
+    A refusal under any other cause is not one. A typo in a literal ``tls_ca_pin`` is the
+    factory's ``ValueError``, whose own cause is ``parse_anchor_pin``'s refusal, and that is a
+    config to fix: ``invalid_config``, as the reload has always audited it (vault BACKLOG
+    #3498). A cycle ends the walk."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while isinstance(cur, WiringError) and id(cur) not in seen:
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return isinstance(cur, TrustAnchorError)
+
+
 async def _audit_refused_reload(
     engine: Engine,
     exc: Exception,
@@ -2428,10 +2445,7 @@ async def _audit_refused_reload(
         status = 503
         answer = "the engine could not reach its store to check a trust anchor; see the engine log"
     elif isinstance(exc, WiringError):
-        # The whole explicit chain, as the store arm above, the connection-test route and a DR
-        # abort read it (vault BACKLOG #3498); one level saw only what refused_connection_anchor
-        # wraps.
-        anchor_refused = trust_anchor_cause(exc) is not None
+        anchor_refused = _refused_by_trust_anchor(exc)
         warn(
             "config reload %s: %s",
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
