@@ -1068,8 +1068,9 @@ holds its key, its reason words and its `count`. The key carries the process suf
 applies, and the alert item above says what the suffix holds. The count in the alert list is a
 different number: how many times the engine has raised that alert.
 
-`queued` is how many records sit on the in-memory hand-off queue right now. It does not count
-records waiting in the on-disk spool, and no field does. Every other count runs from the start of
+`queued` is how many records sit on the general lane of the in-memory hand-off queue right now.
+It does not count audit tee lines on their own lane, or records waiting in the on-disk spool, and
+no field does. Every other count runs from the start of
 the process. While the state is `not_installed`, every count reads zero, whatever was counted
 before. Each engine process has
 its own forwarder and watches its own: every engine shard, and a cluster standby too.
@@ -1082,8 +1083,16 @@ general line logged before it. The line's own time stamp has whole seconds only,
 order of two lines logged in the same second; an audit line's JSON body carries a `ts` with
 fractions of a second, and a general line has nothing like it. `queue_dropped` counts drops from
 both lanes, and `lost` counts each once. The audit lane fills on audit traffic alone, and the
-alert reason above says when it has. The drop warning in the engine log names dropped audit
-lines but never counts them on their own. Both lanes share one sending thread, one connection and one on-disk
+alert reason above says when it has. The drop warning in the engine log names the lane or lanes
+that dropped, with each one's depth, and gives no count for a lane on its own. Its batch and total
+count both lanes, so while only the audit lane drops, the batch is the audit lines dropped and the
+total rises by one per audit row written. That was so before the lanes too: a full single queue
+dropped audit lines into the same counts, and with no general line arriving they were the only
+drops. `queued` leaves the audit lane out, so while the general lane is full
+it does not move as audit rows are written. No field gives the audit lane's depth. A collector
+whose sends fail shows as `send_failing` and the `degraded` state, and an audit lane that fills
+shows as the `audit_queue_full` alert reason and a rise in `queue_dropped`. A collector that is
+only slow shows in neither until a lane fills. Both lanes share one sending thread, one connection and one on-disk
 spool, so a full spool refuses audit lines as it refuses general ones.
 `GET /status` reports the process that answered.
 

@@ -36,8 +36,6 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
-import time
 from collections.abc import Callable
 
 from messagefoundry.logging_setup import AUDIT_LOGGER_NAME, ensure_logger_sink
@@ -89,44 +87,8 @@ def remove_audit_observer(observer: AuditObserver) -> None:
 audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
 audit_logger.setLevel(logging.INFO)
 
-#: The least seconds between two tee-failure lines; see :func:`_report_tee_failure`.
-TEE_FAILURE_REPORT_INTERVAL = 300.0
-#: Monotonic time of the last tee-failure line, or ``None`` before the first.
-_tee_failure_reported_at: float | None = None
-_tee_failure_lock = threading.Lock()
-
-
-def _report_tee_failure() -> None:
-    """Log a tee failure: the first at once, then a failure at most once per
-    :data:`TEE_FAILURE_REPORT_INTERVAL` (vault BACKLOG #2612).
-
-    Until #2612 this logged the first failure in the process and nothing after it, so a sink that
-    broke and stayed broken looked, a day later, the same as one that broke once and healed.
-
-    **The line never names a row and never counts rows** (BACKLOG #1131). ``GET /logs/tail`` serves
-    this log to ``logs:view``, which the Operator holds without ``users:manage``, and a count of
-    failed tees counts the rows written, the hidden lock rows included. A later line says only that
-    a tee failed again, so it tells a reader at most that an audit row was written, once per
-    interval. That timing is the residual ``docs/SECURITY.md`` names. The first line carries the
-    traceback, as it did before #2612; later ones carry no traceback and no exception type."""
-    global _tee_failure_reported_at
-    now = time.monotonic()
-    with _tee_failure_lock:
-        last = _tee_failure_reported_at
-        if last is not None and now - last < TEE_FAILURE_REPORT_INTERVAL:
-            return
-        _tee_failure_reported_at = now
-    if last is None:
-        log.warning(
-            "off-box audit tee failed; the rows are still in the audit_log table. Further failures "
-            "are reported at most once every %.0f seconds, with no count",
-            TEE_FAILURE_REPORT_INTERVAL,
-            exc_info=True,
-        )
-    else:
-        log.warning(
-            "off-box audit tee failed again; the rows are still in the audit_log table",
-        )
+#: Whether this process has logged a tee failure; see the handler in :func:`emit_audit_tee`.
+_TEE_FAILURE_LOGGED = False
 
 
 def emit_audit_tee(
@@ -266,9 +228,19 @@ def emit_audit_tee(
         # Not ensure_ascii, and no escaping here: see "The record survives the scrub" above.
         audit_logger.info(json.dumps(record, ensure_ascii=False))
     except Exception:  # noqa: BLE001 — the audit row is durable; the off-box tee is best-effort
-        # Rate limited and never naming or counting a row (BACKLOG #1131): a line per failed row
-        # named its action, and its COUNT tracked the rows, the hidden lock rows included.
-        _report_tee_failure()
+        # Once per process, and never naming the row (BACKLOG #1131). A line per failed row named
+        # its action, and its COUNT tracked the rows, the hidden lock rows included; ``GET
+        # /logs/tail`` serves this log to ``logs:view``, which the Operator holds without
+        # ``users:manage``. The first failure is what an operator needs: the sink is broken, and
+        # every row is still in the store's ``audit_log``.
+        global _TEE_FAILURE_LOGGED
+        if not _TEE_FAILURE_LOGGED:
+            _TEE_FAILURE_LOGGED = True
+            log.warning(
+                "off-box audit tee failed; the rows are still in the audit_log table, and further "
+                "tee failures in this process are not logged",
+                exc_info=True,
+            )
     # After the tee, so an observer fault cannot cost the off-box copy. Each is guarded on its own.
     for observer in _OBSERVERS:
         try:

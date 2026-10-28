@@ -1055,12 +1055,13 @@ def test_a_broken_tee_sink_logs_once_and_names_no_action(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A line per failed tee row named the row's action, and the line count tracked the rows, the
-    hidden lock rows included. The failure is now logged at most once per interval, naming no
-    action and counting no row (vault BACKLOG #2612). The control is that first line: a broken
-    sink is still reported."""
+    hidden lock rows included. The failure is now logged once per process, naming no action. The
+    control is that first line: a broken sink is still reported."""
     from messagefoundry.store import audit_tee
 
-    monkeypatch.setattr(audit_tee, "_tee_failure_reported_at", None)
+    # No raising=False: if the flag is ever renamed, this reset must fail rather than set a new,
+    # unread attribute and leave the test depending on whether an earlier test logged first.
+    monkeypatch.setattr(audit_tee, "_TEE_FAILURE_LOGGED", False)
 
     def broken(*_: Any, **__: Any) -> None:
         raise OSError("sink down")

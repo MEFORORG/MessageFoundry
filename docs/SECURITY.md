@@ -6123,24 +6123,21 @@ directory's `size_bytes` and the database's `audit` row count as null to a calle
 `users:manage`: the first counted the tee's copies of the hidden rows, and the second minus the
 rows `GET /audit` returns was their exact number. Four rarer log lines no longer carry the bit: a
 failed lock-notice throttle read names neither the account nor the notice; a broken tee sink is
-logged without the row's action; SMTP with `tls_verify = false` is logged once per
+logged once per process without the row's action; SMTP with `tls_verify = false` is logged once per
 process for each relay, by the security notifier when it is built rather than at its first send; and
-a failed TLS key-exchange pin is logged once per process.
+a failed TLS key-exchange pin is logged once per process. **The cost of the tee line:** a sink that
+stays broken, or recovers and breaks again, is reported only by that first line.
 
-**CHANGED by vault BACKLOG #2612: the tee-failure line is rate limited, not once per process.** The
-first failure is logged with its traceback. A later one is logged at most once per
-`TEE_FAILURE_REPORT_INTERVAL` (300 seconds). It carries no row, no count and no exception type
-(`_report_tee_failure` in `messagefoundry/store/audit_tee.py`). The 2026-09-28 decision above chose
-the opposite cost: a sink that stays broken was reported only by its first line.
-
-**The residual is timing.** Each tee-failure line is written in the second a tee failed. A
-`logs:view` reader without `users:manage` may find such a line with no visible `GET /audit` row in
-that second. That reader learns a hidden row was written then, at most once per interval. The
-forwarder's drop warning has the same kind of residual, at most once per
-`_FORWARD_DROP_REPORT_INTERVAL` (60 seconds), while the audit lane is full. That warning names
-dropped audit tee lines but never counts them on their own. **Not closed:** `queue_dropped` and
-`lost` on `GET /status`, and the `log_forward_failed` alert's count, include dropped audit tee
-lines. While only the audit lane drops, each rises by one per audit row written.
+**The forwarder's audit lane (vault BACKLOG #2612) leaves at least these on the channel.** What
+`queued`, the drop warning and the drop counts report about the audit lane is stated once, in
+[CONFIGURATION.md](CONFIGURATION.md) under `[logging]`, where the audit lane is described. `queued`
+leaves the audit lane out, so it does not move as audit rows are written while the general lane is
+full. The drop warning, which `GET /logs/tail` serves, is written at most once per
+`_FORWARD_DROP_REPORT_INTERVAL` (60 seconds), so a warning naming the audit lane tells a `logs:view`
+reader that an audit row was written in that window. **Not closed:** the drop counts on `GET
+/status`, in the warning and in the `log_forward_failed` alert include dropped audit tee lines, as
+the single queue's did. While only the audit lane drops, they rise by one per audit row written. The
+alert's `audit_queue_full` reason word, which is new, says the audit lane dropped.
 
 **A notice the relay loses is audited (BACKLOG #2383).** The `auth.lock_notice` row is written
 when the notice is handed to the relay. It reads `mailed: true` only when the relay queued the

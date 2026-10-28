@@ -1409,12 +1409,48 @@ def test_the_drop_report_names_dropped_audit_lines_without_counting_them(
     finally:
         fwd.close()
     assert fwd.audit_dropped == 5 and fwd.dropped == 5  # counted for the status surface
-    reports = [
-        r.getMessage() for r in caplog.records if "Audit tee lines were among" in r.getMessage()
-    ]
+    reports = [r.getMessage() for r in caplog.records if "hand-off queue is full" in r.getMessage()]
     assert len(reports) == 1, reports
-    depth = str(logging_setup._FORWARD_QUEUE_MAXSIZE)
-    assert re.findall(r"\d+", reports[0]) == ["1", depth, "1"], reports[0]
+    # Only the audit lane dropped, so the report names it and its depth, and not the general lane.
+    assert "(audit lane, depth 2)" in reports[0], reports[0]
+    assert "general lane" not in reports[0], reports[0]
+    assert re.findall(r"\d+", reports[0]) == ["1", "2", "1"], reports[0]
+
+
+def test_the_drop_report_names_both_lanes_when_both_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A report whose batch holds drops from both lanes names both, with each depth, and still
+    gives one combined batch and total (BACKLOG #1131, #2612)."""
+    from messagefoundry.store import audit_tee
+
+    def send(name: str, msg: str) -> None:
+        fwd.handle(logging.LogRecord(name, logging.INFO, __file__, 1, msg, None, None))
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 3)
+    monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_QUEUE_MAXSIZE", 2)
+    target = _CapturingHandler()
+    fwd = _build_queued_forwarder(target, fmt="text")
+    assert fwd._listener.stop_within(1.0)
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            for i in range(4):  # the fourth general record is the first drop, and reports
+                send("mefor.test", f"g{i}")
+            for i in range(3):  # the third is dropped and held for the next report
+                send(audit_tee.audit_logger.name, f"a{i}")
+            send("mefor.test", "g4")
+            monkeypatch.setattr(logging_setup, "_FORWARD_DROP_REPORT_INTERVAL", 0.0)
+            send("mefor.test", "g5")
+    finally:
+        fwd.close()
+    reports = [r.getMessage() for r in caplog.records if "hand-off queue is full" in r.getMessage()]
+    assert len(reports) == 2, reports
+    assert "(general lane, depth 3)" in reports[0], reports[0]
+    # The second batch: the dropped audit line a2, then g4 and g5. The forwarder is not on the root
+    # logger, so the reports themselves never reach it.
+    assert "(general lane, depth 3; audit lane, depth 2)" in reports[1], reports[1]
+    assert re.findall(r"\d+", reports[1]) == ["3", "3", "2", "4"], reports[1]
 
 
 def test_the_audit_lane_cannot_hold_general_lines_back_for_good() -> None:

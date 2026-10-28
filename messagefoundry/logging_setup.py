@@ -1017,6 +1017,11 @@ class _ForwardLanes(queue.Queue[Any]):
     def _qsize(self) -> int:
         return len(self.queue) + len(self.audit)
 
+    def general_qsize(self) -> int:
+        """The general lane's depth alone: what :func:`forwarder_status` reports as ``queued``."""
+        with self.mutex:
+            return len(self.queue)
+
     def _put(self, item: Any) -> None:
         audit = _is_audit_record(item)
         lane, bound = (self.audit, self.audit_maxsize) if audit else (self.queue, self.lane_maxsize)
@@ -1472,28 +1477,35 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
                 audit_total,
             )
             self._dropped_since_report = 0
-        # The audit lines among these drops are named, not counted on their own (BACKLOG #1131):
-        # that count is the audit rows written, the hidden lock rows included, and this line
-        # reaches ``GET /logs/tail``. The totals stay combined, as ``queue_dropped`` on ``GET
-        # /status`` is, because a general-only total minus that field is the same count.
-        audit_note = (
-            " Audit tee lines were among them: their own lane of the queue is full."
-            if audit_batch
-            else ""
-        )
+        # The line names the lane or lanes that dropped and gives no per-lane number (BACKLOG
+        # #1131): the audit count is the audit rows written, the hidden lock rows included, and this
+        # line reaches ``GET /logs/tail``. The batch and the total stay combined, as
+        # ``queue_dropped`` on ``GET /status`` is. When only the audit lane dropped, they equal the
+        # audit count, as on the single queue before #2612 when only audit lines arrived at it full.
         self._reporting.active = True
         try:
             _log.warning(
-                "off-box log forwarding dropped %d record(s): the hand-off queue is full (depth %d) "
+                "off-box log forwarding dropped %d record(s): the hand-off queue is full (%s) "
                 "because the collector is not draining it; %d dropped since this process started. "
-                "Evidence for this window does not reach the collector.%s",
+                "Evidence for this window does not reach the collector.",
                 batch,
-                _FORWARD_QUEUE_MAXSIZE,
+                self._full_lanes(batch, audit_batch),
                 total,
-                audit_note,
             )
         finally:
             self._reporting.active = False
+
+    def _full_lanes(self, batch: int, audit_batch: int) -> str:
+        """Name the lanes a drop report's batch dropped from, with each one's depth."""
+        records = self._records
+        if not isinstance(records, _ForwardLanes):
+            return f"depth {records.maxsize}"
+        lanes = []
+        if batch > audit_batch:
+            lanes.append(f"general lane, depth {records.lane_maxsize}")
+        if audit_batch:
+            lanes.append(f"audit lane, depth {records.audit_maxsize}")
+        return "; ".join(lanes)
 
     def close(self) -> None:
         """Stop accepting, drain what is queued within :data:`_FORWARD_DRAIN_TIMEOUT`, then close the
@@ -1694,8 +1706,9 @@ class ForwarderStatus:
     send_failing: bool = False
     #: Sends that hit a network error, whether or not a spool kept the record.
     send_failures: int = 0
-    #: Records on the in-memory hand-off queue right now. A level, not a loss. Records waiting in
-    #: the on-disk spool are not in it, and no field here counts them.
+    #: Records on the general lane of the in-memory hand-off queue right now. A level, not a loss.
+    #: Audit tee lines on their own lane are not in it (BACKLOG #2612), and neither are records
+    #: waiting in the on-disk spool; no field here counts either.
     queued: int = 0
     #: Records dropped because their lane of the hand-off queue was full, both lanes counted.
     queue_dropped: int = 0
@@ -1765,13 +1778,18 @@ def forwarder_status() -> ForwarderStatus:
     # One read under the lock _count_drop holds, so the audit part never reads ahead of its total.
     with handler._counter_lock:
         queue_dropped, audit_queue_dropped = handler.dropped, handler.audit_dropped
+    # The general lane only (BACKLOG #2612, #1131). While that lane is full, general records are
+    # dropped and cannot move a depth, so a depth that counted the audit lane would rise by one per
+    # audit row written, the hidden lock rows included. A full single queue before #2612 did not.
+    records = handler._records
+    queued = records.general_qsize() if isinstance(records, _ForwardLanes) else records.qsize()
     return ForwarderStatus(
         configured=True,
         installed=True,
         delivery_confirmed=confirmed,
         send_failing=listener.send_failing,
         send_failures=listener.send_failures,
-        queued=handler._records.qsize(),
+        queued=queued,
         queue_dropped=queue_dropped,
         audit_queue_dropped=audit_queue_dropped,
         unsent=listener.unsent,

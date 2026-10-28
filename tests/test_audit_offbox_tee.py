@@ -598,52 +598,6 @@ def test_each_sink_gets_each_tee_line_once_redacted(tmp_path: Path, capsys, monk
         assert f'"seq": 1, "row_hash": "{_HASH}"' in tee[0].replace('\\"', '"'), sink
 
 
-def test_a_failing_tee_is_reported_again_after_the_interval_and_never_counts_rows(
-    audit_capture, monkeypatch, caplog
-) -> None:
-    """Vault BACKLOG #2612: the tee reported its first failure in the process and nothing after it,
-    so a sink broken for a day read the same as one that failed once. It reports again once per
-    interval, and no line names or counts a row (BACKLOG #1131)."""
-    monkeypatch.setattr(audit_tee, "_tee_failure_reported_at", None)
-
-    def broken(*_a, **_k):
-        raise OSError("sink down")
-
-    monkeypatch.setattr(audit_tee.audit_logger, "info", broken)
-
-    def tee(n: int) -> None:
-        emit_audit_tee(
-            action="auth.account_locked",
-            actor="z",
-            channel_id=None,
-            detail=None,
-            ts=1.0,
-            row_id=n,
-            seq=n,
-            row_hash=_HASH,
-        )
-
-    with caplog.at_level(logging.WARNING, logger=audit_tee.log.name):
-        for n in range(1, 6):
-            tee(n)
-        within = [r.getMessage() for r in caplog.records if r.name == audit_tee.log.name]
-        # The interval has passed: put the last report that far back rather than sleep.
-        assert audit_tee._tee_failure_reported_at is not None
-        monkeypatch.setattr(
-            audit_tee,
-            "_tee_failure_reported_at",
-            audit_tee._tee_failure_reported_at - audit_tee.TEE_FAILURE_REPORT_INTERVAL,
-        )
-        for n in range(6, 9):
-            tee(n)
-    lines = [r.getMessage() for r in caplog.records if r.name == audit_tee.log.name]
-    assert len(within) == 1 and "tee failed" in within[0], within  # five failures, one line
-    assert len(lines) == 2 and "failed again" in lines[1], lines  # three more, one more line
-    for line in lines:
-        assert "auth." not in line and "account_locked" not in line, line
-        assert not any(ch.isdigit() for ch in line.replace("300", "")), line  # no row count
-
-
 def test_emit_audit_tee_is_best_effort_on_logging_failure(audit_capture, monkeypatch) -> None:
     def boom(*_a, **_k):
         raise RuntimeError("forwarder exploded")
