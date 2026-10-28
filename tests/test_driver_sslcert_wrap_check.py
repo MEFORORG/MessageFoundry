@@ -239,12 +239,13 @@ def test_a_padded_sslkey_is_checked_as_a_driver_may_trim_it(
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes need POSIX mkfifo")
-def test_a_pipe_named_as_sslkey_is_not_opened(tmp_path: Path, client: _Client) -> None:
+def test_a_pipe_named_as_sslkey_is_refused_without_waiting(tmp_path: Path, client: _Client) -> None:
+    """``sslkey`` keeps keywrap's refusal of a file it cannot read, so a real pipe is refused, and
+    the open does not wait for a writer."""
     pipe = tmp_path / "client.key.pipe"
     os.mkfifo(pipe)
-    assert f"sslkey={{{pipe}}}" in _build(
-        _write(tmp_path, client.cert_pem), extra={"sslkey": str(pipe)}
-    )
+    with pytest.raises(KeyWrapRefused, match="not a regular file"):
+        _build(_write(tmp_path, client.cert_pem), extra={"sslkey": str(pipe)})
 
 
 def test_a_blank_sslkey_does_not_turn_off_the_sslcert_check(

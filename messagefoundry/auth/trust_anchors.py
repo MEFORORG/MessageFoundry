@@ -200,8 +200,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
     that holds for every anchor here since vault BACKLOG #3090.
 
-    **Not covered**, as in item 9: the driver reads the file by path, at every connect its pool
-    opens. A running lane is not stopped when its file fails a later check: its pool goes on
+    **Not covered**, at least, as in item 9: the driver reads the file by path, at every connect
+    its pool opens. A running lane is not stopped when its file fails a later check: its pool goes on
     reading the file at each new connect until the lane is rebuilt, and the refused reload is the
     only signal. Any check-then-load leaves a swap window, as for ``sslkey``. There is no pin:
     ``odbc_params`` has no pin setting. An ``sslcapath`` CA directory, which a driver also reads
@@ -1039,11 +1039,25 @@ def _read_regular_file(path: str) -> bytes:
     """The whole file at ``path``, opened once and judged by its own descriptor. Anything but a
     regular file raises ``OSError``, which every caller reports as an anchor it cannot read.
     ``O_NONBLOCK``, where the platform has it, keeps the open from waiting on a pipe with no
-    writer, so a pipe swapped in for a CA is refused rather than waited on (vault BACKLOG #3090)."""
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-    with os.fdopen(os.open(path, flags), "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+    writer, so a pipe swapped in for a CA is refused rather than waited on (vault BACKLOG #3090).
+    ``O_NOCTTY`` keeps a terminal device named as a CA from becoming the engine's controlling
+    terminal. The descriptor is judged before :func:`os.fdopen` takes it, and closed here when it
+    is refused, since ``fdopen`` does not close a descriptor it refuses (a POSIX directory)."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOCTTY", 0)
+    )
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, "not a regular file")
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
         return handle.read()
 
 
@@ -1591,16 +1605,25 @@ def inbound_lane_reads_ca(conn_type: object, settings: Mapping[str, Any]) -> boo
     """Whether an inbound of ``conn_type`` dials out with a CA its lane check reads: an ``Ftp``
     poller naming a ``tls_ca_file``, or a ``DatabasePoll`` naming an ``odbc_params`` ``sslca``
     (vault BACKLOG #3090, step 7). ``settings`` may be unresolved; the check resolves them. The one
-    list of such inbounds, for :func:`registry_anchor_specs` and the runner."""
+    list of such inbounds, for :func:`registry_anchor_specs` and the runner.
+
+    A ``dialect`` that is not yet text, such as an ``env()`` value, may resolve to ``generic``, so
+    its ``sslca`` counts here and the check decides once it resolves; otherwise such a poller would
+    never be checked, while an outbound with the same dialect is."""
     if conn_type is ConnectorType.REMOTEFILE:
         return bool(settings.get("tls_ca_file"))
-    return conn_type is ConnectorType.DATABASE and bool(_generic_odbc_param(settings, "sslca"))
+    if conn_type is not ConnectorType.DATABASE:
+        return False
+    if not isinstance(settings.get("dialect", "sqlserver"), str):
+        settings = {**settings, "dialect": "generic"}
+    return bool(_generic_odbc_param(settings, "sslca"))
 
 
 def lane_ca_setting(settings: Mapping[str, Any]) -> str:
     """The setting that names a lane's CA, for a refusal line that may not name the file:
-    ``tls_ca_file``, or a generic DATABASE lane's ``odbc_params sslca`` (module item 12)."""
-    if not settings.get("tls_ca_file") and _generic_odbc_param(settings, "sslca") is not None:
+    ``tls_ca_file``, or a generic DATABASE lane's ``odbc_params sslca`` (module item 12). A blank
+    ``sslca`` names no CA, as :func:`inbound_lane_reads_ca` reads it."""
+    if not settings.get("tls_ca_file") and _generic_odbc_param(settings, "sslca"):
         return "odbc_params sslca"
     return "tls_ca_file"
 
@@ -1753,8 +1776,9 @@ def connection_anchor_specs(
 
 
 #: The connection settings :func:`connection_anchor_spec`, :func:`outbound_anchor_spec` and
-#: :func:`database_ca_anchor_spec` read, and the only ones resolved for them. The middle group is
-#: what :func:`unread_ca_reason` reads. ``odbc_params`` holds no ``env()`` value to resolve.
+#: :func:`database_ca_anchor_spec` read, and the only ones resolved for them. The middle group,
+#: with ``dialect`` and ``odbc_params`` for the ``sslmode`` case, is what :func:`unread_ca_reason`
+#: reads. ``odbc_params`` holds no ``env()`` value to resolve.
 _CONNECTION_ANCHOR_KEYS = (
     "dialect",
     "odbc_params",

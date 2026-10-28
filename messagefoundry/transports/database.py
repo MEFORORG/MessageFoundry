@@ -546,9 +546,12 @@ def driver_file_spellings(value: object) -> tuple[str, ...]:
     since a driver may trim it. None for a value that can name another host, which the build
     refuses (:func:`_refuse_remote_path`), so no check opens a remote path first (vault BACKLOG
     #3090). A ``Path`` value is read as its text, as the build sends it."""
-    if not value or _is_remote_spelling(value):
+    if not value:
         return ()
     raw = os.fspath(value) if isinstance(value, os.PathLike) else str(value)
+    # The screen reads the text this opens, so a PathLike whose str() differs cannot pass it.
+    if _is_remote_spelling(value) or _is_remote_spelling(raw):
+        return ()
     return tuple(p for p in dict.fromkeys((raw, raw.strip())) if p)
 
 
@@ -583,7 +586,8 @@ def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None 
     ``PGSSLKEY``, a service file, or its default path) and no key is checked (BACKLOG #2423).
 
     The file is read as :func:`_driver_file_spellings` reads it (vault BACKLOG #3090), so a pipe
-    named here is never opened for reading, and a padded value is checked as a driver may trim it."""
+    named here is never read: its descriptor is judged and refused, as anything that is not a
+    regular file is, and a padded value is checked as a driver may trim it."""
     _refuse_weak_driver_wrap(named, "sslkey", "key file", connection, leave_irregular=False)
 
 
@@ -726,20 +730,35 @@ def _read_driver_file(
 
     The file is opened once and judged by its own descriptor, so nothing can swap a pipe in
     between a check and the open. ``O_NONBLOCK``, where the platform has it, keeps that open from
-    waiting on a pipe with no writer."""
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    waiting on a pipe with no writer, and ``O_NOCTTY`` keeps a terminal device from becoming the
+    engine's controlling terminal. The descriptor is judged before :func:`os.fdopen` takes it,
+    so one that names no regular file is closed here rather than left open."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOCTTY", 0)
+    )
     data: bytes | None = None
     try:
-        with os.fdopen(os.open(path, flags), "rb") as handle:
-            if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                data = handle.read(_MAX_DRIVER_CA_FILE_BYTES + 1)
+        fd = os.open(path, flags)
+        try:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                handle = os.fdopen(fd, "rb")
+                fd = -1  # the handle owns it now
+                with handle:
+                    data = handle.read(_MAX_DRIVER_CA_FILE_BYTES + 1)
+        finally:
+            if fd >= 0:
+                os.close(fd)
     except (FileNotFoundError, ValueError):
         # No such file, or a NUL in the path: the driver cannot load it either.
         logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
         return None
     except OSError as exc:
-        # Opening a directory fails, as IsADirectoryError on POSIX and PermissionError on Windows.
-        # A path through a file names no file either; keywrap refused both, so sslkey still does.
+        # Opening a directory fails on Windows, as PermissionError; on POSIX it opens, and its
+        # descriptor is judged below. A path through a file names no file either; keywrap refused
+        # both, so sslkey still does.
         if os.path.isdir(path) or isinstance(exc, NotADirectoryError):
             _irregular(setting, what, checked_for, error, leave_irregular)
             return None
@@ -751,7 +770,7 @@ def _read_driver_file(
             f"{setting}: the {what} could not be read to check {checked_for}: "
             f"{exc.strerror or type(exc).__name__}"
         ) from exc
-    if data is None:  # a device or pipe: judged by its descriptor, never read
+    if data is None:  # a directory, device or pipe: judged by its descriptor, never read
         _irregular(setting, what, checked_for, error, leave_irregular)
         return None
     if len(data) > _MAX_DRIVER_CA_FILE_BYTES:

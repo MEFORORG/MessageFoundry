@@ -14,6 +14,7 @@ Synthetic certificates only. Nothing here hands a file to a driver.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -195,6 +196,25 @@ def test_the_registry_collects_the_database_outbound_and_poller(tmp_path: Path) 
     # The control: a poller with no sslca has no lane CA, and a tls_ca_file line keeps its name.
     assert not wiring_runner._inbound_lane_reads_ca(registry.inbound["IB_DB_PLAIN"])
     assert ta.lane_ca_setting({"tls_ca_file": str(ca)}) == "tls_ca_file"
+
+
+def test_a_poller_whose_dialect_is_an_env_value_still_counts_its_sslca(tmp_path: Path) -> None:
+    """An ``env()`` dialect may resolve to ``generic``, so the poller's sslca goes to the lane
+    check, which resolves it and decides. Red with ``inbound_lane_reads_ca`` reading the unresolved
+    dialect: the poller is never checked, while an outbound with the same dialect is."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import EnvRef
+
+    settings = {**_settings(_ca(tmp_path)), "dialect": EnvRef("DB_DIALECT")}
+    assert ta.inbound_lane_reads_ca(ConnectorType.DATABASE, settings)
+    # The controls: no sslca, a literal SQL Server preset, and a blank sslca count for nothing.
+    del settings["odbc_params"]["SSLCA"]
+    assert not ta.inbound_lane_reads_ca(ConnectorType.DATABASE, settings)
+    preset = {**_settings(_ca(tmp_path)), "dialect": "sqlserver"}
+    assert not ta.inbound_lane_reads_ca(ConnectorType.DATABASE, preset)
+    blank = _settings("")
+    assert not ta.inbound_lane_reads_ca(ConnectorType.DATABASE, blank)
+    assert ta.lane_ca_setting(blank) == "tls_ca_file"
 
 
 def test_a_path_object_names_the_anchor_as_its_text_does(tmp_path: Path) -> None:
@@ -389,3 +409,60 @@ def test_a_device_named_as_sslca_is_refused_unread(tmp_path: Path) -> None:
     assert spec is not None and spec.path == os.devnull
     with pytest.raises(OSError, match="not a regular file"):
         ta.evaluate_anchor(spec)
+
+
+# --- a refused descriptor is closed ---------------------------------------------------------------
+
+
+def _recording_descriptors(monkeypatch: pytest.MonkeyPatch) -> tuple[list[int], list[int]]:
+    """Record every descriptor ``os.open`` hands out and every one ``os.close`` closes."""
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def opening(*args: Any, **kwargs: Any) -> int:
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def closing(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "close", closing)
+    return opened, closed
+
+
+def test_a_descriptor_fdopen_refuses_is_closed_by_the_anchor_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``os.fdopen`` does not close a descriptor it refuses, as it refuses a POSIX directory, so
+    the read closes it. Runs on every platform. Red with ``_read_regular_file`` back on
+    ``os.fdopen(os.open(...))``: the descriptor stays open, one per lane check."""
+    path = str(_ca(tmp_path))
+    opened, closed = _recording_descriptors(monkeypatch)
+
+    def refusing(*_args: Any, **_kwargs: Any) -> Any:
+        raise IsADirectoryError(errno.EISDIR, "Is a directory")
+
+    monkeypatch.setattr(os, "fdopen", refusing)
+    with pytest.raises(IsADirectoryError):
+        ta.evaluate_anchor(ta.AnchorSpec("outbound:X", "setting", path))
+    assert opened
+    assert set(opened) <= set(closed)
+
+
+@pytest.mark.parametrize("reader", ["anchor", "driver"])
+def test_a_directory_leaves_no_descriptor_open(
+    reader: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory opens on POSIX and is refused at the open on Windows; either way no descriptor
+    is left open. Red on POSIX with either reader back on ``os.fdopen(os.open(...))``."""
+    opened, closed = _recording_descriptors(monkeypatch)
+    if reader == "anchor":
+        with pytest.raises(OSError):
+            ta.evaluate_anchor(ta.AnchorSpec("outbound:X", "setting", str(tmp_path)))
+    else:
+        assert f"SSLCA={{{tmp_path}}}" in _build_odbc_dsn(_settings(tmp_path), connection=_OUT)
+    assert set(opened) <= set(closed)

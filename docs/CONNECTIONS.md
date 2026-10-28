@@ -1773,7 +1773,8 @@ An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-w
 (BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key
 with a weak wrap is refused, and so is an encrypted key with no `sslpassword`. A legacy
 `Proc-Type: 4,ENCRYPTED` key is refused even with one. A certificate with no key passes, PEM or
-DER. With `SSLKEY` set, the key comes from that file, so `SSLCERT` is not read. Each file is read
+DER. With `SSLKEY` set, the key comes from that file, so `SSLCERT` is not read; a blank `SSLKEY`
+counts as unset, since a driver may trim it. Each file is read
 the way an `SSLCA` file is: a missing file is left to the driver, a padded value is checked as a
 driver may trim it, and a file over 1 MiB is refused. A directory, a device or a pipe is left to
 the driver as `SSLCERT`, and refused unread as `SSLKEY`. At least these gaps remain:
