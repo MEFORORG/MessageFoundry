@@ -91,6 +91,8 @@ def test_a_leading_header_with_no_encoding_character_is_the_contract_error() -> 
 @pytest.mark.parametrize("line", ["MSH|^~\\&", "MSH|^~\\&|"])
 def test_the_delimiter_rewrite_keeps_a_later_header_line_in_shape(line: str) -> None:
     """The third header re-join, the outbound delimiter override, follows the same three-or-four
-    entry split: an unchanged delimiter set gives the line back."""
+    entry split for a later MSH line: an unchanged delimiter set gives the line back. A BHS or FHS
+    line is not covered here: that path writes it with its field separator doubled, on ``main``
+    before this change too."""
     parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
     assert line in _builtin_hl7.encode_with_separators(parsed, parsed["seps"]).split("\r")

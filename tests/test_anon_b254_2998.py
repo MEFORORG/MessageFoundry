@@ -287,8 +287,8 @@ def test_a_keep_on_a_header_delimiter_still_loads(
 
 # --- part 2: a header line too short to hold its encoding characters -----------------------------
 
-#: A header line with no separator after field 2. The engine's parser cannot find where the
-#: encoding characters end on such a line.
+#: A header line with no separator after field 2. Its text sits in field 2, which no rule may
+#: rewrite.
 _SHORT_LINES = {
     "bhs-number": f"BHS|{_SSN}",
     "fhs-number": f"FHS|{_SSN}",

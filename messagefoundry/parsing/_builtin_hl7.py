@@ -143,10 +143,13 @@ def _extract_separators(msh_line: str) -> tuple[str, str, str, str, str]:
     ``find`` returned ``-1`` there and sliced the last character off; that quirk is gone (BACKLOG
     #2589), and no case in the parity oracle has that shape. Defaults fill any missing slot:
     repetition ``~``, component ``^``, subcomponent ``&``, escape ``\\``.
+
+    Only the field separator and the first four encoding characters are used, so the scan and the
+    slice stop at index 8: a long first line with no later separator costs nothing extra here.
     """
     sep0 = msh_line[3]
-    end = msh_line.find(sep0, 4)
-    seps = list(msh_line[3:end] if end != -1 else msh_line[3:])
+    end = msh_line.find(sep0, 4, 8)
+    seps = msh_line[3 : end if end != -1 else 8]
     field = seps[0]
     component = seps[1] if len(seps) > 1 else "^"
     repetition = seps[2] if len(seps) > 2 else "~"
@@ -707,13 +710,15 @@ _ESCAPE_DEFAULT = "\\"
 def message_escape_char(norm: str) -> str:
     """Best-effort read of a raw message's OWN escape character (MSH-2's 4th encoding char).
 
-    Calls :func:`_extract_separators` itself, so the budget and the **built-in** parser can never
-    disagree about which character escapes a given message — a disagreement would let a payload
-    hide its escapes from the pre-parse budget. It differs only in being defensive: this runs *before* any parse, on bytes that may not be
-    HL7 at all, so a short/malformed header falls back to HL7's default ``\\`` rather than indexing off
-    the end. Never hardcodes the escape character for a well-formed message (CLAUDE.md §8).
+    Takes the first line the way :func:`parse` does (``strip`` then split on ``\\r``) and calls
+    :func:`_extract_separators` itself, so the budget and the **built-in** parser can never disagree
+    about which character escapes a given message — a disagreement would let a payload hide its
+    escapes from the pre-parse budget. It differs only in being defensive: this runs *before* any
+    parse, on bytes that may not be HL7 at all, so a short/malformed header falls back to HL7's
+    default ``\\`` rather than indexing off the end. Never hardcodes the escape character for a
+    well-formed message (CLAUDE.md §8).
     """
-    line = norm.lstrip().split("\r", 1)[0]
+    line = norm.strip().split("\r", 1)[0]
     if len(line) < 4:
         return _ESCAPE_DEFAULT
     return _extract_separators(line)[4]
@@ -973,7 +978,8 @@ def _encode_segment(
 
     A still-lazy segment returns its cached raw line verbatim (no re-join needed — it was never
     touched). MSH/BHS/FHS rejoin with the hidden separator offset: ``id + MSH1 + MSH2 + MSH1 +
-    field_sep.join(rest)``, mirroring ``hl7.Segment.__str__``. A field entry that componentized is
+    field_sep.join(rest)``, mirroring ``hl7.Segment.__str__``, or ``id + MSH1 + MSH2`` alone when
+    the line had no separator after MSH-2 (:func:`_join_header`). A field entry that componentized is
     re-joined from its raw ``text`` (writes update that text, so it is authoritative).
     """
     lazy_raw = msg["_lazy"].get(seg_index)

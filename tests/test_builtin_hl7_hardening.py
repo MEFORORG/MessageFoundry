@@ -268,10 +268,13 @@ def test_escape_char_read_agrees_with_the_parser_on_every_header_shape() -> None
     # The budget and the parser must never disagree about which character escapes a message — a
     # divergence is exactly how a payload would hide its escapes from the pre-parse scan. This reads
     # defensively (Message.parse has no MSH pre-guard, so the budget sees arbitrary bytes) but the
-    # answer is identical to the parser's own _extract_separators wherever that one can run.
+    # answer is identical to the escape character parse() itself settles on, wherever it can run.
+    # The bodies without a PID line, and the ones padded with whitespace, take the first-line read
+    # through parse()'s own strip (BACKLOG #2589).
     for header in ("MSH|^~\\&|S", "MSH|^~!&|S", "MSH|^~\\", "MSH|^~!", "MSH|^~", "FHS|^~\\&"):
-        expected = _builtin_hl7._extract_separators(header)[4]
-        assert message_escape_char(header + "\rPID|1\r") == expected, header
+        for body in (header + "\rPID|1\r", header, f" {header} ", f"{header}\t\r"):
+            assert message_escape_char(body) == _builtin_hl7.parse(body)["seps"][4], repr(body)
+    assert message_escape_char("MSH|^~ ") == _builtin_hl7.parse("MSH|^~ ")["seps"][4] == "\\"
     # Shapes the parser itself cannot index (it runs only after the MSH check): HL7's default escape
     # character, never an IndexError out of the pre-parse budget.
     for short in ("", "M", "MSH", "MSH|"):
