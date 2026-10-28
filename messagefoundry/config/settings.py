@@ -10209,7 +10209,7 @@ def engine_owned_dirs(
 
     Read from every settings model given, recursively, by field name, so a setting added later is
     covered without a list to keep: at least a ``*_file``, ``*_files`` or ``*_path`` setting (and the
-    store's ``path``) contributes its parent directory, and a ``*_dir`` setting or the backup
+    store's ``path`` and ``[logging].file``) contributes its parent directory, and a ``*_dir`` setting or the backup
     ``destination`` contributes a tree (``base_dir``, the config-repo root, only a directory). A value
     that names a URL is skipped. ``dirs``, ``trees`` and ``files`` add paths the settings models do
     not hold, the config directory or the served TLS certificate say. Relative paths are taken
@@ -10241,7 +10241,7 @@ def engine_owned_dirs(
             elif name.endswith("_files") and isinstance(value, list | tuple):
                 for item in value:
                     add_file(item)
-            elif name.endswith(("_file", "_path")) or name == "path":
+            elif name.endswith(("_file", "_path")) or name in ("path", "file"):
                 add_file(value)
             elif (name.endswith("_dir") or name in _OWNED_TREE_NAMES) and (
                 v := usable(value)

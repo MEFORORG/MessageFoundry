@@ -864,12 +864,15 @@ def test_the_engines_own_directories_are_read_from_its_settings(tmp_path: Path) 
             StoreSettings(path=str(tmp_path / "data" / "mf.db")),
             ApiSettings(tls_cert_file=str(tmp_path / "tls" / "c.pem")),
             BackupSettings(destination=str(tmp_path / "bak")),
-            LoggingSettings(log_dir=str(tmp_path / "logs")),
+            LoggingSettings(
+                log_dir=str(tmp_path / "logs"), file=str(tmp_path / "applog" / "e.log")
+            ),
         ),
         dirs=(tmp_path / "config",),
     )
 
     assert {tmp_path / "data", tmp_path / "tls", tmp_path / "config"} <= set(dirs)
+    assert tmp_path / "applog" in dirs  # [logging].file, a field named plain `file`
     assert {tmp_path / "bak", tmp_path / "logs"} <= set(trees)
 
 
