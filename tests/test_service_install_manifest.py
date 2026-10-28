@@ -1032,6 +1032,10 @@ _PATH_PARAMS = [
     "ServiceConfig",
     "ProjectRoot",
     "DbPath",
+    # -EngineWheel's inputs (vault BACKLOG #2626), read before the build acts.
+    "EngineWheel",
+    "RequirementsLock",
+    "BasePython",
 ]
 
 
@@ -1092,14 +1096,19 @@ def test_every_path_parameter_is_absolute_before_anything_consumes_it(tmp_path: 
     runs after any of them is the #1554 defect in a new position.
     """
     facts = _preflight_facts(tmp_path)
-    nssm_at = _sole_call(facts, "Resolve-Nssm")["start"]
+    # Two call sites, one per path: an install that builds its root (vault BACKLOG #2626)
+    # resolves NSSM before the build, any other after the install check. The first is the bound.
+    calls = [c for c in facts["commands"] if c["name"] == "Resolve-Nssm"]
+    assert len(calls) == 2, f"expected two Resolve-Nssm calls, found {len(calls)}"
+    first = min(calls, key=lambda c: c["start"])
+    nssm_at = first["start"]
     for var in _PATH_PARAMS:
         writes = [a for a in facts["assignments"] if a["lhs"] == var]
         assert writes, f"nothing assigns ${var} in the preflight"
         late = [a for a in writes if a["start"] > nssm_at]
         assert not late, (
             f"${var} is still being written at line(s) {[a['line'] for a in late]}, AFTER "
-            f"Resolve-Nssm (line {_sole_call(facts, 'Resolve-Nssm')['line']}) has already consumed "
+            f"Resolve-Nssm (line {first['line']}) has already consumed "
             "the preflight values -- BACKLOG #1554 is about exactly this ordering"
         )
 

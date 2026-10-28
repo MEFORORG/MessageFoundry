@@ -747,16 +747,20 @@ loud warning):
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
-nor the instance's data label — so cleartext credentials over `http`, cleartext MLLP/DICOM/DICOMweb and the
+nor the instance's data label — so cleartext MLLP/DICOM/DICOMweb and the
 cleartext HTTP family are now governed only by a per-connection `cleartext_accepted` + `cleartext_reason`
-(warn + audit) or a loopback hop. (A per-connection `tls_hop_attested` + `tls_hop_attested_reason` makes
+(warn + audit) or a loopback hop. An HTTP-family credential over `http` to a host off this machine is
+refused with no escape, whatever either declaration says (vault BACKLOG #3533 item 4); the
+forward-proxy login is the exception, and
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer) says which owner ruling governs it. (A per-connection `tls_hop_attested` + `tls_hop_attested_reason` makes
 the opposite claim, "secure by other means", and ALLOWs the hop. It is reported as a loosening; see
 [CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested).) *(b)* Where it does still apply it is mostly
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
-enforce`, and for the weakened-TLS / cleartext-escape cells that route through
+enforce`. That holds for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP and anonymous FTPS cells and, since #329,
-the SFTP host key and the webhook sink — the clamp additionally requires the
-instance to be PHI, which is also the default. Either way, on the shipped posture those cells are inert;
+the SFTP host key of a key-only login and the webhook sink. That clamp once also required the
+instance to be PHI; by design every instance is now treated as carrying patient data (BACKLOG
+#1279), so that conjunct is gone. Either way, on the shipped posture those cells are inert;
 no bullet above is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.
 
 **Never set `MEFOR_ALLOW_INSECURE_TLS` in production.** Its presence is the single **environment-variable**
@@ -1002,7 +1006,7 @@ on the shipped posture.
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
 | **LDAPS** (`[auth].ad_tls_verify`, default true) | verifying directory bind |
 | **Webhook alert sink** and the **AI-broker endpoint** | verifying https openers |
-| **`[alerts]` SMTP sink** and the **per-user security-event notifier** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. Deliberately carries **no** `RevocationHopGuard`: it is constructed outside the `active_hop_posture` scope those guards read, so a guard here could not see the instance posture. Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead |
+| **`[alerts]` SMTP sink** and the **per-user security-event notifier** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. Deliberately carries **no** `RevocationHopGuard`: it is constructed outside the `active_hop_posture` scope those guards read, so a guard here could not see the instance posture. Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
 
 For every hop in that table, revocation is exactly what the ASVS row above calls *delegated* — **your
 PKI's or your egress proxy's job, written into your runbook**. The engine will not make you say so, and
@@ -1026,10 +1030,10 @@ attestation:
 1. **Prove revocation in front — API gate only.** Terminate at a revocation-checking reverse proxy:
    `[api].tls_terminated_upstream` + `[api].trusted_proxies` (+ `[api].plaintext_upstream_hop_acknowledged`,
    see [CONFIGURATION.md](CONFIGURATION.md)), after which the engine terminates no TLS
-   itself and the listener gate never fires. **There is no outbound equivalent you can configure.** The
-   authority has a "declared revocation-checking egress terminator" input, but no call site ever sets it
-   — routing your egress through such a proxy is good practice and does not change the engine's
-   decision, so an outbound hop still needs option 2's per-connection attestation, option 3 or option 4.
+   itself and the listener gate never fires. **There is no outbound equivalent.** The authority has no
+   input for a revocation-checking egress terminator. Routing your egress through such a proxy is good
+   practice and does not change the engine's decision, so an outbound hop still needs option 2's
+   per-connection attestation, option 3 or option 4.
 2. **Attest it** — set the environment variable `MEFOR_TLS_REVOCATION_ATTESTED=1`. **It no longer
    clears the OUTBOUND gate on an enforcing instance, and this bullet said for a while that it did.**
    BACKLOG #299 clamped it: the env is held apart from a per-connection attestation and ranks *below*

@@ -109,7 +109,7 @@ import urllib3.poolmanager
 import urllib3.util
 from urllib3.util.ssl_ import resolve_cert_reqs
 
-from messagefoundry.auth.trust_anchors import has_encryption_header
+from messagefoundry.auth.trust_anchors import has_encryption_header, has_private_key_label
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
@@ -305,21 +305,21 @@ def _narrowed_pool_classes(
             uses, ``trust_anchors.has_encryption_header``, and a flagged text is refused. ``bytes``
             are DER, which has no PEM header: measured, the same text as ``bytes`` refused at once.
             Nothing the engine ships sets ``ca_cert_data`` today, since requests and hvac never pass
-            it, so this guards a later caller.
+            it, so this guards a later caller. Text with a private-key label is refused the same
+            way, through ``trust_anchors.has_private_key_label`` (BACKLOG #3745).
 
             **The refusal is a** :class:`VaultHopRefused`, **like the proxy leg's CA load
             refusal in** :meth:`_narrow_the_proxy_leg`. urllib3 does not catch that type, so it
-            reaches the caller as it is, and :func:`vault_failure_text` keeps its text. The base
-            ``InsecureHopRefused`` would reach the caller too, but that function would give only
-            its type name;
-            :class:`VaultHopRefused` says why. A urllib3 ``SSLError`` raised here would not reach
-            the caller as it is. Measured with urllib3 2.8.0, one raised before the proxy has
-            connected comes out of requests as a ``ProxyError``. The providers would then report a
-            type name only.
+            reaches the caller as it is, and :func:`vault_failure_text` keeps its text. A urllib3
+            ``SSLError`` raised here would not reach the caller as it is. Measured with urllib3
+            2.8.0, one raised before the proxy has connected comes out of requests as a
+            ``ProxyError``. The providers would then report a type name only.
 
-            **A CA file is not checked, because the load itself refuses it.** ``ca_certs`` is a
-            path. Measured, a path load of an encrypted ``CERTIFICATE`` or ``X509 CRL`` block raised
-            ``PEM lib`` at once and wrote no prompt. A check here would also open the file twice.
+            **A CA file is not checked, because the load itself refuses it.** That holds for the
+            encryption header only: a CA file holding a private key loads, and nothing here
+            refuses it (BACKLOG #3745 covers the CA text alone). ``ca_certs`` is a path. Measured,
+            a path load of an encrypted ``CERTIFICATE`` or ``X509 CRL`` block raised ``PEM lib``
+            at once, and no prompt was seen. A check here would also open the file twice.
             ``tests/test_encrypted_pem_cafile_pin.py`` holds both measurements, with the versions
             and terminal conditions, and pins them on each platform CI runs.
 
@@ -327,25 +327,33 @@ def _narrowed_pool_classes(
             reaches OpenSSL as ``capath``. OpenSSL reads a directory's files when it verifies a
             peer, not when the directory is named, so a check of the text handed to the load,
             like the one above, does not cover one. So it was measured, for Python's ``ssl`` only,
-            with a real handshake (2026-10-12), on CPython 3.14.6 / OpenSSL 3.5.7 on
-            Windows and, off-version, on CPython 3.12.3 / OpenSSL 3.0.13 on Linux. A directory
-            file holding an encrypted ``CERTIFICATE`` or ``X509 CRL`` block, under the name
-            OpenSSL looks up, wrote no prompt and never waited, in every terminal condition
-            tried, a pseudo-terminal among them. The handshake refused the peer at once with a
-            verification error, so the hop fails closed. ``tests/test_encrypted_pem_capath_pin.py``
-            holds that table and its controls, and pins it on each platform CI runs. A directory
-            does reach both loads today. With neither ``MEFOR_STORE_VAULT_CA_FILE`` nor
-            ``MEFOR_SECRETS_VAULT_CA_FILE`` set, hvac and requests choose the CA. At least two
-            routes can name a directory: hvac's ``VAULT_CAPATH``, used when ``VAULT_CACERT`` is not
-            set, and requests' ``REQUESTS_CA_BUNDLE`` or ``CURL_CA_BUNDLE``. requests passes a
-            directory on as ``ca_cert_dir``. A refusal here would break a hop that works and stop
-            nothing that was seen to wait, so the directory is loaded as before."""
+            with a real handshake on Windows and, off-version, on Linux. A directory file holding
+            an encrypted ``CERTIFICATE`` or ``X509 CRL`` block, under the name OpenSSL looks up,
+            never waited, in every terminal condition tried, a pseudo-terminal among them. The
+            handshake refused the peer at once with a verification error, so the hop fails
+            closed. No prompt was seen either. On Windows a console prompt is not visible to the
+            caller. ``tests/test_encrypted_pem_capath_pin.py`` says what the Windows reading rests
+            on. It holds the table, with its versions and controls, and pins it on each platform
+            CI runs. A directory does reach both loads today. With neither
+            ``MEFOR_STORE_VAULT_CA_FILE`` nor ``MEFOR_SECRETS_VAULT_CA_FILE`` set, hvac and
+            requests choose the CA. At least two routes can name a directory: hvac's
+            ``VAULT_CAPATH``, used when ``VAULT_CACERT`` is not set, and requests'
+            ``REQUESTS_CA_BUNDLE`` or ``CURL_CA_BUNDLE``. requests passes a directory on as
+            ``ca_cert_dir``. A refusal here would break a hop that works and stop nothing that was
+            seen to wait, so the directory is loaded as before."""
             if isinstance(self.ca_cert_data, str) and has_encryption_header(self.ca_cert_data):
                 # Fixed text: it names no part of the CA text it refuses.
                 raise VaultHopRefused(
                     f"{connector}: the CA text for this hop {_ENCRYPTED_CA_TEXT}. Loading "
                     "an encrypted block can make the TLS library wait for a password; refusing to "
                     "load it (BACKLOG #3090)"
+                )
+            if isinstance(self.ca_cert_data, str) and has_private_key_label(self.ca_cert_data):
+                # BACKLOG #3745: the load would skip a key block, so it is refused here.
+                raise VaultHopRefused(
+                    f"{connector}: the CA text for this hop {_PRIVATE_KEY_CA_TEXT}. CA text is "
+                    "public trust material, so a private key does not belong in it; refusing to "
+                    "load it (BACKLOG #3745)"
                 )
 
         def _refuse_an_unchecked_client_key(self) -> None:
@@ -638,7 +646,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # since, which takes a loopback Vault off the box.
         self.refuse_an_unrevoked_hop(url, proxy)
         # Vault BACKLOG #4028: after this method's refusals, so a send refused here is not named.
-        # What the WARNING claims is in docs/CONFIGURATION.md, the point-of-use paragraphs.
+        # What the WARNING claims is in docs/CONFIGURATION.md, under the sub-heading it names.
         _disclose_ambient_proxy(self._connector, proxy)
         return pool
 
@@ -752,9 +760,9 @@ def vault_failure_text(exc: BaseException) -> str:
     A refusal from this hop keeps its own text: a :class:`VaultHopRefused` from the hop checks, or
     an :class:`~messagefoundry.transports.bounded_read.EgressReplyError` from the reply reader.
     Both are built here and in ``bounded_read`` from the hop's fixed connector label and fixed
-    reason text. They name no part of the address, the proxy URL, the token or the reply. Any
-    other failure gives only its type name, as before, because its text can echo ciphertext, a
-    request body or a URL.
+    reason text. What the hop's text never names is listed once, in :class:`VaultHopRefused`.
+    Any other failure gives only its type name, as
+    before, because its text can echo ciphertext, a request body or a URL.
 
     **A bare** ``InsecureHopRefused`` **gives only its type name too (vault BACKLOG #3247).**
     :class:`VaultHopRefused` says why.
@@ -790,7 +798,8 @@ def _proxy_scheme(proxy: str) -> str:
         scheme = urllib3.util.parse_url(
             requests.utils.prepend_scheme_if_needed(proxy, "http")
         ).scheme
-    except ValueError:  # LocationParseError
+    # LocationParseError; TypeError when the prepend joins a userinfo to no host ("http://u@").
+    except (ValueError, TypeError):
         return ""
     return (scheme or "").lower()
 
@@ -812,6 +821,12 @@ def _unverifiable_proxy_leg(connector: str) -> str:
 _ENCRYPTED_CA_TEXT = (
     "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
     "its PEM text, even outside a block, as in a comment"
+)
+#: The private-key refusal's twin of ``trust_anchors``'s ``PRIVATE_KEY_SCOPE`` (BACKLOG #3745),
+#: kept as a copy for the reason above and compared exactly by the same test file.
+_PRIVATE_KEY_CA_TEXT = (
+    "names a PEM label ending in PRIVATE KEY somewhere after the first -----BEGIN in its PEM text, "
+    "even outside a block, as in a comment"
 )
 
 
@@ -962,7 +977,8 @@ def _proxy_carries_cleartext_credentials(proxy: str) -> bool:
         scheme = urllib3.util.parse_url(
             requests.utils.prepend_scheme_if_needed(proxy, "http")
         ).scheme
-    except ValueError:  # LocationParseError
+    # LocationParseError; TypeError when the prepend joins a userinfo to no host ("http://u@").
+    except (ValueError, TypeError):
         return True
     return (scheme or "").lower() != "https"
 
@@ -1032,6 +1048,12 @@ _CROSSINGS_LOGGED: set[tuple[str, str]] = set()
 _CROSSINGS_LOCK = threading.Lock()
 
 
+def _crossing_logged(connector: str, kind: str) -> bool:
+    """Whether :func:`_first_crossing` has already marked this crossing. Asked before every
+    send, so it takes no lock; a False answer is settled under the lock."""
+    return (connector, kind) in _CROSSINGS_LOGGED
+
+
 def _first_crossing(connector: str, kind: str) -> bool:
     """Whether this is the first ``kind`` of crossing on the ``connector`` hop in this process.
 
@@ -1046,10 +1068,9 @@ def _first_crossing(connector: str, kind: str) -> bool:
     **The hop is named by its connector label.** The key provider and the Transit cipher share
     one label, one Vault address and one settings pair, so they share one line. A process that
     crosses the same hop both ways, attested and warned, logs each once."""
-    key = (connector, kind)
-    # Asked before every send, so the common answer takes no lock.
-    if key in _CROSSINGS_LOGGED:
+    if _crossing_logged(connector, kind):
         return False
+    key = (connector, kind)
     with _CROSSINGS_LOCK:
         if key in _CROSSINGS_LOGGED:
             return False
@@ -1066,12 +1087,18 @@ def _disclose_ambient_proxy(connector: str, proxy: str | None) -> None:
     Keyed by a digest of the raw value, never the raw string: why, and what that does not
     protect, is the ``docs/ASVS-L2-PHASE0-CHANGES.md`` section 4 row "Vault hop ambient-proxy
     disclosure dedupe". Keyed by it rather than the label, so an already-named proxy costs one
-    hash rather than a parse on each send (the Transit cipher sends once per stored cell)."""
+    hash rather than a parse on each send (the Transit cipher sends once per stored cell).
+
+    The label is built before the value is marked as named, so a label that failed to build could
+    not leave the value marked and never named."""
     if not proxy:
         return
-    digest = hashlib.sha256(proxy.encode("utf-8", "surrogatepass")).hexdigest()
-    if _first_crossing(connector, f"ambient proxy {digest}"):
-        logger.warning("%s", vault_hop_proxy_warning(connector, _dialled_proxy_label(proxy)))
+    kind = f"ambient proxy {hashlib.sha256(proxy.encode('utf-8', 'surrogatepass')).hexdigest()}"
+    if _crossing_logged(connector, kind):
+        return
+    label = _dialled_proxy_label(proxy)
+    if _first_crossing(connector, kind):
+        logger.warning("%s", vault_hop_proxy_warning(connector, label))
 
 
 def _dialled_proxy_label(proxy: str) -> str:
@@ -1084,7 +1111,8 @@ def _dialled_proxy_label(proxy: str) -> str:
     label = proxy_label(proxy)
     try:
         parsed = urllib3.util.parse_url(requests.utils.prepend_scheme_if_needed(proxy, "http"))
-    except (ValueError, urllib3.exceptions.LocationParseError):
+    # TypeError: requests' prepend joins a userinfo with a host of None, as in "http://u@".
+    except (ValueError, TypeError, urllib3.exceptions.LocationParseError):
         return UNREADABLE_PROXY_LABEL
     if parsed.host is None:  # else the f-string below would compare a host spelled "None"
         return UNREADABLE_PROXY_LABEL
@@ -1226,7 +1254,6 @@ def _crossed_unrevoked(
         return revocation_hop_disposition(
             enforcing=enforcing,
             is_loopback_hop=on_box,
-            proxy_proven=False,
             attested=attested,
             crl_checked=crl_checked,
             blanket_attested=tls_revocation_attested(),

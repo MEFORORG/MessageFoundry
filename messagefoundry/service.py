@@ -15,9 +15,16 @@ process is detached, output isn't captured) — poll :func:`service_state` to ob
 tray service-manager and the ``service start``/``stop`` CLI. Both elevate the same ``net`` command;
 neither elevates user-writable code.
 
-**Every** program either form hands to the OS is an absolute system-directory path, resolved by
+A third elevated launch, :func:`install_service`, is one-time setup and the exception: it elevates
+the checkout's ``install-service.ps1``. What that exposes is stated once, in
+``docs/DANGEROUS-FUNCTIONALITY.md`` section 4, *The engine starts processes*.
+
+**Every** program these hand to the OS is an absolute system-directory path, resolved by
 :func:`messagefoundry.service_status._system_exe`, whose docstring is the one place that explains
-why an unqualified name would not be safe here.
+why an unqualified name would not be safe here. The service name is vetted by the one guard,
+:func:`messagefoundry.service_status.is_safe_service_name`, and the environment name by
+:func:`is_safe_environment`; both match the whole string, so a trailing line feed is refused too
+(BACKLOG #1680).
 """
 
 from __future__ import annotations
@@ -39,7 +46,12 @@ import messagefoundry
 # not by layer: service_status is the stdlib-only neutral leaf, so importing it here crosses
 # nothing.
 from messagefoundry.childenv import system_tool_environment
-from messagefoundry.service_status import _system_dir, _system_exe, parse_service_state
+from messagefoundry.service_status import (
+    _system_dir,
+    _system_exe,
+    is_safe_service_name,
+    parse_service_state,
+)
 
 # sc.exe is a console program; launched from the GUI process (pythonw has no console) each call
 # would briefly pop a console window — on the Status page's state poll that means a terminal
@@ -69,13 +81,8 @@ _ACTIONS = {
 
 # The restart action chains two `net` calls with `&`, so control_service can't avoid cmd.exe — and
 # that line runs ELEVATED. A service name with a quote/`&`/`|` could break out of its quoted argument
-# and run arbitrary commands as admin. Windows service names need none of those, so allow only a
-# conservative set and reject the rest (review low-16).
-_SAFE_SERVICE_NAME = re.compile(r"^[A-Za-z0-9 ._-]+$")
-
-
-def _is_safe_service_name(name: str) -> bool:
-    return bool(_SAFE_SERVICE_NAME.match(name))
+# and run arbitrary commands as admin. Windows service names need none of those, so every caller
+# here vets the name with the one guard, service_status.is_safe_service_name (review low-16).
 
 
 def _elevated_cmd_params(action: str, name: str) -> str:
@@ -97,13 +104,15 @@ def _elevated_cmd_params(action: str, name: str) -> str:
 # into an ELEVATED PowerShell command line (ShellExecuteW "runas"). It also becomes a filename segment
 # (environments/<name>.toml), so constrain it to the same token charset the engine validates
 # ([ai].environment) and reject anything else — an unsafe value could break out of the quoted arg and
-# run as admin (cf. the service-name guard above).
-_SAFE_ENV_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+# run as admin. Matched whole for the reason given at service_status._SAFE_SERVICE_NAME (BACKLOG
+# #1680); install-service.ps1 checks -Environment against this same text, case-sensitively.
+_SAFE_ENV_NAME = re.compile(r"^[A-Za-z0-9._-]+\z")
 
 
 def is_safe_environment(name: str) -> bool:
     """True if ``name`` is a valid active-environment name (letters, digits, ``.``, ``_``, ``-``)."""
-    return bool(_SAFE_ENV_NAME.match(name))
+    # Not a str is not a name, so an untyped caller gets the ValueError path, not a TypeError.
+    return isinstance(name, str) and _SAFE_ENV_NAME.fullmatch(name) is not None
 
 
 def service_state(name: str) -> str:
@@ -113,7 +122,7 @@ def service_state(name: str) -> str:
     state this module does not report (paused, starting) or ``sc`` output it cannot read."""
     if sys.platform != "win32":
         return "unavailable"
-    if not _is_safe_service_name(name):
+    if not is_safe_service_name(name):
         return "unavailable"  # never let an unsafe name enable the (elevated) control buttons
     try:
         # nosec: fixed system tool (sc), no shell; `name` is validated above (low-16).
@@ -144,9 +153,9 @@ def control_service(action: str, name: str) -> bool:
     Uses ``net`` (synchronous) under an elevated, hidden ``cmd``. Output isn't captured;
     call :func:`service_state` afterwards to see the new state.
 
-    Raises :class:`ValueError` for a service name with shell metacharacters — it would be
-    interpolated into an elevated cmd.exe line (review low-16)."""
-    if not _is_safe_service_name(name):
+    Raises :class:`ValueError` for a name :func:`~messagefoundry.service_status.is_safe_service_name`
+    refuses — it would be interpolated into an elevated cmd.exe line (review low-16)."""
+    if not is_safe_service_name(name):
         raise ValueError(f"unsafe service name {name!r}")
     if sys.platform != "win32":
         return False
@@ -273,13 +282,13 @@ def control_service_ex(action: str, name: str) -> ServiceControlOutcome:
     absolute system-directory paths, so it never elevates user-writable code (:func:`_system_exe`).
     Returns :data:`UNSUPPORTED` off Windows.
 
-    Raises :class:`ValueError` for an unknown ``action`` or a service name with shell metacharacters
+    Raises :class:`ValueError` for an unknown ``action`` or a service name the one guard refuses
     (it is interpolated into an elevated ``cmd.exe`` line — review low-16), *before* the platform
     check so an unsafe input is refused on every OS.
     """
     if action not in _ACTIONS:
         raise ValueError(f"unknown service action {action!r}")
-    if not _is_safe_service_name(name):
+    if not is_safe_service_name(name):
         raise ValueError(f"unsafe service name {name!r}")
     if sys.platform != "win32":
         return ServiceControlOutcome.UNSUPPORTED

@@ -96,8 +96,10 @@ break that Handler rather than protect it.
 
 ## 2. The config loader imports by file path
 
-`config/wiring.py` builds an import spec from a path and executes the module. Two sites do this: the
-loader's own finder, and the direct module load.
+`config/wiring.py` reads the config directory once, compiles each module from those bytes, and
+executes it. Two sites do this: the loader's helper importer, and the direct module load. Neither
+reads a `__pycache__` file, and a sandbox worker runs the bytes the engine read, not the directory
+(vault BACKLOG #2596).
 
 **What it means.** Every `.py` file in your config directory that does not start with `_` gets
 imported at startup, and its top-level code runs. A file you dropped there to look at later is not
@@ -371,9 +373,9 @@ and the builders, and a test checks that each module named calls each builder na
   reads, and the names `[sandbox].pass_environment` lists. No other inherited variable crosses. On
   Linux with `[sandbox].mem_mb` set, the engine also sets `MALLOC_ARENA_MAX=2` where the operator
   passed none.
-- The disaster-recovery hook, in `pipeline/dr.py`, gets everything outside the engine's `MEFOR_*`
-  namespace, less the few secret names the module lists outside it (`hook_environment`). A secret
-  kept under any other name still reaches it.
+- The disaster-recovery hook, in `pipeline/dr.py`, gets an allowlist (`hook_environment`), which
+  the `[dr]` `pass_environment` row of CONFIGURATION.md describes. No secret is in the hook's own
+  environment unless an operator lists its name; the hook still runs as the engine's account.
 - The engine shards and the config-loading child, in `pipeline/supervisor.py`, and the tray's
   branded relaunch, in `tray/branding.py`, get the whole environment, secrets included, less any
   empty or relative `PYTHONPATH` entry (`engine_environment`).
@@ -384,11 +386,11 @@ and the builders, and a test checks that each module named calls each builder na
   `OPENSSL_ENGINES`. No other
   variable reaches them, and no Python variable, since `openssl` is not Python. Both start
   through one call, so they find the same `openssl` on the same `PATH`.
-- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get what the
-  disaster-recovery hook gets, less any empty or relative `PYTHONPATH` entry (`hook_environment`
-  over `engine_environment`). So they keep the index, proxy and certificate settings they read
-  from the environment, and any other variable the runner set, a CI token among them, reaches them
-  too.
+- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get everything outside
+  the engine's `MEFOR_*` namespace, less the few secret names the module lists outside it and any
+  empty or relative `PYTHONPATH` entry (`non_engine_environment` over `engine_environment`). So
+  they keep the index, proxy and certificate settings they read from the environment, and any
+  other variable the runner set, a CI token among them, reaches them too.
 
 At least these pass on the environment they run with, on purpose: `checks.py`, which adds one
 variable, and the tray's opens, where starting VS Code drops the two variables VS Code's own
@@ -432,7 +434,10 @@ site check in the test suite counts a `-Command` start as a shell start, as it c
 The module makes one start on Windows, `powershell.exe`, and up to two on Linux, both `openssl`.
 Each
 is bounded at 30 s (`_PROBE_TIMEOUT_S`). `subprocess.run` kills a probe that runs longer, and that
-reading is an ERROR. The Linux row can so take twice that bound.
+reading is an ERROR. The Linux row can so take twice that bound. The bound is on the probe, not
+always on the call. On Windows, after the kill, `subprocess.run` waits for the probe's output pipes
+to close, so a process the probe started that still holds them would keep the call waiting past
+30 s.
 
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
 run whatever program is registered for the file type or URL scheme. The tray opens its log file,
@@ -793,12 +798,12 @@ administrator rights. What each one grants or changes:
 
 | Script | What it grants or changes |
 |---|---|
-| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. Sets the service's privilege list and its SID type. |
+| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. Sets the service's privilege list and its SID type. With `-EngineWheel`, first builds the engine install under `C:\Program Files\MessageFoundry\engine`: it runs the `-BasePython` interpreter and pip as administrator, installing the `requirements.lock` and engine wheel it checks against `-RequirementsLockSha256` and `-EngineWheelSha256`, binary wheels only ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*). |
 | `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
 | `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
-| `measure-store-access.ps1` | A measurement script, in the assessment's operator-run scope like the rest of this folder by owner ruling of 2026-10-05 ([`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2). It measures whether the service account and the operator can both open one store; it is not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. Unless `-AppExe` names another, it also takes the `messagefoundry` command from `PATH` (`Get-Command messagefoundry`) and runs it while elevated, at least for `gen-key`, which mints the run's store key, and `protect-key`, which writes the service's key file. The `python` probe starts import the engine's own code from whatever install that `python` finds, whatever `-AppExe` says. In the CI job `windows-service-smoke`, whose install step installs the engine editable, both are the checkout's. The installer's check of the engine install ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*) never covers the `python` starts, and covers `protect-key` only when `-AppExe` names the launcher it checks; `gen-key` runs before the installer does. So whoever could write a folder on `PATH`, or the install those commands load, would run code as administrator and would see the store key. The `protect-key` start is handed that store key in its environment, as `MEFOR_STORE_ENCRYPTION_KEY`, which is cleared after it exits. So are at least the `python` probe starts that screen the password and provision the administrator. Those starts and the probe start that signs in are also handed, as `MEFOR_W0_ADMIN_PASSWORD`, the synthetic administrator password, or for the screen each candidate it tries. Without `-AppExe`, the service itself runs the engine in the installer's default install root, not the `PATH` `messagefoundry`. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke`, which runs this script, runs NSSM the same way. |
+| `measure-store-access.ps1` | A measurement script, in the assessment's operator-run scope. [`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2 puts this folder in by its scope sentence, and names this script in by owner ruling of 2026-10-05. It measures whether the service account and the operator can both open one store; it is not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. Unless `-AppExe` names another, it also takes the `messagefoundry` command from `PATH` (`Get-Command messagefoundry`) and runs it while elevated, at least for `gen-key`, which mints the run's store key, and `protect-key`, which writes the service's key file. The `python` probe starts import the engine's own code from whatever install that `python` finds, whatever `-AppExe` says. In the CI job `windows-service-smoke`, whose install step installs the engine editable, both are the checkout's. The installer's check of the engine install ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*) never covers the `python` starts, and covers `protect-key` only when `-AppExe` names the launcher it checks; `gen-key` runs before the installer does. So whoever could write a folder on `PATH`, or the install those commands load, would run code as administrator and would see the store key. The `protect-key` start is handed that store key in its environment, as `MEFOR_STORE_ENCRYPTION_KEY`, which is cleared after it exits. So are at least the `python` probe starts that screen the password and provision the administrator. Those starts and the probe start that signs in are also handed, as `MEFOR_W0_ADMIN_PASSWORD`, the synthetic administrator password, or for the screen each candidate it tries. Without `-AppExe`, the service itself runs the engine in the installer's default install root, not the `PATH` `messagefoundry`. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke`, which runs this script, runs NSSM the same way. |
 
 **The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
 least-privilege virtual account, `NT SERVICE\<ServiceName>`, with no password. `-AllowLocalSystem`
@@ -1177,8 +1182,9 @@ reads the code and fails when one of these no longer matches it:
 
 - the section 4 table: a new process start, or a start that changes form, such as a new
   `shell=True`. In the list under *What each child is handed*, each module an item names must call
-  each builder it names. The host cipher probes' timeout and the `OPENSSL_*` names must match
-  `verify/cipher_policy.py`, and each of its starts must pass that timeout;
+  each builder it names. The host cipher probes' timeout, in the paragraph on the host cipher read,
+  and the `OPENSSL_*` names, in the `openssl` starts' item, must match `verify/cipher_policy.py`,
+  and each of its starts must pass that timeout;
 - the section 5 module list: a new `ctypes` import, and every library load must name its library
   with a literal;
 - the section 7 parser tables: a parse site the six patterns find that the first two tables omit,

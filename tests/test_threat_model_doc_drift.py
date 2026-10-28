@@ -169,6 +169,12 @@ _RESOURCE_ROW_KEYS: dict[str, str] = {
     "**Per-actor PHI reads**": "/logs/tail",
 }
 
+#: The service-name guard, module-qualified (BACKLOG #1680 gave it one home). The bare name is a
+#: substring of the retired `_is_safe_service_name`, so it accepted a row still naming that deleted
+#: function. A test checks this string against the live symbol, so a move reds it. COUPLED edit: the
+#: vault's 15.1.5 service-control row must name it before this lands, or the vault's drift job reds.
+_SERVICE_NAME_GUARD_ANCHOR = "service_status.is_safe_service_name"
+
 _DANGEROUS_ROW_KEYS: dict[str, str] = {
     "**In-process (default) or subprocess-isolated execution": "sandbox",
     "**`db_lookup`**": "db_lookup",
@@ -289,7 +295,7 @@ _DANGEROUS_ANCHORS: tuple[str, ...] = (
     "/uploads",
     "takeover_hook",
     "ShellExecute",
-    "_is_safe_service_name",
+    _SERVICE_NAME_GUARD_ANCHOR,
     "shell=False",
     "transports/file.py",
     "edit-resend",
@@ -2056,6 +2062,24 @@ def test_a_deleted_row_is_detected_even_though_the_prose_still_carries_its_ancho
     # And the section-scoped checker is blind to it, because the prose still says `widget_limit`.
     # That is not a defect here; it is the measured reason the row-scoped one exists.
     assert _missing(mutated, ("widget_limit",)) == []
+
+
+def test_a_row_naming_the_retired_service_name_guard_does_not_satisfy_the_anchor() -> None:
+    """A row naming only the deleted `_is_safe_service_name` fails the anchor; one naming the guard
+    where it lives passes. The bare `is_safe_service_name` anchor accepted both."""
+    table = "| Functionality | Guard |\n|---|---|\n| **Service control** | {} gates the name |"
+    anchors = (_SERVICE_NAME_GUARD_ANCHOR,)
+    assert _missing_in_rows(table.format("`_is_safe_service_name`"), anchors) == list(anchors)
+    assert _missing_in_rows(table.format(f"`{_SERVICE_NAME_GUARD_ANCHOR}`"), anchors) == []
+
+
+def test_the_service_name_guard_anchor_names_the_live_symbol() -> None:
+    """The anchor is hand-typed, so a move of the guard must red here rather than leave the
+    document pinned to its old home. Full module path, so a same-named leaf module elsewhere fails."""
+    from messagefoundry.service_status import is_safe_service_name
+
+    live = f"{is_safe_service_name.__module__}.{is_safe_service_name.__qualname__}"
+    assert live == f"messagefoundry.{_SERVICE_NAME_GUARD_ANCHOR}"
 
 
 def test_the_row_mutation_helper_refuses_to_silently_do_nothing() -> None:

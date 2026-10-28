@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE
+from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE, PRIVATE_KEY_SCOPE
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from tests._encrypted_pem_probe import ENCRYPTION_HEADERS as _HEADERS
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
@@ -150,6 +150,24 @@ def test_encrypted_ca_text_is_refused_before_any_tls_load(proxied: bool, text: s
     assert ENCRYPTION_HEADER_SCOPE in str(refusal.value)
     assert "SYNTHETICBODYMARKER" not in str(refusal.value), "the refusal echoed the CA text"
     assert "AES-256-CBC" not in str(refusal.value), "the refusal echoed the CA text"
+
+
+@pytest.mark.parametrize("proxied", [True, False], ids=["through an https proxy", "direct"])
+@pytest.mark.parametrize("label", ["PRIVATE" + " KEY", "ENCRYPTED PRIVATE" + " KEY"])
+def test_ca_text_with_a_private_key_is_refused_before_any_tls_load(
+    proxied: bool, label: str
+) -> None:
+    """BACKLOG #3745. Red with the private-key check removed from ``_refuse_encrypted_ca_text``:
+    the key block has no encryption header, so nothing else refuses it."""
+    text = _PLAIN + f"-----BEGIN {label}-----\nAAAA\n-----END {label}-----\n"
+    made, factory = _contexts(_NoTlsLoad)
+    conn = _connection(factory, proxied=proxied, ca_cert_data=text)
+    with pytest.raises(InsecureHopRefused) as refusal:
+        conn.connect()
+    assert type(refusal.value) is _strict().VaultHopRefused, "not the hop's marked type"
+    assert made == [], "a TLS context was built for CA text the hop refuses"
+    assert PRIVATE_KEY_SCOPE in str(refusal.value)
+    assert "SYNTHETICBODYMARKER" not in str(refusal.value), "the refusal echoed the CA text"
 
 
 @pytest.mark.parametrize(

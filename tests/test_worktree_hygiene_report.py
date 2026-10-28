@@ -151,6 +151,7 @@ def _violations(path: Path) -> list[str]:
 DOT_SOURCED = (
     ROOT / "scripts" / "coord" / "occupancy.ps1",
     ROOT / "scripts" / "coord" / "session-registry.ps1",
+    ROOT / "scripts" / "worktree" / "worktree-audit.ps1",
 )
 
 
@@ -568,6 +569,117 @@ def test_a_dead_session_record_in_a_worktree_holds_it_back(fx: Fx) -> None:
     assert any("session record" in r for r in rows["repo-m-venv"]["reasons"])
     assert rows["repo-m-clean"]["verdict"] == "REMOVE"
     assert (fx.out / "last-run.txt").read_text(encoding="utf-8").startswith("OK ")
+
+
+def test_seat_locks_whose_session_is_gone_are_listed_and_left_locked(fx: Fx, sleeper: int) -> None:
+    """BACKLOG #2524: a seat that died keeps its lock, and every reclaimer then keeps the tree.
+
+    Only a SEAT lock (``<seat> <session id>``) whose session is gone is listed. A live seat's lock,
+    Claude Code's own agent lock and a hand-written two-word lock are each a control that must not be.
+    """
+    gone, dead, live, occupied = (
+        "aaaaaaaa-0000-0000-0000-000000000001",
+        "aaaaaaaa-0000-0000-0000-000000000002",
+        "aaaaaaaa-0000-0000-0000-000000000003",
+        "aaaaaaaa-0000-0000-0000-000000000004",
+    )
+    codex = "codex-aaaaaaaa-0000-0000-0000-000000000005"
+    elsewhere = str(fx.root / "elsewhere")
+    sessions = fx.cfg / "sessions"
+    (sessions / "999997.json").write_text(
+        json.dumps({"pid": 999997, "sessionId": dead, "cwd": elsewhere}), encoding="utf-8"
+    )
+    # The live seat SITS IN repo-m-venv, so a gone seat's lock on that tree gets no command.
+    (sessions / f"{sleeper}.json").write_text(
+        json.dumps(
+            {
+                "pid": sleeper,
+                "sessionId": live,
+                "cwd": str(fx.paths["m-venv"]),
+                "startedAt": int(time.time() * 1000),
+            }
+        ),
+        encoding="utf-8",
+    )
+    locks = {
+        "wip": f"builder {gone}",
+        "m-unpushed": f"manager {dead}",
+        "m-dirty": f"lander {live}",
+        "m-venv": f"builder {occupied}",
+        "m-recent": f"builder {codex}",
+        "m-fork": "claude agent agent-x (pid 4242)",
+        "m-stacked": "manual hold",
+    }
+    for slug, reason in locks.items():
+        _git(fx.primary, "worktree", "lock", "--reason", reason, str(fx.paths[slug]))
+
+    proc = _run(fx, "-SkipGh", "-SkipFetch")
+    assert proc.returncode == 0, proc.stderr
+    clone = _report(fx)["clones"][0]
+    stale = {Path(s["path"]).name: s for s in clone["staleSeatLocks"]}
+    assert set(stale) == {"repo-wip", "repo-m-unpushed", "repo-m-venv"}, stale
+    assert stale["repo-wip"]["state"] == "NO RECORD"
+    assert stale["repo-m-unpushed"]["state"] == "DEAD"
+    command = stale["repo-wip"]["command"]
+    assert f"worktree unlock '{fx.paths['wip'].as_posix()}'" in command
+    assert command.startswith("if ([Environment]::MachineName -ne "), "no host circuit breaker"
+    # The occupancy veto: a session is in that tree, so no unlock is offered for it.
+    assert stale["repo-m-venv"]["command"] == ""
+    assert "session is in it" in stale["repo-m-venv"]["heldBecause"]
+    # A Codex lock's liveness is unknown: listed apart, with no command.
+    assert [Path(s["path"]).name for s in clone["codexSeatLocks"]] == ["repo-m-recent"]
+    md = (fx.out / "latest.md").read_text(encoding="utf-8")
+    assert "### e. Seat locks whose session is gone (3)" in md
+    assert "Codex seat locks (1)" in md
+
+    # Listed, never unlocked: every lock is still in place.
+    listed = _git(fx.primary, "worktree", "list", "--porcelain")
+    for reason in locks.values():
+        assert f"locked {reason}" in listed
+
+    def paste(cmd: str) -> str:
+        return subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        ).stdout
+
+    # A lock handed to someone else since the report: the pasted command refuses.
+    _git(fx.primary, "worktree", "unlock", str(fx.paths["m-unpushed"]))
+    _git(fx.primary, "worktree", "lock", "--reason", f"manager {live}", str(fx.paths["m-unpushed"]))
+    out = paste(stale["repo-m-unpushed"]["command"])
+    assert "STOP" in out and "no longer reads the reason" in out, out
+    assert f"locked manager {live}" in _git(fx.primary, "worktree", "list", "--porcelain")
+
+    # The proposed command, pasted on this host with the lock unchanged, unlocks exactly that tree.
+    paste(command)
+    listed = _git(fx.primary, "worktree", "list", "--porcelain")
+    assert f"locked builder {gone}" not in listed
+    assert f"locked lander {live}" in listed
+
+
+def test_an_emptied_worktree_folder_is_listed_in_section_f(fx: Fx) -> None:
+    """BACKLOG #2525, through the report: a planted empty, unregistered folder is listed with its
+    log line. The rule's own controls are in test_find_emptied_worktrees.py."""
+    folder = fx.primary / ".claude" / "worktrees" / "seat-gone"
+    folder.mkdir(parents=True)
+    logs = fx.root / "desktop-logs"
+    logs.mkdir()
+    (logs / "main.log").write_text(
+        "2026-09-23 16:46:28 [warn] Git worktree remove failed, will try manual cleanup: "
+        f"error: failed to delete '{folder.as_posix()}': Permission denied\n",
+        encoding="utf-8",
+    )
+    proc = _run(fx, "-SkipGh", "-SkipFetch", "-DesktopLogRoot", str(logs))
+    assert proc.returncode == 0, proc.stderr
+    emptied = _report(fx)["clones"][0]["emptied"]
+    assert [Path(e["path"]).name for e in emptied] == ["seat-gone"]
+    assert len(emptied[0]["logLines"]) == 1
+    md = (fx.out / "latest.md").read_text(encoding="utf-8")
+    assert "### f. Worktree folders emptied in place (1)" in md
+    assert folder.is_dir(), "the report must not touch the folder"
 
 
 def test_hook_drift_is_read_through_the_installers_status_mode(fx: Fx) -> None:

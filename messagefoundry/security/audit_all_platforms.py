@@ -26,7 +26,10 @@ always audited.
 
 WHAT IT DOES, in order, exiting with the first non-zero status:
 
-1. ``pip install --dry-run --ignore-installed --require-hashes -r <lock>`` on the lock AS COMMITTED.
+1. ``pip install --dry-run --ignore-installed --require-hashes --only-binary :all: -r <lock>`` on
+   the lock AS COMMITTED. Wheels only, whatever the caller's pip configuration says: a dry-run
+   still builds an sdist to read its metadata, and that runs the package's build code in an audit.
+   So a pin with no wheel for the host fails here (vault BACKLOG #4083 finding 4).
    This keeps what the old ``pip-audit -r <lock>`` did as a side effect: its pip path dry-run
    installed the lock into a fresh venv, so a pin with a wrong hash or no installable artifact on the
    runner reddened the gate. For ``ci/locks/ci-quality.lock`` that was the only such check in a
@@ -82,7 +85,7 @@ import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from messagefoundry.childenv import engine_environment, hook_environment, python_module_argv
+from messagefoundry.childenv import engine_environment, non_engine_environment, python_module_argv
 
 
 def is_requirement_line(line: str) -> bool:
@@ -181,12 +184,12 @@ def strip_markers(text: str) -> tuple[str, list[str], int]:
 
 
 def _run(cmd: list[str]) -> int:
-    # hook_environment: everything outside the engine's MEFOR_* namespace and its named secrets, so
-    # pip and pip-audit keep the index, proxy and certificate settings they read from the
-    # environment, and an engine secret set on the same runner does not reach them. Built over
+    # non_engine_environment: everything outside the engine's MEFOR_* namespace and its named
+    # secrets, so pip and pip-audit keep the index, proxy and certificate settings they read from
+    # the environment, and an engine secret set on the same runner does not reach them. Built over
     # engine_environment, which drops an empty or relative PYTHONPATH entry: that would put the
     # working directory back on the children's sys.path, which -P keeps off it.
-    env = hook_environment(engine_environment())
+    env = non_engine_environment(engine_environment())
     # The argv is a list and no shell reads it, but it is not all fixed. Written in this module:
     # the module name (pip or pip_audit) and each flag main() writes. From python_module_argv: the
     # interpreter and its child flags, some fixed and some repeated from this process's own flags
@@ -235,7 +238,9 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         print(f"  {entry}")
     sys.stdout.flush()
     pip_check = [*python_module_argv("pip"), "install", "--dry-run", "--ignore-installed"]
-    status = run([*pip_check, "--require-hashes", "--quiet", "-r", str(args.lock)])
+    status = run(
+        [*pip_check, "--require-hashes", "--only-binary", ":all:", "--quiet", "-r", str(args.lock)]
+    )
     if status:
         return status
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP") or None) as tmp:

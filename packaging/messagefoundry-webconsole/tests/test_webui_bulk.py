@@ -231,6 +231,7 @@ def _sys_status(*, update: object = None) -> object:
             path="/x",
             size_bytes=1,
             disk_free_bytes=1,
+            disk_free_status="observed",
             journal_mode="wal",
             messages=0,
             events=0,

@@ -261,6 +261,11 @@ false-premise defect:
    one call, `_TokenEndpointProvider._open_token_hop` in `transports/smart.py`, so one site now
    serves two hops. Read the list as *"at least these"* and locate each by symbol: these line numbers were
    written in August and the §4.3 build moved several of them.
+   *(Note 2026-10-27: revocation "proven in front" never crossed this refusal on a shipped hop: no
+   engine call site set `proxy_proven` True, and the parameter is now gone from
+   `revocation_hop_disposition` and `RevocationHopGuard`, vault BACKLOG #3514 item 5. The
+   docstring of `revocation_hop_disposition` is the source of record.
+   The item keeps its original wording.)*
 2. **Terminating `[api]` TLS — `in_process_tls_revocation_refused`** (`config/tls_policy.py:344`),
    wired at `__main__.py:1722`. `serve` refuses an in-process off-loopback `[api]` TLS bind unless a
    declared TLS-terminating reverse proxy (WP-15) or `MEFOR_TLS_REVOCATION_ATTESTED` proves
@@ -599,7 +604,9 @@ the guarded originating hops listed at §1.5 rider 1. *(This read "the seven gua
 than warn: `config/settings.py:2338-2342` derives `DataClass.PHI` for `dev`, `staging` **and** `prod`,
 and `settings.py:3675` defaults enforcement to `SecurityEnforcement.ENFORCE`. The disposition ladder
 at `tls_policy.py:963-973` has no global audited-opt-out arm (`:958-960`), so the only relaxations are
-loopback, a proven terminator, an attestation, or a non-PHI posture.
+loopback, a proven terminator, an attestation, or a non-PHI posture. *(Note 2026-10-27: on an
+outbound hop the "proven terminator" arm is gone; the docstring of `revocation_hop_disposition`
+says why. The sentence keeps its original wording.)*
 
 **One caveat, stated so nobody reads more coverage into it than exists:**
 `RevocationHopGuard.enforce_construction` **no-ops when the posture is unstamped** — a direct test
@@ -715,6 +722,8 @@ OAuth2 token hop. Two reasons:
 - It delivers the second option's outcome without a second rule. With no context `crl_checked` is
   false, and `refuse_unrevoked_verified_hop` has no `proxy_proven` parameter. So on an enforcing
   instance only a loopback token host or the per-connection `tls_revocation_attested` crosses.
+  *(Note 2026-10-27: `revocation_hop_disposition` and `RevocationHopGuard` have no `proxy_proven`
+  parameter either now, so no hop can declare one.)*
 
 **The refusal on the ECH arm names the attestation alone.** The default text offers
 `[tls].crl_file`, which cannot cross an ECH hop. (It also offered an egress proxy, which no call
@@ -786,7 +795,9 @@ which the same CRL relaxes the same hop without a sidecar.
   or attest. Some sites will attest without a revocation-checking PKI behind the claim, because
   attesting is one environment variable and standing up a proxy is a project. The control is honest by
   construction — the flag is named an attestation and its use is audited — but the residual risk moves
-  into a claim the engine cannot check.
+  into a claim the engine cannot check. *(Note 2026-10-27: a revocation-checking egress proxy does
+  not cross the refusal; `docs/DEPLOYMENT.md`, *The ways across*, lists what does. The bullet keeps
+  its original wording.)*
 - **Direction 3 remains opt-in and default-off**, so a site that configures nothing gets no
   client-certificate revocation and, on an enforcing PHI posture, a start-time refusal telling it so.
 - **An operator who enables direction 3 takes on CRL refresh.** The engine alarms on expiry
@@ -1161,7 +1172,7 @@ does apply the pin, the exact match replaces the standard checks, the trust chai
 `Encrypt=strict` (vault BACKLOG #2223).** With `[store].ssl_root_cert` set on the secure posture,
 `connection_string` now sends `ServerCertificate=` together with `Encrypt=strict`, in place of
 `Encrypt=yes`, and both stay inside the last-wins tail (*code*). The reason: on the Driver 18.7 build
-tested, the `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
+tested on Windows, the `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
 `Encrypt=yes`; no other `Encrypt` value was tested. Microsoft's page, quoted above, documents the
 keyword for strict encryption (*documentation*). The decision rests on a private test record, vault
 BACKLOG #3009, and its contents are not repeated here. Four consequences follow, and they are
@@ -1184,12 +1195,17 @@ decisions too:
    (*code*).
 
 The live Linux test of the pin, `test_server_certificate_pin_is_enforced_under_strict_encryption`,
-runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. No CI job sets it, so
-it is skipped in CI and the Linux reading is not yet taken.
+runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. The 2025
+`sqlserver-store` CI leg sets it, against a second container that forces strict encryption, and
+runs the test with the server's certificate untrusted and then trusted (vault BACKLOG #3714). The
+Linux reading comes from that leg's two `BACKLOG-2223-PIN` lines, once a run is read. **CORRECTED 2026-10-27:** this read *"No
+CI job sets it, so it is skipped in CI and the Linux reading is not yet taken."*
 
 The paragraph above is kept as written. Its first sentence, *"`connection_string` emits
 `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`"*, describes the code before this
 amendment.
+*(Corrected 2026-10-27: the amendment's reason read "on the Driver 18.7 build tested", without
+"on Windows". The measurement was taken on Windows only. Vault BACKLOG #3714 item 10.)*
 
 **The counts, after this note.** The counts paragraph above covers the table above, and this note
 leaves it as written. *(Corrected 2026-10-11: that paragraph has since been edited once, for
@@ -1264,9 +1280,14 @@ only, so §5's out-of-scope fetch bullet and ADR 0078's offline reasoning are un
 **CORRECTED 2026-10-12 (vault BACKLOG #2905, owner ruling 2026-10-05).** The paragraph above said a
 badly signed CRL "would load and then fail every handshake". That described a start as well as
 OpenSSL, and a start has changed. `harden_crl_check` now checks each CRL's signature against the
-hop's own CA list. It refuses one case only: the CRL names a listed CA's key by key identifier, and
-that key did not sign it. Anything short of that proof loads with a WARNING, at least an issuer the
-hop does not list, a CRL that names no key, and a key the engine cannot check with. `docs/CONFIGURATION.md`,
+hop's own CA list. It refuses one case only: the CRL names a listed CA's key by key identifier, the
+engine ran the signature check with that key, and the check failed (corrected under vault BACKLOG
+#3506; it read "that key did not sign it", which is also true of a signature of another kind than
+the key, and that loads). Anything short of that proof loads with a WARNING, at least an issuer the
+hop does not list, a CRL that names no key, and a key the engine cannot check with. Since vault
+BACKLOG #4159, that last case loads only where the unchecked key is the one the CRL names, or the
+CRL names no listed key: a same-name CA with no subject key identifier no longer stops the
+refusal, whether its key verifies the CRL or cannot be checked. `docs/CONFIGURATION.md`,
 under "CRL files", is the one place that says how often it is logged and what a refusal stops.
 So the reload refuses more than a start does, on purpose. The ruling's reason is a CA that
 renewed its key: its CRL can fail the engine's check while handshakes still pass, because OpenSSL

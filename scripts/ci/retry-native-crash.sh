@@ -66,7 +66,7 @@ set -uo pipefail
 
 attempts="${RETRY_NATIVE_CRASH_ATTEMPTS:-3}"
 
-# The default serves the nine database-leg call sites, so only a caller where neither class is
+# The default serves every database-leg call site, so only a caller where neither class is
 # established has to opt out. It names both known classes and does not pick one.
 default_cause=" -- a database-leg crash class: the pyodbc py3.14 parameter-binding segfault (mkleehammer/pyodbc#1459) or a handle freed under a running statement on the store cancel path (BACKLOG #2049); this wrapper cannot tell them apart, read the faulthandler dump"
 cause="${RETRY_NATIVE_CRASH_CAUSE-$default_cause}"

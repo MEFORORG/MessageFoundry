@@ -81,7 +81,7 @@ from messagefoundry.pipeline.crl_reload import (
 from messagefoundry.pki import (
     CrlBlock,
     _crl_attribute_key,
-    crl_signature_refusal,
+    crl_signature_finding,
     judge_every_crl,
     read_soonest_crl_facts,
 )
@@ -115,7 +115,7 @@ class _Pki:
         revoke: bool = False,
         delta: bool = False,
         scope: bool = False,
-        signer: ec.EllipticCurvePrivateKey | None = None,
+        signer: CertificateIssuerPrivateKeyTypes | None = None,
         aki: x509.AuthorityKeyIdentifier | None = None,
         issuer: x509.Name | None = None,
     ) -> bytes:
@@ -206,7 +206,7 @@ def _ca_cert(
 
 
 def _leaf(
-    issuer: x509.Name, signer: ec.EllipticCurvePrivateKey
+    issuer: x509.Name, signer: CertificateIssuerPrivateKeyTypes
 ) -> tuple[x509.Certificate, ec.EllipticCurvePrivateKey]:
     """A ``localhost`` leaf for server and client auth, issued by ``issuer`` and signed by
     ``signer``, and its key."""
@@ -731,7 +731,9 @@ def test_a_crl_with_a_bad_signature_is_refused_and_handshakes_still_succeed(pki:
 
     assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
     assert outcome.refusal.remedy == BAD_SIGNATURE and outcome.refusal.sticky
-    assert "could not confirm its signature" in outcome.refusal.reason
+    # Proven, so the reason says what was proven (vault BACKLOG #3506), not "could not confirm".
+    assert "that key does not verify the CRL's signature" in outcome.refusal.reason
+    assert "could not confirm" not in outcome.refusal.reason
     assert hop.cert_store_stats() == stats
     assert _accepts(hop, pki.server())  # the old copy is kept, and the hop still works
 
@@ -950,6 +952,15 @@ def test_a_reload_applies_a_replacement_whose_issuer_differs_only_in_ascii_case(
     assert _accepts(hop, pki.server()) is not applies
 
 
+def _judge_ca_file(pem: bytes) -> tuple[str, str] | None:
+    """The expiry monitor's CA-file check of ``pem``, for a CA-file-only row (BACKLOG #3512)."""
+    return _ca_file_crl_refusal(pem, time.time(), None, ca_file_only=True, on_unchecked=_no_log)
+
+
+def _no_log() -> None:
+    """The expiry monitor's log of a later CRL it could not check, which these tests ignore."""
+
+
 def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_restarts(
     pki: _Pki,
 ) -> None:
@@ -957,9 +968,9 @@ def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_re
     so a restart into this CA file is not refused. The control is a future CRL from another name."""
     current = pki.crl.read_bytes()
     future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_in_other_case(pki))
-    assert _ca_file_crl_refusal(pki.ca_pem + current + future, time.time(), None) is None
+    assert _judge_ca_file(pki.ca_pem + current + future) is None
     stray = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_OTHER_CA)
-    refusal = _ca_file_crl_refusal(pki.ca_pem + current + stray, time.time(), None)
+    refusal = _judge_ca_file(pki.ca_pem + current + stray)
     assert refusal is not None and "not yet in effect" in refusal[0], refusal
 
 
@@ -1056,7 +1067,7 @@ def test_an_unexpected_failure_is_logged_once_with_its_traceback(
     def boom(pem: bytes, ca_ders: object) -> None:
         raise RuntimeError("a defect")
 
-    monkeypatch.setattr(crl_reload, "crl_signature_refusal", boom)
+    monkeypatch.setattr(crl_reload, "crl_signature_finding", boom)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
         first, second = _reload(pki), _reload(pki)
 
@@ -1199,7 +1210,7 @@ def test_a_wait_never_outranks_a_context_at_the_cap(pki: _Pki) -> None:
     assert outcome.refusal.remedy == RESTART and "reloads" in outcome.refusal.reason
     assert not outcome.refusal.sticky  # the other hop's wait is still retried
     # And it does not send the operator into a start that refuses the same file.
-    assert "a start until then refuses this file too" in outcome.refusal.reason
+    assert "a start refuses this file too at least until then" in outcome.refusal.reason
     assert _accepts(capped, pki.server()) and _accepts(fresh, pki.server())
 
 
@@ -1377,10 +1388,10 @@ def test_a_badly_signed_crl_is_reported_over_one_whose_ca_is_not_listed(
     )
     anchors = [x509.load_pem_x509_certificate(pki.ca_pem).public_bytes(serialization.Encoding.DER)]
     unlisted_first = other.crl.read_bytes() + forged
-    verdict = crl_signature_refusal(unlisted_first, anchors)
-    assert verdict is not None and verdict[1] is True and "block 2" in verdict[0]
-    alone = crl_signature_refusal(other.crl.read_bytes(), anchors)  # control: unlisted alone
-    assert alone is not None and alone[1] is False
+    verdict = crl_signature_finding(unlisted_first, anchors)
+    assert verdict is not None and verdict.state == "bad" and "block 2" in verdict.why
+    alone = crl_signature_finding(other.crl.read_bytes(), anchors)  # control: unlisted alone
+    assert alone is not None and alone.state == "unlisted"
 
 
 # --- Lander hold on PR 1963: a CRL block OpenSSL does not load -------------------------------------

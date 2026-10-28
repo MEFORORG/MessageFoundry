@@ -34,6 +34,7 @@ from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.store.keyprovider import KeyProviderError
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 from tests._vault_hop_sockets import _closed_port, _Listener
+from tests._vault_hop_sockets import listener as listener  # noqa: F401  (the fixture, re-exported)
 from tests._wire_proxy import _WireProxy
 
 pytestmark = pytest.mark.skipif(
@@ -82,15 +83,6 @@ def _hop_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "synthetic-kek")
     monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "synthetic-data-key")
-
-
-@pytest.fixture
-def listener() -> Iterator[_Listener]:
-    lst = _Listener()
-    try:
-        yield lst
-    finally:
-        lst.close()
 
 
 # --- the three shipped entry points ---------------------------------------------------------------
@@ -850,9 +842,15 @@ def test_two_proxies_an_http_vault_is_refused_and_reaches_neither(
         "http://synthetic-user\\@proxy.synthetic.test:3128",
         # Will not parse, so its credentials cannot be ruled out.
         "http://synthetic-user:synthetic-pw@[proxy.synthetic.test:3128",
+        # A userinfo with no host: requests' prepend raises TypeError, not a parser error.
+        "http://synthetic-user@",
     ],
 )
 def test_a_proxy_url_with_cleartext_credentials_is_refused(proxy: str) -> None:
+    from messagefoundry.transports.strict_requests import _proxy_scheme
+
+    # The scheme reader fails closed on the same shapes: a URL it cannot read is not https.
+    assert _proxy_scheme(proxy) != "https"
     from messagefoundry.transports.strict_requests import _refuse_cleartext_proxy_credentials
 
     with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):

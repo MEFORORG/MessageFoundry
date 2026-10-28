@@ -34,6 +34,7 @@ from messagefoundry.api.security import (
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
+from messagefoundry.auth.webauthn import configured_rp_id
 
 __all__ = [
     "BROWSER_HARDENING_OPT_OUT_ENV",
@@ -66,6 +67,7 @@ __all__ = [
     "login_redirect_response",
     "lookup_ui_action",
     "must_change_target",
+    "must_enrol_first",
     "oidc_flow_cookie_name",
     "reauth_landing",
     "register_ui_action",
@@ -314,7 +316,9 @@ def _mfa_redirect() -> HTTPException:
     return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/mfa"})
 
 
-async def rotation_comes_first(auth: AuthService, must_change: bool, token: str | None) -> bool:
+async def rotation_comes_first(
+    auth: AuthService, must_change: bool, token: str | None, *, request: Request | None = None
+) -> bool:
     """Whether a session is confined to the password page (L4b) right now.
 
     A must-change session with no factor, or with its factor proven, can only rotate, unless its
@@ -329,7 +333,7 @@ async def rotation_comes_first(auth: AuthService, must_change: bool, token: str 
     return (
         must_change
         and not await _owes_known_factor(auth, token)
-        and not await _enrols_first(auth, token)
+        and not await _enrols_first(auth, token, request)
     )
 
 
@@ -343,13 +347,35 @@ async def confined_before_its_factor(
     return must_change and not await _owes_known_factor(auth, token)
 
 
-async def _enrols_first(auth: AuthService, token: str | None) -> bool:
+#: The ASGI scope key :func:`must_enrol_first` keeps its per-request answers under.
+_MUST_ENROL_MEMO = "messagefoundry.must_enrol_first"
+
+
+async def must_enrol_first(auth: AuthService, identity: Identity, request: Request | None) -> bool:
+    """``AuthService.must_enrol_before_rotating``, asked at most once per request for an account
+    (BACKLOG #3937 item 5). Each ask reads the account, opens its TOTP cell and digests its
+    passkey set, and one confined request can reach several gates that ask it: ``require_ui``,
+    :func:`must_change_target`, a route's own check. Nothing between them in one request changes
+    a factor before the last of them asks, so the first answer is kept in the request's scope,
+    under a private key rather than on ``request.state``, whose attributes the seam discovery reads
+    as engine-provided state. A caller with no request asks the service."""
+    if request is None:
+        return await auth.must_enrol_before_rotating(identity)
+    memo: dict[str, bool] = request.scope.setdefault(_MUST_ENROL_MEMO, {})
+    if identity.user_id not in memo:
+        memo[identity.user_id] = await auth.must_enrol_before_rotating(identity)
+    return memo[identity.user_id]
+
+
+async def _enrols_first(
+    auth: AuthService, token: str | None, request: Request | None = None
+) -> bool:
     """Whether the session's account must enrol a factor with a way past the sign-in lock before it
     may rotate (ADR 0197 Amendment A, AC-A3). The JSON plane's ``_ENROL_FIRST_ROUTES`` twin. False for
     a token that no longer resolves, so an unknown state stays confined to the password page, where
     the service refuses the rotation anyway. ``activity=False``: this probe is not user activity."""
     identity = await auth.identity_for_token(token, activity=False)
-    return identity is not None and await auth.must_enrol_before_rotating(identity)
+    return identity is not None and await must_enrol_first(auth, identity, request)
 
 
 async def _owes_known_factor(auth: AuthService, token: str | None) -> bool:
@@ -365,7 +391,9 @@ async def _owes_known_factor(auth: AuthService, token: str | None) -> bool:
     return await auth.identity_for_token(token, activity=False) is not None
 
 
-async def must_change_target(auth: AuthService, token: str | None) -> str:
+async def must_change_target(
+    auth: AuthService, token: str | None, *, request: Request | None = None
+) -> str:
     """Where a must-change session is sent: the factor page while it owes an enrolled factor, then
     the enrolment page while its account must enrol a factor with a way past first (ADR 0197
     Amendment A), otherwise
@@ -373,7 +401,7 @@ async def must_change_target(auth: AuthService, token: str | None) -> str:
     state is confined on both paths and never audited as an MFA refusal."""
     if await _owes_known_factor(auth, token):
         return "/ui/mfa"
-    if await _enrols_first(auth, token):
+    if await _enrols_first(auth, token, request):
         return ENROL_FIRST_PAGE
     return "/ui/account/password"
 
@@ -499,7 +527,7 @@ def require_ui(
             and not allow_must_change
             and not (
                 (request.method, request.url.path) in ENROL_FIRST_UI_ROUTES
-                and await auth.must_enrol_before_rotating(identity)
+                and await must_enrol_first(auth, identity, request)
             )
         ):
             # A flagged account can go nowhere but the change-password page (L4b) until it rotates,
@@ -507,7 +535,7 @@ def require_ui(
             # enrolment page first when it must enrol before rotating (ADR 0197 Amendment A). Only
             # the factor-page redirect is audited as an MFA refusal: an account that must enrol owes
             # no factor it has, so sending it to enrol refuses nothing it could prove.
-            target = await must_change_target(auth, token)
+            target = await must_change_target(auth, token, request=request)
             if target == "/ui/mfa":
                 # The MFA refusal in all but name, so it is audited like the one below (#1197), with
                 # the client read through the same extractor (BACKLOG #2088).
@@ -2103,7 +2131,8 @@ def webauthn_rp(request: Request) -> tuple[str, str] | None:
     """
     public_origin = getattr(request.app.state, "public_origin", None)
     if public_origin:
-        host = urlsplit(public_origin).hostname
+        # The same host the engine's factor-drop gates count a passkey under (BACKLOG #3937).
+        host = configured_rp_id(public_origin)
         return (host, public_origin) if host else None
     if getattr(request.app.state, "webauthn_rp_from_request", False):
         host = request.url.hostname

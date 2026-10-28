@@ -21,7 +21,7 @@ controls below, and is **dormant when no anchor is configured** — zero anchors
 byte-identical behaviour (no preflight runs, no audit rows, no new settings effects):
 
 1. A **read-only ACL preflight**: a group-/world-**writable** anchor (anyone who can write the file can
-   substitute the CA and defeat authentication) is **refused** at ``[security].enforcement = enforce``
+   substitute the anchor and defeat the TLS check that trusts it) is **refused** at ``[security].enforcement = enforce``
    and **warned + audited** at ``warn``. It reuses ``_secure_file``'s ``icacls`` DACL mechanism as a
    *verify-only* companion — it inspects the DACL and never changes it. Readability is deliberately not
    the threat (a CA certificate is public); tamperability is. The verdict is **tri-state**: a DACL the
@@ -51,8 +51,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    Before this, a file swapped between the check and the load was trusted unchecked. The AD anchor
    joined in BACKLOG #2034: ``ldap3`` used to read it by path on every bind, and now gets the checked
    bytes as ``ca_certs_data``. **Not covered:** the audit row of the central preflight, which records
-   its own read rather than the consumer's, and the dialling CAs of items 9 and 10, which still
-   load by path.
+   its own read rather than the consumer's, and the anchors of items 9 to 12, which still load
+   by path.
 6. **An indeterminate read refuses at ``enforce``, and a matching pin is the escape** (BACKLOG #1142,
    slice 3). When the ACL or the path could not be settled, the engine cannot say who else can
    replace the anchor, so ``enforce`` refuses to load it. A configured SHA-256 pin that matches the
@@ -98,7 +98,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    re-checks the file on disk, not the bytes a live hop loaded, and rebuilds only a connection
    whose config changed. For that reason the spec carries ``loads_verified_bytes=False``: a
    matching pin is NOT the item 6 escape here, and the PEM shape checks are skipped, since
-   ``cafile=`` loads what ``cadata=`` refuses. Item 5 closed the same gap for the inbound CAs.
+   ``cafile=`` loads what ``cadata=`` refuses. Only the private-key refusal runs (BACKLOG
+   #3745, :func:`_refuse_a_private_key`), on the bytes the check read. Item 5 closed the same gap for the inbound CAs.
    A CA the hop never reads, such as one behind ``use_tls=False`` or an ``http://`` url, is not
    checked, and a pin beside it is refused (:func:`unread_ca_reason`).
 10. **The dialling settings CAs** (vault BACKLOG #3188). At least three settings name a CA that an
@@ -111,7 +112,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
     **Not covered**, as in item 9: these hops load the file by path with ``cafile=``, so the
     checked bytes are not the loaded bytes. The specs carry ``loads_verified_bytes=False`` and no
-    pin, so no pin can stand in for an unjudged read, and the PEM shape checks are skipped. The
+    pin, so no pin can stand in for an unjudged read, and the PEM shape checks are skipped but
+    for the private-key refusal (BACKLOG #3745). The
     hops read the file on their own schedule, not at the check. The SMTP hop reads it at every
     send, so a file swapped between reloads is trusted by the next send, and this check finds the
     swap at the next reload. A connection that falls back to the internal CA reads it when it is
@@ -161,12 +163,60 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     through the alert sinks, the security notifier and the forwarder builder. That is a refactor
     of three modules for a drift no finding has shown. The read and unread tests pin each
     builder's conditions, not their agreement with the hop.
+11. **The SQL Server store pin** (vault BACKLOG #3714). ``[store].ssl_root_cert`` on SQL Server is
+    sent as the ODBC ``ServerCertificate`` pin, under ``Encrypt=strict``, so it is the store hop's
+    only trust anchor. :func:`collect_anchor_specs` adds it under the label
+    ``store_sqlserver_pin`` (:func:`store_pin_anchor_spec`), so it takes the audited checks of
+    items 1 to 4 at start and at every reload. The store checks it too at each open, before any
+    connect, with no audit row, because the store that holds the rows is not open yet. So at
+    ``enforce`` a pin the store refuses stops the start with no row.
+    **Not covered**, as in item 9: the driver reads the file by path at each connect, so the
+    checked bytes are not the loaded bytes, and the spec carries ``loads_verified_bytes=False``
+    and no fingerprint pin. A changed file is used by the next connect and audited by the next
+    reload, which writes ``changed`` and no ``restart_required``.
+
+    **A reload runs the anchor checks and none of the store's content checks.** It checks the
+    ACL, the path and a change (items 1, 3 and 4; the spec has no pin), and refuses a file it
+    cannot read. The store's own content checks run at the next store open, not at a reload: at
+    least that the file is one server certificate, that it is inside its validity period, and
+    the encryption-header refusal (BACKLOG #3090). So a reload can pass a swapped file the next
+    store open refuses, and the driver reads that file at its next connect. At ``warn`` the start logs the pin's warning once: the
+    preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
+
+    **Not added: a PostgreSQL ``ssl_root_cert``.** It is a CA bundle the store loads by path
+    at each new connection, the shape of item 10's CAs, and nothing checks who can write it.
+    This change covers the SQL Server pin only; that gap is unfiled.
+12. **A generic DATABASE connection's driver CA** (vault BACKLOG #3090, step 7). The CA file a
+    generic-dialect ``Database`` outbound or ``DatabasePoll`` names as ``odbc_params`` ``sslca``
+    is a lane CA, as in item 9 (:func:`database_ca_anchor_spec`), under the lane's own label. It
+    takes the checks of items 1 to 4, and the build's own content checks: the encryption-header
+    refusal and the private-key refusal. When those land follows item 9: a group- or
+    world-writable file, or one whose bytes fail, refuses that lane when the lane is built or an
+    operator starts it, and refuses the whole reload when a reload pre-check finds it on a lane it
+    keeps running. ``warn`` warns instead for the ACL and path. A file swapped since the last
+    check writes a ``changed`` row. A CA the driver never reads under ``sslmode=disable`` is not
+    checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
+    build leaves to the driver, or a value that can name another host, which the build refuses.
+    A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
+    that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
+    the stat that judges the path opens it there, so a named pipe's server sees a connect first
+    (:func:`read_if_regular`). Only a driver file's spellings are screened for another host before
+    that stat; a ``tls_ca_file`` is not.
+
+    **Not covered**, at least, as in item 9: the driver reads the file by path, at every connect
+    its pool opens. A running lane is not stopped when its file fails a later check: its pool goes on
+    reading the file at each new connect until the lane is rebuilt, and the refused reload is the
+    only signal. Any check-then-load leaves a swap window, as for ``sslkey``. There is no pin:
+    ``odbc_params`` has no pin setting. An ``sslcapath`` CA directory, which a driver also reads
+    to choose whom to trust, is not an anchor at all: no ACL, path or audit check covers it. Nor
+    is the lane check skipped for a TLS-off keyword other than ``sslmode``, such as ``Encrypt``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -174,6 +224,7 @@ import os
 import re
 import shlex
 import ssl
+import stat
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -189,7 +240,7 @@ from messagefoundry.auth.anchor_path import (
     anchor_path_verdict,
 )
 from messagefoundry.childenv import system_tool_environment
-from messagefoundry.config.models import bool_setting
+from messagefoundry.config.models import ConnectorType, bool_setting, remote_file_protocol
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.redaction import codec_safe_str, safe_exc
@@ -201,6 +252,7 @@ if TYPE_CHECKING:
         ApiSettings,
         AuthSettings,
         LoggingSettings,
+        StoreSettings,
         TlsSettings,
     )
     from messagefoundry.config.wiring import Registry, WiringError
@@ -214,7 +266,9 @@ log = logging.getLogger(__name__)
 #: ``acl_indeterminate`` (the ACL could not be determined, BACKLOG #1142), ``path_insecure`` and
 #: ``path_indeterminate`` (the path check, BACKLOG #1142 directory arm), and ``pem_refused`` (the
 #: file is not text the TLS library loads as trust anchors: no PEM block or a TRUSTED CERTIFICATE
-#: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025), and
+#: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025; and,
+#: since BACKLOG #3745, a file naming a private-key label, which the TLS library would load, on
+#: every anchor), and
 #: ``restart_required`` (a reload found a settings anchor whose bytes differ from the ones its
 #: consumer loaded, BACKLOG #2185).
 AUDIT_ACTION = "auth.trust_anchor"
@@ -222,7 +276,7 @@ AUDIT_ACTION = "auth.trust_anchor"
 
 class TrustAnchorError(Exception):
     """An operator-supplied trust anchor failed its integrity preflight: a configured SHA-256 pin
-    mismatch, a file that holds no loadable PEM block, or, under ``[security].enforcement = enforce``,
+    mismatch, a file that holds no loadable PEM block or names a private-key label, or, under ``[security].enforcement = enforce``,
     an ACL or path that lets another principal replace it or that could not be read. Raised at
     construction and at reload so the engine refuses a tampered/exposed anchor rather than silently
     trusting it.
@@ -251,7 +305,8 @@ class AnchorSpec:
 
     ``label`` is the stable, PHI-free audit key (``"oidc"`` / ``"ad"`` / ``"api_client"`` /
     ``"tls_internal_ca"`` / ``"alerts_email_ca"`` / ``"logging_forward_ca"`` /
-    ``"inbound:<connection>"`` / ``"outbound:<connection>"`` / ``"fhir_lookup:<name>"``);
+    ``"store_sqlserver_pin"`` / ``"inbound:<connection>"`` / ``"outbound:<connection>"`` /
+    ``"fhir_lookup:<name>"``);
     ``setting`` is the human-facing config key for messages; ``path`` is the configured PEM; ``pin``
     is the optional configured pin, as :func:`parse_anchor_pin` reads it; ``pin_setting``
     names where that pin is set, so a refusal can name the escape.
@@ -261,8 +316,12 @@ class AnchorSpec:
     for an unreadable ACL or path, and why the anchor takes the PEM shape checks of
     :func:`anchor_cadata`. **A consumer that reads the file again by path must not reuse a spec
     with this True**: the pin would vouch for bytes it never loaded. The AD anchor did exactly that
-    until BACKLOG #2034. The dialling CAs of module items 9 and 10 still read by path, so their
-    specs carry ``False``."""
+    until BACKLOG #2034. The anchors of module items 9 to 12 still read by path, so their specs
+    carry ``False``.
+
+    ``refuses_encryption_header`` adds the encryption-header refusal to a ``False`` spec's content
+    checks (module item 12). A spec with ``loads_verified_bytes`` True takes it in
+    :func:`anchor_cadata` already."""
 
     label: str
     setting: str
@@ -270,6 +329,7 @@ class AnchorSpec:
     pin: str | None = None
     pin_setting: str | None = None
     loads_verified_bytes: bool = True
+    refuses_encryption_header: bool = False
 
 
 @dataclass(frozen=True)
@@ -396,6 +456,17 @@ ENCRYPTION_HEADER_SCOPE = (
     "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
     "its PEM text, even outside a block, as in a comment"
 )
+#: The tail of every private-key PEM label OpenSSL writes, lower-cased: ``PRIVATE KEY``,
+#: ``ENCRYPTED PRIVATE KEY``, ``RSA PRIVATE KEY``, ``EC PRIVATE KEY`` and the rest (BACKLOG #3745).
+#: :mod:`messagefoundry.keywrap` also treats a block whose label ends in ``PRIVATE KEY`` as a key.
+_PEM_PRIVATE_KEY_LABEL = "private key-----"
+#: What :func:`has_private_key_label` matches, in the words every refusal of it uses (BACKLOG
+#: #3745). Like :data:`ENCRYPTION_HEADER_SCOPE`, ``strict_requests`` keeps an identical literal and
+#: ``tests/test_trust_anchors.py`` compares the two exactly.
+PRIVATE_KEY_SCOPE = (
+    "names a PEM label ending in PRIVATE KEY somewhere after the first -----BEGIN in its PEM text, "
+    "even outside a block, as in a comment"
+)
 #: The source-location tail CPython appends to an ``ssl.SSLError`` message, dropped from a refusal.
 _SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
 
@@ -422,6 +493,56 @@ def has_encryption_header_bytes(data: bytes) -> bool:
     TLS stack by path (BACKLOG #3090). latin-1 maps every byte, and the check looks only for ASCII
     header names, so no byte is lost or refused on the way."""
     return has_encryption_header(data.decode("latin-1"))
+
+
+def has_private_key_label(text: str) -> bool:
+    """Whether a PEM label ending in ``PRIVATE KEY`` appears anywhere after the first
+    ``-----BEGIN `` in ``text`` (BACKLOG #3745).
+
+    A trust anchor is public trust material, so a private key of any kind, plain, PKCS#8
+    ``ENCRYPTED PRIVATE KEY`` or a legacy ``RSA PRIVATE KEY``, does not belong in one. It errs wide
+    for the reason :func:`has_encryption_header` gives: no line model, since OpenSSL finds a BEGIN
+    mid-line, so the label in a comment between two blocks refuses too. A key block always starts
+    with a BEGIN, so the search from the first one sees every such label. It matches the label
+    OpenSSL writes and reads, ending ``PRIVATE KEY-----``; a shape it does not read as a key, such
+    as ``PGP PRIVATE KEY BLOCK`` or a space before the dashes, is not matched."""
+    begin = text.find("-----BEGIN ")
+    if begin < 0:
+        return False
+    return _PEM_PRIVATE_KEY_LABEL in text[begin:].lower()
+
+
+def has_private_key_label_bytes(data: bytes) -> bool:
+    """:func:`has_private_key_label` on a file's raw bytes, decoded as
+    :func:`has_encryption_header_bytes` decodes them."""
+    return has_private_key_label(data.decode("latin-1"))
+
+
+def _refuse_a_private_key(data: bytes, spec: AnchorSpec) -> None:
+    """Refuse an anchor whose bytes hold a private-key label (BACKLOG #3745). It reads the raw
+    bytes, not the text :func:`anchor_cadata` keeps, so a key on a non-ASCII line it drops still
+    refuses. The refusal names the setting and the path, never the content."""
+    if has_private_key_label_bytes(data):
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} {PRIVATE_KEY_SCOPE}. A trust anchor "
+            "is public trust material and needs only certificate blocks, so a private key, "
+            "encrypted or not, does not belong in it. Move the key to its own file, readable only "
+            "by the account that uses it, and keep only the CA certificates here"
+        )
+
+
+def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
+    """The content checks of an anchor its hop reads by path (``loads_verified_bytes`` False):
+    the encryption-header refusal when ``spec`` asks for it (module item 12), then the private-key
+    refusal (BACKLOG #3745), in the order the DATABASE build runs them. The refusal names the
+    setting and the path, never the content."""
+    if spec.refuses_encryption_header and has_encryption_header_bytes(data):
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. Its hop "
+            "hands it to a driver that loads it with its own TLS library, which can wait for a "
+            "password on an encrypted block. Keep only the CA certificates here"
+        )
+    _refuse_a_private_key(data, spec)
 
 
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
@@ -467,25 +588,33 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     **An encryption header name after the first BEGIN refuses, before that load** (BACKLOG
     #2270), whether or not it sits inside a block. A
     ``Proc-Type: 4,ENCRYPTED`` header sends OpenSSL to its password callback, and ``cadata=`` sets
-    none, so OpenSSL falls back to its default one, which reads the terminal. The POSIX terminal run
-    was done later, off-version (BACKLOG #3090, 2026-10-12): on CPython 3.12.3 / OpenSSL 3.0.13 on
-    Linux with a pseudo-terminal, the same ``cadata=`` load wrote ``Enter PEM pass phrase:`` and was
-    still waiting at 5 seconds, while ``cafile=`` refused at once with ``PEM lib``.
-    ``tests/test_encrypted_pem_cafile_pin.py`` holds that table and pins it on each CI platform.
-    What was measured first, on Windows, on
-    CPython 3.14.6 / OpenSSL 3.5.7 in a child process with stdin on the null device: the
+    none, so OpenSSL falls back to its default one, which reads the terminal. Measured on Windows,
+    on CPython 3.14.6 / OpenSSL 3.5.7 in a child process with stdin on the null device: the
     ``cadata=`` load of a certificate block carrying ``Proc-Type: 4,ENCRYPTED`` and ``DEK-Info:``
     did not return within 20 seconds and was killed, while ``cafile=`` on the same bytes refused at
-    once with ``PEM lib``. So a start or a reload could hang on this file. A CA certificate never
-    carries an RFC 1421 encryption header, so ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any
-    case, anywhere after the first BEGIN of the text the load would get, and OpenSSL is never
-    handed that text (:func:`has_encryption_header`). That is wider than the hang: a private-key
+    once with ``PEM lib``. So a start or a reload could hang on this file. A later run, off-version,
+    under a POSIX pseudo-terminal (BACKLOG #3090) saw the same ``cadata=`` load write the password
+    prompt and wait. ``tests/test_encrypted_pem_cafile_pin.py`` holds that run's table, with its
+    versions. It pins the path loads on each CI platform, and the pseudo-terminal case on POSIX
+    only. A CA certificate never carries an RFC 1421 encryption header, so ``Proc-Type:`` and
+    ``DEK-Info:`` both refuse, in any case, anywhere after the first BEGIN of the text the load
+    would get, and OpenSSL is never handed that text (:func:`has_encryption_header`). That is wider
+    than the hang: a private-key
     block encrypted in that legacy header format beside a certificate loads through ``cadata=``,
     and refuses here, and so does the header name in a comment between two blocks or after the
-    last one. A PKCS#8 ``ENCRYPTED PRIVATE KEY`` block has no such header and is not refused. The
+    last one. The
     same header in a comment above the first block still passes, unless a ``-----BEGIN `` comes
     anywhere before it, on its own line or an earlier one. The check reads the text the load would get, so a comment line that is not
-    ASCII, dropped above, is not checked."""
+    ASCII, dropped above, is not checked.
+
+    **A private-key label after the first BEGIN refuses, after the header check and before the
+    load** (BACKLOG #3745, a Manager decision to refuse rather than warn). ``cadata=`` skips a key
+    block and loads the certificate beside it, so without this a key of any label, a plain
+    ``PRIVATE KEY``, a PKCS#8 ``ENCRYPTED PRIVATE KEY`` with no RFC 1421 header, or an ``RSA`` or
+    ``EC PRIVATE KEY``, passed every check and sat in a file the engine reads as public trust
+    material. :func:`has_private_key_label` says what it matches; it reads the raw bytes, so a
+    non-ASCII line the load never sees is checked here. A legacy-encrypted key is refused by the
+    header check first, with that check's text."""
     kept: list[bytes] = []
 
     inside = False
@@ -530,6 +659,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "password. Remove the encrypted block and any comment that names one of those headers, "
             "or export the CA certificate as a plain CERTIFICATE block"
         )
+    _refuse_a_private_key(data, spec)
     try:
         ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
     except ssl.SSLError as exc:
@@ -908,14 +1038,57 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
 # --- evaluation + enforcement -------------------------------------------------------------------
 
 
+def read_if_regular(path: str, limit: int = -1) -> bytes | None:
+    """The bytes of the regular file at ``path``, at most ``limit`` of them, or ``None`` when the
+    path names anything else: a directory, a device or a pipe (vault BACKLOG #3090). A failure to
+    stat, open or read raises ``OSError``. A path ``os.stat`` cannot take raises ``ValueError``,
+    as it does: at least a path holding a NUL, and on POSIX one with a character the filesystem
+    encoding cannot spell.
+
+    The path is stat'ed first, so on POSIX a device or pipe in place is never opened, since
+    opening some devices has effects of its own. On Windows that stat is not such a control:
+    ``os.stat`` opens the path itself, so a named pipe's server sees a client connect and a device
+    name is opened, before this function can judge either. The file is then opened once and
+    judged again by its own descriptor, so nothing swapped in between is read. ``O_NONBLOCK``,
+    where the platform has it, keeps that open from waiting on a pipe with no writer, and
+    ``O_NOCTTY`` keeps a terminal from becoming the engine's controlling terminal. A regular file
+    is read blocking. The descriptor is closed here, once, whatever happens: ``fdopen`` never
+    owns it."""
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        return None
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | nonblock | getattr(os, "O_NOCTTY", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        if nonblock:
+            os.set_blocking(fd, True)  # a buffered read of a non-blocking descriptor may get None
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return handle.read(limit)
+    finally:
+        os.close(fd)
+
+
+def _read_regular_file(path: str) -> bytes:
+    """The whole file at ``path``, read by :func:`read_if_regular`. Anything but a regular file
+    raises ``OSError``, which every caller reports as an anchor it cannot read, so a pipe swapped
+    in for a CA is refused rather than waited on (vault BACKLOG #3090)."""
+    data = read_if_regular(path)
+    if data is None:
+        raise OSError(errno.EINVAL, "not a regular file")
+    return data
+
+
 def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
     """Inspect one anchor file: compute its fingerprint, its DACL verdict, and (if pinned) whether the
     fingerprint matches the pin. Pure inspection — no enforcement, no audit. Reads the file + the DACL,
     so callers on the event loop should dispatch it via :func:`asyncio.to_thread`.
 
     The file is read ONCE, and the verdict carries those bytes as ``data``, so a consumer can load
-    what was hashed rather than open the file again (BACKLOG #1142, slice 2)."""
-    data = Path(spec.path).read_bytes()
+    what was hashed rather than open the file again (BACKLOG #1142, slice 2). It reads only a
+    regular file (:func:`_read_regular_file`), so a pipe never makes the check wait."""
+    data = _read_regular_file(spec.path)
     fingerprint = anchor_digest_hex(ANCHOR_DIGEST, data)
     pin_ok: bool | None = None
     if spec.pin is not None:
@@ -962,8 +1135,8 @@ def _acl_message(spec: AnchorSpec) -> str:
     rights it names are :data:`_WRITE_RIGHTS`, so the text cannot drift from the check."""
     lines = [
         f"{spec.setting}: the trust anchor {spec.path!r} is writable by a non-owner (a group or "
-        "world principal can write it). Anyone who can modify it can substitute the CA and defeat "
-        "authentication. Restrict it to owner-only write."
+        "world principal can write it). Anyone who can modify it can substitute the anchor and "
+        "defeat the TLS check that trusts it. Restrict it to owner-only write."
     ]
     if os.name == "nt":
         q = _ps_quote(spec.path)
@@ -1057,7 +1230,7 @@ def _path_fix(verdict: AnchorVerdict) -> list[str]:
 def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     lines = [
         f"{spec.setting}: the trust anchor {spec.path!r} can be replaced through its path, and "
-        "anyone who replaces it can substitute the CA and defeat authentication:"
+        "anyone who replaces it can substitute the anchor and defeat the TLS check that trusts it:"
     ]
     lines += [f"  {f.kind} {f.path!r}: {f.reason}" for f in _findings(verdict, insecure=True)]
     check = verdict.path_check
@@ -1112,9 +1285,20 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     )
 
 
+#: The last line of an enforced refusal and of a warning (BACKLOG #3714 item 4). Neither says
+#: "start": the same check runs at a reload, a lane build and a store open.
+_REFUSED = "[security].enforcement=enforce refuses it"
+_WARNED = "[security].enforcement=warn, using it anyway"
+
+
 def _log_warning(text: str) -> None:
     """The default ``warn`` of :func:`_enforce_verdict`: this module's logger, at WARNING."""
     log.warning("%s", text)
+
+
+def _silent(_text: str) -> None:
+    """A ``warn`` for :func:`_enforce_verdict` that says nothing: for a check whose caller already
+    logged the same warning (:data:`_WARNED_AT_OPEN`). Every refusal is still raised."""
 
 
 def _enforce_verdict(
@@ -1137,21 +1321,18 @@ def _enforce_verdict(
       BACKLOG #2371): there the pin matched bytes the consumer does not load.
 
     ``warn`` takes each warning's text in place of this module's logger. A caller that runs
-    before logging is configured passes it, so it can scrub the text and log it again later."""
+    before logging is configured passes it, so it can scrub the text and log it again later.
+    :func:`_silent` logs none of them."""
     if verdict.pin_ok is False:
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
         if enforcing:
-            raise TrustAnchorError(
-                _acl_message(spec) + "\n[security].enforcement=enforce refuses to start"
-            )
-        warn(_acl_message(spec) + "\n[security].enforcement=warn, starting anyway")
+            raise TrustAnchorError(f"{_acl_message(spec)}\n{_REFUSED}")
+        warn(f"{_acl_message(spec)}\n{_WARNED}")
     if verdict.path_ok is False:
         if enforcing:
-            raise TrustAnchorError(
-                _path_message(spec, verdict) + "\n[security].enforcement=enforce refuses to start"
-            )
-        warn(_path_message(spec, verdict) + "\n[security].enforcement=warn, starting anyway")
+            raise TrustAnchorError(f"{_path_message(spec, verdict)}\n{_REFUSED}")
+        warn(f"{_path_message(spec, verdict)}\n{_WARNED}")
     if verdict.acl_ok is not None and verdict.path_ok is not None:
         return
     # BACKLOG #1142, slice 3. Slice 2 made the checked bytes the loaded bytes, which is what lets a
@@ -1166,18 +1347,48 @@ def _enforce_verdict(
         return
     fix = _indeterminate_fix(spec, verdict)
     if enforcing:
-        raise TrustAnchorError(f"{unknown}\n{fix}\n[security].enforcement=enforce refuses to start")
-    warn(f"{unknown}\n{fix}\n[security].enforcement=warn, starting anyway")
+        raise TrustAnchorError(f"{unknown}\n{fix}\n{_REFUSED}")
+    warn(f"{unknown}\n{fix}\n{_WARNED}")
+
+
+def _warned_state(verdict: AnchorVerdict) -> tuple[object, ...] | None:
+    """What a warning :func:`_enforce_verdict` logged was about, or ``None`` when it logged none
+    (every verdict it passes with a warning has an ACL or path that is not plainly fine)."""
+    if verdict.acl_ok is True and verdict.path_ok is True:
+        return None
+    path_findings = tuple((f.path, f.reason) for f in _findings(verdict, insecure=True))
+    return (verdict.fingerprint, verdict.acl_ok, verdict.path_ok, verdict.pin_ok, path_findings)
+
+
+#: The open-time warnings the settings preflight need not repeat (vault BACKLOG #3714). The SQL
+#: Server store checks its pin when it opens, before the store that holds audit rows exists, and
+#: at ``warn`` that check logs its warning. ``serve``'s lifespan preflight then checks the same
+#: file moments later. So :func:`enforced_anchor` with ``remember_warning`` records the verdict
+#: it warned about, keyed by label and path, and the next preflight of that anchor writes its row
+#: but skips the warning when its verdict matches. It is used once: a reload warns again. A
+#: command that opens the store and runs no preflight still logs the warning at open.
+_WARNED_AT_OPEN: dict[tuple[str, str], tuple[object, ...]] = {}
+
+
+def enforced_anchor(
+    spec: AnchorSpec, *, enforcing: bool, remember_warning: bool = False
+) -> AnchorVerdict:
+    """Construction-site preflight (no store/audit): evaluate + enforce one anchor, returning its
+    verdict, whose ``data`` is the bytes it checked. It loads nothing. A consumer that loads the
+    anchor into a context calls :func:`verified_anchor_cadata` instead and loads what that returns:
+    calling this and then loading the file by path reopens the check-then-load gap BACKLOG #1142,
+    slice 2 closed. A caller that inspects the content itself reads ``data``, so it reads the file
+    once, as the SQL Server pin's validity check does (vault BACKLOG #3714)."""
+    verdict = evaluate_anchor(spec)
+    _enforce_verdict(spec, verdict, enforcing=enforcing)
+    if remember_warning and (state := _warned_state(verdict)) is not None:
+        _WARNED_AT_OPEN[(spec.label, spec.path)] = state
+    return verdict
 
 
 def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
-    """Construction-site preflight (no store/audit): evaluate + enforce one anchor, returning its
-    fingerprint. It loads nothing. A consumer that loads the anchor into a context calls
-    :func:`verified_anchor_cadata` instead and loads what that returns: calling this and then loading
-    the file by path reopens the check-then-load gap BACKLOG #1142, slice 2 closed."""
-    verdict = evaluate_anchor(spec)
-    _enforce_verdict(spec, verdict, enforcing=enforcing)
-    return verdict.fingerprint
+    """:func:`enforced_anchor`, returning only the fingerprint."""
+    return enforced_anchor(spec, enforcing=enforcing).fingerprint
 
 
 def anchor_refusal(
@@ -1220,8 +1431,7 @@ def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
     whoever can write it can change what is revoked, but not what is trusted.
 
     It records the fingerprint of the bytes it returns, for :func:`loaded_fingerprint`."""
-    verdict = evaluate_anchor(spec)
-    _enforce_verdict(spec, verdict, enforcing=enforcing)
+    verdict = enforced_anchor(spec, enforcing=enforcing)
     text = anchor_cadata(verdict.data, spec)
     _LOADED[(spec.label, spec.path)] = verdict.fingerprint
     return text
@@ -1350,17 +1560,28 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     """Why a dialling connection would never read its ``tls_ca_file``, or ``None`` when it reads
     it or the settings cannot tell yet (vault BACKLOG #2371).
 
-    The switches that build no verifying context: ``tls`` or ``use_tls`` off, ``tls_verify`` off,
-    ``ech_egress`` through an ``http://`` sidecar, and on the HTTP family ``verify_tls`` off or an
-    ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes both hops over cleartext
+    The switches that build no verifying context: ``tls`` or ``use_tls`` off, a remote-file
+    ``protocol`` of plain ``ftp``, ``tls_verify`` off, ``ech_egress`` through an ``http://``
+    sidecar, and on the HTTP family ``verify_tls`` off or an ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes both hops over cleartext
     loopback and verifies the server itself (ADR 0139). An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
     check after resolution decides. Each caller refuses a pin beside an unread CA and checks no
-    file there: a pin nothing checks reads as pinned while nothing is."""
+    file there: a pin nothing checks reads as pinned while nothing is.
+
+    A generic DATABASE connection's CA is its ``odbc_params`` ``sslca`` (module item 12), which
+    its driver does not read under ``sslmode=disable``, or MySQL's ``SSLMODE=DISABLED``, in any
+    case (vault BACKLOG #3090)."""
+    if _odbc_tls_disabled(settings):
+        return "odbc_params sslmode turns TLS off, so the driver reads no CA"
     # Each flag is read as its connector reads it: an explicit None is the default (vault BACKLOG
     # #3230), so a None that turns nothing off does not make a read CA look unread.
     for key, default in (("tls", False), ("use_tls", True)):
         if key in settings and not bool_setting(settings, key, default=default):
             return f"{key} is off, so the hop builds no TLS context"
+    # Ftp() refuses a CA beside a literal tls=False itself. An env() tls resolves only later, into
+    # this protocol (vault BACKLOG #3234), so the resolved check is where that case is caught.
+    protocol = settings.get("protocol")
+    if isinstance(protocol, str) and remote_file_protocol(settings) == "ftp":
+        return "plain FTP (tls=False) builds no TLS context"
     if not bool_setting(settings, "tls_verify", default=True):
         return "tls_verify=False verifies no server certificate"
     if settings.get("ech_egress") and _is_http_url(settings.get("ech_sidecar")):
@@ -1377,6 +1598,94 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
 def _is_http_url(value: object) -> bool:
     """A literal ``http://`` url. An unresolved ``env()`` value is not one yet."""
     return isinstance(value, str) and value.strip().lower().startswith("http://")
+
+
+def _generic_odbc_param(settings: Mapping[str, Any], keyword: str) -> object | None:
+    """:func:`messagefoundry.transports.database.generic_odbc_param`, imported when a connection
+    has ``odbc_params``, for the reason :func:`_token_hop_reads_ca` gives."""
+    if not settings.get("odbc_params"):
+        return None
+    from messagefoundry.transports.database import generic_odbc_param
+
+    return generic_odbc_param(settings, keyword)
+
+
+def _odbc_tls_disabled(settings: Mapping[str, Any]) -> bool:
+    """:func:`messagefoundry.transports.database.generic_odbc_tls_off`, imported as
+    :func:`_generic_odbc_param` imports it, and only for a connection with ``odbc_params``."""
+    if not settings.get("odbc_params"):
+        return False
+    from messagefoundry.transports.database import generic_odbc_tls_off
+
+    return generic_odbc_tls_off(settings)
+
+
+def inbound_lane_reads_ca(conn_type: object, settings: Mapping[str, Any]) -> bool:
+    """Whether an inbound of ``conn_type`` dials out with a CA its lane check reads: an ``Ftp``
+    poller naming a ``tls_ca_file``, or a ``DatabasePoll`` naming an ``odbc_params`` ``sslca``
+    (vault BACKLOG #3090, step 7). ``settings`` may be unresolved; the check resolves them. The one
+    list of such inbounds, for :func:`registry_anchor_specs` and the runner.
+
+    A ``dialect`` that is not yet text, such as an ``env()`` value, may resolve to ``generic``, so
+    its ``sslca`` counts here and the check decides once it resolves; otherwise such a poller would
+    never be checked, while an outbound with the same dialect is."""
+    if conn_type is ConnectorType.REMOTEFILE:
+        return bool(settings.get("tls_ca_file"))
+    return conn_type is ConnectorType.DATABASE and _names_lane_sslca(settings)
+
+
+def _names_lane_sslca(settings: Mapping[str, Any]) -> bool:
+    """Whether a DATABASE connection names a non-empty ``odbc_params`` ``sslca`` its lane check may
+    read. A value of spaces counts: the driver may load it as sent, so the build checks that
+    spelling too (:func:`~messagefoundry.transports.database.driver_file_spellings`). A
+    ``dialect`` that is not yet text may resolve to ``generic``, so it is read as one."""
+    if not isinstance(settings.get("dialect", "sqlserver"), str):
+        settings = {**settings, "dialect": "generic"}  # only for an unresolved dialect
+    return bool(_generic_odbc_param(settings, "sslca"))
+
+
+def lane_ca_setting(settings: Mapping[str, Any]) -> str:
+    """The setting that names a lane's CA, for a refusal line that may not name the file:
+    ``tls_ca_file``, or a generic DATABASE lane's ``odbc_params sslca`` (module item 12), read as
+    :func:`inbound_lane_reads_ca` reads it."""
+    if not settings.get("tls_ca_file") and _names_lane_sslca(settings):
+        return "odbc_params sslca"
+    return "tls_ca_file"
+
+
+def database_ca_anchor_spec(
+    name: str,
+    settings: Mapping[str, Any],
+    *,
+    kind: str = "outbound connection",
+    label: str | None = None,
+) -> AnchorSpec | None:
+    """The CA file a generic DATABASE connection hands its driver as ``odbc_params`` ``sslca``, or
+    ``None`` (module item 12, vault BACKLOG #3090 step 7).
+
+    ``None`` when the connection names no ``sslca``, when its driver never reads it
+    (:func:`unread_ca_reason`), and when no spelling the build checks names an existing path other
+    than a directory: a missing file or a directory is left to the driver, as the build leaves it,
+    and a value that can name another host is never opened here, since the build refuses it. The
+    first spelling that names one is checked. A pipe or device is a spec, and
+    :func:`evaluate_anchor` refuses it unread. ``kind`` and ``label`` are
+    :func:`outbound_anchor_spec`'s. Module item 12 says what the check covers."""
+    value = _generic_odbc_param(settings, "sslca")
+    if value is None or unread_ca_reason(settings) is not None:
+        return None
+    from messagefoundry.transports.database import driver_file_spellings
+
+    spellings = driver_file_spellings(value)
+    path = next((p for p in spellings if os.path.exists(p) and not os.path.isdir(p)), None)
+    if path is None:
+        return None
+    return AnchorSpec(
+        label or _OUTBOUND_LABEL.format(name),
+        f"{kind} '{name}' odbc_params sslca",
+        path,
+        loads_verified_bytes=False,  # the driver reads the file by path, at each connect
+        refuses_encryption_header=True,
+    )
 
 
 def outbound_anchor_spec(
@@ -1491,14 +1800,20 @@ def connection_anchor_specs(
     return [s for name, st in inbound if (s := connection_anchor_spec(name, st)) is not None]
 
 
-#: The connection settings :func:`connection_anchor_spec` and :func:`outbound_anchor_spec` read, and
-#: the only ones resolved for them. The middle group is what :func:`unread_ca_reason` reads.
+#: The connection settings :func:`connection_anchor_spec`, :func:`outbound_anchor_spec` and
+#: :func:`database_ca_anchor_spec` read, and the only ones resolved for them. All but the last
+#: two, ``tls_ca_file`` and ``tls_ca_pin``, are what :func:`unread_ca_reason` reads: ``dialect``
+#: and ``odbc_params`` for the ``sslmode`` case. ``odbc_params`` holds no ``env()`` value to
+#: resolve.
 _CONNECTION_ANCHOR_KEYS = (
+    "dialect",
+    "odbc_params",
     "tls",
     "use_tls",
     "tls_verify",
     "verify_tls",
     "url",
+    "protocol",
     "ech_egress",
     "ech_sidecar",
     "smart_enabled",
@@ -1517,12 +1832,15 @@ def lane_anchor_spec(direction: str, name: str, settings: Mapping[str, Any]) -> 
     both, so the lane check and the reload preflight write rows under the same label. An inbound
     poller dials out over FTPS and reads its CA by path, as an outbound does. It has no ``tls``
     key, so :func:`connection_anchor_spec` never takes it. The caller passes only an ``Ftp``
-    poller as ``"inbound"``."""
+    poller or a ``DatabasePoll`` as ``"inbound"``.
+
+    A generic DATABASE lane's CA is its ``odbc_params`` ``sslca`` (:func:`database_ca_anchor_spec`,
+    module item 12), under the same label. It takes no ``tls_ca_file``, so a lane has one CA."""
     if direction == "inbound":
-        return outbound_anchor_spec(
-            name, settings, kind="inbound connection", label=inbound_record_name(name)
-        )
-    return outbound_anchor_spec(name, settings)
+        kind, label = "inbound connection", inbound_record_name(name)
+        spec = outbound_anchor_spec(name, settings, kind=kind, label=label)
+        return spec or database_ca_anchor_spec(name, settings, kind=kind, label=label)
+    return outbound_anchor_spec(name, settings) or database_ca_anchor_spec(name, settings)
 
 
 def registry_anchor_specs(
@@ -1532,12 +1850,13 @@ def registry_anchor_specs(
     resolved against ``env_values``: the CA of each deployed inbound that requires a peer
     certificate (:func:`connection_anchor_spec`), then, since vault BACKLOG #2371, the CA each
     connection that dials out verifies its server with (:func:`outbound_anchor_spec`): each
-    deployed outbound, each deployed inbound ``Ftp`` poller, and each ``FhirLookup``.
+    deployed outbound, each deployed inbound ``Ftp`` poller, and each ``FhirLookup``. A generic
+    DATABASE outbound or ``DatabasePoll`` takes its ``odbc_params`` ``sslca`` there (module item
+    12). A ``DatabaseLookup`` has no generic dialect, so it has no such CA.
 
-    ``lanes=False`` leaves out the outbound and ``Ftp`` poller CAs, which the start checks lane by
+    ``lanes=False`` leaves out the outbound, ``Ftp`` poller and ``DatabasePoll`` CAs, which the start checks lane by
     lane instead (module item 9). A connection whose anchor settings do not resolve is skipped:
     its own build refuses it, and that error names the missing value."""
-    from messagefoundry.config.models import ConnectorType
     from messagefoundry.config.wiring import WiringError, resolve_env_settings
 
     def resolved(settings: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -1558,7 +1877,7 @@ def registry_anchor_specs(
             if st is not None and (spec := lane_anchor_spec("outbound", oc.name, st)):
                 specs.append(spec)
         for ic in registry.inbound.values():
-            if ic.deployed and ic.spec.type is ConnectorType.REMOTEFILE:
+            if ic.deployed and inbound_lane_reads_ca(ic.spec.type, ic.spec.settings):
                 st = resolved(ic.spec.settings)
                 if st is not None and (spec := lane_anchor_spec("inbound", ic.name, st)):
                     specs.append(spec)
@@ -1661,6 +1980,20 @@ def log_forward_anchor_spec(log_settings: LoggingSettings) -> AnchorSpec | None:
     )
 
 
+def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
+    """The SQL Server ``[store].ssl_root_cert`` pin's anchor spec, or ``None`` when the store sends
+    no pin (vault BACKLOG #2223, #3714): another backend, an unset file, or a weakened posture,
+    as :meth:`~messagefoundry.config.settings.StoreSettings.sqlserver_pin_path` decides.
+
+    Module item 11 says why it is an anchor and what the check does not cover."""
+    path = store.sqlserver_pin_path()
+    if path is None:
+        return None
+    return AnchorSpec(
+        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
+    )
+
+
 def collect_anchor_specs(
     auth: AuthSettings,
     api: ApiSettings,
@@ -1668,14 +2001,17 @@ def collect_anchor_specs(
     tls: TlsSettings,
     alerts: AlertsSettings,
     log_settings: LoggingSettings,
+    store: StoreSettings,
 ) -> list[AnchorSpec]:
     """Every configured operator-supplied trust anchor in the settings, in a stable order: the OIDC,
     AD and API client CAs, then since vault BACKLOG #3188 the settings CAs an engine hop dials with
-    (module item 10). An anchor with no path set is omitted, and so is a dialling CA its hop does
-    not read, so an install with none yields an empty list: the dormant, byte-identical path.
+    (module item 10), then since vault BACKLOG #3714 the SQL Server store pin
+    (:func:`store_pin_anchor_spec`). An anchor with no path set is omitted, and so is a dialling CA
+    its hop does not read, so an install with none yields an empty list: the dormant,
+    byte-identical path.
 
-    The three dialling sections are keyword arguments with no default on purpose. A caller that
-    left one out would leave its CA unchecked with nothing to say so.
+    The four section keywords have no default on purpose. A caller that left one out would leave
+    its anchor unchecked with nothing to say so.
 
     The per-connection inbound CAs are not here: ``serve`` calls this before any graph is loaded.
     :func:`registry_anchor_specs` collects them each time a graph is loaded, at start and at
@@ -1688,6 +2024,7 @@ def collect_anchor_specs(
         internal_ca_anchor_spec(tls),
         alerts_email_anchor_spec(alerts, auth),
         log_forward_anchor_spec(log_settings),
+        store_pin_anchor_spec(store),
     )
     return [spec for spec in candidates if spec is not None]
 
@@ -1908,7 +2245,11 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
 
     An anchor whose consumer reads ``cafile=`` (``loads_verified_bytes`` False, the outbound CAs,
     vault BACKLOG #2371) skips the shape check. ``cafile=`` loads a ``TRUSTED CERTIFICATE`` block,
-    for one, so refusing it here would refuse what the build accepts.
+    for one, so refusing it here would refuse what the build accepts. It takes the private-key
+    check (BACKLOG #3745), since no build needs a key in its CA file, and a driver's CA takes the
+    encryption-header check too (:func:`_refuse_by_path_content`). Each reads the
+    bytes this preflight read; the hop reads the file again, so the gap the docs name for a swapped
+    file holds for a key too.
 
     **Only the file read and the PEM load become an anchor refusal** (BACKLOG #3091). An
     ``OSError`` or a ``ValueError`` from them, such as a missing file or a NUL in the path, is raised as a
@@ -1919,9 +2260,13 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     shape_error: TrustAnchorError | None = None
     try:
         verdict = await asyncio.to_thread(evaluate_anchor, spec)
-        if verdict.pin_ok is not False and spec.loads_verified_bytes:
+        if verdict.pin_ok is not False:
+            # A cafile= consumer takes only the private-key check (BACKLOG #3745), and a driver's
+            # CA the encryption-header check (module item 12): the rest of the shape check would
+            # refuse a TRUSTED CERTIFICATE block its build accepts.
+            check = anchor_cadata if spec.loads_verified_bytes else _refuse_by_path_content
             try:
-                await asyncio.to_thread(anchor_cadata, verdict.data, spec)
+                await asyncio.to_thread(check, verdict.data, spec)
             except TrustAnchorError as exc:
                 shape_error = exc
     except (OSError, ValueError) as exc:
@@ -1943,8 +2288,13 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
         # even when its audit row failed, so a substituted anchor never reads as a store outage.
         # Only an anchor that passes raises the store fault.
         store_fault = exc
+    # A store open that just logged this warning (_WARNED_AT_OPEN) is not repeated; the row is.
+    warned = _WARNED_AT_OPEN.pop((spec.label, spec.path), None)
+    quiet = warned is not None and warned == _warned_state(verdict)
     try:
-        _enforce_verdict(spec, verdict, enforcing=enforcing)
+        _enforce_verdict(
+            spec, verdict, enforcing=enforcing, warn=_silent if quiet else _log_warning
+        )
         if shape_error is not None:
             raise shape_error
     except TrustAnchorError as refusal:
@@ -1963,7 +2313,8 @@ async def run_anchor_preflight(
     caught). **Dormant when ``specs`` is empty** — it makes no store call and writes no audit row, so an
     install with no OIDC/AD/mTLS anchor is byte-identical.
 
-    On a fatal violation (a pin mismatch, a file with no loadable PEM block, or under ``enforce`` an
+    On a fatal violation (a pin mismatch, a file with no loadable PEM block, a private-key label,
+    or under ``enforce`` an
     anchor another principal can replace or whose ACL or path could not be read, unless module item
     6's pin escape applies) it raises :class:`TrustAnchorError` after auditing it, so the caller refuses to start / refuses
     the reload. Otherwise it returns each anchor's fingerprint, keyed by its label."""
@@ -1986,8 +2337,8 @@ async def _report_restart_required(
     """Log and audit each settings anchor whose bytes on disk differ from the bytes its consumer
     loaded (:func:`loaded_fingerprint`), and return those anchors' setting names, in spec order
     and once each, for the reload's response (BACKLOG #3015). An anchor no consumer loaded is
-    skipped: a restart would apply nothing there. The dialling settings CAs of module item 10 are
-    always skipped, since their hops load by path and record no fingerprint.
+    skipped: a restart would apply nothing there. The settings anchors of module items 10 and
+    11 are always skipped, since their hops load by path and record no fingerprint.
 
     A name is returned whether or not its audit row was written: the row is advisory, and the
     restart is needed either way.
@@ -2045,8 +2396,8 @@ def make_settings_anchor_preflight(
     differ from its consumer's (:func:`loaded_fingerprint`), and returns those anchors' setting
     names, which the reload's response reports as ``restart_required`` (BACKLOG #3015). That
     repeats on every reload until a restart. The specs are frozen here, pins included, so a
-    reload re-reads the paths and pins the engine started with. The report skips the dialling
-    settings CAs of module item 10."""
+    reload re-reads the paths and pins the engine started with. The report skips the settings
+    anchors of module items 10 and 11."""
     if not specs:
         return None
     from messagefoundry.config.wiring import WiringError
@@ -2149,7 +2500,7 @@ LaneAnchorCheck = Callable[[str, str, Mapping[str, Any]], Awaitable[None]]
 def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
     """The engine's per-lane check of a dialling CA (vault BACKLOG #2371, ADR 0031 amendment of
     2026-10-06). The runner awaits it inside each outbound lane build, at start and at an operator
-    start, and before it binds an inbound ``Ftp`` poller. A refusal raises there, so the existing
+    start, and before it binds an inbound ``Ftp`` poller or ``DatabasePoll``. A refusal raises there, so the existing
     isolation fails that lane only. Before a reload quiesces, the runner awaits it for each lane
     that reload builds or keeps running, and a refusal refuses the reload. Each label is
     :func:`lane_anchor_spec`'s.
@@ -2175,7 +2526,12 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
         return (spec.path, spec.pin, v.fingerprint, v.acl_ok, v.pin_ok, v.path_ok)
 
     async def check(direction: str, name: str, settings: Mapping[str, Any]) -> None:
-        spec = lane_anchor_spec(direction, name, settings)
+        # A DATABASE lane's spec stats its sslca path (database_ca_anchor_spec), so it is built
+        # off the loop; any other lane's spec reads only the settings.
+        if settings.get("odbc_params"):
+            spec = await asyncio.to_thread(lane_anchor_spec, direction, name, settings)
+        else:
+            spec = lane_anchor_spec(direction, name, settings)
         if spec is None:
             refused.pop(f"{direction}:{name}", None)
             return

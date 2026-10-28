@@ -199,6 +199,10 @@ are **byte-identical**. This reuses `config/tls_policy.py`, mirroring the #200/A
   (a declared revocation-checking egress terminator)→ALLOW; `attested`→ALLOW; synthetic→ALLOW;
   production→REFUSE; else non-prod-PHI→WARN. It carries **no global-escape arm** — the only relaxations are
   the on-box carve-out, a proven terminator, an operator attestation, or a synthetic instance.
+  *(Note 2026-10-27: the `proxy_proven` parameter and its "proven terminator" arm are removed, vault
+  BACKLOG #3514 item 5. The bullet above keeps its original wording; the live signature, precedence
+  and the reason for the removal are in the docstring of `revocation_hop_disposition` in
+  `config/tls_policy.py`.)*
 - **Thin guard** `RevocationHopGuard.capture(...).enforce_construction()` — snapshots the active
   `HopPosture` (`current_hop_posture`, stamped by `build_check_registry`'s `active_hop_posture` scope,
   and by the runner around its live builds when `serve` starts the graph) and reads the blanket
