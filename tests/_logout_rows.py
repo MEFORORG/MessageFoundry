@@ -37,8 +37,8 @@ async def temp_password_expired_rows(store: Any) -> list[tuple[object, object, o
 
 async def seal_failed_details(store: Any) -> list[dict[str, object]]:
     """Each integrity-failure report row's whole ``detail``, newest first: the row a gate writes
-    when it ends a session that fails its seal or its account's epoch, and the row a sign-out or a
-    sign-in's supersession writes for the second (BACKLOG #2592, #3749)."""
+    when it ends a session that fails its seal or its account's epoch, which a sign-out or a
+    sign-in's supersession does not write (BACKLOG #2592, #3749)."""
     return [
         json.loads(str(row["detail"] or "{}"))
         for row in await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)

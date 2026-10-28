@@ -5122,14 +5122,16 @@ engine cannot offer anything at that moment, so those changes are a stated bound
 password form, Windows SSO and federated sign-in) answers with a cookie that replaces the browser's
 session cookie. Once the new sign-in succeeds, the engine revokes the session the browser presented
 and audits `auth.session_revoked` with scope `superseded`, under the name of the user who owned
-that session. A session that was already over is ended with no row. A session a gate would still
-refuse gets the row that gate writes instead, as a sign-out does (below): the
-`auth.temp_password_expired` row, with `"at": "superseded"`, when the owner's admin-issued
-temporary credential is past its deadline, or the integrity-failure report when the session was
-minted under an older session epoch than its account's (BACKLOG #3749). The supersession itself ends only that one session and runs only when the sign-in
-succeeds; other controls at sign-in, such as a directory role change, can end more. It runs before
-the per-user session cap, so the cap does not push out another device's oldest session to make
-room for the one being replaced.
+that session. A session that was already over is ended with no row, and so is one minted under
+an older session epoch than its account's, which a gate would end. When the owner's admin-issued
+temporary credential is past its deadline, a gate would end the session too, so it gets the gate's
+`auth.temp_password_expired` row instead, with `"at": "superseded"` and the same `session` and
+`presented` references (BACKLOG #3749). The gate's integrity report is not written for the epoch
+case: the epoch is read after the revoke, so a whole-account revoke that commits between the two
+would make an untampered row look stale. The supersession itself ends only that one session and
+runs only when the sign-in succeeds; other controls at sign-in, such as a directory role change,
+can end more. It runs before the per-user session cap, so the cap does not push out another
+device's oldest session to make room for the one being replaced.
 Federated sign-in reads the cookie on its start leg, because the identity provider's redirect back
 is cross-site and the browser withholds the Strict cookie there. Windows SSO has no such hop, so a
 cross-site link straight into `/ui/sso` presents no cookie. That prior session is then not ended
@@ -5200,8 +5202,9 @@ revoke, or when the session passes them but `identity_for_token`, under every ga
 it: the owner's admin-issued temporary credential is past its deadline (a disabled account
 excepted, as that check excepts it), or the session was minted under an older session epoch than
 its account's. At least a session over its idle or absolute limit fails the clock checks. The
-last two cases also write what the gate writes: the `auth.temp_password_expired` row, with
-`"at": "logout"` and the sign-out's client address, or the integrity-failure report. A `lapsed` row
+temporary-credential case also writes the gate's `auth.temp_password_expired` row, with
+`"at": "logout"` and the sign-out's client address. The epoch case writes nothing more, for the
+reason given for the supersession above; that race records `lapsed` too. A `lapsed` row
 still names the owner. If the owner cannot be read, neither of those two is checked, and a session
 that passed its clock checks is recorded `revoked`. The owner is read through the ended row's
 `user_id`, which the revoke does not check against the row's seal (BACKLOG #3716), so a tampered

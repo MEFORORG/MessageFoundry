@@ -4479,10 +4479,13 @@ class AuthService:
         client: str | None,
         proof: str | None = None,
         proof_checked: bool = False,
+        ended: Mapping[str, str] | None = None,
     ) -> None:
         """Write the ``auth.temp_password_expired`` row for a session ended because its temporary
-        credential lapsed: :meth:`_end_lapsed_session`'s row, and :meth:`_record_gate_refusal`'s
-        when a sign-out or a sign-in's supersession itself ended such a session (BACKLOG #3749). The fields are that method's to describe."""
+        credential lapsed: :meth:`_end_lapsed_session`'s row, whose docstring describes ``at`` and
+        the proof fields, and :meth:`_audit_ended_lapsed_credential`'s, when a sign-out or a
+        sign-in's supersession itself ended such a session (BACKLOG #3749). ``ended``, when given,
+        is added to the detail: the supersession's ``session`` and ``presented`` references."""
         detail: dict[str, object] = {
             "provider": "local",
             "expiry_hours": self._settings.initial_password_expiry_hours,
@@ -4490,6 +4493,8 @@ class AuthService:
         }
         if proof is not None:
             detail[f"{proof}_checked"] = proof_checked
+        if ended is not None:
+            detail.update(ended)
         await self._audit(
             "auth.temp_password_expired", actor=username, detail=_json(detail), client=client
         )
@@ -10278,13 +10283,6 @@ class AuthService:
                 ref,
             )
             return
-        await self._report_session_seal_failure(token_hash)
-
-    async def _report_session_seal_failure(self, token_hash: str) -> None:
-        """:meth:`_session_seal_failed`'s report of an integrity failure, for a session row already
-        ended: also :meth:`logout`'s and :meth:`_supersede_session_hash`'s, when the row they ended
-        is one the gate would end this way (BACKLOG #3749)."""
-        ref = token_hash[:_SESSION_REF_LEN]
         await self._report_seal_failure(
             ref,
             f"a {SESSION_KIND} row failed its integrity check and was ended (session {ref})",
@@ -10945,9 +10943,9 @@ class AuthService:
         row ended not live, or found it live while :meth:`_gate_refusal`, the test
         :meth:`identity_for_token` applies under every gate, says the gate would still end it: its
         owner's admin-issued temporary credential was past its deadline, or it was minted under an
-        older session epoch than its account's. Those cases also write what the gate writes
-        (:meth:`_record_gate_refusal`): the ``auth.temp_password_expired`` row, with ``"at":
-        "logout"`` and this call's ``client``, or the integrity-failure report (BACKLOG #3749).
+        older session epoch than its account's. The first also writes the gate's
+        ``auth.temp_password_expired`` row, with ``"at": "logout"`` and this call's ``client``
+        (BACKLOG #3749). The second writes nothing more; the comment at the test says why.
         ``revoked`` means the row was found live and the gate would not end it, which includes an
         owner that could not be read, so neither test ran.
 
@@ -11053,21 +11051,19 @@ class AuthService:
         # what a gate would. Judged at ``after``, as the gate judges at its own clock read, so a
         # deadline that passed while the revoke waited on the store still counts. The owner is read
         # through the row's user_id, which the revoke returns unchecked (BACKLOG #3716), so a
-        # tampered row could judge, and name, another account.
+        # tampered row could judge, and name, another account. An epoch refusal records ``lapsed``
+        # and writes nothing more: the gate's integrity report is not written here, because the
+        # epoch is read after the revoke, and a whole-account revoke that committed between the two
+        # would make an untampered row look stale. That race records ``lapsed`` too.
         refusal = self._gate_refusal(ended, user, after) if live and user is not None else None
         outcome: LogoutOutcome = "lapsed" if not live or refusal is not None else "revoked"
         detail = {"outcome": outcome, "session": session}
         if not constant_time_equal(ended.token_hash, presented):  # ASVS 11.2.4, as elsewhere
             detail["presented"] = presented[:12]
         named = actor if actor is not None else (user.username if user is not None else None)
-        if refusal is not None and user is not None:
-            await self._record_gate_refusal(
-                refusal,
-                ended.token_hash,
-                user.username,
-                by="a sign-out",
-                at="logout",
-                client=client,
+        if refusal == "credential" and user is not None:
+            await self._audit_ended_lapsed_credential(
+                ended.token_hash, user.username, by="a sign-out", at="logout", client=client
             )
         await write_audit_soft(
             lambda: self._audit("auth.logout", actor=named, detail=_json(detail), client=client),
@@ -11090,33 +11086,27 @@ class AuthService:
         moment = min(max(before, row.last_used_at), after)
         return row.is_live(now=moment, idle_seconds=self.session_idle_seconds)
 
-    async def _record_gate_refusal(
+    async def _audit_ended_lapsed_credential(
         self,
-        refusal: Literal["credential", "epoch"],
         token_hash: str,
         username: str,
         *,
         by: str,
         at: str,
         client: str | None,
+        ended: Mapping[str, str] | None = None,
     ) -> None:
-        """Write what the gate writes when it ends a session for ``refusal`` (:meth:`_gate_refusal`),
-        for the session ``token_hash`` that :meth:`logout` or :meth:`_supersede_session_hash` has
-        already ended (BACKLOG #3749): for ``"credential"`` the ``auth.temp_password_expired`` row,
-        under ``username`` with ``at`` and ``client``; for ``"epoch"`` the integrity-failure report.
-        ``by`` names the caller in the log line. A fault is logged, not raised: the session has
-        ended, and a raise would report that as a failure."""
-        write: Callable[[], Awaitable[None]]
-        if refusal == "credential":
-            write = partial(self._audit_lapsed_credential, username, at=at, client=client)
-            what = "whose temporary credential had lapsed, but its auth.temp_password_expired row"
-        else:
-            write = partial(self._report_session_seal_failure, token_hash)
-            what = "minted under an older session epoch, but its integrity report"
+        """Write the gate's ``auth.temp_password_expired`` row, under ``username`` with ``at`` and
+        ``client``, for the session ``token_hash`` that :meth:`logout` or
+        :meth:`_supersede_session_hash` has already ended because :meth:`_gate_refusal` found its
+        temporary credential lapsed (BACKLOG #3749). ``by`` names the caller in the log line. A
+        fault is logged, not raised: the session has ended, and a raise would report that as a
+        failure."""
         await write_audit_soft(
-            write,
+            partial(self._audit_lapsed_credential, username, at=at, client=client, ended=ended),
             log=_log,
-            message="%s ended session %s, " + what + " failed",
+            message="%s ended session %s, whose temporary credential had lapsed, but its"
+            " auth.temp_password_expired row failed",
             args=(by, token_hash[:_SESSION_REF_LEN]),
             # A raise would report a session end that already ran as a failure.
             defects=(),
@@ -11171,9 +11161,10 @@ class AuthService:
         this. Since BACKLOG #1900 it counts only live rows and revokes lapsed ones itself.) Only a
         session that was still LIVE gets an audit row, so the trail does
         not record the ending of something that had already ended. A live session the gate would
-        still end (:meth:`_gate_refusal`) gets the row the gate writes instead of
-        ``auth.session_revoked``: the ``auth.temp_password_expired`` row with ``"at":
-        "superseded"``, or the integrity-failure report (BACKLOG #3749).
+        still end (:meth:`_gate_refusal`) is not recorded as one either (BACKLOG #3749): a lapsed
+        temporary credential gets the gate's ``auth.temp_password_expired`` row instead, with
+        ``"at": "superseded"`` and the ``session`` and ``presented`` references below; an older
+        session epoch gets no row, as a session already over gets none.
 
         **The read and the revoke are one store transaction (BACKLOG #2146).** Why that closes the
         race with a concurrent rotation is :meth:`AuthStore.supersede_session`'s to say. It holds
@@ -11189,9 +11180,9 @@ class AuthService:
         end. An elevation
         that finished longer ago than that, such as one a second holder of the token completed
         earlier, is not followed; docs/SECURITY.md (ASVS 7.2.4, the supersession paragraphs) states
-        that bound. The audit row names the session that ended and, when a link was followed, the
-        hash that was presented.
-        Returns True when it wrote a row, or tried to.
+        that bound. The audit row, either one, names the session that ended and, when a link was
+        followed, the hash that was presented.
+        Returns True when it wrote a row, or tried to: a lapse row's failure is logged, not raised.
         """
         before = time.time()
         prior = await self._store.supersede_session(
@@ -11201,28 +11192,34 @@ class AuthService:
         if prior is None or not self._was_live_at_revoke(prior, before, after):
             return False
         owner = await self._load_user(prior.user_id)
-        # BACKLOG #3749: a session the gate would refuse is recorded as the gate records it, as
-        # logout records it, not as the end of a live session. Judged at ``after``, as there. The
-        # owner is read through the row's user_id, which the revoke returns unchecked (BACKLOG
-        # #3716), so a tampered row could judge, and name, another account.
+        # BACKLOG #3749: a session the gate would refuse is not recorded as the end of a live one.
+        # Judged at ``after``, as logout judges it. The owner is read through the row's user_id,
+        # which the revoke returns unchecked (BACKLOG #3716), so a tampered row could judge, and
+        # name, another account.
         refusal = None if owner is None else self._gate_refusal(prior, owner, after)
-        if refusal is not None and owner is not None:
-            await self._record_gate_refusal(
-                refusal,
+        if refusal == "epoch":
+            # Like a session already over, it gets no row. The gate's integrity report is not
+            # written: the epoch is read after the revoke, so a whole-account revoke committed
+            # between the two would make an untampered row look stale (as in logout).
+            return False
+        ended = {"session": prior.token_hash[:12]}
+        if not constant_time_equal(prior.token_hash, prior_hash):  # ASVS 11.2.4, as elsewhere
+            ended["presented"] = prior_hash[:12]
+        if refusal == "credential" and owner is not None:
+            # The gate's row, carrying the references auth.session_revoked would have carried.
+            await self._audit_ended_lapsed_credential(
                 prior.token_hash,
                 owner.username,
                 by="a sign-in's supersession",
                 at="superseded",
                 client=client,
+                ended=ended,
             )
             return True
-        detail = {"scope": "superseded", "session": prior.token_hash[:12]}
-        if not constant_time_equal(prior.token_hash, prior_hash):  # ASVS 11.2.4, as elsewhere
-            detail["presented"] = prior_hash[:12]
         await self._audit(
             "auth.session_revoked",
             actor=owner.username if owner is not None else None,
-            detail=_json(detail),
+            detail=_json({"scope": "superseded", **ended}),
             client=client,
         )
         return True

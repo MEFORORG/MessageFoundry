@@ -654,7 +654,7 @@ async def test_a_superseded_prior_whose_temporary_credential_lapsed_writes_the_g
     """RED when: a sign-in that ends a prior session whose owner's temporary credential lapsed
     audits it as the end of a live session (``auth.session_revoked``), or writes no
     ``auth.temp_password_expired`` row for it (BACKLOG #3749). The gate would refuse that session
-    and write that row, so the supersession records what the gate would."""
+    and write that row, so the supersession records what the gate would, naming the session."""
     service = await _service(store, initial_password_expiry_hours=_EXPIRY_HOURS)
     prior = await _token(service, "op")
     await _lapse_the_credential(store, "op")
@@ -666,25 +666,56 @@ async def test_a_superseded_prior_whose_temporary_credential_lapsed_writes_the_g
         (
             "op",
             "192.0.2.4",
-            {"provider": "local", "expiry_hours": _EXPIRY_HOURS, "at": "superseded"},
+            {
+                "provider": "local",
+                "expiry_hours": _EXPIRY_HOURS,
+                "at": "superseded",
+                "session": hash_token(prior)[:12],
+            },
         )
     ]
 
 
-async def test_a_superseded_prior_from_a_stale_epoch_is_reported_as_the_gate_reports_it(
+async def test_a_lapse_row_reached_through_a_followed_link_names_both_hashes(
+    store: MessageStore,
+) -> None:
+    """RED when: the lapse row a supersession writes in place of ``auth.session_revoked`` drops
+    the references that row carries, so a followed link, the retired token's power, leaves no
+    trace (BACKLOG #3749, ADR 0210)."""
+    service = await _service(store, initial_password_expiry_hours=_EXPIRY_HOURS)
+    prior = await _token(service, "op")
+    successor = await _rotated(service, prior)
+    await _lapse_the_credential(store, "op")
+    assert (await _token(service, "other", supersedes=prior)) is not None
+    assert await _revoked(store, hash_token(successor))
+    assert await _superseded(store) == []
+    rows = await temp_password_expired_rows(store)
+    assert [detail for _, _, detail in rows] == [
+        {
+            "provider": "local",
+            "expiry_hours": _EXPIRY_HOURS,
+            "at": "superseded",
+            "session": hash_token(successor)[:12],
+            "presented": hash_token(prior)[:12],
+        }
+    ]
+
+
+async def test_a_superseded_prior_from_a_stale_epoch_is_not_recorded_as_live(
     store: MessageStore,
 ) -> None:
     """RED when: a sign-in that ends a prior session minted under an older session epoch than its
-    account's audits it as the end of a live session (BACKLOG #3749, #2592). The gate ends such a
-    session and reports it as a row that failed its integrity seal, so the supersession does too."""
+    account's audits it as the end of a live session (BACKLOG #3749, #2592). The gate would end it,
+    so like a session already over it gets no row. The gate's integrity report is not written
+    either: the epoch is read after the revoke, so a whole-account revoke committing between the
+    two would make an untampered row look stale."""
     service = await _service(store)
     prior = await _token(service, "op")
     await _stale_the_epoch(store, "op")
     assert (await _token(service, "other", supersedes=prior)) is not None
     assert await _revoked(store, hash_token(prior))
     assert await _superseded(store) == [], "a session the gate refuses was recorded as live"
-    ref = hash_token(prior)[:12]
-    assert await seal_failed_details(store) == [{"kind": "session", "session": ref}]
+    assert await seal_failed_details(store) == []
     assert await temp_password_expired_rows(store) == []
 
 
@@ -692,25 +723,25 @@ async def test_a_logout_of_a_session_from_a_stale_epoch_records_lapsed(
     store: MessageStore,
 ) -> None:
     """RED when: a sign-out of a session minted under an older session epoch than its account's
-    records ``revoked`` (BACKLOG #3749, #2592). The gate refuses that session and reports it as a
-    row that failed its integrity seal; the sign-out records ``lapsed`` and writes that report,
-    and no ``auth.temp_password_expired`` row, as the gate writes none for it."""
+    records ``revoked`` (BACKLOG #3749, #2592). The gate would end that session, so the sign-out
+    records ``lapsed``. It writes no integrity report (see the supersession test above) and no
+    ``auth.temp_password_expired`` row, as the gate writes none for it."""
     service = await _service(store)
     token = await _token(service, "op")
     await _stale_the_epoch(store, "op")
     assert await service.logout(token, client="192.0.2.5", proven_at=None) == "lapsed"
     assert await logout_rows(store) == [("op", "192.0.2.5", "lapsed")]
-    assert await seal_failed_details(store) == [
-        {"kind": "session", "session": hash_token(token)[:12]}
-    ]
+    assert await seal_failed_details(store) == []
     assert await temp_password_expired_rows(store) == []
 
 
-async def test_a_logout_of_a_live_session_writes_no_seal_report(store: MessageStore) -> None:
+async def test_a_logout_of_a_live_session_under_the_current_epoch_is_revoked(
+    store: MessageStore,
+) -> None:
     """The control for the test above: a session under the account's current epoch is
-    ``revoked`` and reported as nothing else."""
+    ``revoked`` and nothing else is written."""
     service = await _service(store)
     token = await _token(service, "op")
     assert await service.logout(token, client=None, proven_at=None) == "revoked"
-    assert await seal_failed_details(store) == []
+    assert await logout_rows(store) == [("op", None, "revoked")]
     assert await temp_password_expired_rows(store) == []
