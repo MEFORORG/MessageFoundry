@@ -430,15 +430,28 @@ def test_the_shape_of_a_loaded_graph(config_dir: str, monkeypatch: pytest.Monkey
 # --- the setting ---------------------------------------------------------------------------------
 
 
-def test_pass_environment_takes_ordinary_names() -> None:
+#: The two ``pass_environment`` settings share one refusal (vault BACKLOG #2587): the section, the
+#: key its refusal names, and who the refusal says the name may not be passed to.
+_PASS_ENVIRONMENT_SECTIONS = pytest.mark.parametrize(
+    ("section", "key", "receiver"),
+    [
+        (settings.SandboxSettings, "sandbox.pass_environment", "a worker"),
+        (settings.DrSettings, "dr.pass_environment", "a hook"),
+    ],
+)
+
+
+@_PASS_ENVIRONMENT_SECTIONS
+def test_pass_environment_takes_ordinary_names(section: Any, key: str, receiver: str) -> None:
     names = ["SITE_GRAPH_VARIANT", "TENANT_COUNT"]
-    assert settings.SandboxSettings(pass_environment=tuple(names)).pass_environment == tuple(names)
-    assert settings.SandboxSettings().pass_environment == ()
+    assert section(pass_environment=tuple(names)).pass_environment == tuple(names)
+    assert section().pass_environment == ()
     # The environment layer delivers the setting as one comma-separated string.
-    from_env = settings.SandboxSettings.model_validate({"pass_environment": " A_NAME , B_NAME "})
+    from_env = section.model_validate({"pass_environment": " A_NAME , B_NAME "})
     assert from_env.pass_environment == ("A_NAME", "B_NAME")
 
 
+@_PASS_ENVIRONMENT_SECTIONS
 @pytest.mark.parametrize(
     "name",
     [
@@ -450,13 +463,33 @@ def test_pass_environment_takes_ordinary_names() -> None:
         "MEFOR_ANYTHING_AT_ALL",
     ],
 )
-def test_pass_environment_refuses_the_engines_own_names(name: str) -> None:
+def test_pass_environment_refuses_the_engines_own_names(
+    section: Any, key: str, receiver: str, name: str
+) -> None:
     with pytest.raises(ValidationError) as refused:
-        settings.SandboxSettings(pass_environment=(name,))
-    assert "pass_environment" in str(refused.value)
+        section(pass_environment=(name,))
+    assert key in str(refused.value)
+    assert f"passed to {receiver}" in str(refused.value)
 
 
+@_PASS_ENVIRONMENT_SECTIONS
 @pytest.mark.parametrize("name", ["", "A=B", "HAS SPACE", "1LEADING", "TRAILING\n"])
-def test_pass_environment_refuses_what_is_not_a_variable_name(name: str) -> None:
-    with pytest.raises(ValidationError):
-        settings.SandboxSettings(pass_environment=(name,))
+def test_pass_environment_refuses_what_is_not_a_variable_name(
+    section: Any, key: str, receiver: str, name: str
+) -> None:
+    with pytest.raises(ValidationError) as refused:
+        section(pass_environment=(name,))
+    assert key in str(refused.value)
+
+
+@_PASS_ENVIRONMENT_SECTIONS
+def test_pass_environment_never_echoes_a_value_typed_by_mistake(
+    section: Any, key: str, receiver: str
+) -> None:
+    """``NAME=value`` in the list would carry the value into the load error, which serve prints."""
+    with pytest.raises(ValidationError) as refused:
+        section(pass_environment=("OK_NAME", "SITE_FLAG=canary-value"))
+    text = str(refused.value)
+    assert f"{key}: an entry is not" in text  # the control: this is the refusal for that entry
+    assert "canary-value" not in text
+    assert "SITE_FLAG" not in text
