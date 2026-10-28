@@ -5180,18 +5180,22 @@ session still writes an `auth.logout` row, with `outcome` `nothing_to_revoke`; o
 an empty one, writes none. `/ui/logout` has no sign-in check and charges no budget, so an
 unauthenticated caller who can reach it could append these rows without limit, and nothing prunes
 `audit_log`: [`[retention]`](CONFIGURATION.md#retention) `audit_log_warn_rows` only warns as it
-grows. Each such sign-out opens two write transactions, the revoke attempt and the row. On SQLite
-each takes the single writer that message intake also needs, and the rows fill the store's volume
-toward `[retention].min_free_disk_mb`, below which the engine pauses intake. On SQL Server and
-Postgres each row takes the audit-chain append lock, which every audit write in every engine shard
-queues on. This is an exception to
+grows. Each such sign-out opens two write transactions, the revoke attempt and the row. At least
+these costs follow. On SQLite each transaction takes the single writer that message intake also
+needs, and the rows keep filling the store's volume past the
+[`min_free_disk_mb`](CONFIGURATION.md#retention) floor, whose row says what that floor does. On
+SQL Server and Postgres the rows grow the database server's storage, where that floor does not
+apply, and each takes the audit-chain append lock that every audit write, in every engine shard and
+cluster node, queues on. This is an exception to
 [the documented protection set](#the-documented-protection-set-asvs-611), which does not list it.
-A bound in the engine is a follow-up, not yet filed. Until then, at least these narrow it: the
-loopback default bind, while nothing relays to it; `[security].allowed_client_networks`, which is
-[inert behind an undeclared proxy](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842);
-and a proxy limiter in front of `/ui/logout`, which nothing in the engine checks for. Once the route
-is reachable from beyond the box, through an opened bind or a reverse proxy in front of a loopback
-one, the operator must supply one of the last two.
+A bound in the engine is a follow-up, not yet filed; control 10's row budget is one model for it.
+Until then, at least these narrow who can reach the route: the loopback default bind, while nothing
+relays to it, and `[security].allowed_client_networks`, which is
+[inert behind an undeclared proxy](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842).
+Neither refuses a caller on the engine's own host. Only a proxy limiter in front of `/ui/logout`,
+which nothing in the engine checks for, bounds the row count. Once the route is reachable from
+beyond the box by any path, an opened bind or a proxy or relay in front of a loopback one, the
+operator must supply that limiter.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
@@ -5959,7 +5963,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
 | `POST /ui/account/webauthn/verify` | per-actor ceremony budget | the passkey registration finish (BACKLOG #3014); its 429 is a `JSONResponse` with **no** `Retry-After`, charged after the gate's admin-write floor |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
-| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate (the sign-out's unbounded `auth.logout` rows are an open gap under [Session inventory](#session-inventory--targeted-revocation-wp-10)), and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
+| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate (the sign-out's unbounded `nothing_to_revoke` audit rows are an open gap under [Session inventory](#session-inventory--targeted-revocation-wp-10)), and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
 
 The console calls the ceremony gate directly. It used to resolve it through a `getattr` shim that
 fell back to the **sign-in** budget on an engine without the method. The console pins one engine
