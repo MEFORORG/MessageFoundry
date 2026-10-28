@@ -1175,10 +1175,10 @@ rest. A plain `gather` over concurrent stops would cut all of them at once. Inst
 1. The cancel reaches the `asyncio.wait`, which never cancels its awaitables (D6). The stops keep
    running.
 2. `_join_cancelled_source_stops` gives them up to `_CANCELLED_STOP_GRACE_SECONDS` to finish. The
-   grace spares a stop that ends promptly a cut and a redo, and the DICOM and Database cut hazards
-   below. The bound honours the caller's cancel. It saves no shutdown time, and on the production
-   paths it adds up to its own length. Those paths are at least `start()`'s residual-state
-   teardown and its failed-start unwind, each reachable from the graph supervisor while
+   grace spares a stop that ends promptly a cut and a redo, and the DICOM cut hazard below
+   (Database guards its own row step). The bound honours the caller's cancel. It saves no
+   shutdown time, and on the production paths it adds up to its own length. Those paths are at
+   least `start()`'s residual-state teardown and its failed-start unwind, each reachable from the graph supervisor while
    `Engine.stop()`'s `wait_for` on that supervisor expires. `Engine.stop()` next calls
    `registry_runner.stop()`, which waits on the same stops with no bound. A hung stop is cut here
    and then hangs, visibly, in that following `stop()`, which covers the rest.
@@ -1223,10 +1223,35 @@ At least these, read 2026-10-26:
   until it returns. A retry can therefore overlap it. This is the case the grace exists for.
 - **File.** Bounded by its own `_STOP_GRACE_S` for a blocked share call. When cut, it never cancels
   a poll task that is inside a store call, so the task exits at its next stop check.
-- **Database, RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When
-  cut, that `gather` cancels the poll task, and on Database that can be mid store call. Before the
-  grace, only the serial loop's one in-flight stop could be cut like this. Now any of them can, but
-  only after the grace or a second cancel.
+- **Database.** `stop()` joins the poll task with no timeout of its own, through an `asyncio.wait`
+  that a cancel does not forward. A cancel that lands while a row is in its row step, from the
+  handler call (parse, validation and the store commit) through the mark, waits up to
+  `_ROW_STEP_GRACE_S` (2.0 s) for that step: `_stop` is set, so the task marks the row and exits at
+  its next stop check. A cancel anywhere else cuts the task at once, at least in the select, the
+  interval wait, the pool open and the undecodable-row event, where no row step has begun. Either
+  way the task is cut, if still running, and joined, and the pool closed, before the cancel is
+  re-raised, so no poll task outlives a cancelled `stop()`. A committed row is left unmarked, a
+  duplicate, only when its step outlasts that grace or a second cancel to the stop task arrives
+  during it; a second cancel coalesced with the first counts, by the same `cancelling()` baseline
+  the runner uses. That can now happen to several Database stops at once, where the serial loop
+  could do it to one, but only to a step that is hung or whose stop task was cancelled twice; a
+  prompt step is never cut.
+
+  The runner cuts with one cancel per stop task, so to a Database stop the runner's own second
+  cancel is a first: a row step still gets up to the row grace after it. A cancelled teardown is
+  therefore bounded by the runner grace plus at most one row grace, and a runner second cancel by
+  at most one row grace. The same holds for a DEMOTE stop abandoned and later cancelled by
+  `_settle_pending_source_stops` or `_stop_sources_demote`: its row step may finish, store commit
+  and mark included, up to the row grace after that cancel, where the cancelling `gather` cut it
+  at once. That window is unfenced by this change and is left open for review.
+
+  Not covered, and as before: with an atomic-claim `poll_statement` (`UPDATE ... RETURNING`, a
+  status-flag claim), the select itself claims every row it returns, so a cut in the select, or the
+  stop check between rows, leaves claimed rows that never reached the store. That was true of the
+  serial loop too.
+- **RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When cut, that
+  `gather` cancels the poll task. Before the grace, only the serial loop's one in-flight stop could
+  be cut like this. Now any of them can, but only after the grace or a second cancel.
 - **Loopback, PassThrough.** `stop()` returns at once.
 
 ### Tests
@@ -1247,6 +1272,14 @@ own is raised as a `RuntimeError`, which turns red if it is re-raised as a cance
 keeps the drain side, which turns red on head `8bf008396`, where the rest of teardown ran first. A
 third cancel still joins the cut stops, which turns red if the cut stops are not gathered; it is a
 pin, green on `8bf008396` too, because `gather` already behaved this way.
+
+`tests/test_database_transport.py`. A cancelled Database `stop()` lets the row in its hand-off mark
+itself, and lets a mark in flight finish; both turn red on head `030780600`, where `stop()` joined
+the poll task with a cancelling `gather` and the cut left the row committed and unmarked. A hung
+row step is cut after the row grace and joined, which turns red if that wait has no timeout. A
+second cancel cuts the row step at once, and so do two coalesced cancels, which turns red without
+the `cancelling()` baseline. The control, a cancelled `stop()` cuts a hung select at
+once after one row was fully handled, turns red if the row-step flag is not reset.
 
 ### Not changed here
 

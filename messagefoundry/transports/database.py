@@ -1286,7 +1286,7 @@ async def _close_cursor(cur: Any) -> None:
     then fails with ``HY000 Connection is busy with results for another command`` — a failure with no
     relationship to the statement it lands on, which is what made this hard to attribute. An ``UPDATE``
     leaves a row count pending, so the DATABASE source's ``mark`` is the usual victim, and a failed
-    mark **re-emits the row as a DUPLICATE** (see ``_poll_once``). So this is delivery semantics, not
+    mark **re-emits the row as a DUPLICATE** (see ``_ingest_row``). So this is delivery semantics, not
     tidiness.
 
     Never raises. A close failure must not mask the caller's real error, and must not skip the pool
@@ -1614,6 +1614,11 @@ class DatabaseDestination(DestinationConnector):
 #: table one poll cannot repair — and the operator gets 64 ``row_undecodable`` events saying so.
 _MAX_SKIPPED_ROWS_PER_POLL = 64
 
+#: How long a cancelled DatabaseSource.stop() lets a row's hand-off and mark finish before it cuts
+#: them (BACKLOG #1620). It bounds the cancel; a step that outlasts it is hung and is cut, and its
+#: row re-emits as the at-least-once duplicate a failed mark already makes.
+_ROW_STEP_GRACE_S = 2.0
+
 
 class _PolledBatch(NamedTuple):
     """What one poll took from ``poll_statement``.
@@ -1729,6 +1734,8 @@ class DatabaseSource(SourceConnector):
         self._skipping = False  # whether the last tick was gated out (for a single transition log)
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        # True from a row's hand-off through its mark; a cancelled stop() gives that step a grace.
+        self._in_row_step = False
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -1739,13 +1746,53 @@ class DatabaseSource(SourceConnector):
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
+        """Stop polling and close the pool.
+
+        **A cancelled stop() lets a row's hand-off and mark finish first, for a bounded time**
+        (BACKLOG #1620, ADR 0157 Amendment B). Once the handler has committed a row to the store,
+        only the mark keeps it from re-emitting, so cutting the task between the two makes a
+        duplicate. So when the cancel lands while the task is inside that step, stop() waits up to
+        :data:`_ROW_STEP_GRACE_S` for it: ``_stop`` is set, so the task marks the row and exits at
+        its next stop check. A step still running after that is cut, as is one a second cancel
+        reaches, including a second cancel coalesced with the first. A cancel anywhere else cuts at
+        once. Either way the cut is joined, and the pool closed, before the cancel is re-raised, so
+        no poll task outlives a cancelled stop().
+        """
         self._stop.set()
-        if self._task is not None:
-            # return_exceptions: a faulted poll task must not re-raise here — stop() runs during reload
-            # quiesce, outside its rollback (mirrors the File source's belt-and-suspenders).
-            await asyncio.gather(self._task, return_exceptions=True)
-            self._task = None
-        await self.aclose()
+        task = self._task
+        try:
+            if task is not None:
+                await self._join_poll(task)
+        finally:
+            # Skipped only when a further cancel interrupted the join: the task is still referenced
+            # then, so the next stop() joins it before closing the pool under it.
+            if task is None or task.done():
+                if task is not None:
+                    if self._task is task:
+                        self._task = None
+                    # A faulted poll task must not re-raise here — stop() runs during reload
+                    # quiesce, outside its rollback (mirrors the File source). It is logged instead.
+                    if not task.cancelled() and (fault := task.exception()) is not None:
+                        logger.warning("DATABASE source poll task failed: %s", safe_exc(fault))
+                await self.aclose()
+
+    async def _join_poll(self, task: asyncio.Task[None]) -> None:
+        """Wait for the poll task; on a cancel, apply stop()'s row-step grace, then cut and join."""
+        current = asyncio.current_task()
+        # Read before the wait, so a cancel this task already carried does not count as a second.
+        before = current.cancelling() if current is not None else 0
+        try:
+            # wait, not gather: a cancelled wait leaves the task alone, so the arm below decides.
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            try:
+                again = current is not None and current.cancelling() - before > 1
+                if self._in_row_step and not again:
+                    await asyncio.wait({task}, timeout=_ROW_STEP_GRACE_S)
+            finally:
+                task.cancel()  # a no-op once the task has finished
+                await asyncio.gather(task, return_exceptions=True)
+            raise
 
     async def _get_pool(self) -> Any:
         if self._pool is not None:
@@ -1836,30 +1883,40 @@ class DatabaseSource(SourceConnector):
         for record, body in batch.rows:
             if self._stop.is_set():
                 break  # shutting down — leave the rest unmarked for the next start (at-least-once)
+            self._in_row_step = True  # a cancelled stop() gives the hand-off and mark a grace
             try:
-                await self._handler(body.encode(self._encoding))
-            except Exception as exc:
-                # The handler records every message-level outcome itself (parse/route → ERROR) and
-                # returns, so an exception here is an infrastructure failure (the durable store write
-                # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
-                # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
-                logger.warning(
-                    "DATABASE source handler failed (row left unmarked, will retry): %s",
-                    safe_exc(exc),
-                )
-                continue
-            try:
-                await self._mark(record)
-            except Exception as exc:
-                # The handler already ingested the message; a mark failure means the row re-emits next
-                # poll (a duplicate — at-least-once). Log and move on rather than abort the batch tail.
-                # _safe_db_error, not safe_exc: a mark is an UPDATE bound from the row's own columns,
-                # so the driver's rejection text quotes the bound value straight back, and safe_exc
-                # is measured to keep a partial copy of it (BACKLOG #1661).
-                logger.warning(
-                    "DATABASE source mark failed (row will re-emit, a duplicate): %s",
-                    _safe_db_error(exc),
-                )
+                await self._ingest_row(record, body)
+            finally:
+                self._in_row_step = False
+
+    async def _ingest_row(self, record: dict[str, Any], body: str) -> None:
+        """Hand one row to the pipeline, then mark it. A cancelled stop() lets this step run for up
+        to :data:`_ROW_STEP_GRACE_S` before it cuts it, so the step is NOT atomic under shutdown."""
+        assert self._handler is not None
+        try:
+            await self._handler(body.encode(self._encoding))
+        except Exception as exc:
+            # The handler records every message-level outcome itself (parse/route → ERROR) and
+            # returns, so an exception here is an infrastructure failure (the durable store write
+            # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
+            # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
+            logger.warning(
+                "DATABASE source handler failed (row left unmarked, will retry): %s",
+                safe_exc(exc),
+            )
+            return
+        try:
+            await self._mark(record)
+        except Exception as exc:
+            # The handler already ingested the message; a mark failure means the row re-emits next
+            # poll (a duplicate — at-least-once). Log and move on rather than abort the batch tail.
+            # _safe_db_error, not safe_exc: a mark is an UPDATE bound from the row's own columns,
+            # so the driver's rejection text quotes the bound value straight back, and safe_exc
+            # is measured to keep a partial copy of it (BACKLOG #1661).
+            logger.warning(
+                "DATABASE source mark failed (row will re-emit, a duplicate): %s",
+                _safe_db_error(exc),
+            )
 
     async def _select(self) -> _PolledBatch:
         """Run ``poll_statement``, decode each row into a body, and return the decodable ones (at most

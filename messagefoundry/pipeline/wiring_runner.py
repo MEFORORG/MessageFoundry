@@ -912,10 +912,11 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 _PENDING_STOP_SETTLE_SECONDS = 10.0
 #: How long a SHUTDOWN teardown cancelled from outside still lets its in-flight source stops run
 #: before it cuts them (BACKLOG #1620, ADR 0157 Amendment B). The grace spares a stop that ends
-#: promptly a cut and a redo, and the DICOM and Database cut hazards. The bound honours the
-#: caller's cancel: a hung stop is cut here and then hangs in the unbounded registry_runner.stop()
-#: that Engine.stop() runs later in its sequence, after its other stop steps, which covers the
-#: rest. It saves no shutdown time on that path; it ADDS up to its own length there.
+#: promptly a cut and a redo, and the DICOM cut hazard (Database guards its own row step). The
+#: bound honours the caller's cancel: a hung stop is cut here and then hangs in the unbounded
+#: registry_runner.stop() that Engine.stop() runs later in its sequence, after its other stop
+#: steps, which covers the rest. It saves no shutdown time on that path; it ADDS up to its own
+#: length there.
 _CANCELLED_STOP_GRACE_SECONDS = 2.0
 
 
@@ -5734,9 +5735,10 @@ class RegistryRunner:
         This runs inside ``_reload_lock``, which ``reload()``, ``stop()``, the per-connection
         start/stop/restart and every ``/connections`` handler also take. An unbounded join would
         therefore wedge re-promotion, engine shutdown and the connection API for as long as a wedged
-        File/Database ``stop()`` runs. (Database gathers with no cancel and no timeout. File now
-        cancels a poll task blocked on a share call after a grace, BACKLOG #1620, but still waits
-        without a bound while that task is inside a store call.)
+        File/Database ``stop()`` runs. (Database waits on its poll task with no timeout of its own;
+        once cancelled, it lets a row's hand-off and mark run for a bounded grace, then cuts and
+        joins the task. File now cancels a poll task blocked on a share call after a grace, BACKLOG
+        #1620, but still waits without a bound while that task is inside a store call.)
 
         On timeout we cancel and proceed: a failed rebind is isolated per connection (ADR 0031,
         operator-recoverable), whereas refusing to re-promote strands the whole graph — and
