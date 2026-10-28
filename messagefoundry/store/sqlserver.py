@@ -13610,7 +13610,8 @@ class SqlServerStore:
         :meth:`AuthStore.add_webauthn_credential` for ``for_session``: the account row is taken
         under ``UPDLOCK, ROWLOCK`` before the check, as every factor write here takes it, so a
         factor bound elsewhere either committed before the check reads it or waits until this
-        transaction ends."""
+        transaction ends. The session row is taken the same way after it, users then sessions, so
+        a revoke of that session cannot land between the check and the commit either."""
         if for_session is None:
             await self._write_passkeys_txn(
                 cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
@@ -13619,7 +13620,10 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 record = await self._read_user_record(cur, cred.user_id)  # UPDLOCK, ROWLOCK
-                await cur.execute("SELECT * FROM sessions WHERE token_hash=?", (for_session,))
+                await cur.execute(
+                    "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?",
+                    (for_session,),
+                )
                 session = await self._fetch_dicts(cur)
                 # No account: the insert below meets the foreign key (BACKLOG #1807).
                 if record is not None and session_owes_unproven_factor(

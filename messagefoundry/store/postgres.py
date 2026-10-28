@@ -9276,12 +9276,14 @@ class PostgresStore:
         transaction (BACKLOG #2592). See :meth:`AuthStore.add_webauthn_credential` for
         ``for_session``: the account row is taken ``FOR UPDATE`` before the check, as every
         factor write here takes it, so a factor bound elsewhere either committed before the check
-        reads it or waits until this transaction ends."""
+        reads it or waits until this transaction ends. The session row is taken ``FOR UPDATE``
+        after it, in the users-then-sessions order ``revoke_user_sessions`` keeps, so a revoke of
+        that session cannot land between the check and the commit either."""
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             if for_session is not None:
                 record = await self._read_user_record(conn, cred.user_id)  # FOR UPDATE
                 session = await conn.fetchrow(
-                    "SELECT * FROM sessions WHERE token_hash=$1", for_session
+                    "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", for_session
                 )
                 # No account: the insert below meets the foreign key (BACKLOG #1807).
                 if record is not None and session_owes_unproven_factor(

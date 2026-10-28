@@ -14216,10 +14216,12 @@ class AuthService:
                 raise ValueError("this passkey is already enrolled") from exc
             raise ValueError("label already in use") from exc
         if not bound:
-            # The store fails closed on a dead session and a missing account too, so those are told
-            # apart first, by re-reading, and answered as the guards above answer them. What is left
-            # is the factor refusal, audited as the checks above audit it. Nothing was stored and
-            # the session is not stamped; the challenge was popped before the verify.
+            # The store fails closed on a dead session and on an account record that fails its seal
+            # too (a missing account it leaves to the foreign key above), so those are told apart
+            # first, by re-reading, and answered as the guards above answer them: _load_user is
+            # None for an unsealed record. What is left is the factor refusal, audited as the checks
+            # above audit it. Nothing was stored and the session is not stamped; the challenge was
+            # popped before the verify.
             if await self._refuse_lost_enrolment_session(
                 token, actor=identity.username, event="auth.webauthn_failed", client=client
             ):
