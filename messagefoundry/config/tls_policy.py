@@ -581,8 +581,10 @@ def _check_crl_signatures(
 
     **Everything short of proof loads, with one warning.** That covers at least a CRL that names
     no key, a key the engine cannot check with, and a CRL the engine matches to no listed CA. The
-    last is the usual case in a two-tier PKI, where the peer sends the intermediate that issued
-    the CRL, so it must not log per hop. The warning is one line for the file, and
+    key is the one the CRL names or, where it names no listed CA's key, that of any listed CA
+    that fits it, one with no Subject Key Identifier included. A CRL matched to no listed CA is
+    the usual case in a two-tier PKI, where the peer sends the intermediate that issued the CRL,
+    so it must not log per hop. The warning is one line for the file, and
     :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` decides how often it is
     logged. That function is asked only when there is a line to log. So it holds the last file
     version that logged one, and an earlier version is logged again only when it returns after

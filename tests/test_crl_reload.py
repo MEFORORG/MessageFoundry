@@ -206,7 +206,7 @@ def _ca_cert(
 
 
 def _leaf(
-    issuer: x509.Name, signer: ec.EllipticCurvePrivateKey
+    issuer: x509.Name, signer: CertificateIssuerPrivateKeyTypes
 ) -> tuple[x509.Certificate, ec.EllipticCurvePrivateKey]:
     """A ``localhost`` leaf for server and client auth, issued by ``issuer`` and signed by
     ``signer``, and its key."""

@@ -648,7 +648,7 @@ def test_a_badly_signed_crl_put_in_the_ca_file_is_not_answered_with_a_restart(
     detail = _bundle_detail(bundle)
 
     assert detail.startswith("Replace the CRL in the CA file with one its CA signed")
-    assert "a handshake OpenSSL judges by it fails" in detail
+    assert _PROVEN_BAD_CLAIM in detail
     assert "Restart the engine" not in detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
@@ -687,6 +687,9 @@ _SCAN_FAILED = "Check the CRL in the CA file before restarting: the scan"
 #: The lead of the remedy for a CRL in a CA file whose signature is proven bad.
 _PROVEN_BAD = "Replace the CRL in the CA file with one its CA signed"
 
+#: The claim the remedy for a proven bad CRL in a CA file makes about handshakes.
+_PROVEN_BAD_CLAIM = "a handshake OpenSSL judges by it through the CA it names fails"
+
 #: The whole line the scan logs, naming no file, when it could not check a CA file's CRL.
 _SCAN_FAILED_LINE = "cert_expiry: could not check the CRL in a CA file"
 
@@ -720,7 +723,7 @@ def test_the_ca_file_remedy_follows_the_strongest_signature_state(
     detail = _bundle_detail(bundle)
 
     assert detail.startswith(lead), detail
-    assert ("a handshake OpenSSL judges by it fails" in detail) == ("bad" in states), detail
+    assert (_PROVEN_BAD_CLAIM in detail) == ("bad" in states), detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 

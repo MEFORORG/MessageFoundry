@@ -31,7 +31,11 @@ from typing import Any
 
 import ldap3
 import pytest
-from ldap3.core.exceptions import LDAPSessionTerminatedByServerError, LDAPSocketReceiveError
+from ldap3.core.exceptions import (
+    LDAPSessionTerminatedByServerError,
+    LDAPSocketReceiveError,
+    LDAPSocketSendError,
+)
 from ldap3.core.results import (
     RESULT_ADMIN_LIMIT_EXCEEDED,
     RESULT_BUSY,
@@ -196,24 +200,61 @@ def test_real_ldap3_leaves_the_bind_code_where_the_refusal_reads_it(code: int) -
 # --- the step-up re-bind, where the lockout is charged ----------------------------------------------
 
 
+def _unbind_fails_after_a_bind(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str | None]]:
+    """Over the bind already installed, make ``unbind`` raise an ldap3 error on each connection
+    that ran an explicit bind, as a send failing on the release would, before ldap3 closes the
+    socket. The service connection is built with ``auto_bind``, which these doubles never route
+    through ``bind()``, so its unbind runs as installed. Returns each failed unbind and each socket
+    close, in order, as ``(event, DN)``."""
+    bind, unbind_before = ldap3.Connection.bind, ldap3.Connection.unbind
+    events: list[tuple[str, str | None]] = []
+
+    def binding(self: Any) -> bool:
+        bound = bool(bind(self))
+        dn = getattr(self, "_bind_dn", None)
+        self.mf_bind_ran = True
+        self.strategy = SimpleNamespace(close=lambda: events.append(("closed", dn)))
+        return bound
+
+    def unbind(self: Any) -> None:
+        if not getattr(self, "mf_bind_ran", False):
+            unbind_before(self)
+            return
+        events.append(("unbind failed", getattr(self, "_bind_dn", None)))
+        raise LDAPSocketSendError("synthetic: the unbind's send failed")
+
+    monkeypatch.setattr(ldap3.Connection, "bind", binding)
+    monkeypatch.setattr(ldap3.Connection, "unbind", unbind)
+    return events
+
+
 async def _rebind_after(
-    monkeypatch: pytest.MonkeyPatch, end: int | Callable[[Any], bool]
+    monkeypatch: pytest.MonkeyPatch,
+    end: int | Callable[[Any], bool],
+    *,
+    unbind_fails: bool = False,
 ) -> tuple[Any, int, list[str], int]:
     """Sign ``alice`` in, end every later bind with ``end`` (a result code, or a replacement for
     ``ldap3.Connection.bind``), re-bind once with the right password, and return the elevation, the
     row's failed-attempt count, the ``auth.reauth`` details and the number of sessions the
-    per-session re-proof budget has charged."""
+    per-session re-proof budget has charged. ``unbind_fails`` makes the bound connection's unbind
+    raise, and checks that it did (:func:`_unbind_fails_after_a_bind`)."""
     async with _signed_in_estate(monkeypatch, ["alice"]) as (_directory, service, store, tokens):
         if isinstance(end, int):
             _bind_ends_with(monkeypatch, end)
         else:
             monkeypatch.setattr(ldap3.Connection, "bind", end)
+        released = _unbind_fails_after_a_bind(monkeypatch) if unbind_fails else []
         identity = await service.identity_for_token(tokens["alice"])
         assert identity is not None
         elevation = await service.reauth(identity, _PASSWORD, token=tokens["alice"])
         row = await store.get_user(identity.user_id)
         assert row is not None
         details = [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.reauth")]
+        # The fault fired once. The close after it is checked by the authenticator arms below, so
+        # this helper's own check cannot turn the count arms red on the code without the fix.
+        failed_unbinds = [event for event, _dn in released if event == "unbind failed"]
+        assert len(failed_unbinds) == (1 if unbind_fails else 0), "the unbind fault did not fire"
         return elevation, row.failed_attempts, details, len(service._reproof_session_failures)
 
 
@@ -237,6 +278,94 @@ async def test_a_refused_password_is_still_counted(monkeypatch: pytest.MonkeyPat
     assert not elevation.ok and elevation.directory_refusal is None
     assert failed == 1 and charged == 1
     assert not any('"reason": "directory_unavailable"' in d for d in details), details
+
+
+# --- the unbind after a judged bind fails (BACKLOG #3848) -------------------------------------------
+
+
+async def test_a_refused_password_whose_unbind_fails_is_still_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing steps 1 and 2. RED when the unbind's ldap3 error, raised after the refused bind had
+    returned its answer, reaches the re-bind as an outage: then neither the row nor the session is
+    charged for a wrong password."""
+    elevation, failed, details, charged = await _rebind_after(
+        monkeypatch, RESULT_INVALID_CREDENTIALS, unbind_fails=True
+    )
+    assert not elevation.ok and elevation.directory_refusal is None
+    assert failed == 1, "a wrong password whose unbind failed was not counted toward the lockout"
+    assert charged == 1, "a wrong password whose unbind failed was not charged to the session"
+    assert not any('"reason": "directory_unavailable"' in d for d in details), details
+
+
+async def test_a_busy_re_bind_whose_unbind_fails_is_still_not_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE CONTROL: the same failing unbind after a bind the DC ended busy (51). That bind judged no
+    password, and still reads as an outage, so the fix did not make every refusal count."""
+    elevation, failed, details, charged = await _rebind_after(
+        monkeypatch, RESULT_BUSY, unbind_fails=True
+    )
+    assert not elevation.ok and elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
+    assert failed == 0 and charged == 0
+    assert any('"reason": "directory_unavailable"' in d for d in details), details
+
+
+def test_a_failing_unbind_changes_neither_bind_branchs_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing step 3, with #3830 item 9: the real bind on a found entry and the timing-equalizing
+    decoy on an absent one each keep the answer they give when the unbind succeeds. Before, the
+    unbind error replaced both answers with the same ``LdapError``; now it replaces neither, so
+    neither branch answers it differently from the other. Each unbind that raised is the bind's own
+    connection, so the fault fired on both branches, and each socket was closed after it."""
+    _install_fakes(monkeypatch)
+    binds = _bind_ends_with(monkeypatch, RESULT_INVALID_CREDENTIALS)
+    released = _unbind_fails_after_a_bind(monkeypatch)
+    real = LdapAuthenticator(_ad_settings()).authenticate("alice", _PASSWORD)
+    assert real.answer is DirectoryAnswer.FOUND and real.principal is None
+    _search_finds_nothing(monkeypatch)
+    decoy = LdapAuthenticator(_ad_settings()).authenticate("nobody", _PASSWORD)
+    assert decoy.answer is DirectoryAnswer.NOT_FOUND
+    assert len(binds) == 2 and "mf-nonexistent-timing-equalizer" in str(binds[1])
+    assert released == [(event, dn) for dn in binds for event in ("unbind failed", "closed")]
+
+
+def test_a_proved_password_whose_unbind_fails_still_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bound arm: an unbind error never upgrades an answer toward a pass (BACKLOG #3848,
+    Manager decision for batch 458). A proved password whose unbind fails reads as a directory
+    error, as it did before the fix, and no principal is returned. The user's socket is still
+    closed, and the service connection is still released."""
+    rec = _install_fakes(monkeypatch)
+    released = _unbind_fails_after_a_bind(monkeypatch)
+    with pytest.raises(LdapError) as raised:
+        LdapAuthenticator(_ad_settings()).authenticate("alice", _PASSWORD)
+    assert (
+        str(raised.value) == "AD directory call failed: ldap3 raised LDAPSocketSendError (OSError)"
+    )
+    assert isinstance(raised.value.__cause__, LDAPSocketSendError)
+    alice = "CN=alice,OU=Users,DC=example,DC=com"
+    assert released == [("unbind failed", alice), ("closed", alice)]
+    assert len(rec.unbinds) == 1 and alice not in rec.unbinds, "the service unbind did not run"
+
+
+async def test_a_proved_re_bind_whose_unbind_fails_is_refused_and_not_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same arm at the step-up: refused as ``directory_unavailable``, never elevated, and not
+    charged, because the password the directory accepted was not a wrong one. RED when the unbind
+    error is dropped on the bound path, which elevates the session."""
+
+    def bound(self: Any) -> bool:
+        self.result = {"result": 0, "description": "success", "type": "bindResponse"}
+        return True
+
+    elevation, failed, details, charged = await _rebind_after(monkeypatch, bound, unbind_fails=True)
+    assert not elevation.ok and elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
+    assert failed == 0 and charged == 0
+    assert any('"reason": "directory_unavailable"' in d for d in details), details
 
 
 # --- 52 as a Notice of Disconnection: a different path, to the same reading ----------------------

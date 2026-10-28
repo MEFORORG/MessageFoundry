@@ -340,15 +340,14 @@ async def test_pool_connect_hook_is_absent_on_the_weakened_escapes(
 
 
 def test_connection_string_emits_server_certificate_on_secure_posture(tmp_path: object) -> None:
-    """The pin travels with ``Encrypt=strict``: Driver 18 enforced ``ServerCertificate`` with strict
-    and did not with ``Encrypt=yes``, where a pin naming the wrong certificate still connected (vault
-    BACKLOG #2223; measured under #3009)."""
+    """The pin travels with ``Encrypt=strict`` (vault BACKLOG #2223). Why, and the build and platform
+    that was measured on (#3009): the ``ssl_root_cert`` row of ``docs/CONFIGURATION.md``."""
     pin = _leaf_file(tmp_path)
     dsn = connection_string(_ss(ssl_root_cert=pin))
     # The ODBC Driver 18.1+ ServerCertificate keyword pins the cert by file, brace-quoted (STORE-5).
     # Match the standalone keyword (a leading ';') so it isn't confused with TrustServerCertificate.
     assert f";ServerCertificate={{{pin}}}" in dsn
-    # The TLS keywords stay the last-wins tail, and Encrypt=yes appears nowhere in the string.
+    # The TLS keywords stay the tail, and Encrypt=yes appears nowhere in the string.
     assert dsn.rstrip(";").endswith("Encrypt=strict;TrustServerCertificate=no")
     assert "Encrypt=yes" not in dsn
     assert dsn.index(";ServerCertificate=") < dsn.index(";Encrypt=strict")
@@ -415,9 +414,9 @@ def test_connection_string_server_certificate_brace_neutralizes_injection(tmp_pa
 
 # --- vault BACKLOG #2223: the engine checks the SQL Server pin itself --------------------------
 #
-# Under Encrypt=strict a pin match stands in for the driver's own chain, host-name and expiry checks,
-# so the engine refuses a pin outside its validity period, and refuses at load a file that can never
-# match the server's certificate.
+# Under Encrypt=strict the engine checks the pin itself (why, and what it was tested on: the
+# `ssl_root_cert` row of docs/CONFIGURATION.md). So it refuses a pin outside its validity period,
+# and refuses at load a file that can never match the server's certificate.
 
 _DAY = 86_400.0
 

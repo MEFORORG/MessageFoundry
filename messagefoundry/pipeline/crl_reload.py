@@ -227,10 +227,11 @@ UNPROVEN_SIGNATURE = (
     "a CA renews its key the file can be right: a handshake passes where the peer's chain carries "
     f"the CA that signed the CRL, and fails where it does not. {_SHORT_OF_PROOF}"
 )
-#: ``uncheckable``: some CA could not be checked, and none verifies the CRL.
+#: ``uncheckable``: some CA judged could not be checked, and none verifies the CRL.
 UNCHECKABLE_SIGNATURE = (
     "Check that the CRL is one the hop's CA signed: the engine cannot check its signature with "
-    f"the key of the CA certificate this hop lists for its issuer. {_SHORT_OF_PROOF}"
+    "the key the CRL names, or, where it names no listed CA's key, with the key of some listed CA "
+    f"that fits it. {_SHORT_OF_PROOF}"
 )
 NO_ISSUER = (
     "Restart the engine to apply the file. The reload checks a CRL's signature against the hop's "

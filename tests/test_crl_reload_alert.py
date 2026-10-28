@@ -463,10 +463,13 @@ async def test_a_held_copy_that_lapses_first_outranks_a_signature_short_of_proof
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
-def _ca_naming_no_key(pki: _Pki, key: ec.EllipticCurvePrivateKey) -> str:
-    """A CA certificate for ``pki``'s issuer name and ``key``, with no Subject Key Identifier. A
-    CRL whose key identifier names ``pki``'s key fits it without naming its key, so the CA
-    verifies such a CRL where ``key`` signed it."""
+def _ca_the_crl_names(pki: _Pki, key: ec.EllipticCurvePrivateKey) -> str:
+    """A CA certificate for ``pki``'s issuer name and ``key``, whose Subject Key Identifier is the
+    key identifier ``pki``'s CRLs carry. Such a CRL names this CA too, so the CA is judged and
+    verifies the CRL where ``key`` signed it. A CA with no Subject Key Identifier would count for
+    nothing there, since the CRL names ``pki``'s own CA (vault BACKLOG #4159)."""
+    named = pki.aki.key_identifier
+    assert named is not None  # the premise: pki's CRLs name a key
     cert = (
         x509.CertificateBuilder()
         .subject_name(pki.name)
@@ -476,6 +479,7 @@ def _ca_naming_no_key(pki: _Pki, key: ec.EllipticCurvePrivateKey) -> str:
         .not_valid_before(_NOW - _DAY)
         .not_valid_after(_NOW + 365 * _DAY)
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier(named), critical=False)
         .sign(pki.key, hashes.SHA256())
     )
     return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
@@ -505,7 +509,7 @@ async def test_a_bad_signature_for_a_file_not_in_effect_is_judged_again_so_a_lat
     assert not first.start_refuses
     assert not first.refusal.sticky
 
-    hop.load_verify_locations(cadata=_ca_naming_no_key(pki, signer))
+    hop.load_verify_locations(cadata=_ca_the_crl_names(pki, signer))
     (second,) = _pass(runner)
 
     assert second.refusal is not None

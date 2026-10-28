@@ -139,6 +139,9 @@ channel config) with one section per group, plus **environment-variable override
 CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 ```
 
+A secret-class setting can also come from a file in a secrets directory, which then wins over its
+environment variable: see [The secrets directory](#the-secrets-directory-mefor_secrets_directory).
+
 - File location: `./messagefoundry.toml` by default, or `--service-config <path>`. **Under the
   Windows service, `serve` and `supervise` refuse to start without an absolute `--service-config`**,
   so the service never reads a settings file from its working directory. A relative one under
@@ -774,6 +777,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `ad_session_recheck_seconds` | int | `300` | **Directory session reconciliation** ([ADR 0079](adr/0079-kerberos-idp-session-coordination.md) mechanism 2). How often to re-resolve directory principals holding **live** sessions and revoke those AD has disabled or deleted — without it, an AD disable does not take effect until the `[security].max_session_hours` cap (12 h). **`300` (five minutes) is the default** (ADR 0148 GIVEN 1 — the hardened path is the shipped path), floored at **60 s** (a pass costs one LDAP bind per signed-in directory user). `0` disables the loop and is a **loosening** once AD is on — `security_loosenings()` names it. The default is **inert without AD** (`should_reconcile()` also needs an LDAP client), so a non-AD deployment is unaffected; an **explicit** non-zero value without `ad_enabled` is still refused rather than left silently dead. |
 | `ad_session_recheck_strikes` | int | `2` | Consecutive passes a principal must fail to resolve before its sessions are revoked. *The search matched nothing* cannot tell *deleted* from *moved out of the search base*, so a single ambiguous result must never revoke; a set disabled bit and an unreadable `userAccountControl` strike the same way. A wave of unreadable answers is held instead of revoked, with no setting ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)). Range 1–10. |
 | `ad_session_recheck_max_users` | int | `200` | Per-pass bind budget. Beyond this, remaining users are picked up by later passes (least-recently-probed first), so a large estate degrades to a longer effective interval instead of a bind storm. A pass revokes no more accounts than it probed. So at or below `ad_session_revoke_max`, the breaker can never trip. With AD on and a non-zero interval, the engine then logs a **WARNING** at start that names both settings. It still loads, and revocation still works. To arm the breaker, raise this budget above the cap. |
+| `ad_reconcile_outage_passes` | int | `3` | **Lasting directory outage alert** (BACKLOG #3709). A pass on which every probe it asked fails to reach the directory, whatever the cause, is fail-open: it revokes nothing, so a directory disable or deletion reaches no signed-in session while it lasts, and it is audited as `auth.ad_reconcile_skipped`. One such pass pages nobody. Once a run of them is this long, one `ad_reconcile_aborted` alert is raised with reason `directory_unavailable` under its own source, `directory-reconciler-outage`; the passes after it in the same run do not page again. A pass that reaches the directory, including one that judges nothing, ends the run. A pass with nobody signed in asks nothing and leaves the run as it stands. A group search refused for its own deadline or cap reads the same as an unreachable directory here. On by default, and it cannot be turned off: range `2` to `100`, so a single blip never pages. The count is **in memory, per process**: a restart starts it again, so a standing outage pages again after one, and a fresh process does not resolve an outage alert an earlier run left open, which an operator resolves. Each engine process counts and pages on its own. When it resolves itself is under [When the reconciler's alerts resolve themselves](#when-the-reconcilers-alerts-resolve-themselves). |
 | `ad_session_revoke_max` | int | `5` | **Mass-revoke circuit breaker**, absolute half. A search base that names the wrong OU, an OU reorganisation that moves the users out of it, or a service account that lost read rights on the entries while it can still read the base answers "not found" for *every* user — indistinguishable from "everyone was deleted". A base that was deleted or moved, or that the service account may not read at all, usually ends the search with a result code instead: a configuration refusal, which raises its own `ad_reconcile_aborted` instance with reason `directory_misconfigured` on any pass that sees one. The refused account is neither struck nor revoked, but it still counts among the accounts the pass probed, the breaker's denominator. When such a pass aborts and revokes nothing before the breaker runs is stated once in [SECURITY.md](SECURITY.md) (BACKLOG #3010). A lost read right on `userAccountControl` alone is held instead ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)). At `0` the absolute half is gone, so a pass trips once it revokes more than the fraction of the accounts it probed. At or above `ad_session_recheck_max_users`, the breaker can never trip; that row says what the engine does. |
 | `ad_session_revoke_max_fraction` | float | `0.34` | Circuit breaker, proportional half. A pass exceeding **both** thresholds aborts, revokes nothing, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row. Requiring both means it fires only on a change simultaneously *large* and *broad* — the signature of a misconfiguration, not of offboarding (3-of-3 or 50-of-300 still applies). Range >0.0–1.0, but with AD on and a non-zero interval the engine refuses `1.0` at load. At `1.0` this half is never exceeded, for the reason the `ad_session_recheck_max_users` row gives, so the whole breaker would never trip. |
 | `kerberos_enabled` | bool | `false` | Windows SSO (experimental, off by default; needs `ad_enabled`) |
@@ -822,7 +826,8 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 
 The session reconciler's `ad_reconcile_aborted` (the breaker) and `ad_reconcile_held` (the hold)
 alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). So
-does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). This
+does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). The
+lasting outage's instance resolves on its own rule, stated below the list. This
 needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
 this engine process, for every signed-in directory account it did not just revoke.
 
@@ -853,7 +858,7 @@ three on its own, until it restarts again.
   and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
   in at the last referral has since been read in full, present and enabled, on a pass with no
   referral. A pass with any referral, probe fault or configuration refusal (BACKLOG #3010)
-  resolves none of these alerts.
+  resolves none of these three alerts.
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
   held account, a disabled one awaiting its strikes, and one that never answers all do this.
 - An engine gives up resolving the referral when an account signed in at the last referral leaves
@@ -893,6 +898,16 @@ A paging refusal opens one `ad_reconcile_aborted` instance per account, under th
 `directory-reconciler-paging:<username>` (vault BACKLOG #3696). Nothing resolves it automatically.
 Resolve it by hand once that account no longer hits the bound, for example once its sign-in
 succeeds again.
+
+A lasting directory outage opens its own `ad_reconcile_aborted` instance, with reason
+`directory_unavailable` and source `directory-reconciler-outage` (BACKLOG #3709), once a run of
+`ad_reconcile_outage_passes` passes has read the directory unreachable. It resolves on the first
+pass that reaches the directory, if a pass of this engine process paged it. A pass of referrals or
+configuration refusals reached it; a pass whose every probe failed or faulted did not, and neither
+ends the run nor resolves it. A run pages once: an alert resolved by hand while the outage lasts
+stays resolved until a later run pages. Like the others, it is
+not resolved where the alert was already open when the process started, or where another
+reconciler may share the store; resolve those by hand.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
@@ -2006,10 +2021,29 @@ otherwise (the first bullet below says what that leaves out). The CRL names that
 key identifier. The engine ran the signature check with that key, and the check failed. Where
 several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
-authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
-`CRL signature failure`, an error that does not name the file. The refusal names the setting, the
-file and the CRL. Give the setting the CRL that CA signed. No setting turns this check off, as for
-an expired CRL.
+authority key identifier and that carries the subject key identifier the CRL names. A fitting CA
+with no subject key identifier counts for nothing then, whether its key verifies the CRL, does
+not, or cannot be checked (vault BACKLOG #4159). A handshake whose chain runs through the named CA
+and that OpenSSL judges by such a CRL fails with `CRL signature failure`, an error that does not
+name the file. The refusal names the setting, the file and the CRL. Give the setting the CRL that
+CA signed. No setting turns this check off, as for an expired CRL.
+
+**Why a CA with no subject key identifier counts for nothing there, and where that refuses a CRL a
+handshake could pass.** This paragraph is the one statement of that premise and its residuals;
+the code and the changelog point here. The verifying contexts the engine builds set OpenSSL's
+strict verification, as read from their call sites and measured for at least the outbound one.
+Under it OpenSSL 3 refuses a verified chain of two or more certificates through a CA with no
+subject key identifier, so such a CA cannot make the CRL valid for that chain. At least two cases
+are left where the start refuses a CRL that a handshake could pass:
+
+- OpenSSL skips those strict checks where the chain it verifies is one certificate long. That is
+  the length of the chain it builds, which ends at a listed CA, not the number of certificates the
+  peer sends. So a peer whose own certificate is such a CA, self-signed and listed for the hop,
+  passes. It was measured, on CPython 3.14.7 with OpenSSL 3.5.7, to pass a strict handshake judged
+  by a CRL that CA signed and that names the key of another listed CA of the same name, a CRL the
+  start refuses.
+- An OpenSSL build or a verifying context without the strict check could take such a CA for the
+  CRL's issuer. The engine sets no OpenSSL version floor.
 
 The check reads only the file a CRL setting names. A CRL can also reach a hop through its CA file
 alone, on at least the hops that the paragraph on a CRL inside a CA file, further down, names. The
@@ -2040,9 +2074,30 @@ three cases warn:
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
-- The engine cannot check the signature with the listed CA's key, even where the CRL names that key.
-  Two measured examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature
-  over SHA-1 that the CA did make.
+- The engine cannot check the signature with a fitting listed CA's key, at least where it does
+  not support that algorithm or that pairing of key and signature, or where reading the key or
+  checking with it raises an error. Where the CRL names the key of a listed CA that fits it, only
+  such a CA counts here (the paragraph that starts "Why a CA with no subject key identifier" says
+  why). Where it names no such CA's key, as when it names a key no listed CA carries, every
+  fitting CA counts, one with no subject key identifier included. Two measured examples are an
+  ECDSA signature on a CRL that names an RSA key, and an RSA signature over SHA-1 that the CA did
+  make. The CA's key accepts that second one, and the `cryptography` library's own check refuses
+  its digest, so the engine reads it as one it cannot check.
+
+  **That SHA-1 case is a trade-off (vault BACKLOG #4159).** A start loads such a CRL with the
+  WARNING, and the running-hop reload holds it back, so it is applied at the next restart. The
+  cost falls on a host whose TLS library accepts SHA-1, as OpenSSL 3.5.7 was measured to, judging
+  a peer by such a CRL. There a revocation in a new copy waits for a restart, and if nobody
+  restarts, the copy the hop holds lapses at its next update and the hop then refuses the peers
+  it judges by it, as for any held-back file. What it avoids is applying live, with nobody acting, a CRL on which a
+  host that refuses SHA-1, by its build or its system policy, would fail every handshake through
+  that CA. It does not prevent that failure: on such a host the restart loads the CRL with the
+  WARNING, and the handshakes through that CA then fail. Where the copy the hop holds is itself an
+  earlier SHA-1 CRL from that CA, such a host fails those handshakes already, and holding the new
+  copy back gains nothing there. The engine checks with the
+  `cryptography` library's OpenSSL and the handshake runs on Python's, so it cannot tell which
+  kind of host it is on. A forged SHA-1 signature that names a listed CA's key is still proved
+  bad, and refuses the file.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
 it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
@@ -2359,6 +2414,50 @@ Its text names no part of the proxy URL, and `[security].enforcement` does not r
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
+
+#### The secrets directory, `MEFOR_SECRETS_DIRECTORY`
+
+A secret-class setting can come from a file instead of an environment variable
+([ADR 0214](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md),
+vault BACKLOG #2595). Set `MEFOR_SECRETS_DIRECTORY` to an absolute path. It is a path, not a
+secret. Each file in that directory holds one setting and is named exactly as its variable is:
+`MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_AUTH_OIDC_CLIENT_SECRET`,
+`MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY`, `MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD`,
+`MEFOR_ALERTS_EMAIL_PASSWORD`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_VAULT_TOKEN`,
+`MEFOR_SECRETS_VAULT_TOKEN`, `MEFOR_AI_API_KEY`, or `MEFOR_VALUE_<KEY>` for an `env()` value.
+
+- **A file wins over its variable.** With no file for a setting, the variable is read as before.
+  Unset, no directory is read at all.
+- **The engine refuses, at every `[security].enforcement` setting,** a directory or a file in it
+  that a known broad group (at least Everyone, Authenticated Users and the local Users group; on
+  POSIX, a group or other read or write bit) can read or change, a directory in which such a
+  group may delete a file (Windows `FILE_DELETE_CHILD`), and a link on Windows. It also
+  refuses a relative path, a file that is not a regular file, a file named for no setting above
+  (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
+  whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
+  file whose name starts with `.` is ignored. Every load of the settings, by any command, checks
+  the directory, every file name in it, and every file named for a setting above, even one nothing
+  else reads. A `MEFOR_VALUE_*` file's access and contents are checked only when the `env()` values
+  are read: at a `serve` start and on each reload, by `messagefoundry check`, and by
+  `messagefoundry connection upsert` and `remove`, at least. A command that loads the settings and
+  not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
+  named for no setting is cited by its position, never spelled, since its name may be a value.
+- **The access check is a list of known broad groups.** It does not refuse one named account that
+  can write the directory, the way the config-directory checks do, and it does not read the
+  folders above the directory: a broad group that can write one of those could replace the
+  directory. Restrict the directory, and the folders above it, as below rather than relying on
+  the check.
+- **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
+  [`[store].encryption_key_file`](#store).
+- A trailing line break is dropped; any other character, a space included, is part of the value.
+- The files are plain, protected by their access list alone. Nothing creates the directory for you
+  yet. A variable a library reads for itself, such as `VAULT_TOKEN` or `PGPASSWORD`, is not read
+  from here.
+
+On Windows, create the directory with inheritance off, granting SYSTEM and Administrators full
+control and the service account read, and nothing else. On POSIX, make it mode `0700` and each file
+`0600`, owned by the engine's account.
 
 ### `[secret_rotation]`
 Periodic **secret-rotation reminder** ([ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) §5.1) —

@@ -21,6 +21,7 @@ import pytest
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
+from messagefoundry.store.store import DbStatus, DiskFreeStatus
 from tests._store_audit import no_purge_audit
 
 
@@ -755,6 +756,75 @@ async def test_db_status_reports_counts_journal_size(store: MessageStore) -> Non
     assert st.path == store.path
     # A real local drive is measurable, so this is a number — never the "unmeasurable" None.
     assert st.disk_free_bytes is not None and st.disk_free_bytes > 0
+    assert st.disk_free_status is DiskFreeStatus.OBSERVED
+
+
+@pytest.mark.parametrize(
+    ("free", "status"),
+    [
+        (None, DiskFreeStatus.OBSERVED),
+        (0, DiskFreeStatus.UNOBSERVABLE),
+        (0, DiskFreeStatus.NOT_APPLICABLE),
+        (5, DiskFreeStatus.NOT_APPLICABLE),
+    ],
+)
+def test_db_status_refuses_a_disk_status_that_contradicts_its_figure(
+    free: int | None, status: DiskFreeStatus
+) -> None:
+    """BACKLOG #1563: a figure exactly when OBSERVED. Either contradiction would let a reader trust
+    the wrong half, so the pair is refused where it is built rather than guessed at downstream."""
+    with pytest.raises(ValueError, match="contradicts"):
+        DbStatus(
+            path="p",
+            size_bytes=0,
+            disk_free_bytes=free,
+            disk_free_status=status,
+            journal_mode="wal",
+            messages=0,
+            events=0,
+            audit=0,
+        )
+
+
+async def test_an_in_memory_store_states_its_disk_not_applicable() -> None:
+    """A ':memory:' store has no file and so no drive; a figure would be the working directory's
+    free space, which could turn the health heart red for a database that has no disk."""
+    s = await MessageStore.open(":memory:")
+    try:
+        st = await s.db_status()
+    finally:
+        await s.close()
+    assert st.disk_free_bytes is None
+    assert st.disk_free_status is DiskFreeStatus.NOT_APPLICABLE
+
+
+def test_db_status_coerces_a_plain_string_status() -> None:
+    st = DbStatus(
+        path="p",
+        size_bytes=0,
+        disk_free_bytes=5,
+        disk_free_status="observed",  # type: ignore[arg-type]
+        journal_mode="wal",
+        messages=0,
+        events=0,
+        audit=0,
+    )
+    assert st.disk_free_status is DiskFreeStatus.OBSERVED
+
+
+def test_db_status_accepts_a_measured_zero() -> None:
+    """The guard rail: a measured 0 is OBSERVED and stays a figure, so it still alarms."""
+    st = DbStatus(
+        path="p",
+        size_bytes=0,
+        disk_free_bytes=0,
+        disk_free_status=DiskFreeStatus.OBSERVED,
+        journal_mode="wal",
+        messages=0,
+        events=0,
+        audit=0,
+    )
+    assert st.disk_free_bytes == 0
 
 
 async def test_disk_free_bytes_is_none_when_unmeasurable_never_zero(
@@ -771,7 +841,10 @@ async def test_disk_free_bytes_is_none_when_unmeasurable_never_zero(
 
     monkeypatch.setattr("messagefoundry.store.store.shutil.disk_usage", boom)
     assert store._disk_free_bytes() is None
-    assert (await store.db_status()).disk_free_bytes is None
+    st = await store.db_status()
+    assert st.disk_free_bytes is None
+    # The engine's own probe failed, so the store states unobservable, never not_applicable.
+    assert st.disk_free_status is DiskFreeStatus.UNOBSERVABLE
 
 
 async def test_integrity_check_ok(store: MessageStore) -> None:
