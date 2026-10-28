@@ -14,8 +14,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -765,12 +767,32 @@ async def _seed_many(engine: Engine, count: int) -> list[str]:
     ]
 
 
+def _hold_session_clocks(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Hold the clocks the idle window is measured on at ``now[0]``, which only the test moves.
+
+    The service's and the store's ``time.time()`` stamp the session and judge it idle; the export
+    route's ``time.monotonic()`` spaces its idle touches. Held as one, a row takes exactly as long
+    as the test says, so a slow runner's own gap cannot cross the window (BACKLOG #3453). The
+    service's and the store's ``monotonic()`` stay real: their timers are not the subject."""
+    now = [time.time()]
+    held = SimpleNamespace(time=lambda: now[0], monotonic=time.monotonic)
+    monkeypatch.setattr("messagefoundry.auth.service.time", held)
+    monkeypatch.setattr("messagefoundry.store.store.time", held)
+    monkeypatch.setattr(
+        "messagefoundry.api.app.time",
+        SimpleNamespace(time=lambda: now[0], monotonic=lambda: now[0]),
+    )
+    return now
+
+
 async def test_an_export_longer_than_the_idle_window_does_not_idle_its_own_session_out(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The per-row re-check must not turn a long download into an idle session. The idle window is
-    shrunk to 2.0 s and each row takes 0.5 s, so six rows outlast it. The export moves the idle
-    clock every quarter window, so every row streams and the session stays live afterwards."""
+    2.0 s and each row takes 0.5 s on the held clock, so six rows outlast it. The export moves the
+    idle clock every quarter window, so every row streams and the session stays live afterwards.
+    An export that stopped moving it would idle out at row six, 2.5 s after the last touch."""
+    now = _hold_session_clocks(monkeypatch)
     monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 2.0))
     service = await _service(engine)
     await _add_user(service, "op", [Role.OPERATOR.value])
@@ -778,7 +800,7 @@ async def test_an_export_longer_than_the_idle_window_does_not_idle_its_own_sessi
     real = engine.store.get_message
 
     async def slow(message_id: str) -> Any:
-        await asyncio.sleep(0.5)
+        now[0] += 0.5
         return await real(message_id)
 
     async with _client(engine, service, raise_app_exceptions=False) as c:
@@ -815,14 +837,15 @@ async def test_a_stall_past_the_idle_window_ends_the_export(
     """A stall longer than the idle window, of the client or (as here) of a store read, leaves the
     session idle like any other, so the next row's re-check ends the export as a standing change.
     Pinned so the behaviour is a decision. A shorter stall can do it too; the next test measures
-    that."""
+    that. The stall is 3.0 s on the held clock against a 2.0 s window."""
+    now = _hold_session_clocks(monkeypatch)
     monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 2.0))
     service = await _service(engine)
     await _add_user(service, "op", [Role.OPERATOR.value])
     ids = await _seed_many(engine, 2)
 
     async def stall() -> None:
-        await asyncio.sleep(3.0)
+        now[0] += 3.0
 
     async with _client(engine, service, raise_app_exceptions=False) as c:
         token = await _login(c, "op")
@@ -841,20 +864,21 @@ async def test_a_stall_shorter_than_the_idle_window_can_end_the_export(
     can end an export. That figure is arithmetic: the touch runs only at a row's top, at most every
     quarter window, so after a row that did not touch, a stall needs only the rest of the window.
     This test pins the part that can be measured with margin: a stall SHORTER than the window ends
-    the export. The window is 3.0 s; row one touches, row two comes 0.4 s later and does not, and a
-    2.75 s stall after it idles the session before row three's re-check. Accepted, not fixed: a
-    touch during a stall would need a timer beside the stream, and a client that stops reading for
-    that long signs in again."""
+    the export. The window is 3.0 s on the held clock; row one touches, row two comes 0.4 s later
+    and does not, and a 2.75 s stall after it idles the session before row three's re-check.
+    Accepted, not fixed: a touch during a stall would need a timer beside the stream, and a client
+    that stops reading for that long signs in again."""
+    now = _hold_session_clocks(monkeypatch)
     monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 3.0))
     service = await _service(engine)
     await _add_user(service, "op", [Role.OPERATOR.value])
     ids = await _seed_many(engine, 3)
 
     async def short_gap() -> None:
-        await asyncio.sleep(0.4)  # under the 0.75 s quarter window, so row two does not touch
+        now[0] += 0.4  # under the 0.75 s quarter window, so row two does not touch
 
     async def stall() -> None:
-        await asyncio.sleep(2.75)
+        now[0] += 2.75
 
     async with _client(engine, service, raise_app_exceptions=False) as c:
         token = await _login(c, "op")
