@@ -1836,20 +1836,24 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
     notifier, and no other `messagefoundry` command builds an engine. So a refusal under
     `supervise`, `rotate-key`, `backup`, `restore` or the rest leaves the WARNING line and
     nothing else. That holds even for `rotate-key` and `backup`, which open the store.
-  - **An application that builds its own engine can run with no guard.** It runs the reads too,
-    through `create_managed_app` or `Engine.create`. Only the guard refuses a script and counts
-    it. Where the remote-debugging interface is on and the guard is not in the process, an
-    injected script is not refused at all: it runs. The count then stays at 0, so there is no
-    row and no alert. An application that builds the API reports `remote_debug_unguarded`, as
-    that entry below says. One that builds only an `Engine` reports it nowhere. The guard goes
-    in wherever `messagefoundry.__main__` is imported, or
+  - **An application that builds only an `Engine` can run with no guard.** It runs the reads
+    too, through `Engine.create`. Only the guard refuses a script and counts it. Where the
+    remote-debugging interface is on and the guard is not in the process, an injected script is
+    not refused at all: it runs. The count then stays at 0, so there is no row and no alert. An
+    application that builds the API gets the guard when it builds the app, because `create_app`
+    installs it, and `create_managed_app` calls `create_app` (vault BACKLOG #3673). Where the
+    guard does not answer there, it reports `remote_debug_unguarded`, as that entry below says.
+    One that builds only an `Engine` reports it nowhere. The guard goes in wherever
+    `messagefoundry.__main__` is imported, `create_app` runs, or
     `messagefoundry.remotedebug.install_remote_debug_guard()` is called. An audit hook added
     earlier can still refuse it.
 - **This is a residual, not a closed path.** At least two things stay open. A script injected
   during start-up, before the hook is installed, runs. A caller that can restart the engine can
   aim for that window. The hook goes in when the command-line module is imported, ahead of its
   other imports. On one Windows development machine that was about 55 ms after the process was
-  created, against about 210 ms when `serve` installed it as its first step. The interpreter's
+  created, against about 210 ms when `serve` installed it as its first step. Cutting the guard's
+  own imports later saved about 20 ms more, by another method; `messagefoundry/remotedebug.py`
+  has that reading (vault BACKLOG #3673). The interpreter's
   own start-up, about 20 ms there, cannot be covered from inside the engine. And a process that
   can write the engine's memory can run code in it by other means, and can remove a hook.
 - **The tray has no hook, so how it started decides whether the interface is on.** No entry
@@ -1863,11 +1867,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   tray itself with the interface on.
 - **`remote_debug_unguarded`: the interface is on, and the hook did not answer.** Read it as the
   hook not installed: a process the operating system lets attach could run Python inside the
-  engine, with the store key, the connection secrets and the messages in flight. An application
-  that builds the API without `serve` reports this, until something in it imports the
-  command-line module, which installs the hook. `messagefoundry/api/tls.py` does that when it
-  writes a key. `serve` would report it in at least two cases. Both need an audit hook that
-  something else added to the process first. In one, that hook refused the engine's, so the
+  engine, with the store key, the connection secrets and the messages in flight. Building the
+  API app installs the hook, so an application that builds the API without `serve` has it from
+  then on (vault BACKLOG #3673). Such an application, like `serve`, would report this entry in
+  at least two cases. Both need an audit hook that something else added to the process first. In one, that hook refused the engine's, so the
   engine's hook is missing and an injected script runs. Nothing is refused, so there is no
   WARNING, no row and no alert. In the other, that hook raises on the event the engine uses to
   ask whether its own hook is there. The engine's hook is then usually in place and refuses a
@@ -1879,15 +1882,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   reads it carries the count, which the first case cannot produce. The serve-time warning is
   read once, at start, so it carries a count only for a refusal before then. A count says
   the hook was in at some point, not that it still is, so read the entry as missing either way.
-  In either case a later install call adds the hook again. So a hook the other one refused at
+  In either case a later install call tries the add again. So a hook the other one refused at
   import still goes in if that hook stops refusing by the time `serve` or `supervise` makes its
-  own call. In the first case nothing stacks, because the interpreter dropped the hook. In the
-  second a copy can stack, one per install call, and nothing else bounds them. `serve` and
-  `supervise` make at least two calls, at import and then as each starts. Under `python -m`, the
-  `api/tls.py` import above runs the import-time call again, and an application makes one per
-  call it adds. A stacked copy changes no count: the first copy refuses the script, and the
-  interpreter asks no hook after one that raised. Each copy does run on every other audited
-  event, so the hook's per-event cost is paid once per copy. Without a count,
+  own call. Repeated calls stack no second copy of the hook (vault BACKLOG #3673).
+  `install_remote_debug_guard` in `messagefoundry/remotedebug.py` says how, and what bounds it.
+  Without a count,
   the entry cannot tell the cases apart, so read it as the first, and look for what else in the
   process adds an audit hook.
 - **An audit hook added earlier can refuse a script ahead of the engine's, in any state.** Where
