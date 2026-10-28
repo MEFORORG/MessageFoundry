@@ -1977,8 +1977,8 @@ rule 1 would also stop the engine starting, so fix the file. A file whose CRL fa
 check under rule 2 is held back too. On the signature, a start refuses it only where the engine
 proves the signature bad, so fix that file. Short of that proof the signature does not stop a
 start: unless another rule refuses the file, a start loads it with a warning, and each handshake
-then decides. The remedy says which the reload found (vault BACKLOG #3506): `bad_signature` for a
-proof, and `unproven_signature` or `uncheckable_signature` short of it. *A start checks each CRL's
+then decides. The remedy says what the reload found for the CRL it reports (vault BACKLOG #3506):
+`bad_signature` for a proof, and `unproven_signature` or `uncheckable_signature` short of it. *A start checks each CRL's
 signature too*, further down, says what counts as proof, and names cases that load.
 
 **The private copy is about the temporary directory, not the CRL.** The reload loads a private copy
@@ -2068,10 +2068,11 @@ that proof, the remedy asks you to check the file, then restart. It is the `unpr
 row's where the check ran and failed but the CRL names no key of that CA, and the
 `uncheckable_signature` row's where the engine could not check the signature with a matched CA's
 key. After a CA renews its key the file can be right, and a restart then loads it with the WARNING
-above, unless another rule refuses it. Where the engine matches the CRL to no listed CA, the remedy
-is the `no_issuer` row's: restart. For one hop, the reload reads the file's CRLs in order and
-reports the first it matches to a listed CA and cannot confirm. It does not judge the CRLs after
-that one, so a CRL proven badly signed later in the file is not reported. A CRL it matches to no
+above, unless another CRL in the file or another rule refuses it. Where the engine matches the CRL
+to no listed CA, the remedy is the `no_issuer` row's: restart. For one hop, the reload reads the
+file's CRLs in order and reports the first it matches to a listed CA and cannot confirm. It does
+not judge the CRLs after that one, so a CRL proven badly signed later in the file is not reported,
+and a start refuses the file on it. So check every CRL in the file before a restart. A CRL it matches to no
 listed CA is reported only when it finds no CRL of the first kind. If the check fails on a CRL it
 reaches, even after one it matched to no listed CA, that hop's refusal is `retry`. Where
 the hops holding one file get different signature findings, the reload names the one whose row
@@ -2141,8 +2142,8 @@ check reports one CRL, which the paragraph on the reload above names.
 | `bad_signature` | The engine proved a CRL in the file badly signed under rule 2: the CRL names the key of a CA the hop lists, and that key does not verify it. Fix the file. A start that finds the same proof refuses it too, at any time. |
 | `not_provable` | Give the setting a bare CRL. The file carries a certificate the reload cannot prove the hop trusts. |
 | `lapses_first` | Fix the file now with a CRL that is in effect. The hop's copy lapses before the file's CRL takes effect, and every peer is refused in between. A restart does not help, and a start can refuse the file too. |
-| `unproven_signature` | The key of the CA the hop lists for a CRL's issuer does not verify it, but the CRL names no key of that CA, so the engine cannot prove it badly signed. Check the file: after a CA renews its key it can be right. Then restart the engine to apply it. |
-| `uncheckable_signature` | The engine could not check a CRL's signature with the key of the CA the hop lists for its issuer, as with a signature of another kind than that key. Check the file, then restart the engine to apply it. |
+| `unproven_signature` | The key of the CA the hop lists for a CRL's issuer does not verify it, but the CRL names no key of that CA, so the engine cannot prove it badly signed. Check the file: after a CA renews its key it can be right. Check the file's other CRLs too: the reload judged none after this one, and a start refuses the file where it proves any of them badly signed. Then restart the engine to apply it. |
+| `uncheckable_signature` | The engine could not check a CRL's signature with the key of the CA the hop lists for its issuer, as with a signature of another kind than that key. Check the file, and its other CRLs too: the reload judged none after this one, and a start refuses the file where it proves any of them badly signed. Then restart the engine to apply it. |
 | `restart` | Restart the engine to apply the file. |
 | `no_issuer` | Restart the engine to apply the file. Adding the issuing intermediate CA to the hop's own CA file does not apply this file; it lets later reloads verify the CRL without a restart. |
 | `retry` | The engine tries again every pass. A restart applies the file now. |

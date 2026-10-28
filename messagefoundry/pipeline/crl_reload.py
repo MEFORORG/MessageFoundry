@@ -209,11 +209,15 @@ BAD_SIGNATURE = (
     "yet in effect. If a good CRL from that issuer is already in the file, remove this one instead"
 )
 #: What follows a check in the two remedies for a signature the engine could not confirm. One
-#: sentence names a restart, so :data:`_LEADS_TO_A_START` holds both.
+#: sentence names a restart, so :data:`_LEADS_TO_A_START` holds both. The reload judges no CRL
+#: after the one it reports (:func:`~messagefoundry.pki.crl_signature_finding`), and a start
+#: judges them all, so the check must cover every CRL in the file.
 _SHORT_OF_PROOF = (
-    "Restart the engine to apply it once it checks out. Short of proof the signature does not "
-    "stop a start: unless another rule refuses the file, a start loads it with a warning, and "
-    "each handshake then decides. If the file is wrong, fix it"
+    "Check the other CRLs in the file too: the reload judged none after this one, and a start "
+    "refuses the file where it proves any CRL in it badly signed. Restart the engine to apply the "
+    "file once they all check out. Short of such a proof the signature does not stop a start: "
+    "unless another rule refuses the file, a start loads it with a warning, and each handshake "
+    "then decides. If the file is wrong, fix it"
 )
 #: ``unproven``: the CA was checked, its key does not verify the CRL, and the CRL names no key.
 UNPROVEN_SIGNATURE = (

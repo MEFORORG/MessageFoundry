@@ -850,6 +850,16 @@ def test_the_reload_s_finding_is_the_first_block_main_stopped_at(
     finding = crl_signature_finding(bad + unproven, ders)
     assert finding is not None and finding.state == "bad" and len(judged) == 1
 
+    # A start judges every CRL, so it refuses these bytes on the block the reload left unjudged.
+    # Both remedies short of proof must therefore send the operator to the other CRLs before a
+    # restart, not promise that a start loads the file (round 3 review, finding 1).
+    twins.crl.write_bytes(unproven + bad)
+    with pytest.raises(ValueError, match="CRL block 2 of 2"):
+        twins.hop("new")
+    for remedy in (UNPROVEN_SIGNATURE, UNCHECKABLE_SIGNATURE):
+        assert "the reload judged none after this one" in remedy
+        assert "proves any CRL in it badly signed" in remedy
+
 
 @pytest.mark.parametrize("before", ["verified", "unlisted", "unproven"])
 def test_a_failure_in_the_reload_s_check_is_raised_as_main_raised_it(
