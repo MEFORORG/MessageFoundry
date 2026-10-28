@@ -7776,8 +7776,9 @@ def _offline_security_notifier(
     **One shape is refused earlier, and the command does not run.** An ``[alerts]`` SMTP login
     (``email_username`` set) beside ``email_use_tls = false`` or ``email_tls_verify = false`` is
     refused when settings load (vault BACKLOG #3533 item 3). That is before any store is opened or
-    created, so ``provision-admin`` and every other command that loads settings stop there and
-    leave nothing half-written. The remedy is to verify the relay's TLS, or to remove
+    created, so at least ``provision-admin``, ``serve`` and ``supervise`` stop there and leave
+    nothing half-written; ``check`` fails its required ``posture`` leg on it and runs the rest.
+    The remedy is to verify the relay's TLS, or to remove
     ``email_username`` and the password and send unauthenticated.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
