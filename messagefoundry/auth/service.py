@@ -11027,22 +11027,36 @@ class AuthService:
 
         # Read for the row's actor when the caller named none, and for the lapse test below when
         # the session was live: a session already over has nothing left for that test to decide.
-        if actor is None or live:
-            unread = [
-                consequence
-                for consequence, applies in (
-                    ("its auth.logout row names no actor", actor is None),
-                    ("any temporary credential it holds is not checked for a lapse", live),
-                )
-                if applies
-            ]
+        # One literal message per case, never a built one: test_audit_write holds every
+        # write_audit_soft message to the console and redaction rules, and reads only literals.
+        # The session has ended in every case, so a raise would lose its row and report it as a
+        # failure; hence defects=().
+        if actor is None and live:
             await write_audit_soft(
                 _read_the_owner,
                 log=_log,
-                # A literal, so the console and redaction gates in test_audit_write can read it.
-                message="a sign-out ended session %s, but its owner could not be read; %s",
-                args=(session, " and ".join(unread)),
-                # The session has ended: a raise would lose its row and report it as a failure.
+                message="a sign-out ended session %s, but its owner could not be read; its "
+                "auth.logout row names no actor and any temporary credential it holds is not "
+                "checked for a lapse",
+                args=(session,),
+                defects=(),
+            )
+        elif actor is None:
+            await write_audit_soft(
+                _read_the_owner,
+                log=_log,
+                message="a sign-out ended session %s, but its owner could not be read; its "
+                "auth.logout row names no actor",
+                args=(session,),
+                defects=(),
+            )
+        elif live:
+            await write_audit_soft(
+                _read_the_owner,
+                log=_log,
+                message="a sign-out ended session %s, but its owner could not be read; any "
+                "temporary credential it holds is not checked for a lapse",
+                args=(session,),
                 defects=(),
             )
         # BACKLOG #3749: the gate's own refusals, so a sign-out with no gate in front of it records
