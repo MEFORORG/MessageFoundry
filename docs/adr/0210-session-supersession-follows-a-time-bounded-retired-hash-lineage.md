@@ -31,8 +31,8 @@ nothing, and be usable for nothing but the lookup that ends its successor.
 
 **A rotation records a link from the hash it retired to its successor, and the login supersession,
 and only it, follows those links for a bounded time to the live end and revokes that.** Amendment A
-adds the sign-out as a second reader, so "only" here and in item 5, AC-5 and option 1 held when
-this was accepted.
+adds the sign-out as a second reader in the service. This "only", AC-5's and option 1's state the
+record as accepted.
 
 1. **A separate table, `session_lineage`** (`retired_hash` primary key, `successor_hash`,
    `retired_at`, an index on `retired_at`), on SQLite, Postgres and SQL Server. `rotate_session`

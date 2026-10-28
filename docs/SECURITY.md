@@ -5188,8 +5188,9 @@ the session lives on under its new token: an elevation older than the bound, mor
 elevations in a row inside it, and a wall clock that stepped between the elevation and the
 sign-out, which moves the bound by the step. The `auth.logout` row names the
 session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
-was presented. A row the sign-out ended that was over its idle or absolute limit, or stamped
-ahead of the clock, is recorded as `lapsed`, not `revoked`, and still names the owner.
+was presented. The `outcome` is `lapsed` instead when the session's own clock checks fail at the
+revoke. At least a session over its idle or absolute limit fails them. A `lapsed` row still names
+the owner.
 
 **A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
 clears the cookie. That row is then missing, with an ERROR log line; the line names the session

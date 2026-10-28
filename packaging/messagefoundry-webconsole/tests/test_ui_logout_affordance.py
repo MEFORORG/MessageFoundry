@@ -343,6 +343,7 @@ async def test_ui_logout_clears_the_cookie_when_the_row_fails_after_the_revoke(
         await real_record(action, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(engine.store, "record_audit", _refuse_logout_row)
+    caplog.clear()  # only the sign-out's own lines are asserted below
     with caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
         out = await _sign_out_with(engine, service, token)
     _assert_signed_out(out)
@@ -383,6 +384,7 @@ async def test_ui_logout_clears_the_cookie_when_the_owner_lookup_fails(
 
     # Scoped to the sign-out, so a session left live fails the check below on its own terms
     # rather than on this planted fault.
+    caplog.clear()  # only the sign-out's own lines are asserted below
     with monkeypatch.context() as patch, caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
         patch.setattr(engine.store, "get_user", _refuse_owner)
         out = await _sign_out_with(engine, service, token)
@@ -411,6 +413,7 @@ async def test_ui_logout_clears_the_cookie_when_a_row_for_nothing_ended_fails(
         await real_record(action, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(engine.store, "record_audit", _refuse_logout_row)
+    caplog.clear()  # only the sign-out's own lines are asserted below
     with caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
         out = await _sign_out_with(engine, service, "a-token-that-names-no-session")
     _assert_signed_out(out)

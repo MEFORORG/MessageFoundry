@@ -679,10 +679,9 @@ async def test_a_logout_raced_by_a_rotation_ends_the_session_under_its_new_token
 async def test_logout_passes_a_proven_at_read_before_its_gate(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #3715. ``POST /auth/logout`` bounds the lineage walk from the moment its request
-    arrived, which must be read BEFORE its gate proves the token live, so any link followed was
-    written after that proof. The clock ticks on every read, so "before" is a strict order rather
-    than a tie, and ``proven_at=None`` (the credential-free bound) fails here."""
+    """BACKLOG #3715. ``POST /auth/logout`` passes a ``proven_at`` read during the request and
+    before its gate reads the session; ``AuthService.logout`` says why. The clock ticks on every
+    read, so "before" is a strict order. ``proven_at=None`` fails here."""
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
     async with _client(engine, service) as c:
@@ -708,13 +707,14 @@ async def test_logout_passes_a_proven_at_read_before_its_gate(
 
     monkeypatch.setattr(service, "logout", _spy_logout)
     async with _client(engine, service) as c:
+        sent = time.time()
         assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
     assert gate_reads, "the gate never read the session, so this measured nothing"
     assert len(proven) == 1
     assert proven[0] is not None, (
         "the route passed no proven_at, so it took the credential-free bound"
     )
-    assert start < proven[0] < gate_reads[0], (
+    assert sent < proven[0] < gate_reads[0], (
         "proven_at is not a wall-clock read taken during this request, before the gate"
     )
 
