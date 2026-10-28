@@ -237,7 +237,7 @@ from messagefoundry.auth.anchor_path import (
     anchor_path_verdict,
 )
 from messagefoundry.childenv import system_tool_environment
-from messagefoundry.config.models import ConnectorType, bool_setting
+from messagefoundry.config.models import ConnectorType, bool_setting, remote_file_protocol
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.redaction import codec_safe_str, safe_exc
@@ -585,19 +585,18 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     **An encryption header name after the first BEGIN refuses, before that load** (BACKLOG
     #2270), whether or not it sits inside a block. A
     ``Proc-Type: 4,ENCRYPTED`` header sends OpenSSL to its password callback, and ``cadata=`` sets
-    none, so OpenSSL falls back to its default one, which reads the terminal. The POSIX terminal run
-    was done later, off-version (BACKLOG #3090, 2026-10-12): on CPython 3.12.3 / OpenSSL 3.0.13 on
-    Linux with a pseudo-terminal, the same ``cadata=`` load wrote ``Enter PEM pass phrase:`` and was
-    still waiting at 5 seconds, while ``cafile=`` refused at once with ``PEM lib``.
-    ``tests/test_encrypted_pem_cafile_pin.py`` holds that table and pins it on each CI platform.
-    What was measured first, on Windows, on
-    CPython 3.14.6 / OpenSSL 3.5.7 in a child process with stdin on the null device: the
+    none, so OpenSSL falls back to its default one, which reads the terminal. Measured on Windows,
+    on CPython 3.14.6 / OpenSSL 3.5.7 in a child process with stdin on the null device: the
     ``cadata=`` load of a certificate block carrying ``Proc-Type: 4,ENCRYPTED`` and ``DEK-Info:``
     did not return within 20 seconds and was killed, while ``cafile=`` on the same bytes refused at
-    once with ``PEM lib``. So a start or a reload could hang on this file. A CA certificate never
-    carries an RFC 1421 encryption header, so ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any
-    case, anywhere after the first BEGIN of the text the load would get, and OpenSSL is never
-    handed that text (:func:`has_encryption_header`). That is wider than the hang: a private-key
+    once with ``PEM lib``. So a start or a reload could hang on this file. A later run, off-version,
+    under a POSIX pseudo-terminal (BACKLOG #3090) saw the same ``cadata=`` load write the password
+    prompt and wait. ``tests/test_encrypted_pem_cafile_pin.py`` holds that run's table, with its
+    versions. It pins the path loads on each CI platform, and the pseudo-terminal case on POSIX
+    only. A CA certificate never carries an RFC 1421 encryption header, so ``Proc-Type:`` and
+    ``DEK-Info:`` both refuse, in any case, anywhere after the first BEGIN of the text the load
+    would get, and OpenSSL is never handed that text (:func:`has_encryption_header`). That is wider
+    than the hang: a private-key
     block encrypted in that legacy header format beside a certificate loads through ``cadata=``,
     and refuses here, and so does the header name in a comment between two blocks or after the
     last one. The
@@ -1528,9 +1527,9 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     """Why a dialling connection would never read its ``tls_ca_file``, or ``None`` when it reads
     it or the settings cannot tell yet (vault BACKLOG #2371).
 
-    The switches that build no verifying context: ``tls`` or ``use_tls`` off, ``tls_verify`` off,
-    ``ech_egress`` through an ``http://`` sidecar, and on the HTTP family ``verify_tls`` off or an
-    ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes both hops over cleartext
+    The switches that build no verifying context: ``tls`` or ``use_tls`` off, a remote-file
+    ``protocol`` of plain ``ftp``, ``tls_verify`` off, ``ech_egress`` through an ``http://``
+    sidecar, and on the HTTP family ``verify_tls`` off or an ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes both hops over cleartext
     loopback and verifies the server itself (ADR 0139). An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
     check after resolution decides. Each caller refuses a pin beside an unread CA and checks no
     file there: a pin nothing checks reads as pinned while nothing is.
@@ -1545,6 +1544,11 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     for key, default in (("tls", False), ("use_tls", True)):
         if key in settings and not bool_setting(settings, key, default=default):
             return f"{key} is off, so the hop builds no TLS context"
+    # Ftp() refuses a CA beside a literal tls=False itself. An env() tls resolves only later, into
+    # this protocol (vault BACKLOG #3234), so the resolved check is where that case is caught.
+    protocol = settings.get("protocol")
+    if isinstance(protocol, str) and remote_file_protocol(settings) == "ftp":
+        return "plain FTP (tls=False) builds no TLS context"
     if not bool_setting(settings, "tls_verify", default=True):
         return "tls_verify=False verifies no server certificate"
     if settings.get("ech_egress") and _is_http_url(settings.get("ech_sidecar")):
@@ -1759,6 +1763,7 @@ _CONNECTION_ANCHOR_KEYS = (
     "tls_verify",
     "verify_tls",
     "url",
+    "protocol",
     "ech_egress",
     "ech_sidecar",
     "smart_enabled",

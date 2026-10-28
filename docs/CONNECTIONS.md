@@ -145,8 +145,9 @@ transport = "mllp"
   the type it wanted. A quoted TOML value is always a string, so write the number or `true`/`false`
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
   an environment value arrives as text and an **uncast** ref hands the connector that text. A
-  boolean setting is mostly the exception: it is read strictly whatever the cast (vault BACKLOG
-  #3234; [CONFIGURATION.md](CONFIGURATION.md) gives the spellings and the settings it misses). An inline
+  boolean setting is mostly the exception: once resolved, it is read strictly whatever the cast,
+  `ftp`'s `tls` included (vault BACKLOG #3234; [CONFIGURATION.md](CONFIGURATION.md) gives the
+  spellings and what it misses). An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
   The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
@@ -3327,7 +3328,7 @@ outbound(
 | Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
 | What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane, except on `FhirLookup()`, where it refuses the start. At a reload it refuses the reload, if the reload builds or keeps that lane running. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
 | What if it is blank? | On these six factories, and on `Email()` and `Direct()`, a blank literal is refused at load. A blank `env()` value is refused when it resolves, naming the setting, the connection and the environment key (vault BACKLOG #2370). |
-| When is it refused as unread? | On `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. On the others, a token hop can still read it. |
+| When is it refused as unread? | At least on `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. An `Ftp(tls=env(...))` whose value is a false spelling is refused the same way once it resolves, at start, check and reload (vault BACKLOG #3234). One that resolves to `None` is FTPS and reads the CA. On the others, a token hop can still read it. |
 | What if it is unset? | The hop is built exactly as before, from the instance `[tls]` block or the OS store. |
 
 **It is opt-in.** Every default still trusts the OS store, so an internal hop without it is verified
