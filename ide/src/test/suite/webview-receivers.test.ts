@@ -376,11 +376,21 @@ const SCHEMA: ConnectionSchema = {
 const FIELDS_OK = {
   command: "fields",
   groups: buildForm(SCHEMA, "mllp", "outbound", {
-    host: { env: "PEER_HOST", cast: "str" },
+    host: { env: "PEER_HOST", cast: "str", default: "localhost" },
     port: 6661,
+    // An inline secret literal, so one field carries preserveValue.
+    tls_key_password: "x",
     legacy_key: "kept",
   }),
 };
+
+/** FIELDS_OK with no field carrying `value` or `defaultValue`: both are optional (FieldDescriptor). */
+const FIELDS_BARE = variant(FIELDS_OK, (c) => {
+  for (const f of c.groups.flatMap((g: Payload) => g.fields)) {
+    delete f.value;
+    delete f.defaultValue;
+  }
+});
 
 const connection: Receiver = {
   panel: "connection editor",
@@ -407,7 +417,7 @@ const connection: Receiver = {
        <div id="error">${SENTINEL}</div>
        <button id="save"></button><button id="cancel"></button><button id="delete"></button>`,
     ),
-  wellFormed: { error: [ERROR_OK], fields: [FIELDS_OK] },
+  wellFormed: { error: [ERROR_OK], fields: [FIELDS_OK, FIELDS_BARE] },
   malformed: {
     error: badMessages(ERROR_OK),
     fields: [
@@ -814,6 +824,11 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     const fields = FIELDS_OK.groups.flatMap((g) => g.fields);
     assert.ok(fields.some((f) => typeof f.envKey === "string" && typeof f.cast === "string"));
     assert.ok(fields.some((f) => !("envKey" in f) && !("cast" in f)));
+    const bare = FIELDS_BARE.groups.flatMap((g: Payload) => g.fields);
+    assert.ok(fields.some((f) => f.value !== undefined) && fields.some((f) => f.defaultValue !== undefined));
+    assert.ok(fields.some((f) => "envDefault" in f) && fields.some((f) => !("envDefault" in f)));
+    assert.ok(fields.some((f) => "preserveValue" in f) && fields.some((f) => !("preserveValue" in f)));
+    assert.ok(bare.length > 0 && bare.every((f: Payload) => !("value" in f) && !("defaultValue" in f)));
     assert.ok(FIELDS_OK.groups.some((g) => typeof g.description === "string"), "no group has a description");
     assert.ok(FIELDS_OK.groups.some((g) => !("description" in g)));
     assert.ok(fields.some((f) => f.choices === null) && fields.some((f) => Array.isArray(f.choices)));
