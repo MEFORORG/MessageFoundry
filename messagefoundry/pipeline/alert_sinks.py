@@ -1500,7 +1500,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def connection_started(self, name: str) -> None:
         """The inverse of ``connection_stopped`` (BACKLOG #1741; the Protocol says when it fires). No
-        notification; auto-resolves the open instance when alert-state is wired."""
+        notification; auto-resolves the open instance when alert-state is wired. It also ends the
+        cooldown, as ``crl_reload_applied`` does, so a stop that follows inside it is a new incident
+        that pages and dispatches its rule's control action. A rule's own self-restart raises no
+        start, so a crash loop it drives stays throttled."""
+        self._last_sent.pop(f"connection_stopped:{name}", None)
         self._record_state({"type": "connection_started", "connection": name}, "info")
 
     @staticmethod
