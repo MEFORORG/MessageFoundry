@@ -930,10 +930,13 @@ def DatabaseRef(
     from messagefoundry.transports.database import _require_read_only
 
     statement_refusal: str | None = None
-    try:
-        _require_read_only(statement, subject="DatabaseRef statement")
-    except DbLookupError as exc:
-        statement_refusal = str(exc)
+    # A statement that is not a literal (an env() ref) waits for the build check and the sync, which
+    # test it once resolved.
+    if isinstance(statement, str):
+        try:
+            _require_read_only(statement, subject="DatabaseRef statement")
+        except DbLookupError as exc:
+            statement_refusal = str(exc)
     if statement_refusal is not None:
         raise WiringError(statement_refusal)
     # Refused here, at declaration, because a reference set is first dialled at sync time, after

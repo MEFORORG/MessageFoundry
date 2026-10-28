@@ -260,7 +260,7 @@ async def _load_database_source(
     honoured only on an instance at ``[security].enforcement = warn``. ``None`` keeps the ambient
     posture, so a caller already inside a scope is unchanged. ``name`` is the reference set, so a
     refusal or an attestation line names it."""
-    from messagefoundry.transports.database import _close_cursor, _login_timeout, _make_pool
+    from messagefoundry.transports.database import _close_and_release, _login_timeout, _make_pool
 
     server = str(settings.get("server", ""))
     # `egress` is required (vault BACKLOG #2605): a caller that passed none used to skip this check.
@@ -309,8 +309,9 @@ async def _load_database_source(
             columns = [d[0] for d in cur.description]
             rows = await _fetch_reference_rows(cur, limit, name)
         finally:
-            await _close_cursor(cur)
-            await pool.release(conn)
+            # Releases even when a cancellation lands during the cursor close, or the wait_closed
+            # below would wait for the connection forever.
+            await _close_and_release(pool, conn, cur)
     finally:
         pool.close()
         await pool.wait_closed()

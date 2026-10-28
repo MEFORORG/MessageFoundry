@@ -1838,7 +1838,7 @@ in-process layers are defence in depth and neither is authority:
 | Layer | What it does | What it cannot do |
 |---|---|---|
 | Statement gate (`_require_read_only`) | refuses a statement that does not open with `SELECT`/`WITH`, or that carries a write/`EXEC`/DDL keyword outside a literal or comment, or that chains a second statement | it reads text. A write executed on a linked server through a pass-through literal is opaque to it |
-| `ApplicationIntent=ReadOnly` on the DSN | advertises read-only intent | honored only by a SQL Server Always-On **read replica**; a no-op against any other server |
+| `ApplicationIntent=ReadOnly` on the DSN | advertises read-only intent | acts only inside an Always On availability group, where read-only routing sends it to a **readable secondary** and a primary set to `ALLOW_CONNECTIONS = READ_WRITE` refuses it; a no-op outside one |
 
 Lookup pools are opened **autocommit**, so a write that got past the statement gate would commit rather
 than roll back. T-SQL has no `SET TRANSACTION READ ONLY`, so the engine cannot open a read-only

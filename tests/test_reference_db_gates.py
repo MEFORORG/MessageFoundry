@@ -231,6 +231,15 @@ def test_the_build_check_refuses_the_statement_of_an_unprovisioned_set() -> None
     _check(_registry(server=env("MEFOR_TEST_2617_SERVER")))  # the control: a SELECT passes
 
 
+def test_an_env_statement_is_tested_once_resolved() -> None:
+    """``DatabaseRef`` cannot read an ``env()`` statement, so it leaves it to the build check and the
+    sync rather than failing the load on the ref object itself."""
+    registry = _registry(statement=env("MEFOR_TEST_2617_SQL"))
+    with pytest.raises(WiringError, match="DatabaseRef statement must be"):
+        _check(registry, {"mefor_test_2617_sql": "EXEC dbo.p"})
+    _check(registry, {"mefor_test_2617_sql": "SELECT code, value FROM codes"})  # the control
+
+
 def test_the_build_check_passes_a_read_only_statement() -> None:
     for statement in (
         "SELECT code, value FROM codes",

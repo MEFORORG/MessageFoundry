@@ -213,9 +213,9 @@ def _build_dsn(
     with read-only routing, that intent sends the connection to a readable secondary, whose data can
     lag the primary's. It is defense-in-depth for the ADR 0010 read-only carve-out, layered with the
     statement guard in :func:`_require_read_only`. **Neither layer is read-only authority.**
-    ApplicationIntent is honored
-    only by a SQL Server Always-On read replica and is a no-op otherwise, and a statement guard is a
-    shape test on text. The control that actually refuses a write is the privilege of the account this
+    ApplicationIntent acts only inside an availability group, where read-only routing or a replica's
+    ``ALLOW_CONNECTIONS`` setting reads it, and a primary set to ``READ_WRITE`` refuses it; outside
+    one it is a no-op. A statement guard is a shape test on text. The control that actually refuses a write is the privilege of the account this
     DSN dials, which only the operator can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
     encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
@@ -1278,8 +1278,8 @@ def _login_timeout(s: Mapping[str, Any], label: str, *, dialect: str) -> int | N
 class AutocommitNotConfirmed(RuntimeError):
     """A connection from an autocommit pool could not be put in autocommit mode (BACKLOG #2148).
 
-    The borrow is refused, and the connection is closed and returned to its pool, so no statement
-    runs on it. The text names neither the DSN nor the connection's server."""
+    The borrow is refused, and the connection goes back to its pool unconfirmed, so no statement runs
+    on it until a later borrow has set the mode. The text names neither the DSN nor the server."""
 
 
 async def _confirm_autocommit(conn: Any) -> None:
@@ -1318,30 +1318,18 @@ async def _confirm_autocommit(conn: Any) -> None:
         )
 
 
-async def _discard_connection(pool: Any, conn: Any) -> None:
-    """Close ``conn`` and hand it back to ``pool``, which drops a closed connection rather than
-    reusing it. Raises nothing but a cancellation: the caller is already raising the reason the
-    connection is discarded.
+async def _return_to_pool(pool: Any, conn: Any) -> None:
+    """Hand ``conn`` back to ``pool`` for :class:`_AutocommitPool`, where no borrower holds it.
+    Never raises: the caller, if any, is already raising its own reason.
 
-    The release is in a ``finally``, so a cancellation that lands during the close still returns
-    the slot; a slot nobody returns would leave ``wait_closed`` waiting forever. A connection whose
-    close failed goes back open. It is not marked confirmed, so its next borrow sets autocommit again
-    before anything runs on it."""
+    A connection whose autocommit was not confirmed is returned, not closed. It is not marked
+    confirmed, so its next borrow sets autocommit again before any statement runs on it, and refuses
+    again if the driver still rejects the set. Closing it would add nothing to that rule, and
+    aioodbc's own release of an open connection is what wakes a borrower waiting for a free slot."""
     try:
-        await conn.close()
-    except Exception as exc:  # noqa: BLE001 - the caller's refusal is the error that matters
-        logger.warning(
-            "DATABASE: closing a refused pooled connection failed; it goes back to the pool and is "
-            "checked again on its next borrow: %s",
-            safe_exc(exc),
-        )
-    finally:
-        try:
-            await pool.release(conn)
-        except Exception as exc:  # noqa: BLE001 - same
-            logger.debug(
-                "DATABASE: returning a refused pooled connection failed: %s", safe_exc(exc)
-            )
+        await pool.release(conn)
+    except Exception as exc:  # noqa: BLE001 - no borrower is left to tell
+        logger.debug("DATABASE: returning a pooled connection failed: %s", safe_exc(exc))
 
 
 #: Connections settled after their borrower stopped waiting (see ``_AutocommitPool``). The loop holds
@@ -1383,12 +1371,17 @@ class _AutocommitPool:
     operator statement that changes the session's own transaction mode is outside this check. A
     connection object that cannot be held weakly is confirmed on every borrow instead.
 
-    **A borrower that stops waiting does not close the connection under a running call.** The
-    driver call runs on a worker thread and may still be inside the driver when ``acquire_timeout``
-    expires or the task is cancelled. Closing the connection then would free handles that call is
-    using, the crash shape BACKLOG #2049 recorded. So the call is shielded: the borrower leaves at
-    once, which keeps the ``acquire_timeout`` bound, and the connection is released or discarded
-    only once the call has returned."""
+    **A borrower that stops waiting leaves the connection alone until the driver call returns.** The
+    call runs on a worker thread and may still be inside the driver when ``acquire_timeout`` expires
+    or the task is cancelled. Releasing or closing the connection then would let another call reach
+    it, or free handles the running call is using, the crash shape BACKLOG #2049 recorded. So the call
+    is shielded: the borrower leaves at once, so ``acquire_timeout`` still bounds the borrow, and the
+    connection goes back to the pool only once the call has returned.
+
+    **What that does not bound.** Until a hung call returns, its connection is still in use, so a
+    ``pool.close(); await pool.wait_closed()`` on this pool waits for it: a ``DatabaseRef`` sync's
+    teardown, or a source's or lookup's ``aclose()``. How long is the driver's own network timeout.
+    That wait is the price of never freeing a connection under a running driver call."""
 
     def __init__(self, pool: Any) -> None:
         self._pool = pool
@@ -1412,33 +1405,30 @@ class _AutocommitPool:
         except asyncio.CancelledError:
             confirm.add_done_callback(partial(self._settle_detached, conn))
             raise
-        except BaseException:
-            # The confirm task has ended, so no driver call is running on this connection.
-            await _discard_connection(self._pool, conn)
+        except Exception:
+            # The confirm task has ended, so no driver call is running on this connection. A
+            # GeneratorExit or other BaseException is let through without an await.
+            await _return_to_pool(self._pool, conn)
             raise
         self._mark_confirmed(conn)
         return conn
 
     def _settle_detached(self, conn: Any, confirm: asyncio.Future[None]) -> None:
-        """Return or discard ``conn`` once a confirm its borrower abandoned has ended. A done
-        callback, so it never raises; the work it schedules logs its own failure."""
-        passed = not confirm.cancelled() and confirm.exception() is None
-        if passed:
+        """Return ``conn`` to the pool once a confirm its borrower abandoned has ended, marked
+        confirmed only if it passed. A done callback, so it never raises."""
+        failure = None if confirm.cancelled() else confirm.exception()
+        if confirm.cancelled() or failure is not None:
+            # No borrower is left to raise this to, so it is logged here (CLAUDE.md section 6).
+            logger.warning(
+                "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection "
+                "goes back unconfirmed and is set again on its next borrow",
+                "cancelled" if failure is None else safe_exc(failure),
+            )
+        else:
             self._mark_confirmed(conn)
-        task = asyncio.ensure_future(self._settle(conn, passed=passed))
+        task = asyncio.ensure_future(_return_to_pool(self._pool, conn))
         _DETACHED_SETTLES.add(task)
         task.add_done_callback(_DETACHED_SETTLES.discard)
-
-    async def _settle(self, conn: Any, *, passed: bool) -> None:
-        if not passed:
-            await _discard_connection(self._pool, conn)
-            return
-        try:
-            await self._pool.release(conn)
-        except Exception as exc:  # noqa: BLE001 - no borrower is left to tell
-            logger.debug(
-                "DATABASE: returning an abandoned pooled connection failed: %s", safe_exc(exc)
-            )
 
     async def release(self, conn: Any) -> None:
         await self._pool.release(conn)
@@ -1525,6 +1515,17 @@ async def _close_cursor(cur: Any) -> None:
         logger.debug("DATABASE: cursor close failed, ignored: %s", exc)
 
 
+async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
+    """Close ``cur``, then return ``conn`` to ``pool``. The release is in a ``finally``, so a
+    cancellation that lands during the close still returns the connection. Without it the slot
+    stays in use for the pool's life, and a later ``wait_closed`` waits for it forever. A cursor
+    close can take a while, since the driver may discard unread rows."""
+    try:
+        await _close_cursor(cur)
+    finally:
+        await pool.release(conn)
+
+
 async def _probe_db(
     get_pool: Callable[[], Any], *, timeout: float = _DEFAULT_DB_ACQUIRE_TIMEOUT
 ) -> None:
@@ -1555,8 +1556,7 @@ async def _probe_db(
             else DeliveryError(f"DATABASE probe failed: {safe_exc(exc)}")
         ) from exc
     finally:
-        await _close_cursor(cur)
-        await pool.release(conn)
+        await _close_and_release(pool, conn, cur)
 
 
 def _json_default(value: Any) -> Any:
@@ -1706,8 +1706,7 @@ class DatabaseDestination(DestinationConnector):
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
                 raise _classify_db_error(state, str(exc)) from exc
         finally:
-            await _close_cursor(cur)
-            await pool.release(conn)
+            await _close_and_release(pool, conn, cur)
         return captured
 
     async def _capture(self, cur: Any) -> DeliveryResponse:
@@ -2184,8 +2183,7 @@ class DatabaseSource(SourceConnector):
                     ceiling,
                 )
         finally:
-            await _close_cursor(cur)
-            await pool.release(conn)
+            await _close_and_release(pool, conn, cur)
         return _PolledBatch(rows, skipped, budget_spent)
 
     def _body(self, record: dict[str, Any]) -> str:
@@ -2222,8 +2220,7 @@ class DatabaseSource(SourceConnector):
             cur = await conn.cursor()
             await cur.execute(self._mark_sql, params)
         finally:
-            await _close_cursor(cur)
-            await pool.release(conn)
+            await _close_and_release(pool, conn, cur)
 
     async def test_connection(self) -> None:
         await _probe_db(self._get_pool, timeout=self._acquire_timeout)
@@ -2503,8 +2500,7 @@ class DatabaseLookupExecutor:
                 f"db_lookup query on {connection!r} failed" + (f" [{state}]" if state else "")
             ) from exc
         finally:
-            await _close_cursor(cur)
-            await pool.release(conn)
+            await _close_and_release(pool, conn, cur)
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
     async def aclose(self) -> None:

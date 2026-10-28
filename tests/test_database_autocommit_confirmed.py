@@ -35,7 +35,7 @@ from messagefoundry.transports.database import (
     DatabaseLookupExecutor,
     DatabaseSource,
     _acquire,
-    _discard_connection,
+    _close_and_release,
     _make_pool,
 )
 
@@ -172,19 +172,23 @@ async def test_the_context_manager_form_is_confirmed_too(driver: _Driver) -> Non
     assert driver.pools[0].released == [conn]
 
 
-async def test_a_connection_that_does_not_keep_autocommit_is_refused_and_discarded(
+async def test_a_connection_that_does_not_keep_autocommit_is_refused_and_set_again(
     driver: _Driver,
 ) -> None:
-    """The read-back: a set the driver does not keep refuses the borrow. The connection is closed
-    and returned, so the pool does not hand the same one to the next caller."""
+    """The read-back: a set that does not take refuses the borrow. The connection goes back to the
+    pool unconfirmed, so its next borrow sets the mode again before any statement runs on it."""
     driver.sticky = False
     pool = await _make_pool("DSN=x", 2, autocommit=True, login_timeout=5)
     with pytest.raises(AutocommitNotConfirmed) as info:
         await _acquire(pool, 5.0)
     inner = driver.pools[0]
-    assert inner.conn.closed is True
     assert inner.released == [inner.conn]
+    assert inner.conn.closed is False
     assert "DSN" not in str(info.value)  # names no connection detail
+    with pytest.raises(AutocommitNotConfirmed):
+        await _acquire(pool, 5.0)
+    assert inner.conn._conn.sets == [True, True]  # never trusted on the strength of the first try
+    assert inner.conn.executed_under == []
 
 
 async def test_a_connection_with_no_driver_handle_is_refused(driver: _Driver) -> None:
@@ -252,18 +256,19 @@ async def test_a_borrow_abandoned_mid_set_keeps_its_bound_and_never_closes_under
     assert raw.autocommit is True and inner.conn.closed is False  # the set passed: returned, kept
 
 
-async def test_a_discard_returns_the_slot_even_when_cancelled_during_the_close() -> None:
-    """A slot nobody returns would leave the pool's ``wait_closed`` waiting forever."""
+async def test_a_cancelled_cursor_close_still_returns_the_connection() -> None:
+    """A slot nobody returns would leave the pool's ``wait_closed`` waiting forever. A cursor close
+    can take a while (the driver discards unread rows), so a cancellation can land inside it."""
     entered = asyncio.Event()
+    conn = _Connection(_RawConnection())
+    pool = _Pool(conn)
 
-    class _SlowClose(_Connection):
+    class _SlowCursor(_Cursor):
         async def close(self) -> None:
             entered.set()
             await asyncio.Event().wait()
 
-    conn = _SlowClose(_RawConnection())
-    pool = _Pool(conn)
-    task = asyncio.ensure_future(_discard_connection(pool, conn))
+    task = asyncio.ensure_future(_close_and_release(pool, conn, _SlowCursor(conn)))
     await entered.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
