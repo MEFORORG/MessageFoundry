@@ -623,8 +623,10 @@ class AuditKeyVersionRefusedError(CipherError):
 
     The pinned version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
     So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
-    a walk that could not run. Transit also refuses a version its policy retires, so the break says
-    both."""
+    a walk that could not run. Transit also refuses a version its policy retires, and a version a
+    node that lags a rotation does not hold yet, and its reply cannot tell those apart from a
+    planted version, as :class:`RowSealUnverifiableError` says for a row seal. So the break says
+    all three, and a re-check against a node that holds the latest version is the first step."""
 
     def __init__(self, version: int) -> None:
         # The version alone in ``args``, so a copy or pickle rebuilds the same exception.
@@ -633,8 +635,8 @@ class AuditKeyVersionRefusedError(CipherError):
 
     def __str__(self) -> str:
         return (
-            f"Transit refused audit key version {self.version}: the key does not hold it, or its "
-            "policy retires it"
+            f"Transit refused audit key version {self.version}: its reply cannot tell a retired "
+            "version from a planted one or from a Vault node that lags a rotation"
         )
 
 

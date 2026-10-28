@@ -356,8 +356,12 @@ class TransitCipher(_UnmarkedPolicy):
         too. Fixed input keeps a row's own content from deciding the answer. The probe must also
         name a different version, or the refusal was not about the version.
 
-        This infers the cause from the reply; it does not read the key's version range. So a node
-        whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
+        This infers the cause from the reply; it does not read the key's version range. So it cannot
+        tell a retired version from a lagging node: a node whose copy of the key lags a rotation
+        can refuse a real, newer version and still pass. The chain walk reports the row as a break
+        either way, which is the same rule :meth:`verify_seal_hmac` applies to a row seal, where
+        such a refusal is unverifiable rather than an outage (BACKLOG #2592). The classification
+        is kept: a refusal it cleared is evidence about the row, and an outage is not."""
         if not is_vault_bad_request(exc):
             return False
         # The latest version failing too means this was not a version refusal.
