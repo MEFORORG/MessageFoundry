@@ -118,12 +118,11 @@ answers 503 with a `Retry-After`, the CLI prints one error line, and no session 
 - not a well-formed Transit MAC, or one Transit answers `valid: false` for: a failed seal;
 - well-formed, but Transit refuses to check it while its key still answers: *unverifiable*. The
   seal names a key version below `min_decryption_version`, one the Vault node that answered does
-  not hold yet, or a planted one, and the reply cannot tell them apart. (A refusal of exactly the
-  newest version Transit has named to this process cannot be a retirement, so that one is read
-  as a node lagging a rotation: an outage.) Otherwise it is treated as a
-  failed seal, under its own audit action, `integrity.authority_seal_unverifiable`: the row is
-  denied, a session is ended, and a directory map grants nothing. The API refuses an edit of a
-  custom role whose seal is unverifiable (HTTP 409); delete it and create it again. Before raising the
+  not hold yet, or a planted one, and the reply cannot tell them apart. So a genuine seal checked
+  against a Vault node that lags a rotation reads as unverifiable, and its user signs in again. It
+  is treated as a failed seal, under its own audit action, `integrity.authority_seal_unverifiable`:
+  the row is denied, a session is ended, and a directory map grants nothing. The API refuses an
+  edit of a custom role whose seal is unverifiable (HTTP 409); delete it and create it again. Before raising the
   minimum, read [Raising the Transit audit key's minimum
   version](#raising-the-transit-audit-keys-minimum-version);
 - anything else Transit answers: an outage, as above.
@@ -162,7 +161,8 @@ Under `vault_transit`, every authority row seal is an HMAC under the audit key, 
 was made under. **Do not raise the audit key's `min_decryption_version` while rows sealed under
 the older versions remain.** Transit then refuses to check those seals, so each such row is
 *unverifiable* and treated as a failed seal: its session is ended, its account or role grants
-nothing, and its directory map is empty. A row is sealed again only when the engine writes it, and
+nothing, and its directory map grants nothing and refuses a listing or a replacement (HTTP 409)
+until it is cleared. A row is sealed again only when the engine writes it, and
 no command re-seals rows yet. Lowering the minimum again makes the rows verify again, except a row
 the engine changed without re-sealing while it was unverifiable: deleting a custom role removes
 its holders' and its directory map's rows of it that way, so those records then fail as forged.

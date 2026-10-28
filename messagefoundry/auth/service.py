@@ -10140,7 +10140,7 @@ class AuthService:
             )
             return
         await self._report_seal_failure(
-            ref,
+            f"{SESSION_KIND}:{ref}",
             f"a {SESSION_KIND} row {seal_report_text(unverifiable).verb} and was ended"
             f" (session {ref})",
             {"kind": SESSION_KIND, "session": ref},
@@ -10153,12 +10153,13 @@ class AuthService:
         """Report one authority row that failed its integrity seal (BACKLOG #2592): a WARNING, an
         :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row carrying ``detail``, and an
         ``integrity_drift`` alert, at most once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`
-        per ``key``. With ``unverifiable``, a seal Vault transit refused to check, the audit row is
-        :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION`, the throttle key is its own, and the page goes
-        through the sealer under the unverifiable subject, keyed per row exactly as a failed seal's
-        is. ``reason`` and ``detail`` name the row by an id, never a row value. A store
-        refusal of the audit write is logged, not raised, so it does not turn a denial into an
-        error."""
+        per ``key``, the row's kind and id. With ``unverifiable``, a seal Vault transit refused to
+        check, the audit row is :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION`, the throttle key is its
+        own, and the page goes through the sealer under the unverifiable subject with ``key``
+        appended, so a sink's per-subject throttle is per row. Neither page is sent when the
+        service was built with no ``integrity_alert``. ``reason`` and ``detail`` name the row by an
+        id, never a row value. A store refusal of the audit write is logged, not raised, so it does
+        not turn a denial into an error."""
         action, _verb, throttle_key = seal_report_text(unverifiable, key)
         if not self._seal_failures_reported.due(throttle_key):
             return
@@ -10171,11 +10172,13 @@ class AuthService:
             errors=audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
         )
+        if self._integrity_alert is None:
+            return
         # An unverifiable seal pages per row too, since a planted version reads as one, but under
         # its own subject, so a flood of them after a minimum is raised never mutes a forgery's.
         if unverifiable:
-            alert_unverifiable_row(self._store.row_sealer(), reason)
-        elif self._integrity_alert is not None:
+            alert_unverifiable_row(self._store.row_sealer(), key, reason)
+        else:
             self._integrity_alert(reason)
 
     @asynccontextmanager

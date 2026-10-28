@@ -1394,7 +1394,7 @@ def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
 TRANSIT_SEAL_SUBJECT = "authority-seal-transit"
 #: The subject for a well-formed seal Transit refused to check while its key answers. Apart from
 #: :data:`TRANSIT_SEAL_SUBJECT`, so a passing outage never throttles away this one, which is treated
-#: as a failed seal and needs an operator.
+#: as a failed seal and needs an operator. Each row's page appends ``":<kind>:<id>"`` to it.
 TRANSIT_SEAL_UNVERIFIABLE_SUBJECT = "authority-seal-transit-unverifiable"
 #: The cause the sealer passes for that case: ``row_seal.TRANSIT_UNVERIFIABLE_CAUSE``, spelled here
 #: so this module imports nothing from the store.
@@ -1403,19 +1403,21 @@ _TRANSIT_UNVERIFIABLE_CAUSE = "transit-unverifiable"
 
 def transit_seal_alert(sink: AlertSink) -> Callable[[str, str], None]:
     """An alert hook for :meth:`~messagefoundry.store.row_seal.TransitRowSealer.set_alert_hook`:
-    each call raises ``integrity_drift`` under :data:`TRANSIT_SEAL_UNVERIFIABLE_SUBJECT` for the
-    ``"transit-unverifiable"`` cause and :data:`TRANSIT_SEAL_SUBJECT` for any other: the same
-    method a failed seal raises (:func:`authority_seal_alert`). The sealer calls it on its own
-    throttled ERROR path, at most once per throttle window per cause, and
-    ``row_seal.alert_unverifiable_row`` calls it once per unverifiable row a caller reports, each
-    throttled per row by that caller (BACKLOG #2592).
+    each call raises ``integrity_drift``, the same method a failed seal raises
+    (:func:`authority_seal_alert`). The sealer pages an outage on its own throttled ERROR path, at
+    most once per throttle window, under :data:`TRANSIT_SEAL_SUBJECT`.
+    ``row_seal.alert_unverifiable_row`` pages once per unverifiable row a caller reports, each
+    throttled per row by that caller, with a cause of ``"transit-unverifiable:<row>"``; its subject
+    is :data:`TRANSIT_SEAL_UNVERIFIABLE_SUBJECT` with the same ``":<row>"``, so a sink that
+    throttles per subject throttles per row (BACKLOG #2592).
 
     The reason names no row value and never Vault's text. Never raises."""
 
     def _raise(cause: str, reason: str) -> None:
+        # "transit-unverifiable:<row>" keeps its ":<row>" on the subject.
         subject = (
-            TRANSIT_SEAL_UNVERIFIABLE_SUBJECT
-            if cause == _TRANSIT_UNVERIFIABLE_CAUSE
+            TRANSIT_SEAL_UNVERIFIABLE_SUBJECT + cause[len(_TRANSIT_UNVERIFIABLE_CAUSE) :]
+            if cause.partition(":")[0] == _TRANSIT_UNVERIFIABLE_CAUSE
             else TRANSIT_SEAL_SUBJECT
         )
         try:

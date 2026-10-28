@@ -7,9 +7,8 @@
   where the key id is a digest of the Transit key's name. It runs under the audit key
   (`MEFOR_STORE_TRANSIT_AUDIT_KEY`, or the data key when that is unset), so the Vault policy now
   also needs `update` on `transit/verify/<audit key>`. Each Transit call runs off the event loop.
-  A successful check is cached for one minute, and the cache is emptied when the engine sees a
-  newer key version, and a check already waiting on Transit then keeps its answer out of the
-  cache. A Transit call that does not complete refuses that request or write: the API answers 503
+  A successful check is cached for one minute, and the cache is emptied when Transit refuses to
+  check a seal, and a check already waiting on Transit then keeps its answer out of the cache. A Transit call that does not complete refuses that request or write: the API answers 503
   with a `Retry-After`, the CLI prints one error line, and the engine logs an error and raises an
   `integrity_drift` alert under `authority-seal-transit`, each at most once per five minutes. It
   writes no `integrity.authority_seal_failed` row and ends no session, since an outage is not a
@@ -17,10 +16,11 @@
   well-formed one Transit refuses to check while its key answers (a retired version, one the node
   does not hold yet, or a planted one) is treated as a failed seal: denied, its session ended, an
   `integrity.authority_seal_unverifiable` audit row, and an `integrity_drift` alert under
-  `authority-seal-transit-unverifiable`, at most once per five minutes for the key. A refusal of
-  exactly the newest version Transit has named to the engine is a lagging node, so an outage. An edit of a custom role in that state is refused with
+  `authority-seal-transit-unverifiable:<kind>:<id>`, at most once per five minutes for each row.
+  No version number is compared, so a genuine seal checked against a Vault node that lags a
+  rotation reads as unverifiable, and its user signs in again. An edit of a custom role in that state is refused with
   409. Before raising the audit key's `min_decryption_version`, read
-  [PHI.md](docs/PHI.md#raising-the-transit-audit-keys-minimum-version). `serve` seals and verifies
+  [PHI.md](../docs/PHI.md#raising-the-transit-audit-keys-minimum-version). `serve` seals and verifies
   fixed input at start, before it seeds the auth tables, and refuses to start when the token
   cannot.
   A row written on `vault_transit` before this change carries no seal, and is refused like any

@@ -2303,7 +2303,7 @@ class ApprovalGate:
             context=f"a request {verb}",
         )
         if unverifiable:  # per request too, but under the sealer's unverifiable subject
-            alert_unverifiable_row(self._store.row_sealer(), reason)
+            alert_unverifiable_row(self._store.row_sealer(), f"{APPROVAL_KIND}:{ref}", reason)
         else:
             authority_seal_alert(self._alert_sink)(reason)
 
