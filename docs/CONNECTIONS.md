@@ -3179,11 +3179,13 @@ reload, and in the live build when `serve` starts (that outbound is recorded fai
 the graph starts), under the default `[security].enforcement = enforce`
 ([ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)). No data
 label relaxes that — `data_class = "synthetic"` used to allow every cleartext hop silently, and no longer
-does. An HTTP-family credential over such a hop to a host off this machine is refused whatever the
-table below says: neither `cleartext_accepted` nor `tls_hop_attested` lifts it, only a loopback host
-(vault BACKLOG #3533 item 4; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
-names the forward-proxy login as the exception). For a hop with no such credential there are exactly
-three ways it crosses:
+does. An HTTP-family credential the refusal recognizes, over such a hop to a host off this machine,
+is refused whatever the table below says. Neither `cleartext_accepted` nor `tls_hop_attested` lifts
+it, only a loopback host (vault BACKLOG #3533 item 4). A secret under a neutral header name still
+crosses, an accepted limit.
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
+states that limit and names the forward-proxy login as an exception. For a hop with no such
+credential there are exactly three ways it crosses:
 
 | | claim | disposition |
 |---|---|---|

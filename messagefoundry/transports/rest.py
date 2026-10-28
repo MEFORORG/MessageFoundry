@@ -1022,8 +1022,9 @@ def refuse_cleartext_credentials(
     such as ``Authorization`` or an API key in any letter case, or by a credential-shaped value),
     and a credential-looking query parameter (vault BACKLOG #3533 item 4). It is the credential half
     of what the ``verify_tls = false`` rule counts, without that rule's name allowlist: a static
-    header with a neutral name and value, such as ``Prefer``, still crosses a declared cleartext hop.
-    That is an accepted limit, decided 2026-10-27; ``docs/SECURITY-LOOSENING.md`` says why. A static
+    header with a neutral name, such as ``Prefer`` or ``X-Session``, still crosses a declared
+    cleartext hop, whatever its value, a secret included. That is an accepted limit, decided
+    2026-10-27; ``docs/SECURITY-LOOSENING.md`` says why. A static
     ``Proxy-Authorization``, in any spelling, is left out when the request goes to a proxy
     (:func:`hop_reaches_a_proxy`), since the send-time proxy rule judges it then; on a hop that
     goes direct it counts. An ``Authorization`` header in the built ``headers``,

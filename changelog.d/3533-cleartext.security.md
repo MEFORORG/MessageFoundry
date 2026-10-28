@@ -5,8 +5,9 @@
   SOAP WS-Security as well. Its credential test now counts the credentials the
   `verify_tls = false` refusal counts, header names in any case, so a static API-key header or a
   credential-shaped value under a neutral name is refused too. It does not take that refusal's
-  header-name allowlist, so a neutral header such as `Prefer` still crosses a declared cleartext
-  hop. That is an accepted limit, decided on 2026-10-27, and
+  header-name allowlist, so any header with a neutral name, such as `Prefer` or `X-Session`, still
+  crosses a declared cleartext hop, whatever its value, a secret included. That is an accepted
+  limit, decided on 2026-10-27, and
   [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
   says why. A static `Proxy-Authorization` is left to the
   send-time proxy rule only when the request goes to a proxy. A hop can bypass a configured
