@@ -6794,11 +6794,12 @@ def _seal_refusal(username: str, act: str, *, unverifiable: bool = False) -> str
             act,
             username,
         )
+        from messagefoundry.auth.service import UNVERIFIABLE_RECOVERY
+
         return (
             f"the store refused the {act} for {username!r}: Vault transit refused to check its "
-            "record's integrity seal. Check that Vault is healthy and that every Vault node holds "
-            "the audit key's latest version, then run the command again; docs/PHI.md, Recovering "
-            "an unverifiable row, gives the next steps"
+            f"record's integrity seal. {UNVERIFIABLE_RECOVERY} docs/PHI.md, Recovering an "
+            "unverifiable row, gives the next steps"
         )
     logging.getLogger(__name__).warning(
         "%s refused for %r: the account's record failed its integrity seal", act, username

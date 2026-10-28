@@ -160,6 +160,7 @@ from messagefoundry.store.row_seal import (
     ADSET_KIND,
     ROLE_KIND,
     SESSION_KIND,
+    SESSION_REF_LEN,
     USER_KIND,
     RowSealError,
     Sealer,
@@ -3002,7 +3003,7 @@ async def _unless_unverifiable(check: Awaitable[bool]) -> bool | None:
 #: The first step of every unverifiable-seal recovery text (BACKLOG #2592). Transit's refusal cannot
 #: tell a lagging node from a retired version, so the transient cause is ruled out before any act
 #: that would replace or destroy a row that may be genuine. docs/PHI.md states the procedure.
-_UNVERIFIABLE_RECOVERY: Final = (
+UNVERIFIABLE_RECOVERY: Final = (
     "This may be transient: first check that Vault is healthy and that every Vault node holds the"
     " audit key's latest version, then retry."
 )
@@ -3020,7 +3021,7 @@ class CustomRoleUnverifiableError(Exception):
         return (
             "this custom role's stored integrity seal cannot be verified by Vault transit, so it"
             " was not saved: a save would replace the permissions it may still hold."
-            f" {_UNVERIFIABLE_RECOVERY} Only if the role was sealed under a key version the audit"
+            f" {UNVERIFIABLE_RECOVERY} Only if the role was sealed under a key version the audit"
             " key's min_decryption_version has retired, lower that minimum until the role"
             " verifies and save it again, which re-seals it; deleting the role and creating it"
             " again is the last resort"
@@ -3044,7 +3045,7 @@ class AdMapUnverifiableError(Exception):
         return (
             f"the {self.name}'s stored integrity seal cannot be verified by Vault transit, so it"
             " cannot be listed or replaced: an edit would overwrite the pairs it may still hold."
-            f" {_UNVERIFIABLE_RECOVERY} Only if the map was sealed under a key version the audit"
+            f" {UNVERIFIABLE_RECOVERY} Only if the map was sealed under a key version the audit"
             " key's min_decryption_version has retired, lower that minimum until the map verifies"
             " and save it again, which re-seals it; clearing the map by saving it with no entries"
             " (PUT /ad-group-map or /ad-group-scope-map) and entering its pairs again is the last"
@@ -3072,9 +3073,10 @@ def seal_report_text(unverifiable: bool, key: str = "") -> SealReport:
     return SealReport(AUTHORITY_SEAL_FAILED_ACTION, "failed its integrity check", key)
 
 
-#: How much of a session's token hash a log line, audit row or alert names. Twelve hex characters, as
-#: the ``auth.session_revoked`` rows already record.
-_SESSION_REF_LEN: Final = 12
+#: How much of a session's token hash a log line, audit row or alert names: the store's own
+#: :data:`~messagefoundry.store.row_seal.SESSION_REF_LEN`, so a session's page subject is one
+#: whichever of the service or the store's write helper reports it (BACKLOG #2592).
+_SESSION_REF_LEN: Final = SESSION_REF_LEN
 #: Vault BACKLOG #3229: the row written when a directory-driven role change (the sign-in role sync
 #: or the reconciler) leaves no enabled Administrator. Its actor is the demoted account and its
 #: detail is ``{"via": ...}``, the role write's ``assigned_by``: ``ad-sync`` or ``ad-reconcile``.
@@ -8016,7 +8018,10 @@ class AuthService:
         # Administrator short-circuit reads the target roles. An absent or disabled account is
         # still judged on its probe.
         role_map = await self._ad_map_unless_unverifiable(AD_ROLE_MAP)
-        scope_map = await self._ad_map_unless_unverifiable(AD_SCOPE_MAP)
+        # Not read when the role map holds every diff anyway.
+        scope_map = (
+            None if role_map is None else await self._ad_map_unless_unverifiable(AD_SCOPE_MAP)
+        )
         for probe in probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT or role_map is None:
                 # plan_pass reads an account missing from both as no role change and no scope

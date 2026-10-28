@@ -1441,6 +1441,16 @@ def test_the_cli_names_vault_first_for_an_unverifiable_write() -> None:
 # --- the per-row unverifiable subjects are capped; a forgery's page is not ----------------------
 
 
+def test_the_cap_window_is_the_sealers_per_row_page_interval() -> None:
+    """alerts.py spells the window to import nothing from the store; this ties the two, so a row
+    that keeps paging keeps its own subject."""
+    from messagefoundry.pipeline import alerts
+
+    assert (
+        alerts._UNVERIFIABLE_SUBJECT_WINDOW_SECONDS == row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS
+    )
+
+
 def test_unverifiable_row_subjects_are_capped_into_one_aggregate() -> None:
     from messagefoundry.pipeline.alerts import MAX_SUBJECT_ALERTS
 
