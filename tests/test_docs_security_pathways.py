@@ -519,10 +519,25 @@ def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> N
     )
 
 
+def _provider_reads(tree: ast.AST) -> int:
+    """How many provider branches ``tree`` holds: each ``.auth_provider`` read and each call of
+    ``_is_directory_account``, the service's shared reading (BACKLOG #3117, #3780). Docstrings are
+    constants, so they never match."""
+    return sum(
+        1
+        for n in ast.walk(tree)
+        if (isinstance(n, ast.Attribute) and n.attr == "auth_provider")
+        or (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "_is_directory_account"
+        )
+    )
+
+
 def _reads_auth_provider(func: Callable[..., Any]) -> bool:
-    """True when ``func``'s body reads ``.auth_provider``. Docstrings are constants, so they never match."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
-    return any(isinstance(n, ast.Attribute) and n.attr == "auth_provider" for n in ast.walk(tree))
+    """True when ``func``'s body holds a provider branch (:func:`_provider_reads`)."""
+    return _provider_reads(ast.parse(textwrap.dedent(inspect.getsource(func)))) > 0
 
 
 def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> None:
@@ -552,20 +567,22 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     """
 
     # Since BACKLOG #3068 the one provider branch lives in the shared helper both second-factor legs
-    # call, so verify_mfa reads no provider itself and the helper reads it exactly once.
-    def _attrs(func: object) -> list[str]:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
+    # call, so verify_mfa reads no provider itself and the helper reads it exactly once (through
+    # _is_directory_account since BACKLOG #3780; _provider_reads counts either form).
+    def _tree(func: object) -> ast.AST:
+        return ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
+
+    def _attrs(tree: ast.AST) -> list[str]:
         return [n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)]
 
-    verify_attrs = _attrs(AuthService.verify_mfa)
-    helper_attrs = _attrs(AuthService._directory_vouches_for_factor)
-    reread_attrs = _attrs(AuthService._factor_holder_current)
+    verify_tree = _tree(AuthService.verify_mfa)
+    helper_tree = _tree(AuthService._directory_vouches_for_factor)
     assert (
-        verify_attrs.count("auth_provider") == 0
-        and reread_attrs.count("auth_provider") == 0
-        and "_directory_vouches_for_factor" in verify_attrs
-        and helper_attrs.count("auth_provider") == 1
-        and "_directory_step_up_refusal" in helper_attrs
+        _provider_reads(verify_tree) == 0
+        and _provider_reads(_tree(AuthService._factor_holder_current)) == 0
+        and "_directory_vouches_for_factor" in _attrs(verify_tree)
+        and _provider_reads(helper_tree) == 1
+        and "_directory_step_up_refusal" in _attrs(helper_tree)
     ), (
         "verify_mfa grew a provider branch beyond the BACKLOG #2023 directory check; re-derive the "
         "pathway rows, which say a directory account's TOTP leg feeds and meets the lockout."
@@ -583,7 +600,6 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
             f"{func.__qualname__} now reads auth_provider. The pathway rows say a directory account "
             "can enrol TOTP or a passkey and that its TOTP leg feeds the lockout; re-derive both."
         )
-    verify_tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService.verify_mfa)))
     assert any(
         isinstance(n, ast.Attribute) and n.attr == "_register_failure"
         for n in ast.walk(verify_tree)
@@ -4685,10 +4701,7 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
     )
     # Since BACKLOG #3068 the branch is the shared helper's: the leg reads no provider itself.
     provider_reads = sum(
-        1
-        for fn in (assertion, helper, _service_func("_factor_holder_current"))
-        for n in ast.walk(fn)
-        if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
+        _provider_reads(fn) for fn in (assertion, helper, _service_func("_factor_holder_current"))
     )
     assert provider_reads == 1, (
         f"finish_webauthn_assertion and its two helpers read auth_provider {provider_reads} "

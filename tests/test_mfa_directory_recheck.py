@@ -1190,8 +1190,9 @@ async def test_the_directory_check_asks_the_shared_provider_reading(
     e = await _enrolled_directory_session(store, monkeypatch)
     monkeypatch.setattr(service_module, "_is_directory_account", lambda user: False)
 
-    await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 
+    assert verified.ok is True  # control: the leg reached the check and passed it
     assert e.directory.probes == []
 
 
@@ -1220,11 +1221,15 @@ async def test_the_session_loader_refuses_a_revoked_row(
 )
 def test_the_second_factor_legs_ask_no_revoked_at_of_a_loaded_session(method: str) -> None:
     """BACKLOG #3780 item 2. A ``revoked_at`` test after ``_load_session`` can never be true, by
-    the premise the test above pins, so these legs carry none. RED when: one comes back."""
+    the premise the test above pins, so these legs carry none on the ``session`` they load. RED
+    when: one comes back."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(AuthService, method))))
     reads = [
         node.lineno
         for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute) and node.attr == "revoked_at"
+        if isinstance(node, ast.Attribute)
+        and node.attr == "revoked_at"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "session"
     ]
     assert reads == []
