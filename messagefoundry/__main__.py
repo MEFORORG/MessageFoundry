@@ -11174,8 +11174,8 @@ def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
 #: checks that each member really calls `configure_logging`.
 #:
 #: `serve` calls `configure_logging` only after its settings, key and egress gates run. For that
-#: window `_serve` first calls `install_filtered_last_resort` (BACKLOG #3768), which gives
-#: `logging.lastResort` the filter chain rather than adding a root handler. `supervise` calls
+#: window `_serve` calls `install_filtered_last_resort` near its start (BACKLOG #3768), whose
+#: docstring says what it covers. `supervise` calls
 #: `configure_logging` on its first line, so it has no such window.
 _CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
 

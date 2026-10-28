@@ -135,15 +135,27 @@ def test_the_filtered_last_resort_redacts_what_no_handler_takes(
     assert logging_setup.install_filtered_last_resort() is resort  # a second call builds nothing
 
     log = logging.getLogger("messagefoundry.test_filtered_last_resort")
-    log.warning("early %s", SYNTHETIC_PHI)
-    log.info("below the level")
+    log.setLevel(logging.INFO)  # so the INFO record reaches lastResort's own level gate
+    try:
+        log.warning("early %s", SYNTHETIC_PHI)
+        log.info("below the level")
+    finally:
+        log.setLevel(logging.NOTSET)
     quiet = logging.getLogger("messagefoundry.test_filtered_last_resort_nonprop")
     monkeypatch.setattr(quiet, "propagate", False)
     quiet.warning("quiet %s", SYNTHETIC_PHI)
-    early = capsys.readouterr()  # capsys swapped sys.stderr after the build: it is followed
+    early = capsys.readouterr()
     assert early.err.count("early") == 1 and early.err.count("quiet") == 1, early.err
     assert "[redacted]" in early.err and "DOE^JANE" not in early.err, early.err
     assert "below the level" not in early.err and early.out == ""
+
+    # sys.stderr swapped AFTER the build is followed, as the stdlib's own lastResort follows it.
+    swapped = io.StringIO()
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "stderr", swapped)
+        log.warning("swapped %s", SYNTHETIC_PHI)
+    assert "swapped" in swapped.getvalue() and "DOE^JANE" not in swapped.getvalue()
+    assert capsys.readouterr().err == ""
 
     configure_logging("INFO")
     log.warning("late %s", SYNTHETIC_PHI)
