@@ -998,7 +998,7 @@ async def test_a_session_revoked_mid_flight_is_not_elevated(
         service = await _service(store, rsa_key)
         token = await _oidc_session(service, monkeypatch, rsa_key)
         flow_id, _url = await _begin(service, token)
-        await service.logout(token, client=None)
+        await service.logout(token, client=None, proven_at=None)
 
         out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
 
