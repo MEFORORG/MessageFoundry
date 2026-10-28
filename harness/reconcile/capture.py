@@ -66,11 +66,14 @@ class CaptureSink:
       a rule that rewrites MSH-10 rewrites the id too. It is ``None`` when that body does not
       parse.
     * An overlay ``keep`` on a field the default rules scrub turns that scrub off. ``load_rules``
-      logs a WARNING for each, and ``kept_defaults`` in the ``rules`` module lists them.
+      logs a WARNING for each, and ``kept_defaults`` in the ``rules`` module lists them. An
+      overlay that points such a field at a different kind is refused unless it lists the field
+      under ``retarget_acknowledged``; ``docs/PHI.md`` section 9 says what a listed one leaves.
     * ``received_at`` is the real time of capture. No rule shifts it, an MSH-7 rule included.
     * Any anonymizer error drops the message. The sink logs one WARNING per drop that names the
       exception class, never its text or the body, and counts it in ``anon_failed``. A weak salt
-      or a bad overlay is one such error, so check both before you start.
+      is one such error, so check it before you start. A bad overlay never gets this far: the
+      anonymizer takes rules, and ``load_rules`` raises on the overlay first.
     * A message that parses gets its ``AA`` even when the anonymizer drops it. A payload that
       does not parse gets no ACK at all, with or without an anonymizer.
 

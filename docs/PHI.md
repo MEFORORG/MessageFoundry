@@ -2450,8 +2450,10 @@ field with no default rule logs nothing. `python -m tee anonymize-captures` also
 **An overlay can also point a default field at a different kind, and that can leave part of the
 field as captured.** The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn`
 rewrite the first component only, so `PID-5` pointed at `id` leaves the given name. `date` keeps
-the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check counts such a field
-as scrubbed, and its shape detectors do not scan what is left. So a clean return does not clear it.
+the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check scans what such a
+field has left past its first component for the shapes in the table above, so a punctuated phone
+number left there refuses. A name, a city or a year left there passes, so a clean return does not
+clear it.
 
 **`load_rules` refuses such a retarget unless the overlay lists the field under
 `retarget_acknowledged`** (vault BACKLOG #3000):
@@ -2464,8 +2466,9 @@ retarget_acknowledged = ["PID-5"]
 "PID-5" = "id"
 ```
 
-A retarget to the same kind, to `drop` or to `freetext` needs no entry, because none of them
-leaves part of the value. An entry that names no retarget needing it, such as a misspelt field,
+A retarget to the same kind needs no entry, because it changes nothing. Nor does one to `drop` or
+`freetext`, which write a constant in place of the field; on `OBX-5`, where `freetext` keeps some
+values, it is already the default kind. An entry that names no retarget needing it, such as a misspelt field,
 is refused too. A listed retarget loads, and `load_rules` logs one WARNING line for each, as it
 does for a keep. The line names the field, the default kind and the new kind, never a value.
 `python -m tee anonymize-captures` prints one `warning:` line that lists them.

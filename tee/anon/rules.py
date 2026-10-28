@@ -15,7 +15,8 @@ The data layer is deliberately incapable of expressing a *transform*: a rule may
 whole-**field** path to an existing :class:`SurrogateKind` (or ``keep``/``drop``). There is no
 expression language, no conditionals, no field arithmetic — the moment a rule needs to *do*
 something new, that is a code change in ``surrogates.py``. :func:`load_rules` **enforces** this at
-load time (it rejects any overlay key that is not a ``path -> kind``/``keep``/``drop``), so the
+load time (it rejects any overlay key that is not a ``path -> kind``/``keep``/``drop``, or the
+``retarget_acknowledged`` list, which only lets a retarget load and maps nothing), so the
 config can never drift into declarative *logic* authoring (CLAUDE.md §12). This shapes test data;
 it is tooling-side only and never enters a Router/Handler or ``pipeline/``.
 
@@ -36,8 +37,10 @@ from pathlib import Path
 #: field's value (ADR 0030 §3), so rules address whole fields only. The number is ASCII digits with
 #: no leading zero: ``PID-0`` is the segment id itself, which the tee would overwrite, and ``PID-05``
 #: or a non-ASCII digit names a field the two adapters and the leak-check would read differently.
-#: The number has at most three digits. No segment has a field past 999, and with no bound a path
-#: of thousands of digits loaded as a rule that names no field (BACKLOG #3493).
+#: The number has at most three digits: with no bound, a path of thousands of digits loaded as a
+#: rule (BACKLOG #3493). The cost is a field past 999, which no rule or keep can name, so
+#: ``require_full_coverage`` refuses a message that carries a value there. No HL7-defined
+#: segment comes near that many fields.
 _FIELD_PATH_RE = re.compile(r"[A-Z][A-Z0-9]{2}-[1-9][0-9]{0,2}")
 
 
@@ -398,7 +401,7 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     if unknown_top:
         raise RuleError(
             f"anon overlay has unexpected top-level key(s) {_quoted(sorted(unknown_top))}; "
-            "only an [hl7] section (fields/keep/drop) is allowed"
+            f"only an [hl7] section (fields/keep/drop/{RETARGET_ACKNOWLEDGED}) is allowed"
         )
     hl7 = data.get("hl7", {})
     if not isinstance(hl7, dict):

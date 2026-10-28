@@ -597,6 +597,12 @@ _CHECKED = pytest.mark.parametrize(
 )
 
 
+def _load_for(checked: Callable[..., str], overlay: Path) -> tuple[FieldRule, ...]:
+    """The overlay loaded by the same package as ``checked``, as a real caller of it would."""
+    loader = tee_rules.load_rules if checked is tee_anonymize_checked else load_rules
+    return loader(overlay)  # type: ignore[return-value]
+
+
 _UNREACHABLE_LINES = pytest.mark.parametrize(
     ("line", "needle"),
     [
@@ -1067,7 +1073,7 @@ def test_full_coverage_counts_an_explicit_keep_as_decided(
 ) -> None:
     overlay = _overlay(tmp_path, '[hl7]\nkeep = ["ZPD-1", "ZPD-2"]\n')
     msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y", "ZPD|ZZTEST^SYNTH|19700101")
-    out = checked(msg, salt=_SALT, rules=load_rules(overlay), require_full_coverage=True)
+    out = checked(msg, salt=_SALT, rules=_load_for(checked, overlay), require_full_coverage=True)
     assert "ZZTEST^SYNTH" in out  # a keep leaves the field as it was
 
 
@@ -1080,7 +1086,9 @@ def test_a_kept_field_is_still_scanned_for_phi_shapes(
     msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y", "ZPD|123-45-6789")
     for strict in (False, True):
         with pytest.raises(Exception, match="SSN-shaped value in ZPD-1"):
-            checked(msg, salt=_SALT, rules=load_rules(overlay), require_full_coverage=strict)
+            checked(
+                msg, salt=_SALT, rules=_load_for(checked, overlay), require_full_coverage=strict
+            )
 
 
 @_NO_SCANNER

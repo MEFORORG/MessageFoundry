@@ -324,6 +324,82 @@ def test_the_sibling_is_exported(anon: ModuleType) -> None:
     assert "retargeted_defaults" in anon.__all__
 
 
+# --- the leak-check scans what an acknowledged retarget leaves (BACKLOG #3493) -------------------
+
+# PID-13 with a punctuated phone number in a later component, XTN.9, which ``id`` leaves.
+_PHONE_LEFT = _MESSAGE.replace(
+    "5550100^PRN^PH^zz@example.invalid", "5550100^PRN^PH^^^^^^(555) 555-0199"
+)
+
+
+@_BOTH
+def test_a_shape_an_acknowledged_retarget_leaves_refuses(anon: ModuleType, tmp_path: Path) -> None:
+    loaded = anon.rules.load_rules(_overlay(tmp_path, _acknowledged("PID-13", "id")))
+    with pytest.raises(anon.LeakError) as exc:
+        anon.anonymize_checked(_PHONE_LEFT, salt=_SALT, rules=loaded)
+
+    message = str(exc.value)
+    assert "phone-shaped value left by a retarget in PID-13" in message
+    assert "Point each retargeted field back at its default kind" in message
+    assert "555-0199" not in message
+
+    # Controls: the default phone kind rewrites the whole repetition, so nothing is left; and
+    # the same retarget over a PID-13 that holds no such shape past component 1 passes.
+    assert "555-0199" not in anon.anonymize_checked(_PHONE_LEFT, salt=_SALT)
+    assert "zz@example.invalid" in anon.anonymize_checked(_MESSAGE, salt=_SALT, rules=loaded)
+
+
+@_BOTH
+@pytest.mark.parametrize(
+    ("path", "kind"),
+    [
+        # The surrogate id stays in component 1 beside an MR type code. Not a hit: the id is
+        # the surrogate, and component 1 is left out of the scan.
+        ("PID-3", "id"),
+        ("PID-3", "ssn"),
+        # The kinds that rewrite the whole repetition leave nothing to find.
+        ("PID-5", "address"),
+        ("PID-5", "phone"),
+        ("PID-11", "name"),
+        ("PID-13", "provider"),
+        ("PID-7", "date"),
+        ("PV1-7", "dob"),
+    ],
+)
+def test_a_retarget_whose_output_has_no_captured_shape_passes(
+    anon: ModuleType, tmp_path: Path, path: str, kind: str
+) -> None:
+    loaded = anon.rules.load_rules(_overlay(tmp_path, _acknowledged(path, kind)))
+    anon.anonymize_checked(_MESSAGE, salt=_SALT, rules=loaded)
+    assert (
+        anon.leak.retarget_residue_hits(anon.anonymize(_MESSAGE, salt=_SALT, rules=loaded), loaded)
+        == []
+    )
+
+
+@_BOTH
+def test_no_pool_value_has_a_shape_the_residue_scan_looks_for(anon: ModuleType) -> None:
+    # The residue scan rests on this: a kind that rewrites a whole repetition writes from these
+    # pools, so its output past component 1 never trips a detector.
+    seps = anon.surrogates.Seps()
+    values = [
+        seps.component.join(entry) if isinstance(entry, tuple) else str(entry)
+        for name in dir(anon._pools)
+        if isinstance(pool := getattr(anon._pools, name), (tuple, list))
+        for entry in pool
+    ]
+    assert len(values) > 50  # the pools were read, not an empty walk
+    assert [value for value in values if anon.leak._structural_reasons(value, seps)] == []
+
+
+@_BOTH
+def test_the_residue_scan_is_off_with_no_retarget(anon: ModuleType) -> None:
+    # Control: the same message with the default rules, and a rule set with no default changed.
+    assert anon.leak.retarget_residue_hits(_PHONE_LEFT, anon.DEFAULT_RULES) == []
+    built = (*anon.DEFAULT_RULES, anon.FieldRule("ZPD-1", "id"))
+    assert anon.leak.retarget_residue_hits(_PHONE_LEFT, built) == []
+
+
 # --- warned on every load, and the anonymizer never loads ----------------------------------------
 
 _MESSAGES = 50
@@ -366,6 +442,13 @@ def test_many_messages_with_one_load_warn_once(
 
     # One keep line and one retarget line for the whole run.
     assert len(lines) == 2
+
+    # Control: the handler does count repeats, so the 2 above is not a quiet logger. Loading per
+    # message, as the anonymizer used to, gives two lines per message.
+    with _warnings(anon.rules) as repeated:
+        for _ in range(_MESSAGES):
+            getattr(anon, entry)(_MESSAGE, salt=_SALT, rules=anon.rules.load_rules(overlay))
+    assert len(repeated) == 2 * _MESSAGES
 
 
 @_BOTH

@@ -44,7 +44,7 @@ from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 
-from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind
+from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind, retargeted_defaults
 from .surrogates import Seps, message_has_site_code, read_message_seps
 
 
@@ -443,6 +443,45 @@ def structural_phi_hits(
     return hits
 
 
+#: What a hit in the part of a field a retarget left reads as, after its shape label.
+RETARGET_RESIDUE = "left by a retarget"
+
+
+def retarget_residue_hits(
+    text: str, rules: tuple[FieldRule, ...], *, version: str | None = None
+) -> list[str]:
+    """Structural PHI-shape hits in what a retarget of a default field left in ``text``
+    (BACKLOG #3493). Reasons name the shape and the field address only, never a value.
+
+    A rule that points a default field at a different kind (:func:`.rules.retargeted_defaults`)
+    maps the field, so :func:`structural_phi_hits` never scans it. ``id``, ``mrn`` and ``ssn``
+    rewrite component 1 only, and the rest of the captured value stays. So each repetition of
+    such a field is scanned here with its component 1 left out. The kinds that rewrite a whole
+    repetition write it from fixed pools or as one component, and
+    ``tests/test_anon_overlay_retarget_warning.py`` pins that no pool value has one of these
+    shapes, so this adds no hit for them. With component 1 left out, a CX never reads as
+    MRN-typed, which is right: its id is the surrogate."""
+    retargeted = {default.path for default, _ in retargeted_defaults(rules)}
+    parsed = read_message_seps(text)
+    if not retargeted or parsed is None:
+        return []
+    seps = parsed[0]
+    mapped = {r.path for r in rules if r.kind != SurrogateKind.KEEP} - retargeted
+    hits: list[str] = []
+    for address, value in unmapped_field_values(text, mapped, version=version):
+        if address not in retargeted:
+            continue
+        rest = seps.repetition.join(
+            seps.component.join(["", *rep.split(seps.component)[1:]])
+            for rep in value.split(seps.repetition)
+        )
+        hits.extend(
+            f"{reason.removeprefix('unmapped ')} {RETARGET_RESIDUE} in {address}"
+            for reason in _structural_reasons(rest, seps)
+        )
+    return hits
+
+
 def has_unreachable_line(text: str, mapped_paths: Iterable[str] = ()) -> bool:
     """True if ``text`` holds a line no rule can reach, by the same walk the leak-check uses.
     ``normalized_message`` refuses on it, so plain ``anonymize`` and ``anonymize_checked`` agree
@@ -545,6 +584,7 @@ def leak_report(
         walked = unmapped_field_values(text, mapped_paths, version=version)
         unmapped = tuple(sorted({addr for addr, _ in walked}))
         structural = structural_phi_hits(text, mapped_paths, version=version)
+        structural += retarget_residue_hits(text, rules, version=version)
         decided = {r.path for r in rules}
         # A bare line has no field a rule could name, so a rule or a keep on ANY field of its
         # segment decides it (BACKLOG #3001).
@@ -609,9 +649,16 @@ def refusal_advice(
     (BACKLOG #2247). PHI-safe: fixed text, chosen by the kind of hit and never by a value."""
     steps: list[str] = []
     token_hit = len(report.hits) > len(report.structural_hits)
-    shape_hit = any(hit != MALFORMED_LINE_HIT for hit in report.structural_hits)
+    residue_hit = any(RETARGET_RESIDUE in hit for hit in report.structural_hits)
+    shape_hit = any(
+        hit != MALFORMED_LINE_HIT and RETARGET_RESIDUE not in hit for hit in report.structural_hits
+    )
     if token_hit or shape_hit:
         steps.append("Extend the rule map so the field that carries it is scrubbed.")
+    if residue_hit:
+        steps.append(
+            "Point each retargeted field back at its default kind, or at drop or freetext."
+        )
     if coverage_refused:
         steps.append("Add a rule for each field named, or a keep for one you reviewed.")
         if any(address.endswith(BARE_LINE) for address in report.undecided_fields):
