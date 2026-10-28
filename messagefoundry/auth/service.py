@@ -940,6 +940,14 @@ DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 #: #3082). Audited beside :data:`DIRECTORY_UNCONFIRMED`.
 DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
 
+#: The ``auth.login_failed`` reason for a directory sign-in refused because Vault transit refused to
+#: check the seal of an AD map that sign-in writes from (BACKLOG #2592): the group-to-role map, or,
+#: for an account that is not an Administrator, the group-to-channel map. Refused rather than
+#: signed in with nothing, because a write from a map read as empty would replace the account's
+#: genuine roles or scope while Vault may only lag a rotation. Nothing is written; the map's own
+#: seal report pages, per map.
+DIRECTORY_MAP_UNVERIFIABLE = "directory_map_unverifiable"
+
 
 class DirectoryRefusal(Enum):
     """Why a step-up leg refused a directory account it never checked the proof of, carried on
@@ -6865,7 +6873,24 @@ class AuthService:
                 principal.username, "oidc", reason, client=client, extra=refusal_extra
             )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=reason)
-        role_ids = sorted(await self._ad_roles_for_groups(principal.groups))
+        # BACKLOG #2592. Both maps are read before anything is written. A map Vault transit refused
+        # to check refuses the sign-in: read as empty, it would strip the account's genuine roles
+        # or scope while Vault may only lag a rotation. A map that FAILS its seal still reads as
+        # empty and grants nothing, as before. The scope map is not read for an Administrator,
+        # whose groups the scope decision ignores.
+        role_map = await self._ad_map_unless_unverifiable(AD_ROLE_MAP)
+        role_ids = [] if role_map is None else sorted(role_map.values_for(principal.groups))
+        ad_roles = _roles_from_ids(role_ids)
+        administrator = Role.ADMINISTRATOR in ad_roles
+        scope_map = (
+            AdMap(AD_SCOPE_MAP)
+            if administrator or role_map is None
+            else await self._ad_map_unless_unverifiable(AD_SCOPE_MAP)
+        )
+        if role_map is None or scope_map is None:
+            return await self._refuse_directory_row(
+                principal.username, DIRECTORY_MAP_UNVERIFIABLE, client=client, extra=refusal_extra
+            )
         previous = set(user.role_ids)
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
         # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a sync that takes
@@ -6902,9 +6927,14 @@ class AuthService:
                 client=client,
                 detail={"roles": role_ids, "source": "directory"},
             )
-        ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
-        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups, client=client)
+        user = await self._sync_ad_channel_scope(
+            user,
+            ad_roles,
+            principal.groups,
+            mapped=frozenset(scope_map.values_for(principal.groups)),
+            client=client,
+        )
         identity = Identity.build(
             user_id=user.id,
             username=user.username,
@@ -7047,6 +7077,7 @@ class AuthService:
         roles: frozenset[Role],
         groups: Iterable[str],
         *,
+        mapped: frozenset[str] | None = None,
         client: str | None = None,
     ) -> VerifiedUser:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
@@ -7060,14 +7091,22 @@ class AuthService:
 
         History worth keeping: before BACKLOG #1927 this path returned early for every no-match
         login, so a user removed from their last scope-mapped group kept the directory's channels
-        for as long as the account existed."""
+        for as long as the account existed.
+
+        ``mapped``, when given, is what the group-to-channel map gives ``groups``, read by a caller
+        that checked the map before its role write (BACKLOG #2592); otherwise it is read here."""
         administrator = Role.ADMINISTRATOR in roles
+        if administrator:
+            mapped = (
+                frozenset()
+            )  # an administrator's groups are not read: the decision ignores them
+        elif mapped is None:
+            mapped = await self._ad_channels_for_groups(groups)
         decision = channel_scope.decide_ad_channel_scope(
             channel_scope.ScopeInput(
                 stored_scope=user.channel_scope,
                 stored_source=user.channel_scope_source,
-                # An administrator's groups are not read: the decision ignores them.
-                mapped=frozenset() if administrator else await self._ad_channels_for_groups(groups),
+                mapped=mapped,
                 administrator=administrator,
             )
         )
@@ -10538,13 +10577,21 @@ class AuthService:
         a save re-seals only what is entered. When Vault transit refused to check it, reported and
         :class:`AdMapUnverifiableError`: an empty listing would invite a save that replaces pairs
         that may be genuine (BACKLOG #2592)."""
+        current = await self._ad_map_unless_unverifiable(name)
+        if current is None:
+            raise AdMapUnverifiableError(name)
+        return current
+
+    async def _ad_map_unless_unverifiable(self, name: str) -> AdMap | None:
+        """The map ``name`` for a caller that writes or revokes from it: empty when it fails its
+        seal, so it grants nothing, and ``None`` when Vault transit refused to check it, so the
+        caller holds its write rather than act on an empty map that would replace genuine roles
+        or scope (BACKLOG #2592). Either failure is reported."""
         current, holds = await self._checked_ad_map(name)
         if holds:
             return current
         await self._ad_map_seal_failed(name, unverifiable=holds is None)
-        if holds is None:
-            raise AdMapUnverifiableError(name)
-        return AdMap(name)
+        return None if holds is None else AdMap(name)
 
     async def _refuse_unverifiable_ad_map(self, name: str, entries: Sequence[object]) -> None:
         """Refuse replacing map ``name`` with ``entries`` while Vault transit refuses to check its
@@ -10561,9 +10608,10 @@ class AuthService:
 
     async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the AD group-to-role map gives ``groups``; none when the map fails its
-        seal. A directory role decision reads the map through here, through :meth:`_ad_map` once
-        for a whole pass, or through :meth:`_directory_roles_lost`, which tells a failing map from a
-        lost role."""
+        seal. Only for a decision that writes nothing and so only narrows, as the certificate path
+        does. Sign-in and the reconciler, which write or revoke from the map, read it through
+        :meth:`_ad_map_unless_unverifiable`; a step-up reads it through
+        :meth:`_directory_roles_lost`, which tells a failing map from a lost role."""
         return (await self._ad_map(AD_ROLE_MAP)).values_for(groups)
 
     async def _ad_channels_for_groups(self, groups: Iterable[str]) -> frozenset[str]:

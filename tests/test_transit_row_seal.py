@@ -30,6 +30,7 @@ import pytest
 from messagefoundry.auth.service import (
     AUTHORITY_SEAL_FAILED_ACTION,
     AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
+    DIRECTORY_MAP_UNVERIFIABLE,
     DIRECTORY_ROLE_MAP_UNSEALED,
     AdMapUnverifiableError,
     AuthService,
@@ -974,3 +975,120 @@ def test_the_awaited_local_forms_answer_like_the_sync_ones() -> None:
         assert not await sealer.verify_async(SESSION_KIND, [("token_hash", "x")], seal)
 
     asyncio.run(run())
+
+
+# --- a directory decision that writes holds on an unverifiable map (BACKLOG #2592) ---------------
+
+_OPS = "cn=mf-ops,dc=test,dc=invalid"
+_CHANS = "cn=mf-chan,dc=test,dc=invalid"
+
+
+async def _set_map_version(path: Path, name: str, *, planted: bool) -> None:
+    """Rewrite map ``name``'s genuine seal to name a version Transit does not hold, or back, so
+    only that map is unverifiable while every other row still verifies."""
+    old, new = (":vault:v1:", ":vault:v7:") if planted else (":vault:v7:", ":vault:v1:")
+    await _raw_for(path)(
+        "UPDATE authority_set_seal SET seal = replace(seal, ?, ?) WHERE name = ?",
+        (old, new, name),
+    )
+
+
+def _login_refusals(path: Path, reason: str) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT detail FROM audit_log WHERE action = 'auth.login_failed'"
+        ).fetchall()
+        return sum(1 for (detail,) in rows if f'"reason": "{reason}"' in str(detail))
+    finally:
+        conn.close()
+
+
+async def _directory_service(store: MessageStore, ldap: Any) -> AuthService:
+    from tests.test_ad_session_reconcile import _ad_settings
+
+    service = AuthService(store, _ad_settings(), ldap=ldap, integrity_alert=lambda _r: None)
+    await service.initialize()
+    return service
+
+
+@pytest.mark.parametrize("unverifiable", [AD_ROLE_MAP, AD_SCOPE_MAP])
+async def test_a_directory_sign_in_meeting_an_unverifiable_map_is_refused_and_writes_nothing(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch, unverifiable: str
+) -> None:
+    """Before this, the sign-in read an unverifiable role map as empty and wrote no roles onto the
+    account, stripping its genuine ones while Vault might only lag a rotation. Now it refuses,
+    audited, and writes neither roles nor scope; the map pages under its own subject. The
+    federated sign-in ends in the same method, so it is refused the same way."""
+    from tests.test_ad_session_reconcile import _FakeLdap, _principal
+
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    raised = _armed(store, monkeypatch)
+    ldap = _FakeLdap({"jdoe": _principal("jdoe", _CHANS, _OPS)})
+    service = await _directory_service(store, ldap)
+    await service.set_ad_group_map([(_OPS, "operator")], actor="t")
+    await service.set_ad_group_scope_map([(_CHANS, "chan-a")], actor="t")
+    principal = ldap.present["jdoe"]
+    assert (await service._complete_ad_login(principal, None, mfa_verified=True)).ok  # control
+    user = await store.get_user_by_username("jdoe")
+    assert user is not None and user.channel_scope is not None
+    scope_before = user.channel_scope
+    await _set_map_version(path, unverifiable, planted=True)
+    _lapse_cache(store)
+    refused = await service._complete_ad_login(principal, None, mfa_verified=True)
+    assert not refused.ok and refused.token is None
+    assert _login_refusals(path, DIRECTORY_MAP_UNVERIFIABLE) == 1
+    after = await store.get_user_by_username("jdoe")
+    assert after is not None
+    assert await store.get_user_role_ids(after.id) == ["operator"]  # the genuine role is kept
+    assert after.channel_scope == scope_before  # and so is the scope
+    assert raised == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:adset:{unverifiable}"]
+    # Control: once the map verifies again, the same sign-in goes through.
+    await _set_map_version(path, unverifiable, planted=False)
+    assert (await service._complete_ad_login(principal, None, mfa_verified=True)).ok
+
+
+async def test_a_failing_role_map_still_signs_in_with_nothing(transit_store: Opened) -> None:
+    """The forgery control: a map whose seal FAILS, a pair added outside the store, grants
+    nothing, as before. Only a map Transit refused to check holds the write."""
+    from tests.test_ad_session_reconcile import _FakeLdap, _principal
+
+    store, path, _transit = transit_store
+    ldap = _FakeLdap({"jdoe": _principal("jdoe", _OPS)})
+    service = await _directory_service(store, ldap)
+    await service.set_ad_group_map([(_OPS, "operator")], actor="t")
+    principal = ldap.present["jdoe"]
+    assert (await service._complete_ad_login(principal, None, mfa_verified=True)).ok
+    await _raw_for(path)(
+        "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?, ?)",
+        ("cn=planted,dc=test,dc=invalid", "administrator"),
+    )
+    await service._complete_ad_login(principal, None, mfa_verified=True)
+    user = await store.get_user_by_username("jdoe")
+    assert user is not None and await store.get_user_role_ids(user.id) == []
+    assert _login_refusals(path, DIRECTORY_MAP_UNVERIFIABLE) == 0
+    assert _seal_failures(path) >= 1
+
+
+async def test_a_local_administrator_can_clear_an_unverifiable_map(
+    transit_store: Opened,
+) -> None:
+    """The recovery the refusal names needs an account that can sign in while the map is
+    unverifiable. A directory account cannot; a local Administrator can, and can clear it."""
+    from tests._admin_account import login_admin
+
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    service = AuthService(store, AuthSettings())
+    await service.initialize()
+    await service.set_ad_group_map([(_OPS, "operator")], actor="t")
+    await _set_map_version(path, AD_ROLE_MAP, planted=True)
+    _lapse_cache(store)
+    with pytest.raises(AdMapUnverifiableError):
+        await service.list_ad_group_role_map()  # control: the map is unverifiable
+    identity, _token, _password = await login_admin(service)
+    await service.set_ad_group_map([], actor=identity.username)
+    assert await service.list_ad_group_role_map() == []
