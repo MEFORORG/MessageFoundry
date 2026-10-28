@@ -382,8 +382,13 @@ the header counts as a credential and refuses the hop at build.
 the WARN and the audit record decision 2 describes. That was the case decision 2 was written for.
 A header with a neutral name and value, static or per message, still crosses with that body. The
 verify-off rule's header-name allowlist (owner ruling 2026-10-26 on item 7) is not applied to
-cleartext hops. The owner's ruling here named credentials only, so whether the allowlist should
-reach plain `http` off this machine is an open owner question, not built.
+cleartext hops. The owner's ruling here named credentials only. Whether the allowlist should reach
+plain `http` off this machine was then decided: no, under the owner's delegation of 2026-10-27
+(decision `d20261027T133708514-b8b2ed`, after an adversarial review that split). Decision 2
+already accepts that a `cleartext_accepted` hop is not secure, so its body and headers are
+readable on the path. The limit stays accepted, and a neutral header can still carry a secret.
+`docs/SECURITY-LOOSENING.md` records the question and the answer. Until 2026-10-28 this paragraph
+called it an open owner question, not built.
 
 **Why build note 3's argument no longer holds.** It said that refusing a credential would push an
 operator with a legacy Basic-auth peer into writing a false `tls_hop_attested`. The attestation no

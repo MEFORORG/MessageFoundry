@@ -106,9 +106,14 @@ engine has not verified, when the lever named beside each is set:
   told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
 - an HTTP-family static or per-message header with a neutral name, such as `X-Session`, over
   plain `http`, under that hop's own levers. The header allowlist applies on `verify_tls = false`
-  hops only. Whether it should also apply to plain `http` off this machine awaits an owner
-  ruling: the 2026-10-26 ruling on cleartext hops named credentials only (vault BACKLOG #3533
-  item 4);
+  hops only. That is decided, and it stays an accepted limit: plain `http` off this machine refuses
+  credentials only (vault BACKLOG #3533 item 4). The batch 342 Manager asked the owner on
+  2026-10-27: "Should the same allowlist also apply to declared off-box plain-http hops
+  (cleartext_accepted / tls_hop_attested)?" The owner answered "/driver". The Manager decided no,
+  after an adversarial review that split, "decided under the owner's delegation of 2026-10-27"
+  (decision `d20261027T133708514-b8b2ed`). ADR 0153 already accepts that a `cleartext_accepted`
+  hop's body and headers are readable. Refusing neutral headers there adds little, and it would
+  break legacy hops. Until 2026-10-28 this bullet said the question awaited an owner ruling;
 - a secret that is not credential-shaped under an allowlisted header name, such as an opaque token
   in `X-Request-ID`, on a `verify_tls = false` hop. The allowlist reads names, and the value test
   knows only auth-scheme prefixes and JWTs;

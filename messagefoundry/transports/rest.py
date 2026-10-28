@@ -1113,7 +1113,8 @@ def _header_held(name: str, value: object, *, allowlist: bool) -> str | None:
     With ``allowlist``, on a ``verify_tls = false`` hop, any other name off
     :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, in any letter case, is refused for its name alone.
     An off-box cleartext hop passes ``allowlist=False``: the owner's 2026-10-26 ruling on item 4
-    refuses its credentials, and whether its neutral headers meet the list is an open question."""
+    refuses its credentials. Its neutral headers do not meet the list: decided under the owner's
+    delegation of 2026-10-27 (decision d20261027T133708514-b8b2ed)."""
     # Lazy: config.wiring is not otherwise loaded by this module.
     from messagefoundry.config.wiring import _is_secret_header
 
