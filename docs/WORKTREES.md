@@ -892,6 +892,37 @@ minutes. The installer refuses inside Claude Code and on any machine
 other than `-ExpectedHost`; that decides only who registers the task, not what it runs. Tests:
 [`tests/test_pr_state.py`](../tests/test_pr_state.py).
 
+## Ledger acts owed to the Lander — `owed_ledger_acts.py`
+
+**A Lander ledger pass is briefed from this report's output, never from memory or a notes file.**
+On 2026-10-28 two flips asked on engine PRs 2545 and 2546 (rows #3844 and #3025) were held only in
+the Lander's context and an untracked notes file, survived a compaction as a summary, and were left
+out of the next pass's brief.
+
+[`scripts/coord/owed_ledger_acts.py`](../scripts/coord/owed_ledger_acts.py) reads the comments on
+pull requests merged in a window (engine and korus by default) and, through `git` only, a vault
+checkout's ledger at `origin/main`. It prints each ask the ledger has not acted on: `OWED`,
+`MISSING` (the row is in neither ledger file) or `READ` (prose it could not parse). An ask is done
+when the row's banner block changed after the later of the merge and the ask, and now cites the PR
+more often than before. It always exits 0, and a failed read prints an `ERROR` line, never an empty
+report. It does not fetch, so fetch the vault first if its `origin/main` is old; the header prints
+the ref's date.
+
+```powershell
+python scripts\coord\owed_ledger_acts.py --vault <vault checkout>          # last 14 days
+python scripts\coord\owed_ledger_acts.py --vault <vault checkout> --days 3 --all --json
+```
+
+**A Manager asking the Lander for a ledger act puts this marker in the PR comment,** beside the
+prose, even when it also sends mail:
+
+    <!-- lander-ledger-ask rows=#3844,#3025 file=2 -->
+
+`rows` names rows whose banner is owed; `file` counts new rows to file. Either may be left out.
+Without the marker the report falls back to a loose prose read that over-reports. It cannot see an
+ask sent only by mail, or one in an inline review comment. Tests:
+[`tests/test_owed_ledger_acts.py`](../tests/test_owed_ledger_acts.py).
+
 ## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`
 
 `prune-merged.ps1` releases the claims held by a worktree **it** removes, behind a merged-and-clean-and
