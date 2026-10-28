@@ -701,7 +701,9 @@ from typing import Any
 #: gained ``lapsed``, which the console ignores. A console from before this change on this engine
 #: would fail its sign-out with a ``TypeError``, and a newer console on an older one would too; the
 #: pinned digest refuses either pair at mount. The digest moved from ``abc94c8c0254d1ff``.
-#: Re-derived with ``--write`` on the tree merged with main, whose digest was ``5c0af7774d52531e``.
+#: Merged with main: this branch at ``9c07023b6b0f0ba2``; main at ``5c0af7774d52531e``, moved by
+#: BACKLOG #1563's required ``DbInfo.disk_free_status``. Neither parent's value covered both, so the
+#: value below was re-derived with ``--write`` on the merged tree.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
