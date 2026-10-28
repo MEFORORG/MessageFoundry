@@ -8,9 +8,11 @@ memory failed after a context compaction: PRs kept reading as held with their au
 the authors had replied, and green PRs sat unmerged. This report re-derives the answer every pass
 from the PR's own comments and commits, so nothing depends on what a session remembers.
 
-READ-ONLY, AND EXIT 0 ALWAYS. It is a report, not a gate. A repository whose read fails prints as
-an ERROR row naming the reason; it is never omitted, and never printed as an empty list, because
-"no PRs" and "could not read" must not look alike.
+READ-ONLY, AND EXIT 0 ON A FAILED READ. It is a report, not a gate. A repository whose read fails
+prints as an ERROR row naming the reason; it is never omitted, and never printed as an empty list,
+because "no PRs" and "could not read" must not look alike. A reply this script could not turn into
+rows is an ERROR row too, worded as a report defect rather than a read failure. A bad command line
+still exits 2, argparse's usage error.
 
 WHY PYTHON, AND WHAT IT REUSES. ``pr_state.py`` beside it says why coord tooling reading GitHub is
 Python. This script loads ``pr_state.py`` by path and reuses its gh runner, GraphQL wrapper,
@@ -20,9 +22,10 @@ second check-run classifier here to drift. It is fed less than ``pr_state`` feed
 per-run ``isRequired`` needs a PR number argument, which a paginated PR list cannot pass, so here a
 same-named run from an app the rule does not count is read as speaking for the context, and a
 context GitHub requires but the list omits is not surfaced. GREEN is advisory: before arming a
-merge the Lander still reads the live list, as CLAUDE.md section 5 requires. One consequence: a required context whose newest run
-concluded NEUTRAL or SKIPPED counts as green, as ``_pr_checks.PASSING`` and branch protection both
-read it. A required context with no result on the head yet is NOT green.
+merge the Lander still reads the live list, as CLAUDE.md section 5 requires. The vault's and
+korus's lists are hard-coded below, by the commissioning brief's choice, so they too can lag the
+server. A required context whose newest run concluded NEUTRAL or SKIPPED counts as green, as
+``_pr_checks.PASSING`` and branch protection both read it. A required context with no result on the head yet is NOT green.
 
 ONE GRAPHQL QUERY PER REPOSITORY, paginated. Never one ``gh pr view`` per PR. The page is
 ``PR_PAGE`` PRs, below GitHub's 100, because each PR carries its head's contexts, comments and
@@ -38,18 +41,23 @@ login, so the login says nothing about which seat wrote a comment.
   a seat check: it only stops an outside account on a public repository from posting a fake hold
   that would park a PR on its author. A comment from an outside account still counts as a newer
   non-Lander comment, which can only hand the turn TO the Lander, the safe direction.
-* A hold is a Lander comment whose headline, the first bold run (``**...**``), opens with ``Held``
-  or ``Still held``. A bold ``**Held**`` quoted later in a non-hold comment is not a hold.
+* A hold is a Lander comment whose headline opens with the word ``Held`` or ``Still held`` (any
+  case). The headline is the first bold run (``**...**``), and only when it starts within
+  ``HEADLINE_REACH`` characters of the ``)`` closing the session marker, as in
+  ``Lander (session 8a04c9f3), 2026-10-28. **Held, ...**``. A bold ``**Held**`` further into a
+  comment is a mention, not a hold. These are prose heuristics; a machine-readable hold marker
+  would be the sturdier contract, and no such marker exists yet.
 * LANDER's turn: there is no Lander comment; or the latest Lander comment is not a hold; or there is
   a commit newer than the latest hold; or a non-Lander comment newer than it.
 * AUTHOR's turn: the latest Lander comment is a hold and nothing is newer.
 
 "A commit newer than the hold". A hold names the head it held at in backticks in its headline,
 e.g. ``**Held, back to the author, at `f4f4dd470`.**``. That is the preferred signal: if the hold
-names a SHA and the current head does not start with it, there is a new commit. The SHA read is the
-one after ``at``; failing that, the headline's only backticked SHA. A headline naming several SHAs
-with none after ``at`` names no head. Only when the hold names no head does this fall back to the
-head commit's ``committedDate`` against the hold's ``createdAt``. That is the weaker signal:
+names a SHA and the current head does not start with it, there is a new commit. Only a SHA after
+``at`` in the headline counts, so a headline naming the missing fix commit names no head. Only when
+the hold names no head does this fall back to the head commit's ``committedDate`` against the
+hold's ``createdAt``; where that date is unknown too, the row is LANDER's with ``head-unknown``,
+since "cannot tell" must not park a PR on its author. That is the weaker signal:
 ``committedDate`` is the committer date, not the push time, so an old local commit pushed after the
 hold, or a rewrite with ``--committer-date-is-author-date``, can predate it. (A plain rebase rewrites
 the committer date, so it is caught.) Rows decided that way carry ``date-fallback``.
@@ -57,7 +65,9 @@ the committer date, so it is caught.) Rows decided that way carry ``date-fallbac
 WHAT COUNTS AS A COMMENT (the choice made here). Issue comments and submitted PR reviews both count,
 and both are classified by the same body prefix, so a Lander verdict posted as a review body is a
 Lander comment. A review with an empty body counts as a non-Lander comment, because an inline-only
-review is how an author answers a finding in its thread. Skipped entirely: a PENDING review (every
+review is how an author answers a finding in its thread. The cost: every seat shares one login, so
+the Lander's own inline-only review after its hold also hands the turn back to it, the safe
+direction. Two Lander comments in the same second resolve to the non-hold. Skipped entirely: a PENDING review (every
 seat shares one login, so each sees the others' unsubmitted drafts, which the author cannot) and a
 minimized comment or review. Skipped for the TURN, though still counted toward the newest-event
 age: anything authored by a GitHub App or bot (GraphQL ``author.__typename == "Bot"``), such as the
@@ -70,7 +80,8 @@ Inline review-thread comment bodies are not read. Only the latest ``COMMENT_PAGE
 
 FLAGS. ``no-lander-comment``, ``lander-not-hold``, ``new-commit``, ``no-new-commit`` (LANDER's turn
 caused only by a newer non-Lander comment, with no new commit since the hold: the Lander must still
-read it, but can bounce it fast), ``held`` (AUTHOR's turn) and ``date-fallback``.
+read it, but can bounce it fast), ``held`` (AUTHOR's turn), ``date-fallback``, ``head-unknown``,
+and ``in-queue`` / ``auto-armed`` (the PR is already in the merge queue or has auto-merge armed).
 
 Stdlib only.
 """
@@ -113,11 +124,14 @@ REVIEW_PAGE = 50
 TITLE_WIDTH = 50
 
 LANDER_PREFIX = "Lander (session"
-HOLD_HEADS = ("Held", "Still held")
+HOLD_HEADS = ("held", "still held")
+#: How far past the session marker's ")" the headline may start, e.g. ", 2026-10-28. ".
+HEADLINE_REACH = 40
+#: What may follow the word in a hold headline, so "Held-over" or "Heldout" is no hold.
+_HEAD_END = ("", " ", ",", ".", ":", ";", "!")
 #: Associations whose comments may be Lander comments: accounts with standing on the repository.
 TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
-#: SHAs named in backticks. Bounded and literal, so the ReDoS scanner resolves them statically.
-_SHA_IN_BACKTICKS = re.compile(r"`([0-9a-fA-F]{7,40})`")
+#: The held head, named after "at". Bounded and literal, so the ReDoS scanner resolves it statically.
 _SHA_AFTER_AT = re.compile(r"\bat `([0-9a-fA-F]{7,40})`")
 
 LANDER = "LANDER"
@@ -134,6 +148,7 @@ query($owner: String!, $name: String!, $cursor: String) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number title isDraft baseRefName headRefOid mergeable mergeStateStatus
+        mergeQueueEntry { state } autoMergeRequest { enabledAt }
         commits(last: 1) { nodes { commit { oid committedDate statusCheckRollup {
           contexts(first: %CONTEXT_PAGE%) {
             pageInfo { hasNextPage }
@@ -213,7 +228,13 @@ class Event:
 
     @property
     def hold(self) -> bool:
-        return self.lander and headline(self.body).lstrip().startswith(HOLD_HEADS)
+        if not self.lander:
+            return False
+        text = headline(self.body).lstrip().casefold()
+        return any(
+            text.startswith(word) and text[len(word) : len(word) + 1] in _HEAD_END
+            for word in HOLD_HEADS
+        )
 
 
 _nodes = pr_state._nodes
@@ -245,25 +266,28 @@ def _events(pr: dict[str, Any]) -> list[Event]:
 
 
 def headline(body: str) -> str:
-    """The text of a comment's first bold run (``**...**``), or ``""`` where it has none."""
-    start = body.find("**")
-    end = body.find("**", start + 2) if start >= 0 else -1
-    return body[start + 2 : end] if end >= 0 else ""
+    """A Lander comment's headline: its first bold run, if it opens near the session marker.
+
+    ``""`` where the body has no session marker, no bold run, or a first bold run that starts more
+    than ``HEADLINE_REACH`` characters past the marker's ``)``: that run is a mention, not a headline.
+    """
+    text = body.lstrip()
+    close = text.find(")") if text.startswith(LANDER_PREFIX) else -1
+    start = text.find("**", close) if close >= 0 else -1
+    if start < 0 or start - close > HEADLINE_REACH:
+        return ""
+    end = text.find("**", start + 2)
+    return text[start + 2 : end] if end >= 0 else ""
 
 
 def hold_sha(body: str) -> str | None:
     """The head a hold names in its headline, lower-cased, or None.
 
     Only the headline is searched, so a SHA quoted later in the body (a fix commit, a parent, an
-    earlier hold recapped) is never mistaken for the held head. Within it, the SHA after ``at``
-    wins; otherwise the only backticked SHA. Two or more with none after ``at`` name no head.
+    earlier hold recapped) is never mistaken for the held head. Only a SHA after ``at`` counts.
     """
-    head = headline(body)
-    match = _SHA_AFTER_AT.search(head)
-    if match:
-        return match.group(1).lower()
-    found = _SHA_IN_BACKTICKS.findall(head)
-    return found[0].lower() if len(found) == 1 else None
+    match = _SHA_AFTER_AT.search(headline(body))
+    return match.group(1).lower() if match else None
 
 
 def classify(
@@ -274,16 +298,19 @@ def classify(
     landers = [e for e in turn_events if e.lander]
     if not landers:
         return LANDER, ["no-lander-comment"]
-    latest = max(landers, key=lambda e: e.when)
+    # On a same-second tie the non-hold wins, so list order never decides and the Lander looks.
+    latest = max(landers, key=lambda e: (e.when, not e.hold))
     if not latest.hold:
         return LANDER, ["lander-not-hold"]
     flags: list[str] = []
     sha = hold_sha(latest.body)
     if sha is not None:
         new_commit = not head_oid.lower().startswith(sha)
+    elif committed is None:
+        return LANDER, ["head-unknown", "date-fallback"]
     else:
         flags.append("date-fallback")
-        new_commit = committed is not None and committed > latest.when
+        new_commit = committed > latest.when
     newer_comment = any(e.when > latest.when and not e.lander for e in turn_events)
     if new_commit:
         return LANDER, ["new-commit", *flags]
@@ -321,7 +348,7 @@ def _required_green(
     verdict: dict[str, Any] = pr_state.required_verdict(
         read.required, contexts, head_oid, base=pr.get("baseRefName")
     )
-    if read.required_error:
+    if read.required_error and verdict.get("reason") == "no required-context list":
         verdict["reason"] = read.required_error
     state = verdict.get("state")
     return (
@@ -341,6 +368,10 @@ def build_rows(repo: str, read: RepoRead, now: datetime) -> list[dict[str, Any]]
         committed = pr_state.parse_iso(head.get("committedDate")) if on_head else None
         events = _events(pr)
         turn, flags = classify(head_oid, committed, events)
+        if pr.get("mergeQueueEntry"):
+            flags.append("in-queue")
+        if pr.get("autoMergeRequest"):
+            flags.append("auto-armed")
         green, verdict = _required_green(pr, head, read)
         stamps = [e.when for e in events] + ([committed] if committed else [])
         newest = max(stamps) if stamps else None
@@ -355,7 +386,8 @@ def build_rows(repo: str, read: RepoRead, now: datetime) -> list[dict[str, Any]]
                 "mergeStateStatus": pr.get("mergeStateStatus"),
                 "requiredGreen": green,
                 "required": {
-                    k: verdict.get(k) for k in ("state", "failing", "pending", "missing", "reason")
+                    k: verdict.get(k)
+                    for k in ("state", "failing", "pending", "missing", "unknown", "reason")
                 },
                 "turn": turn,
                 "flags": flags,
@@ -375,7 +407,8 @@ def sort_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         age = row.get("ageSeconds")
         return (
             order.get(row["turn"], 3),
-            -(age if isinstance(age, int) else -1),
+            # An undatable PR may be the stalest, so it sorts first in its group, not last.
+            -(age if isinstance(age, int) else sys.maxsize),
             row["repo"],
             number if isinstance(number := row.get("number"), int) else 0,
         )
@@ -498,9 +531,16 @@ def collect(
     rows: list[dict[str, Any]] = []
     for repo in repos:
         try:
-            rows.extend(build_rows(repo, reader(repo), now))
+            read = reader(repo)
         except _READ_ERRORS as exc:
-            rows.append(error_row(repo, f"{type(exc).__name__}: {exc}"[:300]))
+            rows.append(error_row(repo, f"read failed: {type(exc).__name__}: {exc}"[:300]))
+            continue
+        try:
+            rows.extend(build_rows(repo, read, now))
+        except (TypeError, KeyError, AttributeError, ValueError) as exc:
+            # Not a GitHub failure: say so, so a defect here is not chased as an outage.
+            reason = f"rows not built, a report defect: {type(exc).__name__}: {exc}"
+            rows.append(error_row(repo, reason[:300]))
     return sort_rows(rows)
 
 

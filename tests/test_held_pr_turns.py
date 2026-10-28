@@ -180,7 +180,7 @@ def test_hold_with_nothing_newer_is_author_turn(
 def test_hold_then_new_commit_is_lander_turn(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The committedDate predates the hold (a rebase keeps it), yet the SHA named in the hold differs
+    # The committedDate predates the hold (an old local commit pushed late), yet the SHA named in the hold differs
     # from the head, which is the stronger signal.
     pr = _pr(
         3,
@@ -344,13 +344,52 @@ def test_hold_sha_reads_the_headline_only() -> None:
     assert hpt.hold_sha(body) == "1234567ab"
     assert hpt.hold_sha("Lander (session x). **Held.** See `fedcba987`.") is None
     # The SHA after "at" wins over another commit the headline names.
-    assert hpt.hold_sha("x **Held: fix `bbbbbbb` missing, at `aaaaaaa`.**") == "aaaaaaa"
-    # The only SHA in the headline is read; two with none after "at" name no head.
-    assert hpt.hold_sha("x **Held, back to the author (`aaaaaaa`).**") == "aaaaaaa"
-    assert hpt.hold_sha("x **Held: `bbbbbbb` and `ccccccc` are missing.**") is None
+    lander = "Lander (session x). "
+    assert hpt.hold_sha(lander + "**Held: fix `bbbbbbb` missing, at `aaaaaaa`.**") == "aaaaaaa"
+    # A SHA not after "at" names no head: it may be the missing fix, or a hex-spelled word.
+    assert hpt.hold_sha(lander + "**Held: the fix `abcdef1` is not on the head.**") is None
+    assert hpt.hold_sha(lander + "**Held: `defaced` test fails.**") is None
     # A recap of an earlier hold before the bold headline is outside it.
     recap = "Lander (session x). Earlier hold at `ccccccc`. **Still held, at `aaaaaaa`.**"
     assert hpt.hold_sha(recap) == "aaaaaaa"
+
+
+def test_hold_headline_rules() -> None:
+    def hold(body: str) -> bool:
+        return hpt.Event(NOW, body, bot=False, trusted=True).hold
+
+    assert hold("Lander (session x), 2026-10-28. **Held, back to the author, at `abcdef1`.**")
+    assert hold("Lander (session x). **Still Held, at `abcdef1`.**")
+    assert hold("Lander (session x). **HELD.**")
+    assert not hold("Lander (session x). **Held-over check cleared; merging.**")
+    # A bold Held far past the session marker is a mention in a triage note, not a headline.
+    assert not hold(
+        "Lander (session x), 2026-10-28, triage. The merge queue ejected this PR. "
+        "The earlier **Held** is resolved; requeueing."
+    )
+    assert not hpt.Event(NOW, "Lander (session x). **Held.**", bot=False, trusted=False).hold
+
+
+def test_same_second_tie_and_unknown_head_go_to_the_lander() -> None:
+    hold = hpt.Event(NOW, "Lander (session x). **Held, at `abcdef1`.**", bot=False, trusted=True)
+    note = hpt.Event(NOW, "Lander (session x): looking now.", bot=False, trusted=True)
+    head = "abcdef1" + "0" * 33
+    assert hpt.classify(head, None, [hold, note]) == ("LANDER", ["lander-not-hold"])
+    assert hpt.classify(head, None, [note, hold]) == ("LANDER", ["lander-not-hold"])
+    no_sha = hpt.Event(NOW, "Lander (session x). **Held.**", bot=False, trusted=True)
+    assert hpt.classify(head, None, [no_sha]) == ("LANDER", ["head-unknown", "date-fallback"])
+
+
+def test_queue_and_auto_merge_are_flagged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    queued = _pr(90)
+    queued["mergeQueueEntry"] = {"state": "QUEUED"}
+    armed = _pr(91)
+    armed["autoMergeRequest"] = {"enabledAt": "2026-10-28T10:00:00Z"}
+    rows = _engine_rows(tmp_path, capsys, queued, armed)
+    assert rows[90]["flags"] == ["no-lander-comment", "in-queue"]
+    assert rows[91]["flags"] == ["no-lander-comment", "auto-armed"]
 
 
 def test_non_utc_stamp_and_odd_number_do_not_break_the_report(
