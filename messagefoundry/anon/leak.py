@@ -20,7 +20,8 @@ already-pseudonymized field is never re-flagged:
   via ``on_report``) rather than passing unrecorded; and
 * **high-precision structural PHI-shape detectors** over those unmapped values (dashed SSN,
   punctuated NANP phone, CX ``MR``/``MRN``-typed identifier, and a line whose segment id is
-  malformed) — narrow by design to avoid the mass false-positives a broad digit-run search would
+  malformed), plus a dashed SSN or punctuated phone that the message's own field separator cut
+  across fields, when at least one of them is unmapped (BACKLOG #3465) — narrow by design to avoid the mass false-positives a broad digit-run search would
   produce on HL7 bodies (ADR 0030 §5). A name, an undashed number or a date in an unmapped field
   is NOT detected; the coverage report is the only record of it (BACKLOG #1710).
 
@@ -38,7 +39,7 @@ from __future__ import annotations
 import importlib.util
 import re
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -85,6 +86,16 @@ _SSN_DASHED: re.Pattern[str] = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
 #: PUNCTUATED forms are matched — a bare 10-digit run is indistinguishable from an order/account id.
 _PHONE_DASHED: re.Pattern[str] = re.compile(r"(?<!\d)\d{3}-\d{3}-\d{4}(?!\d)")
 _PHONE_PAREN: re.Pattern[str] = re.compile(r"\(\d{3}\)\s?\d{3}-\d{4}")
+_SSN_REASON = "unmapped SSN-shaped value"
+_PHONE_REASON = "unmapped phone-shaped value"
+#: The punctuated shapes, each with its reason. A field separator that is one of their characters,
+#: such as ``-``, cuts a value into several fields, none of which holds the shape whole, so each
+#: line is also read as written for them (BACKLOG #3465).
+_SPLITTABLE_SHAPES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (_SSN_DASHED, _SSN_REASON),
+    (_PHONE_DASHED, _PHONE_REASON),
+    (_PHONE_PAREN, _PHONE_REASON),
+)
 #: HL7 CX id-type codes that mark a component as a medical-record number.
 _MRN_TYPES: frozenset[str] = frozenset({"MR", "MRN"})
 #: A well-formed HL7 segment id: a capital letter, then two capitals or digits (``PID``, ``ZPD``).
@@ -356,11 +367,21 @@ def unmapped_field_values(
     rule names is addressed as :data:`UNKNOWN_SEGMENT`: its fields are still checked, but the id
     itself, which may be a wrapped name, is never printed.
     """
+    return _walk(text, mapped_paths, version, split=False)[0]
+
+
+def _walk(
+    text: str, mapped_paths: set[str], version: str | None, *, split: bool
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """The walk behind :func:`unmapped_field_values`, which returns the first half. With ``split``,
+    the second half is the hits :func:`_split_shape_hits` finds on each line the walk reads field
+    by field; without it, the second half is empty and no line is scanned for them."""
     found = _split_at_header(text)
     if found is None:
-        return []
+        return [], []
     seps, field_sep, lines, header_at = found
     out: list[tuple[str, str]] = []
+    split_hits: list[str] = []
     if version is None:
         version = _header_version(lines[header_at].split(field_sep), seps)
     nameable = known_segments(version) | {path.split("-", 1)[0] for path in mapped_paths}
@@ -378,23 +399,65 @@ def unmapped_field_values(
         # An MSH line ahead of the header is refused whatever it holds. The tee adapter takes
         # the FIRST line whose id reads MSH as its header, so with one here an MSH rule would
         # miss the real header, which this walk never checks.
+        # One address per split index; None for a field the check does not judge.
+        addresses: list[str | None]
         if _line_is_malformed(fields, nameable) or (n < header_at and is_msh):
-            out.append((_MALFORMED_LINE, seg_id))  # always present, even when empty
-            out.extend((f"{MALFORMED_SEGMENT}-{i}", v) for i, v in enumerate(fields) if i and v)
-            continue
-        if len(fields) == 1:
+            # Index 0 is _MALFORMED_LINE, recorded even when empty.
+            addresses = [f"{MALFORMED_SEGMENT}-{i}" for i in range(len(fields))]
+        elif len(fields) == 1:
             # A bare id that passed is in ``nameable``, so it is safe to print. The value is
             # empty: the id is all the line holds, and an empty value trips no detector.
             out.append((f"{seg_id}{BARE_LINE}", ""))
             continue
-        named = seg_id if seg_id in nameable or seg_id.startswith("Z") else UNKNOWN_SEGMENT
-        shift = 1 if seg_id in HEADER_SEGMENTS else 0  # field 1 is the separator itself
-        for i in range(1, len(fields)):
-            value = fields[i]
-            if not value or f"{seg_id}-{i + shift}" in mapped_paths:
+        else:
+            named = seg_id if seg_id in nameable or seg_id.startswith("Z") else UNKNOWN_SEGMENT
+            shift = 1 if seg_id in HEADER_SEGMENTS else 0  # field 1 is the separator itself
+            # The segment id is no field, and a field a rule rewrites is not judged.
+            addresses = [
+                None,
+                *(
+                    None if f"{seg_id}-{i + shift}" in mapped_paths else f"{named}-{i + shift}"
+                    for i in range(1, len(fields))
+                ),
+            ]
+        out.extend(
+            (a, v)
+            for a, v in zip(addresses, fields, strict=True)
+            if a is not None and (v or a == _MALFORMED_LINE)
+        )
+        if split:
+            split_hits.extend(_split_shape_hits(seg, field_sep, addresses))
+    return out, split_hits
+
+
+def _split_shape_hits(line: str, field_sep: str, addresses: Sequence[str | None]) -> list[str]:
+    """Hits for a punctuated shape (:data:`_SPLITTABLE_SHAPES`) that the field separator cuts
+    across fields of ``line``: a match on the line as written that holds the separator, so no one
+    field held it whole (BACKLOG #3465). Under ``|`` no such match exists.
+
+    ``addresses`` names each split index of the line, ``None`` for a field the check does not
+    judge. A match is a hit when at least one field it reaches has an address, and the hit names
+    the first and last of those. So a match that starts in a field a rule rewrote is a hit when it
+    runs on into a field no rule rewrites: the shape reached the output whole.
+
+    At least these pass: the rest of a shape whose first or last part a rule scrubbed, such as
+    ``45-6789``, which is no shape; a shape the sender escaped, such as ``123\\F\\45``, since no
+    detector decodes an escape; and a shape cut by a digit separator, which the shapes' digit
+    boundaries read as part of the number. docs/PHI.md section 9 lists them."""
+    hits: list[str] = []
+    for pattern, reason in _SPLITTABLE_SHAPES:
+        for match in pattern.finditer(line):
+            if field_sep not in match.group():
                 continue
-            out.append((f"{named}-{i + shift}", value))
-    return out
+            # The fields that hold a character of the match. A separator at its first character
+            # belongs to no field, so counting through that character starts at the next field.
+            first = line.count(field_sep, 0, match.start() + 1)
+            last = line.count(field_sep, 0, match.end() - 1)
+            named = [a for a in addresses[first : last + 1] if a is not None]
+            if named:
+                span = named[0] if len(named) == 1 else f"{named[0]} to {named[-1]}"
+                hits.append(f"{reason} across {span}, cut by the field separator")
+    return hits
 
 
 def _has_mrn_typed_identifier(value: str, seps: Seps) -> bool:
@@ -411,10 +474,9 @@ def _has_mrn_typed_identifier(value: str, seps: Seps) -> bool:
 def _structural_reasons(value: str, seps: Seps) -> list[str]:
     """PHI-safe shape labels for one unmapped field value — the SHAPE only, never the value."""
     reasons: list[str] = []
-    if _SSN_DASHED.search(value):
-        reasons.append("unmapped SSN-shaped value")
-    if _PHONE_DASHED.search(value) or _PHONE_PAREN.search(value):
-        reasons.append("unmapped phone-shaped value")
+    for pattern, reason in _SPLITTABLE_SHAPES:
+        if reason not in reasons and pattern.search(value):
+            reasons.append(reason)
     if _has_mrn_typed_identifier(value, seps):
         reasons.append("unmapped MRN-typed identifier")
     return reasons
@@ -430,17 +492,21 @@ def structural_phi_hits(
 
     A line no rule can reach (a malformed segment id, or a short header line; see
     :func:`_line_is_malformed`) is a hit by itself, whatever it holds: the anonymizer passed it
-    through untouched, and a wrapped name or note is exactly what such a line tends to carry."""
+    through untouched, and a wrapped name or note is exactly what such a line tends to carry.
+
+    A dashed SSN or punctuated phone that the message's own field separator cuts across fields
+    is a hit too, named by the fields it spans (:func:`_split_shape_hits`, BACKLOG #3465)."""
     parsed = read_message_seps(text)
     if parsed is None:
         return []
     seps, _field_sep = parsed
     hits: list[str] = []
-    for address, value in unmapped_field_values(text, mapped_paths, version=version):
+    walked, split_hits = _walk(text, mapped_paths, version, split=True)
+    for address, value in walked:
         if address == _MALFORMED_LINE:
             hits.append(MALFORMED_LINE_HIT)
         hits.extend(f"{reason} in {address}" for reason in _structural_reasons(value, seps))
-    return hits
+    return hits + split_hits
 
 
 def has_unreachable_line(text: str, mapped_paths: Iterable[str] = ()) -> bool:
