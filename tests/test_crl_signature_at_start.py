@@ -766,14 +766,12 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
         _hop(ca_file, crl_file)
 
 
-def test_the_reload_s_finding_keeps_the_three_states_apart_and_reports_the_strongest(
-    twins: _Twins,
-) -> None:
+def test_the_reload_s_finding_keeps_the_three_states_apart(twins: _Twins) -> None:
     """Vault BACKLOG #3506 item 8. The reload's check used to fold ``bad``, ``unproven`` and
     ``uncheckable`` into one flag, so the reload could not tell a renewed CA key from a forgery.
-    ``crl_signature_finding`` keeps the state, and across blocks reports the strongest: a proof,
-    then a CA checked and failed, then a CA not checked, then no CA matched, in file order among
-    equals."""
+    ``crl_signature_finding`` keeps the state of the block it reports. Which block that is stays
+    main's: the first a listed CA fits and does not verify, and the first ``unlisted`` block only
+    when the file holds none of those."""
     rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     ders = _ders(twins.new_ca)
     other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-unlisted")])
@@ -789,8 +787,9 @@ def test_the_reload_s_finding_keeps_the_three_states_apart_and_reports_the_stron
         (good, None),
         (unlisted, ("unlisted", 1)),
         (unlisted + uncheckable, ("uncheckable", 2)),
-        (uncheckable + unproven, ("unproven", 2)),
-        (unproven + uncheckable + bad, ("bad", 3)),
+        (unlisted + bad, ("bad", 2)),
+        (good + unlisted + unproven, ("unproven", 3)),
+        (uncheckable + unproven, ("uncheckable", 1)),
         (bad + unproven, ("bad", 1)),
         (unproven + unproven, ("unproven", 1)),
     ]
@@ -809,6 +808,82 @@ def test_the_reload_s_finding_keeps_the_three_states_apart_and_reports_the_stron
         assert pki_module.UNCONFIRMED_SIGNATURE[finding.state] in finding.why
     finding = crl_signature_finding(unlisted, ders)
     assert finding is not None and pki_module.UNLISTED_SIGNATURE in finding.why
+
+
+def _counting_check(
+    monkeypatch: pytest.MonkeyPatch, *, fails_at: int | None = None
+) -> list[x509.CertificateRevocationList]:
+    """Record each CRL the signature check judges, in order. With ``fails_at``, the check of that
+    CRL, counted from 1, raises a RuntimeError instead."""
+    real = pki_module._signature_state
+    judged: list[x509.CertificateRevocationList] = []
+
+    def counting(crl: x509.CertificateRevocationList, cas: list[pki_module._ListedCa]) -> str:
+        judged.append(crl)
+        if len(judged) == fails_at:
+            raise RuntimeError("a defect in the check")
+        return real(crl, cas)
+
+    monkeypatch.setattr(pki_module, "_signature_state", counting)
+    return judged
+
+
+def test_the_reload_s_finding_is_the_first_block_main_stopped_at(
+    twins: _Twins, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3506 code review, round 3. An unproven CRL before a proven bad one reports
+    unproven, and the bad one is not judged at all: the reload looks at exactly the blocks main's
+    check looked at, and only the words of the remedy differ. Round 2 read on for the strongest
+    block, and reported the bad one."""
+    ders = _ders(twins.new_ca)
+    unproven = _crl(twins.stranger, names=None)
+    bad = _crl(twins.stranger, names=twins.new_key)
+    judged = _counting_check(monkeypatch)
+
+    finding = crl_signature_finding(unproven + bad, ders)
+
+    assert finding is not None and finding.state == "unproven", finding
+    assert finding.why.startswith("CRL block 1 of 2"), finding.why
+    assert len(judged) == 1  # the bad block was never judged
+    # Control: the same bad block, first, is found and reported, so the order decides.
+    judged.clear()
+    finding = crl_signature_finding(bad + unproven, ders)
+    assert finding is not None and finding.state == "bad" and len(judged) == 1
+
+
+@pytest.mark.parametrize("before", ["verified", "unlisted", "unproven"])
+def test_a_failure_in_the_reload_s_check_is_raised_as_main_raised_it(
+    twins: _Twins,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    before: str,
+) -> None:
+    """Vault BACKLOG #3506 code review, round 3. Where main's check raised, this raises the same
+    way, so the reload's own handling applies: ``retry``, judged again next pass. Where main
+    returned at an earlier block, this returns there too and never reaches the failure. Round 2
+    instead logged an ERROR from ``pki`` and kept an unproven finding with the words "not
+    judged" added, which the reload then treated as final."""
+    ders = _ders(twins.new_ca)
+    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-unlisted")])
+    first = {
+        "verified": _crl(twins.new_key, names=twins.new_key),
+        "unlisted": _crl(twins.stranger, names=None, name=other),
+        "unproven": _crl(twins.stranger, names=None),
+    }[before]
+    judged = _counting_check(monkeypatch, fails_at=2)
+    pem = first + _crl(twins.new_key, names=twins.new_key)
+
+    with caplog.at_level("DEBUG", logger="messagefoundry.pki"):
+        if before == "unproven":
+            finding = crl_signature_finding(pem, ders)
+            assert finding is not None and finding.state == "unproven", finding
+            assert "not judged" not in finding.why
+            assert len(judged) == 1  # main returned at block 1, so the failure is not reached
+        else:
+            with pytest.raises(RuntimeError, match="a defect in the check"):
+                crl_signature_finding(pem, ders)
+            assert len(judged) == 2
+    assert [r for r in caplog.records if r.name == "messagefoundry.pki"] == []
 
 
 def test_a_version_that_logs_nothing_in_between_does_not_reset_the_record(
@@ -881,53 +956,6 @@ def test_on_a_context_that_already_held_a_crl_the_staging_refusal_comes_before_t
     with pytest.raises(ValueError, match="could not make or read its private copy") as refused:
         _hop(bundle, bundle)
     assert "does not verify" not in str(refused.value)
-
-
-def test_the_reload_s_finding_keeps_an_unconfirmed_verdict_when_a_later_block_fails(
-    twins: _Twins, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Vault BACKLOG #3506 code review, round 2. The reload's check stopped at the first
-    unconfirmed block before item 8, so a failure on a later block never reached it. Item 8 reads
-    on for a stronger finding, and a failure there threw the verdict away: the reload then told
-    the operator to restart, with the signature unjudged. It now keeps the verdict, as a start
-    does, and logs the failure."""
-    real = pki_module._signature_state
-    calls = 0
-
-    def second_fails(crl: x509.CertificateRevocationList, cas: list[pki_module._ListedCa]) -> str:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("a defect in the check")
-        return real(crl, cas)
-
-    monkeypatch.setattr(pki_module, "_signature_state", second_fails)
-    ders = _ders(twins.new_ca)
-    good = _crl(twins.new_key, names=twins.new_key)
-    with caplog.at_level("ERROR", logger="messagefoundry.pki"):
-        finding = crl_signature_finding(_crl(twins.stranger, names=None) + good, ders)
-    assert finding is not None and finding.state == "unproven", finding
-    assert finding.why.startswith("CRL block 1 of 2") and "not judged" in finding.why
-    (error,) = [r for r in caplog.records if "signature check failed after" in r.getMessage()]
-    assert error.exc_info is not None
-
-    # Control: with only an unlisted block before it, nothing is kept, and the failure is raised.
-    calls = 0
-    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-unlisted")])
-    with pytest.raises(RuntimeError, match="a defect in the check"):
-        crl_signature_finding(_crl(twins.stranger, names=None, name=other) + good, ders)
-
-
-def test_the_reload_s_two_rankings_agree() -> None:
-    """Vault BACKLOG #3506 code review, round 2. ``pki._FINDING_RANK`` picks a block within one
-    file and ``crl_reload._PRECEDENCE`` a remedy across contexts. They must order the signature
-    states the same way, or one file's report would depend on how its hops are spread."""
-    by_finding = sorted(pki_module._FINDING_RANK, key=pki_module._FINDING_RANK.__getitem__)
-    by_remedy = sorted(
-        crl_reload._SIGNATURE_REMEDY,
-        key=lambda state: crl_reload._RANK[crl_reload._SIGNATURE_REMEDY[state]],
-    )
-    assert by_finding == by_remedy
 
 
 def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(

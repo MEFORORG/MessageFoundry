@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
-import logging
 import os
 import string
 from collections.abc import Iterable, Iterator
@@ -83,8 +82,6 @@ __all__ = [
     "canonical_dn",
     "IssuerIndex",
 ]
-
-log = logging.getLogger(__name__)
 
 # Day math shared with pipeline/cert_expiry.py's expiry monitor — keep the convention identical.
 _SECONDS_PER_DAY = 86_400
@@ -920,86 +917,63 @@ PROVEN_BAD_SIGNATURE = (
     "signature. A handshake OpenSSL judges by this CRL fails with 'CRL signature failure'"
 )
 
-#: The rank of each state :func:`crl_signature_finding` reports, the strongest lowest. A proof
-#: outranks the rest, and a CA that was checked and failed outranks one that was not checked.
-_FINDING_RANK: dict[CrlSignatureState, int] = {
-    "bad": 0,
-    "unproven": 1,
-    "uncheckable": 2,
-    "unlisted": 3,
-}
-
 
 @dataclass(frozen=True)
 class CrlSignatureFinding:
-    """The strongest thing a hop's CA list says against the CRLs of one file (vault BACKLOG
-    #3506). ``state`` is a :class:`CrlSignature` state other than ``verified``, and ``why`` names
-    the block and says what was found, for a message."""
+    """What a hop's CA list says against one CRL of a file, the one
+    :func:`crl_signature_finding` reports (vault BACKLOG #3506). ``state`` is a
+    :class:`CrlSignature` state other than ``verified``, and ``why`` names the block and says what
+    was found, for a message."""
 
     why: str
     state: CrlSignatureState
 
 
+def _finding(signature: CrlSignature) -> CrlSignatureFinding:
+    """The :class:`CrlSignatureFinding` for ``signature``, in the words a start uses too."""
+    if signature.state == "bad":
+        why = f"the CRL {PROVEN_BAD_SIGNATURE}"
+    elif signature.state == "unlisted":
+        why = UNLISTED_SIGNATURE
+    else:
+        why = (
+            f"the engine could not confirm its signature: {UNCONFIRMED_SIGNATURE[signature.state]}"
+        )
+    return CrlSignatureFinding(f"{signature.where}: {why}", signature.state)
+
+
 def crl_signature_finding(pem: bytes, ca_ders: Iterable[bytes]) -> CrlSignatureFinding | None:
-    """The strongest :class:`CrlSignatureFinding` for the CRLs in ``pem`` against the CAs in
+    """The :class:`CrlSignatureFinding` that holds the CRLs in ``pem`` back against the CAs in
     ``ca_ders``, or ``None`` when each CRL is verified (vault BACKLOG #3506).
 
     The running-hop reload calls this before a live load, because a load cannot be undone
     (BACKLOG #299), and OpenSSL checks a CRL's signature only at the handshake. So OpenSSL itself
     loads a CRL with the right issuer name and Authority Key Identifier but a bad signature, and
-    then every handshake it judges fails with ``CRL signature failure``. The states stay apart, so
-    the reload can tell a CRL proven badly signed, a file to fix, from one it could not confirm,
-    which can be right, as after a CA renews its key. Before vault BACKLOG #3506 the reload read
-    one flag that folded ``bad``, ``unproven`` and ``uncheckable`` together.
-    :data:`_FINDING_RANK` picks the state reported, the first block of it in file order among
-    equals. It stops at the first ``bad`` block, since nothing outranks it.
+    then every handshake it judges fails with ``CRL signature failure``.
 
-    A check that fails part way keeps a finding already reached other than ``unlisted``, as a
-    start keeps its verdicts (``tls_policy._check_crl_signatures``): it is
-    logged, and ``why`` says the CRLs after it were not judged. Before vault BACKLOG #3506 the
-    reload stopped at the first such block, so it never reached the failure. With no such finding
-    the failure is raised.
+    It reads the blocks in file order and returns at the first one that a listed CA fits and none
+    verifies: state ``bad``, ``unproven`` or ``uncheckable``. It judges no block after that one,
+    so a stronger finding later in the file is not reported. A block no listed CA fits,
+    ``unlisted``, does not stop it: the first such block is reported only when the file holds no
+    block of those three states. That is the walk the reload made before vault BACKLOG #3506, so
+    it looks at the same blocks. What changed is that the state is kept, so the reload can tell a
+    CRL proven badly signed, a file to fix, from one it could not confirm, which can be right, as
+    after a CA renews its key. Before #3506 the reload read one flag that folded those three
+    states together.
 
-    A CA that does not parse is ignored. ``pem`` must be bytes :func:`judge_every_crl` accepted;
-    a block that does not parse raises ``ValueError``."""
-    strongest: CrlSignature | None = None
-    unjudged = ""
-    signatures = judge_crl_signatures(pem, ca_ders)
-    while True:
-        try:
-            signature = next(signatures)
-        except StopIteration:
-            break
-        except Exception as exc:
-            if strongest is None or strongest.state == "unlisted":
-                raise
-            log.error(
-                "pki: the CRL signature check failed after %s, so the CRLs after it are not judged",
-                strongest.where,
-                exc_info=True,
-            )
-            unjudged = (
-                f". The check failed on a later CRL ({type(exc).__name__}), so those after it "
-                "are not judged"
-            )
-            break
+    An error the check raises on a block it reaches is raised, even after an ``unlisted`` block,
+    and the reload then refuses that hop with ``retry``. A CA that does not parse is ignored.
+    ``pem`` must be bytes :func:`judge_every_crl` accepted; a block that does not parse raises
+    ``ValueError``."""
+    unlisted: CrlSignature | None = None
+    for signature in judge_crl_signatures(pem, ca_ders):
         if signature.state == "verified":
             continue
-        if strongest is None or _FINDING_RANK[signature.state] < _FINDING_RANK[strongest.state]:
-            strongest = signature
-        if strongest.state == "bad":
-            break
-    if strongest is None:
-        return None
-    if strongest.state == "bad":
-        why = f"the CRL {PROVEN_BAD_SIGNATURE}"
-    elif strongest.state == "unlisted":
-        why = UNLISTED_SIGNATURE
-    else:
-        why = (
-            f"the engine could not confirm its signature: {UNCONFIRMED_SIGNATURE[strongest.state]}"
-        )
-    return CrlSignatureFinding(f"{strongest.where}: {why}{unjudged}", strongest.state)
+        if signature.state != "unlisted":
+            return _finding(signature)
+        # Go on: a block a listed CA fits and does not verify is the finding to report.
+        unlisted = unlisted or signature
+    return None if unlisted is None else _finding(unlisted)
 
 
 def _akid_fit(akid: _CrlAkid | None, listed: _ListedCa) -> bool | None:
