@@ -213,14 +213,15 @@ package = "brace-expansion"
 # TRIAGED 2026-10-28 by Claude, an AI agent in the Manager seat, on issue 2618 (scheduled
 # Security run 40685626928, job cla-action-audit). deepmerge GHSA-gcqx-w48m-w2h4, low:
 # mergeObject() allows prototype poisoning of the returned object. NOT REACHABLE in what cla.yml
-# runs. The lockfile marks deepmerge 4.3.1 `dev` and `peer`; its only parent is jest-config, a
-# test-toolchain package reached through ts-jest. Six deepmerge identifiers (isMergeableObject,
-# cloneUnlessOtherwiseSpecified, deepmerge.all, arrayMerge, mergeObject, propertyIsUnsafe) each
-# returned 0 in dist/index.js, against the @actions/core control's 2. NO FIX EXISTS: GitHub lists
-# no patched version and 4.3.1 is the latest release. Acknowledged by the owner on 2026-10-28.
-# tests/test_cla_action_advisory_gate.py re-runs two of these probes, isMergeableObject and
-# cloneUnlessOtherwiseSpecified, the two names specific to deepmerge, so a re-vendored bundle that
-# carries deepmerge reds there.
+# runs. The lockfile marks deepmerge 4.3.1 `dev` and `peer`. The one lockfile package that depends
+# on it is jest-config, which the lockfile also marks `dev`; npm's report traces the chain up
+# through the jest packages to ts-jest, a root devDependency. The lockfile does not bound what the
+# bundle holds, so the bundle was probed too. Six identifiers (deepmerge, isMergeableObject,
+# cloneUnlessOtherwiseSpecified, arrayMerge, mergeObject, propertyIsUnsafe) each returned 0 in
+# dist/index.js, against the @actions/core control's 2. NO FIX EXISTS: GitHub lists no patched
+# version and 4.3.1 is the latest release. Acknowledged by the owner on 2026-10-28.
+# tests/test_cla_action_advisory_gate.py re-runs the probes from this reading that only deepmerge
+# defines, so a re-vendored bundle that carries deepmerge reds there.
 
 [[advisory]]
 id = "GHSA-gcqx-w48m-w2h4"
