@@ -65,7 +65,7 @@ from messagefoundry.auth.ldap import (
     LdapUnansweredError,
 )
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.reconcile import MISCONFIGURED_ABORT, ProbeOutcome
+from messagefoundry.auth.reconcile import MISCONFIGURED_ABORT, OUTAGE_ABORT, ProbeOutcome
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
@@ -361,7 +361,8 @@ async def test_an_account_that_left_the_directory_is_still_revoked(
         (RESULT_NO_SUCH_OBJECT, True),
         (RESULT_INVALID_DN_SYNTAX, True),
         (RESULT_INSUFFICIENT_ACCESS_RIGHTS, True),
-        # THE CONTROLS: a transient code is a plain outage, which pages nobody.
+        # THE CONTROLS: a transient code is a plain outage, which pages only once the run of
+        # outage passes reaches [auth].ad_reconcile_outage_passes (BACKLOG #3709).
         (RESULT_BUSY, False),
         (RESULT_UNAVAILABLE, False),
     ],
@@ -383,18 +384,30 @@ async def test_a_refused_user_search_base_above_the_breaker_floor_pages_and_neve
     ``directory_misconfigured`` and pages under its own source, counted over the probes asked. It
     never revokes, and it is never the breaker's trip.
 
+    A transient code is a plain outage on every pass. It pages once, under the outage's own source,
+    on the pass that makes the run ``[auth].ad_reconcile_outage_passes`` long, and never again in
+    that run (BACKLOG #3709).
+
     RED before D3b for the three configuration codes: each pass is a plain outage."""
     names = [f"user{i:02d}" for i in range(8)]
     async with _signed_in_estate(monkeypatch, names) as (_directory, service, store, tokens):
         _answer_with(monkeypatch, code, when=_user_search)
         sink = _Sink()
-        for _ in range(4):  # far past ad_session_recheck_strikes
+        outage_passes = service._settings.ad_reconcile_outage_passes
+        assert 2 <= outage_passes < 4  # the run below reaches the outage page, and passes it
+        outage_pages_on: list[int] = []
+        for n in range(1, 5):  # far past ad_session_recheck_strikes
             plan = await _pass(service, sink)
             assert plan.revocations == ()
             if paged:
                 assert plan.aborted == MISCONFIGURED_ABORT
+                assert not plan.outage_page
             else:
                 assert plan.directory_outage
+                assert plan.outage_passes == n
+            if plan.outage_page:
+                outage_pages_on.append(n)
+        assert outage_pages_on == ([] if paged else [outage_passes])
         assert await _alive(service, tokens) == set(names)
         assert await _audited(store, "auth.ad_session_revoked") == []
         assert await _audited(store, "auth.ad_reconcile_aborted") == []
@@ -407,7 +420,8 @@ async def test_a_refused_user_search_base_above_the_breaker_floor_pages_and_neve
             if e[0] == "ad_reconcile_aborted"
         ]
         expected = ("directory-reconciler-misconfigured", MISCONFIGURED_ABORT, len(names))
-        assert pages == ([expected] * 4 if paged else [])
+        outage = ("directory-reconciler-outage", OUTAGE_ABORT, len(names))
+        assert pages == ([expected] * 4 if paged else [outage])
         detail = service.directory_reconcile_misconfigured
         assert (detail is not None) is paged
         assert detail is None or _LEAK not in detail
