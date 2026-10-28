@@ -569,7 +569,7 @@ class ApprovalGate:
             except RowSealError as refused:
                 # Changed outside the store between the read and the move. Nothing re-seals it,
                 # so no later start can move it either (BACKLOG #2592).
-                await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
+                await self._approval_seal_refused(refused, approval_id)
                 continue
             except Exception:  # noqa: BLE001 - every store backend raises its own type
                 log.exception(
@@ -1308,7 +1308,7 @@ class ApprovalGate:
             # The row changed outside the store after it was read, and the store refused the claim
             # (BACKLOG #2592). Nothing ran, and nothing was written. The cause carries the row kind
             # only, never a value.
-            await self._approval_seal_failed(approval_id, unverifiable=exc.unverifiable)
+            await self._approval_seal_refused(exc, approval_id)
             raise ApprovalError(409, _SEAL_REFUSAL) from exc
         except asyncio.CancelledError:
             # Cancelled while claiming. The UPDATE can still commit, and the row would then sit in
@@ -1522,7 +1522,7 @@ class ApprovalGate:
             # The claimed row changed outside the store while the operation ran (BACKLOG #2592).
             # The store wrote nothing and will refuse the status alone too, so the row stays
             # 'executing'. The outcome row below is the record of what happened.
-            await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
+            await self._approval_seal_refused(refused, approval_id)
             moved = None
         except Exception:  # noqa: BLE001 - the outcome stands; see the docstring
             log.exception(
@@ -1584,7 +1584,7 @@ class ApprovalGate:
                 from_status="executing",
             )
         except RowSealError as refused:
-            await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
+            await self._approval_seal_refused(refused, approval_id)
             return None
         except Exception:  # noqa: BLE001 - the caller's outcome stands either way
             log.exception(
@@ -1615,7 +1615,7 @@ class ApprovalGate:
         except RowSealError as refused:
             # The store refused the claim and wrote nothing (BACKLOG #2592), so no audit row was
             # lost: report the failed seal, as the uncancelled path does.
-            await self._approval_seal_failed(approval_id, unverifiable=refused.unverifiable)
+            await self._approval_seal_refused(refused, approval_id)
             return
         except Exception:  # noqa: BLE001 - the caller's cancellation is re-raised either way
             # "Most likely": a COMMIT can land with its reply lost, and then the row and its
@@ -2182,7 +2182,7 @@ class ApprovalGate:
         except RowSealError as exc:
             # The row changed outside the store after it was read (BACKLOG #2592). The store wrote
             # nothing, so the audit row was not lost: this is a refusal, not a fault.
-            await self._approval_seal_failed(approval_id, unverifiable=exc.unverifiable)
+            await self._approval_seal_refused(exc, approval_id)
             raise ApprovalError(409, _SEAL_REFUSAL) from exc
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
             raise self._store_fault(
@@ -2276,6 +2276,15 @@ class ApprovalGate:
             return row
         await self._approval_seal_failed(row.id)
         return None
+
+    async def _approval_seal_refused(self, refused: RowSealError, approval_id: str) -> None:
+        """Report a store write refused for request ``approval_id`` through
+        :meth:`_approval_seal_failed`, under the id the refused row holds as stored when the store
+        named it, so one request pages under one subject however a caller spelled its id on a store
+        that compares ids without case (BACKLOG #2592)."""
+        await self._approval_seal_failed(
+            refused.row_id or approval_id, unverifiable=refused.unverifiable
+        )
 
     async def _approval_seal_failed(self, approval_id: str, *, unverifiable: bool = False) -> None:
         """Report a request whose row failed its integrity seal (BACKLOG #2592): a WARNING, an

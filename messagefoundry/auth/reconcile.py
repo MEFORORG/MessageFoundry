@@ -332,6 +332,11 @@ class ReconcilePlan:
     #: :data:`PAGING_DEADLINE` or :data:`PAGING_CAP`. An account already in that state is not
     #: here, so each pages once per state change. Set on every pass, an outage-shaped one included.
     paging_refused: tuple[tuple[str, str, str], ...] = ()
+    #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #2592): the name
+    #: of the directory map whose seal Vault transit refused to check, on the pass that OPENED a
+    #: hold of the role or scope diffs for it, else ``None``. A pass while the hold stands, and the
+    #: pass that ends it, leave it ``None``, so the hold pages once, not once per pass.
+    map_held: str | None = None
 
     @property
     def directory_outage(self) -> bool:

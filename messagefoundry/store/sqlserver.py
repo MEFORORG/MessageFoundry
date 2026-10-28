@@ -13238,7 +13238,7 @@ class SqlServerStore:
         if current is None:
             return None
         await require_seal_for_write(
-            user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+            user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, current.row.id
         )
         changed = change(current)
         if changed is None:
@@ -13293,7 +13293,7 @@ class SqlServerStore:
         current = await self._read_user_record(cur, user_id)
         if current is not None:
             await require_seal_for_write(
-                user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+                user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, current.row.id
             )
             if (
                 self._row_sealer is not None
@@ -14097,7 +14097,9 @@ class SqlServerStore:
                 # The map is re-sealed only when it verifies; store.py says why.
                 try:
                     await self._write_ad_map(cur, AD_ROLE_MAP, lambda m: m.without_value(role_id))
-                except RowSealError:
+                except RowSealError as refused:
+                    if refused.unverifiable:
+                        raise  # store.py says why
                     report_refused_ad_role_map()
                     await cur.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
                 await cur.execute("DELETE FROM roles WHERE id=?", (role_id,))

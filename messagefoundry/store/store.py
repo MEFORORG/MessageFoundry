@@ -1378,14 +1378,15 @@ async def require_seal_for_write(
     refusal is paged as :func:`seal_holds_for_write` pages it and the error carries
     ``unverifiable``, taken from the exception itself rather than inferred later, so a caller
     reports it under the unverifiable action and never as a forgery. A seal that does not verify
-    raises without it."""
+    raises without it. ``row_id`` must be the id the row holds as STORED, never the one a caller
+    asked for, so the page and the error name one subject per row."""
     try:
         holds = await check
     except TransitSealUnverifiableError as exc:
         alert_unverifiable_write(sealer, kind, row_id)
-        raise RowSealError(kind, unverifiable=True) from exc
+        raise RowSealError(kind, unverifiable=True, row_id=row_id) from exc
     if not holds:
-        raise RowSealError(kind)
+        raise RowSealError(kind, row_id=row_id)
 
 
 async def session_seal_ok(sealer: Sealer | None, record: SessionRecord) -> bool:
@@ -15436,7 +15437,7 @@ class MessageStore:
         if current is None:
             return None
         await require_seal_for_write(
-            user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+            user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, current.row.id
         )
         changed = change(current)
         if changed is None:
@@ -15484,7 +15485,7 @@ class MessageStore:
         current = await self._read_user_record(user_id)
         if current is not None:
             await require_seal_for_write(
-                user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, user_id
+                user_seal_ok(self._row_sealer, current), self._row_sealer, USER_KIND, current.row.id
             )
             if (
                 self._row_sealer is not None
@@ -16321,10 +16322,15 @@ class MessageStore:
                         "DELETE FROM user_roles WHERE role_id=? AND user_id=?", (role_id, holder)
                     )
             # The map keeps its other pairs, so it is re-sealed only when it verifies; a map that
-            # fails loses this role's pairs, which needs no key, and stays failing.
+            # fails loses this role's pairs, which needs no key, and stays failing. A map Vault
+            # transit refused to check refuses the whole delete instead.
             try:
                 await self._write_ad_map(AD_ROLE_MAP, lambda m: m.without_value(role_id))
-            except RowSealError:
+            except RowSealError as refused:
+                if refused.unverifiable:
+                    # Vault transit refused to check the map: a raw delete would leave it reading
+                    # as forged once Vault recovers, so the role delete is refused (BACKLOG #2592).
+                    raise
                 report_refused_ad_role_map()
                 await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
             await self._db.execute("DELETE FROM roles WHERE id=?", (role_id,))

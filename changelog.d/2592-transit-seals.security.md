@@ -19,7 +19,14 @@
   `authority-seal-transit-unverifiable:<kind>:<id>`, at most once per five minutes for each row.
   No version number is compared, so a genuine seal checked against a Vault node that lags a
   rotation reads as unverifiable, and its user signs in again. An edit of a custom role in that state is refused with
-  409. Before raising the audit key's `min_decryption_version`, read
+  409, and so is the delete of any custom role while the AD group-to-role map is in that state,
+  since the delete could not re-seal the map. A directory sign-in refused for an unverifiable map
+  is audited as `auth.login_refused_unverifiable`, which the sign-in burst signal does not count. A
+  reconcile pass that holds role or scope diffs on such a map raises one `ad_reconcile_aborted`
+  alert (reason `directory_map_unverifiable`) when the hold begins, and each map always pages
+  under its own subject, never the capped aggregate. `provision-admin` names the recovery, rather
+  than calling the account unrepairable or printing a defect report, when Vault transit would not
+  check the account it repairs. Before raising the audit key's `min_decryption_version`, read
   [PHI.md](../docs/PHI.md#raising-the-transit-audit-keys-minimum-version). `serve` seals and verifies
   fixed input at start, before it seeds the auth tables, and refuses to start when the token
   cannot.

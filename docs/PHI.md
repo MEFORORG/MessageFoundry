@@ -122,9 +122,14 @@ answers 503 with a `Retry-After`, the CLI prints one error line, and no session 
   against a Vault node that lags a rotation reads as unverifiable, and its user signs in again. It
   is treated as a failed seal, under its own audit action, `integrity.authority_seal_unverifiable`,
   and paged per row: the row is denied and a session is ended. A directory map grants nothing to a
-  decision that writes nothing; a directory sign-in that would write from it is refused, and a
-  reconcile pass holds that map's diff. The API refuses an edit of a custom role or a directory
-  map whose seal is unverifiable (HTTP 409). Recover as [Recovering an unverifiable
+  decision that writes nothing; a directory sign-in that would write from it is refused, audited
+  as `auth.login_refused_unverifiable` rather than `auth.login_failed`, so the sign-in burst
+  signal does not count it. A reconcile pass holds that map's diff, so no role or scope demotion
+  revokes a session while it lasts, and raises one `ad_reconcile_aborted` alert with reason
+  `directory_map_unverifiable` when the hold begins, not on every pass. Each map's own page keeps
+  its own subject however many other rows page. The API refuses an edit of a custom role or a
+  directory map whose seal is unverifiable, and the delete of any custom role while the AD
+  group-to-role map is unverifiable (HTTP 409). Recover as [Recovering an unverifiable
   row](#recovering-an-unverifiable-row) says, and before raising the minimum, read [Raising the
   Transit audit key's minimum version](#raising-the-transit-audit-keys-minimum-version);
 - anything else Transit answers: an outage, as above.
@@ -171,7 +176,8 @@ or a replacement (HTTP 409) until it verifies again or is cleared ([Recovering a
 row](#recovering-an-unverifiable-row)). A row is sealed again only when the engine writes it, and
 no command re-seals rows yet. Lowering the minimum again makes the rows verify again, except a row
 the engine changed without re-sealing while it was unverifiable: deleting a custom role removes
-its holders' and its directory map's rows of it that way, so those records then fail as forged.
+its holders' rows of it that way, so those records then fail as forged. A role delete is refused
+while the AD group-to-role map is unverifiable, so the map is never changed that way.
 
 ### Recovering an unverifiable row
 
@@ -191,7 +197,9 @@ one, so take these steps in order, and stop at the first that clears it:
    entries and enter its pairs again. Both replace what the row held.
 
 While a directory map is unverifiable, no directory account can sign in, so take these steps as a
-local Administrator.
+local Administrator. Clear or re-seal the group-to-role map before deleting a custom role.
+`provision-admin` names step 1 too, at the prompt or as it writes, for an account Vault transit
+would not check.
 
 ---
 

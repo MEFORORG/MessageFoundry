@@ -298,6 +298,7 @@ from messagefoundry.auth.reconcile import (
     ReconcilePlan,
 )
 from messagefoundry.auth.service import (
+    DIRECTORY_MAP_UNVERIFIABLE,
     STEP_UP_ACTION_CONFIG_RELOAD,
     STEP_UP_ACTION_CONNECTION_PURGE,
     STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
@@ -10535,6 +10536,9 @@ _PROBE_FAULT_ALERT_SOURCE = "directory-reconciler-probe-fault"
 #: The source label of the configuration refusal's own ``ad_reconcile_aborted`` instance (BACKLOG
 #: #3010), apart from the others for the same reasons.
 _MISCONFIGURED_ALERT_SOURCE = "directory-reconciler-misconfigured"
+#: The source label of the directory-map hold's own ``ad_reconcile_aborted`` instance (BACKLOG
+#: #2592), apart from the others for the same reasons.
+_MAP_HOLD_ALERT_SOURCE = "directory-reconciler-map-unverifiable"
 #: The source label prefix of a paging refusal's ``ad_reconcile_aborted`` instance (vault BACKLOG
 #: #3696). The account name follows it, so each account is its own instance and throttle, as
 #: ``ad_session_revoked`` is keyed on the account: a second account entering inside the first's
@@ -10620,7 +10624,21 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     resolving is an idempotent update, and a resolve the notifier failed to write is retried that
     way. A process clears only what it watched open, so a fresh process resolves no alert an
     earlier run left open (:func:`_without_inherited_clears` drops that clear);
-    ``_mark_reconcile_clears`` states that rule once."""
+    ``_mark_reconcile_clears`` states that rule once.
+
+    A hold of the role and scope diffs on a directory map Vault transit refused to check (BACKLOG
+    #2592) becomes one ``ad_reconcile_aborted`` alert with reason ``directory_map_unverifiable``,
+    under its own source label (:data:`_MAP_HOLD_ALERT_SOURCE`), on the pass that opens the hold
+    only (``plan.map_held``), an outage-shaped pass included, since the maps were read before the
+    probes were judged. While it stands no demotion revokes a session. Like the fault's, it has no
+    inverse: an operator resolves it."""
+    if plan.map_held is not None:
+        sink.ad_reconcile_aborted(
+            _MAP_HOLD_ALERT_SOURCE,
+            reason=DIRECTORY_MAP_UNVERIFIABLE,
+            probed=plan.asked,
+            detail=auth.directory_reconcile_map_hold or DIRECTORY_MAP_UNVERIFIABLE,
+        )
     if plan.directory_outage:
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.

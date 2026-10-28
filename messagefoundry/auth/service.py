@@ -941,13 +941,17 @@ DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 #: #3082). Audited beside :data:`DIRECTORY_UNCONFIRMED`.
 DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
 
-#: The ``auth.login_failed`` reason for a directory sign-in refused because Vault transit refused to
-#: check the seal of an AD map that sign-in writes from (BACKLOG #2592): the group-to-role map, or,
-#: for an account that is not an Administrator, the group-to-channel map. Refused rather than
-#: signed in with nothing, because a write from a map read as empty would replace the account's
-#: genuine roles or scope while Vault may only lag a rotation. Nothing is written; the map's own
-#: seal report pages, per map.
+#: The reason for a directory sign-in refused because Vault transit refused to check the seal of an
+#: AD map that sign-in writes from (BACKLOG #2592): the group-to-role map, or, for an account that
+#: is not an Administrator, the group-to-channel map. Refused rather than signed in with nothing,
+#: because a write from a map read as empty would replace the account's genuine roles or scope
+#: while Vault may only lag a rotation. Nothing is written; the map's own seal report pages, per
+#: map. Audited under :data:`LOGIN_REFUSED_UNVERIFIABLE_ACTION`, never ``auth.login_failed``.
 DIRECTORY_MAP_UNVERIFIABLE = "directory_map_unverifiable"
+#: The audit action of a :data:`DIRECTORY_MAP_UNVERIFIABLE` refusal (BACKLOG #2592). Not
+#: ``auth.login_failed``: the credential was not wrong, so the sign-in burst signal, which counts
+#: that action, must not read a Vault lag as a password attack. Still audited, per refusal.
+LOGIN_REFUSED_UNVERIFIABLE_ACTION: Final = "auth.login_refused_unverifiable"
 
 
 class DirectoryRefusal(Enum):
@@ -3055,6 +3059,22 @@ class AdMapUnverifiableError(Exception):
         )
 
 
+class CustomRoleDeleteUnverifiableError(AdMapUnverifiableError):
+    """A custom-role delete refused while Vault transit refuses to check the AD group-to-role map's
+    stored seal (BACKLOG #2592). The delete removes the role's pairs from that map, and a map that
+    cannot be checked cannot be re-sealed, so a raw delete would leave the map reading as forged
+    once Vault recovers. Nothing is written. The text names the recovery, and nothing from the
+    map."""
+
+    def __str__(self) -> str:
+        return (
+            f"the custom role was not deleted: the {self.name}'s stored integrity seal cannot be"
+            " verified by Vault transit, and the delete would remove the role's pairs from it"
+            f" without re-sealing it. {UNVERIFIABLE_RECOVERY} Delete the role once the map"
+            " verifies"
+        )
+
+
 class SealReport(NamedTuple):
     """What one seal report writes: its audit action, its verb phrase and its throttle key."""
 
@@ -3089,6 +3109,21 @@ _UNSEALED_NAME_REFUSAL: Final = (
     "the account named {username!r} fails its integrity seal, so it is refused and cannot be"
     " repaired -- provision under a different username"
 )
+#: ``provision-admin``'s refusal for a name a row holds whose seal Vault transit refused to check
+#: (BACKLOG #2592). Not :data:`_UNSEALED_NAME_REFUSAL`: such a row may be genuine, and repairable
+#: once it verifies.
+_UNVERIFIABLE_NAME_REFUSAL: Final = (
+    "the account named {username!r} has an integrity seal Vault transit refused to check, so"
+    f" nothing was written. {UNVERIFIABLE_RECOVERY}"
+)
+
+
+def _refused_name_text(lookup: _UserLookup, username: str) -> str:
+    """The ``provision-admin`` refusal for a name whose row ``lookup`` refused (BACKLOG #2592)."""
+    text = _UNVERIFIABLE_NAME_REFUSAL if lookup.unverifiable else _UNSEALED_NAME_REFUSAL
+    return text.format(username=username)
+
+
 #: ``provision-admin``'s refusal while a local Administrator can sign in with its password (vault
 #: BACKLOG #2711 step 1). Keep the words "already has an enabled Administrator": at least the VS
 #: Code extension (``ide/src/engineControlModel.ts``), the load rig (``harness/load/rigadmin.py``)
@@ -3123,6 +3158,8 @@ class _UserLookup:
 
     user: VerifiedUser | None
     held: bool
+    #: The refusal was a seal Vault transit refused to check, not one that failed.
+    unverifiable: bool = False
 
     @property
     def refused(self) -> bool:
@@ -3374,6 +3411,11 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
+        #: Latched hold of the role or scope diffs on a directory map Vault transit refused to
+        #: check (BACKLOG #2592). Its own latch: a held pass is not an aborted one. Set by
+        #: `_latch_map_hold` on the pass that opens the hold, cleared by the next pass that reads
+        #: both maps verified.
+        self._reconcile_map_hold_alert: str | None = None
         #: Latched LDAP referral (BACKLOG #2538). Its own latch, like the hold's, because a pass with
         #: a referral beside other answers is not aborted and so clears `_reconcile_alert`. Set on a
         #: pass with a referral. Cleared by `_mark_reconcile_clears` on the referral clear's test.
@@ -4059,7 +4101,7 @@ class AuthService:
         lookup = await self._lookup_by_username(username)
         existing = lookup.user
         if lookup.refused:
-            raise FirstAdministratorRefused(_UNSEALED_NAME_REFUSAL.format(username=username))
+            raise FirstAdministratorRefused(_refused_name_text(lookup, username))
         repaired = existing is not None
         # BACKLOG #2019: read BEFORE any write, because `--email` below may replace it and the new
         # address belongs to the operator running this command, not to the holder being told.
@@ -4436,7 +4478,7 @@ class AuthService:
         lookup = await self._lookup_by_username(name)
         existing = lookup.user
         if existing is None:
-            return _UNSEALED_NAME_REFUSAL.format(username=name) if lookup.refused else None
+            return _refused_name_text(lookup, name) if lookup.refused else None
         return self._existing_row_refusal(existing, name)
 
     def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:
@@ -6611,8 +6653,12 @@ class AuthService:
         *,
         client: str | None,
         extra: Mapping[str, object] | None = None,
+        action: str = "auth.login_failed",
     ) -> LoginOutcome:
         """Audit and render the refusal of an ineligible mirror row (BACKLOG #1637 / #1638).
+
+        ``action`` is the audit action, ``auth.login_failed`` but for a refusal that is no failed
+        credential, such as :data:`LOGIN_REFUSED_UNVERIFIABLE_ACTION` (BACKLOG #2592).
 
         **Audited in the shape of the ``local_account_conflict`` refusal, NOT through
         :meth:`_directory_reject_audit`.** That helper requires a mechanism slug, and the Kerberos
@@ -6631,7 +6677,7 @@ class AuthService:
         detail = _json({"provider": "ad", "reason": reason})
         if extra and detail != DIRECTORY_LOCKED_REFUSAL_DETAIL:
             detail = _json({**extra, "provider": "ad", "reason": reason})
-        await self._audit("auth.login_failed", actor=username, detail=detail, client=client)
+        await self._audit(action, actor=username, detail=detail, client=client)
         return LoginOutcome(ok=False, error="invalid credentials", reason=reason)
 
     async def _directory_reject_audit(
@@ -6908,7 +6954,11 @@ class AuthService:
         )
         if role_map is None or scope_map is None:
             return await self._refuse_directory_row(
-                principal.username, DIRECTORY_MAP_UNVERIFIABLE, client=client, extra=refusal_extra
+                principal.username,
+                DIRECTORY_MAP_UNVERIFIABLE,
+                client=client,
+                extra=refusal_extra,
+                action=LOGIN_REFUSED_UNVERIFIABLE_ACTION,
             )
         previous = set(user.role_ids)
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
@@ -7642,6 +7692,31 @@ class AuthService:
         return self._reconcile_referral_alert
 
     @property
+    def directory_reconcile_map_hold(self) -> str | None:
+        """The standing hold's operator message while a directory map's seal cannot be checked by
+        Vault transit, or ``None`` (BACKLOG #2592). Latches until a pass reads both maps verified
+        (:meth:`_latch_map_hold`)."""
+        return self._reconcile_map_hold_alert
+
+    def _latch_map_hold(self, held_map: str | None) -> str | None:
+        """Latch or release the map hold for one pass, and return ``held_map`` only on the pass
+        that OPENS the hold, so the lifespan task pages it once per hold rather than once per pass
+        (BACKLOG #2592). ``held_map`` is the map whose seal Vault transit refused to check this
+        pass, or ``None`` when both verified. The message carries the map's name, never a pair."""
+        if held_map is None:
+            self._reconcile_map_hold_alert = None
+            return None
+        if self._reconcile_map_hold_alert is not None:
+            return None  # the hold stands: latched, already paged
+        self._reconcile_map_hold_alert = (
+            f"directory reconcile HELD: Vault transit refused to check the {held_map}'s integrity"
+            " seal, so no role or scope demotion is applied and no live session is revoked for"
+            f" one until it verifies. {UNVERIFIABLE_RECOVERY}"
+        )
+        _log.error("directory reconcile: %s", self._reconcile_map_hold_alert)
+        return held_map
+
+    @property
     def directory_reconcile_fault(self) -> str | None:
         """The standing probe fault's operator message, or ``None`` (BACKLOG #3100). Latches until a
         pass judges something with no fault (:meth:`_record_reconcile_fault`)."""
@@ -8025,7 +8100,8 @@ class AuthService:
             None if role_map is None else await self._ad_map_unless_unverifiable(AD_SCOPE_MAP)
         )
         # A held diff judged nothing, so this pass confirms no account and marks no clear.
-        diffs_held = role_map is None or scope_map is None
+        held_map = AD_ROLE_MAP if role_map is None else AD_SCOPE_MAP if scope_map is None else None
+        diffs_held = held_map is not None
         for probe in probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT or role_map is None:
                 # plan_pass reads an account missing from both as no role change and no scope
@@ -8080,7 +8156,11 @@ class AuthService:
         self._reconcile_unanswered.difference_update(plan.outcomes)
         self._reconcile_hold_latched = plan.latched
         # Vault BACKLOG #3696. Before any return below, so an outage-shaped pass pages too.
-        plan = replace(plan, paging_refused=self._note_paging_refusals(probes, plan.outcomes))
+        plan = replace(
+            plan,
+            paging_refused=self._note_paging_refusals(probes, plan.outcomes),
+            map_held=self._latch_map_hold(held_map),
+        )
         if plan.hold:
             self._advance_hold_standing("held")
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
@@ -10352,7 +10432,8 @@ class AuthService:
         """:meth:`_load_user_by_username`, also saying whether a row holds the name at all, from
         the same read: a row that fails its seal still holds its name."""
         raw = await self._store.get_user_by_username(username)
-        return _UserLookup(await self._verified(raw), raw is not None)
+        user, unverifiable = await self._verified_checked(raw)
+        return _UserLookup(user, raw is not None, unverifiable)
 
     async def _lookup_by_directory_object_id(self, object_id: str) -> _UserLookup:
         """:meth:`_lookup_by_username`, by the directory's immutable id."""
@@ -10404,8 +10485,14 @@ class AuthService:
         can make one pair disagree. A failing pair is therefore read once more, by id, before it is
         reported: a record changed outside the store fails both times, a raced honest write passes
         the second."""
+        return (await self._verified_checked(user))[0]
+
+    async def _verified_checked(self, user: UserRecord | None) -> tuple[VerifiedUser | None, bool]:
+        """:meth:`_verified`, also saying whether a refusal was a seal Vault transit refused to
+        check (BACKLOG #2592), so a caller can name the recovery rather than call the row
+        unrepairable."""
         if user is None:
-            return None
+            return None, False
         sealer = self._store.row_sealer()
         for attempt in range(2):
             grants = await self._store.get_user_role_grants(user.id)
@@ -10418,20 +10505,20 @@ class AuthService:
                 # Vault transit refused to check the seal: denied and reported, not re-read,
                 # because a re-read asks Transit the same question.
                 await self._user_seal_failed(user.id, unverifiable=True)
-                return None
+                return None, True
             if held:
-                return VerifiedUser.of(user, sorted(g.role_id for g in grants))
+                return VerifiedUser.of(user, sorted(g.role_id for g in grants)), False
             if attempt == 0:
                 reread = await self._store.get_user(user.id)
                 if reread is None:
-                    return None  # deleted meanwhile: nothing to report
+                    return None, False  # deleted meanwhile: nothing to report
                 if _lookup_keys(reread) != _lookup_keys(user):
                     # The account was renamed, rebound or re-keyed meanwhile, so it may no longer be
                     # the one the caller looked up. Not reported, and the next request reads afresh.
-                    return None
+                    return None, False
                 user = reread
         await self._user_seal_failed(user.id)
-        return None
+        return None, False
 
     def _totp_secret(self, user: VerifiedUser) -> str | None:
         """``user``'s TOTP secret, decrypted from the record its seal covered (BACKLOG #3510), or
@@ -15391,11 +15478,25 @@ class AuthService:
         """Delete a custom role; its user/AD-group assignments are removed in the same transaction, and
         every assigned user's live sessions are revoked so the now-gone permissions don't linger on an
         active token. Raises :class:`ValueError` for an unknown or built-in role. Audited. A role
-        whose row fails its integrity seal is deleted like any other (BACKLOG #2592)."""
+        whose row fails its integrity seal is deleted like any other (BACKLOG #2592).
+
+        Raises :class:`CustomRoleDeleteUnverifiableError`, revoking and writing nothing, while
+        Vault transit refuses to check the AD group-to-role map's seal: the delete would remove the
+        role's pairs from a map it cannot re-seal (BACKLOG #2592). The store refuses the same case,
+        for a map that turns unverifiable after this check."""
         if not await self._custom_role_held(role_id):
             raise ValueError("no such custom role")
+        if (await self._checked_ad_map(AD_ROLE_MAP))[1] is None:
+            await self._ad_map_seal_failed(AD_ROLE_MAP, unverifiable=True)
+            raise CustomRoleDeleteUnverifiableError(AD_ROLE_MAP)
         await self._revoke_sessions_for_role(role_id)  # before the rows are gone
-        await self._store.delete_custom_role(role_id)
+        try:
+            await self._store.delete_custom_role(role_id)
+        except RowSealError as refused:
+            if not refused.unverifiable:
+                raise
+            # The store's write helper has paged the map already; this is the denial only.
+            raise CustomRoleDeleteUnverifiableError(AD_ROLE_MAP) from refused
         await self._audit("role.deleted", actor=actor, detail=_json({"role_id": role_id}))
 
     async def sessions_ended_by_custom_role_save(self, role_id: str) -> frozenset[str]:

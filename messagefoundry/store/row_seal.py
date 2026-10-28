@@ -120,13 +120,19 @@ class RowSealError(Exception):
     helper that caught :class:`TransitSealUnverifiableError` sets it
     (``store.require_seal_for_write``); nothing infers it from text. Such a refusal is no evidence
     of a forgery, so a caller reports it under the unverifiable audit action, and the helper has
-    already paged it per row. Nothing was written either way."""
+    already paged it per row. Nothing was written either way.
 
-    def __init__(self, kind: str, unverifiable: bool = False) -> None:
-        # Both in ``args``, so copy and pickle, which call ``cls(*args)``, rebuild the same error.
-        super().__init__(kind, unverifiable)
+    ``row_id`` is the id the refused row holds as STORED, when the helper knows it, so a caller
+    reports under the row's own subject rather than the id it was asked for: on a store whose ids
+    compare without case the two can differ in case, and one row would page under two subjects.
+    Never part of the text."""
+
+    def __init__(self, kind: str, unverifiable: bool = False, row_id: str | None = None) -> None:
+        # All in ``args``, so copy and pickle, which call ``cls(*args)``, rebuild the same error.
+        super().__init__(kind, unverifiable, row_id)
         self.kind = kind
         self.unverifiable = unverifiable
+        self.row_id = row_id
 
     def __str__(self) -> str:
         if self.unverifiable:

@@ -8062,6 +8062,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     )
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import KeylessAuditChainRefused, open_store
+    from messagefoundry.store.row_seal import RowSealError
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -8376,6 +8377,18 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # Refused before the prompt already; one that changed since is refused the same way.
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
         return 2
+    except RowSealError as exc:
+        # BACKLOG #2592: a repair write the store refused because Vault transit would not check
+        # the account's seal. Not a defect, and maybe transient, so it names the recovery. A seal
+        # that FAILED still reaches the defect report, as it did before.
+        if not exc.unverifiable:
+            raise
+        return _emit_error(
+            f"{_seal_refusal(username, 'provision', unverifiable=True)}. The Administrator may be"
+            " missing or incomplete; once the account verifies, run the command again: it"
+            " completes a partly written account, or says why it cannot",
+            as_json=args.json,
+        )
     except sqlite3.IntegrityError as exc:
         # BACKLOG #2697. Ahead of the arm below, which it subclasses: a write the store refused is
         # not a path that is not a database. A lost username race arrives as the refusal above.

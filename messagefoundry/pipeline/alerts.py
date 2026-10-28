@@ -1427,6 +1427,14 @@ _UNVERIFIABLE_SUBJECT_WINDOW_SECONDS: Final = 900.0
 #: pages under the shared ``":*"`` subject rather than failing the alert write. The same bound
 #: the security signals keep (``security_signals._SUBJECT_LIMIT``).
 _UNVERIFIABLE_SUBJECT_LIMIT: Final = 200
+#: The unverifiable subjects of the two AD directory maps, which the cap never folds (BACKLOG
+#: #2592): ``row_seal.ADSET_KIND`` and ``store.AD_ROLE_MAP`` / ``store.AD_SCOPE_MAP``, spelled here
+#: to import nothing from the store, and pinned to them by a test. There are exactly two such rows,
+#: their names fixed in code, so no stored value can open another subject through this exemption.
+_UNCAPPED_UNVERIFIABLE_SUBJECTS: Final = frozenset(
+    f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:adset:{name}"
+    for name in ("ad_group_role_map", "ad_group_scope_map")
+)
 
 
 class SubjectCap:
@@ -1469,7 +1477,10 @@ def transit_seal_alert(
     a row pages under ``"<TRANSIT_SEAL_UNVERIFIABLE_SUBJECT>:*"`` instead, so a flood of planted
     rows opens one aggregate alert rather than one per row. The cap counts these rows only: a
     forgery pages through :func:`authority_seal_alert` under its own subject, and an outage under
-    :data:`TRANSIT_SEAL_SUBJECT`, and no number of unverifiable rows reaches either.
+    :data:`TRANSIT_SEAL_SUBJECT`, and no number of unverifiable rows reaches either. The two AD
+    directory maps are exempt and never counted (:data:`_UNCAPPED_UNVERIFIABLE_SUBJECTS`): one
+    that cannot be checked holds every role and scope demotion, so its page must never fold into
+    the aggregate behind planted rows.
 
     The reason names no row value and never Vault's text. Never raises."""
     cap = SubjectCap(_UNVERIFIABLE_SUBJECT_WINDOW_SECONDS)
@@ -1478,7 +1489,9 @@ def transit_seal_alert(
         if cause.partition(":")[0] == _TRANSIT_UNVERIFIABLE_CAUSE:
             # "transit-unverifiable:<row>" keeps its ":<row>" on the subject, within the cap.
             subject = TRANSIT_SEAL_UNVERIFIABLE_SUBJECT + cause[len(_TRANSIT_UNVERIFIABLE_CAUSE) :]
-            if len(subject) > _UNVERIFIABLE_SUBJECT_LIMIT:
+            if subject in _UNCAPPED_UNVERIFIABLE_SUBJECTS:
+                ...  # a directory map always pages under its own subject, uncounted
+            elif len(subject) > _UNVERIFIABLE_SUBJECT_LIMIT:
                 subject = f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:*"
                 reason += "; the row's key is too long for a subject of its own"
             elif not cap.named(subject, clock()):

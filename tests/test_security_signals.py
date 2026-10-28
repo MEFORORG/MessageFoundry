@@ -195,6 +195,23 @@ def test_the_withheld_directory_lock_refusal_is_not_counted() -> None:
     assert [c for _s, _n, c, _d in sink.signals] == [3]
 
 
+def test_a_sign_in_refused_for_an_unverifiable_map_is_not_counted() -> None:
+    """BACKLOG #2592: a directory sign-in refused because Vault transit would not check an AD map
+    is audited under its own action, so a Vault lag never reads as a password attack. Control: the
+    same rows as failed credentials do trip the signal."""
+    from messagefoundry.auth.service import (
+        DIRECTORY_MAP_UNVERIFIABLE,
+        LOGIN_REFUSED_UNVERIFIABLE_ACTION,
+    )
+
+    detail = json.dumps({"provider": "ad", "reason": DIRECTORY_MAP_UNVERIFIABLE}, sort_keys=True)
+    det, sink, _ = _detector(signin_failures=3)
+    _rows(det, LOGIN_REFUSED_UNVERIFIABLE_ACTION, 10, detail=detail)
+    assert sink.signals == []
+    _rows(det, "auth.login_failed", 3, detail=detail)
+    assert [c for _s, _n, c, _d in sink.signals] == [3]
+
+
 def test_a_spread_of_subjects_collapses_onto_one_shared_subject() -> None:
     det, sink, _ = _detector(signin_failures=2)
     for i in range(MAX_SUBJECT_ALERTS + 3):

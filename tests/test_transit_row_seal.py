@@ -32,8 +32,10 @@ from messagefoundry.auth.service import (
     AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
     DIRECTORY_MAP_UNVERIFIABLE,
     DIRECTORY_ROLE_MAP_UNSEALED,
+    LOGIN_REFUSED_UNVERIFIABLE_ACTION,
     AdMapUnverifiableError,
     AuthService,
+    CustomRoleDeleteUnverifiableError,
     CustomRoleUnverifiableError,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -701,16 +703,38 @@ async def test_an_unverifiable_custom_role_is_listed_empty_refuses_an_edit_and_d
     await service.update_custom_role(
         role.id, display_name="r", description=None, permissions=["messages:read"], actor="t"
     )
-    # Deleting is the recovery path, even with a holder and an AD map pair that are themselves
-    # unverifiable: each falls back to deleting its own row of the role.
+    # Deleting is the recovery path for an unverifiable role and holder, but not while the AD
+    # role map is unverifiable too: the delete would raw-delete the map's pairs, unsealed, and the
+    # map would read as forged once Vault recovers. Refused, and nothing is written.
     await _user(store, "holder")
     await store.set_user_roles("holder", [role.id])
     await store.set_ad_group_role_map([("grp", role.id)])
     await _retire_old_versions(store, transit)
     assert await service._load_role(role.id) is None  # control: the role is unverifiable now
+    with pytest.raises(CustomRoleDeleteUnverifiableError, match="check that Vault is healthy"):
+        await service.delete_custom_role(role.id, actor="t")
+    assert await store.get_role(role.id) is not None
+    assert role.id in await store.get_user_role_ids("holder")
+    transit.min_decryption = 1
+    assert [p for p in await service.list_ad_group_role_map() if p[1] == role.id]  # map untouched
+    # Control: with the map verifiable, an unverifiable role and holder still delete, and the
+    # map is re-sealed without the role's pair.
+    # Each seal to a version Transit does not hold ("v<n>" becomes "v9<n>"), whatever it was.
+    await _raw_for(path)(
+        "UPDATE roles SET seal = replace(seal, ':vault:v', ':vault:v9') WHERE id = ?", (role.id,)
+    )
+    await _raw_for(path)(
+        "UPDATE users SET authz_seal = replace(authz_seal, ':vault:v', ':vault:v9') WHERE id = ?",
+        ("holder",),
+    )
+    _lapse_cache(store)
+    assert await service._load_user("holder") is None  # control: the holder is unverifiable
+    assert await service._load_role(role.id) is None  # control: the role is unverifiable
     await service.delete_custom_role(role.id, actor="t")
     assert await store.get_role(role.id) is None
     assert role.id not in await store.get_user_role_ids("holder")
+    resealed = await service._sealed_ad_map(AD_ROLE_MAP)  # None if it failed its seal
+    assert resealed is not None and not [p for p in resealed.pairs if p[1] == role.id]
 
 
 async def test_an_unverifiable_approval_is_skipped_with_audit_and_alert(
@@ -1002,12 +1026,10 @@ async def _set_map_version(path: Path, name: str, *, planted: bool) -> None:
     )
 
 
-def _login_refusals(path: Path, reason: str) -> int:
+def _login_refusals(path: Path, reason: str, action: str = "auth.login_failed") -> int:
     conn = sqlite3.connect(path)
     try:
-        rows = conn.execute(
-            "SELECT detail FROM audit_log WHERE action = 'auth.login_failed'"
-        ).fetchall()
+        rows = conn.execute("SELECT detail FROM audit_log WHERE action = ?", (action,)).fetchall()
         return sum(1 for (detail,) in rows if f'"reason": "{reason}"' in str(detail))
     finally:
         conn.close()
@@ -1048,7 +1070,10 @@ async def test_a_directory_sign_in_meeting_an_unverifiable_map_is_refused_and_wr
     _lapse_cache(store)
     refused = await service._complete_ad_login(principal, None, mfa_verified=True)
     assert not refused.ok and refused.token is None
-    assert _login_refusals(path, DIRECTORY_MAP_UNVERIFIABLE) == 1
+    # Audited under its own action, never as a failed credential (the burst signal's input).
+    unverified = LOGIN_REFUSED_UNVERIFIABLE_ACTION
+    assert _login_refusals(path, DIRECTORY_MAP_UNVERIFIABLE, unverified) == 1
+    assert _login_refusals(path, DIRECTORY_MAP_UNVERIFIABLE) == 0
     after = await store.get_user_by_username("jdoe")
     assert after is not None
     assert await store.get_user_role_ids(after.id) == ["operator"]  # the genuine role is kept
@@ -1470,6 +1495,10 @@ def test_a_row_seal_error_keeps_its_cause_through_copy_and_pickle() -> None:
     assert "cannot be verified by Vault transit" in str(
         row_seal.RowSealError(SESSION_KIND, unverifiable=True)
     )
+    named = row_seal.RowSealError(SESSION_KIND, True, "stored-id")
+    for back in (copy.copy(named), pickle.loads(pickle.dumps(named))):  # nosec B301
+        assert back.row_id == "stored-id"
+    assert "stored-id" not in str(named)  # never part of the text
 
 
 async def test_an_unverifiable_write_answers_a_409_naming_vault_not_a_failed_check() -> None:
@@ -1639,3 +1668,192 @@ async def test_a_flood_of_unverifiable_rows_does_not_suppress_a_forgery_page(
     _lapse_cache(store)
     assert await service.identity_for_token(forged) is None
     assert raised[-1] == AUTHORITY_SEAL_SUBJECT
+
+
+# --- round 7: a held map pages, a role delete refuses, provision names the recovery -------------
+
+
+class _ReconcileSink(LoggingAlertSink):
+    """Records each ``ad_reconcile_aborted`` as ``(source, reason, detail)``."""
+
+    def __init__(self) -> None:
+        self.aborted: list[tuple[str, str, str]] = []
+
+    def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
+        self.aborted.append((name, reason, detail))
+
+
+@pytest.mark.parametrize("held", [AD_ROLE_MAP, AD_SCOPE_MAP])
+async def test_a_held_reconcile_pass_raises_one_alert_per_hold(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch, held: str
+) -> None:
+    """A DB writer who makes a directory map unverifiable stops every demotion from revoking a
+    live session. Before this, the pass held quietly: only the map's own row page, which the cap
+    could fold. Now the pass raises a reconcile-level alert, once per hold, not once per pass, and
+    again for a new hold. Control: a pass on verified maps raises none."""
+    from messagefoundry.api.app import _MAP_HOLD_ALERT_SOURCE, _alert_reconcile_plan
+    from tests.test_ad_session_reconcile import _FakeLdap, _principal, _signed_in_ad_user
+
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    _armed(store, monkeypatch)
+    ldap = _FakeLdap({"jdoe": _principal("jdoe", _OPS, _CHANS)})
+    service = await _directory_service(store, ldap)
+    await service.set_ad_group_map([(_OPS, "operator")], actor="t")
+    await service.set_ad_group_scope_map([(_CHANS, "chan-a")], actor="t")
+    assert await _signed_in_ad_user(service, store, "jdoe") is not None
+    sink = _ReconcileSink()
+
+    async def one_pass() -> list[tuple[str, str, str]]:
+        sink.aborted.clear()
+        _alert_reconcile_plan(await service.reconcile_directory_sessions(), service, sink)
+        return [a for a in sink.aborted if a[0] == _MAP_HOLD_ALERT_SOURCE]
+
+    assert await one_pass() == []  # control: both maps verify
+    await _set_map_version(path, held, planted=True)
+    _lapse_cache(store)
+    [(_source, reason, detail)] = await one_pass()
+    assert reason == DIRECTORY_MAP_UNVERIFIABLE
+    assert held in detail and "check that Vault is healthy" in detail
+    assert service.directory_reconcile_map_hold is not None
+    assert await one_pass() == []  # the hold still stands: latched, not paged again
+    await _set_map_version(path, held, planted=False)
+    _lapse_cache(store)
+    assert await one_pass() == []
+    assert service.directory_reconcile_map_hold is None  # released
+    await _set_map_version(path, held, planted=True)
+    _lapse_cache(store)
+    assert len(await one_pass()) == 1  # a new hold pages again
+
+
+def test_a_directory_map_page_is_never_folded_into_the_aggregate() -> None:
+    """Past the cap a planted row pages under the shared ``:*`` subject, but each directory map
+    keeps its own: one unverifiable map holds every demotion, so its page must stand apart. The
+    exemption names the two maps exactly, so another ``adset`` key is capped as before (control),
+    and the exempt pages take no place in the cap."""
+    from messagefoundry.pipeline import alerts
+    from messagefoundry.pipeline.alerts import MAX_SUBJECT_ALERTS
+
+    assert {
+        f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:{row_seal.ADSET_KIND}:{name}"
+        for name in (AD_ROLE_MAP, AD_SCOPE_MAP)
+    } == alerts._UNCAPPED_UNVERIFIABLE_SUBJECTS
+    raised: list[str] = []
+    sink = LoggingAlertSink()
+    sink.integrity_drift = lambda name, *, reason, drift_count: raised.append(name)  # type: ignore[method-assign]
+    hook = transit_seal_alert(sink, clock=lambda: 1000.0)
+    cause = row_seal.TRANSIT_UNVERIFIABLE_CAUSE
+    hook(f"{cause}:adset:{AD_ROLE_MAP}", "r")  # does not count against the cap
+    for i in range(MAX_SUBJECT_ALERTS):
+        hook(f"{cause}:{SESSION_KIND}:{i:012d}", "r")
+    assert raised.count(f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:*") == 0
+    for name in (AD_ROLE_MAP, AD_SCOPE_MAP):
+        hook(f"{cause}:adset:{name}", "r")
+        assert raised[-1] == f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:adset:{name}"
+    hook(f"{cause}:adset:another_map", "r")  # control: not one of the two
+    assert raised[-1] == f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:*"
+
+
+async def test_a_role_delete_on_an_unverifiable_map_is_a_409_and_the_store_refuses_it_too(
+    transit_store: Opened,
+) -> None:
+    """The service refuses before it revokes anything, the route answers 409 with the recovery,
+    and the store refuses the same delete on its own, for a map that turns unverifiable after the
+    service's check: nothing is written. Control: on a verifiable map the delete goes through."""
+    from fastapi import HTTPException
+
+    from messagefoundry.api.auth_routes import _ad_map_unverifiable_is_409
+
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    service = AuthService(store, AuthSettings(), integrity_alert=lambda _r: None)
+    await service.initialize()
+    role = await service.create_custom_role(
+        display_name="r", description=None, permissions=["messages:read"], actor="t"
+    )
+    await _user(store, "holder")
+    await store.set_user_roles("holder", [role.id])
+    await store.set_ad_group_role_map([("grp", role.id)])
+    token = await _mint(store, "holder")
+    await _set_map_version(path, AD_ROLE_MAP, planted=True)
+    _lapse_cache(store)
+    with pytest.raises(HTTPException) as caught, _ad_map_unverifiable_is_409():
+        await service.delete_custom_role(role.id, actor="t")
+    assert caught.value.status_code == 409
+    assert "check that Vault is healthy" in str(caught.value.detail)
+    assert await store.get_role(role.id) is not None
+    assert await store.get_session(hash_token(token)) is not None  # not revoked either
+    with pytest.raises(row_seal.RowSealError) as refused:
+        await store.delete_custom_role(role.id)
+    assert refused.value.unverifiable
+    assert await store.get_role(role.id) is not None
+    assert role.id in await store.get_user_role_ids("holder")
+    await _set_map_version(path, AD_ROLE_MAP, planted=False)
+    _lapse_cache(store)
+    await service.delete_custom_role(role.id, actor="t")  # control
+    assert await store.get_role(role.id) is None
+
+
+async def test_provision_admin_names_the_recovery_for_an_unverifiable_name(
+    transit_store: Opened,
+) -> None:
+    """At load time an account Vault transit would not check is no forgery, so the refusal names
+    the recovery rather than calling the row unrepairable. Control: a forged account still reads
+    as unrepairable."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    service = AuthService(store, AuthSettings(), integrity_alert=lambda _r: None)
+    await service.initialize()
+    await _user(store, "site-admin")
+    await _plant_user_version(path, "site-admin")
+    _lapse_cache(store)
+    text = await service.provision_refusal("site-admin", notify_email="ops@example.invalid")
+    assert text is not None and "check that Vault is healthy" in text
+    assert "cannot be repaired" not in text
+    await _raw_for(path)("UPDATE users SET authz_seal = '' WHERE id = ?", ("site-admin",))
+    forged = await service.provision_refusal("site-admin", notify_email="ops@example.invalid")
+    assert forged is not None and "cannot be repaired" in forged
+
+
+async def test_a_store_user_write_pages_under_the_stored_id_not_the_requested_one(
+    transit_store: Opened, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a store whose ids compare without case (SQL Server) a request can name a row in another
+    case. The page and the error name the id the row holds, so one row has one subject. SQLite
+    compares ids exactly, so the case-insensitive lookup is stood in for here."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    raised = _armed(store, monkeypatch)
+    await _user(store, "seal-case")
+    await _plant_user_version(path, "seal-case")
+    _lapse_cache(store)
+    read = store._read_user_record
+
+    async def folded(user_id: str) -> Any:
+        return await read(user_id.lower())
+
+    monkeypatch.setattr(store, "_read_user_record", folded)
+    with pytest.raises(row_seal.RowSealError) as refused:
+        await store.clear_lockout("SEAL-CASE")
+    assert raised == [f"{TRANSIT_SEAL_UNVERIFIABLE_SUBJECT}:user:seal-case"]
+    assert refused.value.row_id == "seal-case"
+
+
+async def test_the_approval_gate_reports_under_the_refused_rows_stored_id() -> None:
+    from messagefoundry.api.approvals import ApprovalGate
+
+    reported: list[tuple[str, bool]] = []
+
+    class _Gate:
+        async def _approval_seal_failed(self, approval_id: str, *, unverifiable: bool) -> None:
+            reported.append((approval_id, unverifiable))
+
+    gate: Any = _Gate()
+    stored = row_seal.RowSealError("approval", unverifiable=True, row_id="appr-1")
+    await ApprovalGate._approval_seal_refused(gate, stored, "APPR-1")
+    await ApprovalGate._approval_seal_refused(gate, row_seal.RowSealError("approval"), "APPR-1")
+    assert reported == [("appr-1", True), ("APPR-1", False)]  # the second is the control

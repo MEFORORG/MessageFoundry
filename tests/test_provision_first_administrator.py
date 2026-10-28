@@ -548,6 +548,43 @@ def test_cli_provisions_and_names_the_store_it_wrote_to(
     asyncio.run(check())
 
 
+@pytest.mark.parametrize("unverifiable", [True, False])
+def test_cli_names_the_recovery_for_a_repair_write_vault_would_not_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    unverifiable: bool,
+) -> None:
+    """BACKLOG #2592: a repair write the store refused because Vault transit would not check the
+    account's seal exits 1 with one error line that names the recovery, not the defect report.
+    Control: a seal that FAILED is not caught here, and still reaches the defect path."""
+    from messagefoundry.auth.service import UNVERIFIABLE_RECOVERY
+    from messagefoundry.store.row_seal import USER_KIND, RowSealError
+
+    async def refused(*_a: object, **_k: object) -> None:
+        raise RowSealError(USER_KIND, unverifiable=unverifiable, row_id="u1")
+
+    monkeypatch.setattr(AuthService, "provision_first_administrator", refused)
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    argv += ["--db", str(tmp_path / "provision.db"), "--json"]
+    code = main(argv)
+    captured = capsys.readouterr()
+    if not unverifiable:
+        assert code != 0
+        assert UNVERIFIABLE_RECOVERY not in captured.out
+        assert "uncaught exception" in captured.err  # the CLI floor's defect report
+        return
+    assert code == 1
+    assert "uncaught exception" not in captured.err
+    error = json.loads(captured.out)["error"]
+    assert UNVERIFIABLE_RECOVERY in error
+    assert "Vault transit refused to check" in error and "may be missing" in error
+    assert "u1" not in error  # the row's id stays out of the terminal line
+
+
 def test_cli_refuses_without_an_email_before_the_prompt_and_the_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -1348,7 +1348,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> SimpleMessage:
         """The delete past :func:`delete_custom_role`'s step-up, for the seam."""
         try:
-            await service.delete_custom_role(role_id, actor=identity.username)
+            # A map Vault transit refused to check refuses the delete with a 409 (BACKLOG #2592).
+            with _ad_map_unverifiable_is_409():
+                await service.delete_custom_role(role_id, actor=identity.username)
         except ValueError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
         return SimpleMessage(detail="custom role deleted")
