@@ -189,7 +189,6 @@ from messagefoundry.store.store import (
     VerifiedUser,
     WebAuthnCredential,
     ad_map_seal_ok,
-    discoverable_way_past,
     log_unopened_totp,
     passkey_digest,
     passkey_is_way_past,
@@ -1089,8 +1088,8 @@ class PasskeyProof:
 @dataclass(frozen=True)
 class StagedChallenge:
     """A challenge :meth:`AuthService.take_passkey_challenge` popped. ``paid`` says whether the
-    begin leg's sign-in limiter charge for it is still inside the limiter's window, so the sign-in
-    POST may skip its own (BACKLOG #3937 item 2)."""
+    begin leg's sign-in limiter hit was renewed for this sign-in, so the sign-in POST skips its own
+    charge (BACKLOG #3937 item 2)."""
 
     challenge: bytes
     paid: bool
@@ -2573,11 +2572,14 @@ async def lockable_account_census(
     sealed = store.row_sealer() is not None
     # One probe, so a site with no passkey anywhere reads no account's set below. Without the
     # [webauthn] extra no passkey can sign in, so none is a way past and none is read.
-    # With no configured rp_id no passkey counts (BACKLOG #3937), so none is read either.
     any_passkeys = webauthn.available() and await store.any_webauthn_credentials()
 
-    def counts(cred: WebAuthnCredential) -> bool:
+    def gate_counts(cred: WebAuthnCredential) -> bool:
         return passkey_is_way_past_under(cred, way_past_rp_id)
+
+    # Which passkey may sign the owner in: under the configured rp_id where there is one, any
+    # discoverable one where there is none (the sign-in then takes the request's rp_id).
+    sign_in_counts = passkey_is_way_past if way_past_rp_id is None else gate_counts
 
     for user in await store.list_users():
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
@@ -2614,17 +2616,15 @@ async def lockable_account_census(
         creds = await store.list_webauthn_credentials(user.id) if any_passkeys else []
         digest = user.row.cred_digest if user.row is not None else ""
         # Two questions, two rules (BACKLOG #3937). Whether a reset would remove a passkey that
-        # may still sign the holder in asks the plain rule, since on a loopback bind with no
-        # public_origin the sign-in takes a passkey under the request's rp_id. Whether the account
-        # holds a way past the GATES count asks the configured rp_id, as the gates do.
-        if discoverable_way_past(creds, digest, sealed=sealed):
+        # may still sign the holder in asks ``sign_in_counts``. Whether the account holds a way
+        # past the GATES count asks the configured rp_id, as the gates do. One digest check.
+        trusted = not sealed or passkey_digest(creds) == digest
+        if trusted and any(sign_in_counts(c) for c in creds):
             if state == "unknown":
                 unknown_beside_a_passkey.append(user.username)
             else:
                 passkey_only.append(user.username)
-        if not user.totp_enabled and not discoverable_way_past(
-            creds, digest, sealed=sealed, passkey_counts=counts
-        ):
+        if not user.totp_enabled and not (trusted and any(gate_counts(c) for c in creds)):
             no_way_past.append(user.username)
     return LockableAccountCensus(
         no_way_past=tuple(sorted(no_way_past)),
@@ -5384,9 +5384,7 @@ class AuthService:
             if totp_state != "usable" and await self._holds_discoverable_passkey(
                 user,
                 held=passkeys,
-                counts=self._gate_counts
-                if self.passkeys_count_as_way_past()
-                else passkey_is_way_past,
+                counts=self._way_past_counts(),
             ):
                 notice["combined_passkey_sign_in"] = True
         await self._record_suspicious_login(
@@ -12490,9 +12488,10 @@ class AuthService:
 
         A passkey registered before wave 2, or one whose client reported it was not made
         discoverable, cannot be found by the usernameless ceremony, so it is a second factor
-        everywhere else but no way past the lock (the amendment's fact 11). Every caller is a
-        factor-drop gate, so a passkey counts only under the configured relying party
-        (:meth:`_gate_counts`, BACKLOG #3937)."""
+        everywhere else but no way past the lock (the amendment's fact 11). It answers for the
+        factor-drop gates, at least the rotation gate and its courtesy twin
+        :meth:`must_enrol_before_rotating`, so a passkey counts only under the configured relying
+        party (:meth:`_gate_counts`, BACKLOG #3937)."""
         return await self._totp_way_past(user) or await self._holds_gate_passkey(user)
 
     async def _totp_way_past(self, user: VerifiedUser) -> bool:
@@ -12544,6 +12543,23 @@ class AuthService:
             held = await self._verified_passkeys(user)
         return any(counts(c) for c in held or ())
 
+    def _way_past_counts(self) -> PasskeyCounts:
+        """The passkey rule for a question about the passkey the owner may sign in with, not about
+        what a factor-drop gate may count: :meth:`_gate_counts` where the configuration names a
+        relying party, since every sign-in then arrives under it, and the plain rule where it names
+        none, since the sign-in then takes the request's rp_id. At least the lock notice, the
+        passkey removal's guard on its target and the first-factor refusal ask it."""
+        return self._gate_counts if self.passkeys_count_as_way_past() else passkey_is_way_past
+
+    async def _first_factor_way_past(self, user: VerifiedUser) -> bool:
+        """Whether ``user`` already holds a way past, for the AC-A3 refusal of a first factor that
+        is none: TOTP, or a passkey under :meth:`_way_past_counts`. With no configured relying party
+        a discoverable passkey still answers here, so a covered account with none cannot take a
+        passkey that is not discoverable as its first factor (BACKLOG #3937)."""
+        return await self._totp_way_past(user) or await self._holds_discoverable_passkey(
+            user, counts=self._way_past_counts()
+        )
+
     def passkeys_count_as_way_past(self) -> bool:
         """Whether any passkey can count as a way past the sign-in lock at the factor-drop gates:
         only where the configuration names a relying party (:meth:`_gate_counts`, BACKLOG #3937).
@@ -12566,8 +12582,9 @@ class AuthService:
         under the configured relying party, because the combined passkey sign-in keeps only the
         passkeys under the request's rp_id. With no configured one nothing counts, the direction
         that keeps TOTP: a passkey that turned out to be under another rp_id would leave the
-        account no way past the sign-in lock. The sign-in path and the lock notice keep the plain
-        rule; they run with the request's rp_id in hand or name a way past the owner can try."""
+        account no way past the sign-in lock. The sign-in path keeps the plain rule, with the
+        request's rp_id in hand; the questions about which passkey the owner may sign in with ask
+        :meth:`_way_past_counts`."""
         return passkey_is_way_past_under(cred, self._way_past_rp_id)
 
     async def must_enrol_before_rotating(self, identity: Identity) -> bool:
@@ -14284,9 +14301,8 @@ class AuthService:
         # stored. Asked after the verify, since only the response says what was made.
         if (
             not discoverable
-            and self.passkeys_count_as_way_past()
             and self._covered_by_requirement(user, identity.roles)
-            and not await self._has_way_past(user)
+            and not await self._first_factor_way_past(user)
         ):
             await self._audit(
                 "auth.webauthn_failed",
@@ -14370,14 +14386,19 @@ class AuthService:
         client address (:class:`webauthn.PreAuthChallengePool` says why). Raises ``RuntimeError``
         on an install without the ``[webauthn]`` extra; the route asks
         :meth:`webauthn_available` first."""
-        if not self.allow_login_attempt(client):
-            return None
+        charge: webauthn.LoginCharge | None = None
+        if self._login_limiter is not None:
+            key = client or "unknown"
+            stamp = self._login_limiter.allow_stamped(key)
+            if stamp is None:
+                return None
+            charge = (key, stamp)
         challenge = webauthn.new_challenge()
         options = webauthn.assertion_options(
             rp_id=rp_id, challenge=challenge, allow_credential_ids=()
         )
         handle = mint_token()
-        self._preauth_challenges.put(hash_token(handle), challenge)
+        self._preauth_challenges.put(hash_token(handle), challenge, charge)
         return handle, options
 
     def take_passkey_challenge(self, handle: str) -> StagedChallenge | None:
@@ -14386,19 +14407,22 @@ class AuthService:
         second call finds nothing.
 
         ``POST /ui/login`` calls it BEFORE the sign-in limiter and skips its own charge only when
-        the result is ``paid``: the begin leg that staged it charged control 2 for this sign-in,
-        and that charge is still inside the limiter's window (BACKLOG #3937 item 2, ADR 0197
-        Amendment A). A challenge lives longer than the window, so an older one is charged again;
-        otherwise begin legs run in earlier windows could be banked and spent later as uncharged
-        sign-ins. A forged or absent handle finds nothing and is charged like any other request.
-        The route passes the challenge to :meth:`login` as ``passkey_challenge``."""
+        the result is ``paid``: the begin leg's control-2 hit for this sign-in was still in the
+        window, and this call MOVED it to now (``SlidingWindowRateLimiter.renew``), so the sign-in
+        is counted once and from the moment it is spent (BACKLOG #3937 item 2, ADR 0197 Amendment
+        A). A hit that had left the window is not renewed and the POST charges afresh, so begin
+        legs cannot be banked and spent later. A forged or absent handle finds nothing and is
+        charged like any other request. The route passes the challenge to :meth:`login` as
+        ``passkey_challenge``."""
         taken = self._preauth_challenges.pop(hash_token(handle))
         if taken is None:
             return None
-        challenge, age = taken
-        return StagedChallenge(
-            challenge=challenge, paid=age < self._settings.login_rate_limit_window_seconds
-        )
+        challenge, charge = taken
+        if self._login_limiter is None:
+            paid = True  # control 2 is off: nothing to charge either way
+        else:
+            paid = charge is not None and self._login_limiter.renew(*charge)
+        return StagedChallenge(challenge=challenge, paid=paid)
 
     async def begin_webauthn_assertion(self, token: str | None, *, rp_id: str) -> str | None:
         """Stage an assertion ceremony for the caller's session; returns the browser request-options
@@ -14707,12 +14731,9 @@ class AuthService:
         # configured one, any discoverable passkey may be the way past the sign-in uses, so its
         # removal is guarded, and the store counts no other passkey as what remains: the removal
         # then needs TOTP that is a way past, the direction that keeps a factor.
-        target_counts = (
-            self._gate_counts(target)
-            if self._way_past_rp_id is not None
-            else passkey_is_way_past(target)
+        keep_way_past = self._way_past_counts()(target) and self._covered_by_requirement(
+            user, identity.roles
         )
-        keep_way_past = target_counts and self._covered_by_requirement(user, identity.roles)
         # A TOTP this release refuses is no factor the holder can use (BACKLOG #3422), so the
         # last-factor rule (ADR 0068 decision 5) does not count it either.
         last_second_factor = len(creds) == 1 and not await self._totp_way_past(user)

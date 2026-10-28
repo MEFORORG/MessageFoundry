@@ -32,9 +32,10 @@ this line.**
 ### Security
 
 - **A passkey sign-in costs one unit of the sign-in window, not two.** `POST /ui/login` pops the
-  challenge the begin leg staged before its own charge, and skips the charge only when it found
-  one; a forged, expired or absent handle is charged. Needs the engine seam that carries
-  `AuthService.take_passkey_challenge`. The console also asks `must_enrol_before_rotating` once per
+  challenge the begin leg staged before its own charge, and charges only when the engine did not
+  renew the begin leg's hit (`StagedChallenge.paid`; the engine's SECURITY.md states the rule).
+  Needs the engine seam that carries `AuthService.take_passkey_challenge`. With no configured
+  public origin the enrol-first notice offers TOTP alone. The console also asks `must_enrol_before_rotating` once per
   request, and the two passkey ceremonies share one serializer in `app.js`. (BACKLOG #3937)
 
 - **An IdP step-up's return is charged to the operator's own re-authentication budget, not the

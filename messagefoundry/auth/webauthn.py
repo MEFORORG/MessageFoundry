@@ -402,6 +402,10 @@ class ChallengeCache:
         return len(moved)
 
 
+#: A sign-in limiter hit: the limiter key and the monotonic stamp ``allow_stamped`` returned.
+LoginCharge = tuple[str, float]
+
+
 class PreAuthChallengePool:
     """Bounded, TTL'd, process-local staging for the usernameless sign-in's challenges (ADR 0197
     Amendment A, wave 2).
@@ -431,38 +435,38 @@ class PreAuthChallengePool:
         self._ttl = ttl_seconds
         self._cap = cap
         self._clock = clock
-        self._entries: OrderedDict[str, tuple[bytes, float]] = OrderedDict()
+        # key -> (challenge, deadline, the begin leg's sign-in limiter charge or None).
+        self._entries: OrderedDict[str, tuple[bytes, float, LoginCharge | None]] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self._entries)
 
     def _prune(self, now: float) -> None:
         while self._entries:
-            key, (_challenge, deadline) = next(iter(self._entries.items()))
+            key, (_challenge, deadline, _charge) = next(iter(self._entries.items()))
             if deadline > now:
                 return
             del self._entries[key]
 
-    def put(self, key: str, challenge: bytes) -> None:
-        """Stage ``challenge`` under ``key`` (a handle hash), evicting the oldest entry when full."""
+    def put(self, key: str, challenge: bytes, charge: LoginCharge | None = None) -> None:
+        """Stage ``challenge`` under ``key`` (a handle hash), evicting the oldest entry when full.
+        ``charge`` is the begin leg's sign-in limiter hit, which the sign-in renews (BACKLOG #3937)."""
         now = self._clock()
         self._prune(now)
         self._entries.pop(key, None)
         while len(self._entries) >= self._cap:
             self._entries.popitem(last=False)
-        self._entries[key] = (challenge, now + self._ttl)
+        self._entries[key] = (challenge, now + self._ttl, charge)
 
-    def pop(self, key: str) -> tuple[bytes, float] | None:
+    def pop(self, key: str) -> tuple[bytes, LoginCharge | None] | None:
         """Consume the challenge staged under ``key``: single use, ``None`` if absent or expired.
-        Returns the challenge and its age in seconds, which the sign-in reads to judge whether the
-        begin leg's limiter charge is still inside the limiter's window (BACKLOG #3937)."""
+        Returns the challenge and the charge :meth:`put` stored with it."""
         # A dict lookup, discharged for ASVS 11.2.4 for the reason ChallengeCache.put gives: the
         # key is the SHA-256 of the caller's own handle.
         entry = self._entries.pop(key, None)
-        now = self._clock()
-        if entry is None or entry[1] <= now:
+        if entry is None or entry[1] <= self._clock():
             return None
-        return entry[0], now - (entry[1] - self._ttl)
+        return entry[0], entry[2]
 
 
 @dataclass(frozen=True, slots=True)

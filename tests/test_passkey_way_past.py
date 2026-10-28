@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import time
+import types
 from typing import Any
 
 import pytest
@@ -695,7 +696,7 @@ def test_the_pre_auth_pool_evicts_its_oldest_rather_than_refusing() -> None:
         pool.put(f"k{i}", bytes([i]))
     pool.put("k3", b"\x03")
     assert len(pool) == 3
-    assert pool.pop("k0") is None and pool.pop("k1") == (b"\x01", 1.0)  # (challenge, age)
+    assert pool.pop("k0") is None and pool.pop("k1") == (b"\x01", None)  # (challenge, charge)
     assert pool.pop("k1") is None
     clock[0] += 10
     assert pool.pop("k2") is None and pool.pop("k3") is None
@@ -1572,9 +1573,12 @@ async def test_a_passkey_under_another_rp_id_does_not_open_the_rotation_gate(
         with pytest.raises(FactorEnrolmentRequired):
             await gate.change_password(identity, _NEW_PASSWORD)
         census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=configured)
-        assert census.no_way_past == (identity.username,) and census.passkey_only == (
-            identity.username,
-        )
+        assert census.no_way_past == (identity.username,)
+        # The reset warning's question, which passkey may sign the holder in: with no configured
+        # rp_id the request's rp_id may still take this one; under another configured one it never
+        # can.
+        expected = (identity.username,) if configured is None else ()
+        assert census.passkey_only == expected
 
         control = _gate_service(store, RP)
         assert not await control.must_enrol_before_rotating(identity)
@@ -1647,30 +1651,67 @@ async def test_a_seal_refusal_calls_a_passkey_sign_in_combined_only_where_it_was
         await store.close()
 
 
-async def test_a_staged_challenge_waives_the_sign_in_charge_only_inside_the_window() -> None:
-    """Item 2: a challenge lives longer than the limiter's window, so one staged in an earlier
-    window is not ``paid`` and the sign-in POST charges again. Otherwise begin legs could be
-    banked and spent later as uncharged sign-ins. A forged handle finds nothing."""
+async def test_a_staged_challenge_renews_its_charge_and_cannot_be_banked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 2: taking a staged challenge MOVES the begin leg's control-2 hit to now rather than
+    skipping a charge, so a begin leg's budget cannot be spent in a later window. A challenge
+    lives longer than the window: one whose hit has aged out is not ``paid`` and the sign-in
+    charges afresh. A forged handle finds nothing."""
     from messagefoundry.auth import webauthn as wa
 
+    clock = [1_000.0]
+    # The limiter module's own clock only: the event loop keeps the real one.
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", types.SimpleNamespace(monotonic=lambda: clock[0])
+    )
     store = await MessageStore.open(":memory:")
     try:
-        service = _service(store, login_rate_limit_window_seconds=60.0)
-        clock = [1_000.0]
+        service = _service(
+            store,
+            login_rate_limit_enabled=True,
+            login_rate_limit_per_ip=2,
+            login_rate_limit_window_seconds=60.0,
+        )
         service._preauth_challenges = wa.PreAuthChallengePool(clock=lambda: clock[0])
-        fresh = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.30")
-        old = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.30")
-        assert fresh is not None and old is not None
-        clock[0] += 30
-        taken = service.take_passkey_challenge(fresh[0])
-        assert taken is not None and taken.paid
-        clock[0] += 31  # 61 s after staging: still live (120 s), past the 60 s window
-        taken = service.take_passkey_challenge(old[0])
+        first = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.30")
+        second = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.30")
+        assert first is not None and second is not None
+        clock[0] += 59
+        taken = service.take_passkey_challenge(first[0])
+        assert taken is not None and taken.paid  # its hit now stands at t=59
+        clock[0] += 2  # t=61: the second begin's hit (t=0) has aged out; the challenge has not
+        taken = service.take_passkey_challenge(second[0])
         assert taken is not None and not taken.paid
-        assert service.take_passkey_challenge(old[0]) is None, "a challenge was taken twice"
+        assert service.allow_login_attempt("192.0.2.30"), "the renewed hit was counted twice"
+        assert not service.allow_login_attempt("192.0.2.30"), "a banked charge was spent"
+        assert service.take_passkey_challenge(second[0]) is None, "a challenge was taken twice"
         assert service.take_passkey_challenge("forged") is None
     finally:
         await store.close()
+
+
+def test_the_limiter_renews_only_a_hit_still_in_its_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``SlidingWindowRateLimiter.renew`` moves a live hit to now and counts nothing new; an aged
+    or unknown hit is not renewed."""
+    from messagefoundry.auth import ratelimit
+
+    clock = [0.0]
+    # The limiter module's own clock only: the event loop keeps the real one.
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", types.SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    limiter = ratelimit.SlidingWindowRateLimiter(per_key=1, glob=5, window_seconds=10.0)
+    stamp = limiter.allow_stamped("a")
+    assert stamp == 0.0 and not limiter.allow("a")
+    clock[0] = 9.0
+    assert limiter.renew("a", stamp)
+    assert not limiter.renew("a", stamp), "a renewed hit was renewed again"
+    clock[0] = 12.0  # the original stamp would have aged out; the renewed hit (t=9) has not
+    assert not limiter.allow("a")
+    clock[0] = 19.5
+    assert limiter.allow("a")
+    assert not limiter.renew("b", 19.5)
 
 
 def test_the_configured_rp_id_is_the_public_origin_host() -> None:

@@ -699,7 +699,7 @@ from typing import Any
 #: BACKLOG #3937 items 1, 2 and 5: ``AuthService`` gained ``take_passkey_challenge`` (returning a
 #: ``StagedChallenge``), ``passkeys_count_as_way_past`` (the enrol-first notice) and ``login`` the
 #: ``passkey_challenge`` keyword. ``POST /ui/login`` pops the staged challenge itself and skips its
-#: own sign-in limiter charge only when it found one, so a passkey sign-in costs one unit. The
+#: own sign-in limiter charge only when the result is ``paid`` (docs/SECURITY.md has the rule). The
 #: console keeps ``must_enrol_before_rotating``'s answer in the request scope for the request, and
 #: ``require_ui``'s body changed, which moved the route-gate lines. An older console on this engine
 #: would charge twice; a newer one on an older engine would raise AttributeError at sign-in. They
