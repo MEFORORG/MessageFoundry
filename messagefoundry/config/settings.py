@@ -957,9 +957,9 @@ class StoreSettings(_Section):
     #     CA-bundle pin (chain + hostname still verified).
     #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's OWN certificate
     #     by file (an exact-cert match, brace-quoted STORE-5-safe), so a CA file matches nothing. It goes
-    #     out with `Encrypt=strict`: on the Driver 18.7 build tested, the pin was enforced with strict and
-    #     not with `Encrypt=yes` (vault BACKLOG #2223). Strict is TDS 8.0, so it needs SQL Server 2022 or
-    #     later, the supported floor; an older server refuses the connection. Not a revocation control.
+    #     out with `Encrypt=strict` (vault BACKLOG #2223). Why strict, the server version it needs, and the
+    #     build and platform it was tested on: the `ssl_root_cert` row of docs/CONFIGURATION.md. Not a
+    #     revocation control.
     # REJECTED for SQLite (no TLS at all). A path, not a secret — it may live in the config file /
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
@@ -7381,6 +7381,32 @@ def _env_overrides(environ: Mapping[str, str]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _secrets_directory_overrides(environ: Mapping[str, str]) -> dict[str, dict[str, Any]]:
+    """The secret-class settings fields the secrets directory supplies, as ``{section: {key:
+    value}}`` (vault BACKLOG #2595, ADR 0214).
+
+    Merged over the environment layer, so a setting's file wins over its variable, which is the
+    accessor's rule in ``engine_secrets``. Every file the directory holds for a setting is read and
+    checked here, so a load refuses an unusable one even when nothing else would read it, such as a
+    Vault token file on a site with no Vault. Only names that are settings fields are returned: the
+    two Vault tokens are read by their own modules, and the store key is never read from the
+    directory. Raises ``SecretsDirectoryError``, a ``ValueError``, when the directory cannot be
+    used."""
+    from messagefoundry.engine_secrets import DIRECTORY_SETTING_NAMES, open_secrets_directory
+
+    directory = open_secrets_directory(environ)
+    if directory is None:
+        return {}
+    found = {name: directory.read(name) for name in DIRECTORY_SETTING_NAMES}
+    return _env_overrides(
+        {
+            name: value
+            for name, value in found.items()
+            if value is not None and name not in _OUT_OF_BAND_ENV
+        }
+    )
+
+
 def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | None:
     """The active environment ``MEFOR_AI_ENVIRONMENT`` names, or ``None`` when it is unset or blank.
 
@@ -7600,6 +7626,8 @@ _OUT_OF_BAND_ENV: frozenset[str] = frozenset(
         "MEFOR_SECRETS_VAULT_CA_FILE",
         "MEFOR_SECRETS_VAULT_KV_MOUNT",
         "MEFOR_SECRETS_VAULT_TOKEN",
+        # Where the secrets directory is (engine_secrets.py, vault BACKLOG #2595, ADR 0214).
+        "MEFOR_SECRETS_DIRECTORY",
         # The store's Vault KeyProvider and Transit cipher (store/keyprovider_vault.py,
         # store/crypto_transit.py).
         "MEFOR_STORE_TRANSIT_AUDIT_KEY",
@@ -10009,7 +10037,10 @@ def load_settings(
     environ: Mapping[str, str] | None = None,
     default_file: bool = True,
 ) -> ServiceSettings:
-    """Resolve settings with CLI > env > file > default precedence.
+    """Resolve settings with CLI > secrets directory > env > file > default precedence.
+
+    The secrets directory supplies only the secret-class settings, and only when
+    ``MEFOR_SECRETS_DIRECTORY`` names one (vault BACKLOG #2595, ADR 0214).
 
     ``config_path`` reads that TOML file (error if it's missing); when ``None``, ``./messagefoundry.toml``
     is used **only if it exists**. ``cli`` is a nested ``{section: {key: value}}`` of explicitly-provided
@@ -10054,6 +10085,10 @@ def load_settings(
     # typo that causes a validation error is named. Over `environ` itself, so it reports the
     # variable as the operator spelled it; `data` is read for what the settings name.
     _reject_unknown_env_keys(environ, data)
+    # The secrets directory (vault BACKLOG #2595, ADR 0214), after the unread-variable warnings and
+    # the refusals above, so a directory it refuses does not hide a mistyped variable or key
+    # until the next start. It writes only secret values, which nothing above reads.
+    _merge(data, _secrets_directory_overrides(environ))
     _desugar_security(data)
 
     if cli:
