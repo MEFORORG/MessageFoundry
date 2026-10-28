@@ -390,7 +390,7 @@ async def test_a_bad_signature_refusal_for_a_file_not_in_effect_says_a_start_ref
     assert "Restart the engine" not in BAD_SIGNATURE
     assert "at least until then" not in outcome.refusal.reason
     assert not outcome.start_refuses
-    # Not final while the file is not in effect: judged again each pass, as before item 8.
+    # Not final while its issuer has no CRL in effect: judged again each pass, as before item 8.
     # test_a_bad_signature_for_a_file_not_in_effect_is_judged_again_so_a_later_lapse_shows
     # says why.
     assert not outcome.refusal.sticky
@@ -484,9 +484,9 @@ def _ca_naming_no_key(pki: _Pki, key: ec.EllipticCurvePrivateKey) -> str:
 async def test_a_bad_signature_for_a_file_not_in_effect_is_judged_again_so_a_later_lapse_shows(
     pki: _Pki,
 ) -> None:
-    """Vault BACKLOG #3506 item 8, the Lander's hold on PR 2589. While a CRL in the file is not in
-    effect, a ``bad_signature`` refusal is judged again each pass, as before item 8, so a
-    ``lapses_first`` found for the same bytes later is reported. Here the hop's list gains a CA
+    """Vault BACKLOG #3506 item 8, the Lander's hold on PR 2589. While some issuer in the file has
+    no CRL in effect yet, a ``bad_signature`` refusal is judged again each pass, as before item 8,
+    so a ``lapses_first`` found for the same bytes later is reported. Here the hop's list gains a CA
     that verifies the CRL, as a CA directory can add one. The refusal still carries no "at least
     until" caveat and no ``start_refuses``. Before this repair the refusal was final until the
     bytes changed, so every later pass replayed ``bad_signature``."""

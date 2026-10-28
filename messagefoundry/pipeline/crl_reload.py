@@ -201,8 +201,8 @@ LAPSES_FIRST = (
 #:
 #: ``bad``: a file to fix. It names no restart, so it takes no not-in-effect caveat
 #: (:data:`_LEADS_TO_A_START`): a start whose check finds the same refuses the file whatever the
-#: time. While such a file is not in effect it is still judged again each pass
-#: (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`). The text gives no definition of proof, on purpose:
+#: time. While some issuer in such a file has no CRL in effect yet, it is still judged again each
+#: pass (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`). The text gives no definition of proof, on purpose:
 #: ``CrlSignature`` holds it, and a short form here went wrong.
 BAD_SIGNATURE = (
     "Fix the file: give a CRL the hop's CA signed. On the signature, a start refuses the file too "
@@ -274,9 +274,10 @@ _RANK = {remedy: rank for rank, remedy in enumerate(_PRECEDENCE)}
 _LEADS_TO_A_START = frozenset(
     {RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE, UNPROVEN_SIGNATURE, UNCHECKABLE_SIGNATURE}
 )
-#: The remedies whose refusal the reload judges again each pass while a CRL in the file is not in
-#: effect (:meth:`_Refusals.reopen`). Each one in :data:`_LEADS_TO_A_START` is, because its caveat
-#: names a time that passes. So is :data:`BAD_SIGNATURE`, as it was before item 8 of vault
+#: The remedies whose refusal the reload judges again each pass while some issuer in the file has
+#: no CRL in effect yet (:func:`~messagefoundry.config.tls_policy.crl_not_in_effect`,
+#: :meth:`_Refusals.reopen`). Each one in :data:`_LEADS_TO_A_START` is, because its caveat names a
+#: time that passes. So is :data:`BAD_SIGNATURE`, as it was before item 8 of vault
 #: BACKLOG #3506 took it out of that set: otherwise it is final until the bytes change, and a
 #: refusal a later pass would find for the same bytes is never reported. One such is
 #: :data:`LAPSES_FIRST`, which it outranks, once the hop's CA list gains a CA that verifies the CRL.
@@ -497,7 +498,8 @@ class _Refusals:
         self.strongest: tuple[str, str] | None = None
         #: True once the next pass must judge these bytes again. Either a refusal that can lift
         #: (:data:`_RETRIED`) is what stopped a context or the whole pass, so that context may
-        #: still take them, or the reason reported carries a warning that ends with time.
+        #: still take them, or the refusal reported is one :data:`_REOPENED_WHILE_NOT_IN_EFFECT`
+        #: holds and some issuer in the file has no CRL in effect yet.
         self.pending = False
         #: An unexpected failure, logged with its traceback once per file version.
         self.error: BaseException | None = None
@@ -536,7 +538,8 @@ class _Refusals:
 
         "Final" is the reload's rule, not a proof. A file check reads the hop's CA list, which a
         CA directory can still add to. A file to fix was already final on its own, and a wait
-        beside it no longer keeps the pass open."""
+        beside it no longer keeps the pass open. :data:`BAD_SIGNATURE` is final only once every
+        issuer in the file has a CRL in effect (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`)."""
         return not self.pending and (self.strongest is None or self.strongest[1] not in _RETRIED)
 
 

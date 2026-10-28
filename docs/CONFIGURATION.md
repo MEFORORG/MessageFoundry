@@ -2168,10 +2168,11 @@ stands. Neither acknowledging the alert nor resolving it by hand stops the remin
 it mutes their pages. While the engine cannot read the file, a
 reminder is still sent for a refusal the engine treats as final, such as `fix_file`. One it judges
 again every pass gets a reminder only from a reload pass that judged it again, and none while the
-engine cannot read the file. That covers at least `wait`, `lapses_first`, `retry`, `no_issuer`,
-one that carries `start_refuses`, and `bad_signature` while a CRL in the file is not yet in
-effect: such a refusal can name a time that has passed, or lift on its own, as `bad_signature`
-does once the hop lists a CA that verifies that CRL. A read that hangs
+engine cannot read the file. That covers at least `wait`, `lapses_first`, `retry`, `no_issuer` and
+one that carries `start_refuses`: such a refusal can name a time that has passed, or lift on its
+own. It covers `bad_signature` too while some issuer in the file has no CRL in effect yet. The
+engine judges that refusal again every pass then, so it can report a later refusal for the same
+file, such as `lapses_first`. A read that hangs
 rather than fails, such as on a share that stops answering, holds the whole reload loop, so no
 reminder is sent while it hangs. The notifier's cooldown still applies while the alert is open: a second
 refused version, or a reminder, inside `[alerts].realert_seconds` of the last page updates the open
