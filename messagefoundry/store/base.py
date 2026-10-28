@@ -2376,7 +2376,15 @@ class AuthStore(Protocol):
     async def consume_totp_step(self, user_id: str, step: int) -> bool: ...
 
     # --- MFA: WebAuthn passkeys second factor (local accounts, WP-14b / ADR 0068) ---
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None: ...
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
+        """Persist one passkey and return True. With ``for_session`` (a session's token hash) it
+        is CONDITIONAL (BACKLOG #3014, #3690): inside the insert's own transaction, with the
+        account row locked, it asks ``session_owes_unproven_factor`` and, when the account now
+        holds a second factor that session has not proven, writes nothing and returns False. So a
+        factor bound on another session after the service's own check is still refused."""
+        ...
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]: ...
 

@@ -1082,6 +1082,14 @@ async def test_webauthn_store_contract(store) -> None:
     await _assert_webauthn_store_contract(store)
 
 
+async def test_webauthn_conditional_bind_contract(store) -> None:
+    """BACKLOG #3014, #3690 item 1 on the real Postgres backend: the conditional passkey insert,
+    checked with the account row held under FOR UPDATE."""
+    from tests._webauthn_store_contract import _assert_webauthn_conditional_bind_contract
+
+    await _assert_webauthn_conditional_bind_contract(store)
+
+
 async def test_totp_store_contract(store) -> None:
     """WP-14 TOTP store contract on the real Postgres backend — the backfill that finally executes
     the FOR UPDATE row-lock paths (consume_totp_step / consume_recovery_code_hash) under test."""

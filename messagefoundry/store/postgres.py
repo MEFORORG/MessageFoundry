@@ -320,6 +320,7 @@ from messagefoundry.store.store import (
     seal_session,
     seal_user,
     session_insert_params,
+    session_owes_unproven_factor,
     session_reseal_params,
     session_seal_ok,
     settle_newest_keyed_audit_row,
@@ -9263,18 +9264,37 @@ class PostgresStore:
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
         material, not a secret — excluded from the store cipher). asyncpg raises
         UniqueViolationError for a duplicate ``(user_id, label)`` or a credential id already held,
         and ForeignKeyViolationError for an account that does not exist; the caller tells them
         apart by re-reading, as ``AuthService.finish_webauthn_registration`` says (ADR 0068 §4,
         BACKLOG #2733). The account is re-sealed over its new passkey digest in the same
-        transaction (BACKLOG #2592)."""
+        transaction (BACKLOG #2592). See :meth:`AuthStore.add_webauthn_credential` for
+        ``for_session``: the account row is taken ``FOR UPDATE`` before the check, as every
+        factor write here takes it, so a factor bound elsewhere either committed before the check
+        reads it or waits until this transaction ends."""
         async with self._timed_acquire(record=False) as conn, conn.transaction():
+            if for_session is not None:
+                record = await self._read_user_record(conn, cred.user_id)  # FOR UPDATE
+                session = await conn.fetchrow(
+                    "SELECT * FROM sessions WHERE token_hash=$1", for_session
+                )
+                # No account: the insert below meets the foreign key (BACKLOG #1807).
+                if record is not None and session_owes_unproven_factor(
+                    self._row_sealer,
+                    None if session is None else SessionRecord.from_mapping(dict(session)),
+                    record,
+                    await self._account_passkeys(conn, cred.user_id),
+                ):
+                    return False
             await self._write_passkeys(
                 conn, cred.user_id, _PG_WEBAUTHN_INSERT, *webauthn_insert_params(cred)
             )
+        return True
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's enrolled passkeys, oldest first."""

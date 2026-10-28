@@ -101,6 +101,98 @@ async def _assert_webauthn_rehash_contract(store: Any) -> None:
     assert await store.delete_webauthn_credential("wa-r1", tagged) is True
 
 
+async def _assert_webauthn_conditional_bind_contract(store: Any) -> None:
+    """BACKLOG #3014, #3690 item 1: ``add_webauthn_credential(..., for_session=...)`` binds only
+    when the account holds no second factor that session has not proven, asked inside the insert's
+    own transaction. Session-relative: a pending session binds an account's FIRST factor, and a
+    stamped session binds beside the factors it proved. Fails closed on a missing, revoked or
+    foreign session. A missing account still meets the foreign key (BACKLOG #1807)."""
+    for uid, name in (("wa-c1", "wa-carol"), ("wa-c2", "wa-dave")):
+        await store.create_user(
+            user_id=uid,
+            username=name,
+            auth_provider="local",
+            password_hash="h",
+            now=100.0,
+            password_generated=False,
+        )
+    for token_hash, uid in (("cb-a", "wa-c1"), ("cb-b", "wa-c1"), ("cb-d", "wa-c2")):
+        assert await store.create_session(
+            token_hash=token_hash, user_id=uid, expires_at=10_000_000_000.0, now=100.0
+        )
+
+    # The first factor, from a pending session: nothing is owed, so it binds.
+    assert (
+        await store.add_webauthn_credential(
+            _cred("wa-c1", "first", id_hash="cb-h1"), for_session="cb-a"
+        )
+        is True
+    )
+    # Another pending session of the same account now owes that passkey: refused, nothing written.
+    assert (
+        await store.add_webauthn_credential(
+            _cred("wa-c1", "second", id_hash="cb-h2"), for_session="cb-b"
+        )
+        is False
+    )
+    assert [c.credential_id_hash for c in await store.list_webauthn_credentials("wa-c1")] == [
+        "cb-h1"
+    ]
+    # Once that session is stamped it binds beside the factor: "no unproven factor", not "zero".
+    await store.mark_session_mfa_verified("cb-b", now=101.0)
+    assert (
+        await store.add_webauthn_credential(
+            _cred("wa-c1", "second", id_hash="cb-h2"), for_session="cb-b"
+        )
+        is True
+    )
+    assert len(await store.list_webauthn_credentials("wa-c1")) == 2
+
+    # A TOTP alone is a factor too.
+    cell = await store.set_totp_secret("wa-c2", secret="JBSWY3DPEHPK3PXP", now=102.0)
+    assert await store.enable_totp(
+        "wa-c2", recovery_code_hashes=["rc"], expected_secret_cell=cell, now=103.0
+    )
+    assert (
+        await store.add_webauthn_credential(
+            _cred("wa-c2", "key", id_hash="cb-h3"), for_session="cb-d"
+        )
+        is False
+    )
+    assert await store.get_webauthn_credential("cb-h3") is None
+
+    # Fail closed: a session that does not exist, one of another account, and a revoked one.
+    await store.delete_all_webauthn_credentials("wa-c1")
+    assert await store.has_webauthn_credentials("wa-c1") is False  # nothing owed from here on
+    assert (
+        await store.add_webauthn_credential(
+            _cred("wa-c1", "k", id_hash="cb-h4"), for_session="cb-none"
+        )
+        is False
+    )
+    assert (
+        await store.add_webauthn_credential(
+            _cred("wa-c1", "k", id_hash="cb-h4"), for_session="cb-d"
+        )
+        is False
+    )
+    await store.revoke_session("cb-a", now=104.0)
+    assert (
+        await store.add_webauthn_credential(
+            _cred("wa-c1", "k", id_hash="cb-h4"), for_session="cb-a"
+        )
+        is False
+    )
+    assert await store.get_webauthn_credential("cb-h4") is None
+
+    # A missing account is left to the foreign key, as the unconditional insert leaves it.
+    await _assert_integrity_refused(
+        store.add_webauthn_credential(_cred("wa-gone", "k", id_hash="cb-h5"), for_session="cb-b"),
+        "a conditional passkey for an account that does not exist",
+    )
+    assert await store.get_webauthn_credential("cb-h5") is None
+
+
 async def _assert_webauthn_store_contract(store: Any) -> None:
     """The webauthn_credentials contract every backend must satisfy (ADR 0068 §4)."""
     await store.create_user(

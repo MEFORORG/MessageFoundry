@@ -2422,6 +2422,38 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
 
 
+def session_owes_unproven_factor(
+    sealer: RowSealer | None,
+    session: SessionRecord | None,
+    record: UserAuthzRecord,
+    passkeys: Sequence[WebAuthnCredential],
+) -> bool:
+    """Whether binding a new factor for ``record``'s account from ``session`` must be refused,
+    because the account holds a second factor this session has not proven (BACKLOG #3014, #3690).
+
+    The store-side twin of ``AuthService._factor_binding_is_blocked``, asked inside the write's own
+    transaction so a factor bound on another session after the service asked is still seen. It is
+    session-relative: a session stamped MFA-verified binds beside the factors it proved, and an
+    account with no factor at all binds its first one from a pending session. So it encodes "no
+    unproven factor", never "zero factors". Each factor term can only add a factor, as
+    ``_second_factor_enrolled`` reads them: TOTP, a sealed passkey digest, or any passkey row.
+
+    Fails closed (True) on a missing, revoked, foreign or unsealed session, and on an unsealed
+    account: nothing there can be shown to owe nothing. A missing account is the caller's to
+    handle: the insert's foreign key already refuses it (BACKLOG #1807)."""
+    if (
+        session is None
+        or session.revoked_at is not None
+        or session.user_id != record.row.id
+        or not session_seal_ok(sealer, session)
+        or not user_seal_ok(sealer, record)
+    ):
+        return True
+    if session.mfa_verified_at is not None:
+        return False
+    return record.row.totp_enabled or record.row.cred_digest != "" or bool(passkeys)
+
+
 def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
     """``record`` with its seal set: the sealer's seal over it under the active key, or empty on a
     store with no sealer (BACKLOG #2592)."""
@@ -15842,16 +15874,42 @@ class MessageStore:
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
         """Persist one enrolled passkey. Public keys are plaintext by design (see the
         ``_CIPHER_COLUMNS`` note). sqlite3.IntegrityError is raised for at least a duplicate
         ``(user_id, label)``, a credential id already held and an account that does not exist; the
         caller tells them apart by re-reading, as ``AuthService.finish_webauthn_registration`` says
         (ADR 0068 §4, BACKLOG #2733). The account is re-sealed over its new passkey digest in the
-        same transaction (BACKLOG #2592)."""
-        async with _writer_guard(self._db, self._lock):
+        same transaction (BACKLOG #2592). See :meth:`AuthStore.add_webauthn_credential` for
+        ``for_session``: here the check and the insert share one ``BEGIN``, under the writer lock,
+        so no writer of this process runs between them, and a writer in another process that
+        commits between them fails this transaction's write rather than going unseen."""
+        async with _writer_txn(self._db, self._lock):
+            record = None if for_session is None else await self._read_user_record(cred.user_id)
+            # No account: the insert below meets the foreign key, as it always did (BACKLOG #1807).
+            if (
+                for_session is not None
+                and record is not None
+                and session_owes_unproven_factor(
+                    self._row_sealer,
+                    await self._read_session_row(for_session),
+                    record,
+                    await self._account_passkeys(cred.user_id),
+                )
+            ):
+                await self._db.rollback()  # only read; this closes the transaction
+                return False
             await self._write_passkeys(cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred))
             await self._commit()
+        return True
+
+    async def _read_session_row(self, token_hash: str) -> SessionRecord | None:
+        """The session row, read on the writer connection inside the caller's transaction."""
+        cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
+        row = await cur.fetchone()
+        return SessionRecord.from_mapping(dict(row)) if row else None
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's enrolled passkeys, oldest first."""
