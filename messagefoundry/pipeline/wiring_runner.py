@@ -227,9 +227,8 @@ from messagefoundry.transports.base import (
     ReplyBodyDropped,
     SyncReplyResolver,
     check_file_key,
-    declares_guarded_destination_dirs,
-    declares_guarded_dirs,
     guarded_destination_dirs,
+    guarded_setting_keys,
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
@@ -3060,46 +3059,42 @@ class RegistryRunner:
         running connections, so a stopped, failed or DR-parked one stays protected. Under
         ``serve --shard`` this shard's ``inbound`` map holds only its own inbounds, so the inbounds
         come from :meth:`Registry.inbound_specs`, the whole config's; outbounds are never filtered.
-        None when one connection's settings cannot be resolved (a missing env() value, say): the
-        caller then deletes nothing, because a guard that silently drops a directory fails open."""
+        Only the settings a connector declares its directories from are resolved
+        (:func:`guarded_setting_keys`). None when one of those cannot be resolved (a missing env()
+        value, say): the caller then deletes nothing, because a guard that silently drops a directory
+        fails open."""
+        connections = [
+            (False, name, spec, inbound_record_name(name))
+            for name, spec in self.registry.inbound_specs().items()
+        ] + [(True, name, oc.spec, name) for name, oc in self.registry.outbound.items()]
         dirs: list[Path] = []
-        for name, spec in self.registry.inbound_specs().items():
-            if not declares_guarded_dirs(spec.type):
-                continue  # a fault in an inbound with no directories cannot hide one
+        for outbound, name, spec, record in connections:
+            keys = guarded_setting_keys(spec.type, outbound=outbound)
+            if not keys:
+                continue  # a fault in a connection with no directories cannot hide one
             try:
                 settings = resolve_env_settings(
-                    spec.settings, self._env_values, connection=inbound_record_name(name)
+                    {k: spec.settings[k] for k in keys if k in spec.settings},
+                    self._env_values,
+                    connection=record,
                 )
-                dirs.extend(
-                    guarded_source_dirs(Source(type=spec.type, name=name, settings=settings))
-                )
-            except (WiringError, ValueError, TypeError, KeyError) as exc:
-                self._log_unresolved_guard("inbound", name, exc)
-                return None
-        for name, oc in self.registry.outbound.items():
-            if not declares_guarded_destination_dirs(oc.spec.type):
-                continue
-            try:
-                settings = resolve_env_settings(oc.spec.settings, self._env_values, connection=name)
                 dirs.extend(
                     guarded_destination_dirs(
-                        Destination(type=oc.spec.type, name=name, settings=settings)
+                        Destination(type=spec.type, name=name, settings=settings)
                     )
+                    if outbound
+                    else guarded_source_dirs(Source(type=spec.type, name=name, settings=settings))
                 )
             except (WiringError, ValueError, TypeError, KeyError) as exc:
-                self._log_unresolved_guard("outbound", name, exc)
+                log.warning(
+                    "%s connection %r: its directories could not be resolved for the "
+                    "[retention].processed_archive_days guard (%s)",
+                    "outbound" if outbound else "inbound",
+                    name,
+                    type(exc).__name__,
+                )
                 return None
         return tuple(dirs)
-
-    @staticmethod
-    def _log_unresolved_guard(kind: str, name: str, exc: Exception) -> None:
-        log.warning(
-            "%s connection %r: its directories could not be resolved for the "
-            "[retention].processed_archive_days guard (%s)",
-            kind,
-            name,
-            type(exc).__name__,
-        )
 
     async def park_intake(self, standby: Priority, *, keep: frozenset[str] = frozenset()) -> None:
         """Make this box a passive standby for intake and unbind every inbound, in one span of the

@@ -814,10 +814,11 @@ class RetentionRunner:
         Every archive is handed the watch and ``.error`` directories of every inbound in the
         deployment, on every engine shard, and every File outbound's target directory, bound or not,
         so one whose archive directory overlaps any connection's drops, quarantine or deliveries
-        deletes nothing. When a connection's directories cannot be read from its configuration, or one
-        of them has no readable identity on disk, the whole sweep is skipped: the guard is only as
-        good as its list (:func:`build_archive_guard`). An archive whose opened directory has no
-        readable identity is not swept. A directory two connections share is swept once. A fault in one connection
+        deletes nothing. When a connection's directories cannot be read from its configuration the
+        whole sweep is skipped: the guard is only as good as its list. A guarded directory whose
+        identity cannot be read is read again by each archive under its own identity, and an archive
+        that still cannot read it is not swept (:class:`ArchiveGuard`), nor is one whose opened
+        directory has no readable identity. A directory two connections share is swept once. A fault in one connection
         is logged and the others still run, because a sweep must never stop the pass: a pass that
         raised here would lose the audit row for what it had already purged."""
         # Everything up to the sweep itself is contained: a fault here, a connector's declared
@@ -831,9 +832,9 @@ class RetentionRunner:
                 extra = self._guard_source()
                 if extra is None:
                     log.warning(
-                        "the [retention].processed_archive_days sweep deleted nothing this pass: an "
-                        "inbound's directories could not be resolved from its configuration, so the "
-                        "sweep cannot tell what it must not reach"
+                        "the [retention].processed_archive_days sweep deleted nothing this pass: a "
+                        "connection's directories could not be resolved from its configuration, so "
+                        "the sweep cannot tell what it must not reach"
                     )
                     return 0
                 guarded.extend(extra)

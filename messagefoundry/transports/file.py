@@ -37,7 +37,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, BinaryIO, Self, TypeVar
+from typing import Any, BinaryIO, ClassVar, Self, TypeVar
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -464,6 +464,9 @@ class FileDestination(DestinationConnector):
             )
         # Set once a directory fsync has failed here, so it is logged once and not retried (#1618).
         self._dir_fsync_unsupported = False
+
+    #: The settings :meth:`guarded_dirs` reads, the only ones the guard resolves.
+    guarded_setting_keys: ClassVar[tuple[str, ...]] = ("directory",)
 
     @staticmethod
     def guarded_dirs(config: Destination) -> tuple[Path, ...]:
@@ -1778,6 +1781,9 @@ class FileSource(SourceConnector):
                 _describe_os_error(exc, file_name=path.name),
             )
 
+    #: The settings :meth:`guarded_dirs` reads, the only ones the guard resolves.
+    guarded_setting_keys: ClassVar[tuple[str, ...]] = ("directory", "error_subdir")
+
     @staticmethod
     def guarded_dirs(config: Source) -> tuple[Path, ...]:
         """The watch and ``.error`` directories ``config`` names, which no archive sweep may reach
@@ -1840,7 +1846,8 @@ class FileSource(SourceConnector):
           the file itself just before it is removed. File content is never read, and no file name is
           logged: a drop's name can carry an identifier.
         * Nothing at all when ``processed_dir`` is, or holds, this connection's watch directory or
-          ``.error``, or any directory ``protected`` guards. A ``processed_subdir`` of ``"."`` or
+          ``.error``, or any directory ``protected`` guards, or when one of those exists but its
+          identity cannot be read under this connection's identity. A ``processed_subdir`` of ``"."`` or
           ``".."`` would otherwise age out undelivered drops, and ``.error`` deletion is unruled
           (#3335). The directory is compared by resolved, case-folded path before it is opened, and
           by identity once it is (:class:`ArchiveGuard`).
@@ -1852,7 +1859,21 @@ class FileSource(SourceConnector):
         pass, and how many it could not remove is logged."""
         if not self.archiving:
             return 0
-        guard = protected | build_archive_guard((self.directory, self.error_dir))
+        # This connection's own directories, and every guarded directory the pass could not read,
+        # read again here, under this connection's identity: an alternate credential may reach a
+        # share the engine's own account cannot. One it still cannot read refuses the sweep.
+        own = build_archive_guard((self.directory, self.error_dir, *protected.unresolved))
+        if own.unresolved:
+            logger.warning(
+                "file source %s: the [retention].processed_archive_days sweep skips this connection "
+                "this pass, because %d directory(ies) it must not reach exist, or may, but their "
+                "identity could not be read under this connection's identity, so an alias of one "
+                "would not be recognised",
+                self._label,
+                len(own.unresolved),
+            )
+            return 0
+        guard = ArchiveGuard(protected.keys | own.keys, protected.ids | own.ids)
         try:
             mine = archive_dir_key(self.processed_dir)
         except (OSError, ValueError):

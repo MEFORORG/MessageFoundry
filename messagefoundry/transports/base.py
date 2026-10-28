@@ -62,12 +62,10 @@ __all__ = [
     "ProcessedFileLedger",
     "ProcessedArchive",
     "ArchiveGuard",
-    "ArchiveGuardUnresolved",
     "archive_dir_key",
     "build_archive_guard",
-    "declares_guarded_dirs",
-    "declares_guarded_destination_dirs",
     "guarded_destination_dirs",
+    "guarded_setting_keys",
     "guarded_source_dirs",
     "FILE_KEY_SCHEME",
     "FILE_KEY_SCHEMES",
@@ -678,15 +676,25 @@ class ArchiveGuard:
 
     ``keys`` holds each guarded directory's :func:`archive_dir_key`, for the check before the archive
     directory is opened. ``ids`` holds the ``(st_dev, st_ino)`` of each guarded directory and of every
-    directory above one, for the check once it is open: an archive directory that is, or holds, a
-    guarded one under another name (a UNC path and the local path of one share, a bind mount, a DFS
-    link, a lexical ``x/..``) is recognised by what was actually opened."""
+    readable directory above one, for the check once it is open: an archive directory that is, or
+    holds, a guarded one under another name (a UNC path and the local path of one share, a bind
+    mount, a DFS link, a lexical ``x/..``) is recognised by what was actually opened.
+
+    ``unresolved`` holds each guarded directory that exists, or may, but whose identity could not be
+    read, an unreachable share or a refused ``stat`` say. Without that identity an alias of it would
+    pass the check once the archive is open, so each archive reads them again under its own
+    identity (an alternate credential may reach a share the engine's own account cannot), and an
+    archive that still cannot read one deletes nothing: the guard fails closed, as the sweep does
+    for an opened archive directory whose identity it cannot read."""
 
     keys: frozenset[str] = frozenset()
     ids: frozenset[tuple[int, int]] = frozenset()
+    unresolved: frozenset[Path] = frozenset()
 
     def __or__(self, other: ArchiveGuard) -> ArchiveGuard:
-        return ArchiveGuard(self.keys | other.keys, self.ids | other.ids)
+        return ArchiveGuard(
+            self.keys | other.keys, self.ids | other.ids, self.unresolved | other.unresolved
+        )
 
 
 def archive_dir_key(path: Path) -> str:
@@ -697,19 +705,10 @@ def archive_dir_key(path: Path) -> str:
     return os.path.normcase(os.path.realpath(path)).casefold()
 
 
-class ArchiveGuardUnresolved(OSError):
-    """A directory an archive sweep must not reach has no readable identity (BACKLOG #1188).
-
-    Raised by :func:`build_archive_guard`, so the sweep deletes nothing: without that identity an
-    archive directory that is the same directory under another name (a UNC path and the local path of
-    one share, a bind mount) would pass the identity check, so the guard fails closed, as the sweep
-    does for an opened archive directory whose identity it cannot read."""
-
-
 #: What an absent directory raises: one not created yet (a ``.error`` before the first quarantine, an
 #: outbound directory before the first write) has nothing an archive could alias. Windows is read by
-#: its own code, because it maps an unreachable network path (``ERROR_BAD_NETPATH``) to ``ENOENT``
-#: too, and that one must fail closed.
+#: its own codes, an allowlist, because it maps an unreachable network path (``ERROR_BAD_NETPATH``,
+#: ``ERROR_BAD_NET_NAME``) to ``ENOENT`` too, and those must fail closed.
 _ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR})
 _ABSENT_WINERRORS = frozenset({2, 3})  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
 
@@ -725,16 +724,18 @@ def build_archive_guard(dirs: Iterable[Path]) -> ArchiveGuard:
     """The :class:`ArchiveGuard` over ``dirs``. Blocking (``realpath``, ``stat``).
 
     A directory that cannot be resolved is compared by its absolute path. Its identity, and that of
-    every directory above it, is recorded for the check once the archive is open. A directory that
-    does not exist yet stands in by its nearest existing ancestor. Any other directory whose identity
-    cannot be read, an unreachable share or a refused ``stat`` say, raises
-    :class:`ArchiveGuardUnresolved`, and so does a path none of whose directories can be read: the
-    sweep then deletes nothing. An identity of inode 0, which some file systems report for every
-    directory and which would otherwise match them all, is not recorded; the sweep refuses an opened
-    archive directory of inode 0 instead."""
+    each directory above it, is recorded for the check once the archive is open. A directory that
+    does not exist yet stands in by its nearest existing ancestor. A directory whose identity cannot
+    be read for any other reason goes into :attr:`ArchiveGuard.unresolved`, and so does one none of
+    whose path can be read. An ancestor above a readable directory that cannot itself be read (a
+    traverse-only parent) is passed over. An identity of inode 0, which some file systems report for
+    every directory and which would otherwise match them all, is not recorded; the sweep refuses an
+    opened archive directory of inode 0 instead. Each directory is stat'ed once per call."""
     keys: set[str] = set()
     ids: set[tuple[int, int]] = set()
-    for path in dirs:
+    unresolved: set[Path] = set()
+    seen: set[Path] = set()
+    for path in dict.fromkeys(dirs):
         try:
             here = Path(os.path.realpath(path))
         except (OSError, ValueError):
@@ -742,57 +743,53 @@ def build_archive_guard(dirs: Iterable[Path]) -> ArchiveGuard:
         keys.add(os.path.normcase(str(here)).casefold())
         found = False
         for candidate in (here, *here.parents):
+            if candidate in seen:
+                found = True
+                break  # it and everything above it were recorded for an earlier directory
             try:
                 st = os.stat(candidate)
-            except OSError as exc:
-                if not found and _is_absent(exc):
+            except (OSError, ValueError) as exc:
+                if found:
+                    continue  # a traverse-only ancestor; the guarded directory itself was read
+                if isinstance(exc, OSError) and _is_absent(exc):
                     continue  # not created yet; the nearest existing ancestor stands in for it
-                raise ArchiveGuardUnresolved(
-                    "a directory the archive sweep must not reach could not be read: "
-                    f"{type(exc).__name__}"
-                ) from exc
-            except ValueError as exc:
-                raise ArchiveGuardUnresolved(
-                    "a directory the archive sweep must not reach has an unreadable path"
-                ) from exc
+                break  # the guarded directory exists, or may, and cannot be read
             found = True
+            seen.add(candidate)
             if st.st_ino:
                 ids.add((st.st_dev, st.st_ino))
         if not found:
-            raise ArchiveGuardUnresolved(
-                "no directory on the path of a directory the archive sweep must not reach could be read"
-            )
-    return ArchiveGuard(frozenset(keys), frozenset(ids))
+            unresolved.add(Path(path))
+    return ArchiveGuard(frozenset(keys), frozenset(ids), frozenset(unresolved))
 
 
-def declares_guarded_dirs(kind: ConnectorType) -> bool:
-    """Whether the inbound connector registered for ``kind`` declares directories no archive sweep
-    may reach (:func:`guarded_source_dirs`)."""
-    return callable(getattr(_SOURCES.get(kind), "guarded_dirs", None))
+def guarded_setting_keys(kind: ConnectorType, *, outbound: bool = False) -> tuple[str, ...]:
+    """The settings the connector registered for ``kind`` reads its guarded directories from
+    (:func:`guarded_source_dirs`, :func:`guarded_destination_dirs`), or none when it declares no
+    directories. Only these are resolved for the guard, so another setting's ``env()`` value, a
+    not-deployed connection's secret say, is neither read nor able to switch the sweep off."""
+    builder = (_DESTINATIONS if outbound else _SOURCES).get(kind)
+    if not callable(getattr(builder, "guarded_dirs", None)):
+        return ()
+    return tuple(getattr(builder, "guarded_setting_keys", ()))
 
 
 def guarded_source_dirs(config: Source) -> tuple[Path, ...]:
     """The directories an inbound built from ``config`` reads drops from or quarantines into, which no
     archive sweep may reach (BACKLOG #1188). Empty for a connector that declares none. A connector
-    declares them with a ``guarded_dirs(config)`` callable on what it registered, so the pipeline asks
-    without naming a connector type."""
+    declares them with a ``guarded_dirs(config)`` callable on what it registered, and the settings
+    that callable reads in ``guarded_setting_keys``, so the pipeline asks without naming a connector
+    type."""
     declare = getattr(_SOURCES.get(config.type), "guarded_dirs", None)
     if not callable(declare):
         return ()
     return tuple(declare(config))
 
 
-def declares_guarded_destination_dirs(kind: ConnectorType) -> bool:
-    """Whether the outbound connector registered for ``kind`` declares directories no archive sweep
-    may reach (:func:`guarded_destination_dirs`)."""
-    return callable(getattr(_DESTINATIONS.get(kind), "guarded_dirs", None))
-
-
 def guarded_destination_dirs(config: Destination) -> tuple[Path, ...]:
     """The directories an outbound built from ``config`` writes into, which no archive sweep may reach
     (BACKLOG #1188): a written file can be awaiting a partner's pickup. Empty for a connector that
-    declares none. Declared like :func:`guarded_source_dirs`, with ``guarded_dirs(config)`` on what
-    the connector registered."""
+    declares none. Declared like :func:`guarded_source_dirs`."""
     declare = getattr(_DESTINATIONS.get(config.type), "guarded_dirs", None)
     if not callable(declare):
         return ()

@@ -31,6 +31,7 @@ from messagefoundry.config.wiring import (
     InboundConnection,
     OutboundConnection,
     Registry,
+    env,
 )
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.retention import RetentionRunner
@@ -41,7 +42,6 @@ from messagefoundry.transports import base as transport_base
 from messagefoundry.transports import file as file_transport
 from messagefoundry.transports.base import (
     ArchiveGuard,
-    ArchiveGuardUnresolved,
     ProcessedArchive,
     build_archive_guard,
     guarded_source_dirs,
@@ -429,19 +429,80 @@ def test_an_unresolvable_outbound_directory_fails_closed(
     assert runner.archive_guard_dirs() is None
 
 
-def test_a_guarded_directory_whose_identity_cannot_be_read_fails_closed(
+def test_a_guarded_directory_whose_identity_cannot_be_read_is_recorded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A guarded directory that exists but cannot be stat'ed would add no identity, so an alias of it
-    would pass the check once the archive is open. The guard refuses instead.
+    """A guarded directory that exists but cannot be stat'ed adds no identity, so an alias of it
+    would pass the check once the archive is open. The guard records it as unresolved.
 
     Mutation: `continue` on every stat failure in `build_archive_guard`. Red."""
     guarded = tmp_path / "share"
     guarded.mkdir()
     _refuse_stat_of(monkeypatch, guarded)
 
-    with pytest.raises(ArchiveGuardUnresolved):
-        build_archive_guard({guarded})
+    assert build_archive_guard({guarded}).unresolved == {guarded}
+
+
+def test_an_archive_that_cannot_read_an_unresolved_directory_sweeps_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The archive reads the unresolved directory again under its own identity and still cannot.
+
+    Mutation: drop the `own.unresolved` refusal in `_prune_processed`. Red."""
+    src = _source(tmp_path / "in")
+    copy = _aged(src.processed_dir / "done.hl7", 90)
+    other = tmp_path / "share"
+    other.mkdir()
+    _refuse_stat_of(monkeypatch, other)
+
+    assert src._prune_processed(_CUTOFF, ArchiveGuard(unresolved=frozenset({other})), _never) == 0
+    assert copy.exists()
+
+
+def test_an_archive_that_can_read_an_unresolved_directory_sweeps(tmp_path: Path) -> None:
+    """A directory the pass could not read, which this archive's identity can (an alternate
+    credential reaching a share, say), does not stop this archive's sweep: its identity is used."""
+    src = _source(tmp_path / "in")
+    copy = _aged(src.processed_dir / "done.hl7", 90)
+    other = tmp_path / "share"
+    other.mkdir()
+
+    assert src._prune_processed(_CUTOFF, ArchiveGuard(unresolved=frozenset({other})), _never) == 1
+    assert not copy.exists()
+
+
+def test_an_unreadable_directory_that_is_the_archive_is_refused_once_reread(
+    tmp_path: Path,
+) -> None:
+    """The pass could not read B's watch directory; A's archive re-reads it, finds it is its own
+    archive directory, and refuses by identity."""
+    shared = tmp_path / "shared"
+    a = _source(tmp_path / "a", processed_subdir=str(shared))
+    drop = _aged(shared / "waiting.hl7", 90)
+    guard = ArchiveGuard(keys=frozenset({"unrelated"}), unresolved=frozenset({shared}))
+
+    assert a._prune_processed(_CUTOFF, guard, _never) == 0
+    assert drop.exists()
+
+
+def test_only_the_directory_settings_are_resolved_for_the_guard(tmp_path: Path) -> None:
+    """A not-deployed outbound's unrelated env() secret, missing in this environment, is not read and
+    does not switch the sweep off.
+
+    Mutation: resolve `spec.settings` whole in `archive_guard_dirs`. Red."""
+    reg = Registry()
+    reg.add_outbound(
+        OutboundConnection(
+            "OB_PARKED",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "out"), "credential_password": env("NOT_SET_HERE")},
+            ),
+            deployed=False,
+        )
+    )
+
+    assert _runner(reg).archive_guard_dirs() == (tmp_path / "out",)
 
 
 def test_an_unreachable_network_path_is_not_read_as_absent() -> None:
