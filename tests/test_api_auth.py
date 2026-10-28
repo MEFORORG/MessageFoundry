@@ -682,7 +682,7 @@ async def test_a_logout_audit_row_names_the_caller_and_the_client_address(engine
     assertion compares a value this test named (BACKLOG #1644). The sign-in comes from another
     address, so the row cannot pass by recording the address the session was minted from. The
     route's dependency refuses a dead token, so the route has no control that names no session;
-    ``tests/test_logout_lineage.py`` drives that branch in the service."""
+    ``tests/test_session_supersession.py`` drives that branch in the service."""
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
     async with _client(engine, service, peer=("192.0.2.10", 40000)) as c:

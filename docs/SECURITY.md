@@ -5117,12 +5117,17 @@ revoke, and a revoke needs no key on any backend.
 
 **A sign-out follows the links too, for far less time (BACKLOG #3715).** An elevation in another
 tab can re-key the session while a sign-out is in flight, and the sign-out then ends the session
-under its new token, in the same transaction as the revoke. `POST /auth/logout` follows only links
-written after its request arrived. Its sign-in check proved the token live after that moment, so
-the route gains no reach. `/ui/logout` carries no credential, so it follows links written up to 5
+under its new token, in the same transaction as the revoke. `POST /auth/logout` follows links
+written up to 5 seconds before its request arrived; the slack covers a link stamped before its
+rotation commits, and clocks that differ between engine processes. Its sign-in check proved the
+token live after the request arrived, so any link from it was written after that proof, and the
+route gains no reach. `/ui/logout` carries no credential, so it follows links written up to 5
 seconds before the call. **That is a separate power, credential-free and end-only:** for 5 seconds
 after an elevation, anyone who presents the RETIRED token to `/ui/logout` ends the session it
-became, with no sign-in. It cannot open or extend a session. The `auth.logout` row names the
+became, with no sign-in. It cannot open or extend a session. At least these cases stay open, and
+the session lives on under its new token: an elevation older than the bound, more than 32
+elevations in a row inside it, and a wall clock that stepped between the elevation and the
+sign-out, which moves the bound by the step. The `auth.logout` row names the
 session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
 was presented. A row the sign-out ended that was already over its idle or absolute limit is
 recorded as `lapsed`, not `revoked`, and still names the owner.
@@ -5130,10 +5135,13 @@ recorded as `lapsed`, not `revoked`, and still names the owner.
 **A sign-out that ended nothing writes its row within a budget (BACKLOG #3749).** `/ui/logout` has
 no sign-in check, so without one anyone could append `auth.logout` rows without limit. At most 10
 such rows per client address, and 100 in all, are written per 60 seconds; past that the row is
-dropped and counted in an `auth.logout_rows_dropped` row. One is written when the budget first
-trips, and another with the rest of the count before the next row the budget admits. The budget is
-in-process, so each engine shard keeps its own. It bounds only the row: the sign-out itself is
-never throttled, and a sign-out that ended a session always writes its row.
+dropped and counted in an `auth.logout_rows_dropped` row, which names no client. At most one such
+row is written per 60 seconds: one when the budget first trips, and the rest of the count with the
+first sign-out that ends nothing a window later. The budget and its count are in-process, so each
+engine shard keeps its own; drops after the last count row are not written if no such sign-out
+follows, and a restart loses them. It bounds only the rows of a sign-out that names no caller:
+`POST /auth/logout` always writes its row, the sign-out itself is never throttled, and a sign-out
+that ended a session always writes its row.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
@@ -6009,7 +6017,7 @@ Every authentication and authorization event is written to the durable `audit_lo
 user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.logout` /
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
-`auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
+`auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused` / `auth.session_revoke_missed` / `auth.logout_rows_dropped` (a console sign-out's `auth.logout` row is budgeted; see the session section), the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. Most reads narrowed to the caller's channel scope write no row

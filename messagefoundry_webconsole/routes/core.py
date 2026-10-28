@@ -824,9 +824,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         auth = get_auth(request)
         token = session_token(request)
         if auth is not None and token:
-            # No ``lineage_since``: this route proves nothing about the token, so the service's
-            # short credential-free bound applies. See AuthService.logout (BACKLOG #3715, #3884).
-            await auth.logout(token, client=client_ip(request))
+            # ``proven_at=None``: this route proves nothing about the token, so the service's
+            # short credential-free bound applies. The service logs, not raises, a failed audit
+            # row, so the cookie below is still cleared (BACKLOG #3715, #3884; AuthService.logout).
+            await auth.logout(token, client=client_ip(request), proven_at=None)
         resp = RedirectResponse("/ui/login?e=loggedout", status_code=303)
         # ASVS 14.3.1: revoking server-side and deleting the cookie leaves the browser's CACHED
         # representations of the operator's PHI pages behind, which Back / bfcache can resurrect.

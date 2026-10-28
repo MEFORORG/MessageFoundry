@@ -110,3 +110,16 @@ between the elevation and the sign-in moves the bound by the step, either way. T
 flow TTL even where federated sign-in is off, where every leg is one request; the brief fixed the
 window at no less than the flow TTL, and a narrower one there is open as a refinement. The
 Postgres and SQL Server legs run only on hosted runners.
+
+## Amendment A (2026-10-28): the sign-out follows the lineage too
+
+BACKLOG #3715 and #3749, under Manager decisions d20261028T013326097-7a011f and
+d20261028T013328555-1a54a4 (class B, adversarially reviewed). `AuthService.logout` now passes a
+window to `supersede_session`, as this record's Consequences foresaw for #3029. The window is short:
+links retired up to 5 seconds before the moment the token was proven live. `POST /auth/logout`
+measures that from its request's arrival, which its gate proved, so it gains no reach. `/ui/logout`
+proves nothing and measures it from the call, so a retired token gains a SECOND power, beside the
+one under Consequences: for 5 seconds after an elevation, presented to `/ui/logout` with no
+credential, it ends the session it became. It still cannot open or extend one. `docs/SECURITY.md`
+states both powers. `revoke_own_session` still follows no link.
+

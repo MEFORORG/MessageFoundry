@@ -32,7 +32,7 @@ from _ui_clients import create_local_user_chosen
 import messagefoundry_webconsole
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import _LOGOUT_LINEAGE_SECONDS, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -237,7 +237,7 @@ async def test_ui_logout_with_a_cookie_naming_no_session_still_records_the_addre
     the test above, it shows the actor there comes from the session, not from the request.
 
     Such rows are bounded per client address (BACKLOG #3749 item 6); one is well inside the
-    budget, which ``tests/test_logout_lineage.py`` drives."""
+    budget, which ``tests/test_session_supersession.py`` drives."""
     service = await _service(engine)
     out = await _sign_out_with(engine, service, "a-token-that-names-no-session")
     assert out.status_code == 303
@@ -285,12 +285,13 @@ async def test_ui_logout_with_a_cookie_an_elevation_just_retired_ends_its_succes
     """BACKLOG #3715, #3749 item 3. An elevation in another tab re-keys the session while this
     tab's sign-out is in flight, so the cookie it sends names no session. Within 5 seconds of
     the elevation the sign-out follows the link, ends the session under its new token, and the
-    row names the owner, where it used to keep a NULL actor and leave the session live."""
+    row names the owner, where it used to keep a NULL actor and leave the session live. The clock
+    is set 2 seconds inside the bound, so a slow runner has that much room."""
     service, old = await _signed_in_operator(engine)
     successor = await service._rotate_session_token(old)
     assert successor is not None, "the rotation failed closed, so the race was not driven"
     real = time.time
-    monkeypatch.setattr(time, "time", lambda: real() + 4.0)
+    monkeypatch.setattr(time, "time", lambda: real() + _LOGOUT_LINEAGE_SECONDS - 2.0)
     out = await _sign_out_with(engine, service, old)
     assert out.status_code == 303
     assert await service.identity_for_token(successor, activity=False) is None
@@ -314,7 +315,7 @@ async def test_ui_logout_with_a_cookie_retired_past_the_window_ends_nothing(
     successor = await service._rotate_session_token(old)
     assert successor is not None
     real = time.time
-    monkeypatch.setattr(time, "time", lambda: real() + 6.0)
+    monkeypatch.setattr(time, "time", lambda: real() + _LOGOUT_LINEAGE_SECONDS + 1.0)
     out = await _sign_out_with(engine, service, old)
     assert out.status_code == 303
     assert await service.identity_for_token(successor, activity=False) is not None

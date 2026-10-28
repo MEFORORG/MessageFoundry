@@ -36,7 +36,7 @@ this line.**
   sign-out sends now ends the session it became, with the owner as the row's actor, rather
   than leaving it live. Once a session ended, a refused `auth.logout` row no longer answers 500
   without clearing the cookie and sending Clear-Site-Data. Both are the engine's behaviour; this
-  console pins the engine seam whose `AuthService.logout` carries `lineage_since`.
+  console passes `AuthService.logout`'s new required `proven_at` and pins that engine seam.
   (BACKLOG #3715, #3749, #3884)
 
 - **An IdP step-up's return is charged to the operator's own re-authentication budget, not the

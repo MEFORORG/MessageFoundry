@@ -26,7 +26,12 @@ import pytest
 from messagefoundry.auth import Role
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.oidc import FederatedPrincipal
-from messagefoundry.auth.service import _LOGOUT_MISS_ROWS_PER_CLIENT, AuthService
+from messagefoundry.auth.service import (
+    _LOGOUT_LINEAGE_SECONDS,
+    _LOGOUT_MISS_ROWS_PER_CLIENT,
+    _LOGOUT_MISS_WINDOW_SECONDS,
+    AuthService,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
@@ -306,8 +311,8 @@ async def test_a_logout_records_whether_it_ended_a_session(store: MessageStore) 
     # The return value is the same outcome the row records, in both cases.
     service = await _service(store)
     token = await _token(service)
-    first = await service.logout(token, actor="op", client=None)
-    replay = await service.logout(token, actor="op", client=None)
+    first = await service.logout(token, actor="op", client=None, proven_at=None)
+    replay = await service.logout(token, actor="op", client=None, proven_at=None)
     assert not await _live(service, token)
     assert [first, replay] == ["revoked", "nothing_to_revoke"]
     assert await logout_rows(store) == [
@@ -325,8 +330,8 @@ async def test_a_logout_with_no_actor_names_the_owner_of_the_session_it_ended(
     # matching a default of "op".
     service = await _service(store)
     token = await _token(service, "other")
-    first = await service.logout(token, client="203.0.113.5")
-    replay = await service.logout(token, client="203.0.113.6")
+    first = await service.logout(token, client="203.0.113.5", proven_at=None)
+    replay = await service.logout(token, client="203.0.113.6", proven_at=None)
     assert [first, replay] == ["revoked", "nothing_to_revoke"]
     # BACKLOG #3339: each row records the address that call passed, on both branches.
     assert await logout_rows(store) == [
@@ -339,8 +344,8 @@ async def test_a_logout_with_no_token_returns_nothing_to_revoke_and_writes_no_ro
     store: MessageStore,
 ) -> None:
     service = await _service(store)
-    assert await service.logout(None, client=None) == "nothing_to_revoke"
-    assert await service.logout("", client=None) == "nothing_to_revoke"
+    assert await service.logout(None, client=None, proven_at=None) == "nothing_to_revoke"
+    assert await service.logout("", client=None, proven_at=None) == "nothing_to_revoke"
     assert await logout_rows(store) == []
 
 
@@ -407,7 +412,7 @@ async def test_the_no_op_inputs_revoke_nothing_and_write_no_row(
 ) -> None:
     service = await _service(store)
     dead = await _token(service)
-    await service.logout(dead, client=None)
+    await service.logout(dead, client=None, proven_at=None)
     prior: str | None = {
         "none": None,
         "empty": "",
@@ -559,36 +564,36 @@ async def test_a_lapsed_session_is_recorded_as_lapsed_and_names_its_owner(
     token = await _token(service)
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 40 * 60)  # idle 40 min, limit 30: lapsed
-    assert await service.logout(token, client=None) == "lapsed"
+    assert await service.logout(token, client=None, proven_at=None) == "lapsed"
     assert await logout_rows(store) == [("op", None, "lapsed")]
 
 
-async def test_a_logout_follows_a_rotation_only_since_lineage_since(
+async def test_a_logout_follows_no_rotation_older_than_its_bound_before_proven_at(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # BACKLOG #3715. POST /auth/logout passes the moment its request arrived, so a link written
-    # before that moment is not followed: the token was already retired when it arrived, which the
-    # route's gate would have refused. The clock steps so the rotation lands strictly before it.
+    # BACKLOG #3715. POST /auth/logout passes the moment its request arrived as proven_at, and a
+    # link retired more than _LOGOUT_LINEAGE_SECONDS before that is not followed. The clock steps
+    # past the bound, so the rotation lands strictly before it.
     service = await _service(store, session_idle_timeout_minutes=30)
     token = await _token(service)
     successor = await _rotated(service, token)
     real = time.time
-    monkeypatch.setattr(time, "time", lambda: real() + 1.0)
-    outcome = await service.logout(token, client=None, actor="op", lineage_since=time.time())
+    monkeypatch.setattr(time, "time", lambda: real() + _LOGOUT_LINEAGE_SECONDS + 1.0)
+    outcome = await service.logout(token, client=None, actor="op", proven_at=time.time())
     assert outcome == "nothing_to_revoke"
-    assert await _live(service, successor), "a link older than lineage_since was followed"
+    assert await _live(service, successor), "a link older than the bound was followed"
 
 
 async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(
     store: MessageStore,
 ) -> None:
-    # The positive control for the test above: with lineage_since before the rotation, the
-    # retired token ends its successor, and the row names both hashes.
+    # The positive control for the test above: proven before the rotation, the retired token
+    # ends its successor, and the row names both hashes.
     service = await _service(store, session_idle_timeout_minutes=30)
     token = await _token(service)
-    since = time.time()
+    proven = time.time()
     successor = await _rotated(service, token)
-    outcome = await service.logout(token, client=None, actor="op", lineage_since=since)
+    outcome = await service.logout(token, client=None, actor="op", proven_at=proven)
     assert outcome == "revoked"
     assert not await _live(service, successor)
     assert await logout_details(store) == [
@@ -602,25 +607,40 @@ async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(
 
 async def _misses(service: AuthService, client: str, count: int) -> None:
     for n in range(count):
-        assert await service.logout(f"no-such-token-{n}", client=client) == "nothing_to_revoke"
+        assert (
+            await service.logout(f"no-such-token-{n}", client=client, proven_at=None)
+            == "nothing_to_revoke"
+        )
 
 
-async def test_sign_outs_that_end_nothing_write_rows_within_a_budget(store: MessageStore) -> None:
+async def test_sign_outs_that_end_nothing_write_rows_within_a_budget(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # BACKLOG #3749 item 6. /ui/logout has no auth dependency, so anyone could append auth.logout
-    # rows. Past the per-client budget the row is dropped, and counted: one row when the budget
-    # trips, the rest of the count before the next row it admits.
+    # rows. Past the per-client budget the row is dropped and counted, in at most one count row a
+    # window: the first drop writes one at once, and the rest wait for a miss a window later.
     service = await _service(store, session_idle_timeout_minutes=30)
     budget = _LOGOUT_MISS_ROWS_PER_CLIENT
     await _misses(service, "203.0.113.9", budget + 3)
     assert len(await logout_rows(store)) == budget, "the budget did not bound the rows"
     assert await logout_rows_dropped(store) == [1], "the trip wrote no counted row"
-    # Another client still has its own budget, and its row first flushes the count.
+    # Another client still has its own budget, and inside the window writes no second count row.
     await _misses(service, "203.0.113.10", 1)
-    assert await logout_rows_dropped(store) == [2, 1], "newest first: the flush, then the trip"
+    assert await logout_rows_dropped(store) == [1], "a second count row inside one window"
     assert len(await logout_rows(store)) == budget + 1
+    # A window later the budget has room again, and the next miss first writes the rest.
+    real = time.monotonic
+    monkeypatch.setattr(time, "monotonic", lambda: real() + _LOGOUT_MISS_WINDOW_SECONDS + 1.0)
+    await _misses(service, "203.0.113.9", 1)
+    assert await logout_rows_dropped(store) == [2, 1], "newest first: the rest, then the trip"
+    assert len(await logout_rows(store)) == budget + 2
+    # An authenticated caller's miss is never budgeted: it names an actor.
+    for n in range(budget + 1):
+        await service.logout(f"gone-{n}", client="203.0.113.9", actor="op", proven_at=None)
+    assert len(await logout_rows(store)) == 2 * budget + 3
     # A sign-out that ends a session always writes, from the tripped client too.
     token = await _token(service)
-    assert await service.logout(token, client="203.0.113.9") == "revoked"
+    assert await service.logout(token, client="203.0.113.9", proven_at=None) == "revoked"
     assert (await logout_rows(store))[0] == ("op", "203.0.113.9", "revoked")
 
 

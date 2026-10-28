@@ -696,18 +696,19 @@ from typing import Any
 #: ea0b48d0bf69ec09; this branch at d3f76a351d8328bd). The value below was re-derived with
 #: ``--write`` on the merged tree, so it covers both.
 #:
-#: BACKLOG #3715 / #3749: ``AuthService.logout`` gained an optional keyword ``lineage_since``,
-#: which ``POST /auth/logout`` passes and ``/ui/logout`` leaves out, and ``LogoutOutcome`` gained
-#: ``lapsed``. The console calls ``logout`` with the same arguments and ignores its return, so no
-#: console call breaks in either skew direction; the discovered signature moved the digest from
-#: ``abc94c8c0254d1ff``. Re-derived with ``--write``.
+#: BACKLOG #3715 / #3749: ``AuthService.logout`` gained a REQUIRED keyword ``proven_at``, when a
+#: credential proved the token live, which ``/ui/logout`` passes as ``None``; and ``LogoutOutcome``
+#: gained ``lapsed``, which the console ignores. A console from before this change on this engine
+#: would fail its sign-out with a ``TypeError``, and a newer console on an older one would too; the
+#: pinned digest refuses either pair at mount. The digest moved from ``abc94c8c0254d1ff``.
+#: Re-derived with ``--write``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "283ffb77632ef2b3"
+ENGINE_UI_SEAM: str = "9c07023b6b0f0ba2"
 
 
 @dataclass(frozen=True, slots=True)

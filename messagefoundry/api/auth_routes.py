@@ -711,15 +711,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
     ) -> SimpleMessage:
-        # BACKLOG #3715: the gate proved the token live after ``arrived``, so following only links
-        # retired since then ends a session an elevation re-keyed while this request was in
-        # flight, and reaches no further. ``arrived`` is declared first, so FastAPI solves it
-        # before the gate.
+        # BACKLOG #3715: the gate proved the token live after ``arrived``, which is declared first
+        # so FastAPI solves it before the gate. See AuthService.logout for the bound.
         await service.logout(
             bearer_token(request),
             actor=identity.username,
             client=client_ip(request),
-            lineage_since=arrived,
+            proven_at=arrived,
         )
         return SimpleMessage(detail="logged out")
 

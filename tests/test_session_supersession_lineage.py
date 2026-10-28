@@ -243,7 +243,7 @@ def test_only_the_rotation_the_supersession_and_the_purge_touch_the_lineage(back
     }
 
 
-def test_the_service_follows_the_lineage_from_the_supersession_alone() -> None:
+def test_the_service_follows_the_lineage_from_the_supersession_and_sign_out_alone() -> None:
     # `_load_session` and the validator never pass a lineage window; only the sign-in's
     # supersession and the sign-out (BACKLOG #3715) do, and both only to end a session.
     # `_end_lapsed_session` shares the store call and passes none.
