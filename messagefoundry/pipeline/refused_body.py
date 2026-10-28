@@ -21,9 +21,11 @@ What this bounds is the BYTES each refusal stores, never the count of refusals:
 The charge is the UTF-8 length of the form the store would write, so a body whose stored view takes
 two or three bytes a character is charged for them.
 
-The sender's ACK or NAK is untouched: this runs after the refusal is decided, on what is STORED. The
-sender was answered AR or AE, so it still holds its own copy. Nothing here pauses intake, so it is not
-the depth budget that owner rulings R1 and R2 keep off.
+The sender's ACK or NAK is untouched: this runs after the refusal is decided, on what is STORED. A
+listener's peer sent the body over the wire and, for HL7 with an ACK mode, was answered AR or AE, so it
+holds its own copy. A poll source is different: the engine consumes the only copy (a file it deletes,
+a row it marks), so the runner keeps every refusal from one whole. Nothing here pauses intake, so it
+is not the depth budget that owner rulings R1 and R2 keep off.
 
 The allowance is a token bucket per inbound name, held by the engine process. An inbound lives on
 exactly one engine shard, so a per-inbound count needs no cross-shard state. The Engine owns one
@@ -33,7 +35,6 @@ refill a spent allowance.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import time
@@ -47,6 +48,7 @@ from messagefoundry.config.settings import REFUSED_BODY_HEAD_BYTES as DEFAULT_HE
 from messagefoundry.config.settings import (
     REFUSED_BODY_WINDOW_SECONDS as DEFAULT_WINDOW_SECONDS,
 )
+from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
 from messagefoundry.parsing.binary import is_marked
 from messagefoundry.pipeline.ingress_guards import store_safe_raw
@@ -67,13 +69,6 @@ __all__ = [
 #: so this never reaches the API's user-metadata field.
 METADATA_KEY = "refused_body"
 
-#: Hash a body larger than this in a worker thread. ``hashlib`` releases the GIL on large inputs, so a
-#: flood of 16 MiB refusals does not stall the event loop for the hash.
-_THREAD_HASH_BYTES = 1024 * 1024
-#: At most this many of those hashes at once, so a flood of large refusals cannot fill the default
-#: thread pool that strict validation and the lookups share (the SVG sanitizer is capped the same way).
-_HASH_SLOTS = 2
-
 #: The bytes a latin-1 view writes as two UTF-8 bytes.
 _HIGH_BYTES = bytes(range(0x80, 0x100))
 
@@ -81,8 +76,8 @@ _HIGH_BYTES = bytes(range(0x80, 0x100))
 @dataclass(frozen=True, slots=True)
 class RefusedBodyPolicy:
     """The three ``[inbound]`` settings. ``allowance_bytes = 0`` stores only the head of every
-    refused body larger than a head; there is no off value, by design. The settings carry the
-    operator floors; these checks only refuse values the arithmetic below cannot use."""
+    refused body larger than a head. The settings carry the operator's bounds; these checks only
+    refuse values the arithmetic below cannot use."""
 
     allowance_bytes: int = DEFAULT_ALLOWANCE_BYTES
     window_seconds: float = DEFAULT_WINDOW_SECONDS
@@ -110,7 +105,7 @@ class BoundedRefusal:
 class RefusedBodyAllowance:
     """A rolling byte allowance per inbound name (a token bucket that refills evenly over the window).
 
-    Mutated only on the event loop, and :meth:`admit` never awaits, so it needs no lock."""
+    Mutated only on the event loop, and nothing here awaits, so it needs no lock."""
 
     def __init__(
         self,
@@ -122,47 +117,57 @@ class RefusedBodyAllowance:
         self._clock = clock
         # inbound name -> (bytes left, when last charged). Bounded by the number of inbounds.
         self._buckets: dict[str, tuple[float, float]] = {}
-        self._hash_slots = asyncio.Semaphore(_HASH_SLOTS)
 
-    def admit(self, inbound: str, size: int) -> bool:
-        """Whether ``size`` bytes may be stored whole on ``inbound``, charging the allowance when
-        they may. :meth:`bound` decides first whether a body needs the allowance at all."""
+    def try_charge(self, inbound: str, size: int) -> bool:
+        """Charge ``size`` bytes to ``inbound``'s allowance if it covers them, and say whether it
+        did. It is a charge, not a question: a ``True`` spends the bytes."""
         policy = self.policy
         now = self._clock()
         capacity = float(policy.allowance_bytes)
         left, last = self._buckets.get(inbound, (capacity, now))
         left = min(capacity, left + (now - last) * capacity / policy.window_seconds)
-        admitted = size <= left
-        if admitted:
+        charged = size <= left
+        if charged:
             left -= size
         self._buckets[inbound] = (left, now)
-        return admitted
+        return charged
 
-    async def bound(
-        self, inbound: str, wire: bytes, text: str | None, content_type: str, error: str
+    def bound(
+        self,
+        inbound: str,
+        wire: bytes,
+        text: str | None,
+        content_type: str,
+        error: str,
+        *,
+        keep_whole: bool = False,
     ) -> BoundedRefusal:
         """Decide what to store for one refused body.
 
         ``wire`` is the body as received, which is what the length and SHA-256 describe, so they
         match the sender's copy. ``text`` is its decoded form when the refusal came after the
         decode, else ``None``. The whole stored form is :func:`store_safe_raw` of the two, as it was
-        before this bound. It is built only when the allowance admits it, because under a flood the
-        head is the common case and building a 16 MiB view to discard it is the waste this avoids."""
-        if len(wire) > _THREAD_HASH_BYTES:
-            async with self._hash_slots:
-                digest = await asyncio.to_thread(_sha256, wire)
-        else:
-            digest = _sha256(wire)
+        before this bound. It is built only when it will be stored, because under a flood the head
+        is the common case and building a 16 MiB view to discard it is waste.
+
+        ``keep_whole`` stores the body whole and charges nothing. The runner passes it for an
+        inbound whose source consumes the only copy (a poll source), where a head would lose the
+        rest for good.
+
+        The hash runs on the event loop, as the decode before it does: about the same cost, and
+        no thread or await between the refusal and its row, so a cancelled listener cannot leave a
+        refusal unrecorded in that gap and a full thread pool cannot hold up its NAK."""
+        digest = hashlib.sha256(wire).hexdigest()
         head_bytes = self.policy.head_bytes
         carried, stored_bytes = _stored_form(wire, text)
         fits_in_head = (len(wire) if carried else stored_bytes) <= head_bytes
-        whole = fits_in_head or self.admit(inbound, stored_bytes)
+        whole = keep_whole or fits_in_head or self.try_charge(inbound, stored_bytes)
         if whole:
             stored = store_safe_raw(wire, content_type, text=text)
         else:
             stored = _head(wire, text, content_type, head_bytes)
-            note = f" [refused-body allowance spent: stored only the head of a {len(wire):,}-byte body]"
-            error = _with_note(error, note)
+            note = f"[refused-body allowance spent: stored only the head of a {len(wire):,}-byte body] "
+            error = _with_note(note, error)
         metadata = json.dumps(
             {
                 METADATA_KEY: {
@@ -175,13 +180,10 @@ class RefusedBodyAllowance:
         return BoundedRefusal(raw=stored, error=error, metadata=metadata)
 
 
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def _stored_form(wire: bytes, text: str | None) -> tuple[bool, int]:
     """Whether :func:`store_safe_raw` would store the body as byte carriage, and the UTF-8 length of
-    the form it would store, worked out without building that form."""
+    the form it would store, worked out without building that form. A test holds the two to the same
+    answer, so a change to that function's rule turns it red."""
     if text is not None and "\x00" not in text:
         return False, len(text) if text.isascii() else len(text.encode("utf-8", "surrogatepass"))
     if text is None and b"\x00" not in wire:
@@ -190,31 +192,35 @@ def _stored_form(wire: bytes, text: str | None) -> tuple[bool, int]:
     return True, len(CARRIAGE_MARKER) + 4 * ((len(wire) + 2) // 3)  # mfb64:v1: byte carriage
 
 
-def _with_note(error: str, note: str) -> str:
-    """``error`` cut so that it and ``note`` fit the store's bound on the column whole. The store runs
-    :func:`safe_text` again; a result inside the bound passes it uncut, so the note survives it."""
+def _with_note(note: str, error: str) -> str:
+    """``note`` then ``error``, with ``error`` cut so the two fit the store's bound on the column.
+
+    The note goes first because the store runs :func:`safe_text` again, and its HL7-segment rule
+    redacts from a segment id such as ``MSH|`` to the end of the text. A reason quoting one would
+    take a note after it with it. Inside the bound nothing is cut, so the note survives that pass."""
     budget = _ERROR_LIMIT - len(note)
     while True:
         reason = safe_text(error, limit=budget)
-        over = len(reason) + len(note) - _ERROR_LIMIT
+        over = len(note) + len(reason) - _ERROR_LIMIT
         if over <= 0 or budget <= over:
-            return reason + note
+            return note + reason
         budget -= over
 
 
 def _head(wire: bytes, text: str | None, content_type: str, head_bytes: int) -> str:
     """The first ``head_bytes`` of a refused body, in the form the store would have held.
 
-    A NUL-free decoded text is cut at a character boundary. Otherwise the head of the received bytes
-    goes through :func:`store_safe_raw` on its own, so a head with no NUL in it stays readable even
-    when the whole body needed byte carriage. A text form is cut so its UTF-8 is at most
-    ``head_bytes``; byte carriage is never cut, because a cut base64 string no longer decodes."""
-    if text is not None and "\x00" not in text:
+    A NUL-free decoded text is cut at a character boundary, so its UTF-8 is at most ``head_bytes``.
+    Otherwise the head of the received bytes goes through :func:`store_safe_raw` on its own, so a
+    head with no NUL in it stays readable even when the whole body needed byte carriage. Anything
+    that reads as byte carriage is re-made from the head bytes, never cut: a cut base64 string no
+    longer decodes, and a sender may open a text body with the carriage marker itself."""
+    if text is not None and "\x00" not in text and not is_marked(text):
         view = text[:head_bytes]
     else:
         view = store_safe_raw(wire[:head_bytes], content_type)
         if is_marked(view):
-            return view
+            return RawMessage.from_bytes(wire[:head_bytes], content_type).raw
     encoded = view.encode("utf-8", "surrogatepass")
     if len(encoded) <= head_bytes:
         return view

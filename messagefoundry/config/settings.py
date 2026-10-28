@@ -2107,14 +2107,16 @@ class InboundSettings(_Section):
     # while its inbound's rolling byte allowance covers it; past that, the first
     # refused_body_head_bytes of it are. A body whose head is the whole of it is stored whole. This
     # bounds the bytes a reject flood stores, never the count of refusals, and never pauses intake, so
-    # it ships on and has no off value: 0 stores only heads. The allowance refills evenly over the
+    # it ships on and has no off value: 0 stores only heads. A poll source's refusals are always whole. The allowance refills evenly over the
     # window. Held per engine process; an inbound lives on one engine shard. docs/CONFIGURATION.md
     # carries the catalog rows.
     refused_body_allowance_bytes: int = Field(default=REFUSED_BODY_ALLOWANCE_BYTES, ge=0)
+    # The window's floor and the head's ceiling keep a typo from switching the bound off in effect:
+    # a near-zero window refills at once, and a head as large as a frame stores every body whole.
     refused_body_window_seconds: float = Field(
-        default=REFUSED_BODY_WINDOW_SECONDS, gt=0, allow_inf_nan=False
+        default=REFUSED_BODY_WINDOW_SECONDS, ge=1.0, allow_inf_nan=False
     )
-    refused_body_head_bytes: int = Field(default=REFUSED_BODY_HEAD_BYTES, ge=256)
+    refused_body_head_bytes: int = Field(default=REFUSED_BODY_HEAD_BYTES, ge=256, le=1024 * 1024)
 
     @field_validator("max_staged_depth")
     @classmethod

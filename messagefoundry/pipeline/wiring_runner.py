@@ -1381,6 +1381,9 @@ class RegistryRunner:
         # passes it to every runner a reload builds; None (embedding/tests) gets the shipped defaults,
         # so the bound is on wherever a runner is built.
         self._refused_body = refused_body_allowance or RefusedBodyAllowance()
+        # The inbounds whose source polls a shared resource (a directory, a table): the engine consumes
+        # the only copy of what it reads, so a refusal there is always stored whole. Set at bind.
+        self._refusals_kept_whole: set[str] = set()
         # DR run-profile (#61, ADR 0048). _priority_default is the global [delivery].priority a
         # connection inherits when it declares no priority= (resolution: per-connection override >
         # global default > built-in NORMAL). _dr_threshold is the THIS-RUN run-profile gate: when set
@@ -4557,6 +4560,13 @@ class RegistryRunner:
         # measurement. A source consults it BEFORE it reads: a listener before its next socket read,
         # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
         source.intake_gate = self._intake_gate
+        # Vault BACKLOG #2608: a poll source's refusals are stored whole, never as a head, because the
+        # file it deletes or the row it marks was the only copy. Keyed on the transport's own declared
+        # contract, not on a connector type (CLAUDE.md section 4).
+        if getattr(source, "polls_shared_resource", False):
+            self._refusals_kept_whole.add(ic.name)
+        else:
+            self._refusals_kept_whole.discard(ic.name)
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
         # free of any pipeline/cluster import. Only POLL sources act on it — they skip a scan when it
@@ -7996,7 +8006,14 @@ class RegistryRunner:
         The per-inbound refused-body allowance decides whether the whole body or its head is stored;
         its length and SHA-256 always are (vault BACKLOG #2608). The caller's ACK or NAK does not
         depend on it."""
-        bounded = await self._refused_body.bound(ic.name, wire, text, ic.content_type.value, error)
+        bounded = self._refused_body.bound(
+            ic.name,
+            wire,
+            text,
+            ic.content_type.value,
+            error,
+            keep_whole=ic.name in self._refusals_kept_whole,
+        )
         return await self.store.record_received(
             channel_id=ic.name,
             raw=bounded.raw,

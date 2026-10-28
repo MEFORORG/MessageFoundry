@@ -18,6 +18,7 @@ Synthetic HL7 only; no real PHI.
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import hashlib
 import json
@@ -33,6 +34,7 @@ from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Regi
 from messagefoundry.parsing.binary import decode as decode_carriage
 from messagefoundry.parsing.binary import is_marked
 from messagefoundry.pipeline import refused_body
+from messagefoundry.pipeline.ingress_guards import store_safe_raw
 from messagefoundry.pipeline.refused_body import (
     METADATA_KEY,
     RefusedBodyAllowance,
@@ -42,6 +44,10 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.redaction import safe_text
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.metadata import user_metadata
+from messagefoundry.transports.database import DatabaseSource
+from messagefoundry.transports.file import FileSource
+from messagefoundry.transports.http_listener import HttpSource
+from messagefoundry.transports.mllp import MLLPSource
 
 _MSH = b"MSH|^~\\&|SND|FAC|RCV|FAC|20260101||ADT^A01|MSG1|P|2.5.1\r"
 _STRICT_OK = _MSH + b"EVN|A01|20260101\rPID|1||MRN123^^^H^MR||DOE^JANE\rPV1|1|I\r"
@@ -150,7 +156,8 @@ async def test_a_reject_flood_stores_heads_past_the_allowance_and_counts_every_r
     for r in heads:
         assert r["raw"] == body.decode()[: policy.head_bytes]
         assert "refused-body allowance spent" in r["error"]
-        assert r["error"].startswith("parse error:")
+        assert r["error"].startswith("[refused-body allowance spent: ")
+        assert "parse error:" in r["error"]
     # Length and SHA-256 are stored for every refusal, whole or head.
     digest = hashlib.sha256(body).hexdigest()
     for r in rows:
@@ -281,14 +288,16 @@ async def test_every_refusal_phase_stores_a_head_and_the_body_record_once_spent(
         else:
             assert whole_row["raw"].startswith(row["raw"])
     assert "refused-body allowance spent" in row["error"]
-    # The reason itself survives in front of the note.
-    assert row["error"].split(" [refused-body")[0] in whole_row["error"]
+    # The note leads, and the reason itself survives after it.
+    note, reason = row["error"].split("-byte body] ", 1)
+    assert note.startswith("[refused-body allowance spent: ")
+    assert reason[:20] and reason[:20] in whole_row["error"]
 
 
 # --- the allowance itself --------------------------------------------------------------------------
 
 
-async def test_a_body_whose_head_is_the_whole_body_is_stored_whole_and_charges_nothing() -> None:
+def test_a_body_whose_head_is_the_whole_body_is_stored_whole_and_charges_nothing() -> None:
     allowance = RefusedBodyAllowance(
         RefusedBodyPolicy(allowance_bytes=2000, window_seconds=60.0, head_bytes=1000)
     )
@@ -296,43 +305,107 @@ async def test_a_body_whose_head_is_the_whole_body_is_stored_whole_and_charges_n
     small_carried = b"\x00\x01" * 400  # 800 bytes, stored as byte carriage of about 1080 characters
     for _ in range(50):
         for wire, text in ((small_text.encode(), small_text), (small_carried, None)):
-            bounded = await allowance.bound("IB_A", wire, text, ContentType.TEXT.value, "e")
+            bounded = allowance.bound("IB_A", wire, text, ContentType.TEXT.value, "e")
             assert json.loads(bounded.metadata)[METADATA_KEY]["stored"] == "whole"
             assert bounded.error == "e"
     # The 100 small bodies charged nothing, so a body the allowance covers is still admitted.
-    assert allowance.admit("IB_A", 2000)
-    assert not allowance.admit("IB_A", 1)
+    assert allowance.try_charge("IB_A", 2000)
+    assert not allowance.try_charge("IB_A", 1)
 
 
-async def test_the_charge_is_the_utf8_the_store_writes_not_the_characters() -> None:
+def test_the_charge_is_the_utf8_the_store_writes_not_the_characters() -> None:
     # A decode failure stores the latin-1 view, which writes two UTF-8 bytes for each high byte. So
     # a 1500-byte body of high bytes costs 3000, and an allowance of 2999 cannot store it whole.
     allowance = RefusedBodyAllowance(
         RefusedBodyPolicy(allowance_bytes=2999, window_seconds=60.0, head_bytes=1000)
     )
     wire = b"\xff" * 1500
-    bounded = await allowance.bound("IB_A", wire, None, ContentType.HL7V2.value, "decode error")
+    bounded = allowance.bound("IB_A", wire, None, ContentType.HL7V2.value, "decode error")
     assert json.loads(bounded.metadata)[METADATA_KEY]["stored"] == "head"
     assert len(bounded.raw.encode()) <= 1000
     # The refusal above charged nothing, so a body costing 2998 still fits the 2999.
-    fits = await allowance.bound("IB_A", b"\xff" * 1499, None, ContentType.HL7V2.value, "e")
+    fits = allowance.bound("IB_A", b"\xff" * 1499, None, ContentType.HL7V2.value, "e")
     assert json.loads(fits.metadata)[METADATA_KEY]["stored"] == "whole"
 
 
-async def test_the_note_survives_the_stores_own_bound_on_the_error() -> None:
+def test_the_note_survives_the_stores_own_bound_on_the_error() -> None:
     allowance = RefusedBodyAllowance(
         RefusedBodyPolicy(allowance_bytes=0, window_seconds=60.0, head_bytes=256)
     )
     long_reason = "strict-validation failed: " + "PID.3 bad; " * 40
     wire = b"A" * 20_000_000
-    bounded = await allowance.bound("IB_A", wire, None, ContentType.TEXT.value, long_reason)
+    bounded = allowance.bound("IB_A", wire, None, ContentType.TEXT.value, long_reason)
     assert len(bounded.error) <= 200
     # The store runs safe_text again; the stored text must come through it unchanged.
     assert safe_text(bounded.error) == bounded.error
-    assert bounded.error.endswith(
-        "[refused-body allowance spent: stored only the head of a 20,000,000-byte body]"
+    assert bounded.error.startswith(
+        "[refused-body allowance spent: stored only the head of a 20,000,000-byte body] "
+        "strict-validation failed:"
     )
-    assert bounded.error.startswith("strict-validation failed:")
+
+
+@pytest.mark.parametrize(
+    "reason", ["parse error: HL7PeekError: bad MSH|^~\\&|SND", "strict-validation failed: PID|x"]
+)
+def test_the_note_survives_a_reason_quoting_a_segment(reason: str) -> None:
+    # The store's HL7-segment rule redacts from a segment id to the end of the text, so a note after
+    # such a reason would be eaten by the store's own second pass.
+    allowance = RefusedBodyAllowance(
+        RefusedBodyPolicy(allowance_bytes=0, window_seconds=60.0, head_bytes=256)
+    )
+    bounded = allowance.bound("IB_A", b"A" * 5000, None, ContentType.TEXT.value, reason)
+    assert safe_text(bounded.error).startswith("[refused-body allowance spent: ")
+
+
+def test_keep_whole_stores_whole_and_charges_nothing() -> None:
+    allowance = RefusedBodyAllowance(
+        RefusedBodyPolicy(allowance_bytes=0, window_seconds=60.0, head_bytes=256)
+    )
+    wire = b"A" * 5000
+    bounded = allowance.bound("IB_A", wire, None, ContentType.TEXT.value, "e", keep_whole=True)
+    assert bounded.raw == wire.decode() and bounded.error == "e"
+    rec = json.loads(bounded.metadata)[METADATA_KEY]
+    assert rec == {"bytes": 5000, "sha256": hashlib.sha256(wire).hexdigest(), "stored": "whole"}
+
+
+async def test_a_poll_sources_refusals_are_kept_whole(store: MessageStore) -> None:
+    # A poll source consumes the only copy (a file it deletes, a row it marks), so the runner never
+    # stores its refusals as heads. Keyed on the transport's own declared contract.
+    assert FileSource.polls_shared_resource and DatabaseSource.polls_shared_resource
+    assert not MLLPSource.polls_shared_resource and not HttpSource.polls_shared_resource
+    policy = RefusedBodyPolicy(allowance_bytes=0, window_seconds=60.0, head_bytes=512)
+    runner = _runner(store, [_ic()], RefusedBodyAllowance(policy))
+    runner._refusals_kept_whole.add("IB_A")  # what binding a poll source sets
+    body = _parse_failure(4000)
+    for _ in range(5):
+        await runner._handle_inbound(runner.registry.inbound["IB_A"], body)
+    assert [r["raw"] for r in await _rows(store)] == [body.decode()] * 5
+
+
+@pytest.mark.parametrize(
+    ("wire", "text"),
+    [
+        (b"plain ascii", None),
+        (b"\xff\xfe high bytes", None),
+        (b"has a \x00 nul", None),
+        ("caf\u00e9".encode(), "caf\u00e9"),
+        (b"nul \x00 text", "nul \x00 text"),
+        (b"", None),
+    ],
+)
+def test_the_charge_matches_what_store_safe_raw_writes(wire: bytes, text: str | None) -> None:
+    carried, size = refused_body._stored_form(wire, text)
+    written = store_safe_raw(wire, ContentType.TEXT.value, text=text)
+    assert carried == is_marked(written)
+    assert size == len(written.encode())
+
+
+def test_a_text_that_opens_with_the_carriage_marker_is_never_cut_into_broken_carriage() -> None:
+    payload = b"\x00\x01" * 3000
+    text = "mfb64:v1:" + base64.b64encode(payload).decode()
+    head = refused_body._head(text.encode(), text, ContentType.JSON.value, 512)
+    assert is_marked(head)
+    assert decode_carriage(head) == text.encode()[:512]
 
 
 def test_the_allowance_refills_evenly_and_never_past_its_capacity() -> None:
@@ -340,14 +413,14 @@ def test_the_allowance_refills_evenly_and_never_past_its_capacity() -> None:
     allowance = RefusedBodyAllowance(
         RefusedBodyPolicy(allowance_bytes=6000, window_seconds=60.0, head_bytes=10), clock=clock
     )
-    assert allowance.admit("IB_A", 6000)
-    assert not allowance.admit("IB_A", 100)
+    assert allowance.try_charge("IB_A", 6000)
+    assert not allowance.try_charge("IB_A", 100)
     clock.now += 30.0  # half a window refills half the allowance
-    assert allowance.admit("IB_A", 3000)
-    assert not allowance.admit("IB_A", 100)
+    assert allowance.try_charge("IB_A", 3000)
+    assert not allowance.try_charge("IB_A", 100)
     clock.now += 600.0  # ten windows idle still refill only one allowance
-    assert not allowance.admit("IB_A", 6001)
-    assert allowance.admit("IB_A", 6000)
+    assert not allowance.try_charge("IB_A", 6001)
+    assert allowance.try_charge("IB_A", 6000)
 
 
 def test_a_text_head_is_cut_at_a_character_boundary() -> None:
@@ -373,7 +446,8 @@ def test_the_settings_ship_on_with_the_module_defaults() -> None:
     assert s.refused_body_allowance_bytes > 0
     for bad in (
         {"refused_body_allowance_bytes": -1.0},
-        {"refused_body_window_seconds": 0.0},
+        {"refused_body_window_seconds": 0.5},
+        {"refused_body_head_bytes": 1048577.0},
         {"refused_body_head_bytes": 255.0},
     ):
         with pytest.raises(ValidationError):
