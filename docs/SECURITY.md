@@ -5122,15 +5122,12 @@ engine cannot offer anything at that moment, so those changes are a stated bound
 password form, Windows SSO and federated sign-in) answers with a cookie that replaces the browser's
 session cookie. Once the new sign-in succeeds, the engine revokes the session the browser presented
 and audits `auth.session_revoked` with scope `superseded`, under the name of the user who owned
-that session. A session that was already over is ended with no row, and so is one minted under
-an older session epoch than its account's, which a gate would end. When the owner's admin-issued
-temporary credential is past its deadline, a gate would end the session too, so it gets the gate's
-`auth.temp_password_expired` row instead, with `"at": "superseded"` and the same `session` and
-`presented` references (BACKLOG #3749). The gate's integrity report is not written for the epoch
-case: the epoch is read after the revoke, so a whole-account revoke that commits between the two
-would make an untampered row look stale. The supersession itself ends only that one session and
-runs only when the sign-in succeeds; other controls at sign-in, such as a directory role change,
-can end more. It runs before the per-user session cap, so the cap does not push out another
+that session. A session that was already over is ended with no row. When the owner's
+admin-issued temporary credential is past its deadline, a gate would end the session too, so it
+gets the gate's `auth.temp_password_expired` row instead, with `"at": "superseded"` and the same
+`session` and `presented` references (BACKLOG #3749). The supersession itself ends only that one
+session and runs only when the sign-in succeeds; other controls at sign-in, such as a directory
+role change, can end more. It runs before the per-user session cap, so the cap does not push out another
 device's oldest session to make room for the one being replaced.
 Federated sign-in reads the cookie on its start leg, because the identity provider's redirect back
 is cross-site and the browser withholds the Strict cookie there. Windows SSO has no such hop, so a
@@ -5198,23 +5195,23 @@ elevations in a row inside it, and a wall clock that stepped between the elevati
 sign-out, which moves the bound by the step. The `auth.logout` row names the
 session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
 was presented. The `outcome` is `lapsed` instead when the session's own clock checks fail at the
-revoke, or when the session passes them but `identity_for_token`, under every gate, would still end
-it: the owner's admin-issued temporary credential is past its deadline (a disabled account
-excepted, as that check excepts it), or the session was minted under an older session epoch than
-its account's. At least a session over its idle or absolute limit fails the clock checks. The
-temporary-credential case also writes the gate's `auth.temp_password_expired` row, with
-`"at": "logout"` and the sign-out's client address. The epoch case writes nothing more, for the
-reason given for the supersession above; that race records `lapsed` too. A `lapsed` row
-still names the owner. If the owner cannot be read, neither of those two is checked, and a session
-that passed its clock checks is recorded `revoked`. The owner is read through the ended row's
-`user_id`, which the revoke does not check against the row's seal (BACKLOG #3716), so a tampered
-row could put these rows, and the outcome, on another account.
+revoke, or when the session passes them but the owner's admin-issued temporary credential is past
+its deadline, the test `identity_for_token` applies under every gate (a disabled account excepted,
+as that check excepts it). At least a session over its idle or absolute limit fails the clock
+checks. The temporary-credential case also writes the gate's `auth.temp_password_expired` row, with
+`"at": "logout"` and the sign-out's client address. A `lapsed` row still names the owner. If the
+owner cannot be read, the temporary credential is not checked, and a session that passed its clock
+checks is recorded `revoked`. So is a session minted under an older session epoch than its
+account's, which a gate would end: the sign-out reads the account after its revoke, so a
+whole-account revoke landing between the two would make a session that was live look stale. The
+owner is read through the ended row's `user_id`, which the revoke does not check against the row's
+seal (BACKLOG #3716), so a tampered row could put both rows, and the outcome, on another account.
 
 **A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
 clears the cookie. That row is then missing, with an ERROR log line; the line names the session
 when the sign-out ended one. A failed owner lookup on `/ui/logout`, which names no caller, writes
 the row with no actor, so it does not reach that user's security-events feed. On a session that
-passed its clock checks it also leaves the gate's two checks unrun, as above.
+passed its clock checks it also leaves the temporary credential unchecked, as above.
 
 **Open gap: `/ui/logout` audit rows for sign-outs that end no session are unbounded.** A request
 to `/ui/logout` whose session cookie ends no session can still write an `auth.logout` row, with
@@ -6128,8 +6125,9 @@ In their place, every refused sign-in on an existing, enabled local account writ
 whether a wrong credential or a live lock refused it. Two refusals keep their own rows: an unknown or
 disabled name (`reason: unknown_or_disabled`), and a right password on an expired temporary
 credential (`auth.temp_password_expired`). That action also records a session ended because its
-temporary credential lapsed, with `"at": "session"` and no sign-in attempt behind it (BACKLOG
-#2298; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
+temporary credential lapsed: with `"at": "session"` and no sign-in attempt behind it, with
+`"at": "logout"` at a sign-out, or with `"at": "superseded"` at another sign-in on the same
+browser, which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
 `users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
 never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
 selects rows by the caller's own username, so it shows the holder their own lock and no one else's.
