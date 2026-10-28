@@ -518,7 +518,8 @@ def test_a_crl_its_named_ca_proves_bad_refuses_beside_an_unchecked_ca_with_no_sk
     assert verdict_of_scan is not None
     assert verdict_of_scan[1].startswith("Replace the CRL in the CA file with one its CA signed")
 
-    # The running-hop reload is unchanged: it held this file back before and still does.
+    # The running-hop reload held this file back before and still does, now as proven bad rather
+    # than ``uncheckable``, so its remedy is ``bad_signature``.
     finding = crl_signature_finding(pem, _ders(mixed))
     assert finding is not None and finding.state == "bad"
 

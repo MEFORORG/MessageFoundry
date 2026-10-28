@@ -491,9 +491,11 @@ async def test_a_bad_signature_for_a_file_not_in_effect_is_judged_again_so_a_lat
     """Vault BACKLOG #3506 item 8, the Lander's hold on PR 2589. While some issuer in the file has
     no CRL in effect yet, a ``bad_signature`` refusal is judged again each pass, as before item 8,
     so a ``lapses_first`` found for the same bytes later is reported. Here the hop's list gains a CA
-    that verifies the CRL, as a CA directory can add one. The refusal still carries no "at least
-    until" caveat and no ``start_refuses``. Before this repair the refusal was final until the
-    bytes changed, so every later pass replayed ``bad_signature``."""
+    that the CRL names and that verifies it, as a CA directory can add one; since vault BACKLOG
+    #4159 a CA with no Subject Key Identifier would count for nothing beside the named one. The
+    refusal still carries no "at least until" caveat and no ``start_refuses``. Before this repair
+    the refusal was final until the bytes changed, so every later pass replayed
+    ``bad_signature``."""
     hop = pki.outbound_hop()  # its copy lapses in about five and a half days
     sink = _Sink()
     runner = _runner(sink)

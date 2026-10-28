@@ -281,7 +281,9 @@ _LEADS_TO_A_START = frozenset(
 #: time that passes. So is :data:`BAD_SIGNATURE`, as it was before item 8 of vault
 #: BACKLOG #3506 took it out of that set: otherwise it is final until the bytes change, and a
 #: refusal a later pass would find for the same bytes is never reported. One such is
-#: :data:`LAPSES_FIRST`, which it outranks, once the hop's CA list gains a CA that verifies the CRL.
+#: :data:`LAPSES_FIRST`, which it outranks, once the hop's CA list gains a CA that the CRL names and
+#: that verifies it. A CA with no Subject Key Identifier counts for nothing beside a named one
+#: (vault BACKLOG #4159, :class:`~messagefoundry.pki.CrlSignature`), so adding one lifts nothing.
 _REOPENED_WHILE_NOT_IN_EFFECT = _LEADS_TO_A_START | {BAD_SIGNATURE}
 #: The remedy for each :class:`~messagefoundry.pki.CrlSignature` state that holds a file back.
 #: ``unlisted`` is no signature finding: the reload's list may lack the issuer, so a restart.
