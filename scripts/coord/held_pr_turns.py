@@ -77,8 +77,10 @@ others' unsubmitted drafts, which the author cannot). A minimized comment still 
 as a Lander event: hiding a reply must not bring back the hold before it. Skipped for the TURN,
 though still counted toward the newest-event age: anything authored by a GitHub App or bot
 (GraphQL ``author.__typename == "Bot"``), such as the auto-approve review a push triggers; the push
-itself is caught as a new head. An event with no readable time is an ERROR row, never dropped,
-since dropping a reply could park the PR on its author. Inline review-thread comment bodies are not
+itself is caught as a new head. A non-Lander event dates from its latest edit
+(``lastEditedAt``), so editing an older comment to answer a hold is a reply. An event with no
+readable time, or a node that is not an object, is an ERROR row, never dropped, since dropping a
+reply could park the PR on its author. Inline review-thread comment bodies are not
 read. Only the latest ``COMMENT_PAGE`` issue comments and ``REVIEW_PAGE`` reviews are fetched.
 
 FLAGS. ``held`` (AUTHOR's turn); ``no-hold`` (no Lander event, or the newest is not a marker
@@ -163,11 +165,14 @@ query($owner: String!, $name: String!, $cursor: String) {
           }
         } } } }
         comments(last: %COMMENT_PAGE%) {
-          nodes { body createdAt authorAssociation isMinimized author { __typename login } }
+          nodes {
+            body createdAt lastEditedAt authorAssociation isMinimized
+            author { __typename login }
+          }
         }
         reviews(last: %REVIEW_PAGE%) {
           nodes {
-            body state createdAt submittedAt authorAssociation isMinimized
+            body state createdAt submittedAt lastEditedAt authorAssociation isMinimized
             author { __typename login }
           }
         }
@@ -239,6 +244,12 @@ class Event:
     #: Trusted association and not minimized: allowed to be a Lander event at all.
     trusted: bool
     dismissed: bool = False
+    #: ``lastEditedAt``: an edit is a reply too, so a non-Lander event dates from its latest edit.
+    edited: datetime | None = None
+
+    @property
+    def latest(self) -> datetime:
+        return max(self.when, self.edited) if self.edited else self.when
 
     @cached_property
     def _marker(self) -> str | None:
@@ -264,7 +275,10 @@ def _events(pr: dict[str, Any]) -> list[Event]:
         ("reviews", ("submittedAt", "createdAt")),
     ):
         for node in _nodes(pr.get(kind)):
-            if not isinstance(node, dict) or node.get("state") == "PENDING":
+            if not isinstance(node, dict):
+                # Skipping it could drop a reply after the hold and park the PR on its author.
+                raise ReadError(f"a {kind[:-1]} node is not an object")
+            if node.get("state") == "PENDING":
                 continue
             when = next(
                 (w for k in stamp_keys if (w := pr_state.parse_iso(node.get(k))) is not None), None
@@ -281,6 +295,7 @@ def _events(pr: dict[str, Any]) -> list[Event]:
                     trusted=not node.get("isMinimized")
                     and node.get("authorAssociation") in TRUSTED_ASSOCIATIONS,
                     dismissed=node.get("state") == "DISMISSED",
+                    edited=pr_state.parse_iso(node.get("lastEditedAt")),
                 )
             )
     return out
@@ -300,7 +315,7 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str]]:
         return LANDER, ["no-hold"]
     head = head_oid.lower()
     new_commit = not all(head.startswith(h) for h in heads)
-    replied = any(e.when >= when and not e.lander for e in turn_events)
+    replied = any(e.latest >= when and not e.lander for e in turn_events)
     if not new_commit and not replied:
         return AUTHOR, ["held"]
     flags = ["new-commit"] if new_commit else []
@@ -434,20 +449,31 @@ def fetch_live(gh: Gh, repo: str) -> RepoRead:
         repository, _rate = pr_state.graphql(
             gh, QUERY, {"owner": owner, "name": name, "cursor": cursor}, part="pulls"
         )
-        conn = repository.get("pullRequests")
-        if not isinstance(conn, dict):
-            raise ReadError("reply has no pullRequests connection")
-        read.prs.extend(_nodes(conn))
-        page = conn.get("pageInfo") or {}
-        if not page.get("hasNextPage"):
+        cursor = _take_page(read, repository.get("pullRequests"))
+        if cursor is None:
             break
-        cursor = page.get("endCursor")
-        if not cursor:
-            raise ReadError("hasNextPage with no endCursor")
     else:
         raise ReadError(f"more than {MAX_PAGES * PR_PAGE} open PRs; refusing a partial list")
     _set_required(read, repo, lambda: list(pr_state.fetch_required(gh, repo)))
     return read
+
+
+def _take_page(read: RepoRead, conn: object) -> str | None:
+    """Add one page's PRs to ``read``; the next page's cursor, or ``None`` on the last page.
+
+    A page that cannot say whether more follow is a ReadError: a partial list must not print as
+    the whole one.
+    """
+    page = conn.get("pageInfo") if isinstance(conn, dict) else None
+    if not isinstance(conn, dict) or not isinstance(page, dict):
+        raise ReadError("a page has no pullRequests connection with pageInfo")
+    read.prs.extend(_nodes(conn))
+    if not page.get("hasNextPage"):
+        return None
+    cursor = page.get("endCursor")
+    if not cursor:
+        raise ReadError("hasNextPage with no endCursor")
+    return str(cursor)
 
 
 def _set_required(read: RepoRead, repo: str, live: Callable[[], list[str]]) -> None:
@@ -476,11 +502,15 @@ def from_input(doc: object, repo: str) -> RepoRead:
     if entry.get("error"):
         raise ReadError(str(entry["error"]))
     read = RepoRead()
+    cursor: str | None = None
     for page in entry.get("pages") or []:
         try:
-            read.prs.extend(_nodes(page["data"]["repository"]["pullRequests"]))
+            conn = page["data"]["repository"]["pullRequests"]
         except (KeyError, TypeError) as exc:
             raise ReadError(f"an input page has no data.repository.pullRequests: {exc!r}") from exc
+        cursor = _take_page(read, conn)
+    if cursor is not None:
+        raise ReadError("the last input page says more pages follow; refusing a partial list")
 
     def canned() -> list[str]:
         required = entry.get("required")
@@ -518,7 +548,9 @@ def render(rows: list[dict[str, Any]]) -> str:
             pr = "" if number is None else str(number)
             table.append((ERROR, "", short, pr, "", "", "", "", "", row["error"]))
             continue
-        title = row["title"]
+        # Anyone can title a PR on a public repository: a control or bidi character must not
+        # rewrite or forge a row on the Lander's terminal.
+        title = "".join(c if c.isprintable() else "?" for c in row["title"])
         if len(title) > TITLE_WIDTH:
             title = title[: TITLE_WIDTH - 3] + "..."
         table.append(

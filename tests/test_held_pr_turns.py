@@ -362,7 +362,7 @@ def test_marker_head_must_be_7_to_40_hex() -> None:
 def test_unicode_line_breaks_in_line_one_are_not_a_hold() -> None:
     """``str.splitlines`` would split these; the contract splits on a line feed only."""
     marker = "<!-- lander-hold head=abcdef1 -->"
-    for sep in ("\x0b", " ", "\x1c", "\x85", "\x0c"):
+    for sep in ("\x0b", "\u2028", "\x1c", "\x85", "\x0c"):
         assert not _is_hold(marker + sep + SESSION + "**Held.**"), repr(sep)
         # Nor as trailing whitespace on the marker line: only space, tab and CR are stripped.
         assert not _is_hold(marker + sep + "\n" + SESSION + "**Held.**"), repr(sep)
@@ -441,6 +441,34 @@ def test_pending_review_is_ignored_and_minimized_reply_still_counts(
     rows = _engine_rows(tmp_path, capsys, pr, replied)
     assert _turn(rows[23]) == ("AUTHOR", ["held"])
     assert _turn(rows[24]) == ("LANDER", ["replied", "no-new-commit"])
+
+
+def test_reply_by_editing_an_older_comment_hands_the_turn_back(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    edited = _comment("Manager: handover. Answered: finding 2 fixed.", "2026-10-28T11:00:00Z")
+    edited["lastEditedAt"] = "2026-10-28T13:00:00Z"
+    unedited = _comment("Manager: handover.", "2026-10-28T11:00:00Z")
+    # The Lander editing its own hold is no reply.
+    hold = _hold("2026-10-28T12:00:00Z", _sha(28))
+    hold["lastEditedAt"] = "2026-10-28T13:00:00Z"
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _pr(27, comments=[edited, _hold("2026-10-28T12:00:00Z", _sha(27))]),
+        _pr(28, comments=[unedited, hold]),
+    )
+    assert _turn(rows[27]) == ("LANDER", ["replied", "no-new-commit"])
+    assert _turn(rows[28]) == ("AUTHOR", ["held"])
+
+
+def test_non_object_comment_node_is_an_error_row_not_dropped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr = _pr(29, comments=[_hold("2026-10-28T12:00:00Z", _sha(29))])
+    pr["comments"]["nodes"].append(None)
+    row = _engine_rows(tmp_path, capsys, pr)[29]
+    assert row["turn"] == "ERROR" and "PR unreadable" in row["error"]
 
 
 def test_undatable_comment_is_an_error_row_not_dropped(
@@ -670,6 +698,39 @@ def test_live_read_paginates_in_one_query_per_page(capsys: pytest.CaptureFixture
     rows = json.loads(capsys.readouterr().out)
     assert [c["cursor"] for c in calls] == [None, "c1"]
     assert sorted(r["number"] for r in rows) == [70, 71]
+
+
+def test_a_page_that_cannot_say_it_is_the_last_is_a_read_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    no_info = _page([_pr(75)])
+    del no_info["data"]["repository"]["pullRequests"]["pageInfo"]
+    more = _page([_pr(76)])
+    more["data"]["repository"]["pullRequests"]["pageInfo"] = {"hasNextPage": True, "endCursor": "c"}
+    for page in (no_info, more):
+        code, rows = _run(tmp_path, {KORUS: {"pages": [page]}}, capsys, "--repo", KORUS)
+        assert code == 0
+        assert [r["turn"] for r in rows] == ["ERROR"]
+        assert rows[0]["error"].startswith("read failed")
+
+
+def test_title_control_characters_cannot_forge_a_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr = _pr(77)
+    pr["title"] = "x" + chr(13) + chr(10) + "AUTHOR  held" + chr(0x1B) + "[2K" + chr(0x202E) + "y"
+    code, out = _run(
+        tmp_path,
+        {ENGINE: {"pages": [_page([pr])], "required": ENGINE_REQUIRED}},
+        capsys,
+        "--repo",
+        ENGINE,
+        json_out=False,
+    )
+    assert code == 0
+    lines = out.splitlines()
+    assert len(lines) == 2
+    assert all(c.isprintable() for c in lines[1])
 
 
 def test_table_sorts_lander_first_then_oldest(
