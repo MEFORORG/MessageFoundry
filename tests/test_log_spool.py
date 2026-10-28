@@ -34,6 +34,7 @@ from messagefoundry.logging_setup import (
     _TimeoutSysLogHandler,
     _TlsSysLogHandler,
     configure_logging,
+    forwarder_status,
     is_permanent_connect_error,
 )
 
@@ -468,6 +469,7 @@ def test_a_permanent_connect_failure_is_reported_at_error_and_not_deferred(
     assert installed is False
     assert "ERROR" in out and "failed permanently" in out
     assert "not reachable yet" not in out
+    _assert_reads_not_installed_permanently()
     # The spool was released, so a later configure in this process can take it.
     again = LogSpool(spool_dir, max_bytes=1_000)
     again.open()
@@ -495,6 +497,15 @@ def test_a_name_that_does_not_resolve_fails_permanently_under_the_real_create_so
     out = capsys.readouterr().out
     assert installed is False
     assert "ERROR" in out and "failed permanently" in out
+    _assert_reads_not_installed_permanently()
+
+
+def _assert_reads_not_installed_permanently() -> None:
+    """What the health surface reads after a permanent start failure: configured, not installed,
+    and the fixed word ``permanent`` (vault BACKLOG #4083 finding 11)."""
+    status = forwarder_status()
+    assert (status.configured, status.installed, status.start_failure) == (True, False, "permanent")
+    assert status.state == "not_installed"
 
 
 def test_a_transient_lookup_failure_is_still_deferred_on_cpython_3149(

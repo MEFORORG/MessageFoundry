@@ -215,10 +215,10 @@ def test_supervise_under_warn_prints_the_collector_ca_warning_and_logs_it_after_
     err = capsys.readouterr().err
     assert rc == 0 and len(recorder.forwards) == 1 and recorder.spawned == 1
     assert any(
-        line.startswith("warning:") and "forward_tls_ca_file" in line and "starting anyway" in line
+        line.startswith("warning:") and "forward_tls_ca_file" in line and "using it anyway" in line
         for line in err.splitlines()
     ), err
-    noted = [r.name for r in caplog.records if "starting anyway" in r.getMessage()]
+    noted = [r.name for r in caplog.records if "using it anyway" in r.getMessage()]
     assert noted == ["messagefoundry.__main__"], noted
 
 

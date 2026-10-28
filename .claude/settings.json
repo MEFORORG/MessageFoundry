@@ -164,6 +164,23 @@
         ]
       }
     ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/seat-unlock.ps1"
+            ],
+            "timeout": 20
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [

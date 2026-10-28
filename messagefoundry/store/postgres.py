@@ -1541,8 +1541,7 @@ def _refuse_store_revocation(
     position the syslog forwarder and the OIDC IdP legs are also in. ``None`` (a direct test /
     embedding that derives no posture) falls through to the ambient ``current_hop_posture``, which is
     unstamped at every ``open_store`` call site -- the store is opened from the API lifespan and the
-    CLI, never inside ``build_check_registry``'s scope -- so it stays the shipped no-op. No
-    ``proxy_proven``: an engine->store hop has no declared revocation-checking egress terminator. Raises
+    CLI, never inside ``build_check_registry``'s scope -- so it stays the shipped no-op. Raises
     :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` -- a ``ValueError`` subclass, so it
     still surfaces at store open exactly like the weakened-TLS refusal it sits beside -- on a
     production-PHI verifying store hop off-loopback; WARNs on a non-production one; allows loopback and

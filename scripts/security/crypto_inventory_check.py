@@ -444,7 +444,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # it as a start judges a CRL setting (tls_policy.judge_crl_bytes, which reads the CRL fields). It
     # loads those bytes into a scratch context (tls_policy.crl_scratch_context) to read the CA
     # certificates OpenSSL takes from them, and checks each CRL's signature against those through
-    # pki.crl_signature_refusal (a public-key verify). The scratch context is discarded: it serves no
+    # pki.judge_crl_signatures (a public-key verify), which tells a signature proven bad from one
+    # it could not confirm (BACKLOG #3512). The scratch context is discarded: it serves no
     # handshake and changes no hop's trust.
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
         {"messagefoundry.config.tls_policy", "ssl"}
@@ -665,10 +666,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2317 adds the tls_policy import: the cleartext-hop authority (is_loopback_hop_host,
     # insecure_hop_disposition) refuses an http:// Vault that is not loopback reached directly. That
     # is a posture decision on the scheme, and it calls no cipher or context.
-    # Vault BACKLOG #4028 adds hashlib: SHA-256 of the raw ambient proxy value keys the once-per-
-    # hop-and-proxy disclosure. A dedupe key, not a security control and not key material; what it
-    # keeps out of memory, and what it does not, is the section 4 row "Vault hop ambient-proxy
-    # disclosure dedupe".
+    # Vault BACKLOG #4028 adds hashlib: SHA-256 of the raw ambient proxy value keys the
+    # disclosure, logged once per hop and distinct proxy value. A dedupe key, not a security
+    # control and not key material; what it keeps out of memory, and what it does not, is the
+    # section 4 row "Vault hop ambient-proxy disclosure dedupe".
     "messagefoundry/transports/strict_requests.py": frozenset(
         {"hashlib", "messagefoundry.config.tls_policy", "ssl"}
     ),
@@ -1316,8 +1317,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
-    # BACKLOG #3176: the expiry scan's CA-file CRL check calls pki.crl_signature_refusal itself, when
-    # a pass finds a hop holding an older copy of a CA file; the INVENTORY row above says the rest.
+    # BACKLOG #3176: the expiry scan's CA-file CRL check calls pki.judge_crl_signatures itself
+    # (BACKLOG #3512), when a pass finds a hop holding a copy of a CA file that differs from the
+    # file; the INVENTORY row above says the rest.
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
         {
             "sign_verify:via messagefoundry.pki",
@@ -1411,6 +1413,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # Vault BACKLOG #2223: load_pinned_server_certificate counts the certificates in a SQL
             # Server pin file, so a bundle is refused at load. Public certificates only.
             "key_cert:cryptography.x509.load_pem_x509_certificates",
+            # Vault BACKLOG #3506: _crl_extensions parses a copy of a CRL whose authority key
+            # identifier carries a serial that is not positive, to read its extensions without
+            # cryptography's warning. Public material; no signature is checked on the copy.
+            "key_cert:cryptography.x509.load_der_x509_crl",
             "key_cert:cryptography.x509.load_pem_x509_crl",
             "key_cert:cryptography.x509.random_serial_number",
             "key_cert:via messagefoundry.keywrap",
@@ -1545,7 +1551,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # certificate only) through pki.load_pinned_server_certificate to refuse one outside its
             # validity period, since Encrypt=strict leaves that check to the engine.
             "key_cert:via messagefoundry.pki",
-            # Vault BACKLOG #2223: the same pin takes the trust-anchor preflight (enforce_anchor), which
+            # Vault BACKLOG #2223: the same pin takes the trust-anchor preflight (enforced_anchor), which
             # fingerprints the public file (SHA-256). No pin is configured for it, so no compare runs.
             "compare:via messagefoundry.auth.trust_anchors",
             "hash:via messagefoundry.auth.trust_anchors",

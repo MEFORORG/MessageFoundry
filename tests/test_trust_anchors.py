@@ -41,6 +41,7 @@ from messagefoundry.config.settings import (
     EgressSettings,
     EscalationTier,
     LoggingSettings,
+    StoreSettings,
     TlsSettings,
 )
 from messagefoundry.store import MessageStore
@@ -57,8 +58,10 @@ async def store(tmp_path: Path):
 
 @pytest.fixture(autouse=True)
 def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test starts with no consumer load recorded (BACKLOG #2185), whatever ran before it."""
+    """Each test starts with no consumer load recorded (BACKLOG #2185), and no open-time warning
+    (BACKLOG #3714), whatever ran before it."""
     monkeypatch.setattr(ta, "_LOADED", {})
+    monkeypatch.setattr(ta, "_WARNED_AT_OPEN", {})
 
 
 def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[AnchorSpec]:
@@ -69,6 +72,7 @@ def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[
         tls=TlsSettings(),
         alerts=AlertsSettings(),
         log_settings=LoggingSettings(),
+        store=StoreSettings(),
     )
 
 
@@ -696,7 +700,7 @@ def test_group_writable_refusal_carries_its_own_fix(
         assert any(line.startswith(f"Then run icacls {q} again.") for line in lines)
     else:
         assert f"  chmod go-w {shlex.quote(str(p))}" in lines
-    assert lines[-1] == "[security].enforcement=enforce refuses to start"
+    assert lines[-1] == "[security].enforcement=enforce refuses it"
 
 
 @_windows_only
@@ -754,7 +758,7 @@ def test_indeterminate_dacl_refuses_at_enforce_and_names_both_fixes(
     assert "move the anchor" in text
     assert "set [api].tls_client_ca_pin to" in text
     assert hashlib.sha256(b"body").hexdigest() in text
-    assert "enforce refuses to start" in text and text.isascii()
+    assert "enforce refuses it" in text and text.isascii()
 
 
 def test_indeterminate_dacl_with_a_matching_pin_loads_with_a_warning(
@@ -791,7 +795,7 @@ def test_indeterminate_dacl_warns_at_warn(
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     assert enforce_anchor(AnchorSpec("t", "[x]", str(p), None), enforcing=False)
-    assert "could not settle" in caplog.text and "starting anyway" in caplog.text
+    assert "could not settle" in caplog.text and "using it anyway" in caplog.text
     assert "pin it to" in caplog.text  # no pin setting named, so the generic spelling
 
 
@@ -2112,8 +2116,10 @@ def _byte_order_mark_before_the_block() -> bytes:
 
 def _encrypted_key_beside_the_certificate() -> bytes:
     """Manager decision: a key block with a legacy encryption header refuses too, though cadata=
-    loads the certificate beside it, since the header is refused in a block of any label. A PKCS#8
-    ENCRYPTED PRIVATE KEY block, or a plain key block, has no such header and is not refused."""
+    loads the certificate beside it, since the header is refused in a block of any label. It is
+    refused by the header check, with that check's text, before the private-key check of BACKLOG
+    #3745 reads it; a PKCS#8 ENCRYPTED PRIVATE KEY block, or a plain key block, has no such header
+    and is refused by that later check instead (the #3745 tests below)."""
     label = b"RSA PRIVATE" + b" KEY"  # split, so the secret scanner does not read a real key
     key = b"-----BEGIN " + label + b"-----\n" + _ENCRYPTED + b"AAAA\n-----END " + label + b"-----\n"
     return _real_ca("crl-test-ca")[0] + key
@@ -2251,6 +2257,131 @@ def test_the_vault_hop_states_the_same_scope() -> None:
         and isinstance(stmt.value, ast.Constant)
     ]
     assert value == ta.ENCRYPTION_HEADER_SCOPE
+
+
+# --- BACKLOG #3745: a private-key block in a trust anchor refuses (a Manager decision) ------------
+#
+# Every label is split in the source and every body is fake, so no committed byte reads as a key.
+
+_PRIVATE = "PRIVATE" + " KEY"
+_KEY_LABELS = [_PRIVATE, "ENCRYPTED " + _PRIVATE, "RSA " + _PRIVATE, "EC " + _PRIVATE]
+_NON_ASCII = b"\xc3\xa9 "  # a UTF-8 e-acute and a space
+
+
+def _key_block(label: str) -> bytes:
+    return f"-----BEGIN {label}-----\nAAAA\n-----END {label}-----\n".encode("ascii")
+
+
+@pytest.mark.parametrize("label", _KEY_LABELS)
+@pytest.mark.parametrize("first", [False, True], ids=["after the certificate", "before it"])
+def test_a_private_key_block_in_an_anchor_refuses(
+    monkeypatch: pytest.MonkeyPatch, label: str, first: bool
+) -> None:
+    """Red with the private-key check removed from anchor_cadata: cadata= skips the key block and
+    loads the certificate beside it. The refusal names the setting and never the content."""
+    cert = _real_ca("crl-test-ca")[0]
+    data = _key_block(label) + cert if first else cert + _key_block(label)
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    with pytest.raises(TrustAnchorError) as err:
+        ta.anchor_cadata(data, spec)
+    text = str(err.value)
+    assert ta.PRIVATE_KEY_SCOPE in text and "[api].tls_client_ca_file" in text
+    assert "AAAA" not in text
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        # OpenSSL finds a BEGIN after 254 bytes of one line, so a line-start check would miss it.
+        pytest.param(
+            lambda: _real_ca("crl-test-ca")[0] + b"#" * 254 + _key_block(_PRIVATE),
+            id="BEGIN after 254 bytes",
+        ),
+        # The check errs wide, as the header check does, and the text says so.
+        pytest.param(
+            lambda: _real_ca("crl-test-ca")[0] + f"# no {_PRIVATE}----- here\n".encode(),
+            id="label in a comment after the last END",
+        ),
+        # A non-ASCII line is dropped from the cadata= text, but the check reads the bytes. Both
+        # the BEGIN and the END line are non-ASCII, so a check of the kept text finds no label.
+        pytest.param(
+            lambda: (
+                _real_ca("crl-test-ca")[0]
+                + _NON_ASCII
+                + _key_block(_PRIVATE).replace(b"-----END", _NON_ASCII + b"-----END")
+            ),
+            id="key on a non-ASCII line",
+        ),
+        pytest.param(lambda: _real_ca("crl-test-ca")[0] + _key_block(_PRIVATE.lower()), id="lower"),
+    ],
+)
+def test_a_private_key_label_refuses_in_the_shapes_a_line_check_misses(
+    monkeypatch: pytest.MonkeyPatch, shape: Any
+) -> None:
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    with pytest.raises(TrustAnchorError) as err:
+        ta.anchor_cadata(shape(), spec)
+    assert ta.PRIVATE_KEY_SCOPE in str(err.value)
+
+
+def test_a_certificate_only_anchor_still_loads() -> None:
+    """The control: two plain certificates, with a key-like word that is not a label above and
+    between them, still load."""
+    data = (
+        b"# the CA, not its PRIVATE KEY\n"
+        + _real_ca("crl-test-ca")[0]
+        + f"# the second CA; its {_PRIVATE} stays with its owner\n".encode()
+        + _real_ca("second-ca")[0]
+    )
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    assert ta.anchor_cadata(data, spec) == data.decode()
+    assert not ta.has_private_key_label(data.decode())
+    assert not ta.has_private_key_label(_key_block(_PRIVATE).decode().replace("-----BEGIN ", ""))
+
+
+async def test_a_cafile_anchor_refuses_a_key_and_still_takes_a_trusted_block(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An anchor whose hop loads cafile= (loads_verified_bytes False) skips the shape check, so a
+    TRUSTED CERTIFICATE block still passes it, but a key block refuses (BACKLOG #3745). Red with
+    the private-key check removed from _preflight_one."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+
+    def spec(body: bytes, name: str) -> AnchorSpec:
+        path = tmp_path / name
+        path.write_bytes(body)
+        return AnchorSpec(
+            "tls_internal_ca", "[tls].internal_ca_file", str(path), loads_verified_bytes=False
+        )
+
+    keyed = spec(_real_ca("crl-test-ca")[0] + _key_block("EC " + _PRIVATE), "keyed.pem")
+    with pytest.raises(TrustAnchorError) as err:
+        await run_anchor_preflight([keyed], store, enforcing=True)
+    assert ta.PRIVATE_KEY_SCOPE in str(err.value) and "[tls].internal_ca_file" in str(err.value)
+    assert "pem_refused" in {r["event"] for r in await _rows(store, "tls_internal_ca")}
+    # The control: the shape check stays off for this anchor.
+    trusted = spec(b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n", "trusted.pem")
+    await run_anchor_preflight([trusted], store, enforcing=True)
+
+
+def test_the_vault_hop_states_the_same_private_key_scope() -> None:
+    """The twin of :func:`test_the_vault_hop_states_the_same_scope` for BACKLOG #3745."""
+    import ast
+
+    import messagefoundry.transports as transports
+
+    source = (Path(transports.__file__).parent / "strict_requests.py").read_text(encoding="utf-8")
+    (value,) = [
+        stmt.value.value
+        for stmt in ast.parse(source).body
+        if isinstance(stmt, ast.Assign)
+        and any(isinstance(n, ast.Name) and n.id == "_PRIVATE_KEY_CA_TEXT" for n in stmt.targets)
+        and isinstance(stmt.value, ast.Constant)
+    ]
+    assert value == ta.PRIVATE_KEY_SCOPE
 
 
 def _ran(returncode: int, stdout: str | None, stderr: str = "") -> Any:
@@ -2519,6 +2650,7 @@ def _dialling_specs(
         tls=TlsSettings(**with_ca("internal_ca_file", tls)),
         alerts=AlertsSettings(**with_ca("email_tls_ca_file", alerts)),
         log_settings=LoggingSettings(**with_ca("forward_tls_ca_file", log_settings)),
+        store=StoreSettings(),
     )
 
 
@@ -2910,6 +3042,134 @@ async def test_a_store_fault_on_an_earlier_anchor_does_not_hide_a_later_refusal(
         await preflight()
     assert isinstance(err.value.__cause__, TrustAnchorError)
     assert "[auth].ad_tls_ca_cert_file" in str(err.value)
+
+
+# --- vault BACKLOG #3714 item 1: the SQL Server store pin is a settings anchor ------------------
+
+
+def _sqlserver_pin(tmp_path: Path) -> Path:
+    """A real server certificate, which a SQL Server ``ssl_root_cert`` must be to load."""
+    from messagefoundry import pki
+
+    pin = tmp_path / "db-server.pem"
+    pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])
+    return pin
+
+
+def _store_specs(**store: Any) -> list[AnchorSpec]:
+    """:func:`collect_anchor_specs` with every other section at its default, which names no CA."""
+    base: dict[str, Any] = {"server": "db.example", "database": "mefor", "username": "mefor"}
+    return collect_anchor_specs(
+        AuthSettings(),
+        ApiSettings(),
+        tls=TlsSettings(),
+        alerts=AlertsSettings(),
+        log_settings=LoggingSettings(),
+        store=StoreSettings(**{**base, **store}),
+    )
+
+
+def test_the_sqlserver_store_pin_is_a_settings_anchor(tmp_path: Path) -> None:
+    """Red under: the store section left out of :func:`collect_anchor_specs`. The driver reads the
+    pin by path at each connect, so the spec carries no fingerprint pin and
+    ``loads_verified_bytes=False``."""
+    pin = str(_sqlserver_pin(tmp_path))
+    (spec,) = _store_specs(backend="sqlserver", ssl_root_cert=pin)
+    assert (spec.label, spec.setting, spec.path) == (
+        "store_sqlserver_pin",
+        "[store].ssl_root_cert",
+        pin,
+    )
+    assert spec.pin is None and spec.loads_verified_bytes is False
+
+
+def test_a_postgres_ssl_root_cert_is_not_a_settings_anchor(tmp_path: Path) -> None:
+    """The control for the case above: the same file as a PostgreSQL ``ssl_root_cert`` is not
+    collected, since this check covers the SQL Server pin only (module item 11), and neither is a
+    SQL Server store with no pin. Red under: the backend arm dropped from the store's pin
+    predicate."""
+    pin = str(_sqlserver_pin(tmp_path))
+    assert _store_specs(backend="postgres", ssl_root_cert=pin) == []
+    assert _store_specs(backend="sqlserver") == []
+
+
+async def test_the_sqlserver_store_pin_is_audited_at_start_and_rechecked_at_reload(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's own check at open writes no row, because the store that holds them is not open
+    yet. The settings preflight does: a start writes the ``observed`` row, a reload after a swap
+    writes ``changed``, and a reload after the file becomes writable by others refuses at
+    ``enforce`` with its ``acl_insecure`` row. Red under: the store pin left out of
+    :func:`collect_anchor_specs`, where no row is written and the last reload passes."""
+    from messagefoundry import pki
+    from messagefoundry.config.wiring import WiringError
+
+    acl: dict[str, bool] = {"ok": True}
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: acl["ok"])
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    await run_anchor_preflight(specs, store, enforcing=True)  # the start
+    assert [r["event"] for r in await _rows(store, "store_sqlserver_pin")] == ["observed"]
+    preflight = ta.make_settings_anchor_preflight(specs, store, enforcing=True)
+    assert preflight is not None
+    pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])  # the server's renewed cert
+    assert await preflight() == ()  # the driver reads the file per connect: no restart to report
+    events = [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+    assert sorted(events) == ["changed", "observed"], events
+    acl["ok"] = False
+    with pytest.raises(WiringError, match=r"\[store\]\.ssl_root_cert") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert "acl_insecure" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+
+
+async def test_a_start_at_warn_logs_the_pins_warning_once(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A serve start checks the pin twice: at store open, then in the lifespan preflight. At
+    ``warn`` it logs the warning once, and the preflight still writes its row. The control is the
+    reload after it, which warns again. Red under: the preflight ignoring the open's warning."""
+    import logging
+
+    from messagefoundry import pki
+    from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.store.sqlserver import check_pinned_certificate
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    from messagefoundry.config.settings import StoreBackend
+
+    settings = StoreSettings(
+        backend=StoreBackend.SQLSERVER,
+        server="db.example",
+        database="mefor",
+        username="mefor",
+        ssl_root_cert=str(pin),
+    )
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+
+    def warnings_logged() -> int:
+        return sum("writable by a non-owner" in r.getMessage() for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING, logger=ta.__name__):
+        check_pinned_certificate(settings, posture=HopPosture(enforcing=False))  # the store open
+        await run_anchor_preflight(specs, store, enforcing=False)  # the lifespan
+        assert warnings_logged() == 1
+        assert "acl_insecure" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+        await run_anchor_preflight(specs, store, enforcing=False)  # a reload
+        assert warnings_logged() == 2
+        # The control that can differ: a file swapped between the open and the preflight is a
+        # different verdict, so the preflight warns about it too. Red under: matching on the
+        # label alone, without the verdict.
+        check_pinned_certificate(settings, posture=HopPosture(enforcing=False))
+        pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])
+        await run_anchor_preflight(specs, store, enforcing=False)
+        assert warnings_logged() == 4
 
 
 # --- BACKLOG #3470: the hops built before the audited start check -----------------------------------

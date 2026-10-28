@@ -2263,7 +2263,11 @@ _RETRACTED_CRL_SIGNATURE_CLAIMS = (
 #: Sentences the guide must keep, each for a fact a reader acts on.
 _REQUIRED_CRL_SIGNATURE_SENTENCES = (
     "an earlier version is logged again when it returns after another version that was logged",
-    "the engine does not check its signature, at a start or at a reload",
+    # Finding (f): the older wording read as if nothing checked it, the expiry scan included.
+    "neither a start nor a reload checks its signature",
+    # Finding (b) and the Manager's item 4: a staging retry is not a file to fix, and a start
+    # can refuse it too.
+    "The private copy is about the temporary directory, not the CRL.",
 )
 
 
