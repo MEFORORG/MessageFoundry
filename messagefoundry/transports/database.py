@@ -657,12 +657,18 @@ def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | N
     :func:`~messagefoundry.auth.trust_anchors.has_private_key_label_bytes` (BACKLOG #3745).
 
     :func:`_driver_file_spellings` says which paths are left to the driver, and which spellings
-    are read.
+    are read. A share Windows cannot reach is refused, unless ``sslmode`` turns TLS off
+    (:func:`generic_odbc_tls_off`): then the driver reads no CA, so it never meets that file.
 
     **It runs when the connection is built, not at each connect.** What checks the file after
     that, and what does not, is ``auth.trust_anchors`` module item 12."""
     for setting, data in _driver_file_spellings(
-        named, "sslca", connection, "CA file", "it for an encryption header or a private key"
+        named,
+        "sslca",
+        connection,
+        "CA file",
+        "it for an encryption header or a private key",
+        leave_unreachable=generic_odbc_tls_off({"dialect": "generic", "odbc_params": named}),
     ):
         if has_encryption_header_bytes(data):
             raise ValueError(
@@ -686,6 +692,7 @@ def _driver_file_spellings(
     *,
     error: type[ValueError] = ValueError,
     leave_irregular: bool = True,
+    leave_unreachable: bool = False,
 ) -> Iterator[tuple[str, bytes]]:
     """``(setting, bytes)`` for each spelling of the ``keyword`` file
     (:func:`driver_file_spellings`) that :func:`_read_driver_file` reads, for the caller to check.
@@ -693,7 +700,13 @@ def _driver_file_spellings(
     setting = f"{hop_name_prefix(connection)}DATABASE odbc_params {keyword}"
     for path in driver_file_spellings(named.get(keyword)):
         data = _read_driver_file(
-            path, setting, what, checked_for, error=error, leave_irregular=leave_irregular
+            path,
+            setting,
+            what,
+            checked_for,
+            error=error,
+            leave_irregular=leave_irregular,
+            leave_unreachable=leave_unreachable,
         )
         if data is not None:
             yield setting, data
@@ -707,6 +720,7 @@ def _read_driver_file(
     *,
     error: type[ValueError] = ValueError,
     leave_irregular: bool = True,
+    leave_unreachable: bool = False,
 ) -> bytes | None:
     """The bytes of one spelling of a file a driver loads, for the engine to check first, or
     ``None`` when the file is left to the driver. ``what`` and ``checked_for`` word a refusal, and
@@ -718,7 +732,9 @@ def _read_driver_file(
     read because reading one could itself wait. Without it, as for ``sslkey``, those are refused
     unread, as ``refuse_weak_key_file`` refused a directory. Any other read failure is refused,
     because a file the check cannot read is one it cannot clear, and so is a file past
-    :data:`_MAX_DRIVER_CA_FILE_BYTES`.
+    :data:`_MAX_DRIVER_CA_FILE_BYTES`. That includes a share Windows could not reach
+    (:func:`_names_no_file`), unless ``leave_unreachable`` says the driver will not read the file
+    either.
 
     The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says
     how a device or pipe is judged without being read, or waited on."""
@@ -731,13 +747,15 @@ def _read_driver_file(
     except OSError as exc:
         # read_if_regular returns None for a directory it stats. One swapped in after that stat
         # can fail the open instead, as PermissionError on Windows, so the path is looked at
-        # again here. A path through a file names no file either; keywrap refused both, so sslkey
-        # still does.
-        if os.path.isdir(path) or isinstance(exc, NotADirectoryError):
+        # again here, but never after a FileNotFoundError: on a share Windows could not reach,
+        # a second look waits out the same network timeout again, on the event loop. A path
+        # through a file names no file either; keywrap refused both, so sslkey still does.
+        missing = isinstance(exc, FileNotFoundError)
+        if isinstance(exc, NotADirectoryError) or (not missing and os.path.isdir(path)):
             _irregular(setting, what, checked_for, error, leave_irregular)
             return None
-        if _names_no_file(exc):
-            logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
+        if _names_no_file(exc) or (missing and leave_unreachable):
+            logger.debug("%s: no file the driver reads at this spelling, so no check", setting)
             return None
         raise error(
             f"{setting}: the {what} could not be read to check {checked_for}: "

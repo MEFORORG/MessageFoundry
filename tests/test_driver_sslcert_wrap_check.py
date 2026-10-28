@@ -281,6 +281,64 @@ def test_a_read_failure_that_names_no_file_is_the_only_one_left_to_the_driver(
         assert f"sslkey={{{path}}}" in _build(plain, extra={"sslkey": path})
 
 
+@pytest.mark.parametrize(("shape", "refused"), [("notfound:53", True), ("notfound", False)])
+def test_a_missing_name_is_judged_from_the_first_error_with_no_second_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str, refused: bool
+) -> None:
+    """A FileNotFoundError says what it says, so the path is not looked at again. On a share
+    Windows could not reach, a second look waits out the same network timeout on the event loop.
+    Red with ``os.path.isdir`` asked before the error is read: it is called for the path."""
+    path = _write(tmp_path, b"unread")
+    error = _read_failure(shape)
+
+    def failing(*_args: Any) -> bytes | None:
+        raise error
+
+    looked: list[str] = []
+    real_isdir = os.path.isdir
+
+    def isdir(target: Any) -> bool:
+        looked.append(os.fspath(target))
+        return real_isdir(target)
+
+    monkeypatch.setattr(database, "read_if_regular", failing)
+    monkeypatch.setattr(os.path, "isdir", isdir)
+    if refused:
+        with pytest.raises(ValueError, match="could not be read"):
+            _build(path, spelling="sslca")
+    else:
+        assert f"sslca={{{path}}}" in _build(path, spelling="sslca")
+    assert path not in looked
+
+
+@pytest.mark.parametrize("mode", ["disable", "DISABLED"])
+def test_an_unreachable_sslca_the_driver_never_reads_does_not_fail_the_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Under a mode that turns TLS off the driver reads no CA (``generic_odbc_tls_off``), so a
+    share that cannot be reached at build time is not a reason to refuse. Red with the
+    unreachable-share refusal applied whatever the mode. The control: the same share under
+    ``verify-full``, where the driver reads the CA, is refused."""
+    path = _write(tmp_path, b"unread")
+    error = _read_failure("notfound:67")
+
+    def failing(*_args: Any) -> bytes | None:
+        raise error
+
+    monkeypatch.setattr(database, "read_if_regular", failing)
+    assert f"sslca={{{path}}}" in _build(path, spelling="sslca", extra={"SSLmode": mode})
+    with pytest.raises(ValueError, match="could not be read"):
+        _build(path, spelling="sslca")
+
+
+def test_a_readable_sslca_is_still_checked_when_tls_is_off(tmp_path: Path) -> None:
+    """Only the unreachable share is left to a driver that reads no CA. A CA file the engine can
+    read is checked as before, so an encrypted block in it is refused under ``disable`` too."""
+    path = _write(tmp_path, b"-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n", "ca.pem")
+    with pytest.raises(ValueError, match="encryption header"):
+        _build(path, spelling="sslca", extra={"SSLmode": "disable"})
+
+
 def test_with_sslkey_set_sslcert_is_not_read(tmp_path: Path, client: _Client) -> None:
     """With ``sslkey`` set the driver takes the key from that file, so an encrypted key left in a
     combined ``sslcert`` export is never loaded. ``refuse_weak_cert_chain_key`` follows the same
