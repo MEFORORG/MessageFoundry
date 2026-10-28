@@ -390,15 +390,17 @@ async function withRenewalRetry<T>(
  *
  * `minDHSize` is 2048 (BACKLOG #300), where Node's default is 1024. It bounds the group the one DHE
  * suite in {@link TLS_12_SUITES} may run over, rather than dropping that suite (owner ruling of
- * 2026-10-27). The engine's own listener was measured accepting `ffdhe2048` and `ffdhe3072`
- * (`harden_kex_groups` in `messagefoundry/config/tls_policy.py`), and both pass. OpenSSL 3.2 and
- * later already refuse a group under 2048 bits at their default security level; the option holds
- * the floor where that level is lower, as it is by default before 3.2 or under a system OpenSSL
- * configuration that lowers it. `test/suite/engine-client-dh.test.ts` measures both. Node checks it
- * on each full handshake. A pooled socket or a resumed session reuses an earlier handshake, which
- * this client also made with the floor. VS Code's desktop runtime, Electron with
- * BoringSSL, is taken to negotiate no DHE suite, so there the option has nothing to act on. The
- * value is a literal so the crypto inventory's token carries it.
+ * 2026-10-27). What it guards against is a server that negotiates that suite, such as a TLS
+ * terminator in front of the engine. OpenSSL 3.2 and later already refuse a group under 2048 bits
+ * at their default security level. The option holds the floor where that level is lower: by
+ * default before 3.2, or where a system OpenSSL configuration lowers it.
+ * `test/suite/engine-client-dh.test.ts` lowers the level and shows the option refusing.
+ *
+ * Node checks it on each full handshake. Its https agent does not key its socket pool or session
+ * cache on it, so a socket another caller opened to the same engine without it could be reused;
+ * every request this client builds carries it. VS Code's desktop runtime, Electron with BoringSSL,
+ * is taken to negotiate no DHE suite, so there the option has nothing to act on. The value is a
+ * literal so the crypto inventory's token carries it.
  */
 export function tlsOptions(url: URL): EngineTlsOptions {
   if (url.protocol !== "https:") {

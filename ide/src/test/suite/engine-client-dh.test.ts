@@ -138,8 +138,12 @@ suite("the IDE refuses a Diffie-Hellman group under 2048 bits (BACKLOG #300)", f
   });
 
   /** A TLS 1.2 server that offers only the DHE suite, over `group`. Its own level is lowered so it
-   *  will SERVE a small group: what is under test is whether the client accepts one. */
-  async function serve(group: "modp5" | "modp14"): Promise<string> {
+   *  will SERVE a small group: what is under test is whether the client accepts one. `served`
+   *  counts the requests that reached its handler. */
+  async function serve(
+    group: "modp5" | "modp14",
+  ): Promise<{ base: string; served: () => number }> {
+    let served = 0;
     const server = https.createServer(
       {
         key: material.key,
@@ -150,13 +154,15 @@ suite("the IDE refuses a Diffie-Hellman group under 2048 bits (BACKLOG #300)", f
         maxVersion: "TLSv1.2",
       },
       (_req, res) => {
+        served += 1;
         res.setHeader("Content-Type", "application/json");
         res.end("{}");
       },
     );
     servers.push(server);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    return `https://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const base = `https://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    return { base, served: () => served };
   }
 
   /** One handshake with `options`, answering the DH size negotiated or the error code. */
@@ -178,7 +184,7 @@ suite("the IDE refuses a Diffie-Hellman group under 2048 bits (BACKLOG #300)", f
   }
 
   test("a 1536-bit group is refused by the floor, where OpenSSL's own level would let it through", async () => {
-    const base = await serve("modp5");
+    const { base, served } = await serve("modp5");
     const lowered = `${TLS_CIPHERS}:@SECLEVEL=1`;
     // CONTROL: Node's default floor of 1024 at the same lowered level completes, so the group is
     // negotiable and the refusal below is the floor's, not the server's or OpenSSL's.
@@ -190,12 +196,13 @@ suite("the IDE refuses a Diffie-Hellman group under 2048 bits (BACKLOG #300)", f
       await handshake(base, { ...tlsOptions(new URL(base)), ciphers: lowered }),
       "ERR_TLS_DH_PARAM_SIZE",
     );
+    // Node refuses after the handshake, in JS: the request must still never have reached the server.
+    assert.strictEqual(served(), 1, "only the control's request may reach the handler");
   });
 
   test("the real client completes against a 2048-bit group", async () => {
-    // The floor must not refuse what it is meant to admit. The engine's own listener was measured
-    // accepting ffdhe2048, a 2048-bit group like this one.
-    const base = await serve("modp14");
+    // The floor must not refuse what it is meant to admit: a group of exactly 2048 bits.
+    const { base } = await serve("modp14");
     setEngineTrustAnchor(base, material.cert);
     assert.deepStrictEqual(await getJson(base, "/health"), {});
     assert.strictEqual(
@@ -207,10 +214,10 @@ suite("the IDE refuses a Diffie-Hellman group under 2048 bits (BACKLOG #300)", f
   test("the real client never completes against a 1536-bit group", async () => {
     // Whichever layer refuses first on this runtime (OpenSSL's level, or the floor where the level
     // is lower), the request the extension makes must fail.
-    const base = await serve("modp5");
+    const { base, served } = await serve("modp5");
     setEngineTrustAnchor(base, material.cert);
     // Tied to the DH cause: a lost DHE suite would also fail, as EPROTO "no shared cipher".
-    await assert.rejects(getJson(base, "/health"), (err: NodeJS.ErrnoException) => {
+    await assert.rejects(getJson(base, "/health", "test-token"), (err: NodeJS.ErrnoException) => {
       assert.ok(
         err.code === "ERR_TLS_DH_PARAM_SIZE" ||
           (err.code === "EPROTO" && /dh key too small/i.test(err.message)),
@@ -218,5 +225,6 @@ suite("the IDE refuses a Diffie-Hellman group under 2048 bits (BACKLOG #300)", f
       );
       return true;
     });
+    assert.strictEqual(served(), 0, "the request, and its bearer token, reached the server");
   });
 });

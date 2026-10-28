@@ -353,7 +353,9 @@ suite("the registered anchor reaches the TLS layer", () => {
 
   test("a registered anchor keeps the 2048-bit Diffie-Hellman group floor (BACKLOG #300)", () => {
     setEngineTrustAnchor("https://127.0.0.1:8765", PEM);
-    assert.strictEqual(tlsOptions(new URL("https://127.0.0.1:8765")).minDHSize, 2048);
+    const opts = tlsOptions(new URL("https://127.0.0.1:8765"));
+    assert.strictEqual(opts.ca, PEM, "the anchor branch was not taken — the test proves nothing");
+    assert.strictEqual(opts.minDHSize, 2048);
   });
 
   test("the suite pin is the approved AEAD list and carries no CBC suite (BACKLOG #300)", () => {

@@ -2298,8 +2298,10 @@ _LIT = r"""(?:\s*['"`](?P<alg>[\w.-]+)['"`])?"""
 #: pin names changes the token even when no literal moved.
 _CIPHER_LIT = r"""(?:\s*(?:['"`](?P<alg>[^'"`\n]+)['"`]|(?P<ref>[A-Za-z_$][\w$.]*)))?"""
 #: A numeric option value (BACKLOG #300, ``minDHSize``): a number literal is captured as the value,
-#: so lowering it changes the token; a name is captured as a reference, as ``_CIPHER_LIT`` does.
-_NUMBER_LIT = r"""(?:\s*(?:(?P<alg>[0-9][0-9_]*)|(?P<ref>[A-Za-z_$][\w$.]*)))?"""
+#: so a changed literal changes the token; a name is captured as a reference, as ``_CIPHER_LIT``
+#: does. The number must end the value, so an expression such as ``2048 / 2`` captures nothing and
+#: reads as a bare, undocumented token. An assignment after the object is built is not seen at all.
+_NUMBER_LIT = r"""(?:\s*(?:(?P<alg>[0-9][0-9_]*)(?=\s*(?:[,}]|$))|(?P<ref>[A-Za-z_$][\w$.]*)))?"""
 #: One cipher SUITE NAME in a string literal, OpenSSL style (``ECDHE-RSA-AES256-GCM-SHA384``) or IANA
 #: style (``TLS_AES_256_GCM_SHA384``, ``TLS_DH_anon_WITH_AES_128_CBC_SHA``). BACKLOG #2020. It must
 #: sit between quotes, colons, commas or whitespace, so each suite of a joined list is its own
@@ -2427,13 +2429,12 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # The single source of CSP nonces for every webview the extension builds (see the randomness
     # arm's row for the same file, which is where the entropy argument lives).
     "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),
-    # The TLS floor and suite pin the extension applies to every https request it makes to the engine:
-    # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS, minDHSize: 2048 }`,
-    # plus the pinned engine CA as `ca` when one is configured. Certificate verification is never
+    # The TLS floors and suite pin the extension applies to every https request it makes to the
+    # engine; `tlsOptions` in that file says what it returns. Certificate verification is never
     # switched off. The protocol floor is a named constant, not a literal, so the token does not
-    # carry it. The DHE group floor is a literal, so `minDHSize[2048]` does: lowering it, or
-    # dropping it, reds the gate (BACKLOG #300). `ciphers` is the
-    # BACKLOG #300 suite pin; `TLS_12_SUITES` in that file says which suites and what holds them.
+    # carry it. The DHE group floor is a literal, so `minDHSize[2048]` does. At least a changed
+    # literal, an expression in its place, or a dropped key reds the gate (BACKLOG #300).
+    # `ciphers` is the BACKLOG #300 suite pin; `TLS_12_SUITES` in that file says which suites and what holds them.
     # The `ciphers` token names the constant the pin uses, `TLS_CIPHERS`. The seven `suite` tokens
     # are the literals of `TLS_12_SUITES` and `TLS_13_SUITES`, so this row pins WHICH suites the file
     # names (BACKLOG #2020): drop one, add a full suite name such as a CBC one, or add an expanding
@@ -2468,12 +2469,12 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     # Not a TLS use the product makes: the extension test that measures the DHE group floor above
-    # with real handshakes (BACKLOG #300). It mints a throwaway RSA key and self-signed certificate in
-    # memory, serves the one DHE suite over a 1536-bit or 2048-bit group with the SERVER's level
-    # lowered to 0 so it will serve the small group, and lowers the CLIENT's level to 1 in two
-    # handshakes, so the refusal it asserts is the `minDHSize` floor's and not OpenSSL's. The
-    # `minDHSize[1024]` is the control arm, Node's own default. `DH` is the PEM label of the
-    # parameter block.
+    # with real handshakes (BACKLOG #300). It mints a throwaway RSA key and self-signed certificate
+    # in memory. Its server offers the one DHE suite over a 1536-bit or 2048-bit group, at level 0
+    # so it will serve the small group. Two client handshakes lower the client's level to 1, so the
+    # refusal asserted is the floor's and not OpenSSL's. `minDHSize[1024]` is the control arm, Node's
+    # own default. `DH` is the PEM label of the parameter block. It also signs with `crypto.sign`
+    # and builds groups with `getDiffieHellman`, which no pattern here names.
     "ide/src/test/suite/engine-client-dh.test.ts": frozenset(
         {
             "key_cert:createKey",

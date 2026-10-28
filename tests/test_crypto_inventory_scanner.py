@@ -1132,6 +1132,14 @@ def test_a_min_dh_size_value_is_in_its_token(line: str, token: str) -> None:
     assert token in _gate().non_python_operation_tokens_in(line + "\n")
 
 
+@pytest.mark.parametrize("value", ["2048 / 2", "2048 >> 1", "2048 - 1024"])
+def test_a_min_dh_size_expression_is_not_read_as_its_leading_number(value: str) -> None:
+    # The leading 2048 must not pass for the documented literal while the value is lower.
+    tokens = _gate().non_python_operation_tokens_in(f"x = {{ minDHSize: {value} }};\n")
+    assert "tls_context:minDHSize" in tokens
+    assert "tls_context:minDHSize[2048]" not in tokens
+
+
 @pytest.mark.parametrize(
     ("literal", "suites"),
     [
