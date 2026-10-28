@@ -50,11 +50,24 @@ def _dt(s: str) -> datetime:
 _URL_IDS = itertools.count()
 
 
+def _block(text: str) -> Any:
+    """A test block. A banner line here is a ``> `` line that is not a NOTE or HELD note; the real
+    ledger marks one with a status glyph, which this file may not carry."""
+    banners = tuple(
+        ln
+        for ln in text.split("\n")
+        if ln.startswith("> ") and not ln.startswith(("> NOTE", "> HELD"))
+    )
+    return oa.Block(text, banners)
+
+
 class FakeLedger:
-    """Commits as ``(time, sha, {row: block})``, oldest first; the last is the ref's tip."""
+    """Commits as ``(time, sha, {row: block text})``, oldest first; the last is the ref's tip."""
 
     def __init__(self, commits: list[tuple[str, str, dict[int, str]]]) -> None:
-        self.commits = [(_dt(t), sha, blocks) for t, sha, blocks in commits]
+        self.commits = [
+            (_dt(t), sha, {n: _block(b) for n, b in blocks.items()}) for t, sha, blocks in commits
+        ]
 
     def tip(self) -> tuple[str, str]:
         when, sha, _ = self.commits[-1]
@@ -64,7 +77,7 @@ class FakeLedger:
         found = [sha for t, sha, _ in self.commits if t <= when]
         return found[-1] if found else None
 
-    def blocks(self, sha: str) -> dict[int, str]:
+    def blocks(self, sha: str) -> dict[int, Any]:
         return next(b for _, s, b in self.commits if s == sha)
 
 
@@ -184,7 +197,7 @@ def test_an_edit_that_does_not_cite_the_pr_leaves_it_owed(
 
 def test_a_change_before_the_ask_is_not_the_act(capsys: pytest.CaptureFixture[str]) -> None:
     # Cites PR 2545 but landed before the 23:59Z ask, so the ask's baseline already holds it.
-    early = {3844: OPEN_3844 + "\n> NOTE: engine PR 2545 is in the queue.", 3025: PARTIAL_3025}
+    early = {3844: OPEN_3844 + "\n> IN REVIEW: engine PR 2545 is in the queue.", 3025: PARTIAL_3025}
     ledger = _ledger_433(("2026-10-27T10:00:00Z", "b" * 40, early))
     assert "row #3844" in _run(PRS_433, ledger, capsys, "--repo", ENGINE)
 
@@ -290,8 +303,9 @@ def test_no_vault_is_an_error_not_an_empty_report(capsys: pytest.CaptureFixture[
 
 
 def test_json_output(capsys: pytest.CaptureFixture[str]) -> None:
-    rows = json.loads(_run(PRS_433, _ledger_433(), capsys, "--repo", ENGINE, "--json"))
-    owed = {(r["pr"], r["what"]) for r in rows if r["status"] == "OWED"}
+    doc = json.loads(_run(PRS_433, _ledger_433(), capsys, "--repo", ENGINE, "--json"))
+    assert doc["scannedPullRequests"] == 2 and doc["ledger"].startswith("origin/main ")
+    owed = {(r["pr"], r["what"]) for r in doc["rows"] if r["status"] == "OWED"}
     assert owed == {(2545, "row #3844"), (2546, "row #3025")}
 
 
@@ -309,6 +323,7 @@ def test_git_ledger_reads_blocks_at_a_commit_before_a_time(tmp_path: Path) -> No
     (repo / "scripts" / "docs" / "backlog_status_check.py").write_text(
         "from pathlib import Path\n"
         "import re\n"
+        "_BANNER = re.compile(r'^>\\s(?:OPEN|SHIPPED)')\n"
         "LEDGER_SOURCES = (Path('docs/BACKLOG.md'), Path('docs/archive/CLOSED.md'))\n"
         "class Item:\n"
         "    def __init__(self, num, line, body_line):\n"
@@ -345,6 +360,95 @@ def test_git_ledger_reads_blocks_at_a_commit_before_a_time(tmp_path: Path) -> No
     assert ledger.tip()[0] == second
     assert ledger.sha_before(_dt("2026-10-27T23:59:46Z")) == first
     assert ledger.sha_before(_dt("2026-10-01T00:00:00Z")) is None
-    assert ledger.blocks(first)[3844] == "## 3844. gap\n\n> OPEN\n"
-    assert "body text" not in ledger.blocks(second)[3844]
-    assert "engine PR 2545" in ledger.blocks(second)[3844]
+    assert ledger.blocks(first)[3844] == ("## 3844. gap\n\n> OPEN\n", ("> OPEN",))
+    assert "body text" not in ledger.blocks(second)[3844].text
+    assert ledger.blocks(second)[3844].banners == ("> SHIPPED by engine PR 2545",)
+
+
+def _one(body: str, at: str = "2026-10-27T06:00:00Z", **kw: Any) -> dict[str, list[dict[str, Any]]]:
+    return {ENGINE: [_pr(2545, "2026-10-27T04:55:16Z", [_comment(body, at)], **kw)]}
+
+
+@pytest.mark.parametrize(
+    "marker", ["<!-- lander-ledger-ask -->", "<!-- lander-ledger-ask flips=3844 -->"]
+)
+def test_a_marker_naming_nothing_prints_read(
+    marker: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _run(
+        _one(marker + "\nFor the Lander: please flip #3844."),
+        _ledger_433(),
+        capsys,
+        "--repo",
+        ENGINE,
+    )
+    assert "READ" in out and "nothing owed" not in out
+
+
+@pytest.mark.parametrize("rows", ["#3844 #3025", "#3844;#3025", "3844, 3025", " #3844 , #3025"])
+def test_marker_rows_take_any_separator(rows: str) -> None:
+    assert oa.parse_marker(f"<!-- lander-ledger-ask rows={rows} file=1 -->") == [((3844, 3025), 1)]
+    assert oa.parse_marker(f"<!-- lander-ledger-ask row={rows} -->") == [((3844, 3025), 0)]
+
+
+def test_a_held_note_citing_the_pr_is_not_the_act(capsys: pytest.CaptureFixture[str]) -> None:
+    held = {3844: OPEN_3844 + "\n> HELD 2026-10-28: flip for engine PR 2545 waits on a ruling."}
+    ledger = _ledger_433(("2026-10-28T19:00:00Z", "b" * 40, held))
+    assert "OWED" in _run(PRS_433, ledger, capsys, "--repo", ENGINE)
+
+
+def test_a_flip_replacing_an_existing_citation_is_done(capsys: pytest.CaptureFixture[str]) -> None:
+    review = {3844: "## 3844. gap\n\n> IN REVIEW: engine PR 2545"}
+    shipped = {3844: "## 3844. gap\n\n> SHIPPED by engine PR 2545"}
+    ledger = FakeLedger(
+        [("2026-10-20T00:00:00Z", "a" * 40, review), ("2026-10-28T10:00:00Z", "b" * 40, shipped)]
+    )
+    assert "nothing owed" in _run(
+        _one("For the Lander: flip #3844."), ledger, capsys, "--repo", ENGINE
+    )
+
+
+def test_a_later_acknowledgement_does_not_reopen_the_act(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    comments = [
+        _comment("For the Lander: please flip #3844.", "2026-10-27T06:00:00Z"),
+        _comment("Lander: flipped #3844 in vault PR 2730; done.", "2026-10-28T11:00:00Z"),
+    ]
+    prs = {ENGINE: [_pr(2545, "2026-10-27T04:55:16Z", comments)]}
+    shipped = {3844: "## 3844. gap\n\n> SHIPPED by engine PR 2545"}
+    ledger = _ledger_433(("2026-10-28T10:00:00Z", "b" * 40, shipped))
+    assert "nothing owed" in _run(prs, ledger, capsys, "--repo", ENGINE)
+
+
+def test_plural_pr_citations() -> None:
+    assert oa.cited_prs("engine PRs 2545 and 2546") == [(ENGINE, 2545), (ENGINE, 2546)]
+    assert oa.cited_prs("PR 1, 2 and 3") == [(ENGINE, 1), (ENGINE, 2), (ENGINE, 3)]
+    assert oa.row_refs("flip #3844 (engine PRs #2545 and #2546)") == [3844]
+
+
+def test_prose_row_word_and_split_sentences(capsys: pytest.CaptureFixture[str]) -> None:
+    title = "Fix it (BACKLOG #1611)"
+    assert oa.parse_prose("For the Lander: please flip row 3844.", title)[0] == (3844,)
+    assert oa.parse_prose("Lander: BACKLOG #3844 ships here. Please flip it.", title)[0] == (3844,)
+
+
+def test_a_reminder_does_not_shrink_a_marker_file_count(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    comments = [
+        _comment("<!-- lander-ledger-ask file=2 -->", "2026-10-27T06:00:00Z"),
+        _comment("Lander: reminder, please file the rows for this PR.", "2026-10-27T08:00:00Z"),
+    ]
+    prs = {ENGINE: [_pr(2545, "2026-10-27T04:55:16Z", comments)]}
+    one = {3844: OPEN_3844, 4800: "## 4800. f\n\n> Filed from engine PR 2545."}
+    ledger = _ledger_433(("2026-10-27T07:00:00Z", "b" * 40, one))
+    out = _run(prs, ledger, capsys, "--repo", ENGINE)
+    assert "file 2 row(s)" in out and "OWED" in out
+
+
+@pytest.mark.parametrize(
+    "body", ["Lander b58f86: flip #3844 is owed.", "Lander (local_7289): flip #3844 is owed."]
+)
+def test_the_landers_own_prefixes_are_skipped(body: str) -> None:
+    assert oa.parse_prose(body) is None
