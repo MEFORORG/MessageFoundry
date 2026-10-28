@@ -4,7 +4,9 @@
 // wizard (connectionQuickInput.ts) is a keyboard-first alternative to the connectionEditor webview
 // form; both write via the SAME `messagefoundry connection upsert` CLI. Keeping the answer→ConnObj
 // mapping, the upsert argv, the per-step validators, and the step plan here (no vscode) lets the whole
-// state machine be unit-tested node-side (the CI ide job has no Python / Extension Host).
+// state machine be unit-tested node-side (the CI ide job has no Python / Extension Host). The
+// `connection upsert|remove` argv builders here are shared with the webview form and the
+// connections.toml custom editor, so every IDE writer names the same settings file (BACKLOG #2908).
 
 import * as fs from "fs";
 import * as path from "path";
@@ -157,8 +159,10 @@ export function buildConnObj(state: WizardState): WizardConnObj {
   return conn;
 }
 
-/** The `messagefoundry.serviceConfig` default, and the file the CLI reads when no flag names one. */
-export const DEFAULT_SERVICE_CONFIG = "messagefoundry.toml";
+/** The file the CLI falls back to, in its working directory, when no `--service-config` is given
+ *  (`_DEFAULT_FILE` in messagefoundry/config/settings.py). Not the IDE setting's default, though the
+ *  two are the same name today. */
+const CLI_FALLBACK_SERVICE_CONFIG = "messagefoundry.toml";
 
 /**
  * The `--service-config` value a connection edit run in `workspace` passes, or `undefined` to leave
@@ -169,12 +173,13 @@ export const DEFAULT_SERVICE_CONFIG = "messagefoundry.toml";
  * the working directory, so a workspace whose `messagefoundry.serviceConfig` names another file
  * would be checked against the wrong settings, or none. So the setting is passed.
  *
- * One case leaves it off: the setting names the default file and that file does not exist. Passing
- * it there would make the CLI refuse every edit ("service config not found"), where leaving it off
- * reads exactly the same absent path -- the edit is checked with no instance settings, as before.
- * A non-default setting naming a missing file is still passed, so the CLI says the file is missing
- * rather than quietly checking against a `messagefoundry.toml` the setting did not name. A blank
- * setting names no file, so it leaves the flag off too.
+ * One case leaves it off: neither the file the setting names nor the CLI's fallback file exists.
+ * The CLI refuses a named file that is missing ("service config not found"), so passing the flag
+ * there would block every edit in a workspace that has no settings file yet, where leaving it off
+ * reads no file either -- the edit is checked with no instance settings, as it was before. When the
+ * named file is missing but the fallback exists, the flag is still passed, so the CLI says the
+ * named file is missing rather than quietly checking against a file the setting did not name. A
+ * blank setting names no file, so it leaves the flag off too.
  */
 export function connectionServiceConfig(
   workspace: string,
@@ -185,7 +190,8 @@ export function connectionServiceConfig(
     return undefined;
   }
   const named = path.resolve(workspace, setting);
-  if (named === path.resolve(workspace, DEFAULT_SERVICE_CONFIG) && !exists(named)) {
+  const fallback = path.resolve(workspace, CLI_FALLBACK_SERVICE_CONFIG);
+  if (!exists(named) && !exists(fallback)) {
     return undefined;
   }
   return setting;
