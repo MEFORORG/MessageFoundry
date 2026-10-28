@@ -212,7 +212,7 @@ class ReadError(RuntimeError):
 #: What building a row can raise on a reply this script did not foresee: a report defect, not a
 #: read failure. A crafted stamp raises OverflowError, an ArithmeticError, when its offset pushes
 #: it past year 1 or 9999.
-_ROW_ERRORS = (TypeError, KeyError, AttributeError, ValueError, ArithmeticError)
+_ROW_ERRORS = (TypeError, LookupError, AttributeError, ValueError, ArithmeticError)
 #: What reading one repository can raise; each becomes that repository's "read failed" row.
 _READ_ERRORS = (pr_state.PollError, pr_state.GhError, OSError, ReadError)
 
@@ -286,6 +286,10 @@ def _events(pr: dict[str, Any]) -> list[Event]:
             if when is None:
                 # Dropping it could hide a reply after the hold and park the PR on its author.
                 raise ReadError(f"a {kind[:-1]} has no readable timestamp")
+            edited = pr_state.parse_iso(node.get("lastEditedAt"))
+            if edited is None and node.get("lastEditedAt") is not None:
+                # An unreadable edit time could hide a reply-by-edit, so it is no silent None.
+                raise ReadError(f"a {kind[:-1]} has an unreadable lastEditedAt")
             author = node.get("author")
             out.append(
                 Event(
@@ -295,7 +299,7 @@ def _events(pr: dict[str, Any]) -> list[Event]:
                     trusted=not node.get("isMinimized")
                     and node.get("authorAssociation") in TRUSTED_ASSOCIATIONS,
                     dismissed=node.get("state") == "DISMISSED",
-                    edited=pr_state.parse_iso(node.get("lastEditedAt")),
+                    edited=edited,
                 )
             )
     return out
@@ -383,7 +387,7 @@ def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[s
     if pr.get("autoMergeRequest"):
         flags.append("auto-armed")
     green, verdict = _required_green(pr, head, read)
-    stamps = [e.when for e in events] + ([committed] if committed else [])
+    stamps = [e.latest for e in events] + ([committed] if committed else [])
     newest = max(stamps) if stamps else None
     age = int((now - newest).total_seconds()) if newest else None
     return {
@@ -464,10 +468,13 @@ def _take_page(read: RepoRead, conn: object) -> str | None:
     A page that cannot say whether more follow is a ReadError: a partial list must not print as
     the whole one.
     """
-    page = conn.get("pageInfo") if isinstance(conn, dict) else None
-    if not isinstance(conn, dict) or not isinstance(page, dict):
-        raise ReadError("a page has no pullRequests connection with pageInfo")
-    read.prs.extend(_nodes(conn))
+    if not (
+        isinstance(conn, dict)
+        and isinstance(page := conn.get("pageInfo"), dict)
+        and isinstance(conn.get("nodes"), list)
+    ):
+        raise ReadError("a page has no pullRequests connection with pageInfo and nodes")
+    read.prs.extend(conn["nodes"])
     if not page.get("hasNextPage"):
         return None
     cursor = page.get("endCursor")
@@ -501,9 +508,13 @@ def from_input(doc: object, repo: str) -> RepoRead:
         raise ReadError(f"the input entry for {repo} is not an object")
     if entry.get("error"):
         raise ReadError(str(entry["error"]))
+    pages = entry.get("pages")
+    if not isinstance(pages, list) or not pages:
+        # A live read always has at least one page, so none is no read, not zero PRs.
+        raise ReadError(f"the input entry for {repo} has no pages")
     read = RepoRead()
     cursor: str | None = None
-    for page in entry.get("pages") or []:
+    for page in pages:
         try:
             conn = page["data"]["repository"]["pullRequests"]
         except (KeyError, TypeError) as exc:
@@ -548,9 +559,7 @@ def render(rows: list[dict[str, Any]]) -> str:
             pr = "" if number is None else str(number)
             table.append((ERROR, "", short, pr, "", "", "", "", "", row["error"]))
             continue
-        # Anyone can title a PR on a public repository: a control or bidi character must not
-        # rewrite or forge a row on the Lander's terminal.
-        title = "".join(c if c.isprintable() else "?" for c in row["title"])
+        title = row["title"]
         if len(title) > TITLE_WIDTH:
             title = title[: TITLE_WIDTH - 3] + "..."
         table.append(
@@ -580,7 +589,12 @@ def render(rows: list[dict[str, Any]]) -> str:
             why = (row["repo"].split("/", 1)[-1], str(row["required"].get("reason")))
             unknown[why] = unknown.get(why, 0) + 1
     lines += [f"note: {repo} GREEN ? on {n} PR(s): {why}" for (repo, why), n in unknown.items()]
-    return "\n".join(line.rstrip() for line in lines)
+    # Titles and error text come from GitHub, and anyone can title a PR on a public repository:
+    # a control or bidi character must not rewrite or forge a row on the Lander's terminal. One
+    # character for one keeps the columns aligned.
+    return "\n".join(
+        "".join(c if c.isprintable() else "?" for c in line).rstrip() for line in lines
+    )
 
 
 def collect(
@@ -617,7 +631,8 @@ def main(
     unreadable: str | None = None
     if args.input is not None:
         try:
-            doc = json.loads(args.input.read_text(encoding="utf-8"))
+            # utf-8-sig: Windows PowerShell 5's Out-File writes a BOM.
+            doc = json.loads(args.input.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
             unreadable = f"input file unreadable: {exc}"
 

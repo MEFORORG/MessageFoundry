@@ -459,7 +459,19 @@ def test_reply_by_editing_an_older_comment_hands_the_turn_back(
         _pr(28, comments=[unedited, hold]),
     )
     assert _turn(rows[27]) == ("LANDER", ["replied", "no-new-commit"])
+    # The age dates from the edit, the newest thing that happened.
+    assert rows[27]["newestEvent"] == "2026-10-28T13:00:00Z"
     assert _turn(rows[28]) == ("AUTHOR", ["held"])
+
+
+def test_unreadable_edit_time_is_an_error_row_not_dropped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    edited = _comment("Manager: answered.", "2026-10-28T11:00:00Z")
+    edited["lastEditedAt"] = "garbage"
+    pr = _pr(34, comments=[edited, _hold("2026-10-28T12:00:00Z", _sha(34))])
+    row = _engine_rows(tmp_path, capsys, pr)[34]
+    assert row["turn"] == "ERROR" and "lastEditedAt" in row["error"]
 
 
 def test_non_object_comment_node_is_an_error_row_not_dropped(
@@ -707,11 +719,28 @@ def test_a_page_that_cannot_say_it_is_the_last_is_a_read_failure(
     del no_info["data"]["repository"]["pullRequests"]["pageInfo"]
     more = _page([_pr(76)])
     more["data"]["repository"]["pullRequests"]["pageInfo"] = {"hasNextPage": True, "endCursor": "c"}
-    for page in (no_info, more):
-        code, rows = _run(tmp_path, {KORUS: {"pages": [page]}}, capsys, "--repo", KORUS)
+    no_nodes = _page([])
+    del no_nodes["data"]["repository"]["pullRequests"]["nodes"]
+    entries: list[dict[str, Any]] = [
+        {"pages": [no_info]},
+        {"pages": [more]},
+        {"pages": [no_nodes]},
+        {"pages": []},
+        {"required": []},
+    ]
+    for entry in entries:
+        code, rows = _run(tmp_path, {KORUS: entry}, capsys, "--repo", KORUS)
         assert code == 0
-        assert [r["turn"] for r in rows] == ["ERROR"]
+        assert [r["turn"] for r in rows] == ["ERROR"], entry
         assert rows[0]["error"].startswith("read failed")
+
+
+def test_input_file_with_a_bom_is_read(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "bom.json"
+    doc = {KORUS: {"pages": [_page([_pr(78)])]}}
+    path.write_text(json.dumps(doc), encoding="utf-8-sig")
+    assert hpt.main(["--input", str(path), "--json", "--repo", KORUS], now=lambda: NOW) == 0
+    assert [r["number"] for r in json.loads(capsys.readouterr().out)] == [78]
 
 
 def test_title_control_characters_cannot_forge_a_row(
@@ -731,6 +760,11 @@ def test_title_control_characters_cannot_forge_a_row(
     lines = out.splitlines()
     assert len(lines) == 2
     assert all(c.isprintable() for c in lines[1])
+    # Error text from a reply is GitHub's too, and is cleaned the same way.
+    forged = {KORUS: {"error": "502" + chr(10) + "AUTHOR  held  korus  999  yes"}}
+    code, out = _run(tmp_path, forged, capsys, "--repo", KORUS, json_out=False)
+    assert code == 0
+    assert len(out.splitlines()) == 2
 
 
 def test_table_sorts_lander_first_then_oldest(
