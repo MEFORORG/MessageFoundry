@@ -2023,13 +2023,14 @@ class ExportStopped(RuntimeError):
     """A running export stopped: its caller lost standing, or its scope changed (BACKLOG #1154,
     #3381). The bulk message export and the audit export raise it.
 
-    The response has already started, so no status code can say so. The raise was meant to abort
-    the transfer, so the client would see an incomplete download rather than a short file that
-    looks complete. **It does not, on the engine as shipped (found under BACKLOG #3381, unfixed).**
-    Starlette's ``BaseHTTPMiddleware``, which each ``@app.middleware("http")`` layer is, ends the
-    response with its final body message when the inner app raises, and re-raises only after
-    that. So the client receives a cleanly ended 200 holding the rows streamed before the stop.
-    Returning without the final body message would fare no better behind those layers.
+    The response has already started, so no status code can say so. The raise aborts the transfer
+    instead: it leaves the app with the body unfinished, and the server drops the connection, so
+    the client sees a failed download (an incomplete chunked body), never a short file that looks
+    complete. That holds only while every middleware in the response path is pure ASGI. Starlette's
+    ``BaseHTTPMiddleware`` (what ``@app.middleware("http")`` builds) sends the final body message
+    before it re-raises, which turned a stop into a cleanly ended 200 until BACKLOG #3907 converted
+    the engine's two such layers. ``tests/test_export_stop_wire.py`` measures it over real uvicorn,
+    with h11 and with httptools.
 
     A stop is a decision, not a crash. The raising stream writes a WARNING with the counts and the
     stop's audit row before it raises (BACKLOG #3381), so ``_unhandled_exception`` writes no ERROR

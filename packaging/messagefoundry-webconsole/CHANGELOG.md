@@ -31,6 +31,12 @@ this line.**
 
 ### Security
 
+- **A message export the engine stops no longer reads as saved.** With an engine that ends a
+  stopped export as a failed transfer, the console's export now says it did not finish after N
+  messages, that the engine stopped it or the connection failed, and that nothing was saved. It
+  used to say "Network error during export." for any failed read. Before that engine, a stopped
+  export reached the console as a clean end, and it said "Saved N messages" over a partial file.
+  No seam change. (BACKLOG #3907)
 - **An IdP step-up's return is charged to the operator's own re-authentication budget, not the
   sign-in budget.** `GET /ui/oidc/callback` now reads the user its staged step-up flow names and
   charges a key of its own for that user in the per-actor limiter `POST /ui/reauth/oidc` already

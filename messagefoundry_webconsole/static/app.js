@@ -1508,6 +1508,7 @@
       controller = new AbortController();
       setBusy(true);
       if (progress) progress.textContent = "Starting…";
+      var lines = 0;
       try {
         var resp = await fetch(url, {
           credentials: "same-origin",
@@ -1527,7 +1528,6 @@
         var reader = resp.body.getReader();
         var chunks = [];
         var bytes = 0;
-        var lines = 0;
         for (;;) {
           var step = await reader.read();
           if (step.done) break;
@@ -1552,6 +1552,15 @@
       } catch (e) {
         if (e && e.name === "AbortError") {
           if (progress) progress.textContent = "Export stopped.";
+        } else if (progress && lines > 0) {
+          // The engine ends a download it stops mid-stream (a revoked session, a withdrawn
+          // permission, a changed channel scope) as a failed transfer, so a stop lands here, not on
+          // the "Saved" line above (BACKLOG #3907). The rows already read are not saved: a partial
+          // file must never pass for a whole export.
+          progress.textContent =
+            "Export did not finish after " +
+            lines +
+            " messages: the engine stopped it or the connection failed. Nothing was saved.";
         } else if (progress) {
           progress.textContent = "Network error during export.";
         }
