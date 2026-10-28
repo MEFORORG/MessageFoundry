@@ -818,7 +818,8 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 
 The session reconciler's `ad_reconcile_aborted` (the breaker) and `ad_reconcile_held` (the hold)
 alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). So
-does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). This
+does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). The
+lasting outage's instance resolves on its own rule, stated below the list. This
 needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
 this engine process, for every signed-in directory account it did not just revoke.
 
@@ -849,7 +850,7 @@ three on its own, until it restarts again.
   and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
   in at the last referral has since been read in full, present and enabled, on a pass with no
   referral. A pass with any referral, probe fault or configuration refusal (BACKLOG #3010)
-  resolves none of these alerts.
+  resolves none of these three alerts.
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
   held account, a disabled one awaiting its strikes, and one that never answers all do this.
 - An engine gives up resolving the referral when an account signed in at the last referral leaves
@@ -893,7 +894,10 @@ succeeds again.
 A lasting directory outage opens its own `ad_reconcile_aborted` instance, with reason
 `directory_unavailable` and source `directory-reconciler-outage` (BACKLOG #3709), once a run of
 `ad_reconcile_outage_passes` passes has read the directory unreachable. It resolves on the first
-pass that reaches the directory, if a pass of this engine process paged it. Like the others, it is
+pass that reaches the directory, if a pass of this engine process paged it. A pass of referrals or
+configuration refusals reached it; a pass whose every probe failed or faulted did not, and neither
+ends the run nor resolves it. A run pages once: an alert resolved by hand while the outage lasts
+stays resolved until a later run pages. Like the others, it is
 not resolved where the alert was already open when the process started, or where another
 reconciler may share the store; resolve those by hand.
 

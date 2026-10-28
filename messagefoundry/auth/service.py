@@ -7743,7 +7743,8 @@ class AuthService:
         each one so, a group search refused for the engine's own bound included.
 
         A pass that asked the directory anything and is not an outage reached it, even one that
-        judged nothing, such as a pass of referrals only. It ends the run, and once a run here has
+        judged nothing, such as a pass of referrals only, unless every probe failed or faulted
+        (``plan.probe_fault``), which leaves the run as it stands. It ends the run, and once a run here has
         paged it marks ``outage_clear`` on every such pass, as the other clears are raised, so a
         resolve that failed is retried. A pass that asked nothing, with nobody signed in or only
         id-less rows, learned nothing about the directory and leaves the run as it stands.
@@ -7759,7 +7760,10 @@ class AuthService:
                 and self._reconcile_outage_passes >= self._settings.ad_reconcile_outage_passes
             )
             return replace(plan, outage_passes=self._reconcile_outage_passes, outage_page=page)
-        if plan.asked == 0:
+        if plan.asked == 0 or plan.probe_fault:
+            # Nothing was asked, or every probe asked failed or faulted: a fault the engine could
+            # not read says nothing about whether the directory was reached, so it neither ends
+            # nor extends the run.
             return replace(plan, outage_passes=self._reconcile_outage_passes)
         if self._reconcile_outage_run_paged:
             _log.warning(
@@ -8046,7 +8050,6 @@ class AuthService:
                 await self._record_reconcile_fault(plan)
             # Vault BACKLOG #3696. On every abort, an outage-shaped one included, as its page is.
             await self._record_paging_refusals(plan)
-            self._latch_outage_page(plan)  # BACKLOG #3709. After the outage's skipped row.
             if not plan.judged_nothing:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
                 # item 9). A pass that judged nothing (an outage, or one whose every answer went
@@ -8054,6 +8057,8 @@ class AuthService:
                 await self._record_reconcile_hold(plan)
                 plan = self._mark_reconcile_clears(plan, users)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
+            # BACKLOG #3709. Last, so any pass that raises before it leaves the next one to page.
+            self._latch_outage_page(plan)
             return plan
 
         self._reconcile_alert = None

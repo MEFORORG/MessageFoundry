@@ -648,7 +648,9 @@ class AlertSink(Protocol):
         (``AuthService._mark_reconcile_clears`` states the test). Emits **no** notification; when
         alert-state is wired (ADR 0044) it auto-resolves the open ``ad_reconcile_aborted`` instance
         for the same ``name``: ``"directory-reconciler"`` for the breaker's instance, and
-        ``"directory-reconciler-referral"`` for the referral's. Raised on every such pass, except where
+        ``"directory-reconciler-referral"`` for the referral's, and ``"directory-reconciler-outage"``
+        for a lasting outage's, on a pass that reached the directory after a run that paged
+        (``AuthService._note_directory_outage``, BACKLOG #3709). Raised on every such pass, except where
         ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
         ``[cluster]`` node or in an engine that runs more than one engine shard
         (``api/app.py::_without_clears`` says why), and while the open instance is one an earlier
@@ -1214,7 +1216,8 @@ class LoggingAlertSink:
 
     def ad_reconcile_breaker_cleared(self, name: str) -> None:
         # The inverse (auto-resolve) event, raised on every clear pass; no page, so DEBUG.
-        # The referral's source label raises it too, once no referral stands (BACKLOG #2538).
+        # The referral's source label raises it too, once no referral stands (BACKLOG #2538), and
+        # the outage's, on a reach after a run that paged (BACKLOG #3709).
         log.debug("ALERT ad_reconcile_breaker_cleared: %r found its condition clear", name)
 
     def ad_reconcile_hold_released(self, name: str) -> None:

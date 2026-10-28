@@ -10491,10 +10491,11 @@ _PAGING_ALERT_SOURCE = "directory-reconciler-paging"
 #: #3709), apart from the others for the same reasons.
 _OUTAGE_ALERT_SOURCE = "directory-reconciler-outage"
 #: What the lasting outage tells the operator. Short, for the store's 200-character reason, and
-#: about probes rather than the network: a group search past the engine's own bound reads the same.
+#: about probes rather than the network: a group search past the engine's own bound reads the same,
+#: and a disable still revokes that account on a pass that reaches its user search.
 _OUTAGE_ALERT_TEXT: Final[str] = (
-    "No directory probe succeeded in {passes} reconcile passes running, so no directory disable or "
-    "deletion ends a session. Check the directory and the path to it."
+    "No directory probe succeeded in {passes} reconcile passes running, so the reconciler revoked "
+    "nothing. Check the directory, the path to it, and any group-search paging alert."
 )
 #: What each paging refusal cause tells the operator. Short, and the consequence first, because
 #: the store keeps only the first 200 characters of an instance's reason; the account is in the

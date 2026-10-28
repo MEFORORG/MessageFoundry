@@ -2646,6 +2646,37 @@ async def test_a_pass_of_id_less_rows_only_leaves_the_outage_run_alone() -> None
         await store.close()
 
 
+async def test_a_fault_only_pass_leaves_the_run_and_a_referral_pass_resolves_it() -> None:
+    """BACKLOG #3709. A pass whose every probe failed or faulted says nothing about whether the
+    directory was reached, so it neither ends the run nor resolves the page. A pass of referrals
+    only judged nothing, but the directory answered it, so it resolves the page.
+
+    RED when: a fault-only pass reads as a reach, or a referral-only pass does not."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for _ in range(2):
+            await _pass(service, sink)
+        assert len(_outage_events(sink)) == 1
+        ldap.unreachable = {"bob"}
+        ldap.broken = {"alice": ValueError("synthetic: unreadable entry")}
+        faulted = await _pass(service, sink)
+        assert faulted.probe_fault and faulted.outage_passes == 2 and not faulted.outage_clear
+        ldap.unreachable, ldap.broken = set(), {}
+        ldap.referring = {"alice", "bob"}
+        referred = await _pass(service, sink)
+        assert referred.directory_referral and referred.outage_clear
+        assert _outage_events(sink)[-1] == (
+            "ad_reconcile_breaker_cleared",
+            _OUTAGE_ALERT_SOURCE,
+            {},
+        )
+    finally:
+        await store.close()
+
+
 async def test_a_threshold_pass_that_raises_pages_on_the_next_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
