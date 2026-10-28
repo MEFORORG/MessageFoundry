@@ -901,8 +901,9 @@ out of the next pass's brief.
 
 [`scripts/coord/owed_ledger_acts.py`](../scripts/coord/owed_ledger_acts.py) reads the comments on
 pull requests merged in a window (engine and korus by default) and, through `git` only, a vault
-checkout's ledger at `origin/main`. It prints each ask the ledger has not acted on: `OWED`,
-`MISSING` (the row is in neither ledger file) or `READ` (prose it could not parse). When an ask
+checkout's ledger at `origin/main`, as text: it runs no code the vault holds. It prints each ask
+the ledger has not acted on: `OWED`, `MISSING` (the row is in neither ledger file) or `READ` (prose
+or a marker it could not parse). Its rules lean toward printing an ask that may be done. When an ask
 counts as done is stated once, in the script's docstring. A failed read prints an `ERROR` line and
 exits 0, never an empty report; only a bad command line exits non-zero. It does not fetch, so fetch
 the vault first if its `origin/main` is old; the header prints the ref's date.
@@ -918,8 +919,10 @@ prose, even when it also sends mail:
     <!-- lander-ledger-ask rows=#3844,#3025 file=2 -->
 
 `rows` names rows whose banner is owed; `file` counts new rows to file. Either may be left out.
-Without the marker the report falls back to a loose prose read that over-reports. It cannot see an
-ask sent only by mail, or one in an inline review comment. Tests:
+A marker inside backticks, a fenced block or a quoted line is an example and is not read. Without
+the marker the report falls back to a loose prose read. That read errs toward over-reporting, but
+it can still miss an ask worded in a way it does not know. It cannot see at least an ask sent only
+by mail, or one in an inline review comment. Tests:
 [`tests/test_owed_ledger_acts.py`](../tests/test_owed_ledger_acts.py).
 
 ## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`
