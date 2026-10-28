@@ -39,7 +39,7 @@ from messagefoundry.remotedebug import (
 #
 # `_serve` and `_supervise` still make the same call first. Their comments describe the window
 # as it was before this call existed; with this one in place theirs normally adds nothing.
-# `install_remote_debug_guard` says when a later call adds a copy, including this one run again.
+# `install_remote_debug_guard` says why a later call adds no second copy, this one run again too.
 install_remote_debug_guard()
 
 # PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that

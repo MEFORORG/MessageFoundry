@@ -3803,7 +3803,8 @@ def create_app(
     # gets the remote-debugging hook here, rather than late or never. It goes in after the API's
     # imports, so a script injected while they load still runs. Installing at import would put a
     # permanent audit hook in every process that imports the package, which this does not.
-    # messagefoundry/remotedebug.py says what the hook does and when a repeat call adds a copy.
+    # messagefoundry/remotedebug.py says what the hook does, and why a repeat call adds no copy and
+    # no second unraisable-hook wrapper (the Lander's finding 2 on engine PR 2573).
     install_remote_debug_guard()
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
     # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.

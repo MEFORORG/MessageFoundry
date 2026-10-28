@@ -16,7 +16,8 @@ unless ``PYTHON_DISABLE_REMOTE_DEBUG=1`` is set.
 
 **What this does.** Before it runs an injected script, the target interpreter raises the audit
 event ``cpython.remote_debugger_script``, and it does not run the script when an audit hook raises.
-:func:`install_remote_debug_guard` adds a hook that raises on that event and on nothing else.
+:func:`install_remote_debug_guard` adds a hook that raises on that event. The one other event it
+raises on is the add of a second copy of itself, while the install makes that add.
 :func:`remote_debug_posture` reports the interpreter setting and whether the hook answers.
 ``tests/test_remote_debug_guard.py`` injects into a real child both ways, because the behaviour is
 the interpreter's and could change under this module.
@@ -74,6 +75,10 @@ be removed, so each reading came from a child process of its own.
   not match. Each ran 9 rounds of 2,000,000 calls, so each arm has 18. With no audit hook the median was 36 ns a call (30 to 52).
   With this hook, installed as the command line installs it, it was 110 ns (91 to 133). The
   medians differ by 74 ns. An earlier reading, taken when the hook was written, was 60 to 90 ns.
+  The hook has since gained a third test for each event, the one that refuses a second copy
+  (vault BACKLOG #3673). It was not timed again in the engine. A stand-in for the hook, timed on
+  the same machine on 2026-10-28 in child processes, took about 3 ns more for each event with
+  it than without it.
 
 So on that feed, on Windows, the hook cost about 74 ns for each message. That figure is the two
 readings multiplied, not a timed message. The count belongs to that operating system as well as
@@ -163,14 +168,29 @@ _FILE_NAME_LIMIT: Final = 120
 #: refused; only its log line is dropped, so a caller that repeats cannot grow the queue.
 _REPORT_BACKLOG: Final = 64
 
+#: The audit event ``sys.addaudithook`` raises to the hooks already in, before it adds a new one.
+#: The interpreter drops the new hook, without an error, when one of them raises an Exception.
+_ADD_HOOK_EVENT: Final = "sys.addaudithook"
+
 _install_lock = threading.Lock()
 _reports: queue.SimpleQueue[str] = queue.SimpleQueue()
 _refused = 0
 _reporter_started = False
+#: The thread an install is adding the hook on, while that add runs, so a copy already in can
+#: refuse it (vault BACKLOG #3673, the Lander's finding 2). None at every other moment.
+_adding_on: int | None = None
+#: The quiet wrapper an install left on ``sys.unraisablehook``. A later install does not wrap
+#: again while it is still the hook in place.
+_quiet: Callable[[sys.UnraisableHookArgs], None] | None = None
 
 
 class RemoteScriptRefused(RuntimeError):
     """Raised inside the audit hook, which is what makes the interpreter drop the script."""
+
+
+class _SecondCopyRefused(RuntimeError):
+    """Raised by a copy of the hook already in, on the add of another copy. The interpreter
+    swallows it and drops the new copy."""
 
 
 class RemoteDebugPosture(NamedTuple):
@@ -200,6 +220,11 @@ def _guard(event: str, args: tuple[object, ...]) -> None:
         raise RemoteScriptRefused("remote debugging scripts are refused in the engine process")
     if event == _PROBE_EVENT and args and isinstance(args[0], list):
         args[0].append(True)
+    # A copy already in refuses the next one, whatever the probe could read. The thread check
+    # keeps an unrelated hook added by another thread meanwhile from being refused. The None test
+    # comes first because it is the cheapest, and the marker is None outside an install.
+    if _adding_on is not None and event == _ADD_HOOK_EVENT and _adding_on == threading.get_ident():
+        raise _SecondCopyRefused("the remote-debugging hook is already in this process")
 
 
 def _ascii(name: str) -> str:
@@ -279,9 +304,15 @@ def _after_fork_in_child() -> None:
     is new because a thread that no longer exists may have held it at the fork. The queue is new
     because the parent's reporter logs what was queued before the fork. The count starts again
     because it is this process's, and the child's refusal watch would otherwise report the
-    parent's refusals as its own."""
-    global _install_lock, _refused, _reports, _reporter_started
+    parent's refusals as its own.
+
+    The child keeps the hook list and ``sys.unraisablehook`` too, so the copy and the quiet
+    wrapper it inherited still stop a later install from adding another (vault BACKLOG #3673, the
+    Lander's finding 2). Only the marker of an add in progress is cleared: the thread that set it
+    does not exist in the child."""
+    global _adding_on, _install_lock, _refused, _reports, _reporter_started
     _install_lock = threading.Lock()
+    _adding_on = None
     _reports = queue.SimpleQueue()
     _refused = 0
     if _reporter_started:
@@ -332,7 +363,8 @@ def _guard_answers() -> bool:
 
 def install_remote_debug_guard() -> None:
     """Add the hook to this process when the interpreter accepts injected scripts and the hook
-    does not answer a probe. Behind a hook that cuts the probe off, every call adds a copy.
+    does not answer a probe. The process holds at most one copy, and at most one quiet wrapper
+    from repeated calls, whatever the probe reads (vault BACKLOG #3673, the Lander's finding 2).
 
     Call it as early in the process as possible: a script injected before the call runs. A later
     call adds nothing once the hook answers, and an audit hook cannot be removed. Each call starts
@@ -353,27 +385,24 @@ def install_remote_debug_guard() -> None:
     - It passed every hook unanswered (False): the hook is not in the list, for example because
       an audit hook added earlier raised on ``sys.addaudithook`` and the interpreter dropped the
       new hook without an error. The quiet wrapper this call put on ``sys.unraisablehook`` comes
-      off, this call starts no reporter, and the next call tries again. Nothing can stack, because
-      the hook is not in the list. A wrapper and a reporter an earlier cut-off call left stay.
+      off, this call starts no reporter, and the next call tries again. A wrapper and a reporter
+      an earlier cut-off call left stay.
     - An earlier hook raised on the probe event and cut it off (None). The hook may be in behind
       it, refusing, or that hook may also have refused the add. The quiet wrapper and the reporter
       stay, so a refusal is logged and its full path is kept off standard error. The posture reads
       the hook as missing.
 
-    Any call whose first probe does not read True adds the hook, whatever an earlier call read.
+    Any call whose first probe does not read True tries the add, whatever an earlier call read.
     That keeps the retry for an earlier hook that cuts the probe off and refused the add at
     import, but no longer refuses it by the time ``serve`` or ``supervise`` makes its own call.
-    The cost is a copy that may stack where the first add did go in behind a cut-off probe: one
-    per call made while the probe stays cut off, and nothing else bounds them. ``serve`` and
-    ``supervise`` make at least two calls, at import and then first in ``_serve`` or
-    ``_supervise``; other subcommands make the import's call. Each
-    :func:`messagefoundry.api.create_app` call makes one more, so ``serve`` makes at least
-    three. Under ``python -m``, a later import of the command-line module runs the import-time call again, as
-    ``api/tls.py`` does when it writes a key. A stacked copy changes no count: the first copy
-    raises on ``cpython.remote_debugger_script``, and the interpreter stops at the first hook
-    that raises, so a later copy never sees the event. Each copy does run on every other audited
-    event, so the per-event cost the module docstring measures is paid once per copy, and each
-    call that adds also wraps ``sys.unraisablehook`` once more.
+    It cannot stack a copy. The interpreter raises ``sys.addaudithook`` to every hook already in
+    before it adds one, and drops the new hook when any of them raises. A copy already in raises
+    there while this call's add runs, on this call's thread only. So the add goes in only where no
+    copy saw that event: none is in, or a hook ahead of it raised and dropped the add anyway. The
+    quiet wrapper is put on only where the hook in place is not the one an earlier call left, so
+    calls made while the probe stays cut off add no wrapper either. Code that replaces
+    ``sys.unraisablehook`` after an install gets one more wrapper from the next call, not one per
+    call.
 
     Where ``sys.addaudithook`` raised instead of returning, the hook is not in, so the quiet
     wrapper is put back and the next call tries again. Nothing is logged there: the command line
@@ -386,31 +415,38 @@ def install_remote_debug_guard() -> None:
     the only trace of the refusal. It carries the other hook's exception, so the quiet wrapper
     passes it on rather than hide the one record that exists.
     """
+    global _adding_on, _quiet
     if not sys.is_remote_debug_enabled():
         return
     with _install_lock:
-        # A cut-off probe adds too: the docstring says why, and what can stack.
+        # A cut-off probe tries the add too; a copy already in refuses it. The docstring says why.
         if not _guard_answers():
-            # Quiet first, so no refusal is ever reported with its full path.
+            # Quiet first, so no refusal is ever reported with its full path. Only once: a wrapper
+            # an earlier call left in place is still the one.
             previous = sys.unraisablehook
-            quiet = sys.unraisablehook = _without_own_refusals(previous)
+            wrapped = previous is not _quiet
+            if wrapped:
+                _quiet = sys.unraisablehook = _without_own_refusals(previous)
             # never-raise: a hook already installed may object to this one. The documented
             # contract is that the interpreter swallows a RuntimeError from it and passes on any
             # other exception. Measured on CPython 3.14.6, it swallows a ValueError and an
             # Exception subclass of its own too. So this catch matters only on an interpreter that
             # does what the documentation says. A BaseException such as KeyboardInterrupt still
             # leaves, with the wrapper put back.
+            _adding_on = threading.get_ident()
             try:
                 sys.addaudithook(_guard)
             except BaseException as exc:
-                if sys.unraisablehook is quiet:
+                if wrapped and sys.unraisablehook is _quiet:
                     sys.unraisablehook = previous
                 if isinstance(exc, Exception):
                     return
                 raise
+            finally:
+                _adding_on = None
             if _probe() is False:
                 # Dropped: there is nothing to report for, and nothing to quiet.
-                if sys.unraisablehook is quiet:
+                if wrapped and sys.unraisablehook is _quiet:
                     sys.unraisablehook = previous
                 return
         _ensure_reporter()

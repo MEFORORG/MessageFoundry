@@ -1876,16 +1876,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   reads it carries the count, which the first case cannot produce. The serve-time warning is
   read once, at start, so it carries a count only for a refusal before then. A count says
   the hook was in at some point, not that it still is, so read the entry as missing either way.
-  In either case a later install call adds the hook again. So a hook the other one refused at
+  In either case a later install call tries the add again. So a hook the other one refused at
   import still goes in if that hook stops refusing by the time `serve` or `supervise` makes its
-  own call. In the first case nothing stacks, because the interpreter dropped the hook. In the
-  second a copy can stack, one per install call, and nothing else bounds them. `serve` and
-  `supervise` make at least two calls, at import and then as each starts, and each build of the
-  API app makes one more. Under `python -m`, `messagefoundry/api/tls.py` imports the
-  command-line module when it writes a key, which runs the import-time call again. An
-  application makes one per call it adds. A stacked copy changes no count: the first copy refuses the script, and the
-  interpreter asks no hook after one that raised. Each copy does run on every other audited
-  event, so the hook's per-event cost is paid once per copy. Without a count,
+  own call. No copy stacks in either case, however many calls are made: a copy already in
+  refuses the add of another, and the install wraps the interpreter's unraisable hook only once
+  while its wrapper stays in place (vault BACKLOG #3673). Without a count,
   the entry cannot tell the cases apart, so read it as the first, and look for what else in the
   process adds an audit hook.
 - **An audit hook added earlier can refuse a script ahead of the engine's, in any state.** Where
