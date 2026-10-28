@@ -1249,7 +1249,9 @@ lock that wrong passwords set:
    escalate. *Amended 2026-10-28 by BACKLOG #3937 item 8:* narrowed. The lock now escalates beside a
    discoverable passkey under the configured relying party where the `[webauthn]` extra is
    installed. It still keeps the fixed length at least with no relying party configured, without
-   the extra, and where the passkey set fails its seal or a passkey row does not parse. And a
+   the extra, and where the passkey set fails its seal. A passkey set the store cannot fetch or
+   parse inside the increment escalates instead: the failure is counted, and the unreadable set
+   fails closed, toward the longer lock. And a
    holder whose only authenticator cannot store a discoverable credential cannot
    register it in wave 2, so they keep TOTP.
 4. **The handover of an issued credential.** Whoever intercepts it can claim the account. That is

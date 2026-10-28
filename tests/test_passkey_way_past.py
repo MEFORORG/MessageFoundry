@@ -13,6 +13,7 @@ here is real: the in-repo soft authenticator drives py_webauthn's own verify fun
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 import types
 from pathlib import Path
@@ -444,11 +445,13 @@ async def _passkey_owner(
     return service, identity, password, auth
 
 
-async def _corrupt_passkey_rows(store: MessageStore, user_id: str, transports: str) -> None:
+async def _corrupt_passkey_rows(store: MessageStore, user_id: str, transports: str | bytes) -> None:
     """Write a ``transports`` value into every passkey row of ``user_id`` that does not parse, as
-    a row written outside the store might hold."""
+    a row written outside the store might hold. ``bytes`` are stored as TEXT that is not UTF-8,
+    which sqlite3 cannot decode while FETCHING the row, before any parse runs."""
+    cell = "CAST(? AS TEXT)" if isinstance(transports, bytes) else "?"
     await store._db.execute(
-        "UPDATE webauthn_credentials SET transports=? WHERE user_id=?", (transports, user_id)
+        f"UPDATE webauthn_credentials SET transports={cell} WHERE user_id=?", (transports, user_id)
     )
     await store._db.commit()
 
@@ -1832,19 +1835,80 @@ _UNPARSEABLE_TRANSPORTS = ["not json", "5", '"usb"', "null", "[" * 100_000]
 
 
 @pytest.mark.parametrize(
-    "transports", _UNPARSEABLE_TRANSPORTS, ids=["text", "5", "str", "null", "deep"]
+    "transports",
+    [*_UNPARSEABLE_TRANSPORTS, b"\xff"],
+    ids=["text", "5", "str", "null", "deep", "not-utf8"],
 )
-async def test_a_passkey_row_that_does_not_parse_still_lets_the_lock_arm(transports: str) -> None:
+async def test_an_unreadable_passkey_row_counts_the_failure_and_escalates_the_lock(
+    transports: str | bytes, caplog: pytest.LogCaptureFixture
+) -> None:
     """The escalation reads the passkey set inside the count's own transaction. A row that does not
-    parse must not roll the count back, or the account would never lock: it keeps the fixed length
-    instead, and the lock arms on every cycle."""
+    parse, or one the driver cannot even fetch (``not-utf8``), must not roll the count back, or the
+    account would never lock. Every failure counts, the lock arms on every cycle, and it escalates:
+    an unreadable set is treated as escalating, the closed direction (BACKLOG #3937 item 8). A
+    warning names the account and carries none of the cell. RED when: the fetch error escapes the
+    increment, or the unreadable set keeps the fixed length."""
     store = await MessageStore.open(":memory:")
     try:
         service, identity, _, _ = await _passkey_owner(store)
         await _corrupt_passkey_rows(store, identity.user_id, transports)
-        assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
+        assert await _two_sign_in_cycles(service, identity.user_id) == 1800.0
+        warned = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelname == "WARNING" and identity.user_id in r.getMessage()
+        ]
+        assert warned, "no warning named the account"
+        assert all(m.isascii() and "json" not in m for m in warned), warned
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize(
+    ("error", "unreadable"),
+    [
+        (
+            sqlite3.OperationalError("Could not decode to UTF-8 column 'transports' with text 'x'"),
+            True,
+        ),
+        (UnicodeDecodeError("utf-16-le", b"\x00\xd8", 0, 2, "unpaired surrogate"), True),
+        (sqlite3.OperationalError("database is locked"), False),
+        (sqlite3.DatabaseError("disk I/O error"), False),
+        (RuntimeError("anything else"), False),
+    ],
+    ids=["sqlite-decode", "driver-decode", "sqlite-locked", "sqlite-io", "other"],
+)
+async def test_only_a_decode_or_parse_failure_escalates_rather_than_rolling_back(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, unreadable: bool
+) -> None:
+    """The escalation's passkey read catches only what says the SET cannot be read: a cell the
+    driver cannot decode while fetching, told apart by type or, for sqlite3, by message. Every
+    other driver error still raises and rolls the failure's write back as any write failure does,
+    rather than being swallowed into an escalation. RED when: the catch widens to every
+    ``OperationalError``, or misses the decode one."""
+    from messagefoundry.store import store as store_mod
+
+    monkeypatch.setattr(store_mod, "sets_a_later_sign_in_lock", lambda *a: True)
+
+    async def read_record() -> Any:
+        return types.SimpleNamespace(row=types.SimpleNamespace(id="u1"))
+
+    async def read_passkeys() -> list[Any]:
+        raise error
+
+    call = store_mod.escalation_passkeys(
+        "sign_in",
+        passkey_escalates=store_mod.passkey_is_way_past,
+        threshold=3,
+        now=1.0,
+        read_record=read_record,
+        read_passkeys=read_passkeys,
+    )
+    if unreadable:
+        assert await call is store_mod.UnreadablePasskeys.UNREADABLE
+    else:
+        with pytest.raises(type(error)):
+            await call
 
 
 @pytest.mark.parametrize("malformed", ["not json", "5"])

@@ -5671,7 +5671,9 @@ changed is what a campaign costs, and whom:
   escalates on such an account, as it does beside TOTP, where the passkey is under the
   configured relying party and the `[webauthn]` extra is installed (BACKLOG #3937). With no
   relying party configured it keeps the fixed
-  length, since a passkey pinned to another hostname may not sign the owner in.
+  length, since a passkey pinned to another hostname may not sign the owner in. A passkey set the
+  store cannot fetch or parse inside the failure's own increment escalates it: the failure still
+  counts, and the lock fails closed, toward the longer length.
 - **A caller holding one factor** (the password, the TOTP device, a passkey, or a directory sign-in)
   feeds the second-step counter. That lock refuses every sign-in, and on a local account it doubles per cycle
   too, because one of the owner's two factors is already lost.

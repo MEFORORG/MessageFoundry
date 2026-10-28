@@ -13,7 +13,7 @@ import asyncio
 import base64
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
@@ -902,7 +902,29 @@ async def test_lockout_store_contract(store) -> None:
     backend needs does not exist."""
     from tests._lockout_store_contract import _assert_lockout_contract
 
-    await _assert_lockout_contract(store)
+    def corrupt(cell: str) -> Callable[[str], Awaitable[None]]:
+        async def write(user_id: str) -> None:
+            async with store._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(
+                    f"UPDATE webauthn_credentials SET transports={cell} WHERE user_id=?",
+                    (user_id,),
+                )
+                await cur.close()
+                await conn.commit()
+
+        return write
+
+    await _assert_lockout_contract(
+        store,
+        corrupt_passkeys={
+            # A lone UTF-16 surrogate: the driver's decode of the NVARCHAR cell raises
+            # UnicodeDecodeError while fetching, before any parse runs. A driver that decodes it
+            # anyway hands the parse a value that is not JSON, which must escalate too.
+            "fetch": corrupt("NCHAR(55296)"),
+            "parse": corrupt("N'not json'"),
+        },
+    )
 
 
 async def test_login_address_store_contract(store) -> None:

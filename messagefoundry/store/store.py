@@ -2938,6 +2938,30 @@ def sets_a_later_sign_in_lock(row: UserRecord | UserRow, threshold: int, now: fl
     return reaches >= threshold and row.lock_cycles >= 1
 
 
+class UnreadablePasskeys(Enum):
+    """What :func:`escalation_passkeys` answers for a passkey set it could not read (BACKLOG #3937
+    item 8): :func:`lockout_increment` escalates the sign-in lock on it, the closed direction."""
+
+    UNREADABLE = "unreadable"
+
+
+#: The prefix of the ``sqlite3.OperationalError`` the stdlib raises for a TEXT cell it cannot
+#: decode while fetching a row (CPython ``Modules/_sqlite/cursor.c``). The rest of the message
+#: quotes the cell, so it is matched and never logged.
+_SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
+
+
+def _unreadable_passkey_set(exc: Exception) -> bool:
+    """Whether ``exc``, raised by a backend's passkey read, says the set cannot be read rather than
+    that the read itself failed: a row that does not parse (:class:`PasskeyRowMalformed`), or a
+    cell the driver cannot decode while fetching, before any row is parsed. At least two drivers
+    raise the second differently: sqlite3 an ``OperationalError`` told apart only by its message,
+    asyncpg and pyodbc a ``UnicodeDecodeError``. Any other driver error is not this."""
+    if isinstance(exc, sqlite3.OperationalError):
+        return str(exc).startswith(_SQLITE_DECODE_FAILURE)
+    return isinstance(exc, (PasskeyRowMalformed, UnicodeDecodeError))
+
+
 async def escalation_passkeys(
     counter: LockoutCounter,
     *,
@@ -2946,7 +2970,7 @@ async def escalation_passkeys(
     now: float,
     read_record: Callable[[], Awaitable[UserAuthzRecord | None]],
     read_passkeys: Callable[[], Awaitable[list[WebAuthnCredential]]],
-) -> list[WebAuthnCredential] | None:
+) -> list[WebAuthnCredential] | Literal[UnreadablePasskeys.UNREADABLE] | None:
     """The passkey set a SIGN-IN failure's escalation reads (BACKLOG #3937 item 8), or ``None``
     where it cannot matter. Every backend calls it inside the increment's own transaction:
     ``read_record`` locks the account row there (the writer lock on SQLite, ``FOR UPDATE``,
@@ -2954,11 +2978,11 @@ async def escalation_passkeys(
     ``read_passkeys`` run, so a racing failure cannot make the gate stale, a passkey write waits,
     and a wrong password below the threshold costs no passkey read.
 
-    A passkey row that does not parse answers ``None``, logged: the lock then keeps the fixed
-    length, and the count still lands. Raising here would roll the count back, and a malformed row
-    would then stop the account ever locking. ``ValueError`` is caught beside
-    :class:`PasskeyRowMalformed` for a value the driver cannot decode while fetching, before any
-    row is parsed (a ``UnicodeDecodeError`` on SQL Server)."""
+    A set that cannot be read (:func:`_unreadable_passkey_set`) answers
+    :attr:`UnreadablePasskeys.UNREADABLE`, logged, and the lock escalates on it. Raising here would
+    roll the count back, and the account would then never lock; the fixed length would let a
+    corrupt row shorten the lock. Any other error is raised, and rolls the write back as it would
+    anywhere else."""
     if counter != "sign_in" or passkey_escalates is None:
         return None
     record = await read_record()
@@ -2966,13 +2990,16 @@ async def escalation_passkeys(
         return None
     try:
         return await read_passkeys()
-    except (PasskeyRowMalformed, ValueError) as exc:
+    except Exception as exc:
+        if not _unreadable_passkey_set(exc):
+            raise
+        # The class name only: a decode error's message and arguments quote the cell.
         log.warning(
-            "a passkey row of user %s did not parse (%s); its sign-in lock keeps its fixed length",
+            "the passkeys of user %s could not be read (%s); its sign-in lock escalates",
             record.row.id,
             type(exc).__name__,
         )
-        return None
+        return UnreadablePasskeys.UNREADABLE
 
 
 @dataclass(frozen=True)
@@ -3147,7 +3174,7 @@ def lockout_increment(
     now: float,
     out: list[LockoutIncrement],
     totp_counts: TotpCounts | None = None,
-    passkeys: Sequence[WebAuthnCredential] | None = None,
+    passkeys: Sequence[WebAuthnCredential] | Literal[UnreadablePasskeys.UNREADABLE] | None = None,
     sealed: bool = False,
     passkey_escalates: PasskeyCounts | None = None,
 ) -> UserChange:
@@ -3162,16 +3189,17 @@ def lockout_increment(
     write, hold one that ``passkey_escalates`` counts (:func:`discoverable_way_past`, trusted only
     where it matches the locked row's digest on a ``sealed`` store; BACKLOG #3937 item 8). The
     backend reads the set only where :func:`escalation_passkeys` says it can matter, and passes
-    ``None`` otherwise; ``None`` for either counts no passkey, the fixed length callers had before."""
+    ``None`` otherwise; ``None`` for either counts no passkey, the fixed length callers had before.
+    A set that could not be read (:attr:`UnreadablePasskeys.UNREADABLE`) escalates."""
     attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
 
     def passkey_way_past(r: UserAuthzRecord) -> bool:
-        return (
-            passkeys is not None
-            and passkey_escalates is not None
-            and discoverable_way_past(
-                passkeys, r.row.cred_digest, sealed=sealed, passkey_counts=passkey_escalates
-            )
+        if passkeys is None or passkey_escalates is None:
+            return False
+        if passkeys is UnreadablePasskeys.UNREADABLE:
+            return True
+        return discoverable_way_past(
+            passkeys, r.row.cred_digest, sealed=sealed, passkey_counts=passkey_escalates
         )
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord:
