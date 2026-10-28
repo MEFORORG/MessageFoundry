@@ -6134,13 +6134,13 @@ states only what it leaves a `logs:view` or `monitoring:read` reader without `us
 `queued` on `GET /status` counts the general lane only, so it does not move with audit rows while
 the general lane is full; a depth over both lanes would have risen by one per row. **Not closed
 either:** while the general lane is draining but not full, audit lines are served ahead of it, so
-each audit row can delay one general line and `queued` can still drift with the audit-row rate. The drop warning,
-which `GET /logs/tail` serves, is written at most once per `_FORWARD_DROP_REPORT_INTERVAL`, so a
-warning naming the audit lane tells its reader that an audit row was written in that window.
-**Not closed:** the drop counts on `GET /status`, in the warning and in the `log_forward_failed`
-alert include dropped audit tee lines, as the single queue's did. While only the audit lane drops,
-they rise by one per audit row written. The alert's `audit_queue_full` reason word, which is new,
-and the warning's lane name say when that is so.
+each audit row can delay one general line and `queued` can still drift with the audit-row rate.
+The drop warning, which `GET /logs/tail` serves, and the `log_forward_failed` alert never say which
+lane dropped; what they carry is stated once, in CONFIGURATION.md under `[logging]`.
+**Not closed:** the drop counts on `GET /status`, in the warning and in the alert include dropped
+audit tee lines, as the single queue's did. While only the audit lane drops, they rise by one per
+audit row written, and a reader who sees `queue_dropped` rise while `queued` sits below the general
+lane's capacity can infer that the audit lane is the one dropping.
 
 **A notice the relay loses is audited (BACKLOG #2383).** The `auth.lock_notice` row is written
 when the notice is handed to the relay. It reads `mailed: true` only when the relay queued the

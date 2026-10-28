@@ -316,9 +316,11 @@ def test_a_rising_drop_count_raises_the_alert_with_no_record_text() -> None:
     assert "DOE" not in repr(sink.forward_failures) and "PID" not in repr(sink.forward_failures)
 
 
-def test_a_full_audit_lane_raises_the_alert_beside_queue_full() -> None:
-    """An audit tee line dropped for a full audit lane is a queue drop, and it is named on its own
-    (BACKLOG #2612). It is counted once in ``lost``: the audit count is a part of ``queue_dropped``."""
+def test_a_full_audit_lane_raises_the_dropping_alert_as_queue_full() -> None:
+    """An audit tee line dropped for a full audit lane raises the ``dropping`` alert, with the same
+    ``queue_full`` reason a general drop raises (BACKLOG #2612). No reason word names the audit
+    lane: the alert's reader may hold ``logs:view`` alone, and a word that rose only on audit
+    drops would tell it an audit row was written (BACKLOG #1131)."""
     handler, _ = _attach(_Collector(), audit_maxsize=1)
     sink = _RecordingSink()
     watch, _ = _watch(sink)
@@ -328,23 +330,22 @@ def test_a_full_audit_lane_raises_the_alert_beside_queue_full() -> None:
             logging.LogRecord(AUDIT_LOGGER_NAME, logging.INFO, __file__, 1, "{}", None, None)
         )
     status = forwarder_status()
-    assert status.audit_queue_dropped == handler.audit_dropped == 2
     # The drop warning is a general record, and the general lane had room for it.
     assert status.queue_dropped == status.lost == 2
     assert status.state == "degraded"
     watch.run_once()
-    assert sink.forward_failures == [("forwarder:dropping", "queue_full,audit_queue_full", 2)]
+    assert sink.forward_failures == [("forwarder:dropping", "queue_full", 2)]
+    assert "audit" not in repr(sink.forward_failures)
 
 
-def test_a_general_drop_does_not_name_the_audit_lane() -> None:
+def test_a_general_drop_raises_the_same_reason_as_an_audit_drop() -> None:
     """The control for the test above: a general record dropped while the audit lane has room
-    raises ``queue_full`` alone."""
+    raises ``queue_full``, the same reason, so the reason cannot tell the lanes apart."""
     handler, _ = _attach(_Collector(), maxsize=1, audit_maxsize=1)
     sink = _RecordingSink()
     watch, _ = _watch(sink)
     for _ in range(3):
         handler.handle(_record(SYNTHETIC_RECORD))
-    assert handler.audit_dropped == 0
     watch.run_once()
     assert [(name, reason) for name, reason, _ in sink.forward_failures] == [
         ("forwarder:dropping", "queue_full")
@@ -373,7 +374,6 @@ def test_queued_does_not_move_with_audit_rows_while_the_general_lane_is_full() -
     health = _log_forwarder_health()
     assert after.queued == before.queued and health is not None and health.queued == before.queued
     assert handler._records.qsize() == 3 + n  # the control: the audit lane holds every line
-    assert after.audit_queue_dropped == 0
 
 
 def test_a_healthy_forwarder_raises_nothing() -> None:

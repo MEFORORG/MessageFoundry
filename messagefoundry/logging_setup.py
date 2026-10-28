@@ -99,7 +99,6 @@ __all__ = [
     "SyslogForward",
     "ForwarderStatus",
     "FORWARD_LOSS_COUNTERS",
-    "FORWARD_LOSS_PARTS",
     "AUDIT_LOGGER_NAME",
     "forwarder_status",
     "query_sntp_offset",
@@ -1412,14 +1411,15 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         #: Cleared by :meth:`close` so producers stop refilling and the drain can terminate.
         self._accepting = True
         self._stopped = False
-        self._counter_lock = threading.Lock()
+        #: Re-entrant (BACKLOG #2612): a signal handler or a finalizer can run on a thread that
+        #: already holds it, inside :meth:`_count_drop`, and log a record that is dropped in turn.
+        #: A plain lock would deadlock that thread on itself. The nested count can land between
+        #: the outer read of the batch and its reset, and is then left out of the next batch
+        #: report; :attr:`dropped` still counts it.
+        self._counter_lock = threading.RLock()
         #: Records dropped for a full queue over the life of this handler. Read it for posture.
         self.dropped = 0
-        #: The audit tee lines among :attr:`dropped`: their lane was full (BACKLOG #2612).
-        self.audit_dropped = 0
         self._dropped_since_report = 0
-        #: :attr:`audit_dropped` as of the last drop report.
-        self._audit_dropped_reported = 0
         self._last_drop_report: float | None = None
         #: Re-entrancy guard: the drop report is a log record that reaches this handler.
         self._reporting = threading.local()
@@ -1443,25 +1443,24 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         the report is itself a log record arriving at this same full queue.
 
         An audit tee line has its own lane (:class:`_ForwardLanes`), so it is dropped only when that
-        lane is full, and the drop is counted in :attr:`audit_dropped` as well."""
+        lane is full. Its drop is counted and reported exactly as a general record's is, and the
+        report reads the same whichever lane dropped (BACKLOG #1131)."""
         if not self._accepting:
             if getattr(self._reporting, "active", False):
                 # close()'s own report, arriving at the handler it is closing. It was never going
                 # to the collector, and counting it would log a false "queue is full" drop.
                 return
-            self._count_drop(audit=_is_audit_record(record))
+            self._count_drop()
             return
         try:
             self.queue.put_nowait(record)
         except queue.Full:
-            self._count_drop(audit=_is_audit_record(record))
+            self._count_drop()
 
-    def _count_drop(self, *, audit: bool = False) -> None:
+    def _count_drop(self) -> None:
         with self._counter_lock:
             self.dropped += 1
             self._dropped_since_report += 1
-            if audit:
-                self.audit_dropped += 1
             if getattr(self._reporting, "active", False):
                 # We ARE the report. Counting is all we may do here; warning again would recurse.
                 return
@@ -1471,41 +1470,25 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
                 return
             self._last_drop_report = now
             batch, total = self._dropped_since_report, self.dropped
-            audit_total = self.audit_dropped
-            audit_batch, self._audit_dropped_reported = (
-                audit_total - self._audit_dropped_reported,
-                audit_total,
-            )
             self._dropped_since_report = 0
-        # The line names the lane or lanes that dropped, with no separate number per lane (BACKLOG
-        # #1131): the audit count is the audit rows written, the hidden lock rows included, and this
-        # line reaches ``GET /logs/tail``. The batch and the total stay combined, as
-        # ``queue_dropped`` on ``GET /status`` is. So when only the audit lane dropped, they ARE the
-        # audit count, and the lane name says so. docs/SECURITY.md records that as not closed.
+        records = self._records
+        depth = records.lane_maxsize if isinstance(records, _ForwardLanes) else records.maxsize
+        # The line never says which lane dropped (BACKLOG #1131): it reaches ``GET /logs/tail``,
+        # and naming the audit lane would tell that reader an audit row was written in the window.
+        # The counts stay combined over both lanes, as ``queue_dropped`` on ``GET /status`` is,
+        # and the one depth figure is the general lane's whichever lane dropped.
         self._reporting.active = True
         try:
             _log.warning(
-                "off-box log forwarding dropped %d record(s): the hand-off queue is full (%s) "
+                "off-box log forwarding dropped %d record(s): the hand-off queue is full (depth %d) "
                 "because the collector is not draining it; %d dropped since this process started. "
                 "Evidence for this window does not reach the collector.",
                 batch,
-                self._full_lanes(batch, audit_batch),
+                depth,
                 total,
             )
         finally:
             self._reporting.active = False
-
-    def _full_lanes(self, batch: int, audit_batch: int) -> str:
-        """Name the lanes a drop report's batch dropped from, with each one's depth."""
-        records = self._records
-        if not isinstance(records, _ForwardLanes):
-            return f"depth {records.maxsize}"
-        lanes = []
-        if batch > audit_batch:
-            lanes.append(f"general lane, depth {records.lane_maxsize}")
-        if audit_batch:
-            lanes.append(f"audit lane, depth {records.audit_maxsize}")
-        return "; ".join(lanes)
 
     def close(self) -> None:
         """Stop accepting, drain what is queued within :data:`_FORWARD_DRAIN_TIMEOUT`, then close the
@@ -1672,11 +1655,6 @@ FORWARD_LOSS_COUNTERS = (
     ("spool_skipped", "spool_damaged"),
 )
 
-#: Counts that are a PART of a loss counter above, each with its own fixed word (BACKLOG #2612).
-#: :attr:`ForwarderStatus.lost` does not add these, or it would count each such record twice; the
-#: watch names each one that rose beside the counter it is part of.
-FORWARD_LOSS_PARTS = (("audit_queue_dropped", "audit_queue_full"),)
-
 
 @dataclass(frozen=True, slots=True)
 class ForwarderStatus:
@@ -1710,10 +1688,9 @@ class ForwarderStatus:
     #: Audit tee lines on their own lane are not in it (BACKLOG #2612), and neither are records
     #: waiting in the on-disk spool; no field here counts either.
     queued: int = 0
-    #: Records dropped because their lane of the hand-off queue was full, both lanes counted.
+    #: Records dropped because their lane of the hand-off queue was full, both lanes counted
+    #: together. No field says which lane dropped (BACKLOG #2612, #1131).
     queue_dropped: int = 0
-    #: The audit tee lines among :attr:`queue_dropped`: the audit lane was full (BACKLOG #2612).
-    audit_queue_dropped: int = 0
     #: Records a network error cost, with no spool to keep them.
     unsent: int = 0
     #: Records dropped for a send error that was not a network error.
@@ -1754,9 +1731,8 @@ def forwarder_status() -> ForwarderStatus:
     """Read the forwarder's health from memory. It touches no socket and no disk, so it is safe on
     the event loop and still answers when the collector does not.
 
-    The counters belong to other threads. Each is one integer that only goes up, so a reading is
-    at worst one record behind. The two drop counters are the exception and are read together
-    under their lock, so the audit part can never read ahead of the total it is part of."""
+    The counters belong to other threads and are read without their locks. Each is one integer
+    that only goes up, so a reading is at worst one record behind."""
     configured, start_failure = _forward_configured, _forward_start_failure
     confirmed = _forward_delivery_confirmed
     for handler in logging.getLogger().handlers:
@@ -1775,9 +1751,6 @@ def forwarder_status() -> ForwarderStatus:
             configured=True, start_failure=start_failure, delivery_confirmed=confirmed
         )
     spool = listener.spool
-    # One read under the lock _count_drop holds, so the audit part never reads ahead of its total.
-    with handler._counter_lock:
-        queue_dropped, audit_queue_dropped = handler.dropped, handler.audit_dropped
     # The general lane only (BACKLOG #2612, #1131). While that lane is full, general records are
     # dropped and cannot move a depth, so a depth that counted the audit lane would rise by one per
     # audit row written, the hidden lock rows included. A full single queue before #2612 did not.
@@ -1790,8 +1763,7 @@ def forwarder_status() -> ForwarderStatus:
         send_failing=listener.send_failing,
         send_failures=listener.send_failures,
         queued=queued,
-        queue_dropped=queue_dropped,
-        audit_queue_dropped=audit_queue_dropped,
+        queue_dropped=handler.dropped,
         unsent=listener.unsent,
         undeliverable=listener.undeliverable,
         spool_dropped=spool.dropped if spool is not None else 0,

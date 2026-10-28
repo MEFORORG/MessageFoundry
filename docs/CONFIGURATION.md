@@ -1025,8 +1025,7 @@ about a missing or failing forwarder two ways (BACKLOG #2612).
     the cause, then restart the engine.
   - `dropping`: a loss count rose. The reason names which. `count` is `lost` from the status
     field below: the records the engine has counted as lost since the process started. It is a
-    floor, because some losses are not counted. An audit tee line dropped because the audit
-    lane was full adds `audit_queue_full` to the reason, as well as `queue_full`.
+    floor, because some losses are not counted.
   - `spool_unreadable`: a read of the on-disk spool failed. The spool keeps its records, and
     they are not sent until a read succeeds.
   - `not_sending`: every check for five minutes found `send_failing` true, and a send has
@@ -1082,13 +1081,14 @@ to four in a row while a general line waits, so an audit line can reach the coll
 general line logged before it. The line's own time stamp has whole seconds only, so it cannot restore the
 order of two lines logged in the same second; an audit line's JSON body carries a `ts` with
 fractions of a second, and a general line has nothing like it. `queue_dropped` counts drops from
-both lanes, and `lost` counts each once. The audit lane fills on audit traffic alone, and the
-alert reason above says when it has. The drop warning in the engine log names the lane or lanes
-that dropped, with each one's capacity, and no separate count per lane. Its batch and total
-count both lanes. What these counts and `queued` tell a reader about audit rows is in
+both lanes, and `lost` counts each once. **The drop warning in the engine log and the `dropping`
+alert read the same whichever lane dropped.** The warning carries at least the combined batch,
+one capacity figure (the general lane's) and the combined total, as the single queue's did; the
+alert carries at least the `queue_full` reason and `lost`. Neither names a lane or gives a count
+for one lane alone. What these counts and `queued` tell a reader about audit rows is in
 [SECURITY.md](SECURITY.md), beside the other audit-row residuals of the log channel. No field gives the audit lane's depth. A collector
-whose sends fail shows as `send_failing` and the `degraded` state, and an audit lane that fills
-shows as the `audit_queue_full` alert reason and a rise in `queue_dropped`. A collector that is
+whose sends fail shows as `send_failing` and the `degraded` state, and a lane that fills shows as
+the `queue_full` alert reason and a rise in `queue_dropped`. A collector that is
 only slow shows in neither until a lane fills. Both lanes share one sending thread, one connection and one on-disk
 spool, so a full spool refuses audit lines as it refuses general ones.
 `GET /status` reports the process that answered.

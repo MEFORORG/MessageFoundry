@@ -1378,81 +1378,76 @@ def test_a_general_log_flood_does_not_cost_an_audit_line(
     assert audit == expected  # every audit line, once each, in the order it was logged
 
 
-def test_the_drop_report_names_the_audit_lane_when_only_it_dropped(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A count of dropped audit tee lines counts the audit rows written, the hidden lock rows
-    included, and the drop report reaches ``GET /logs/tail`` (BACKLOG #1131, #2612). The report's
-    only numbers are the combined batch, the lane depth and the combined total, which
-    ``queue_dropped`` already serves. With only the audit lane dropping they are the audit count,
-    a residual docs/SECURITY.md records as not closed; this test pins that the lane is named
-    right, not that the count is hidden."""
-    from messagefoundry.store import audit_tee
-
+def _drop_reports(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, logger_name: str
+) -> list[str]:
+    """Fill one lane of a forwarder that is not draining, and return the drop reports it logged."""
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 2)
     monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_QUEUE_MAXSIZE", 2)
     target = _CapturingHandler()
     fwd = _build_queued_forwarder(target, fmt="text")
     assert fwd._listener.stop_within(1.0)  # nothing drains, so the lane fills
+    caplog.clear()
     try:
         with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
             for i in range(7):
                 fwd.handle(
-                    logging.LogRecord(
-                        audit_tee.audit_logger.name,
-                        logging.INFO,
-                        __file__,
-                        1,
-                        f"row {i}",
-                        None,
-                        None,
-                    )
+                    logging.LogRecord(logger_name, logging.INFO, __file__, 1, f"r{i}", None, None)
                 )
     finally:
         fwd.close()
-    assert fwd.audit_dropped == 5 and fwd.dropped == 5  # counted for the status surface
-    reports = [r.getMessage() for r in caplog.records if "hand-off queue is full" in r.getMessage()]
-    assert len(reports) == 1, reports
-    # Only the audit lane dropped, so the report names it and its depth, and not the general lane.
-    assert "(audit lane, depth 2)" in reports[0], reports[0]
-    assert "general lane" not in reports[0], reports[0]
-    assert re.findall(r"\d+", reports[0]) == ["1", "2", "1"], reports[0]
+    assert fwd.dropped == 5  # the two that fit, then five drops, whichever lane
+    return [r.getMessage() for r in caplog.records if "hand-off queue is full" in r.getMessage()]
 
 
-def test_the_drop_report_names_both_lanes_when_both_dropped(
+def test_the_drop_report_reads_the_same_whichever_lane_dropped(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A report whose batch holds drops from both lanes names both, with each depth, and still
-    gives one combined batch and total (BACKLOG #1131, #2612)."""
+    """The drop report reaches ``GET /logs/tail``, so it must not say which lane dropped: naming the
+    audit lane would tell that reader an audit row was written in the window (BACKLOG #1131,
+    #2612). An audit-only drop and a general-only drop of the same size log the same text, with
+    the combined counts and the one depth figure the single queue printed."""
     from messagefoundry.store import audit_tee
 
-    def send(name: str, msg: str) -> None:
-        fwd.handle(logging.LogRecord(name, logging.INFO, __file__, 1, msg, None, None))
+    audit = _drop_reports(monkeypatch, caplog, audit_tee.audit_logger.name)
+    general = _drop_reports(monkeypatch, caplog, "mefor.test")
+    assert len(audit) == 1, audit
+    assert audit == general  # the control is the general lane: same text, so no lane signal
+    assert "lane" not in audit[0].lower() and "audit" not in audit[0].lower(), audit[0]
+    assert re.findall(r"\d+", audit[0]) == ["1", "2", "1"], audit[0]
 
-    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 3)
-    monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_QUEUE_MAXSIZE", 2)
-    target = _CapturingHandler()
-    fwd = _build_queued_forwarder(target, fmt="text")
-    assert fwd._listener.stop_within(1.0)
-    try:
-        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
-            for i in range(4):  # the fourth general record is the first drop, and reports
-                send("mefor.test", f"g{i}")
-            for i in range(3):  # the third is dropped and held for the next report
-                send(audit_tee.audit_logger.name, f"a{i}")
-            send("mefor.test", "g4")
-            monkeypatch.setattr(logging_setup, "_FORWARD_DROP_REPORT_INTERVAL", 0.0)
-            send("mefor.test", "g5")
-    finally:
+
+def test_a_drop_counted_by_the_thread_already_holding_the_counter_lock_does_not_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal handler or a finalizer can log on a thread that is inside ``_count_drop`` and so
+    holds the counter lock. When that record is dropped too, the drop is counted under the same
+    lock on the same thread (BACKLOG #2612). A plain lock deadlocks the thread on itself; the
+    control is that the lock is held at all, so the nested count really re-enters it."""
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 1)
+    fwd = _build_queued_forwarder(_CapturingHandler(), fmt="text")
+    assert fwd._listener.stop_within(1.0)  # nothing drains, so the lane stays full
+    record = logging.LogRecord("mefor.test", logging.INFO, __file__, 1, "x", None, None)
+    fwd.handle(record)  # fills the lane
+    held: list[bool] = []
+
+    def reenter() -> None:
+        with fwd._counter_lock:
+            held.append(True)
+            fwd.handle(record)  # dropped, so counted under the lock this thread holds
+
+    worker = threading.Thread(target=reenter, daemon=True)
+    worker.start()
+    worker.join(5.0)
+    if worker.is_alive():
+        # The stuck worker holds the lock for good, and close() and the interpreter's logging
+        # shutdown would both block on it. A fresh lock lets the run fail rather than hang.
+        fwd._counter_lock = threading.RLock()
         fwd.close()
-    reports = [r.getMessage() for r in caplog.records if "hand-off queue is full" in r.getMessage()]
-    assert len(reports) == 2, reports
-    assert "(general lane, depth 3)" in reports[0], reports[0]
-    # The second batch: the dropped audit line a2, then g4 and g5. The forwarder is not on the root
-    # logger, so the reports themselves never reach it.
-    assert "(general lane, depth 3; audit lane, depth 2)" in reports[1], reports[1]
-    assert re.findall(r"\d+", reports[1]) == ["3", "3", "2", "4"], reports[1]
+        pytest.fail("the nested drop count deadlocked on the counter lock")
+    fwd.close()
+    assert held == [True] and fwd.dropped == 1
 
 
 def test_the_audit_lane_cannot_hold_general_lines_back_for_good() -> None:
