@@ -5814,7 +5814,7 @@ class AuthService:
         signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
         # BACKLOG #2388: an IdP that re-authenticates with no human step (an amr the operator named
         # in oidc_callback_floor_exempt_amr) is exempt. Recorded on the success row, below, and on
-        # each refusal after this point, a lock refusal excepted (BACKLOG #3220).
+        # each refusal after this point (BACKLOG #3220), a lock refusal included (BACKLOG #3726).
         floor_exempt_amr = (
             self._oidc_callback_floor_exemption(
                 self._oidc_callback_floor_exempt_values(), principal_claims.amr

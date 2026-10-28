@@ -26,7 +26,8 @@ This module is the one place that names the hidden rows. Every API read of the t
   later sign-in that a wrong candidate would have been refused for as a plain wrong password.
 * ``auth.directory_login_locked`` -- a directory (Kerberos or OIDC) sign-in refused by a live lock
   (BACKLOG #3726). Its own action, so the whole row is hidden whatever its detail holds, and the
-  OIDC ``callback_floor_exempt_amr`` marker can ride it without showing the lock to anyone else.
+  OIDC ``callback_floor_exempt_amr`` marker can ride it without showing the lock to a reader
+  without ``users:manage`` on these read paths. A ``users:manage`` holder reads it with its marker.
 * ``auth.admin_unlocked`` -- the whole row, not only its lock fields. Its detail records both lock
   expiries and both cycle counts; stripped of those, it would still say that an account needed
   unlocking. An administrator reads it in full, which is who acts on it.
@@ -118,9 +119,10 @@ LOCK_EVENT_ACTIONS: Final[frozenset[str]] = frozenset(
 #: constant, so the stored text and the hidden text cannot drift apart.
 LOCKED_REFUSAL_DETAIL: Final = json.dumps({"reason": "locked"}, sort_keys=True)
 #: The exact detail a directory (Kerberos or OIDC) lock refusal stored under ``auth.login_failed``
-#: before BACKLOG #3726 gave it :data:`DIRECTORY_LOGIN_LOCKED_ACTION`. No writer stores it now. It
+#: before BACKLOG #3726 gave it :data:`DIRECTORY_LOGIN_LOCKED_ACTION`. No writer stores it now.
+#: RETAINED DELIBERATELY (batch 458 Manager decision): removing a filter was not #3726's call. It
 #: stays in the exclusion below, and uncounted by the sign-in burst signal, so a row in that shape
-#: still never shows a reader without ``users:manage`` a lock.
+#: still never shows a reader without ``users:manage`` a lock, until its own follow-up row decides.
 DIRECTORY_LOCKED_REFUSAL_DETAIL: Final = json.dumps(
     {"provider": "ad", "reason": "locked"}, sort_keys=True
 )
