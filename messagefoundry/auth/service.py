@@ -10816,17 +10816,18 @@ class AuthService:
         characters of its id and, when a link was followed, of the hash presented. With no token
         there is nothing to look up, so this returns ``nothing_to_revoke`` and writes no row.
 
-        **A sign-out with no ``actor`` that ended nothing writes its row within a budget (BACKLOG
-        #3749 item 6).** :meth:`_admit_logout_miss_row` says how. A caller that names an actor was
-        authenticated, so its rows are bounded by its sessions and are never budgeted. The
-        sign-out itself runs and answers as before (BACKLOG #287), and a sign-out that ended a
-        session always writes.
+        **A sign-out with no ``proven_at`` that ended nothing writes its row within a budget
+        (BACKLOG #3749 item 6).** :meth:`_admit_logout_miss_row` says how. A caller that proved the
+        token was authenticated, so its rows are bounded by its sessions and are never budgeted.
+        The sign-out itself runs and answers as before (BACKLOG #287), and a sign-out that ended a
+        session always attempts its row.
 
-        **A fault in the owner lookup or a row write is logged, not raised (BACKLOG #3884 item
+        **A fault in the owner lookup or an audit write is logged, not raised (BACKLOG #3884 item
         1).** Once a session ended, a raise would report a sign-out that already happened as a
-        failure, and ``/ui/logout`` answered 500 without clearing the cookie. An owner lookup the
-        store refuses leaves the row with no actor rather than no row. A fault in the revoke itself
-        still raises: the session may not have ended, and the caller must not say it did.
+        failure, and ``/ui/logout`` answered 500 without clearing the cookie. A failed owner lookup
+        leaves the row with no actor rather than no row; a refused row write leaves no row and an
+        ERROR log line naming the session. A fault in the revoke itself still raises: the session
+        may not have ended, and the caller must not say it did.
 
         The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
         caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
@@ -10847,7 +10848,7 @@ class AuthService:
         if ended is None:
             # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
             # ended, so the trail still records the sign-out request, within the budget.
-            if actor is not None or await self._admit_logout_miss_row(client):
+            if proven_at is not None or await self._admit_logout_miss_row(client):
                 await write_audit_soft(
                     lambda: self._audit(
                         "auth.logout",
@@ -10867,20 +10868,23 @@ class AuthService:
         detail = {"outcome": outcome, "session": ended.token_hash[:12]}
         if not constant_time_equal(ended.token_hash, presented):  # ASVS 11.2.4, as elsewhere
             detail["presented"] = presented[:12]
-        named = actor
-        if named is None:
-            try:
-                named = await self._owner_name(ended.user_id)
-            except AUDIT_WRITE_DEFECTS:
-                raise
-            except store_call_errors():
-                _log.exception(
-                    "a sign-out ended session %s, but its owner could not be read; its "
-                    "auth.logout row names no actor",
-                    detail["session"],
-                )
+        named: list[str | None] = [actor]
+
+        async def _name_the_owner() -> None:
+            named[0] = await self._owner_name(ended.user_id)
+
+        if actor is None:
+            await write_audit_soft(
+                _name_the_owner,
+                log=_log,
+                message="a sign-out ended session %s, but its owner could not be read; its "
+                "auth.logout row names no actor",
+                args=(detail["session"],),
+                # The session has ended: a raise would lose its row and report it as a failure.
+                defects=(),
+            )
         await write_audit_soft(
-            lambda: self._audit("auth.logout", actor=named, detail=_json(detail), client=client),
+            lambda: self._audit("auth.logout", actor=named[0], detail=_json(detail), client=client),
             log=_log,
             message="a sign-out ended session %s, but its auth.logout row failed",
             args=(detail["session"],),
@@ -10890,8 +10894,8 @@ class AuthService:
         return outcome
 
     async def _admit_logout_miss_row(self, client: str | None) -> bool:
-        """Whether a sign-out with no actor that ended nothing may write its ``auth.logout`` row
-        now (BACKLOG #3749 item 6). ``/ui/logout`` has no auth dependency, so without a bound
+        """Whether a sign-out with no ``proven_at`` that ended nothing may write its ``auth.logout``
+        row now (BACKLOG #3749 item 6). ``/ui/logout`` has no auth dependency, so without a bound
         anyone could append such rows.
 
         :data:`_LOGOUT_MISS_ROWS_PER_CLIENT` rows per client address, under the global ceiling
@@ -10917,7 +10921,8 @@ class AuthService:
                 log=_log,
                 message="%d dropped auth.logout rows could not be counted; the count is kept",
                 args=(dropped,),
-                defects=AUDIT_WRITE_DEFECTS,
+                # A raise would fail the sign-out the caller is owed, and lose the count.
+                defects=(),
             )
             if not written:
                 self._logout_misses_dropped += dropped

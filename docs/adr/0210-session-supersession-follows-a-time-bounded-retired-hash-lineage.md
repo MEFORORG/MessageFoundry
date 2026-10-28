@@ -122,4 +122,3 @@ proves nothing and measures it from the call, so a retired token gains a SECOND 
 one under Consequences: for 5 seconds after an elevation, presented to `/ui/logout` with no
 credential, it ends the session it became. It still cannot open or extend one. `docs/SECURITY.md`
 states both powers. `revoke_own_session` still follows no link.
-

@@ -26,8 +26,10 @@ import pytest
 from messagefoundry.auth import Role
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.oidc import FederatedPrincipal
+from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.service import (
     _LOGOUT_LINEAGE_SECONDS,
+    _LOGOUT_MISS_ROWS_GLOBAL,
     _LOGOUT_MISS_ROWS_PER_CLIENT,
     _LOGOUT_MISS_WINDOW_SECONDS,
     AuthService,
@@ -614,7 +616,7 @@ async def _misses(service: AuthService, client: str, count: int) -> None:
 
 
 async def test_sign_outs_that_end_nothing_write_rows_within_a_budget(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore,
 ) -> None:
     # BACKLOG #3749 item 6. /ui/logout has no auth dependency, so anyone could append auth.logout
     # rows. Past the per-client budget the row is dropped and counted, in at most one count row a
@@ -628,15 +630,20 @@ async def test_sign_outs_that_end_nothing_write_rows_within_a_budget(
     await _misses(service, "203.0.113.10", 1)
     assert await logout_rows_dropped(store) == [1], "a second count row inside one window"
     assert len(await logout_rows(store)) == budget + 1
-    # A window later the budget has room again, and the next miss first writes the rest.
-    real = time.monotonic
-    monkeypatch.setattr(time, "monotonic", lambda: real() + _LOGOUT_MISS_WINDOW_SECONDS + 1.0)
+    # A window later the budget has room again, and the next miss first writes the rest. The
+    # window's passing is set on the service's own state, not by moving time.monotonic, which the
+    # event loop's clock reads too.
+    service._logout_miss_limiter = SlidingWindowRateLimiter(
+        per_key=budget, glob=_LOGOUT_MISS_ROWS_GLOBAL, window_seconds=_LOGOUT_MISS_WINDOW_SECONDS
+    )
+    assert service._logout_dropped_row_at is not None
+    service._logout_dropped_row_at -= _LOGOUT_MISS_WINDOW_SECONDS + 1.0
     await _misses(service, "203.0.113.9", 1)
     assert await logout_rows_dropped(store) == [2, 1], "newest first: the rest, then the trip"
     assert len(await logout_rows(store)) == budget + 2
-    # An authenticated caller's miss is never budgeted: it names an actor.
+    # An authenticated caller's miss is never budgeted: its gate proved the token.
     for n in range(budget + 1):
-        await service.logout(f"gone-{n}", client="203.0.113.9", actor="op", proven_at=None)
+        await service.logout(f"gone-{n}", client="203.0.113.9", actor="op", proven_at=time.time())
     assert len(await logout_rows(store)) == 2 * budget + 3
     # A sign-out that ends a session always writes, from the tripped client too.
     token = await _token(service)

@@ -5139,9 +5139,11 @@ dropped and counted in an `auth.logout_rows_dropped` row, which names no client.
 row is written per 60 seconds: one when the budget first trips, and the rest of the count with the
 first sign-out that ends nothing a window later. The budget and its count are in-process, so each
 engine shard keeps its own; drops after the last count row are not written if no such sign-out
-follows, and a restart loses them. It bounds only the rows of a sign-out that names no caller:
-`POST /auth/logout` always writes its row, the sign-out itself is never throttled, and a sign-out
-that ended a session always writes its row.
+follows, and a restart loses them. It bounds only the rows of a sign-out that proved nothing
+about the token: `POST /auth/logout` is never budgeted, and neither is a sign-out that ended a
+session. The sign-out itself is never throttled. A refused audit write is logged, not raised, so
+`/ui/logout` still clears the cookie; that row is then missing, with an ERROR log line naming the
+session.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was

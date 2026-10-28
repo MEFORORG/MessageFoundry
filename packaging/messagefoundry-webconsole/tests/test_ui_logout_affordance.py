@@ -286,12 +286,12 @@ async def test_ui_logout_with_a_cookie_an_elevation_just_retired_ends_its_succes
     tab's sign-out is in flight, so the cookie it sends names no session. Within 5 seconds of
     the elevation the sign-out follows the link, ends the session under its new token, and the
     row names the owner, where it used to keep a NULL actor and leave the session live. The clock
-    is set 2 seconds inside the bound, so a slow runner has that much room."""
+    is FROZEN 2 seconds inside the bound, read after the rotation, so runner speed cannot move it."""
     service, old = await _signed_in_operator(engine)
     successor = await service._rotate_session_token(old)
     assert successor is not None, "the rotation failed closed, so the race was not driven"
-    real = time.time
-    monkeypatch.setattr(time, "time", lambda: real() + _LOGOUT_LINEAGE_SECONDS - 2.0)
+    rotated_at = time.time()
+    monkeypatch.setattr(time, "time", lambda: rotated_at + _LOGOUT_LINEAGE_SECONDS - 2.0)
     out = await _sign_out_with(engine, service, old)
     assert out.status_code == 303
     assert await service.identity_for_token(successor, activity=False) is None
@@ -314,8 +314,8 @@ async def test_ui_logout_with_a_cookie_retired_past_the_window_ends_nothing(
     service, old = await _signed_in_operator(engine)
     successor = await service._rotate_session_token(old)
     assert successor is not None
-    real = time.time
-    monkeypatch.setattr(time, "time", lambda: real() + _LOGOUT_LINEAGE_SECONDS + 1.0)
+    rotated_at = time.time()
+    monkeypatch.setattr(time, "time", lambda: rotated_at + _LOGOUT_LINEAGE_SECONDS + 1.0)
     out = await _sign_out_with(engine, service, old)
     assert out.status_code == 303
     assert await service.identity_for_token(successor, activity=False) is not None
