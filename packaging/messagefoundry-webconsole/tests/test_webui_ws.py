@@ -573,10 +573,10 @@ def test_derive_health_ok_when_no_log_dir_is_configured() -> None:
 
 
 def test_bytes_renders_an_unmeasured_value_as_words_not_a_quantity() -> None:
-    """BACKLOG #1563, the on-screen half. The Engine Status page prints "Disk free" straight from
-    ``DbInfo``, so a server backend's unmeasurable figure must not fall through to "0 B" — an
-    operator reading that sees a disk emergency, when in fact nobody looked. A real zero still
-    renders as a quantity, because that one IS a measurement."""
+    """An unmeasured value renders as words, never as "0 B", which reads as a measured empty
+    drive. A real zero still renders as a quantity, because that one IS a measurement. The "Disk
+    free" row words its own unmeasured cases (BACKLOG #1563, pinned below and in
+    test_webui_monitoring.py), so this pins only the helper's guard."""
     from messagefoundry_webconsole.pages.monitoring import _bytes
 
     assert _bytes(None) == "nothing measured"
@@ -584,19 +584,39 @@ def test_bytes_renders_an_unmeasured_value_as_words_not_a_quantity() -> None:
     assert _bytes(10 * 1024**3) == "10.0 GiB"
 
 
-def test_db_disk_free_names_a_status_that_arrived_around_validation() -> None:
-    """BACKLOG #1563. ``DbInfo`` refuses an unknown ``disk_free_status``, but one built around
-    validation must still be named, warn-styled, in the words ``_derive_health`` uses, rather than
-    read as observed, not-applicable or a failed probe. The three real statuses are pinned through
-    the whole page in test_webui_monitoring.py."""
+def test_db_disk_free_matches_derive_health_for_pairs_around_validation() -> None:
+    """BACKLOG #1563. ``DbInfo`` refuses an unknown ``disk_free_status``, and the stores never
+    pair ``observed`` with a null or ``unobservable`` with a figure. A value built around that
+    validation must still render the way ``_derive_health`` reads it, so the row and the nav heart
+    cannot disagree: an unknown status is named, a probed status with no figure is the failed
+    probe, and a figure is shown as one. The three real renders are pinned through the whole page
+    in test_webui_monitoring.py."""
     from messagefoundry.api.models import DbInfo
     from messagefoundry_webconsole.pages.monitoring import _db_disk_free
+    from messagefoundry_webconsole.routes.status import _derive_health
 
-    db = _sysinfo(None).db
-    odd = DbInfo.model_construct(**{**db.model_dump(), "disk_free_status": "remote"})
-    assert str(_db_disk_free(odd)) == (
-        '<span class="health-warn">db disk status not recognised: &#x27;remote&#x27;</span>'
-    )
+    base = _sysinfo(None).db.model_dump()
+
+    def _row(disk_status: str, free: int | None) -> str:
+        db = DbInfo.model_construct(
+            **{**base, "disk_free_status": disk_status, "disk_free_bytes": free}
+        )
+        return str(_db_disk_free(db))
+
+    pill = '<span class="status status-failed">{}</span>'
+    assert _row("remote", None) == pill.format("db disk status not recognised: &#x27;remote&#x27;")
+    assert _row("observed", None) == pill.format("db directory missing or unreadable")
+    assert _row("unobservable", 50 * _GIB) == "50.0 GiB"
+    # The heart, on the same two contradictory pairs, for the agreement the row is built to keep.
+    for disk_status, free, want in (
+        ("observed", None, ("warn", "db directory missing or unreadable")),
+        ("unobservable", 50 * _GIB, ("ok", None)),
+    ):
+        sysinfo = _sysinfo(50 * _GIB)
+        sysinfo.db = DbInfo.model_construct(
+            **{**base, "disk_free_status": disk_status, "disk_free_bytes": free}
+        )
+        assert _derive_health(sysinfo, None, None, None) == want
 
 
 def test_derive_health_down_when_store_unreachable() -> None:

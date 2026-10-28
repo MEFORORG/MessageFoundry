@@ -153,11 +153,11 @@ def _contradiction(value: bool | None) -> str:
 def _bytes(n: int | None) -> str:
     """Render a byte count in a compact binary unit (KiB/MiB/GiB).
 
-    ``None`` renders as words, never as a quantity: falling through to "0 B" would print the
-    on-screen half of BACKLOG #1563, since an operator reading "0 B" free on a remote SQL Server
-    sees a disk emergency where in fact nobody looked. The wording borrows ``_contradiction``'s
-    "nothing measured" rather than ``_opt``'s em dash, which reads as a missing row instead of an
-    unmeasured one, and rather than a fifth new spelling of unknown for the same table."""
+    ``None`` renders as words, never as a quantity: "0 B" reads as a measured empty drive. The
+    "Disk free" row no longer reaches this with a None (``_db_disk_free`` words each unmeasured
+    case itself, BACKLOG #1563); the guard stays so any caller's None reads as unmeasured. The
+    wording borrows ``_contradiction``'s "nothing measured" rather than ``_opt``'s em dash, which
+    reads as a missing row instead of an unmeasured one."""
     if n is None:
         return "nothing measured"
     size = float(n)
@@ -171,20 +171,25 @@ def _bytes(n: int | None) -> str:
 def _db_disk_free(db: DbInfo) -> object:
     """Render the store's "Disk free" row by what the backend STATES about it (BACKLOG #1563).
 
-    A null figure has two causes, and they must not read alike: a server backend's disk is on the
-    database host, out of this engine's sight, which is nothing wrong; a failed probe of the
-    engine's own DB directory is something wrong, so it renders warn-styled with the very reason
-    ``_derive_health`` warns on, keeping this row and the nav heart in one sentence."""
-    status = db.disk_free_status
-    if status == "observed":
+    A null figure has two causes, and they must not read alike. ``not_applicable`` claims nothing
+    about any drive: a server backend's disk is on the database host, and an in-memory SQLite store
+    has none, so the row says so in neutral words. Under ``observed`` or ``unobservable`` the
+    engine probes its own DB directory, so a null there is a failed probe; it renders in the pill
+    this page gives every other row the nav heart warns on, with ``_derive_health``'s own reason.
+    The tree mirrors ``_derive_health``'s, keyed on the status and then the figure, so the row and
+    the heart cannot disagree about a pair that arrives around ``DbInfo`` validation."""
+    disk_status = db.disk_free_status
+    if disk_status == "not_applicable":
+        return "not measured by this engine (a server backend, or an in-memory store)"
+    if disk_status in ("observed", "unobservable"):
+        if db.disk_free_bytes is None:
+            return el("span", "db directory missing or unreadable", class_="status status-failed")
         return _bytes(db.disk_free_bytes)
-    if status == "not_applicable":
-        return "not measured by this engine (server backend; the disk is on the database host)"
-    if status == "unobservable":
-        return el("span", "db directory missing or unreadable", class_="health-warn")
     # DbInfo refuses any other value at validation; one that arrives around it is named, matching
     # _derive_health, rather than read as either case above.
-    return el("span", f"db disk status not recognised: {status!r}", class_="health-warn")
+    return el(
+        "span", f"db disk status not recognised: {disk_status!r}", class_="status status-failed"
+    )
 
 
 def _suspend_form(a: AlertInstanceInfo) -> Markup:
