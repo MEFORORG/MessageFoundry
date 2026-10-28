@@ -2216,9 +2216,13 @@ class WebAuthnCredential:
     def from_mapping(cls, d: Mapping[str, Any]) -> WebAuthnCredential:
         """The passkey ``d`` holds, or :class:`PasskeyRowMalformed` for a row that does not parse,
         so a caller that must survive one (the sign-in lock's escalation and its notice, BACKLOG
-        #3937) catches that alone and not every ``TypeError`` or ``KeyError`` beside it."""
-        transports = d.get("transports")
+        #3937) catches that alone and not every ``TypeError`` or ``KeyError`` beside it. A
+        ``transports`` value that is JSON but not a list does not parse either."""
         try:
+            raw = d.get("transports")
+            transports = json.loads(raw) if raw else None
+            if transports is not None and not isinstance(transports, list):
+                raise TypeError("transports is not a list")
             return cls(
                 credential_id_hash=d["credential_id_hash"],
                 credential_id=d["credential_id"],
@@ -2226,7 +2230,7 @@ class WebAuthnCredential:
                 rp_id=d["rp_id"],
                 public_key=d["public_key"],
                 sign_count=int(d["sign_count"]),
-                transports=[str(t) for t in json.loads(transports)] if transports else None,
+                transports=None if transports is None else [str(t) for t in transports],
                 device_type=d["device_type"],
                 backed_up=bool(d["backed_up"]),
                 label=d["label"],
@@ -2235,14 +2239,18 @@ class WebAuthnCredential:
                 last_used_at=_opt_float(d.get("last_used_at")),
                 discoverable=bool(d.get("discoverable", False)),
             )
-        except (ValueError, TypeError, KeyError) as exc:
-            raise PasskeyRowMalformed(type(exc).__name__) from exc
+        # OverflowError (int() of an infinite REAL) and RecursionError (deeply nested JSON) are
+        # parse failures too, as they are for the other JSON columns this module reads.
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError) as exc:
+            # ``from None``: the underlying message can quote the row's value.
+            raise PasskeyRowMalformed(type(exc).__name__) from None
 
 
-class PasskeyRowMalformed(ValueError):
-    """A ``webauthn_credentials`` row that does not parse into a :class:`WebAuthnCredential`. A
-    ``ValueError``, so a caller that caught the parse error before still does. The argument is the
-    underlying error's class name, never the row's content."""
+class PasskeyRowMalformed(Exception):
+    """A ``webauthn_credentials`` row that does not parse into a :class:`WebAuthnCredential`.
+    Not a ``ValueError``: the routes answer a ``ValueError`` as the client's fault, and a row the
+    store did not write is the server's. The argument is the underlying error's class name, never
+    the row's content."""
 
 
 # --- the sealed user record (BACKLOG #2592) ----------------------------------------------------
@@ -16376,8 +16384,7 @@ class MessageStore:
         later-cycle lock, on a cell the locked row must still hold (:func:`escalation_verdict`,
         BACKLOG #3422). A passkey that ``passkey_escalates`` counts escalates the SIGN-IN lock too,
         asked of the set read in this same transaction after the account row
-        (:func:`escalation_passkeys`, BACKLOG #3937 item 8); a passkey row that does not parse
-        counts none, and the count still lands. The count itself stays atomic.
+        (:func:`escalation_passkeys`, BACKLOG #3937 item 8). The count itself stays atomic.
 
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""

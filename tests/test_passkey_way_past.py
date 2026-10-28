@@ -1826,14 +1826,20 @@ async def test_without_the_webauthn_extra_a_passkey_does_not_escalate_the_lock(
         await store.close()
 
 
-async def test_a_passkey_row_that_does_not_parse_still_lets_the_lock_arm() -> None:
+#: ``transports`` values that do not parse: not JSON, JSON but no list (a scalar, and a string
+#: that would iterate as characters), and JSON nested past the recursion limit.
+_UNPARSEABLE_TRANSPORTS = ["not json", "5", '"usb"', "[" * 100_000]
+
+
+@pytest.mark.parametrize("transports", _UNPARSEABLE_TRANSPORTS, ids=["text", "5", "str", "deep"])
+async def test_a_passkey_row_that_does_not_parse_still_lets_the_lock_arm(transports: str) -> None:
     """The escalation reads the passkey set inside the count's own transaction. A row that does not
     parse must not roll the count back, or the account would never lock: it keeps the fixed length
     instead, and the lock arms on every cycle."""
     store = await MessageStore.open(":memory:")
     try:
         service, identity, _, _ = await _passkey_owner(store)
-        await _corrupt_passkey_rows(store, identity.user_id, "not json")
+        await _corrupt_passkey_rows(store, identity.user_id, transports)
         assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
     finally:
         await store.close()
@@ -1847,7 +1853,7 @@ async def test_a_passkey_row_that_does_not_parse_is_the_uniform_refusal_on_the_l
     writes the lock notice, which asks whether the account holds a discoverable passkey. A passkey
     row that does not parse must leave that the 401 every wrong password gets, never a 500 that
     would name the account as one holding a passkey. The failure is still counted: the lock arms,
-    with the fixed length, and a warning names the account. ``5`` parses as JSON but is no list,
+    and a warning names the account. ``5`` parses as JSON but is no list,
     the TypeError arm. RED when: the notice's passkey read lets the parse error out."""
     import httpx
 
@@ -1900,5 +1906,20 @@ async def test_a_passkey_row_that_does_not_parse_refuses_the_combined_passkey_si
         await _set_sign_in_lock(store, identity.user_id)
         out = await service.login(identity.username, password, passkey=_proof(service, auth))
         assert not out.ok and out.token is None, "the lock was passed"
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_row_that_does_not_parse_names_the_account_in_the_census() -> None:
+    """The census reads every account's passkeys. A row that does not parse counts for nothing, so
+    the account is named as having no way past, and the census still runs for every other account.
+    RED when: the parse error escapes and the whole census is lost."""
+    store = await MessageStore.open(":memory:")
+    try:
+        _, identity, _, _ = await _passkey_owner(store)
+        await _corrupt_passkey_rows(store, identity.user_id, "not json")
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert census.no_way_past == (identity.username,)
+        assert census.passkey_only == ()
     finally:
         await store.close()

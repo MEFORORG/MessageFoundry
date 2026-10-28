@@ -9609,9 +9609,8 @@ class PostgresStore:
         set a later-cycle lock, on a cell the locked row must still hold
         (``store.escalation_verdict``, BACKLOG #3422). A passkey that ``passkey_escalates`` counts
         escalates the SIGN-IN lock too, asked of the set read in this same transaction after the
-        account row (``store.escalation_passkeys``, BACKLOG #3937 item 8); a passkey row that does
-        not parse counts none, and the count still lands. Returns ``(0, False, 0)`` for an unknown
-        user."""
+        account row (``store.escalation_passkeys``, BACKLOG #3937 item 8). Returns
+        ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
         totp_counts = await escalation_verdict(

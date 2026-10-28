@@ -365,7 +365,9 @@ _LOADERS: dict[str, frozenset[str]] = {
     "_load_users": frozenset({"list_users"}),
     # The role rows, and one re-read by id before a failing pair is reported.
     "_verified": frozenset({"get_user_role_grants", "get_user"}),
-    "_verified_passkeys": frozenset({"list_webauthn_credentials"}),
+    # The passkey read, for _verified_passkeys alone, which checks the set against its digest; it
+    # answers None for a row that does not parse (BACKLOG #3937).
+    "_read_passkeys": frozenset({"list_webauthn_credentials"}),
     # Existence questions: only a bool leaves them, never the unchecked row.
     "_username_held": frozenset({"get_user_by_username"}),
     "_directory_object_id_held": frozenset({"get_user_by_directory_object_id"}),

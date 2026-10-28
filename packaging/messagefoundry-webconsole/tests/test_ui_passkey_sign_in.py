@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any
 
 import httpx
 import pytest
@@ -36,13 +37,14 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
 
 
-async def _service(engine: Engine) -> AuthService:
+async def _service(engine: Engine, **overrides: Any) -> AuthService:
     service = AuthService(
         engine.store,
         AuthSettings(
             mfa_verify_min_elapsed_seconds=0,
             login_rate_limit_enabled=False,
             admin_write_min_interval_seconds=0,
+            **overrides,
         ),
     )
     await service.initialize()
@@ -278,16 +280,7 @@ async def test_a_passkey_row_that_does_not_parse_is_the_uniform_refusal_on_ui_lo
     passkey. A passkey row that does not parse must leave that the redirect every wrong password
     gets, never a 500, and the failure is still counted. RED when: the notice's passkey read lets
     the parse error out."""
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            mfa_verify_min_elapsed_seconds=0,
-            login_rate_limit_enabled=False,
-            admin_write_min_interval_seconds=0,
-            lockout_threshold=3,
-        ),
-    )
-    await service.initialize()
+    service = await _service(engine, lockout_threshold=3)
     user_id, _ = await _passkey_only_operator(service)
     from messagefoundry.store.store import MessageStore
 
