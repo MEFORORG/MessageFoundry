@@ -57,7 +57,7 @@ from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
 from tests._ast_sites import call_sites
-from tests._sign_in_claim import SIGN_IN_ANY_TENSE, SIGN_IN_CLAIM
+from tests._sign_in_claim import SIGN_IN_CLAIM
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -4226,22 +4226,27 @@ def test_the_thirteenth_sweep_deployment_states_the_built_intake_auth(scope: str
         ), "the caveat must say the allow-list is not consulted once intake_auth names a mode"
 
 
-def test_the_thirteenth_sweep_loosening_note_binds_no_user_at_sign_in() -> None:
-    """docs/SECURITY-LOOSENING.md said the password of every user who signs in crosses a plain
-    `ldap://` hop. Simple-bind sign-in is retired; the step-up re-bind is the only user bind left
-    (the probe above)."""
+def test_the_loosening_guide_lists_a_plain_ldap_bind_as_refused_not_as_a_loosening() -> None:
+    """Vault BACKLOG #3533 item 1 removed ``[auth].ad_allow_insecure_ldap``. Its loosening entry,
+    which this test once read for a sign-in claim, went with it. The guide must not describe the
+    plain bind as a lever any more, and its credential-refusal table must name it."""
     doc = _doc("docs/SECURITY-LOOSENING.md")
-    start = doc.index("### `[auth].ad_allow_insecure_ldap = true`")
-    section = doc[start : doc.index("\n### ", start + 1)]
-    clauses = [c for c in _clauses(section) if "password" in c]
-    assert clauses, "the cleartext-LDAP section names no password, so this check reads nothing"
-    # The shared pattern in every tense, so "sign-in", "login", "signed in" and "logged on" are read.
-    at_sign_in = [c for c in clauses if SIGN_IN_ANY_TENSE.search(c)]
-    assert not at_sign_in, (
-        f"docs/SECURITY-LOOSENING.md says a user's sign-in binds a password again: {at_sign_in}"
+    assert "### `[auth].ad_allow_insecure_ldap" not in doc, (
+        "docs/SECURITY-LOOSENING.md still has a loosening entry for the removed opt-in"
     )
-    assert any(re.search(r"\bstep(?:s|-)? ?up\b", c) for c in clauses), (
-        "the cleartext-LDAP section must say the step-up re-bind carries the user's password"
+    start = doc.index("## No escape sends a credential to an unverified peer")
+    section = doc[start : doc.index("\n## ", start + 1)]
+    table, _, rest = section.partition("**The rule does not reach every hop yet.**")
+    assert re.search(r"^\| `\[auth\]` AD binds \| `ad_server` is a plain `ldap://`", table, re.M), (
+        "the refusal table does not name the plain ldap:// AD bind"
+    )
+    end = rest.find("\nAn SFTP login")
+    bullets = [
+        line for line in rest[: end if end != -1 else None].splitlines() if line.startswith("- ")
+    ]
+    assert bullets, "found no bullets under the not-reached heading, so this check reads nothing"
+    assert not [b for b in bullets if "ldap://" in b], (
+        "the not-reached list still names the plain ldap:// bind"
     )
 
 
