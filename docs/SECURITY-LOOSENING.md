@@ -104,16 +104,6 @@ engine has not verified, when the lever named beside each is set:
   query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
   like a credential. A secret anywhere in the path crosses unrefused too. A path secret cannot be
   told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
-- an HTTP-family static or per-message header with a neutral name, such as `X-Session`, over
-  plain `http`, under that hop's own levers. The header allowlist applies on `verify_tls = false`
-  hops only. That is decided, and it stays an accepted limit: plain `http` off this machine refuses
-  credentials only (vault BACKLOG #3533 item 4). The batch 342 Manager asked the owner on
-  2026-10-27: "Should the same allowlist also apply to declared off-box plain-http hops
-  (cleartext_accepted / tls_hop_attested)?" The owner answered "/driver". The Manager decided no,
-  after an adversarial review that split, "decided under the owner's delegation of 2026-10-27"
-  (decision `d20261027T133708514-b8b2ed`). ADR 0153 already accepts that a `cleartext_accepted`
-  hop's body and headers are readable. Refusing neutral headers there adds little, and it would
-  break legacy hops. Until 2026-10-28 this bullet said the question awaited an owner ruling;
 - a secret that is not credential-shaped under an allowlisted header name, such as an opaque token
   in `X-Request-ID`, on a `verify_tls = false` hop. The allowlist reads names, and the value test
   knows only auth-scheme prefixes and JWTs;
@@ -122,6 +112,24 @@ engine has not verified, when the lever named beside each is set:
   `encrypt = false`;
 - a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
   `[security].enforcement = warn`.
+
+**Accepted limit: a neutral header crosses plain `http` off this machine.** An HTTP-family static
+or per-message header with a neutral name, such as `X-Session`, still crosses that hop. The hop
+itself crosses only under its own levers, such as `cleartext_accepted` or `tls_hop_attested`.
+It refuses credentials only (vault BACKLOG #3533 item 4). The header allowlist applies on
+`verify_tls = false` hops only. This limit is accepted, with no fix planned. It was decided on
+2026-10-27, under the owner's delegation, as decision `d20261027T133708514-b8b2ed`
+([record](https://github.com/MEFORORG/MessageFoundry/pull/2576#issuecomment-6443284239)).
+
+Two reasons support it. The first holds under both declarations: a neutral header is not a
+credential, and the owner's ruling of 2026-10-26 already refuses credentials on these hops. The
+second holds under `cleartext_accepted` only. That declaration says the hop is not secure, and
+[ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
+decision 2 accepts that. So the hop's body and headers are readable on the path, and refusing
+neutral headers would add little protection. Under `tls_hop_attested` that argument does not
+hold, because the declaration claims the hop is secure by means the engine cannot see. There the
+decision rests on the first reason alone. Under either declaration, a secret under a neutral name
+still crosses. Until 2026-10-28 this guide said the question awaited an owner ruling.
 
 **The forward-proxy login is judged by a different owner ruling.** A `proxy_user` login rides the
 leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG

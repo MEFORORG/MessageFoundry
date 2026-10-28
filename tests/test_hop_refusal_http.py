@@ -677,7 +677,7 @@ def test_a_declared_cleartext_hop_carries_a_neutral_static_header(
 ) -> None:
     """The verify-off header allowlist does not apply to a declared cleartext hop: the owner's
     ruling on item 4 refuses credentials only, so a header with a neutral name and value crosses.
-    Whether the allowlist should apply here too is an open owner question."""
+    That is an accepted limit, decided 2026-10-27; docs/SECURITY-LOOSENING.md says why."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_PROD):
         dest = _build(

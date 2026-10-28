@@ -1,12 +1,14 @@
-- **No declaration carries an HTTP-family credential across cleartext http.** `Rest`, `Soap`,
-  `FHIR`, `DICOMweb` and `FhirLookup` refuse a credential over plain `http` to a host off this
+- **No declaration carries a recognized HTTP-family credential across cleartext http.** `Rest`,
+  `Soap`, `FHIR`, `DICOMweb` and `FhirLookup` refuse a credential over plain `http` to a host off this
   machine, with no escape. Neither `tls_hop_attested` nor `cleartext_accepted` lifts it; a
   loopback host still does. The rule covers the OAuth2 and SMART token requests, HTTP Digest and
   SOAP WS-Security as well. Its credential test now counts the credentials the
   `verify_tls = false` refusal counts, header names in any case, so a static API-key header or a
   credential-shaped value under a neutral name is refused too. It does not take that refusal's
   header-name allowlist, so a neutral header such as `Prefer` still crosses a declared cleartext
-  hop; whether it should is an open owner question. A static `Proxy-Authorization` is left to the
+  hop. That is an accepted limit, decided on 2026-10-27, and
+  [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
+  says why. A static `Proxy-Authorization` is left to the
   send-time proxy rule only when the request goes to a proxy. A hop can bypass a configured
   `proxy_url` through `proxy_no_proxy`, urllib's own bypass list, or a `"default"` with no system
   proxy. That hop goes direct, so the header counts as a credential and refuses it at build. A

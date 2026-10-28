@@ -353,7 +353,7 @@ Three surfaces cannot see the whole set, and each SAYS so rather than reporting 
 `loosenings_scope` marker; the `serve`-time loosening warning fires before the graph is loaded and says
 the construction gate reports them separately (it does, moments later, per connection).
 
-## Amendment 2026-10-27: no declaration carries a credential across cleartext http
+## Amendment 2026-10-27: no declaration carries a recognized credential across cleartext http
 
 **Owner ruling 2026-10-26** (vault BACKLOG #3533 item 4). The batch 342 Manager asked the owner
 whether a credential should still cross a cleartext hop that `cleartext_accepted` or
@@ -382,13 +382,12 @@ the header counts as a credential and refuses the hop at build.
 the WARN and the audit record decision 2 describes. That was the case decision 2 was written for.
 A header with a neutral name and value, static or per message, still crosses with that body. The
 verify-off rule's header-name allowlist (owner ruling 2026-10-26 on item 7) is not applied to
-cleartext hops. The owner's ruling here named credentials only. Whether the allowlist should reach
-plain `http` off this machine was then decided: no, under the owner's delegation of 2026-10-27
-(decision `d20261027T133708514-b8b2ed`, after an adversarial review that split). Decision 2
-already accepts that a `cleartext_accepted` hop is not secure, so its body and headers are
-readable on the path. The limit stays accepted, and a neutral header can still carry a secret.
-`docs/SECURITY-LOOSENING.md` records the question and the answer. Until 2026-10-28 this paragraph
-called it an open owner question, not built.
+cleartext hops. The owner's ruling here named credentials only. On 2026-10-27 it was decided, under
+the owner's delegation, not to extend the allowlist to these hops. The decision and its reasons
+are stated once, in
+[SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer),
+*Accepted limit: a neutral header crosses plain `http` off this machine*. Until 2026-10-28 this
+paragraph called it an open owner question.
 
 **Why build note 3's argument no longer holds.** It said that refusing a credential would push an
 operator with a legacy Basic-auth peer into writing a false `tls_hop_attested`. The attestation no
