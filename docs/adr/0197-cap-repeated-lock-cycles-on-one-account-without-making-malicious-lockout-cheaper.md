@@ -1108,14 +1108,18 @@ sign-in lock does not refuse it, just as it does not refuse the TOTP combined si
   that made it a silent password oracle: a right guess moved no counter, a wrong one moved the
   sign-in count, and the lock-state surface shows both counts. Routed together, the two cells look
   the same in every record. A password holder loses nothing by it, since a signature cannot be
-  guessed, and a flaky authenticator costs the owner only the fixed sign-in lock, which this path
+  guessed, and a flaky authenticator costs the owner only the sign-in lock, which this path
   passes anyway. The cost is a lost signal: a right password beside a junk assertion no longer
   tells the owner their password is known. **This routing is not a model for the TOTP path.** A
   TOTP code can be guessed, so uncounting "right password, wrong code" there would hand a password
   holder uncounted code guesses, the hole option C item 1 describes.
-- **The sign-in lock keeps its fixed length on a passkey-only account.** Escalating it would need
-  the passkey count inside each backend's atomic increment. The ruling asks for a way past, not a
-  smaller guess budget, so the fixed length is kept and named as a residual.
+- **The sign-in lock keeps its fixed length on a passkey-only account** as wave 2 shipped it.
+  Escalating it would need the passkey count inside each backend's atomic increment. The ruling
+  asks for a way past, not a smaller guess budget, so the fixed length is kept and named as a
+  residual. *Amended 2026-10-28 by BACKLOG #3937 item 8:* the passkey set is now read inside that
+  increment, so this lock escalates beside a discoverable passkey under the configured relying
+  party where the `[webauthn]` extra is installed; residual 3 below names at least the cases that
+  keep the fixed length.
 
 Files: `auth/webauthn.py` (registration options, a usernameless assertion), `auth/service.py`
 (`_login_local`, a pre-auth begin, the part 4 and last-factor gates), the passkey table on all three
@@ -1242,7 +1246,11 @@ lock that wrong passwords set:
    passkey twin: a client that cannot run the usernameless ceremony. The remedy is `admin-unlock`,
    or the administrator's factor reset.
 3. **Passkey-only accounts keep 480 password guesses a day**, because their sign-in lock does not
-   escalate. And a holder whose only authenticator cannot store a discoverable credential cannot
+   escalate. *Amended 2026-10-28 by BACKLOG #3937 item 8:* narrowed. The lock now escalates beside a
+   discoverable passkey under the configured relying party where the `[webauthn]` extra is
+   installed. It still keeps the fixed length at least with no relying party configured, without
+   the extra, and where the passkey set fails its seal or a passkey row does not parse. And a
+   holder whose only authenticator cannot store a discoverable credential cannot
    register it in wave 2, so they keep TOTP.
 4. **The handover of an issued credential.** Whoever intercepts it can claim the account. That is
    already true of a reset; N-B2 extends it to account creation, and makes the takeover quieter,
