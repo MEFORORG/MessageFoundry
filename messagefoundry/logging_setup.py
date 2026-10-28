@@ -1473,10 +1473,10 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
             self._dropped_since_report = 0
         records = self._records
         depth = records.lane_maxsize if isinstance(records, _ForwardLanes) else records.maxsize
-        # The line never says which lane dropped (BACKLOG #1131): it reaches ``GET /logs/tail``,
-        # and naming the audit lane would tell that reader an audit row was written in the window.
-        # The counts stay combined over both lanes, as ``queue_dropped`` on ``GET /status`` is,
-        # and the one depth figure is the general lane's whichever lane dropped.
+        # The line names no lane and prints the general lane's depth whichever lane dropped, so
+        # its wording adds no audit-row signal to ``GET /logs/tail`` (BACKLOG #1131). Its counts
+        # are combined over both lanes, as ``queue_dropped`` on ``GET /status`` is, and they can
+        # still rise with audit rows alone; docs/SECURITY.md records that as not closed.
         self._reporting.active = True
         try:
             _log.warning(

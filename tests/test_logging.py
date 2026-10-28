@@ -1381,22 +1381,26 @@ def test_a_general_log_flood_does_not_cost_an_audit_line(
 def _drop_reports(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, logger_name: str
 ) -> list[str]:
-    """Fill one lane of a forwarder that is not draining, and return the drop reports it logged."""
-    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 2)
-    monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_QUEUE_MAXSIZE", 2)
+    """Fill one lane of a forwarder that is not draining with five records past its bound, and
+    return the drop reports it logged. The lanes' bounds differ, so a report that printed the
+    dropping lane's own bound would read differently per lane."""
+    general_bound, audit_bound = 3, 2
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", general_bound)
+    monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_QUEUE_MAXSIZE", audit_bound)
+    bound = audit_bound if logger_name == logging_setup.AUDIT_LOGGER_NAME else general_bound
     target = _CapturingHandler()
     fwd = _build_queued_forwarder(target, fmt="text")
     assert fwd._listener.stop_within(1.0)  # nothing drains, so the lane fills
     caplog.clear()
     try:
         with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
-            for i in range(7):
+            for i in range(bound + 5):
                 fwd.handle(
                     logging.LogRecord(logger_name, logging.INFO, __file__, 1, f"r{i}", None, None)
                 )
     finally:
         fwd.close()
-    assert fwd.dropped == 5  # the two that fit, then five drops, whichever lane
+    assert fwd.dropped == 5  # the lane's bound fits, then five drops, whichever lane
     return [r.getMessage() for r in caplog.records if "hand-off queue is full" in r.getMessage()]
 
 
@@ -1415,7 +1419,7 @@ def test_the_drop_report_reads_the_same_whichever_lane_dropped(
     assert len(audit) == 1, audit
     assert audit == general  # the control is the general lane: same text, so no lane signal
     assert "lane" not in audit[0].lower() and "audit" not in audit[0].lower(), audit[0]
-    assert re.findall(r"\d+", audit[0]) == ["1", "2", "1"], audit[0]
+    assert re.findall(r"\d+", audit[0]) == ["1", "3", "1"], audit[0]  # the general lane's depth
 
 
 def test_a_drop_counted_by_the_thread_already_holding_the_counter_lock_does_not_deadlock(
