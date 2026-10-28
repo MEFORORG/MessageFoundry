@@ -1038,11 +1038,15 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
 def read_if_regular(path: str, limit: int = -1) -> bytes | None:
     """The bytes of the regular file at ``path``, at most ``limit`` of them, or ``None`` when the
     path names anything else: a directory, a device or a pipe (vault BACKLOG #3090). A failure to
-    stat, open or read raises ``OSError``.
+    stat, open or read raises ``OSError``, and a path holding a NUL raises ``ValueError``, as
+    ``os.stat`` does.
 
-    The path is stat'ed first, so a device or pipe in place is never opened, since opening some
-    devices has effects of its own. The file is then opened once and judged again by its own
-    descriptor, so nothing swapped in between is read. ``O_NONBLOCK``, where the platform has it,
+    The path is stat'ed first, so on POSIX a device or pipe in place is never opened, since
+    opening some devices has effects of its own. On Windows that stat is not such a control:
+    ``os.stat`` opens the path itself, so a named pipe's server sees a client connect and a device
+    name is opened, before this function can judge either. The file is then opened once and
+    judged again by its own descriptor, so nothing swapped in between is read. ``O_NONBLOCK``,
+    where the platform has it,
     keeps that open from waiting on a pipe with no writer, and ``O_NOCTTY`` keeps a terminal from
     becoming the engine's controlling terminal. A regular file is read blocking. The descriptor is
     closed here, once, whatever happens: ``fdopen`` never owns it."""
@@ -1627,8 +1631,10 @@ def inbound_lane_reads_ca(conn_type: object, settings: Mapping[str, Any]) -> boo
 
 
 def _names_lane_sslca(settings: Mapping[str, Any]) -> bool:
-    """Whether a DATABASE connection names a non-blank ``odbc_params`` ``sslca`` its lane check may
-    read. A ``dialect`` that is not yet text may resolve to ``generic``, so it is read as one."""
+    """Whether a DATABASE connection names a non-empty ``odbc_params`` ``sslca`` its lane check may
+    read. A value of spaces counts: the driver may load it as sent, so the build checks that
+    spelling too (:func:`~messagefoundry.transports.database.driver_file_spellings`). A
+    ``dialect`` that is not yet text may resolve to ``generic``, so it is read as one."""
     if not isinstance(settings.get("dialect", "sqlserver"), str):
         settings = {**settings, "dialect": "generic"}  # only for an unresolved dialect
     return bool(_generic_odbc_param(settings, "sslca"))
@@ -1791,8 +1797,10 @@ def connection_anchor_specs(
 
 
 #: The connection settings :func:`connection_anchor_spec`, :func:`outbound_anchor_spec` and
-#: :func:`database_ca_anchor_spec` read, and the only ones resolved for them. The first two, for
-#: the ``sslmode`` case, and the middle group are what :func:`unread_ca_reason` reads. ``odbc_params`` holds no ``env()`` value to resolve.
+#: :func:`database_ca_anchor_spec` read, and the only ones resolved for them. All but the last
+#: two, ``tls_ca_file`` and ``tls_ca_pin``, are what :func:`unread_ca_reason` reads: ``dialect``
+#: and ``odbc_params`` for the ``sslmode`` case. ``odbc_params`` holds no ``env()`` value to
+#: resolve.
 _CONNECTION_ANCHOR_KEYS = (
     "dialect",
     "odbc_params",

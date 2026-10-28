@@ -20,6 +20,7 @@ import json
 import os
 import re
 import stat
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -220,7 +221,8 @@ def test_a_poller_whose_dialect_is_an_env_value_still_counts_its_sslca(tmp_path:
 
 def test_a_path_object_names_the_anchor_as_its_text_does(tmp_path: Path) -> None:
     """A code-first ``Path`` value builds, since the build reads ``str(value)``, so the lane
-    check takes it too. Red with the ``os.fspath`` step removed: no spec, so no check."""
+    check takes it too. Red with ``driver_file_spellings`` taking only a ``str`` rather than the
+    ``str()`` of any value: no spec, so no check."""
     ca = _ca(tmp_path)
     settings = _settings(ca)
     settings["odbc_params"]["SSLCA"] = ca
@@ -352,7 +354,7 @@ async def test_a_ca_that_is_not_a_regular_file_at_read_time_is_refused_not_read(
     """The spec is chosen by a ``stat``; a pipe swapped in before the check reads the file would
     make a plain read wait. ``evaluate_anchor`` judges its own descriptor, so a file that is not
     regular there is an anchor it cannot read. Runs on every platform: the descriptor is reported
-    as a pipe. Red with the regular-file test taken out of ``_read_regular_file``."""
+    as a pipe. Red with the descriptor's regular-file test taken out of ``read_if_regular``."""
     ca = _ca(tmp_path)
     settings = _settings(ca)
     spec = ta.lane_anchor_spec("outbound", _OUT, settings)
@@ -377,6 +379,38 @@ def test_a_real_pipe_is_refused_without_waiting(tmp_path: Path) -> None:
     os.mkfifo(pipe)
     with pytest.raises(OSError, match="not a regular file"):
         ta.evaluate_anchor(ta.AnchorSpec("outbound:X", "setting", str(pipe)))
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes need POSIX mkfifo")
+def test_a_pipe_swapped_in_after_the_stat_is_opened_without_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stat reports a regular file, and a pipe with no writer is in place by the open.
+    ``O_NONBLOCK`` keeps that open from waiting, and the descriptor check then answers ``None``.
+    Red with ``O_NONBLOCK`` dropped from ``read_if_regular``'s flags: the open waits for a writer
+    and the read does not return."""
+    pipe = str(tmp_path / "ca.pipe")
+    os.mkfifo(pipe)
+    regular = _ca(tmp_path)
+    real_stat = os.stat
+
+    def as_regular(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(path) == pipe:
+            return real_stat(regular)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", as_regular)
+    result: dict[str, bytes | None] = {}
+    reader = threading.Thread(
+        target=lambda: result.update(data=ta.read_if_regular(pipe)), daemon=True
+    )
+    reader.start()
+    reader.join(10)
+    if reader.is_alive():
+        os.close(os.open(pipe, os.O_WRONLY))  # a writer releases the waiting open
+        reader.join(10)
+        pytest.fail("read_if_regular waited on a pipe with no writer")
+    assert result == {"data": None}
 
 
 @pytest.mark.parametrize(
@@ -459,14 +493,16 @@ def test_a_directory_leaves_no_descriptor_open(
     reader: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A directory is judged by its stat and never opened, so no descriptor is left open. Red on
-    POSIX with either reader back on ``os.fdopen(os.open(...))`` and no stat first."""
+    POSIX with the stat taken out of ``read_if_regular``: the directory is opened. Windows cannot
+    open a directory this way, so there it is green either way."""
     opened, closed = _recording_descriptors(monkeypatch)
     if reader == "anchor":
         with pytest.raises(OSError):
             ta.evaluate_anchor(ta.AnchorSpec("outbound:X", "setting", str(tmp_path)))
     else:
         assert f"SSLCA={{{tmp_path}}}" in _build_odbc_dsn(_settings(tmp_path), connection=_OUT)
-    assert set(opened) <= set(closed)
+    assert opened == []
+    assert closed == []
 
 
 def test_a_path_like_value_is_checked_at_the_text_the_driver_is_sent(tmp_path: Path) -> None:

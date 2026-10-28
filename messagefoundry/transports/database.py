@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import errno
 import json
 import logging
 import os
@@ -574,9 +573,10 @@ def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None 
     through ``pqopt``, which the builder refuses, so there libpq finds the key on its own (at least
     ``PGSSLKEY``, a service file, or its default path) and no key is checked (BACKLOG #2423).
 
-    The file is read as :func:`_driver_file_spellings` reads it (vault BACKLOG #3090), so a pipe
-    named here is never read: its descriptor is judged and refused, as anything that is not a
-    regular file is, and a padded value is checked as a driver may trim it."""
+    The file is read at each spelling :func:`driver_file_spellings` gives (vault BACKLOG #3090), so
+    a padded value is checked as a driver may trim it, and a pipe named here is never read: it is
+    refused, as anything that is not a regular file is, on its stat, or on its descriptor if it
+    was swapped in after that stat (:func:`~messagefoundry.auth.trust_anchors.read_if_regular`)."""
     _refuse_weak_driver_wrap(named, "sslkey", "key file", connection, leave_irregular=False)
 
 
@@ -726,14 +726,17 @@ def _read_driver_file(
         logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
         return None
     except OSError as exc:
-        # A directory is judged by its stat, below; one swapped in after that stat can fail the
-        # open, as PermissionError on Windows. A path through a file names no file either; keywrap
-        # refused both, so sslkey still does.
+        # read_if_regular returns None for a directory it stats. One swapped in after that stat
+        # can fail the open instead, as PermissionError on Windows, so the path is looked at
+        # again here. A path through a file names no file either; keywrap refused both, so sslkey
+        # still does.
         if os.path.isdir(path) or isinstance(exc, NotADirectoryError):
             _irregular(setting, what, checked_for, error, leave_irregular)
             return None
-        if exc.errno == errno.EINVAL or getattr(exc, "winerror", None) == _WINDOWS_INVALID_NAME:
-            # A name the platform cannot spell, such as a padded Windows path: no such file.
+        if getattr(exc, "winerror", None) == _WINDOWS_INVALID_NAME:
+            # A name Windows cannot spell, such as a padded path: no such file. Only that Win32
+            # code: CPython maps every Win32 error it has no errno for to EINVAL, so testing
+            # errno would leave a real read failure unchecked.
             logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
             return None
         raise error(

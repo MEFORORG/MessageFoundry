@@ -15,6 +15,7 @@ Synthetic keys and certificates only.
 from __future__ import annotations
 
 import datetime
+import errno
 import os
 import stat
 from pathlib import Path
@@ -164,8 +165,9 @@ def test_a_file_that_is_not_regular_is_not_read(
     tmp_path: Path, client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A file the open handle reports as a pipe is never read, so a pipe cannot hold the build.
-    Runs on every platform; the POSIX test below opens a real pipe. Red with the regular-file test
-    taken out of ``_read_driver_file``: the encrypted key behind it is read and refused."""
+    Runs on every platform; the POSIX test below opens a real pipe. Red with the descriptor's
+    regular-file test taken out of ``trust_anchors.read_if_regular``, which ``_read_driver_file``
+    reads through: the encrypted key behind it is read and refused."""
     path = _write(tmp_path, client.cert_pem + client.approved_key)
     real_fstat = os.fstat
     handles: set[int] = set()
@@ -212,6 +214,40 @@ def test_an_sslcert_past_the_read_cap_is_refused(
     monkeypatch.setattr(database, "_MAX_DRIVER_CA_FILE_BYTES", len(data) - 1)
     with pytest.raises(ValueError, match="certificate file is larger than"):
         _build(path, sslpassword=_PASSPHRASE)
+
+
+class _WindowsReadError(OSError):
+    """An ``OSError`` carrying a Win32 code on any platform, as CPython raises one on Windows."""
+
+    winerror: int = 0  # 0: no Win32 code, as on POSIX
+
+
+@pytest.mark.parametrize(
+    ("winerror", "refused"),
+    [(0, True), (1920, True), (1117, True), (123, False)],
+)
+def test_a_read_failure_reported_as_einval_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int, refused: bool
+) -> None:
+    """CPython maps every Win32 error it has no errno for to EINVAL, so a real failure to read the
+    key (1920, ERROR_CANT_ACCESS_FILE; 1117, ERROR_IO_DEVICE) arrives as EINVAL. Only 123,
+    ERROR_INVALID_NAME, names no file and is left to the driver. Red with ``_read_driver_file``
+    leaving any EINVAL to the driver: the unreadable key is never checked."""
+    path = _write(tmp_path, b"unread")
+    error = _WindowsReadError(errno.EINVAL, "Invalid argument")
+    error.winerror = winerror
+
+    def failing(*_args: Any) -> bytes | None:
+        raise error
+
+    monkeypatch.setattr(database, "read_if_regular", failing)
+    if refused:
+        with pytest.raises(KeyWrapRefused, match="could not be read"):
+            _build(_write(tmp_path, b"plain", "plain.pem"), extra={"sslkey": path})
+    else:
+        assert f"sslkey={{{path}}}" in _build(
+            _write(tmp_path, b"plain", "plain.pem"), extra={"sslkey": path}
+        )
 
 
 def test_with_sslkey_set_sslcert_is_not_read(tmp_path: Path, client: _Client) -> None:
