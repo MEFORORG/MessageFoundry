@@ -694,24 +694,30 @@ def test_the_ldap3_methods_the_origin_check_names_still_exist() -> None:
     assert ldap_module._REFERRAL_TAG not in asn1.BIND_RESPONSE_CONTEXT
 
 
-def test_an_unbind_error_never_replaces_the_refusal() -> None:
+def test_an_unbind_error_never_replaces_how_the_block_ended(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Round-one review finding. Both bind branches answer with the block's own exception, so an
     unbind failing after an undecodable bind must not replace it on one branch only. After a
-    clean block, the unbind's error still propagates."""
+    clean block the unbind's error is logged and not raised either (BACKLOG #3848): a refused bind
+    returns from inside the block, and an unbind error raised over it read as an outage."""
     unbind_fault = ldap3.core.exceptions.LDAPSocketSendError("synthetic")
     conn = SimpleNamespace(unbind=_raise(unbind_fault))
     refusal = LdapUndecodableError("synthetic refusal")
     with pytest.raises(LdapUndecodableError) as raised, ldap_module._released(conn):
         raise refusal
     assert raised.value is refusal
-    with pytest.raises(ldap3.core.exceptions.LDAPSocketSendError), ldap_module._released(conn):
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger=ldap_module.logger.name), ldap_module._released(conn):
         pass
+    assert [r.getMessage() for r in caplog.records] == [
+        "AD unbind failed: ldap3.core.exceptions.LDAPSocketSendError"
+    ]
 
 
 def test_a_probe_answered_before_the_unbind_fails_keeps_its_answer() -> None:
-    """The service connection's release, end to end (``_service_session``, BACKLOG #3017): unlike
-    ``_released`` above after a clean block, an unbind whose send fails is suppressed, and the probe
-    still answers."""
+    """The service connection's release, end to end (``_service_session``, BACKLOG #3017): an
+    unbind whose send fails is suppressed, and the probe still answers."""
     with _scripted_dc(_groups_answered) as (_dc, authenticator):
         real = ldap3.Connection.unbind
 

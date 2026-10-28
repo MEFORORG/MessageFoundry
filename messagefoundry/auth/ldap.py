@@ -1482,23 +1482,28 @@ def _refuse_service_bind(exc: BaseException) -> NoReturn:
 
 @contextlib.contextmanager
 def _released(conn: Any) -> Iterator[None]:
-    """Unbind ``conn`` when the block ends, however it ends.
+    """Unbind ``conn`` when the block ends, however it ends. An ldap3 error from the unbind is
+    logged at DEBUG, by type only, and never raised: by then the block has answered or raised.
 
-    An ldap3 error from the unbind never replaces an exception the block raised (BACKLOG #3010).
-    The block's own exception is the answer both bind branches give, so an unbind failing after an
-    undecodable bind must not replace it on one branch only, or an absent account and a present
-    one would answer differently. After a block that raised nothing, the unbind's error propagates
-    as before.
+    **It never replaces an exception the block raised (BACKLOG #3010).** The block's own exception
+    is the answer both bind branches give, so an unbind failing after an undecodable bind must not
+    replace it on one branch only, or an absent account and a present one would answer differently.
+
+    **Nor does it replace an answer the block returned (BACKLOG #3848).** A refused bind returns
+    from inside this block, and must still reach the step-up re-bind as a refused password, which
+    it counts, rather than as an :class:`LdapError`, which it reads as ``directory_unavailable``
+    and does not. The decoy bind (:meth:`LdapAuthenticator._equalizing_bind`) is released here
+    too, so an unbind error changes neither branch's answer (#3830).
     """
     import ldap3
 
     try:
         yield
-    except BaseException:
-        with contextlib.suppress(ldap3.core.exceptions.LDAPException):
+    finally:
+        try:
             conn.unbind()
-        raise
-    conn.unbind()
+        except ldap3.core.exceptions.LDAPException as failed:
+            logger.debug("AD unbind failed: %s", _type_name(failed))
 
 
 class LdapAuthenticator:
@@ -1655,20 +1660,12 @@ class LdapAuthenticator:
         response on a stream that may be out of step too. It also reopens a connection that was
         open on entry and closed on exit, so an unbind inside it would cost one more connect.
 
-        An ldap3 error from the unbind is suppressed: by then the block has answered or raised, and
-        an unbind failure changes neither. ``_released`` lets one through after a block that raised
-        nothing, which the user bind's connection keeps.
+        Released by :func:`_released`, as the user bind's connection is, so an ldap3 error from the
+        unbind changes nothing the block answered or raised.
         """
-        import ldap3
-
         svc = self._service_conn()
-        try:
+        with _released(svc):
             yield svc
-        finally:
-            try:
-                svc.unbind()
-            except ldap3.core.exceptions.LDAPException as failed:
-                logger.debug("AD service-account unbind failed: %s", _type_name(failed))
 
     def _equalizing_bind(self, password: str) -> None:
         """Do the password-verifying bind's work for a principal that does not exist, and discard it.
