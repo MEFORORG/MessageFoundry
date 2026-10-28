@@ -153,6 +153,15 @@ _AUTO_RESOLVE: dict[str, str] = {
     "crl_reload_applied": "crl_reload_refused",
 }
 
+#: Inverses whose auto-resolve keeps the #81 escalation occurrence count (BACKLOG #1741).
+#: ``connection_started`` fires after every successful start, and a ``restart_inbound`` rule
+#: restarts the connection its own ``connection_stopped`` named. Resetting the count there would
+#: restart a crash loop at the base tier every cycle, so an ``after_count`` tier would never be
+#: reached; keeping it escalates the loop exactly as an instance nothing resolves does. Only an
+#: operator resolve (:meth:`NotifierAlertSink.forget`) clears the count for these. Every other
+#: inverse resets the count, as ADR 0133 D1 states.
+_AUTO_RESOLVE_KEEPS_ESCALATION: frozenset[str] = frozenset({"connection_started"})
+
 _T = TypeVar("_T")
 
 
@@ -819,7 +828,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #81 (ADR 0133): per-(type:connection) OCCURRENCE counter driving occurrence-based escalation.
         # Mirrors the store's `count` (both increment once per emit) but read SYNCHRONOUSLY in _emit to
         # pick the escalation tier. In-memory + per-node (advisory, like _last_sent); reset on auto-resolve
-        # + operator resolve (the durable count/escalation_tier is the cross-restart record).
+        # (except _AUTO_RESOLVE_KEEPS_ESCALATION) + operator resolve (the durable count/escalation_tier
+        # is the cross-restart record).
         self._occurrences: dict[str, int] = {}
         # #144 (ADR 0128): the injected async connection-control callback (action, target) → awaitable,
         # wired by the api/app.py lifespan to RegistryRunner.restart_inbound/restart_outbound. None = no
@@ -1617,8 +1627,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
             # re-open of the SAME key starts un-suspended at the base tier (the durable suspended_until /
             # escalation_tier were on the now-resolved row and never return via list_active).
+            # The count survives for the inverses in _AUTO_RESOLVE_KEEPS_ESCALATION (BACKLOG #1741).
             self._suspended.pop(key, None)
-            self._occurrences.pop(key, None)
+            if etype not in _AUTO_RESOLVE_KEEPS_ESCALATION:
+                self._occurrences.pop(key, None)
             coro = store.resolve_alert_instances_for(
                 event_type=inverse_of, connection=connection, now=now
             )

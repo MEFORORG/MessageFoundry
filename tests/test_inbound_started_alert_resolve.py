@@ -16,11 +16,18 @@ import logging
 import socket
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import _ALERT_EVENT_TYPES, EgressSettings
+from messagefoundry.config.settings import (
+    _ALERT_EVENT_TYPES,
+    AlertRule,
+    AlertSeverity,
+    EgressSettings,
+    EscalationTier,
+)
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
@@ -29,7 +36,10 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
     env,
 )
-from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
+from messagefoundry.pipeline.alert_sinks import (
+    _AUTO_RESOLVE,
+    NotifierAlertSink,
+)
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -54,10 +64,11 @@ def held_port() -> Iterator[tuple[int, socket.socket]]:
         s.close()
 
 
-async def _settle(sink: NotifierAlertSink) -> None:
+async def _settle(sink: NotifierAlertSink, tasks: set[asyncio.Task[None]] | None = None) -> None:
     # Only the still-running tasks: a done task leaves the set through a callback that a gather of
-    # finished tasks never yields to (tests/test_ad_user_account_control.py says why).
-    while pending := [t for t in sink._state_tasks if not t.done()]:
+    # finished tasks never yields to (tests/test_ad_user_account_control.py says why). The state
+    # writes unless another task set is named.
+    while pending := [t for t in (sink._state_tasks if tasks is None else tasks) if not t.done()]:
         await asyncio.gather(*pending)
 
 
@@ -332,3 +343,97 @@ async def test_a_clustered_node_or_unowned_namesake_resolves_nothing(
         assert sink.started == ["SHARED"]
     finally:
         await runner.stop()
+
+
+class _RecordingTransport:
+    # The shape tests/test_alert_escalation.py uses.
+    name = "webhook"
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        self.events.append(event)
+
+
+async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
+    store: MessageStore,
+) -> None:
+    # Review note 1 on BACKLOG #1741: the inverse resolves the instance every cycle, and a resolve
+    # that reset the occurrence count would restart a restart_inbound crash loop at the base tier
+    # each time, so an after_count tier is never reached. Each cycle is the per_lane router STOP
+    # (hold + the worker returning + its connection_stopped), the rule's restart, and the start's
+    # connection_started.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    rule = AlertRule(
+        event_type="connection_stopped",
+        connection="IB",
+        severity=AlertSeverity.WARNING,
+        cooldown_seconds=0.001,  # the floor is above 0; each cycle waits it out below
+        control_action="restart_inbound",
+        escalate=[EscalationTier(after_count=3, severity=AlertSeverity.CRITICAL)],
+    )
+    pages = _RecordingTransport()
+    sink = NotifierAlertSink([pages], rules=[rule], store=store)
+    runner = _runner(reg, store, sink, claim_mode="per_lane")
+    restarts: list[str] = []
+    go = asyncio.Event()  # holds each restart until the cycle has read the open instance
+
+    async def _control(action: str, target: str, *, default_target: bool) -> None:
+        assert action == "restart_inbound"
+        restarts.append(target)
+        await go.wait()
+        go.clear()
+        await runner.restart_inbound(target)
+
+    sink.set_control_callback(_control)
+    sink.start()
+    await runner.start()
+    try:
+        tiers: list[int] = []
+        for _ in range(4):
+            await asyncio.sleep(0.01)
+            runner._hold_for_operator("IB", "inbound")
+            task = runner._router_workers["IB"]
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            sink.connection_stopped("IB", detail="router halted on internal error")
+            await _settle(sink)
+            open_tiers = [
+                i.escalation_tier
+                for i in await store.list_active_alert_instances(allowed_channels=None)
+            ]
+            go.set()
+            await _settle(sink, sink._control_tasks)
+            await _settle(sink)
+            assert runner.inbound_running("IB") and await _open(store) == set()
+            tiers.extend(open_tiers)
+        assert restarts == ["IB"] * 4
+        # The tier the durable instance records is the tier the loop has reached.
+        assert tiers == [0, 0, 1, 1]
+    finally:
+        await runner.stop()
+        await sink.aclose()
+    assert [e["severity"] for e in pages.events] == ["warning", "warning", "critical", "critical"]
+
+
+async def test_an_operator_resolve_still_restarts_the_count() -> None:
+    # Only the connection_started inverse keeps the count; forget() (an operator resolve) and every
+    # other inverse still clear it, as ADR 0133 D1 says.
+    sink = NotifierAlertSink([])
+    sink._occurrences["connection_stopped:IB"] = 5
+    sink._occurrences["connection_error:OB"] = 5
+    sink.forget("connection_stopped", "IB")
+    assert "connection_stopped:IB" not in sink._occurrences
+
+    class _Resolve:
+        async def resolve_alert_instances_for(self, **_kw: object) -> int:
+            return 0
+
+    sink.set_store(_Resolve())  # type: ignore[arg-type]
+    sink.connection_restored("OB")
+    assert "connection_error:OB" not in sink._occurrences
+    await _settle(sink)
