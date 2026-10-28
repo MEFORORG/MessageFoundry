@@ -3409,7 +3409,10 @@ passkey is then refused with, audited `auth.webauthn_failed`, include at least
 `reason=factor_removed`, `reason=factor_unverified` when the passkey set read after the write fails
 its seal, `reason=session_lost` when the session or the account went with it, and `reason=locked`;
 an MFA reset gives `reason=session_lost` once its revocation has landed, and
-`reason=factor_removed` before.
+`reason=factor_removed` before. A database driver error, a lost connection or a pool acquire timeout
+in the passkey set read after the write, on any sign-count answer, is refused with
+`reason=store_error` and leaves the factor unmarked (BACKLOG #3775); what still raises there is
+listed in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment of 2026-10-17.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). Unless a setting turns it off or loosens it (at least
 `[auth].login_rate_limit_enabled = false`; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced)

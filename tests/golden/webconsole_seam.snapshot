@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-27c38abe54f0ffde
+36c5fa9d74fc1625
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -275,7 +275,7 @@ messagefoundry.api.models.ConnectionEventInfo: connection, direction, id, kind, 
 messagefoundry.api.models.ConnectionEventList: before_id, events, limit, offset, total
 messagefoundry.api.models.ConnectionFlagRequest: direction, flagged
 messagefoundry.api.models.ConnectionRow: alerts_active, backlog_seconds, channel_id, channel_name, delivered_age_seconds, destination, direction, error, errored, flagged, idle_seconds, method, name, owner_shard, paused, peer, port, queue_depth, read, role, simulated, status, toml_managed, waiting_for_reply, written
-messagefoundry.api.models.DbInfo: audit, disk_free_bytes, events, journal_mode, messages, path, size_bytes, synchronous
+messagefoundry.api.models.DbInfo: audit, disk_free_bytes, disk_free_status, events, journal_mode, messages, path, size_bytes, synchronous
 messagefoundry.api.models.DeadLetterList: dead_letters, limit, offset, replay_targets, replayable_in_scope, total
 messagefoundry.api.models.DeadLetterReplayRequest: channel_id, destination_name
 messagefoundry.api.models.DeadLetterRow: attempts, channel_id, control_id, destination_name, failed_at, last_error, message_id, message_type, outbox_id, received_at, summary
@@ -335,6 +335,7 @@ messagefoundry.config.ai_policy.SecurityEnforcement: ENFORCE, WARN
 messagefoundry.api.auth_models.ChannelScope.expected_source: ad, manual
 messagefoundry.api.models.ApprovalResolveRequest.outcome: effects_applied, effects_not_applied
 messagefoundry.api.models.ConnectionFlagRequest.direction: inbound, outbound
+messagefoundry.api.models.DbInfo.disk_free_status: not_applicable, observed, unobservable
 messagefoundry.api.models.PendingApprovalInfo.release_blocked: no_requester_id, not_gated, operation_unavailable, params_no_requester, params_unreadable, requester_not_authorized
 messagefoundry.api.models.PendingApprovalInfo.status: interrupted, pending
 messagefoundry.api.models.SearchPresetCriteria.target: both, raw, summary
