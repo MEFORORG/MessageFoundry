@@ -2155,7 +2155,8 @@ Properties of the anonymizer:
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
   scrubbed dataset stays structurally realistic.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
-  loose string search.
+  loose string search. With no site prefix loaded it matches nothing, and
+  `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
   reach. Plain `anonymize` and `anonymize_checked` both refuse it, on the engine and on the tee.
@@ -2373,8 +2374,11 @@ What the `date` kind does to a value:
   one timestamp, and a second one after the component separator is not a precision code.
 - An `OBX-5` result whose `OBX-2` type is `DT` or `TS`, such as a last menstrual period, takes the
   `date` kind too: the year stays, and a value that is not a valid timestamp is scrubbed to
-  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is still
-  kept whole, and one sent as `DTM` or `ST` is redacted whole.
+  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is kept
+  whole whenever it fits the `NM` grammar below. At least these fit: digits alone, such as
+  `20110715`, even after a sign or a comparator; one decimal point, such as `2011.07`; and a date
+  split across repetitions. A dash or a slash inside the date, as in `2011-07-15`, does not fit,
+  so that one is redacted whole, as is one sent as `DTM` or `ST`.
 - An `OBX-5` result whose `OBX-2` type is `NM`, `SN` or `TM` is kept whole only when it fits the
   grammar of that type (vault BACKLOG #2961). `NM` is an optional comparator, an optional sign,
   digits and at most one decimal point. `SN` is a comparator, a number, a separator and a second
@@ -2382,9 +2386,9 @@ What the `date` kind does to a value:
   becomes `[REDACTED]`. So `123-45-6789` or `555-555-0100` under a numeric label would no longer
   leave whole, and neither would an eight-digit date under `TM`. **The grammar cannot tell a
   number from an identifier written as a number.** At least these would still leave whole under
-  `NM`, and in a number part of an `SN`: an undashed nine-digit number, which is the shape of an
-  SSN; an undashed ten-digit number, or eleven digits after a `+`, which is the shape of a phone
-  number; an eight-digit number that reads as a date; and an identifier split across repetitions.
+  `NM`, and in a number part of an `SN`. An undashed nine-digit number has the shape of an SSN.
+  An undashed ten-digit number, or eleven digits after a `+`, has the shape of a phone number. An
+  eight-digit number can read as a date. And an identifier can be split across repetitions.
   Under `TM`, at least a six-digit date whose parts are in range for a time would still leave
   whole: `150312` reads as 15:03:12. The leak-check's shape detectors do not scan `OBX-5`,
   because a rule maps it, so nothing refuses these. A message that declares a digit or one of
