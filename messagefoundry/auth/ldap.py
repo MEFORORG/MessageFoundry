@@ -1007,6 +1007,18 @@ def _reading_connection(exc: BaseException) -> Any:
     return connection if in_ldap3 else None
 
 
+def _close_without_sending(conn: Any, why: str) -> None:
+    """Shut ``conn``'s socket with ldap3's ``BaseStrategy.close``, which sends nothing on a stream
+    that may be out of step or already failed. Best effort: an error is logged at DEBUG, by type
+    only, because the caller's answer stands either way."""
+    import ldap3
+
+    try:
+        conn.strategy.close()
+    except (ldap3.core.exceptions.LDAPException, OSError) as failed:
+        logger.debug("AD socket close %s: %s", why, _type_name(failed))
+
+
 @contextlib.contextmanager
 def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
     """The boundary every ldap3 call that reads a response runs inside: each search and each page
@@ -1044,14 +1056,8 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
         if connection is None:
             raise
         if close:
-            # BaseStrategy.close shuts the socket without sending anything on a stream that may
-            # be out of step. Best effort: the refusal below is the answer either way.
-            try:
-                connection.strategy.close()
-            except (ldap3.core.exceptions.LDAPException, OSError) as failed:
-                logger.debug(
-                    "AD socket close after an undecodable response: %s", _type_name(failed)
-                )
+            # The refusal below is the answer either way.
+            _close_without_sending(connection, "after an undecodable response")
         if _is_bind_referral(exc):
             raise _referred_bind(operation) from exc
         raise _undecodable(operation, exc) from exc
@@ -1380,8 +1386,10 @@ def _socket_faults_as_ldap_error() -> Iterator[None]:
     Two wraps are wider than the open, and each says why. The ``auto_bind`` construction checks its
     keywords and opens in one call, so a renamed ldap3 keyword there would map; the real-ldap3 arms
     of ``tests/test_ldap_referrals.py`` build that connection, so one would fail there first. And
-    ``authenticate`` wraps the whole decoy bind, which must neither map nor swallow by itself
-    beyond the release both branches share (:func:`_released`).
+    ``authenticate`` wraps the whole decoy bind, which must neither map nor swallow by itself.
+    Its release is inside that wrap and the real bind's is not, so an unbind fault of one of these
+    types that is not an ldap3 error still maps on the decoy branch alone (#3830 item 9); an ldap3
+    one :func:`_released` logs on both.
 
     A response ldap3 could not decode is not a socket fault: each bind also runs inside
     :func:`_ldap3_call`, nested inside this wrap, which refuses it first.
@@ -1485,17 +1493,18 @@ def _refuse_service_bind(exc: BaseException) -> NoReturn:
 def _released(conn: Any, what: str) -> Iterator[None]:
     """Unbind ``conn`` when the block ends, however it ends. An ldap3 error from the unbind is
     logged at DEBUG, by type only and naming ``what`` connection it was, and never raised: by then
-    the block has answered or raised. Any other error from the unbind still propagates, so an
+    the block has answered or raised. **Everything below holds for an ldap3 error only.** Any other
+    error from the unbind propagates, replacing the block's outcome and skipping the close, so an
     engine defect there does not hide as a log line.
 
-    **The socket is closed even when the unbind's send fails.** ldap3 2.9.1's ``unbind`` sends the
-    request and only then closes, so a failed send left the socket open until the object was
-    collected. ``BaseStrategy.close`` shuts it without sending anything, as :func:`_ldap3_call`
-    does after an undecodable response.
+    **After an ldap3 error, the socket is closed without sending.** ldap3 2.9.1's ``unbind`` sends
+    the request and only then closes, so a failed send left the socket open until the object was
+    collected (:func:`_close_without_sending`).
 
-    **It never replaces an exception the block raised (BACKLOG #3010).** The block's own exception
-    is the answer both bind branches give, so an unbind failing after an undecodable bind must not
-    replace it on one branch only, or an absent account and a present one would answer differently.
+    **An ldap3 unbind error never replaces an exception the block raised (BACKLOG #3010).** The
+    block's own exception is the answer both bind branches give, so an unbind failing after an
+    undecodable bind must not replace it on one branch only, or an absent account and a present one
+    would answer differently.
 
     **Nor does it replace an answer the block returned (BACKLOG #3848).** A refused bind returns
     from inside this block, and must still reach the step-up re-bind as a refused password, which
@@ -1512,10 +1521,7 @@ def _released(conn: Any, what: str) -> Iterator[None]:
             conn.unbind()
         except ldap3.core.exceptions.LDAPException as failed:
             logger.debug("AD %s unbind failed: %s", what, _type_name(failed))
-            try:
-                conn.strategy.close()
-            except (ldap3.core.exceptions.LDAPException, OSError) as unclosed:
-                logger.debug("AD %s socket close failed: %s", what, _type_name(unclosed))
+            _close_without_sending(conn, f"after a failed {what} unbind")
 
 
 class LdapAuthenticator:

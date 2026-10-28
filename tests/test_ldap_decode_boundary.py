@@ -749,6 +749,29 @@ def test_a_probe_answered_before_the_unbind_fails_keeps_its_answer() -> None:
             assert authenticator.probe_principal("alice").principal is not None
 
 
+def test_a_real_socket_is_closed_when_the_unbind_send_fails() -> None:
+    """The close after a failed unbind, through a REAL ldap3 stack (BACKLOG #3848): the unbind
+    request's send fails inside ldap3's own ``unbind``, before ldap3 would close, and the
+    connection still ends closed with no socket. RED when ``_released`` drops the close, or when a
+    future ldap3's ``BaseStrategy.close`` stops shutting a socket ldap3 left open."""
+    from ldap3.strategy.base import BaseStrategy
+
+    real_send = BaseStrategy.send
+    released: list[Any] = []
+
+    def send(self: Any, message_type: str, request: Any, controls: Any = None) -> Any:
+        if message_type == "unbindRequest":
+            released.append(self.connection)
+            raise ldap3.core.exceptions.LDAPSocketSendError("synthetic: the unbind's send failed")
+        return real_send(self, message_type, request, controls)
+
+    with _scripted_dc(_groups_answered) as (_dc, authenticator), pytest.MonkeyPatch.context() as mp:
+        mp.setattr(BaseStrategy, "send", send)
+        assert authenticator.probe_principal("alice").principal is not None
+    assert len(released) == 1, "the unbind's send did not fail once"
+    assert released[0].closed and released[0].socket is None
+
+
 def test_the_refusal_warns_once_per_operation_and_fault(caplog: pytest.LogCaptureFixture) -> None:
     with _scripted_dc(lambda _raw: [_done(4242)]) as (_dc, authenticator):
         for _ in range(3):

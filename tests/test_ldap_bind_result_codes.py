@@ -203,16 +203,18 @@ def test_real_ldap3_leaves_the_bind_code_where_the_refusal_reads_it(code: int) -
 def _unbind_fails_after_a_bind(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str | None]]:
     """Over the bind already installed, make ``unbind`` raise an ldap3 error on each connection
     that ran an explicit bind, as a send failing on the release would, before ldap3 closes the
-    socket. The service connection binds in its constructor, so its unbind runs as installed.
-    Returns each failed unbind and each socket close, in order, as ``(event, DN)``."""
+    socket. The service connection is built with ``auto_bind``, which these doubles never route
+    through ``bind()``, so its unbind runs as installed. Returns each failed unbind and each socket
+    close, in order, as ``(event, DN)``."""
     bind, unbind_before = ldap3.Connection.bind, ldap3.Connection.unbind
     events: list[tuple[str, str | None]] = []
 
     def binding(self: Any) -> bool:
+        bound = bool(bind(self))
         dn = getattr(self, "_bind_dn", None)
         self.mf_bind_ran = True
         self.strategy = SimpleNamespace(close=lambda: events.append(("closed", dn)))
-        return bool(bind(self))
+        return bound
 
     def unbind(self: Any) -> None:
         if not getattr(self, "mf_bind_ran", False):
