@@ -716,8 +716,9 @@ def preserve_obx5_value(value_type: str | None, value: str | None, seps: Seps) -
     """True if an OBX-5 carrying ``value`` under declared type ``value_type`` may be left INTACT.
 
     The fail-closed half of the OBX-5 free-text rule, shared byte-for-byte by the engine and tee
-    adapters (ADR 0030 §1 parity) so the two can never disagree about a value type. Two gates, and
-    anything that clears neither is redacted:
+    adapters (ADR 0030 §1 parity) so the two can never disagree about a value type. A message whose
+    component, repetition or subcomponent separator is whitespace keeps nothing here. Past that, two
+    gates, and anything that clears neither is redacted:
 
     * the declared type must be on the preserve allowlist above — an absent, empty or unknown OBX-2
       falls straight through to ``False``; and
@@ -736,7 +737,8 @@ def preserve_obx5_value(value_type: str | None, value: str | None, seps: Seps) -
     text = value or ""
     # A space is how words and digit groups are written apart. Under a whitespace component,
     # repetition or subcomponent separator, ``000 12 3456`` splits into three valid numbers and a
-    # sentence into bare tokens, so no type is kept. The field separator is not read.
+    # sentence into bare tokens, so no numeric or coded value is kept. A date type never reaches
+    # this function. The field separator is not read.
     if any(mark.isspace() for mark in (seps.component, seps.repetition, seps.subcomponent)):
         return False
     if (grammar := _NUMERIC_OBX_GRAMMAR.get(declared)) is not None:

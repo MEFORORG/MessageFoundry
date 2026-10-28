@@ -2386,16 +2386,21 @@ What the `date` kind does to a value:
   least these would still leave whole under `NM`, and in a number part of an `SN`: an undashed
   nine-digit number, which is the shape of an SSN; an undashed ten-digit number, or eleven digits
   after a `+`, which is the shape of a phone number; an eight-digit number that reads as a date;
-  and an identifier split across repetitions. Under `TM`, at least a six-digit date whose parts
-  are in range for a time would still leave whole: `150312` reads as 15:03:12. The leak-check's
+  and an identifier split across repetitions. In an `SN`, a date or a phone number written as two
+  numbers and a separator, such as `^1945^-^0612`, would still leave whole too. Under `TM`, at
+  least a four-digit month and day, such as `0612`, and a six-digit date whose parts are in range
+  for a time, such as `150312`, would still leave whole. The leak-check's
   shape detectors do not scan `OBX-5`, because a rule maps it, so nothing refuses these. A message
   that declares a digit or one of `+ - . : / < > =` as its component, repetition or subcomponent
   separator keeps no numeric `OBX-5` value, and one that declares a whitespace character there
-  keeps no `OBX-5` value of any type. The guard does not read the field separator. Under a field
-  separator of `-`, at least a value such as `000-12-3456` would still leave whole. The message
-  itself splits it across `OBX-5`, `OBX-6` and `OBX-7`. The first part is a valid number, and no
-  rule maps the other two fields. Under the coded types `ID`, `IS`, `CE` and `CWE` a single word,
-  such as a surname, would still leave whole.
+  keeps no numeric or coded `OBX-5` value. A `DT` or `TS` value takes the `date` kind there as
+  anywhere, and that kind splits on the repetition separator, so under a space it would keep at
+  least every year-shaped run of four digits. The guard does not read the field separator. Under a
+  field separator of `-`, at least a value such as `000-12-3456` would still leave whole. The
+  message itself splits it across `OBX-5`, `OBX-6` and `OBX-7`. The first part is a valid number,
+  and no rule maps the other two fields. Under the coded types `ID`, `IS`, `CE` and `CWE`, at least a
+  bare token, such as a surname or `000-12-3456`, and a name split across components, such as
+  `DOE^JOHN`, would still leave whole.
 - When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
   site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
   kind filled, so the filled date stays a date. Two things follow. A site code that reads as a
