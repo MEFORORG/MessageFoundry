@@ -2221,7 +2221,7 @@ class WebAuthnCredential:
         try:
             raw = d.get("transports")
             transports = json.loads(raw) if raw else None
-            if transports is not None and not isinstance(transports, list):
+            if raw and not isinstance(transports, list):  # ``null`` included
                 raise TypeError("transports is not a list")
             return cls(
                 credential_id_hash=d["credential_id_hash"],
@@ -2947,7 +2947,9 @@ async def escalation_passkeys(
 
     A passkey row that does not parse answers ``None``, logged: the lock then keeps the fixed
     length, and the count still lands. Raising here would roll the count back, and a malformed row
-    would then stop the account ever locking."""
+    would then stop the account ever locking. ``ValueError`` is caught beside
+    :class:`PasskeyRowMalformed` for a value the driver cannot decode while fetching, before any
+    row is parsed (a ``UnicodeDecodeError`` on SQL Server)."""
     if counter != "sign_in" or passkey_escalates is None:
         return None
     record = await read_record()
@@ -2955,11 +2957,11 @@ async def escalation_passkeys(
         return None
     try:
         return await read_passkeys()
-    except PasskeyRowMalformed as exc:
+    except (PasskeyRowMalformed, ValueError) as exc:
         log.warning(
             "a passkey row of user %s did not parse (%s); its sign-in lock keeps its fixed length",
             record.row.id,
-            exc,
+            type(exc).__name__,
         )
         return None
 
@@ -16382,9 +16384,8 @@ class MessageStore:
         from ``auth_provider`` read in the SAME locked ``SELECT``; for the SIGN-IN lock a refused
         TOTP is judged by ``totp_usable`` before the lock, only for a failure that would set a
         later-cycle lock, on a cell the locked row must still hold (:func:`escalation_verdict`,
-        BACKLOG #3422). A passkey that ``passkey_escalates`` counts escalates the SIGN-IN lock too,
-        asked of the set read in this same transaction after the account row
-        (:func:`escalation_passkeys`, BACKLOG #3937 item 8). The count itself stays atomic.
+        BACKLOG #3422). The passkey half of the escalation is :func:`escalation_passkeys`
+        (BACKLOG #3937 item 8). The count itself stays atomic.
 
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""

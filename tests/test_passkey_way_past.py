@@ -1827,11 +1827,13 @@ async def test_without_the_webauthn_extra_a_passkey_does_not_escalate_the_lock(
 
 
 #: ``transports`` values that do not parse: not JSON, JSON but no list (a scalar, and a string
-#: that would iterate as characters), and JSON nested past the recursion limit.
-_UNPARSEABLE_TRANSPORTS = ["not json", "5", '"usb"', "[" * 100_000]
+#: that would iterate as characters, and ``null``), and JSON nested past the recursion limit.
+_UNPARSEABLE_TRANSPORTS = ["not json", "5", '"usb"', "null", "[" * 100_000]
 
 
-@pytest.mark.parametrize("transports", _UNPARSEABLE_TRANSPORTS, ids=["text", "5", "str", "deep"])
+@pytest.mark.parametrize(
+    "transports", _UNPARSEABLE_TRANSPORTS, ids=["text", "5", "str", "null", "deep"]
+)
 async def test_a_passkey_row_that_does_not_parse_still_lets_the_lock_arm(transports: str) -> None:
     """The escalation reads the passkey set inside the count's own transaction. A row that does not
     parse must not roll the count back, or the account would never lock: it keeps the fixed length

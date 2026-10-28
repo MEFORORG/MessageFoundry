@@ -10451,39 +10451,30 @@ class AuthService:
         ceremony. On a keyless store there is no digest to check. A mismatch is read once more,
         account and passkeys, before it is reported, for the reason :meth:`_verified` gives.
 
-        A passkey row that does not parse is ``None`` too (:meth:`_read_passkeys`), never an
-        exception: every caller already denies on ``None``, and several answer a caller who has
-        proved nothing (the sign-in and its lock notice, BACKLOG #3937), where a 500 would name the
-        account as one holding a passkey."""
-        creds = await self._read_passkeys(user.id)
-        if creds is None:
-            return None
-        if self._store.row_sealer() is None or passkey_digest(creds) == user.cred_digest:
-            return creds
-        fresh = await self._load_user(user.id)
-        if fresh is None:
-            return None  # gone, or failing its own seal, which _verified has reported
-        creds = await self._read_passkeys(user.id)
-        if creds is None:
+        A passkey row that does not parse is ``None`` too, never an exception: every caller
+        already denies on ``None``, and several answer a caller who has proved nothing (the sign-in
+        and its lock notice, BACKLOG #3937), where a 500 would name the account as one holding a
+        passkey. The store never writes such a row, so on a sealed store it is reported as the set
+        failing its seal; on a keyless store it is logged, at most once per report interval."""
+        try:
+            creds = await self._store.list_webauthn_credentials(user.id)
+            if self._store.row_sealer() is None or passkey_digest(creds) == user.cred_digest:
+                return creds
+            fresh = await self._load_user(user.id)
+            if fresh is None:
+                return None  # gone, or failing its own seal, which _verified has reported
+            creds = await self._store.list_webauthn_credentials(user.id)
+        except PasskeyRowMalformed as exc:
+            if self._store.row_sealer() is not None:
+                _log.debug("a passkey row of user %s did not parse (%s)", user.id, exc)
+                await self._user_seal_failed(user.id, part="passkeys")
+            elif self._seal_failures_reported.due(f"passkey-parse:{user.id}"):
+                _log.warning("a passkey row of user %s did not parse (%s)", user.id, exc)
             return None
         if passkey_digest(creds) == fresh.cred_digest:
             return creds
         await self._user_seal_failed(user.id, part="passkeys")
         return None
-
-    async def _read_passkeys(self, user_id: str) -> list[WebAuthnCredential] | None:
-        """The account's passkey rows, or ``None`` where one does not parse (BACKLOG #3937),
-        UNCHECKED against the seal: :meth:`_verified_passkeys` is its only caller. The store never
-        writes such a row, so on a sealed store it is reported as the passkey set
-        failing its seal; on a keyless store, with nothing to check it against, it is logged."""
-        try:
-            return await self._store.list_webauthn_credentials(user_id)
-        except PasskeyRowMalformed as exc:
-            if self._store.row_sealer() is not None:
-                await self._user_seal_failed(user_id, part="passkeys")
-            else:
-                _log.warning("a passkey row of user %s did not parse (%s)", user_id, exc)
-            return None
 
     async def _user_seal_failed(self, user_id: str, *, part: str = USER_KIND) -> None:
         """Report an account whose record (or, with ``part="passkeys"``, whose passkey set) failed
