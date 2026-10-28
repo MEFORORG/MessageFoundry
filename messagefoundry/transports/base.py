@@ -741,7 +741,7 @@ def build_archive_guard(dirs: Iterable[Path]) -> ArchiveGuard:
         for candidate in (here, *here.parents):
             if candidate in seen:
                 found = True
-                break  # it and everything above it were recorded for an earlier directory
+                break  # it, with its identity, and everything above it were recorded already
             try:
                 st = os.stat(candidate)
             except (OSError, ValueError) as exc:
@@ -753,8 +753,10 @@ def build_archive_guard(dirs: Iterable[Path]) -> ArchiveGuard:
             if not st.st_ino and not found:
                 break  # no identity for the guarded directory (or its stand-in): unresolved
             found = True
-            seen.add(candidate)
             if st.st_ino:
+                # Only a directory with an identity is memoised: one of inode 0 reached first as an
+                # ancestor must still be unresolved when it is itself a guarded directory.
+                seen.add(candidate)
                 ids.add((st.st_dev, st.st_ino))
         if not found:
             unresolved.add(Path(path))

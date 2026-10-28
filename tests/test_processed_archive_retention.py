@@ -567,6 +567,30 @@ def test_a_guarded_directory_of_inode_zero_is_unresolved(
     assert build_archive_guard({guarded}).unresolved == {guarded}
 
 
+def test_an_inode_zero_ancestor_seen_first_is_still_unresolved_when_guarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory first reached as an ancestor, whose stat reports inode 0, is later itself a
+    guarded directory. It must be unresolved, not passed because it was walked already.
+
+    Mutation: memoise every stat'ed directory in `build_archive_guard`. Red."""
+    parent = tmp_path / "shares"
+    child = parent / "in"
+    child.mkdir(parents=True)
+    real_stat = os.stat
+    target = Path(os.path.realpath(parent))
+
+    def listing_answer(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        st = real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+        if isinstance(path, (str, os.PathLike)) and Path(path) == target:
+            return os.stat_result((st.st_mode, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return st
+
+    monkeypatch.setattr(os, "stat", listing_answer)
+
+    assert build_archive_guard([child, parent]).unresolved == {parent}
+
+
 def test_a_missing_archive_directory_is_not_an_error(tmp_path: Path) -> None:
     assert _prune(_source(tmp_path / "in")) == 0
 
