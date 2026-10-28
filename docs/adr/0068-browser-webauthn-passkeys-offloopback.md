@@ -666,9 +666,11 @@ reads that follow cannot drop it. A cancel before the row is written writes none
 then refused, and no refusal writes a second clone row. The reasons a gone passkey is refused
 with, audited `auth.webauthn_failed`, include at least `factor_removed`, `factor_unverified` when
 the passkey set read after the write fails its seal, `session_lost` when the session or the
-account went with it, and `locked` when a second-step lock landed. A store error in the passkey set
-read after the write, whatever the store answered, is refused with `store_error` (BACKLOG #3775); a
-store error in the session, account and lock re-read before it still raises.
+account went with it, and `locked` when a second-step lock landed. A database driver error, a lost
+connection or a pool acquire timeout in the passkey set read after the write, on any sign-count
+answer, is refused with `store_error` (BACKLOG #3775). At least a closed SQLite connection, the
+engine's other `RuntimeError` refusals and SQLite's `ProgrammingError` still raise there, and so
+does a store error in the session, account and lock re-read before it.
 
 **Why a gone passkey still raises the signal.** A self-service passkey delete takes no account
 queue, and an MFA reset deletes every passkey before it revokes the sessions, so either can land
