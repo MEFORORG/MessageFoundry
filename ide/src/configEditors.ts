@@ -14,10 +14,11 @@
 // reloading the (clean) document from disk, which is BYPASSED if the same file is also open, dirty, in
 // a text view.
 import * as vscode from "vscode";
-import { configDir, runJson, workspaceDir } from "./cli";
+import { configDir, runJson, serviceConfig, workspaceDir } from "./cli";
 import { postToWebview } from "./webviewMessaging";
 import { connectionFormHtml, formSchemaFor } from "./connectionEditor";
 import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
+import { connectionRemoveArgs, connectionServiceConfig, connectionUpsertArgs } from "./connectionWizardModel";
 import { Detail, codeSetFormHtml } from "./codeSetEditor";
 import {
   ConnectionListItem,
@@ -195,7 +196,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           }
           markSaving();
           try {
-            await runJson(["connection", "upsert", "--config", configDir(), "--data", JSON.stringify(plan.conn)], ws);
+            await runJson(connectionUpsertArgs(configDir(), connectionServiceConfig(ws, serviceConfig()), plan.conn), ws);
           } catch (e) {
             clearGuard();
             postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });
@@ -215,7 +216,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           }
           markSaving();
           try {
-            await runJson(["connection", "remove", "--config", configDir(), "--name", m.name], ws);
+            await runJson(connectionRemoveArgs(configDir(), connectionServiceConfig(ws, serviceConfig()), m.name), ws);
           } catch (e) {
             clearGuard();
             postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });

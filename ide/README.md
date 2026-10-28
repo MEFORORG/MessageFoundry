@@ -189,7 +189,11 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   a checked-in `.vscode/settings.json` cannot swap in another interpreter.
 - `messagefoundry.configDir` (default `samples/config`) — config modules directory.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
-  loads; the Alert Wizard and the security editor read/write their sections of it.
+  loads; the Alert Wizard and the security editor read/write their sections of it. Connection edits
+  are checked against this file, at least its `[egress]` allowlist, by passing it as
+  `--service-config`. The flag is left off only where neither this file nor a workspace
+  `messagefoundry.toml` exists. Where this file is missing but that one exists, a connection edit
+  fails with "service config not found" rather than be checked against the other file.
 - `messagefoundry.engineUrl` (default `https://127.0.0.1:8765`) — engine API URL used by
   *Stage → Promote* when no named environments are configured. **Machine-scoped** (a workspace file
   cannot retarget a promote, and with it your credentials, at another host). https by default

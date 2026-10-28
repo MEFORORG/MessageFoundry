@@ -372,7 +372,7 @@ messagefoundry connection upsert --config samples/config --data '{...}'
 messagefoundry connection remove --config samples/config --name IB_ACME_ADT_TCP
 ```
 
-`upsert`/`remove` validate the whole config dir (structure + connector build + the fail-closed `[egress]` allowlist) against a candidate before it replaces the file, so a refused edit never touches it.
+`upsert`/`remove` validate the whole config dir (structure + connector build + the fail-closed `[egress]` allowlist) against a candidate before it replaces the file, so a refused edit never touches it. The allowlist is read from `--service-config <file>`, else from a `messagefoundry.toml` in the working directory if one is there. The VS Code editor passes its `messagefoundry.serviceConfig` setting as `--service-config`; the IDE README's *Settings* section says when it leaves the flag off.
 
 ### Try it end-to-end
 

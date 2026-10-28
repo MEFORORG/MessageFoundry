@@ -316,7 +316,8 @@ def test_connection_upsert_refuses_what_an_enforcing_reload_would(
 def test_connection_upsert_says_which_settings_it_read_when_none_were_named(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The IDE's usual call names no --service-config, so the edit is judged against the defaults
+    # A call may name no --service-config: a hand-run one, or the IDE's where the workspace has no
+    # settings file yet (vault BACKLOG #2908). The edit is then judged against the defaults
     # (enforce, no acknowledgement). The refusal must say so, or it names a switch the instance
     # may already have set.
     _clear_posture_env(monkeypatch)

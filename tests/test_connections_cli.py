@@ -505,7 +505,8 @@ def _no_egress_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_an_unlisted_outbound_edit_without_a_service_config_names_where_the_list_goes(
     cfg: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The IDE runs `connection upsert` with no --service-config. Under the deny default (vault
+    # A `connection upsert` may name no --service-config: a hand-run one, or the IDE's where the
+    # workspace has no settings file yet, as here (vault BACKLOG #2908). Under the deny default (vault
     # BACKLOG #2605) an unlisted outbound is refused, and the refusal must say which flag and which
     # [egress] list fix it, rather than leave the analyst guessing which file was read.
     monkeypatch.chdir(cfg)  # no messagefoundry.toml here, so no settings file is found
