@@ -120,11 +120,13 @@ answers 503 with a `Retry-After`, the CLI prints one error line, and no session 
   seal names a key version below `min_decryption_version`, one the Vault node that answered does
   not hold yet, or a planted one, and the reply cannot tell them apart. So a genuine seal checked
   against a Vault node that lags a rotation reads as unverifiable, and its user signs in again. It
-  is treated as a failed seal, under its own audit action, `integrity.authority_seal_unverifiable`:
-  the row is denied, a session is ended, and a directory map grants nothing. The API refuses an
-  edit of a custom role whose seal is unverifiable (HTTP 409); delete it and create it again. Before raising the
-  minimum, read [Raising the Transit audit key's minimum
-  version](#raising-the-transit-audit-keys-minimum-version);
+  is treated as a failed seal, under its own audit action, `integrity.authority_seal_unverifiable`,
+  and paged per row: the row is denied and a session is ended. A directory map grants nothing to a
+  decision that writes nothing; a directory sign-in that would write from it is refused, and a
+  reconcile pass holds that map's diff. The API refuses an edit of a custom role or a directory
+  map whose seal is unverifiable (HTTP 409). Recover as [Recovering an unverifiable
+  row](#recovering-an-unverifiable-row) says, and before raising the minimum, read [Raising the
+  Transit audit key's minimum version](#raising-the-transit-audit-keys-minimum-version);
 - anything else Transit answers: an outage, as above.
 
 The audit row is written wherever the auth service or the approval gate reads the row. An
@@ -161,11 +163,32 @@ Under `vault_transit`, every authority row seal is an HMAC under the audit key, 
 was made under. **Do not raise the audit key's `min_decryption_version` while rows sealed under
 the older versions remain.** Transit then refuses to check those seals, so each such row is
 *unverifiable* and treated as a failed seal: its session is ended, its account or role grants
-nothing, and its directory map grants nothing and refuses a listing or a replacement (HTTP 409)
-until it is cleared. A row is sealed again only when the engine writes it, and
+nothing, and its directory map grants nothing, refuses a directory sign-in, and refuses a listing
+or a replacement (HTTP 409) until it verifies again or is cleared ([Recovering an unverifiable
+row](#recovering-an-unverifiable-row)). A row is sealed again only when the engine writes it, and
 no command re-seals rows yet. Lowering the minimum again makes the rows verify again, except a row
 the engine changed without re-sealing while it was unverifiable: deleting a custom role removes
 its holders' and its directory map's rows of it that way, so those records then fail as forged.
+
+### Recovering an unverifiable row
+
+Transit's refusal cannot tell a Vault node that lags a rotation from a retired version or a planted
+one, so take these steps in order, and stop at the first that clears it:
+
+1. **Check Vault first.** Confirm that Vault is healthy and that every node the engine reaches holds
+   the audit key's latest version, then retry. A lagging node clears by itself, and nothing needs
+   re-sealing.
+2. **Re-seal a row under a retired version.** Only if the row was sealed under a version the audit
+   key's `min_decryption_version` has retired: lower the minimum until the row verifies, save it
+   again (a custom role through its edit, a directory map through `PUT /ad-group-map` or
+   `PUT /ad-group-scope-map` with its pairs), which seals it under the latest version, then raise
+   the minimum again.
+3. **Delete or clear it, as the last resort.** A row that still does not verify may be planted.
+   Delete the custom role and create it again, or clear the directory map by saving it with no
+   entries and enter its pairs again. Both replace what the row held.
+
+While a directory map is unverifiable, no directory account can sign in, so take these steps as a
+local Administrator.
 
 ---
 

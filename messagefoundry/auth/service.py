@@ -2999,6 +2999,15 @@ async def _unless_unverifiable(check: Awaitable[bool]) -> bool | None:
         return None
 
 
+#: The first step of every unverifiable-seal recovery text (BACKLOG #2592). Transit's refusal cannot
+#: tell a lagging node from a retired version, so the transient cause is ruled out before any act
+#: that would replace or destroy a row that may be genuine. docs/PHI.md states the procedure.
+_UNVERIFIABLE_RECOVERY: Final = (
+    "This may be transient: first check that Vault is healthy and that every Vault node holds the"
+    " audit key's latest version, then retry."
+)
+
+
 class CustomRoleUnverifiableError(Exception):
     """An edit of a custom role whose stored seal Vault transit refused to check (BACKLOG #2592).
 
@@ -3010,8 +3019,11 @@ class CustomRoleUnverifiableError(Exception):
         # pickle call that.
         return (
             "this custom role's stored integrity seal cannot be verified by Vault transit, so it"
-            " was not saved: a save would replace the permissions it may still hold. To recover,"
-            " delete the role and create it again"
+            " was not saved: a save would replace the permissions it may still hold."
+            f" {_UNVERIFIABLE_RECOVERY} Only if the role was sealed under a key version the audit"
+            " key's min_decryption_version has retired, lower that minimum until the role"
+            " verifies and save it again, which re-seals it; deleting the role and creating it"
+            " again is the last resort"
         )
 
 
@@ -3020,8 +3032,9 @@ class AdMapUnverifiableError(Exception):
     refused to check (BACKLOG #2592), as :class:`CustomRoleUnverifiableError` is for a role.
 
     Refused rather than listed empty: an administrator saving from an empty listing would replace
-    pairs the map may genuinely hold. A role or channel decision never raises it; the map grants
-    nothing there. The text names the recovery, and nothing from the map."""
+    pairs the map may genuinely hold. A role or channel decision never raises it: one that writes
+    nothing reads the map as granting nothing, and a sign-in or reconcile pass that writes from it
+    holds instead. The text names the recovery, and nothing from the map."""
 
     def __init__(self, name: str) -> None:
         super().__init__(name)  # so ``args`` rebuilds it, for copy and pickle
@@ -3031,9 +3044,11 @@ class AdMapUnverifiableError(Exception):
         return (
             f"the {self.name}'s stored integrity seal cannot be verified by Vault transit, so it"
             " cannot be listed or replaced: an edit would overwrite the pairs it may still hold."
-            " To recover, make Vault transit hold the key version that sealed it again, or clear"
-            " the map through the API by saving it with no entries (PUT /ad-group-map or"
-            " /ad-group-scope-map) and then enter its pairs again"
+            f" {_UNVERIFIABLE_RECOVERY} Only if the map was sealed under a key version the audit"
+            " key's min_decryption_version has retired, lower that minimum until the map verifies"
+            " and save it again, which re-seals it; clearing the map by saving it with no entries"
+            " (PUT /ad-group-map or /ad-group-scope-map) and entering its pairs again is the last"
+            " resort"
         )
 
 

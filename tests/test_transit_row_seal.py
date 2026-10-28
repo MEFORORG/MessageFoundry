@@ -615,9 +615,9 @@ async def test_an_unverifiable_directory_map_refuses_a_listing_and_a_replace(
     await replace([pair], actor="t")
     assert await listing() == [pair]  # control
     await _retire_old_versions(store, transit)
-    with pytest.raises(AdMapUnverifiableError, match="clear the map"):
+    with pytest.raises(AdMapUnverifiableError, match="check that Vault is healthy"):
         await listing()
-    with pytest.raises(AdMapUnverifiableError, match="clear the map"):
+    with pytest.raises(AdMapUnverifiableError, match="check that Vault is healthy"):
         await replace([("other", pair[1])], actor="t")
     assert (await store.get_ad_map(name)).pairs == (pair,)  # no pair lost
     lookup = service._ad_roles_for_groups if roles else service._ad_channels_for_groups
@@ -662,8 +662,16 @@ def test_an_unverifiable_directory_map_is_a_409_naming_the_recovery() -> None:
     with pytest.raises(HTTPException) as caught, _ad_map_unverifiable_is_409():
         raise AdMapUnverifiableError(AD_ROLE_MAP)
     assert caught.value.status_code == 409
-    assert "clear the map" in str(caught.value.detail)
-    assert "ad_group_role_map" in str(caught.value.detail)
+    detail = str(caught.value.detail)
+    assert "ad_group_role_map" in detail
+    # The transient cause is ruled out before the act that would destroy genuine pairs.
+    assert detail.index("check that Vault is healthy") < detail.index("clearing the map")
+
+
+def test_the_custom_role_recovery_rules_out_vault_before_deleting() -> None:
+    detail = str(CustomRoleUnverifiableError())
+    assert detail.index("check that Vault is healthy") < detail.index("deleting the role")
+    assert detail.index("save it again") < detail.index("deleting the role")
 
 
 async def test_an_unverifiable_custom_role_is_listed_empty_refuses_an_edit_and_deletes(
@@ -681,7 +689,7 @@ async def test_an_unverifiable_custom_role_is_listed_empty_refuses_an_edit_and_d
     assert await service._load_role(role.id) is None
     [listed] = [r for r in await service.list_custom_roles() if r.id == role.id]
     assert listed.permissions == frozenset()
-    with pytest.raises(CustomRoleUnverifiableError, match="delete the role"):
+    with pytest.raises(CustomRoleUnverifiableError, match="check that Vault is healthy"):
         await service.update_custom_role(
             role.id, display_name="r", description=None, permissions=["messages:read"], actor="t"
         )

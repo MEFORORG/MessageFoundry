@@ -281,7 +281,7 @@ async def test_an_edit_of_a_custom_role_whose_seal_cannot_be_verified_answers_40
         monkeypatch.setattr(service, "update_custom_role", refused)
         r = await c.put(f"/roles/custom/{role.id}", json=body, headers=_auth(token))
         assert r.status_code == 409
-        assert "delete the role" in r.json()["detail"]
+        assert "check that Vault is healthy" in r.json()["detail"]
 
 
 async def test_security_events_feed_lists_callers_auth_events(engine: Engine) -> None:

@@ -1302,7 +1302,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         except CustomRoleError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         except CustomRoleUnverifiableError as exc:
-            # BACKLOG #2592: a fixed text that names deleting the role as the recovery.
+            # BACKLOG #2592: a fixed text that names the recovery, Vault first.
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
