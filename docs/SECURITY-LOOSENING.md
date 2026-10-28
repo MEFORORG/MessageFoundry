@@ -1878,9 +1878,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   the hook was in at some point, not that it still is, so read the entry as missing either way.
   In either case a later install call tries the add again. So a hook the other one refused at
   import still goes in if that hook stops refusing by the time `serve` or `supervise` makes its
-  own call. No copy stacks in either case, however many calls are made: a copy already in
-  refuses the add of another, and the install wraps the interpreter's unraisable hook only once
-  while its wrapper stays in place (vault BACKLOG #3673). Without a count,
+  own call. Repeated calls stack no second copy of the hook (vault BACKLOG #3673).
+  `install_remote_debug_guard` in `messagefoundry/remotedebug.py` says how, and what bounds it.
+  Without a count,
   the entry cannot tell the cases apart, so read it as the first, and look for what else in the
   process adds an audit hook.
 - **An audit hook added earlier can refuse a script ahead of the engine's, in any state.** Where

@@ -641,9 +641,18 @@ class _Installs:
 
     The add does what the interpreter does: it raises ``sys.addaudithook`` to each hook already
     in, and drops the new hook without an error when one raises an Exception. ``calls`` records
-    every add the install made; ``hooks`` holds the ones that went in."""
+    every add the install made; ``hooks`` holds the ones that went in. ``drops`` names the adds,
+    counted from 0, that an earlier hook refuses, so a test's scripted probes and this list agree.
+    """
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        enabled: bool = True,
+        drops: frozenset[int] = frozenset(),
+    ) -> None:
+        self.drops = drops
         self.calls: list[object] = []
         self.hooks: list[Callable[[str, tuple[object, ...]], object]] = []
         self.reporters = 0
@@ -660,6 +669,8 @@ class _Installs:
 
     def _add(self, hook: Callable[[str, tuple[object, ...]], object]) -> None:
         self.calls.append(hook)
+        if len(self.calls) - 1 in self.drops:
+            return
         for already in self.hooks:
             try:
                 already("sys.addaudithook", ())
@@ -794,16 +805,16 @@ def test_a_probe_that_reads_false_after_a_cut_off_one_adds_on_every_call(
 ) -> None:
     """The Lander's second finding on engine PR 2528: each call's probes, before and after its
     add, read None and None, then False and False, then None and None. The second call proves the
-    hook is not in, so the third call must add, as main does. Every call here tries the add. The
-    scripted probes, not the stand-in's list, say which add the interpreter kept, so this reads
-    the calls."""
-    installs = _Installs(monkeypatch)
+    hook is not in, so the third call must add, as main does. The stand-in drops the first two
+    adds, as the False reading says, and the third goes in."""
+    installs = _Installs(monkeypatch, drops=frozenset({0, 1}))
     answers = iter([None, None, False, False, None, None])
     monkeypatch.setattr(remotedebug, "_probe", lambda: next(answers))
     install_remote_debug_guard()
     install_remote_debug_guard()
     install_remote_debug_guard()
     assert installs.calls == [remotedebug._guard] * 3
+    assert installs.hooks == [remotedebug._guard]
     assert installs.reporters == 1
 
 
@@ -830,7 +841,7 @@ def test_a_hook_that_answers_once_the_objecting_hook_stops_is_added_then(
 ) -> None:
     """What the retry in state 1 is kept for: an earlier hook that objected at import and stopped
     objecting by the time ``serve`` makes its own call."""
-    installs = _Installs(monkeypatch)
+    installs = _Installs(monkeypatch, drops=frozenset({0}))
     # Dropped at the first call (before, after); added at the second (before, after); answering
     # at the third.
     answers = iter([False, False, False, True, True])
@@ -839,8 +850,9 @@ def test_a_hook_that_answers_once_the_objecting_hook_stops_is_added_then(
     assert installs.reporters == 0
     install_remote_debug_guard()
     install_remote_debug_guard()
-    # Two adds; the scripted probes say the first was dropped and the second went in.
+    # Two adds: the first dropped, the second in.
     assert installs.calls == [remotedebug._guard, remotedebug._guard]
+    assert installs.hooks == [remotedebug._guard]
     assert installs.reporters == 1
 
 
@@ -1383,10 +1395,11 @@ def test_a_hook_behind_one_that_stops_the_probe_is_reported(
     reporter runs and the quiet wrapper stays."""
     reading = _install_probe(tmp_path, "probe-objecting")
     assert reading["before"] is False and reading["after"] is False
-    # Every call adds while the probe is cut off, so a hook refused at import still goes in later
-    # (the Lander's first finding on engine PR 2528). The probe makes the import's call and then
-    # two more, and records each add call; the interpreter keeps each one here, as nothing
-    # refuses an add.
+    # Every call tries the add while the probe is cut off, so a hook refused at import still goes
+    # in later (the Lander's first finding on engine PR 2528). The probe makes the import's call
+    # and then two more, and records each add call. The interpreter keeps only the first: the
+    # copy it holds refuses the next two. The probe here cannot count copies behind its cut;
+    # test_building_the_api_again_and_again_behind_a_cut_off_probe_keeps_one_copy does.
     assert len(cast("list[object]", reading["loaded_at_install"])) == 3
     assert reading["reporter"] is True and reading["quiet"] is True
 

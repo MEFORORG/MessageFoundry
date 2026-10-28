@@ -16,8 +16,8 @@ unless ``PYTHON_DISABLE_REMOTE_DEBUG=1`` is set.
 
 **What this does.** Before it runs an injected script, the target interpreter raises the audit
 event ``cpython.remote_debugger_script``, and it does not run the script when an audit hook raises.
-:func:`install_remote_debug_guard` adds a hook that raises on that event. The one other event it
-raises on is the add of a second copy of itself, while the install makes that add.
+:func:`install_remote_debug_guard` adds a hook that raises on that event. It raises on one other:
+any ``sys.addaudithook`` made on the installing thread while that install adds its own copy.
 :func:`remote_debug_posture` reports the interpreter setting and whether the hook answers.
 ``tests/test_remote_debug_guard.py`` injects into a real child both ways, because the behaviour is
 the interpreter's and could change under this module.
@@ -220,8 +220,9 @@ def _guard(event: str, args: tuple[object, ...]) -> None:
         raise RemoteScriptRefused("remote debugging scripts are refused in the engine process")
     if event == _PROBE_EVENT and args and isinstance(args[0], list):
         args[0].append(True)
-    # A copy already in refuses the next one, whatever the probe could read. The thread check
-    # keeps an unrelated hook added by another thread meanwhile from being refused. The None test
+    # A copy already in refuses the next one, whatever the probe could read. The event names no
+    # hook, so this refuses every add on the installing thread while the install adds. The thread
+    # check keeps an unrelated hook added by another thread meanwhile from being refused. The None test
     # comes first because it is the cheapest, and the marker is None outside an install.
     if _adding_on is not None and event == _ADD_HOOK_EVENT and _adding_on == threading.get_ident():
         raise _SecondCopyRefused("the remote-debugging hook is already in this process")
@@ -363,8 +364,8 @@ def _guard_answers() -> bool:
 
 def install_remote_debug_guard() -> None:
     """Add the hook to this process when the interpreter accepts injected scripts and the hook
-    does not answer a probe. The process holds at most one copy, and at most one quiet wrapper
-    from repeated calls, whatever the probe reads (vault BACKLOG #3673, the Lander's finding 2).
+    does not answer a probe. Repeated calls add no second copy and no second quiet wrapper,
+    whatever the probe reads (vault BACKLOG #3673, the Lander's finding 2).
 
     Call it as early in the process as possible: a script injected before the call runs. A later
     call adds nothing once the hook answers, and an audit hook cannot be removed. Each call starts
@@ -395,17 +396,24 @@ def install_remote_debug_guard() -> None:
     Any call whose first probe does not read True tries the add, whatever an earlier call read.
     That keeps the retry for an earlier hook that cuts the probe off and refused the add at
     import, but no longer refuses it by the time ``serve`` or ``supervise`` makes its own call.
-    It cannot stack a copy. The interpreter raises ``sys.addaudithook`` to every hook already in
-    before it adds one, and drops the new hook when any of them raises. A copy already in raises
-    there while this call's add runs, on this call's thread only. So the add goes in only where no
-    copy saw that event: none is in, or a hook ahead of it raised and dropped the add anyway. The
-    quiet wrapper is put on only where the hook in place is not the one an earlier call left, so
-    calls made while the probe stays cut off add no wrapper either. Code that replaces
+    The retry cannot stack a copy. Before it adds a hook, the interpreter raises
+    ``sys.addaudithook`` to every hook already in. It drops the new hook when any of them raises.
+    A copy already in raises there while this call's add runs, on this call's thread only. So the
+    add goes in only where no copy saw that event. Either none is in, or a hook ahead of it raised
+    and dropped the add anyway. The event names no hook, so a wrapper around
+    ``sys.addaudithook`` that adds a hook of its own inside this call's add is refused as well.
+
+    The bound holds for one module object. A process that removes this module from
+    ``sys.modules`` and imports it again gets a second set of state. A copy from the first import
+    never refuses an add the second one makes.
+
+    The quiet wrapper goes on only where the hook in place is not the one an earlier call left.
+    So calls made while the probe stays cut off add no wrapper either. Code that replaces
     ``sys.unraisablehook`` after an install gets one more wrapper from the next call, not one per
     call.
 
-    Where ``sys.addaudithook`` raised instead of returning, the hook is not in, so the quiet
-    wrapper is put back and the next call tries again. Nothing is logged there: the command line
+    Where ``sys.addaudithook`` raised instead of returning, the hook is not in. The wrapper this
+    call put on comes off, one an earlier call left stays, and the next call tries again. Nothing is logged there: the command line
     makes this call before logging is configured, and the posture reports the missing hook.
 
     One refusal is out of reach in any state. An audit hook added earlier that raises on
@@ -424,8 +432,7 @@ def install_remote_debug_guard() -> None:
             # Quiet first, so no refusal is ever reported with its full path. Only once: a wrapper
             # an earlier call left in place is still the one.
             previous = sys.unraisablehook
-            wrapped = previous is not _quiet
-            if wrapped:
+            if previous is not _quiet:
                 _quiet = sys.unraisablehook = _without_own_refusals(previous)
             # never-raise: a hook already installed may object to this one. The documented
             # contract is that the interpreter swallows a RuntimeError from it and passes on any
@@ -437,7 +444,8 @@ def install_remote_debug_guard() -> None:
             try:
                 sys.addaudithook(_guard)
             except BaseException as exc:
-                if wrapped and sys.unraisablehook is _quiet:
+                # A wrapper an earlier call left is `previous` too, so this leaves it in place.
+                if sys.unraisablehook is _quiet:
                     sys.unraisablehook = previous
                 if isinstance(exc, Exception):
                     return
@@ -446,7 +454,7 @@ def install_remote_debug_guard() -> None:
                 _adding_on = None
             if _probe() is False:
                 # Dropped: there is nothing to report for, and nothing to quiet.
-                if wrapped and sys.unraisablehook is _quiet:
+                if sys.unraisablehook is _quiet:
                     sys.unraisablehook = previous
                 return
         _ensure_reporter()

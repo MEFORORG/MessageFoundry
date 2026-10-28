@@ -4410,9 +4410,11 @@ def create_app(
         # Vault BACKLOG #2700 / #2701: read off THIS process, which is the engine. Each is read
         # once here, so the loosening list and the `interpreter` block below report one reading.
         # create_app installed the remote-debugging hook (vault BACKLOG #3673), so a reading that
-        # says it is missing points at another audit hook in the process. The start-up reading is the one `serve` took as it started, kept for the
-        # life of the process. An app built without `serve` takes it here, once, and that first
-        # reading reads files, so the call is kept off the event loop.
+        # says it is missing points at another audit hook in the process.
+        #
+        # The start-up reading is the one `serve` took as it started, kept for the life of the
+        # process. An app built without `serve` takes it here, once, and that first reading reads
+        # files, so the call is kept off the event loop.
         remote_debug = remote_debug_posture()
         startup = await asyncio.to_thread(startup_posture)
         # Vault BACKLOG #2595: the service-environment reading `serve` took as it started, kept
