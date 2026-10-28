@@ -2169,7 +2169,8 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
         "or whose value will not compute, still escalates. It does so too on a local account "
         "holding a discoverable passkey under the configured relying party (BACKLOG #3937). "
         "Every other lock keeps "
-        "`lockout_minutes`. A local account whose enrolment is known to be refused keeps it for "
+        "`lockout_minutes`. A local account whose enrolment is known to be refused, and that holds "
+        "no such passkey, keeps it for "
         "serial failures only: a race listed under [WebAuthn passkeys]"
     )
     assert doubling in " ".join(local_row[2].split()), (

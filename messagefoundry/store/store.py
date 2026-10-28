@@ -2937,7 +2937,8 @@ async def escalation_passkeys(
         return await read_passkeys()
     except (ValueError, TypeError, KeyError) as exc:
         log.warning(
-            "a passkey row did not parse (%s); this sign-in lock keeps its fixed length",
+            "a passkey row of user %s did not parse (%s); its sign-in lock keeps its fixed length",
+            record.row.id,
             type(exc).__name__,
         )
         return None
