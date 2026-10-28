@@ -245,3 +245,18 @@ def test_parse_audit_row_pair_shares_the_anchor_head_rule() -> None:
         with pytest.raises(store_mod.AuditRowPairError) as exc:
             store_mod.parse_audit_row_pair(bad)
         assert bad.strip() not in exc.value.reason, exc.value.reason
+
+
+def test_one_seq_with_two_hashes_is_refused_not_reported_as_tampering(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "k.db"
+    pairs = _seed(db, 2)
+    assert main(_args(db, [pairs[0], (pairs[0][0], pairs[1][1])])) == 2
+    assert "two different row_hash values" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("seq", ["1_0", "+3", "３", "9" * 20, "9223372036854775808"])
+def test_a_seq_no_store_can_emit_is_malformed(seq: str) -> None:
+    with pytest.raises(store_mod.AuditRowPairError):
+        store_mod.parse_audit_row_pair(f"{seq}:" + "a" * 64)

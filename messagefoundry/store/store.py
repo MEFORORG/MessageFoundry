@@ -4165,15 +4165,15 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     return count, head
 
 
-def _audit_head_shape(head: str) -> tuple[str | None, str]:
+def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, str]:
     """``(why a non-empty head is refused, or None; the head normalised)``. The one statement of
     which heads the store can emit, shared by :func:`parse_audit_anchor` and
     :func:`parse_audit_row_pair`, so a hardening of it reaches both. The reason quotes no part of the
-    head."""
-    if all(c in _AUDIT_ANCHOR_HEX for c in head):
+    head. ``noun`` names the value in the reason."""
+    if set(head) <= _AUDIT_ANCHOR_HEX:
         if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
             return (
-                f"the head is {len(head)} hex characters, not a full "
+                f"{noun} is {len(head)} hex characters, not a full "
                 f"{AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest",
                 head,
             )
@@ -4181,7 +4181,7 @@ def _audit_head_shape(head: str) -> tuple[str | None, str]:
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
         return None, head  # opaque by construction; never normalise what we do not define
     return (
-        f"the head is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
+        f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
         f"isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138)",
         head,
     )
@@ -4215,18 +4215,23 @@ def parse_audit_row_pair(text: str) -> tuple[int, str]:
     seq_text, sep, head = text.strip().partition(":")
     if not sep:
         raise AuditRowPairError("no ':' separator", text)
-    try:
-        seq = int(seq_text)
-    except ValueError:
-        raise AuditRowPairError("the sequence number is not an integer", text) from None
-    if seq < 1:
-        raise AuditRowPairError("the sequence number is below 1, so it names no row", text)
+    # ASCII digits only, and no wider than a store's sequence column: `int()` alone would read
+    # '1_0' as 10, accept non-ASCII digits, and admit a seq no store can hold.
+    if not (seq_text.isascii() and seq_text.isdigit()) or len(seq_text) > 19:
+        raise AuditRowPairError(
+            "the sequence number is not a plain decimal of up to 19 digits", text
+        )
+    seq = int(seq_text)
+    if not 1 <= seq <= _AUDIT_SEQ_MAX:
+        raise AuditRowPairError(
+            "the sequence number is outside 1 to 2**63-1, so it names no row", text
+        )
     head = head.strip()
     if not head:
         raise AuditRowPairError("the row_hash is empty", text)
-    refusal, head = _audit_head_shape(head)
+    refusal, head = _audit_head_shape(head, "the row_hash")
     if refusal is not None:
-        raise AuditRowPairError(refusal.replace("the head", "the row_hash", 1), text)
+        raise AuditRowPairError(refusal, text)
     return seq, head
 
 
@@ -4916,8 +4921,9 @@ def verify_audit_rows(
         # input rather than raise a false tamper alarm on an intact chain (parse_audit_row_pair).
         raise ValueError("an expected audit row's sequence number is below 1")
     prefix_pair = None if expected_prefix is None else (expected_prefix[0], expected_prefix[1])
-    witnesses = sorted(row_pairs if prefix_pair is None else row_pairs | {prefix_pair})
-    witness_positions = frozenset(seq for seq, _ in witnesses)
+    witness_positions = frozenset(
+        [seq for seq, _ in row_pairs] + ([] if prefix_pair is None else [prefix_pair[0]])
+    )
     witness_heads: dict[int, str] = {}
     # The range being walked: its key, its first position and that row's id, and its digest.
     range_key: str | None = None
@@ -5076,8 +5082,9 @@ def verify_audit_rows(
             f"audit chain broken at seq={first_pos}, row id={first_id}"
             + (f" ({reason})" if reason else ""),
         )
-    # Every comparator below runs before any verdict is returned, and each failing one is reported,
-    # so one run names everything it found.
+    # Past a chain break, which returned above, every comparator below runs before any verdict is
+    # returned and each failing one is reported. A break still hides them, as it always hid the
+    # prefix: the break is reported first, at its own row.
     failures: list[str] = []
     if expected_anchor is not None:
         exp_count, exp_head = expected_anchor
@@ -5092,19 +5099,21 @@ def verify_audit_rows(
             )
     if prefix_pair is not None:
         ok, msg = audit_prefix_verdict(prefix_pair, witness_heads.get(prefix_pair[0]), count)
-        if not ok and msg is not None:
-            failures.append(msg)  # its own message: the engine routes on its marker (#328)
-    missing: list[tuple[int, str]] = []
-    for seq, head in sorted(row_pairs):
+        if not ok:  # its own message: the engine routes on its marker (#328)
+            failures.append(msg or f"audit log {AUDIT_PREFIX_BREAK_MARKER}")
+    missing = 0
+    first: tuple[int, str] | None = None
+    for pair in row_pairs:
         # The prefix comparator answers the same question for one row: is this head the chain's head
         # at that position? It compares in constant time once the position was reached.
-        if not audit_prefix_verdict((seq, head), witness_heads.get(seq), count)[0]:
-            missing.append((seq, head))
-    if missing:
-        seq, head = missing[0]
+        if not audit_prefix_verdict(pair, witness_heads.get(pair[0]), count)[0]:
+            missing += 1
+            first = pair if first is None else min(first, pair)
+    if first is not None:
+        seq, head = first
         have = witness_heads.get(seq)
         failures.append(
-            f"{len(missing)} of {len(row_pairs)} distinct expected audit row(s) are not in the chain "
+            f"{missing} of {len(row_pairs)} distinct expected audit row(s) are not in the chain "
             f"as it stands (have {count} row(s)); the first by seq: row {seq} "
             + (
                 "is past the chain's end"

@@ -1026,9 +1026,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--expected-rows-file",
         default=None,
         metavar="PATH",
-        help="read SEQ:ROW_HASH pairs, one per line, from a UTF-8 text file of at most 256 MiB, such "
-        "as pairs exported from the off-box audit copy. Blank lines are skipped. Checked as "
-        "--expected-row is",
+        help="read SEQ:ROW_HASH pairs, one per line, from a UTF-8 text file of at most "
+        f"{_AUDIT_ROWS_FILE_MAX_BYTES // 2**20} MiB, such as pairs exported from the off-box audit "
+        "copy. Blank lines are skipped. Checked as --expected-row is",
     )
 
     audit_anchor = sub.add_parser(
@@ -6724,13 +6724,18 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
         lines = read_bounded_utf8_lines(
             path,
             _AUDIT_ROWS_FILE_MAX_BYTES,
-            too_large=f"the file is larger than {_AUDIT_ROWS_FILE_MAX_BYTES} bytes",
+            too_large=f"the file is larger than {_AUDIT_ROWS_FILE_MAX_BYTES // 2**20} MiB",
         )
     except (OSError, UnicodeDecodeError) as exc:
         # `UnicodeDecodeError` is a `ValueError`: uncaught it would exit 1, a broken chain's code.
+        # The encoding hint goes only on the error it explains.
+        hint = (
+            f" It must be a UTF-8 text file of SEQ:ROW_HASH lines; {_UTF16_HINT}"
+            if isinstance(exc, UnicodeDecodeError)
+            else ""
+        )
         print(
-            f"error: cannot read --expected-rows-file {path!r}: {codec_safe_str(exc)}. It must be "
-            f"a UTF-8 text file of SEQ:ROW_HASH lines; {_UTF16_HINT}",
+            f"error: cannot read --expected-rows-file {path!r}: {codec_safe_str(exc)}.{hint}",
             file=sys.stderr,
         )
         return 2
@@ -6753,6 +6758,16 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
         print(f"error: --expected-rows-file {path!r} holds no SEQ:ROW_HASH line", file=sys.stderr)
         return 2
     return pairs
+
+
+def _contradictory_pair_seq(pairs: list[tuple[int, str]]) -> int | None:
+    """A seq given two different row_hashes, or None. No chain matches both, so such a set is a bad
+    input, such as an export mixing two engines' tees, never evidence of tampering."""
+    seen: dict[int, str] = {}
+    for seq, head in pairs:
+        if seen.setdefault(seq, head) != head:
+            return seq
+    return None
 
 
 def _host_gated_store_settings(
@@ -9237,6 +9252,14 @@ def _audit_verify(args: argparse.Namespace) -> int:
     expected_rows = _resolve_expected_rows(args)
     if isinstance(expected_rows, int):
         return expected_rows
+    clash = _contradictory_pair_seq(expected_rows)
+    if clash is not None:
+        print(
+            f"error: the expected rows give seq {clash} two different row_hash values; no chain "
+            "matches both, so the set is refused rather than reported as tampering",
+            file=sys.stderr,
+        )
+        return 2
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:

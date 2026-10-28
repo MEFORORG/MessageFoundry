@@ -6239,7 +6239,7 @@ onto keyless rows fails the verify, and is also reported as
 |---|---|
 | `0` | A clean walk, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. It covers at least one row, unless `--allow-empty` or an expected anchor of `0:` accepted an empty log (see exit `3`). |
 | `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, an expected row (`--expected-row`, `--expected-rows-file`) that is gone or whose hash differs, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. A key, key-provider or database error that stops the check part way prints one too, such as a Transit outage or a row that is not UTF-8. That line names the error's class and its cause's class, never its text. It says the rest of the chain was not checked. Before vault BACKLOG #3054 these exited 1 or 2 with no `FAIL` line. An error the command does not classify still exits 1 with none. |
-| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), a malformed expected row or an `--expected-rows-file` that cannot be read or holds no pair (vault BACKLOG #2612), and an empty log in a shell that holds no key and whose settings require one. |
+| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), a malformed expected row, two expected rows giving one `seq` different hashes, or an `--expected-rows-file` that cannot be read, is not UTF-8, is over its bound or holds no pair (vault BACKLOG #2612), and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
 | `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. It prints a `NOT CHECKED` line. This is not a pass. |
 | `5` | The chain is keyless and walked clean as plain SHA-256. This shell holds no key, and its settings require one. So the chain was not checked to their standard. It prints a `NOT CHECKED` line and a `WARNING` on stderr. This is not a pass. Before vault BACKLOG #3054 it exited 0. The paragraph on the setup where this goes wrong, below, says what a move between 4 and 5 means. |
@@ -6339,13 +6339,12 @@ rows; for continuous coverage the off-box tee is still the control ([BACKLOG #32
 `[retention].audit_days` row in [`CONFIGURATION.md`](CONFIGURATION.md) is the source of record).
 To check the store against that tee, pass the pairs it forwarded back as `messagefoundry audit-verify
 --expected-row SEQ:ROW_HASH` (repeatable), or `--expected-rows-file PATH` with one pair per line, in
-a UTF-8 file of at most 256 MiB (vault BACKLOG #2612). Each pair asks whether the row at `seq` is
+a UTF-8 file within the size bound its `--help` states (vault BACKLOG #2612). Each pair asks whether the row at `seq` is
 still in the chain with that `row_hash`. Each row hash chains in the one before it, so a pair that
 matches also vouches for every row below it, and unlike the exact anchor a pair stays valid as the
 chain grows. Once the store opens and the walk finishes, a pair whose row is gone, or whose hash
-differs, is a broken chain, exit 1; the exit table above still governs a store that does not open.
-Exit 2 covers at least a malformed pair, a pair at `seq` 0, and a file that cannot be read, is not
-UTF-8, is over the bound, or holds no pair. Key the pairs on `seq`, never on the record's `row_id`,
+differs, is a broken chain, exit 1; a pair set the command refuses is exit 2. The exit table above
+is the source of record for both, and still governs a store that does not open. Key the pairs on `seq`, never on the record's `row_id`,
 which can skip numbers. All the pairs are checked in one walk of the chain, which matters under
 `vault_transit`, where each row costs a Transit round trip. **The pairs witness only as well as the
 copy they came from.** A pair is only as authentic as the collector's record of it, and a forwarder
