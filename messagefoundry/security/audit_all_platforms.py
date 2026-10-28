@@ -40,6 +40,14 @@ WHAT IT DOES, in order, exiting with the first non-zero status:
 3. ``pip-audit -r <copy> --desc --disable-pip --strict`` plus any extra arguments (``--ignore-vuln
    <ID>`` for a triaged advisory, which therefore goes AFTER the lock).
 
+``--skip-private <name>``, given BEFORE the lock and repeatable, leaves that one pin out of the copy,
+and prints it as not audited (vault BACKLOG #3786 finding 1). It is for a package no advisory
+database can look up, such as an adopter's private one: ``--strict`` fails such a pin, and
+``--ignore-vuln`` cannot clear that, since it names an advisory, not a package. Every other pin is
+still looked up under ``--strict``, and step 1 still checks the named one's hashes, so it must be
+downloadable from the index pip is configured with. Nothing checks that the named package is in
+fact private: like ``--ignore-vuln``, it is the adopter's recorded decision.
+
 WHY STRIPPING IS SOUND HERE. Every pin in a uv export is a version that uv resolved for some
 environment. The engine sets no ``[tool.uv] environments``, so that includes environments nobody
 supports (PyPy, cygwin, macOS). Auditing those pins too is accepted: an advisory against one fails
@@ -56,8 +64,10 @@ never writes and which would resolve against the temporary copy's directory, or 
 rather than audit what it names (``uv export --no-emit-project`` writes none; a lock tool can
 write at least an index URL, ``--trusted-host`` and ``--find-links`` lines unless told not to); and
 a requirement that continues onto a line other than a hash, option or comment, where a marker
-would stay in place. It does not judge whether a non-empty lock is complete; released-line-audit
-carries its own floor for that.
+would stay in place; and a ``--skip-private`` that names the engine, a package the lock does not
+pin, or every pin, or that comes after the lock as a word of its own (the ``=`` form or an
+abbreviation there reaches pip-audit, which fails on it as an unknown option). It does not judge
+whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
 before it (a line ending in a backslash continues, unless it is a comment), indented or not. A
@@ -79,10 +89,11 @@ import argparse
 import codecs
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 
 from messagefoundry.childenv import engine_environment, hook_environment, python_module_argv
@@ -183,6 +194,52 @@ def strip_markers(text: str) -> tuple[str, list[str], int]:
     return "".join(out), stripped, requirements
 
 
+#: A distribution name at the start of a requirement (PEP 508).
+_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+
+def canonical_name(name: str) -> str:
+    """``name`` as PEP 503 compares it: runs of ``-``, ``_`` and ``.`` folded to ``-``, lower case."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def drop_requirements(text: str, names: Collection[str]) -> tuple[str, list[tuple[str, str]]]:
+    """``text`` without each requirement whose canonical name is in ``names``, the lines it
+    continues onto included; and each dropped requirement as ``(canonical name, first line)``.
+    Where a requirement starts and how far it goes on is read as :func:`_kinds` reads it."""
+    out: list[str] = []
+    dropped: list[tuple[str, str]] = []
+    dropping = continued = False
+    lines = text.splitlines(keepends=True)
+    for line, kind in zip(lines, _kinds(lines), strict=True):
+        body = _body(line)
+        if not continued:
+            head = body.lstrip()
+            match = _NAME.match(head) if kind == "requirement" else None
+            name = canonical_name(match[0]) if match else ""
+            dropping = bool(name) and name in names
+            if dropping:
+                dropped.append((name, head.removesuffix("\\").rstrip()))
+        if not dropping:
+            out.append(line)
+        continued = body.endswith("\\") and not body.lstrip().startswith("#")
+    return "".join(out), dropped
+
+
+#: The engine is the pin the adopter's tripwire exists to audit, so it is never skipped as private.
+_NEVER_PRIVATE = frozenset({"messagefoundry"})
+
+
+def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str]) -> str | None:
+    """Why a ``--skip-private`` request is refused, or ``None``."""
+    if "--skip-private" in pip_audit_args:
+        # After the lock, argparse hands it to pip-audit, which fails with a usage error that
+        # names neither the flag's position nor this module.
+        return "--skip-private goes before the lock, not after it"
+    named = sorted(_NEVER_PRIVATE.intersection(private))
+    return f"--skip-private may not name the engine: {named}" if named else None
+
+
 def _run(cmd: list[str]) -> int:
     # hook_environment: everything outside the engine's MEFOR_* namespace and its named secrets, so
     # pip and pip-audit keep the index, proxy and certificate settings they read from the
@@ -203,6 +260,14 @@ def _run(cmd: list[str]) -> int:
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _run) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
+    parser.add_argument(
+        "--skip-private",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="leave this pin out of the audit, for a package no advisory database can look up; "
+        "repeatable, and given before the lock",
+    )
     parser.add_argument("lock", type=Path, help="the hashed lock to audit")
     parser.add_argument(
         "pip_audit_args",
@@ -230,12 +295,35 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
             file=sys.stderr,
         )
         return 2
+    private = {canonical_name(name) for name in args.skip_private}
+    refusal = _skip_private_refusal(private, args.pip_audit_args)
+    if refusal:
+        print(f"::error::{args.lock}: {refusal}", file=sys.stderr)
+        return 2
+    text, skipped = drop_requirements(text, private)
+    unmatched = private - {name for name, _ in skipped}
+    if unmatched:
+        print(
+            f"::error::{args.lock}: --skip-private names a package the lock does not pin: "
+            f"{sorted(unmatched)}",
+            file=sys.stderr,
+        )
+        return 2
+    if len(skipped) == requirements:
+        print(f"::error::{args.lock}: --skip-private leaves no pin to audit", file=sys.stderr)
+        return 2
+    # A skipped pin is neither counted nor listed as audited.
+    stripped = [
+        e for e in stripped if not (m := _NAME.match(e)) or canonical_name(m[0]) not in private
+    ]
     print(
-        f"{args.lock}: {requirements} pinned requirements, {len(stripped)} un-gated from a marker "
-        "the host would have evaluated:"
+        f"{args.lock}: {requirements - len(skipped)} pinned requirements audited, {len(stripped)} "
+        "un-gated from a marker the host would have evaluated:"
     )
     for entry in stripped:
         print(f"  {entry}")
+    for _, entry in skipped:
+        print(f"  not audited, named by --skip-private: {entry}")
     sys.stdout.flush()
     pip_check = [*python_module_argv("pip"), "install", "--dry-run", "--ignore-installed"]
     status = run(
