@@ -13025,7 +13025,7 @@ class AuthService:
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
-        if session is None or session.revoked_at is not None:
+        if session is None:
             return Elevation()
         user = await self._load_user(session.user_id)
         if user is None or user.disabled or not user.totp_enabled:
@@ -13061,13 +13061,16 @@ class AuthService:
             # what was read before it may be stale: a session revoked meanwhile would still spend
             # its code, and a lock set by the attempt ahead in the queue would go unseen. A session
             # or account gone answers ``session_lost``, as the re-reads before and after this one
-            # do (BACKLOG #3068): the token no longer authenticates.
+            # do (BACKLOG #3068): the token no longer authenticates. Audited with the row
+            # :meth:`_factor_holder_current` writes (BACKLOG #3780).
             session = await self._load_session(hash_token(token))
-            if session is None or session.revoked_at is not None:
+            loaded = None if session is None else await self._load_user(session.user_id)
+            if session is None or loaded is None or loaded.disabled:
+                await self._audit_session_lost(
+                    "auth.mfa_failed", actor=user.username, client=client, phase=None
+                )
                 return Elevation(session_lost=True)
-            user = await self._load_user(session.user_id)
-            if user is None or user.disabled:
-                return Elevation(session_lost=True)
+            user = loaded
             if not user.totp_enabled:
                 return Elevation()
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
@@ -13326,7 +13329,7 @@ class AuthService:
         if floor <= 0:
             return False
         session = await self._load_session(hash_token(token))
-        if session is None or session.revoked_at is not None or session.mfa_verified_at is not None:
+        if session is None or session.mfa_verified_at is not None:
             return False
         if now - session.created_at >= floor:
             return False
@@ -13422,9 +13425,9 @@ class AuthService:
     ) -> None:
         """The ``session_lost`` row a factor leg writes when its session or account went: ``event``
         with ``reason=session_lost``, and ``phase`` when given. The one spelling
-        :meth:`_factor_holder_current` and :meth:`_refuse_lost_enrolment_session` share, so the row a
-        directory account's re-read writes and the one a local account's enrolment guard writes
-        cannot drift apart."""
+        :meth:`_factor_holder_current`, :meth:`_refuse_lost_enrolment_session` and
+        :meth:`verify_mfa`'s in-queue re-read share (BACKLOG #3780), so the rows each writes for
+        the same outcome cannot drift apart."""
         lost = {"reason": "session_lost"}
         if phase is not None:
             lost["phase"] = phase
@@ -13468,7 +13471,7 @@ class AuthService:
         spend (a challenge, a TOTP step, recovery codes, a stored credential), and after the cheap
         local refusals, so a caller already refused costs no lookup. Note that the re-read refuses
         a second-step-locked account."""
-        if user.auth_provider != AuthProvider.AD.value:
+        if not _is_directory_account(user):
             return user
         refusal = await self._directory_step_up_refusal(user)
         if refusal is not None:
@@ -13513,11 +13516,7 @@ class AuthService:
         ``session_lost`` row only, for the reason :meth:`_directory_vouches_for_factor` states. Only
         revocation is asked of the session, not its expiry."""
         session = await self._load_session(hash_token(token))
-        user = (
-            None
-            if session is None or session.revoked_at is not None
-            else (await self._load_user(session.user_id))
-        )
+        user = None if session is None else await self._load_user(session.user_id)
         if user is None or user.disabled:
             await self._audit_session_lost(event, actor=actor, client=client, phase=phase)
             return Elevation(session_lost=True)
@@ -14263,7 +14262,7 @@ class AuthService:
         if not token:
             return None
         session = await self._load_session(hash_token(token))
-        if session is None or session.revoked_at is not None:
+        if session is None:
             return None
         # Only passkeys the account's seal names are offered (BACKLOG #2592).
         user = await self._load_user(session.user_id)
@@ -14313,7 +14312,7 @@ class AuthService:
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
-        if session is None or session.revoked_at is not None:
+        if session is None:
             return Elevation()
         user = await self._load_user(session.user_id)
         if user is None or user.disabled:
