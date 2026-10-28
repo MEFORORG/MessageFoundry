@@ -179,9 +179,12 @@ _reporter_started = False
 #: The thread an install is adding the hook on, while that add runs, so a copy already in can
 #: refuse it (vault BACKLOG #3673, the Lander's finding 2). None at every other moment.
 _adding_on: int | None = None
+#: What ``_quiet`` holds before any install wraps. A private object, never None: a process may set
+#: ``sys.unraisablehook`` to None, and a None here would then read as a wrapper already in place.
+_NOT_WRAPPED: Final = object()
 #: The quiet wrapper an install left on ``sys.unraisablehook``. A later install does not wrap
 #: again while it is still the hook in place.
-_quiet: Callable[[sys.UnraisableHookArgs], None] | None = None
+_quiet: object = _NOT_WRAPPED
 
 
 class RemoteScriptRefused(RuntimeError):
@@ -439,9 +442,10 @@ def install_remote_debug_guard() -> None:
             # other exception. Measured on CPython 3.14.6, it swallows a ValueError and an
             # Exception subclass of its own too. So this catch matters only on an interpreter that
             # does what the documentation says. A BaseException such as KeyboardInterrupt still
-            # leaves, with the wrapper put back.
-            _adding_on = threading.get_ident()
+            # leaves, with the wrapper put back. The marker is set inside the try, so an exception
+            # that lands right after it is set still meets the finally that clears it.
             try:
+                _adding_on = threading.get_ident()
                 sys.addaudithook(_guard)
             except BaseException as exc:
                 # A wrapper an earlier call left is `previous` too, so this leaves it in place.

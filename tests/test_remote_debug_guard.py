@@ -32,8 +32,8 @@ import time
 import warnings
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
-from types import SimpleNamespace
-from typing import NoReturn, cast
+from types import FrameType, SimpleNamespace
+from typing import TYPE_CHECKING, NoReturn, cast
 
 import httpx
 import pytest
@@ -68,6 +68,9 @@ from messagefoundry.remotedebug import (
     remote_debug_posture,
 )
 from tests._ast_sites import callee_name, named_func, parse_source
+
+if TYPE_CHECKING:
+    from _typeshed import TraceFunction
 
 _REPO = Path(messagefoundry.__file__).resolve().parents[1]
 
@@ -661,7 +664,7 @@ class _Installs:
         # Restored afterwards: a successful install wraps it. The marker too, which a stand-in
         # here leaves set only if the install failed to clear it.
         monkeypatch.setattr(sys, "unraisablehook", sys.unraisablehook)
-        monkeypatch.setattr(remotedebug, "_quiet", None)
+        monkeypatch.setattr(remotedebug, "_quiet", remotedebug._NOT_WRAPPED)
         monkeypatch.setattr(remotedebug, "_adding_on", None)
         monkeypatch.setattr(remotedebug, "_start_reporter", self._start)
         # This process started its reporter when the suite imported the command line.
@@ -872,6 +875,80 @@ def test_install_lets_a_base_exception_out_with_the_unraisable_hook_put_back(
     with pytest.raises(KeyboardInterrupt):
         install_remote_debug_guard()
     assert sys.unraisablehook is before and remotedebug._adding_on is None
+
+
+def test_an_interrupt_just_after_the_marker_is_set_still_clears_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round two of the review on engine PR 2573 (vault BACKLOG #3673): the marker of an add in
+    progress was set one statement before the ``try`` whose ``finally`` clears it. An exception
+    landing between the two, such as a KeyboardInterrupt, left it set, and the copy in place then
+    refused every later add on that thread without a word. A trace function raises the interrupt
+    on the first line the install runs once the marker is set. Measured on the code before the
+    fix, that is the ``try`` line itself, and the marker stayed set."""
+    _Installs(monkeypatch)
+    # A lock of the test's own: on the code before the fix, the interrupt at the ``try`` line also
+    # left the install lock held, which would hang every later test that installs.
+    monkeypatch.setattr(remotedebug, "_install_lock", threading.Lock())
+    before = sys.unraisablehook
+    monkeypatch.setattr(remotedebug, "_probe", lambda: False)
+    code = install_remote_debug_guard.__code__
+    raised: list[int] = []
+
+    def on_line(frame: FrameType, event: str, arg: object) -> TraceFunction:
+        # Once only, so the test measures a single interrupt and not one per later line.
+        if event == "line" and remotedebug._adding_on is not None and not raised:
+            raised.append(frame.f_lineno)
+            raise KeyboardInterrupt
+        return on_line
+
+    def on_call(frame: FrameType, event: str, arg: object) -> TraceFunction | None:
+        return on_line if frame.f_code is code else None
+
+    previous_trace = sys.gettrace()
+    sys.settrace(on_call)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            install_remote_debug_guard()
+    finally:
+        sys.settrace(previous_trace)
+    assert remotedebug._adding_on is None and sys.unraisablehook is before
+
+
+#: Stands in for the full path of an injected script, which the interpreter's own report carries.
+_INJECTED_PATH = "D:/scratch/injected-script-path.py"
+
+
+class _RefusedOnCollect:
+    """Raises the hook's refusal from ``__del__``, so the interpreter reports it through
+    ``sys.unraisablehook`` as it reports a refused script."""
+
+    def __del__(self) -> None:
+        raise RemoteScriptRefused(_INJECTED_PATH)
+
+
+def test_the_first_install_wraps_an_unraisable_hook_set_to_none(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round two of the review on engine PR 2573 (vault BACKLOG #3673): the record of the wrapper
+    an install left started as None. Where ``sys.unraisablehook`` was None too, the first install
+    read it as its own wrapper and put none on. The interpreter then wrote a refusal, with its
+    full path, to standard error."""
+    installs = _Installs(monkeypatch)
+    monkeypatch.setattr(sys, "unraisablehook", None)  # restored afterwards
+    answers = iter([False, True])
+    monkeypatch.setattr(remotedebug, "_probe", lambda: next(answers))
+    install_remote_debug_guard()
+    assert installs.hooks == [remotedebug._guard] and _quiet_wrappers() == 1
+    capsys.readouterr()
+    refused = _RefusedOnCollect()
+    del refused
+    assert _INJECTED_PATH not in capsys.readouterr().err
+    # CONTROL: with no wrapper, the interpreter's report does reach the captured standard error.
+    monkeypatch.setattr(sys, "unraisablehook", None)
+    refused = _RefusedOnCollect()
+    del refused
+    assert _INJECTED_PATH in capsys.readouterr().err
 
 
 def test_install_does_not_raise_when_a_hook_objects_with_any_exception(
