@@ -9994,19 +9994,24 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     (:data:`~messagefoundry.store.cipher_cells.SQLITE_CIPHER_CELLS`) on a read-only connection, in
     short chunks, so it can run beside the service. It reports per-cell counts and each cell's first
     failing row by its locator, never a value. In a keyed store it also counts the non-blank values
-    that carry no marker, which a walk selecting by the marker never reads.
+    that carry no marker, which a walk selecting by the marker never reads: a FAIL on a surface the
+    store has sealed, which refuses them at read, and reported only on one no keyed open has sealed
+    yet. A VACUUM part way, or the key service going unreachable, stops it with a FAIL rather than
+    a count over a subset.
 
     Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT COVERED (a server backend), 4 KEY_MISMATCH (a
     sealed value and no key resolved, the usual cause being a shell without the service's key)."""
-    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
     from messagefoundry.store.base import build_store_cipher
     from messagefoundry.store.cipher_cells import (
         DEFAULT_CHUNK_ROWS,
         SQLITE_CIPHER_CELLS,
         CipherAudit,
+        CipherWalkInterrupted,
         audit_cipher_cells,
         connect_readonly,
     )
+    from messagefoundry.store.crypto import CipherError
 
     as_json = bool(args.json)
     cli: dict[str, dict[str, object]] = {}
@@ -10054,30 +10059,40 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         # neither creates a file.
         _emit_error(f"no store at {path} (check --db / [store].path)", as_json=as_json)
         return 2
+    # The instance's own posture, derived as `serve` derives it, for the Vault hops the cipher
+    # build can dial (vault BACKLOG #2983).
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     try:
-        # No posture in scope here, so none is passed: the Vault hops then judge it as enforcing.
-        cipher = build_store_cipher(store)
+        cipher = build_store_cipher(store, posture=posture)
     except _key_unresolved() as exc:
         _emit_error(f"the store key could not be resolved: {exc}", as_json=as_json)
         return 2
     try:
         conn = connect_readonly(path, busy_timeout=args.busy_timeout)
-        # A file that is not a database fails here, before any cell is read: could not start.
-        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
     except sqlite3.Error as exc:
         return _emit_store_open_error(exc, path, as_json=as_json)
     stopped: str | None = None
     audit = CipherAudit()
+    key_service_down: tuple[type[Exception], ...] = (CipherError, *_key_unresolved())
     try:
+        try:
+            # A file that is not a database fails here, before any cell is read: could not start.
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite3.Error as exc:
+            return _emit_store_open_error(exc, path, as_json=as_json)
         audit = audit_cipher_cells(conn, cipher, cells=cells, chunk_rows=chunk_rows)
     except sqlite3.Error as exc:
         # Part way: a lock held past --busy-timeout, a disk error, a value the driver cannot read.
         # The rendering quotes no row's content.
         stopped = _store_error_text(exc)
-    except _key_unresolved() as exc:
-        # A key provider, or Transit, failing part way. Its class only: under Transit the error is
-        # raised for one value, and its text is not this command's to print.
-        stopped = type(exc).__name__
+    except CipherWalkInterrupted as exc:
+        stopped = str(exc)
+    except key_service_down as exc:
+        # The key service failing part way: unreachable Transit (the walk raises that rather than
+        # count every later value as damaged), or a key provider. Its classes only: under Transit
+        # the error is raised for one value, and its text is not this command's to print.
+        cause = exc.__cause__
+        stopped = type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
     finally:
         conn.close()
 
@@ -10102,20 +10117,28 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         status, code = "FAIL", 1
         first = next(t.first_unmarked for t in audit.tallies if t.first_unmarked)
         reason = (
-            f"{audit.unmarked} non-blank value(s) in this keyed store carry no at-rest marker, so "
-            "the store refuses each at read: a damaged or stripped marker, or a planted row "
-            f"(BACKLOG #1169); the first: {first}"
+            f"{audit.unmarked} non-blank value(s) on surfaces this keyed store has sealed carry no "
+            "at-rest marker, so the store refuses each at read: a damaged or stripped marker, or a "
+            f"planted row (BACKLOG #1169); the first: {first}"
         )
     else:
         status, code = "PASS", 0
         reason = f"{audit.opened} sealed value(s) decrypted and authenticated"
         if not cipher.encrypts:
-            reason += "; the store settings resolved no key, and the store holds no sealed value"
+            reason += "; the store settings resolved no key, and no cell read holds a sealed value"
         elif audit.unmarked:
             reason += (
                 f"; {audit.unmarked} unmarked value(s) are read as plaintext under "
                 "[store].allow_unmarked_ciphertext"
             )
+    if code in (0, 1) and stopped is None:
+        if audit.legacy:
+            reason += (
+                f"; {audit.legacy} plaintext value(s) on surfaces no keyed open has sealed yet, "
+                "which the service's next keyed open seals"
+            )
+        if audit.absent:
+            reason += f"; not in this store, so not read: {', '.join(audit.absent)}"
 
     # A walk that stopped has no counts worth printing: zeros would read as an empty store.
     counted = stopped is None
@@ -10129,12 +10152,15 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 "opened": audit.opened if counted else None,
                 "failed": audit.failed if counted else None,
                 "unmarked": audit.unmarked if counted else None,
+                "legacy": audit.legacy if counted else None,
                 "cells": [
                     {
                         "cell": t.name,
+                        "present": t.present,
                         "opened": t.opened,
                         "failed": t.failed,
                         "unmarked": t.unmarked,
+                        "legacy": t.legacy,
                         "first_failure": t.first_failure,
                         "first_unmarked": t.first_unmarked,
                     }
@@ -10146,7 +10172,13 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     else:
         print(f"{status}: {reason}")
         for t in cell_rows:
-            print(f"  {t.name} opened={t.opened} failed={t.failed} unmarked={t.unmarked}")
+            if not t.present:
+                print(f"  {t.name} not in this store, not read")
+                continue
+            print(
+                f"  {t.name} opened={t.opened} failed={t.failed} unmarked={t.unmarked} "
+                f"legacy={t.legacy}"
+            )
             for line in (t.first_failure, t.first_unmarked):
                 if line:
                     print(f"    {line}")

@@ -79,7 +79,11 @@ from messagefoundry.store.base import (
     resolve_active_key,
     resolve_decrypt_keys,
 )
-from messagefoundry.store.cipher_cells import read_cipher_cells
+from messagefoundry.store.cipher_cells import (
+    CipherWalkInterrupted,
+    connect_readonly,
+    read_cipher_cells,
+)
 from messagefoundry.store.crypto import (
     StoreKeylessError,
     store_data_key_id,
@@ -2557,6 +2561,10 @@ def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str
     )
 
 
+#: sqlite3's own default. Nothing else writes the extracted snapshot, so it never waits.
+_SNAPSHOT_BUSY_TIMEOUT = 5.0
+
+
 def _decrypt_check(
     snap: Path, settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> tuple[str, str, int]:
@@ -2580,12 +2588,11 @@ def _decrypt_check(
     """
     import sqlite3
 
-    from messagefoundry.store.store import _sqlite_readonly_uri
-
     cipher = build_store_cipher(settings, posture=posture)
     cells = 0
-    # The store's own URI builder, not `f"file:{snap}"`: a staging path can hold `#` or `?`.
-    conn = sqlite3.connect(_sqlite_readonly_uri(str(snap.absolute())), uri=True)
+    # The store's own read-only URI builder, not `f"file:{snap}"`: a path can hold `#` or `?`, and
+    # an unquoted `#` cut the path short, so the old open read a different, empty file and passed.
+    conn = connect_readonly(snap, busy_timeout=_SNAPSHOT_BUSY_TIMEOUT)
     try:
         for reading in read_cipher_cells(conn, cipher):
             if reading.kind == "keyless":
@@ -2600,9 +2607,12 @@ def _decrypt_check(
                 # is the branch above). Reporting the softer verdict on a bit-flipped PHI cell is
                 # the reading that must not be talked down.
                 return "FAIL", reading.failure(source="snapshot"), cells
-            cells += 1
+            if reading.kind == "opened":
+                cells += 1
     except sqlite3.Error as exc:
         return "FAIL", safe_exc(exc), cells
+    except CipherWalkInterrupted as exc:  # nothing else writes a snapshot, but never PASS a part
+        return "FAIL", str(exc), cells
     finally:
         conn.close()
     return "PASS", "ok", cells

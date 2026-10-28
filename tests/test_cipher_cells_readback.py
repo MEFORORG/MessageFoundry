@@ -21,7 +21,7 @@ import json
 import shutil
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -36,11 +36,12 @@ from messagefoundry.store.cipher_cells import (
     DEFAULT_CHUNK_ROWS,
     SQLITE_CIPHER_CELLS,
     CipherCell,
+    CipherWalkInterrupted,
     audit_cipher_cells,
     connect_readonly,
     read_cipher_cells,
 )
-from messagefoundry.store.crypto import _V4_PREFIX, MARKER_PREFIX, generate_key
+from messagefoundry.store.crypto import _V4_PREFIX, MARKER_PREFIX, Cipher, CipherError, generate_key
 from messagefoundry.store.store import Stage
 
 #: Every value the fixture writes, keys included, carries this. A FAIL reason must never contain it:
@@ -472,8 +473,10 @@ def test_a_damaged_marker_passes_the_restore_walk_and_fails_the_audit(
     finally:
         conn.close()
 
+    # The restore-verify's walk still selects by the marker, so it does not read this value: the
+    # marker limb that stays open on the restore path (BACKLOG #1719's remainder).
     status, message, _ = dr_backup._decrypt_check(db, settings)
-    assert status == "PASS", message  # the hole this audit closes
+    assert status == "PASS", message
 
     rc, payload = _audit(db, monkeypatch, capsys)
     assert rc == 1 and payload["status"] == "FAIL", payload
@@ -566,6 +569,161 @@ def test_a_missing_store_is_refused_and_not_created(
     assert main(["cipher-audit", "--db", str(missing)]) == 2
     assert "no store at" in capsys.readouterr().err
     assert not missing.exists()
+
+
+def _first_sealed(db: Path, table: str, column: str) -> tuple[int, str]:
+    conn = sqlite3.connect(db)
+    try:
+        rowid, value = conn.execute(
+            f"SELECT rowid, {column} FROM {table} WHERE {column} LIKE ? ORDER BY rowid LIMIT 1",
+            (f"{MARKER_PREFIX}%",),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(rowid), str(value)
+
+
+def _set(db: Path, table: str, column: str, rowid: int, value: object) -> None:
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (value, rowid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_sealed_value_stored_as_a_blob_is_still_opened(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """LIKE matches a BLOB that starts with the marker, and the walk must judge it by that same
+    match: read as ``str(bytes)`` it would look unmarked and be skipped, and a damaged one would
+    pass the restore-verify."""
+    db, settings = _copy(_template, tmp_path)
+    rowid, value = _first_sealed(db, "messages", "raw")
+    head, _, payload = value.rpartition(":")
+    blob = bytearray(base64.b64decode(payload))
+    blob[-1] ^= 0x01
+    _set(db, "messages", "raw", rowid, f"{head}:{base64.b64encode(bytes(blob)).decode()}".encode())
+    status, message, _ = dr_backup._decrypt_check(db, settings)
+    assert status == "FAIL" and "messages.raw" in message, message
+
+
+def test_a_queue_row_pointed_at_another_body_fails(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """``body_ref`` is not in the queue tag, so the payload still opens when it is changed; the
+    reader refuses the row because its sealed reference differs, and so must the walk."""
+    db, settings = _copy(_template, tmp_path)
+    conn = sqlite3.connect(db)
+    try:
+        rowid = conn.execute(
+            "SELECT rowid FROM queue WHERE body_ref IS NOT NULL ORDER BY rowid LIMIT 1"
+        ).fetchone()[0]
+        conn.execute("UPDATE queue SET body_ref = ? WHERE rowid = ?", ("0" * 64, rowid))
+        conn.commit()
+    finally:
+        conn.close()
+    status, message, _ = dr_backup._decrypt_check(db, settings)
+    assert status == "FAIL" and "differs from its body_ref" in message, message
+
+
+def test_plaintext_on_a_surface_never_sealed_is_legacy_not_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A store written keyless, audited before any keyed open: its plaintext is what the next
+    keyed open seals, not a stripped marker. It is reported, and the audit passes."""
+    db = tmp_path / "msg.db"
+
+    async def write() -> None:
+        store = await _open(db, StoreSettings(path=str(db)))
+        try:
+            await store.enqueue_message(channel_id="IB_SYNTH", raw=_RAW, deliveries=[("OB", "X")])
+        finally:
+            await store.close()
+
+    asyncio.run(write())
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 0 and payload["status"] == "PASS", payload
+    assert payload["legacy"] >= 1 and payload["unmarked"] == 0, payload
+    assert "next keyed open seals" in payload["reason"]
+
+
+def test_a_cell_the_store_lacks_is_named_not_counted_as_empty(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db, settings = _copy(_template, tmp_path)
+    _keyed(monkeypatch, settings)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DROP TABLE alert_instance")
+        conn.commit()
+    finally:
+        conn.close()
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc == 0, payload
+    assert _cells(payload)["alert_instance.reason"]["present"] is False
+    assert "not read: alert_instance.reason" in payload["reason"]
+
+
+def test_a_locator_cannot_forge_a_report_line(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    db, settings = _copy(_template, tmp_path)
+    raw = next(c for c in SQLITE_CIPHER_CELLS if (c.table, c.column) == ("messages", "raw"))
+    rowid, _value = _first_sealed(db, "messages", "raw")
+    _set(db, "messages", "id", rowid, "x\nPASS: forged")
+    _flip_one_aead_byte(db, raw)
+    status, message, _ = dr_backup._decrypt_check(db, settings)
+    assert status == "FAIL" and "\n" not in message and "id=x\\nPASS: forged" in message, message
+
+
+def test_a_schema_change_part_way_stops_the_walk(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """A VACUUM between chunks may renumber rowids; the walk stops rather than finish on a subset."""
+    db, settings = _copy(_template, tmp_path)
+    reader = connect_readonly(db, busy_timeout=5.0)
+    writer = sqlite3.connect(db, isolation_level=None)
+    try:
+        walk = read_cipher_cells(reader, build_store_cipher(settings), chunk_rows=1)
+        next(walk)
+        writer.execute("VACUUM")
+        with pytest.raises(CipherWalkInterrupted):
+            list(walk)
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_an_unreachable_key_service_stops_the_audit(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """Transit raises the same CipherError for an outage as for a bad value. The audit stops on
+    the first outage instead of calling every later value damaged."""
+    db, _settings = _copy(_template, tmp_path)
+
+    class _Down:
+        encrypts = True
+
+        def is_encrypted(self, stored: str) -> bool:
+            return stored.startswith(MARKER_PREFIX)
+
+        def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+            try:
+                raise ConnectionRefusedError("synthetic outage")
+            except OSError as exc:
+                raise CipherError("Transit decrypt failed") from exc
+
+    reader = connect_readonly(db, busy_timeout=5.0)
+    try:
+        with pytest.raises(CipherError):
+            audit_cipher_cells(reader, cast(Cipher, _Down()))
+    finally:
+        reader.close()
 
 
 def test_chunks_read_every_row_and_hold_no_read_transaction_between_them(
