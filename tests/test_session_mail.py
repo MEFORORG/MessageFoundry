@@ -2276,11 +2276,8 @@ def test_the_no_box_notice_is_throttled_and_obeys_the_off_switch(
 
 
 # --------------------------------------------------------------------------------------------------
-# Mail addressed to where the session MOVED is not read, so the drain says it is there. Measured
-# 2026-10-28: a Lander launched in the primary and then used EnterWorktree. Its seat record follows
-# the hook `cwd`, so peers mailed the worktree it moved into, while the drain kept answering for the
-# pinned primary (rule 3 of scripts/hooks/_hookinput.ps1). Fifteen messages waited fourteen hours and
-# nothing said so. The drain still never shows or consumes that box; it names it, once per change.
+# Mail addressed to the worktree a pinned session MOVED into is named, never shown or consumed.
+# docs/SESSION-MAIL.md, "Mail sent to the worktree you moved into", carries the why.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -2303,7 +2300,7 @@ def _moved_inbox(repo: Path) -> list[Path]:
 def test_mail_in_the_box_the_session_moved_into_is_named_not_shown(
     repo: Path, tmp_path: Path, moved_worktree: Path
 ) -> None:
-    sid = f"moved-{uuid.uuid4()}"
+    sid = str(uuid.uuid4())
     seed_pin(repo, repo, sid)
     text = injection(run_drain(repo, cwd=moved_worktree, run_from=repo, session_id=sid))
     assert "1 message(s) wait in the box of" in text, text
@@ -2321,7 +2318,7 @@ def test_mail_in_the_box_the_session_moved_into_is_named_not_shown(
 def test_the_notice_rides_with_the_starting_boxs_own_mail(
     repo: Path, tmp_path: Path, moved_worktree: Path
 ) -> None:
-    sid = f"moved-{uuid.uuid4()}"
+    sid = str(uuid.uuid4())
     seed_pin(repo, repo, sid)
     seed(repo, tmp_path, [{"body": "mail for the primary"}])
     text = injection(run_drain(repo, cwd=moved_worktree, run_from=repo, session_id=sid))
@@ -2333,17 +2330,66 @@ def test_no_notice_when_the_session_is_where_it_started(
     repo: Path, tmp_path: Path, moved_worktree: Path
 ) -> None:
     """The control: pinned in the worktree it is in, the drain shows the mail as before."""
-    sid = f"moved-{uuid.uuid4()}"
+    sid = str(uuid.uuid4())
     seed_pin(repo, moved_worktree, sid)
     text = injection(run_drain(repo, cwd=moved_worktree, run_from=repo, session_id=sid))
     assert "    | mail for the moved session" in text, text
     assert "wait in the box of" not in text, text
 
 
-def test_the_documented_hand_drain_reads_the_moved_box(
+def test_the_notice_survives_a_silent_stop_on_a_box_holding_only_foreign_mail(
     repo: Path, tmp_path: Path, moved_worktree: Path
 ) -> None:
-    """docs/SESSION-MAIL.md's recipe: run from the worktree, with no session id, so no pin applies."""
-    text = injection(run_drain(repo, cwd=moved_worktree, run_from=moved_worktree, session_id=None))
+    """The starting box exists but shows nothing at Stop, the path that otherwise emits no stdout."""
+    sid = str(uuid.uuid4())
+    seed_pin(repo, repo, sid)
+    seed(repo, tmp_path, [{"body": "for someone else", "toSessionId": "other-session"}])
+    text = injection(run_drain(repo, cwd=moved_worktree, run_from=repo, session_id=sid))
+    assert "for someone else" not in text, text
+    assert "1 message(s) wait in the box of" in text, text
+
+
+def test_mail_the_session_may_not_read_is_not_counted(repo: Path, tmp_path: Path) -> None:
+    wt = Path(os.path.realpath(tmp_path)) / "moved-wt"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", wt.name, str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    seed(repo, tmp_path, [{"body": "not yours", "toSessionId": "other-session"}], box_cwd=wt)
+    sid = str(uuid.uuid4())
+    seed_pin(repo, repo, sid)
+    text = injection(run_drain(repo, cwd=wt, run_from=repo, session_id=sid))
+    assert "wait in the box of" not in text, text
+
+
+def _hand_drain(wt: Path, sid: str) -> str:
+    """docs/SESSION-MAIL.md's recipe, forward slashes and all, run from the worktree."""
+    payload = json.dumps(
+        {"hook_event_name": "SessionStart", "session_id": sid, "cwd": wt.as_posix()}
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", DRAIN.as_posix()],
+        cwd=str(wt),
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return injection(proc)
+
+
+def test_the_documented_hand_drain_shows_the_moved_box_and_consumes_nothing(
+    repo: Path, tmp_path: Path, moved_worktree: Path
+) -> None:
+    sid = str(uuid.uuid4())
+    seed_pin(repo, repo, sid)
+    text = _hand_drain(moved_worktree, sid)
     assert "    | mail for the moved session" in text, text
-    assert _moved_inbox(repo) == [], "a Stop drain did not consume what it showed"
+    assert len(_moved_inbox(repo)) == 1, "the hand drain consumed the message"
+    assert "mail for the moved session" not in _hand_drain(moved_worktree, sid), "shown twice"
+    # The pin is untouched, so the session's own drain still reads the starting box.
+    pinned = injection(run_drain(repo, cwd=moved_worktree, run_from=repo, session_id=sid))
+    assert "mail for the moved session" not in pinned, pinned

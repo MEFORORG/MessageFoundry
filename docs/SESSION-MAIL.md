@@ -235,25 +235,28 @@ lives in [`scripts/hooks/_hookinput.ps1`](../scripts/hooks/_hookinput.ps1): a Se
 launch worktree, and every later event answers for the pin, so a `cd` into a sibling never shows or
 consumes the sibling's mail. `EnterWorktree` looks like that `cd` to the drain.
 
-The seat record does not follow the pin. `scripts/coord/seat.ps1` records the hook `cwd`, so after a
-move a peer that addresses you by your seat record, or replies to the `from` of mail you sent from
-there, writes to the box you moved into. Measured 2026-10-28: a Lander launched in the primary,
-entered a sibling worktree, and fifteen messages waited there for fourteen hours with nothing saying
-so.
+The seat record does not follow the pin. `scripts/coord/seat.ps1` records the toplevel of the hook
+`cwd`, so after a move a peer that addresses you by your seat record writes to the box of the
+worktree you moved into, and nothing drains it. Measured 2026-10-28: a Lander launched in the
+primary, entered a sibling worktree, and fifteen messages waited there for fourteen hours with
+nothing saying so.
 
-The drain now names that box. When the hook `cwd` is in another worktree of the same repository and
-that worktree's box holds mail, the injection carries one line with the count and the path. It never
-shows or consumes that box, because after a stray `cd` it is a sibling's. The line is said once per
-change in that inbox, because Stop output re-wakes the model.
+The drain now names that box. When a pinned session's hook `cwd` is in another worktree of the same
+repository, and that worktree's box holds live mail this session may read, the injection carries one
+line with the count and the path. It never shows or consumes that box, because after a stray `cd` it
+is a sibling's. The line is said again only when newer mail arrives there, because Stop output
+re-wakes the model.
 
-To read and consume it, run the drain from the worktree you moved into, with no session id, so no
-pin applies. Run it only where you moved on purpose; the drain consumes what it shows.
+To read it, run the drain by hand from the worktree you moved into, as a SessionStart carrying your
+own session id. A SessionStart answers for the `cwd` it names, applies the session-id filter, marks
+what it showed so a second run shows only newer mail, and consumes nothing. From the Bash tool, with
+forward slashes so neither bash nor JSON eats a backslash:
 
-    '{"hook_event_name":"Stop","cwd":"<that worktree>"}' | pwsh -NoProfile -File scripts\hooks\mail-drain.ps1
+    echo '{"hook_event_name":"SessionStart","session_id":"<your session id>","cwd":"<that worktree, forward slashes>"}' | pwsh -NoProfile -File scripts/hooks/mail-drain.ps1
 
-The `cwd` is JSON, so double each backslash in the path. The output is the hook's JSON; the mail is in `hookSpecificOutput.additionalContext`. To count
-without reading, run `scripts\coord\mail.ps1 -Status` from that worktree. Starting the session in
-the worktree avoids all of this ([`WORKTREES.md`](WORKTREES.md#start-the-session-in-the-worktree)).
+The mail is in the output's `hookSpecificOutput.additionalContext`. To count without reading, run
+`scripts/coord/mail.ps1 -Status` from that worktree. Starting the session in the worktree avoids all
+of this ([`WORKTREES.md`](WORKTREES.md#start-the-session-in-the-worktree)).
 
 ---
 

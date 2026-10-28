@@ -112,7 +112,8 @@
     WHAT IT EMITS IS A FUNCTION OF STATE, ON PURPOSE. The distinct outcomes render as distinct
     sentences: mail delivered, mail deferred by the caps, mail truncated, a body withheld, mail
     expired, mail unreadable, a filename this channel did not mint, a claim lost to a sibling drain,
-    a claim stranded by a dead claimer, box empty, and mail suppressed by the OFF switch. The defect
+    a claim stranded by a dead claimer, box empty, mail waiting in the box of a worktree the session
+    moved into, and mail suppressed by the OFF switch. The defect
     being designed against is on record in announce-session.ps1 -- a hook that was wired, fired,
     resolved nothing and exited 0 for weeks, byte-identical to a healthy hook with nothing to do. A
     channel whose output never changes cannot be told apart from one that is dead.
@@ -355,6 +356,7 @@ $MAIL_PREAMBLE = @(
 )
 
 $script:MovedBoxNote = ''
+$script:MovedBoxStamp = ''
 
 function Write-Injection {
     param([string]$Event, [string]$Text)
@@ -371,6 +373,11 @@ function Write-Injection {
         }
     }
     [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
+    # Dated only now that the notice is out; see "MAIL ADDRESSED TO WHERE THE SESSION IS NOW".
+    if ($script:MovedBoxStamp) {
+        try { (Get-Item -LiteralPath $script:MovedBoxStamp -EA Stop).LastWriteTime = Get-Date } catch { }
+        $script:MovedBoxStamp = ''
+    }
 }
 
 function Get-Clean {
@@ -937,44 +944,75 @@ try {
     # is the one read of the legacy box; nothing writes to it.
     Move-LegacyInbox -Root $root -Key $key -LegacyKey (ConvertTo-LegacyBoxKey -Path $cwd)
 
-    # --- MAIL ADDRESSED TO WHERE THE SESSION IS NOW. A session that launched in one worktree and moved
-    # into another (EnterWorktree) is answered for by its pin, so this drain reads the STARTING box. Its
-    # seat record follows the hook `cwd` (scripts/coord/seat.ps1), so a peer who addresses it by that
-    # record writes to the box it moved into, which nothing read. Measured 2026-10-28: fifteen
-    # messages waited fourteen hours in a Lander's moved-into box, in silence. That box may also be a
-    # sibling's after a stray `cd`, so it is still never shown or consumed here; its waiting count
-    # and path are NAMED. Once per change in its inbox, because output at Stop re-wakes the model and
-    # an unchanged count repeated every turn would loop.
+    # --- MAIL ADDRESSED TO WHERE THE SESSION IS NOW. A pinned session whose `cwd` is in another
+    # worktree of this repository (EnterWorktree, or a stray `cd`) has that box NAMED here, never shown
+    # or consumed, since it may be a sibling's. docs/SESSION-MAIL.md, "Mail sent to the worktree you
+    # moved into", says why. Only live mail this session may read is counted, and the notice is said
+    # once per NEWEST waiting stem, so an arrival wakes the model once and a removal by the box's own
+    # session does not. Output at Stop re-wakes the model, so the stamp that silences a repeat must be
+    # writable before anything is said at Stop: an unwritable one goes to stderr instead, which does not
+    # wake. It is marked "pending" (dated in the past) now and dated only after the emit, so a drain
+    # killed between the two says it again rather than never.
+    $script:MovedBoxStamp = ''
     try {
         if ($hasHelper -and $session -and $session.Source -eq 'pin' -and $session.Root) {
             $nowCwd = (Get-CcxHookPayloadCwd -Payload $hook).Cwd
             $nowRoot = if ($nowCwd) { Get-CcxWorktreeRoot $nowCwd } else { $null }
             if ($nowRoot -and -not (Test-CcxSamePath $nowRoot $session.Root)) {
                 $nowCommon = Get-CcxGitCommonDir $nowRoot
-                $pinCommon = Get-CcxGitCommonDir $session.Root
-                if ($nowCommon -and $pinCommon -and (Test-CcxSamePath $nowCommon $pinCommon)) {
+                if ($nowCommon -and (Test-CcxSamePath $nowCommon $common.Trim())) {
                     $nowKey = ConvertTo-BoxKey -Path $nowRoot
                     $nowInbox = Join-Path $root "box/$nowKey/inbox"
-                    $waiting = @(Get-ChildItem -LiteralPath $nowInbox -Filter '*.json' -File -EA SilentlyContinue |
-                            Sort-Object Name)
-                    if ($waiting.Count -gt 0 -and (Test-CcxSayOnce -Key "$sessionId|$nowKey|$(($waiting.Name) -join ',')" `
-                                -Minutes $MOVED_BOX_COOLDOWN_MINUTES `
-                                -Dir (Join-Path ([System.IO.Path]::GetTempPath()) 'mefor-mail-moved'))) {
-                        $script:MovedBoxNote = (
-                            "[mefor-mail] $($waiting.Count) message(s) wait in the box of $(Get-Clean $nowRoot $MAX_CWD_CHARS), " +
-                            "where this session is now. This drain does not read that box: it reads the box of " +
-                            "$(Get-Clean ([string]$session.Root) $MAX_CWD_CHARS), where the session started " +
-                            "(scripts/hooks/_hookinput.ps1, rule 3). A seat record follows the current directory, so a " +
-                            "peer who addressed you by yours wrote there. Nothing in it was shown or consumed. If you " +
-                            "moved there on purpose, that mail is yours: docs/SESSION-MAIL.md, `"Mail sent to the " +
-                            "worktree you moved into`", says how to read it. As of ${asOf}; said again only when that " +
-                            "box changes.") -replace '[^\x20-\x7E\n]', '?'
+                    $nowUtc = [DateTime]::UtcNow
+                    $waiting = @(foreach ($f in @(Get-ChildItem -LiteralPath $nowInbox -Filter '*.json' -File -EA SilentlyContinue)) {
+                            $parts = Split-MailFileName -Name $f.Name
+                            if (-not $parts) { continue }
+                            $m = $null
+                            try { $m = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
+                            $exp = [DateTime]::MinValue
+                            if ($m.expiresUtc -and [DateTime]::TryParse([string]$m.expiresUtc, [Globalization.CultureInfo]::InvariantCulture,
+                                    [Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$exp) -and $exp -lt $nowUtc) { continue }
+                            $to = if ($m.to -and $m.to.sessionId) { [string]$m.to.sessionId } else { '' }
+                            if ($to -and $to -ne $sessionId) { continue }
+                            $parts.Stem
+                        })
+                    if ($waiting.Count -gt 0) {
+                        $newest = ($waiting | Sort-Object -Descending | Select-Object -First 1)
+                        $stampDir = Join-Path ([System.IO.Path]::GetTempPath()) 'mefor-mail-moved'
+                        $stamp = Join-Path $stampDir "$(Get-CcxShortHash "$sessionId|$nowKey|$newest" -Bytes 8).stamp"
+                        $prev = Get-Item -LiteralPath $stamp -EA SilentlyContinue
+                        $age = if ($prev) { ((Get-Date) - $prev.LastWriteTime).TotalMinutes } else { -1 }
+                        if (-not ($age -ge 0 -and $age -lt $MOVED_BOX_COOLDOWN_MINUTES)) {
+                            $note = (
+                                "[mefor-mail] $($waiting.Count) message(s) wait in the box of the worktree this session " +
+                                "is in now, $(Get-Clean $nowRoot $MAX_CWD_CHARS). This drain does not read that box: it " +
+                                "reads the box of $(Get-Clean ([string]$session.Root) $MAX_CWD_CHARS), where the session " +
+                                "started. Nothing in it was shown or consumed. If you moved there on purpose, that mail " +
+                                "is yours: docs/SESSION-MAIL.md, `"Mail sent to the worktree you moved into`", says how " +
+                                "to read it. As of ${asOf}; said again when newer mail arrives there.") -replace '[^\x20-\x7E\n]', '?'
+                            $writable = $false
+                            try {
+                                New-Item -ItemType Directory -Force -Path $stampDir -EA Stop | Out-Null
+                                Set-Content -LiteralPath $stamp -Value 'pending' -Encoding ascii -EA Stop
+                                (Get-Item -LiteralPath $stamp -EA Stop).LastWriteTime = [DateTime]'2000-01-01'
+                                $writable = $true
+                                # A stamp outlives its cooldown for nothing; prune those at each write.
+                                Get-ChildItem -LiteralPath $stampDir -Filter '*.stamp' -File -EA SilentlyContinue |
+                                    Where-Object { $_.LastWriteTime -gt [DateTime]'2000-01-02' -and
+                                        ((Get-Date) - $_.LastWriteTime).TotalMinutes -gt $MOVED_BOX_COOLDOWN_MINUTES } |
+                                    Remove-Item -Force -EA SilentlyContinue
+                            }
+                            catch { }
+                            if ($writable) { $script:MovedBoxNote = $note; $script:MovedBoxStamp = $stamp }
+                            elseif ($consuming) { try { [Console]::Error.WriteLine($note) } catch { } }
+                            else { $script:MovedBoxNote = $note }
+                        }
                     }
                 }
             }
         }
     }
-    catch { $script:MovedBoxNote = '' }
+    catch { $script:MovedBoxNote = ''; $script:MovedBoxStamp = '' }
 
     # VALIDATE BEFORE YOU BUILD. The session id is hook-payload input -- any process running under this
     # account can produce one -- and a shown-marker path is built out of it, so it goes through the same
@@ -1703,7 +1741,8 @@ try {
         # changes nothing. It is here so that the day somebody moves a break, a bounded pass cannot
         # start rendering as silence, which is the failure this whole block exists to prevent.
         $bounded = ($messageSweepTruncated -or $markerSweepTruncated -or $receiptSweepTruncated)
-        # A DRAIN THAT SHOWS NOTHING SPEAKS AT SessionStart ONLY. Any other event is SILENT -- no
+        # A DRAIN THAT SHOWS NOTHING SPEAKS AT SessionStart ONLY, except for the one-shot moved-box notice
+        # (see "MAIL ADDRESSED TO WHERE THE SESSION IS NOW"). Any other event is otherwise SILENT -- no
         # stdout at all -- because output there is not free context, it is a wake. Measured 2026-10-18
         # in the primary checkout: on Stop, additionalContext re-invoked the model, so a box holding
         # two messages addressed to OTHER sessions (the primary's box is shared by every session in
