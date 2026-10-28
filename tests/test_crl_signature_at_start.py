@@ -445,10 +445,11 @@ def _ca_without_ski(key: _CaKey, *, localhost: bool = False) -> x509.Certificate
 
 
 @functools.cache
-def _rsa_key(which: int = 0) -> rsa.RSAPrivateKey:
+def _rsa_key(which: int, /) -> rsa.RSAPrivateKey:
     """RSA key number ``which``, shared by every test that asks for it: a key the engine cannot
     check an ECDSA signature with, or a key to sign over SHA-1 with. Generated once each: a
-    2048-bit key takes a noticeable fraction of a second."""
+    2048-bit key takes a noticeable fraction of a second. No default, so one number names one
+    key however it is written."""
     return rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
@@ -483,7 +484,7 @@ def test_a_crl_its_named_ca_proves_bad_refuses_beside_an_unchecked_ca_with_no_sk
     not to verify the CRL. Beside it sits a CA of the same name with no Subject Key Identifier and
     an RSA key, which fits the CRL and cannot check its ECDSA signature. Before vault BACKLOG #4159
     that read ``uncheckable`` and the start loaded the file with a WARNING."""
-    no_ski = _ca_without_ski(_rsa_key())
+    no_ski = _ca_without_ski(_rsa_key(0))
     named = twins.new_ca.read_bytes()
     mixed = tmp_path / "mixed.pem"
     mixed.write_bytes(
@@ -549,19 +550,28 @@ def test_a_crl_its_named_ca_proves_bad_refuses_beside_a_ca_with_no_ski_that_veri
     # The running-hop reload holds it back now too: it loaded it live before, as ``verified``.
     verdict = crl_signature_refusal(pem, _ders(mixed))
     assert verdict is not None and verdict[1] is True
+    # The CA-file monitor gives the proven remedy, where it raised no alert before.
+    verdict_of_scan = cert_expiry._ca_file_crl_refusal(
+        mixed.read_bytes() + pem,
+        time.time(),
+        None,
+        ca_file_only=True,
+        on_unchecked=lambda: None,
+    )
+    assert verdict_of_scan is not None
+    assert verdict_of_scan[1].startswith("Replace the CRL in the CA file with one its CA signed")
 
-    # Control: OpenSSL fails a strict handshake through the named CA. Listed first, the CA with no
-    # SKI lets the handshake reach the CRL, and it fails there; a CRL the named CA signed passes.
-    # Listed after the named CA, a CA with no SKI and a key of the same kind fails the chain before
-    # the CRL is reached, whatever the CRL (open question 4 in the PR body).
+    # Control: OpenSSL fails a strict handshake through the named CA. Which error depends on the
+    # order OpenSSL sorts same-name CAs in, which differs by C runtime, not on the file order.
+    # Where it tries the named CA first, the handshake reaches this CRL and fails on it. Where it
+    # tries the CA with no SKI first, whose key is of the leaf's kind, the strict check fails the
+    # chain on the missing SKI before the CRL, whatever the CRL (open question 4 in the PR body).
+    # The CRL's own failure, in both orders, is the unchecked-CA test's control above; a CA with
+    # no SKI whose key could also verify this CRL must be of the CRL's kind, and so of the leaf's.
     raw = _raw_hop(mixed, twins.crl)
     assert raw.verify_flags & ssl.VERIFY_X509_STRICT
-    expected = "CRL signature failure" if no_ski_first else "Missing Subject Key Identifier"
-    with pytest.raises(ssl.SSLError, match=expected):
+    with pytest.raises(ssl.SSLError, match="CRL signature failure|Missing Subject Key Identifier"):
         _handshake(raw, twins.server(sends_renewed=False))
-    if no_ski_first:
-        twins.write_crl("new", "new")
-        _handshake(_raw_hop(mixed, twins.crl), twins.server(sends_renewed=False))
 
 
 def test_a_strict_engine_context_refuses_a_chain_through_a_ca_with_no_ski(tmp_path: Path) -> None:
@@ -588,9 +598,10 @@ def test_a_strict_engine_context_refuses_a_chain_through_a_ca_with_no_ski(tmp_pa
     _handshake(client, server)  # raises if refused
 
 
+@pytest.mark.parametrize("no_ski_first", [False, True], ids=["named-ca-first", "no-ski-ca-first"])
 @pytest.mark.parametrize("sends_more", [False, True], ids=["sends-itself", "sends-another-too"])
 def test_the_one_certificate_residual_a_start_refuses_a_crl_a_strict_handshake_passes(
-    twins: _Twins, tmp_path: Path, sends_more: bool
+    twins: _Twins, tmp_path: Path, sends_more: bool, no_ski_first: bool
 ) -> None:
     """The first residual ``docs/CONFIGURATION.md`` states for the rule above, set up whole. The
     hop lists the new CA, which the CRL names, and beside it a self-signed CA of the same name
@@ -598,10 +609,12 @@ def test_the_one_certificate_residual_a_start_refuses_a_crl_a_strict_handshake_p
     refuses the file. A peer whose own certificate is that CA passes a strict handshake judged by
     the CRL: OpenSSL skips its strict checks on a verified chain of one certificate, and that is
     the chain it builds, not the certificates the peer sends. If this goes red, the residual has
-    moved: correct that paragraph."""
+    moved: correct that paragraph. Both CA-file orders run, because OpenSSL sorts same-name CAs
+    in an order that differs by C runtime, and the two file orders cover both."""
     no_ski = _ca_without_ski(twins.stranger, localhost=True)
     listed = tmp_path / "listed.pem"
-    listed.write_bytes(twins.new_ca.read_bytes() + no_ski.public_bytes(_PEM))
+    pair = [twins.new_ca.read_bytes(), no_ski.public_bytes(_PEM)]
+    listed.write_bytes(b"".join(reversed(pair) if no_ski_first else pair))
     sent = no_ski.public_bytes(_PEM) + (twins.new_ca.read_bytes() if sends_more else b"")
     server = _server(tmp_path, sent, twins.stranger)
     twins.write_crl("stranger", "new")
@@ -631,6 +644,30 @@ def test_the_one_certificate_residual_a_start_refuses_a_crl_a_strict_handshake_p
         _handshake(strict_hop(), server)
 
 
+def test_a_lone_ca_with_no_ski_judges_its_own_one_certificate_chain_through_the_crl_setting(
+    tmp_path: Path,
+) -> None:
+    """The lone-CA shape of the case above, on the engine's own path: no other CA of that name is
+    listed, so the CRL names no listed CA's key, the CA with no SKI is judged, it verifies the CRL,
+    and the start loads the file through the CRL setting. A peer that presents that CA as its own
+    certificate passes the engine's strict handshake, and the CRL is live for it."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    ca = _ca_without_ski(key, localhost=True)
+    (tmp_path / "ca.pem").write_bytes(ca.public_bytes(_PEM))
+    (tmp_path / "crl.pem").write_bytes(_crl(key, names=key))
+    server = _server(tmp_path, ca.public_bytes(_PEM), key)
+
+    client = _hop(tmp_path / "ca.pem", tmp_path / "crl.pem")
+    assert client.verify_flags & ssl.VERIFY_X509_STRICT
+    assert client.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    _handshake(client, server)  # raises if refused
+
+    # Control: the CRL is live for this chain. Revoking the peer's own serial refuses it.
+    (tmp_path / "crl.pem").write_bytes(_crl(key, names=key, revoke=ca.serial_number))
+    with pytest.raises(ssl.SSLError, match="revoked"):
+        _handshake(_hop(tmp_path / "ca.pem", tmp_path / "crl.pem"), server)
+
+
 def test_a_named_ca_that_cannot_be_checked_still_warns_beside_a_ca_with_no_ski(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -638,7 +675,7 @@ def test_a_named_ca_that_cannot_be_checked_still_warns_beside_a_ca_with_no_ski(
     signature, so that CA cannot be checked. A CA of the same name with no Subject Key
     Identifier and an EC key sits beside it, and its key is proven not to verify the CRL. The
     named CA could still have signed it, so the state stays ``uncheckable`` and the start warns."""
-    rsa_key = _rsa_key()
+    rsa_key = _rsa_key(0)
     named = _ca(rsa_key, rsa_key)
     no_ski = _ca_without_ski(ec.generate_private_key(ec.SECP256R1()))
     (tmp_path / "ca.pem").write_bytes(named.public_bytes(_PEM) + no_ski.public_bytes(_PEM))
@@ -658,7 +695,7 @@ def test_a_lone_ca_with_no_ski_that_cannot_be_checked_still_warns(
     """(c) The only CA of that name carries no Subject Key Identifier and has an RSA key. The CRL
     names a key by identifier and carries an ECDSA signature, so that CA fits, is not named, and
     cannot be checked. No CA is proven bad, so the start warns."""
-    no_ski = _ca_without_ski(_rsa_key())
+    no_ski = _ca_without_ski(_rsa_key(0))
     (tmp_path / "ca.pem").write_bytes(no_ski.public_bytes(_PEM))
     signer = ec.generate_private_key(ec.SECP256R1())
     pem = _crl(signer, names=signer)
@@ -997,7 +1034,7 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_verified_and_a_forged_one_is_bad(
     ``uncheckable`` before: a start warned, and the reload held it back. The premise is OpenSSL's:
     it takes that CRL and judges the peer by it. The SHA-384 CRL is the control for the hand-made
     encoding: the same swap under a digest the library accepts reads ``verified`` too."""
-    key = _rsa_key()
+    key = _rsa_key(0)
     other = _rsa_key(1)
     ca = _ca(key, key)
     ders = [ca.public_bytes(serialization.Encoding.DER)]
@@ -1075,7 +1112,7 @@ def test_one_signer_gets_one_verdict_under_sha256_and_sha1(
     signer's verdict could differ by digest alone: a CA with no SKI signing beside the named CA
     read ``verified`` over SHA-256 and ``bad`` over SHA-1, and the named CA signing read
     ``verified`` and ``uncheckable``. Each row now gives one verdict for both digests."""
-    keys = {"named": _rsa_key(), "no-ski": _rsa_key(1)}
+    keys = {"named": _rsa_key(0), "no-ski": _rsa_key(1)}
     cas = {"named": _ca(keys["named"], keys["named"]), "no-ski": _ca_without_ski(keys["no-ski"])}
     shape = _crl(keys[signer], names=None if names is None else keys[names])
     pem = _resigned(shape, keys[signer], oid, digest)

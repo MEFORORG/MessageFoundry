@@ -931,7 +931,9 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
         elif signature.state != "verified":
             return (
                 f"{signature.where}: the engine could not confirm its signature with the key "
-                "of the CA certificate this hop trusts for that issuer. The check failed or "
+                "of the CA certificate this hop trusts for that issuer: the one the CRL names by "
+                "key identifier, where it names a listed CA's key, and a CA of that name with no "
+                "subject key identifier does not count then. The check failed or "
                 "could not run. Where that key did not sign the CRL, a handshake that OpenSSL "
                 "checks against that CA's key by this CRL fails with 'CRL signature failure'",
                 True,
@@ -988,7 +990,14 @@ def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
     followed the refusal would differ for one signer by digest alone. Measured 2026-10-27
     with ``cryptography`` 50.0.2 and OpenSSL 3.5.7: ``is_signature_valid`` refuses an RSA PKCS1v15
     signature over SHA-1 that the CA did make, and a handshake takes that CRL and judges the peer
-    by it. Before #4159 such a signature read ``None``. A forged one reads False."""
+    by it. Before #4159 such a signature read ``None``. A forged one reads False.
+
+    **True says the CA's key made the signature, not that every TLS library takes it.** The key
+    is asked through ``cryptography``'s own OpenSSL, and the handshake runs on the ``ssl``
+    module's, which can be another build with another policy. A policy that refuses the digest,
+    such as a system crypto policy that refuses SHA-1 signatures, fails the handshake on a CRL
+    read ``verified`` here. That holds for any verified signature, not only one
+    ``is_signature_valid`` refused; ``docs/CONFIGURATION.md`` states it beside the warn cases."""
     try:
         key = ca.public_key()
         if crl.is_signature_valid(key):  # type: ignore[arg-type]

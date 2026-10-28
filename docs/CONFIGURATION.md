@@ -2054,14 +2054,19 @@ three cases warn:
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
-- The engine cannot check the signature with a fitting listed CA's key, because it does not support
-  that algorithm or that pairing of key and signature. Where the CRL names a listed CA's key, only
-  that CA counts here (the refusal above says why). Where it names no listed CA's key, as when it
-  names a key no listed CA carries, every fitting CA counts, one with no subject key identifier
-  included. A measured example is an ECDSA signature on a CRL that names an RSA key. A signature
-  the CA's key accepts is verified even where the `cryptography` library's own check refuses it,
-  as for an RSA signature over SHA-1 that the CA did make; OpenSSL 3.5.7 was measured to judge a
-  peer by such a CRL (vault BACKLOG #4159).
+- The engine cannot check the signature with a fitting listed CA's key, at least where it does
+  not support that algorithm or that pairing of key and signature, or where reading the key or
+  checking with it raises an error. Where the CRL names a listed CA's key, only that CA counts
+  here (the paragraph that starts "Why a CA with no subject key identifier" says why). Where it
+  names no listed CA's key, as when it names a key no listed CA carries, every fitting CA counts,
+  one with no subject key identifier included. A measured example is an ECDSA signature on a CRL
+  that names an RSA key. A signature the CA's key accepts is verified even where the
+  `cryptography` library's own check refuses it, as for an RSA signature over SHA-1 that the CA
+  did make; OpenSSL 3.5.7 was measured to judge a peer by such a CRL (vault BACKLOG #4159).
+  Verified means the CA's key made the signature, not that every TLS library takes it: the
+  engine checks with the `cryptography` library's OpenSSL, the handshake runs on Python's, and a
+  build or system policy that refuses the digest, such as SHA-1, fails the handshake on a CRL
+  that started with no warning and that a reload applies.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
 it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
