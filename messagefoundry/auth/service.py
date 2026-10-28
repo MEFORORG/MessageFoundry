@@ -14419,7 +14419,9 @@ class AuthService:
         try:
             standing = await self._passkey_held(user, cred)
         except AUDIT_WRITE_DEFECTS:
-            raise  # a bad statement is a defect, not a store refusal
+            # SQLite's bad statement or bind is a defect, not a store refusal. On PostgreSQL and
+            # SQL Server a bad statement is a driver DatabaseError, so it is refused below.
+            raise
         except _session_write_errors():
             # BACKLOG #3775: after the sign-count write, a store fault here refuses with an audit
             # row rather than raising past the ceremony with none. Soft, so a store that refuses
