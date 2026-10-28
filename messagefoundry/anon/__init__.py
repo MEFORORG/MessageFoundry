@@ -34,7 +34,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
-from pathlib import Path
 
 from .hl7 import anonymize_message
 from .keying import Keyer
@@ -92,15 +91,17 @@ def anonymize(
     raw: str,
     *,
     salt: str,
-    overlay: Path | None = None,
     rules: tuple[FieldRule, ...] | None = None,
     blanked: list[str] | None = None,
 ) -> str:
     """De-identify one HL7 v2 message with the secret ``salt`` and the effective rule set.
 
-    ``rules`` overrides the rule set outright; otherwise :func:`load_rules` is used with the optional
-    ``anon.toml`` ``overlay`` path. HL7 v2 only for now — the payload-agnostic seam (ADR 0004 / 0030
-    §7) is left for a real X12/FHIR feed; do not feed a non-HL7 body here.
+    ``rules`` is the rule set, :data:`DEFAULT_RULES` when left out. For an ``anon.toml`` overlay,
+    call :func:`load_rules` once and pass what it returns to every message: this function takes no
+    overlay path, so a run reads, checks and warns about its overlay once (BACKLOG #3493).
+
+    HL7 v2 only for now — the payload-agnostic seam (ADR 0004 / 0030 §7) is left for a real
+    X12/FHIR feed; do not feed a non-HL7 body here.
 
     ``blanked``, when given, collects the address of every field the ``date`` kind scrubbed to empty
     because its value was not a timestamp it could keep. :func:`anonymize_checked` puts those addresses in
@@ -108,7 +109,7 @@ def anonymize(
     """
     keyer = Keyer(salt)
     if rules is None:
-        rules = load_rules(overlay)
+        rules = DEFAULT_RULES
     # A KEEP rule is a decision to leave the field alone, so it rewrites nothing.
     rewrites = tuple(r for r in rules if r.kind != SurrogateKind.KEEP)
     return anonymize_message(raw, keyer, rewrites, blanked)
@@ -118,7 +119,6 @@ def anonymize_checked(
     raw: str,
     *,
     salt: str,
-    overlay: Path | None = None,
     rules: tuple[FieldRule, ...] | None = None,
     require_live_denylist: bool = False,
     require_full_coverage: bool = False,
@@ -158,7 +158,7 @@ def anonymize_checked(
     The report's ``blanked_fields`` names each field the ``date`` kind scrubbed to empty because the
     value was not a timestamp it could keep. It is a record, not a refusal cause (BACKLOG #2330).
     """
-    effective = rules if rules is not None else load_rules(overlay)
+    effective = rules if rules is not None else DEFAULT_RULES
     blanked: list[str] = []
     output = anonymize(raw, salt=salt, rules=effective, blanked=blanked)
     # The version of the INPUT: a rule on MSH-12 has put a surrogate in the output, and a

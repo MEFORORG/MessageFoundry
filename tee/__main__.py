@@ -49,7 +49,14 @@ from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
 from tee.anon.leak import CoverageTally
-from tee.anon.rules import AnonError, RuleError, kept_defaults, load_rules, retargeted_defaults
+from tee.anon.rules import (
+    RETARGET_ACKNOWLEDGED,
+    AnonError,
+    RuleError,
+    kept_defaults,
+    load_rules,
+    retargeted_defaults,
+)
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -688,8 +695,10 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             + ", which turns off the default scrub of each: those fields are not rewritten",
             file=sys.stderr,
         )
-    # Printed for the same reason. A different kind can leave part of a field in the dataset
-    # while the leak-check counts the field as scrubbed (BACKLOG #3000).
+    # Printed for the same reason. load_rules refused every retarget the overlay did not list under
+    # [hl7].retarget_acknowledged, so each one here was listed. A different kind can still leave
+    # part of a field in the dataset while the leak-check counts the field as scrubbed (BACKLOG
+    # #3000).
     retargeted = retargeted_defaults(rules)
     if retargeted:
         print(
@@ -698,8 +707,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 f"{default.path} ({default.kind.value} to {now.kind.value})"
                 for default, now in retargeted
             )
-            + ", which replaces the default scrub of each: a different kind can leave part of "
-            "the field as captured",
+            + f", which replaces the default scrub of each, as [hl7].{RETARGET_ACKNOWLEDGED} "
+            "allows: a different kind can leave part of the field as captured",
             file=sys.stderr,
         )
 
