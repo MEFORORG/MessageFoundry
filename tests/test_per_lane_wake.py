@@ -33,7 +33,7 @@ from messagefoundry.config.wiring import (
     Send,
 )
 from messagefoundry.parsing.message import Message, RawMessage
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.wiring_runner import _PER_LANE_IDLE_BACKSTOP_SECONDS, RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
 
 ADT = (
@@ -284,13 +284,21 @@ def _delivery_registry(inbox: Path, out_a: Path, out_b: Path) -> Registry:
     return reg
 
 
-async def _until(predicate: Any, timeout: float = 3.0) -> None:
-    elapsed = 0.0
+# How long _until waits, in wall-clock seconds. A passing run ends the wait as soon as its condition
+# holds, so this is a ceiling, not a speed assertion. It sits BELOW the per-lane idle backstop on
+# purpose: with wake ON, a lost wake parks its lane until that backstop, so a ceiling under it keeps
+# a lost wake red instead of letting the backstop rescue it. The 3s it replaces (counted in sleeps,
+# not wall time) failed on a windows-2025 runner under a full parallel suite (BACKLOG #3456).
+_UNTIL_CEILING_SECONDS = _PER_LANE_IDLE_BACKSTOP_SECONDS / 2
+
+
+async def _until(predicate: Any, timeout: float = _UNTIL_CEILING_SECONDS) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     while not await predicate():
+        if loop.time() >= deadline:
+            raise AssertionError(f"condition not met within {timeout:g}s")
         await asyncio.sleep(0.02)
-        elapsed += 0.02
-        if elapsed > timeout:
-            raise AssertionError("condition not met within timeout")
 
 
 @pytest.mark.parametrize("per_lane_wake", [False, True])
@@ -354,7 +362,12 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
         # Poll the ACTUAL asserted condition — all 3 messages finalized to PROCESSED — not a proxy like
         # "N outbound rows DONE" (each message fans out to 2, so that proxy trips at 1.5 messages; it
         # false-greened on a fast runner and flaked on a slow one — mf-ci-test-flakes).
-        await _until(lambda: _n_processed(store, 3))
+        try:
+            await _until(lambda: _n_processed(store, 3))
+        except AssertionError as exc:
+            # Name where the messages stopped, so a recurrence shows which stage never drained.
+            msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
+            raise AssertionError(f"{exc}; statuses: {sorted(m['status'] for m in msgs)}") from exc
     finally:
         await r.stop()
     # Every message reached PROCESSED under per-lane wake, in arrival (ingest = rowid = seq) order —

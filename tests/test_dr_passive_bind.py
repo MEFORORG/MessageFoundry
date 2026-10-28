@@ -43,6 +43,21 @@ async def _accepts(port: int) -> bool:
     return True
 
 
+async def _comes_up(port: int, *, ceiling: float = 20.0) -> bool:
+    """Whether ``port`` accepts within ``ceiling`` wall-clock seconds, retrying a refused or slow
+    connect. For a control that expects a bound listener only: the first try lands when the runner
+    is not starved, so the ceiling is never slept on in a passing run. One 2s connect is a speed
+    assertion on a loaded runner (BACKLOG #3456). An assertion that a port is NOT bound keeps the
+    single probe, since retrying it would only wait longer to read the same False."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + ceiling
+    while not await _accepts(port):
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
 _DB = "dr-passive.db"
 
 
@@ -326,7 +341,10 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
         assert rr is not None
         if not norm_auto_start:
             await rr.start_inbound(_NORM, operator=True)
-            assert await _accepts(norm_port)  # control: the probe sees a bound feed
+            # The runner's own record of the bind first, so a red here says whether the start
+            # bound nothing or only the probe missed a bound feed.
+            assert rr.inbound_running(_NORM) and rr.inbound_failed(_NORM) is None
+            assert await _comes_up(norm_port)  # control: the probe sees a bound feed
             await engine.reload_detail(cfg)
         assert rr.inbound_filtered(_NORM) is not None and not await _accepts(norm_port)
 

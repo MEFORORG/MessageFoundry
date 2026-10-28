@@ -46,6 +46,14 @@ async def store(tmp_path: Path):
     await s.close()
 
 
+# A ceiling on a wait whose normal case ends far sooner, so a passing run never sleeps on it. It is
+# not a speed assertion: it only turns a hang into a failure before the per-test watchdog fires
+# (pyproject.toml's 60s), so two of them must fit under that. The 3s it replaces was a speed
+# assertion by accident: a windows-2025 runner under a full parallel suite took longer than that to
+# carry one file into send() (BACKLOG #3456).
+_HANG_CEILING_SECONDS = 20.0
+
+
 class _HangingDestination(DestinationConnector):
     """A connector whose send() hangs forever (until the delivery worker task is cancelled). Models
     a wedged downstream — the worst case for graceful stop."""
@@ -53,10 +61,17 @@ class _HangingDestination(DestinationConnector):
     def __init__(self) -> None:
         self.entered = asyncio.Event()  # set the moment send() is first called
         self.closed = False
+        self.cancelled = False  # send() saw its CancelledError
+        self.task: asyncio.Task[object] | None = None  # the task send() ran on
 
     async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
+        self.task = asyncio.current_task()
         self.entered.set()
-        await asyncio.Event().wait()  # never returns; only a task cancellation unblocks it
+        try:
+            await asyncio.Event().wait()  # never returns; only a task cancellation unblocks it
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
     async def aclose(self) -> None:
         self.closed = True
@@ -134,15 +149,27 @@ async def test_hung_outbound_does_not_block_graceful_stop(
     )
     await runner.start()
     hung = _HangingDestination()
-    runner._destinations["out"] = hung  # swap in the wedged connector (worker re-resolves per item)
-    (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
-    await asyncio.wait_for(hung.entered.wait(), timeout=3.0)  # send() is now hung mid-delivery
-    # The hung send must NOT block graceful stop — bounded so a regression (a swallowed cancellation)
-    # fails loud as a timeout instead of hanging the suite.
-    await asyncio.wait_for(runner.stop(), timeout=5.0)
+    stopping = False
+    try:
+        runner._destinations["out"] = hung  # swap in the wedged connector (re-resolved per item)
+        (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+        # Setup, not the property: send() is now hung mid-delivery.
+        await asyncio.wait_for(hung.entered.wait(), timeout=_HANG_CEILING_SECONDS)
+        # The hung send must NOT block graceful stop. A regression (a swallowed or missing
+        # cancellation) hangs here for good, and the ceiling turns that into a TimeoutError.
+        stopping = True
+        await asyncio.wait_for(runner.stop(), timeout=_HANG_CEILING_SECONDS)
+    finally:
+        if not stopping:
+            # A failed setup still stops the graph, or its tasks outlive the store fixture and
+            # log against a closed database, as the 2026-10-12 failure's teardown did.
+            await runner.stop()
     assert not runner.running
     assert runner._workers == {} and runner._sources == {}  # no leaked tasks/sources
     assert hung.closed  # the connector was closed during teardown
+    # Stop cancelled the hung send rather than abandoning it, and the task it ran on is finished.
+    assert hung.cancelled
+    assert hung.task is not None and hung.task.done()
 
 
 async def test_problem_connection_does_not_block_engine_restart(
