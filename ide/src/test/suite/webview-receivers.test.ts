@@ -827,20 +827,18 @@ suite("webview receivers discard a malformed payload and render a well-formed on
   test("mfShapeOk refuses an entry that is not a function, and a check that is truthy but not true", () => {
     // SHAPE_HELPERS is the source every receiver embeds, so this runs the shipped helper. Every
     // panel's entries are functions returning booleans, so only this pins the two guards.
-    const h = new Function(`${SHAPE_HELPERS}; return { mfShapeOk };`)() as {
+    // The helpers get their own `console` as a parameter, never the global one: in the VS Code
+    // Extension Host console.warn is an accessor whose setter does not install an assigned stub, so
+    // a stub on the global console saw nothing there (measured at VS Code 1.143.1).
+    const warned: string[] = [];
+    const pageConsole = { warn: (...args: unknown[]) => void warned.push(args.map(String).join(" ")) };
+    const h = new Function("console", `${SHAPE_HELPERS}; return { mfShapeOk };`)(pageConsole) as {
       mfShapeOk(d: Payload, key: string, shapes: Record<string, unknown>, panel: string): boolean;
     };
     const shapes = { notCallable: 1, truthy: () => 1, ok: () => true };
-    const warned: string[] = [];
-    const warn = console.warn;
-    console.warn = (...args: unknown[]) => void warned.push(args.map(String).join(" "));
-    try {
-      assert.strictEqual(h.mfShapeOk({ command: "notCallable" }, "command", shapes, "P"), false);
-      assert.strictEqual(h.mfShapeOk({ command: "truthy" }, "command", shapes, "P"), false);
-      assert.strictEqual(h.mfShapeOk({ command: "ok" }, "command", shapes, "P"), true, "control");
-    } finally {
-      console.warn = warn;
-    }
+    assert.strictEqual(h.mfShapeOk({ command: "notCallable" }, "command", shapes, "P"), false);
+    assert.strictEqual(h.mfShapeOk({ command: "truthy" }, "command", shapes, "P"), false);
+    assert.strictEqual(h.mfShapeOk({ command: "ok" }, "command", shapes, "P"), true, "control");
     assert.deepStrictEqual(warned, [
       'MessageFoundry P: discarded a malformed "notCallable" message',
       'MessageFoundry P: discarded a malformed "truthy" message',
