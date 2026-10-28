@@ -473,8 +473,9 @@ async def test_two_planted_rows_each_raise_their_own_alert(
     transit_store: Opened, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Two sessions whose genuine seals are rewritten to a version Transit does not hold each
-    page on their own, inside one throttle window, keyed per row as a forgery is, so the first
-    row's page never mutes the second's (BACKLOG #2592). Both stay denied, ended and audited."""
+    reach the alert hook on their own, inside one throttle window, keyed per row as a forgery is,
+    so the service's throttle never mutes the second (BACKLOG #2592). A sink that throttles per
+    subject still collapses them, as it does forgeries. Both stay denied, ended and audited."""
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
     store, path, transit = transit_store
     transit.refusal = hvac_exceptions.InvalidRequest
@@ -858,6 +859,7 @@ def test_the_unverifiable_errors_survive_copy_and_pickle() -> None:
     for error in (
         RowSealUnverifiableError("vault:v3:probe"),
         AdMapUnverifiableError(AD_SCOPE_MAP),
+        CustomRoleUnverifiableError(),
     ):
         for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error)):
             assert type(clone) is type(error)

@@ -2988,8 +2988,10 @@ class CustomRoleUnverifiableError(Exception):
     Refused rather than saved: the role is listed with no permissions, so a re-save would replace
     what it may genuinely hold. The text names the recovery, and nothing from the row."""
 
-    def __init__(self) -> None:
-        super().__init__(
+    def __str__(self) -> str:
+        # Fixed text rather than an ``__init__`` argument, so ``cls(*args)`` rebuilds it: copy and
+        # pickle call that.
+        return (
             "this custom role's stored integrity seal cannot be verified by Vault transit, so it"
             " was not saved: a save would replace the permissions it may still hold. To recover,"
             " delete the role and create it again"
@@ -3013,7 +3015,8 @@ class AdMapUnverifiableError(Exception):
             f"the {self.name}'s stored integrity seal cannot be verified by Vault transit, so it"
             " cannot be listed or replaced: an edit would overwrite the pairs it may still hold."
             " To recover, make Vault transit hold the key version that sealed it again, or clear"
-            " the map by saving it with no entries and then enter its pairs again"
+            " the map through the API by saving it with no entries (PUT /ad-group-map or"
+            " /ad-group-scope-map) and then enter its pairs again"
         )
 
 
@@ -10461,7 +10464,9 @@ class AuthService:
     async def _checked_ad_map(self, name: str) -> tuple[AdMap, bool | None]:
         """The AD map ``name`` with its seal's verdict, as :meth:`_checked_role` gives a role's:
         ``True`` holds, ``False`` fails and ``None`` is a seal Vault transit refused to check
-        (BACKLOG #2592). It reports nothing; each caller decides."""
+        (BACKLOG #2592). It writes no seal-failure audit row and raises no per-map page; each
+        caller decides. The sealer's own throttled ERROR line and key-level page on a refusal
+        still fire."""
         current = await self._store.get_ad_map(name)
         return current, await _unless_unverifiable(
             ad_map_seal_ok(self._store.row_sealer(), current)

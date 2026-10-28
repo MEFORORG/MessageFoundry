@@ -2014,23 +2014,23 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 if r == Role.ADMINISTRATOR.value
             }
 
-        grants = any(e.role == Role.ADMINISTRATOR.value for e in body.entries)
+        requested_admin = {
+            g
+            for g, e in zip(groups, body.entries, strict=True)
+            if e.role == Role.ADMINISTRATOR.value
+        }
         with _ad_map_unverifiable_is_409():
-            before = await admin_groups() if grants else set()
+            before = await admin_groups() if requested_admin else set()
             await service.set_ad_group_map(
                 [(g, e.role) for g, e in zip(groups, body.entries, strict=True)],
                 actor=identity.username,
             )
         try:
-            after = await admin_groups() if grants else set()
-        except AdMapUnverifiableError:
+            after = await admin_groups() if requested_admin else set()
+        except (AdMapUnverifiableError, TransitSealUnavailableError):
             # BACKLOG #2592: the save landed, but its read-back could not be checked, so every
             # group it maps to Administrator pages rather than none.
-            after = {
-                g
-                for g, e in zip(groups, body.entries, strict=True)
-                if e.role == Role.ADMINISTRATOR.value
-            }
+            after = requested_admin
         for group in sorted(after - before):
             _alert_administrator_granted(
                 app, f"ad-group:{group}", via="ad_group_map", granted_by=identity.username
