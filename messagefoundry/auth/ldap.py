@@ -1489,13 +1489,26 @@ def _refuse_service_bind(exc: BaseException) -> NoReturn:
     raise LdapError("AD refused the service-account bind; ldap3 raised LDAPBindError") from exc
 
 
+@dataclass(slots=True)
+class _Release:
+    """What :func:`_released` yields: once its block has ended, the ldap3 error the unbind raised,
+    or ``None``. A caller whose block decided a PASS reads it after the block (BACKLOG #3848)."""
+
+    unbind_error: BaseException | None = None
+
+
 @contextlib.contextmanager
-def _released(conn: Any, what: str) -> Iterator[None]:
+def _released(conn: Any, what: str) -> Iterator[_Release]:
     """Unbind ``conn`` when the block ends, however it ends. An ldap3 error from the unbind is
     logged at DEBUG, by type only and naming ``what`` connection it was, and never raised: by then
     the block has answered or raised. **Everything below holds for an ldap3 error only.** Any other
     error from the unbind propagates, replacing the block's outcome and skipping the close, so an
     engine defect there does not hide as a log line.
+
+    **An unbind error never upgrades an answer toward a pass; it only stops a refusal going
+    uncharged (BACKLOG #3848).** The error is kept on the yielded :class:`_Release`, so a caller
+    whose block ended in a pass, the user bind that proved the password, raises it after the block
+    and fails closed as before. A refusal, or a raised error, needs nothing from it.
 
     **After an ldap3 error, the socket is closed without sending.** ldap3 2.9.1's ``unbind`` sends
     the request and only then closes, so a failed send left the socket open until the object was
@@ -1510,18 +1523,21 @@ def _released(conn: Any, what: str) -> Iterator[None]:
     from inside this block, and must still reach the step-up re-bind as a refused password, which
     it counts, rather than as an :class:`LdapError`, which it reads as ``directory_unavailable``
     and does not. The decoy bind (:meth:`LdapAuthenticator._equalizing_bind`) is released here
-    too, so an ldap3 error from the unbind changes neither branch's answer (#3830).
+    too, so an ldap3 error from the unbind changes neither branch's refusal (#3830). The decoy
+    never passes, so it never reads :attr:`_Release.unbind_error`.
     """
     import ldap3
 
+    release = _Release()
     try:
-        yield
+        yield release
     finally:
         try:
             conn.unbind()
         except ldap3.core.exceptions.LDAPException as failed:
             logger.debug("AD %s unbind failed: %s", what, _type_name(failed))
             _close_without_sending(conn, f"after a failed {what} unbind")
+            release.unbind_error = failed
 
 
 class LdapAuthenticator:
@@ -2059,7 +2075,7 @@ class LdapAuthenticator:
                 # Released on BOTH paths. A rejected password is the common adversarial case, so
                 # returning early without unbinding would leave the connection to GC under exactly
                 # the load that matters (ASVS 13.1.3 — resource release).
-                with _released(user_conn, "user bind"):
+                with _released(user_conn, "user bind") as release:
                     # BACKLOG #2566: the bind opens the socket, so only the bind is wrapped. The
                     # build above does no I/O, and the release runs on an open socket.
                     with _socket_faults_as_ldap_error(), _ldap3_call("user bind"):
@@ -2068,8 +2084,14 @@ class LdapAuthenticator:
                         _refuse_referral(user_conn, "user bind")
                         # A busy or unavailable directory judged no password (BACKLOG #3169).
                         _refuse_unjudged_bind(user_conn)
-                        # The entry was found enabled, so the refusal judged this account.
+                        # The entry was found enabled, so the refusal judged this account. It is
+                        # charged whatever the unbind does after it (BACKLOG #3848).
                         return DirectoryBind(DirectoryAnswer.FOUND)
+                # The password was proved, but an unbind error never upgrades an answer toward a
+                # pass (BACKLOG #3848): it fails closed as a directory error, as it did before. The
+                # decoy never passes, so it reads nothing from its release and keeps its answer.
+                if release.unbind_error is not None:
+                    raise release.unbind_error
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
         except ldap3.core.exceptions.LDAPException as exc:
             raise _ldap3_failed(exc) from exc

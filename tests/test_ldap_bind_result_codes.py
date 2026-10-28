@@ -331,19 +331,41 @@ def test_a_failing_unbind_changes_neither_bind_branchs_answer(
     assert released == [(event, dn) for dn in binds for event in ("unbind failed", "closed")]
 
 
-def test_a_bound_password_whose_unbind_fails_still_signs_in(
+def test_a_proved_password_whose_unbind_fails_still_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The bound arm of the same rule: the password was proved before the release, and the group
-    read runs on the service connection, so a failing unbind on the user's connection no longer
-    turns a proved password into an outage. The user's socket is still closed."""
+    """The bound arm: an unbind error never upgrades an answer toward a pass (BACKLOG #3848,
+    Manager decision for batch 458). A proved password whose unbind fails reads as a directory
+    error, as it did before the fix, and no principal is returned. The user's socket is still
+    closed, and the service connection is still released."""
     rec = _install_fakes(monkeypatch)
     released = _unbind_fails_after_a_bind(monkeypatch)
-    bind = LdapAuthenticator(_ad_settings()).authenticate("alice", _PASSWORD)
-    assert bind.answer is DirectoryAnswer.FOUND and bind.principal is not None
+    with pytest.raises(LdapError) as raised:
+        LdapAuthenticator(_ad_settings()).authenticate("alice", _PASSWORD)
+    assert (
+        str(raised.value) == "AD directory call failed: ldap3 raised LDAPSocketSendError (OSError)"
+    )
+    assert isinstance(raised.value.__cause__, LDAPSocketSendError)
     alice = "CN=alice,OU=Users,DC=example,DC=com"
     assert released == [("unbind failed", alice), ("closed", alice)]
     assert len(rec.unbinds) == 1 and alice not in rec.unbinds, "the service unbind did not run"
+
+
+async def test_a_proved_re_bind_whose_unbind_fails_is_refused_and_not_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same arm at the step-up: refused as ``directory_unavailable``, never elevated, and not
+    charged, because the password the directory accepted was not a wrong one. RED when the unbind
+    error is dropped on the bound path, which elevates the session."""
+
+    def bound(self: Any) -> bool:
+        self.result = {"result": 0, "description": "success", "type": "bindResponse"}
+        return True
+
+    elevation, failed, details, charged = await _rebind_after(monkeypatch, bound, unbind_fails=True)
+    assert not elevation.ok and elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
+    assert failed == 0 and charged == 0
+    assert any('"reason": "directory_unavailable"' in d for d in details), details
 
 
 # --- 52 as a Notice of Disconnection: a different path, to the same reading ----------------------
