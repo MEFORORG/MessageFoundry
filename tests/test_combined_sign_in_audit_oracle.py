@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -681,16 +682,41 @@ async def test_a_marked_directory_lock_refusal_is_hidden_whole_on_every_read_pat
     its exact text, so any added field made it visible. ``GET /audit?action=`` is covered by
     :func:`test_the_routes_hide_lock_rows_from_a_reader_without_users_manage`."""
     world = await _open_world(tmp_path, monkeypatch)
+    marker = {"callback_floor_exempt_amr": ["wia"]}
     try:
         await world.service._refuse_directory_row(
-            "probe-locked", "locked", client=None, extra={"callback_floor_exempt_amr": ["wia"]}
+            "probe-locked", "locked", client=None, extra=marker
         )
-        for read in (_read_trail, _read_export):
-            auditor = [r for r in await read(world, _AUDITOR) if r[0] == "probe-locked"]
+        # The positive control: a refusal from the same writer, with the same marker, that is not
+        # a lock and so is shown to the Auditor. Without it, an Auditor read that came back empty
+        # for any reason would pass the absence assertion below.
+        await world.service._refuse_directory_row(
+            "probe-visible", "disabled", client=None, extra=marker
+        )
+
+        # A helper, not a loop body: the absence lint counts a guard only at a scope's top level.
+        async def hidden_from_the_auditor_only(
+            read: Callable[[_World, str], Awaitable[list[_Row]]],
+        ) -> None:
+            seen = await read(world, _AUDITOR)
+            assert len(seen) >= 1, (read.__name__, seen)
+            control = [r for r in seen if r[0] == "probe-visible"]
+            assert [r[1] for r in control] == ["auth.login_failed"], (read.__name__, seen)
+            assert (
+                json.loads(control[0][3] or "{}")["callback_floor_exempt_amr"]
+                == marker["callback_floor_exempt_amr"]
+            )
+            auditor = [r for r in seen if r[0] == "probe-locked"]
             admin = [r for r in await read(world, _SECOND_ADMIN) if r[0] == "probe-locked"]
             assert auditor == [], (read.__name__, auditor)
             assert [r[1] for r in admin] == [DIRECTORY_LOGIN_LOCKED_ACTION], (read.__name__, admin)
-            assert json.loads(admin[0][3] or "{}")["callback_floor_exempt_amr"] == ["wia"]
+            assert (
+                json.loads(admin[0][3] or "{}")["callback_floor_exempt_amr"]
+                == marker["callback_floor_exempt_amr"]
+            )
+
+        for read in (_read_trail, _read_export):
+            await hidden_from_the_auditor_only(read)
 
         async with _client(world, serve_ui=True) as c:
             for reader, expect_shown in ((_AUDITOR, False), (_SECOND_ADMIN, True)):
