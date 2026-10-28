@@ -1380,7 +1380,8 @@ def _socket_faults_as_ldap_error() -> Iterator[None]:
     Two wraps are wider than the open, and each says why. The ``auto_bind`` construction checks its
     keywords and opens in one call, so a renamed ldap3 keyword there would map; the real-ldap3 arms
     of ``tests/test_ldap_referrals.py`` build that connection, so one would fail there first. And
-    ``authenticate`` wraps the whole decoy bind, which must neither map nor swallow by itself.
+    ``authenticate`` wraps the whole decoy bind, which must neither map nor swallow by itself
+    beyond the release both branches share (:func:`_released`).
 
     A response ldap3 could not decode is not a socket fault: each bind also runs inside
     :func:`_ldap3_call`, nested inside this wrap, which refuses it first.
@@ -1481,9 +1482,16 @@ def _refuse_service_bind(exc: BaseException) -> NoReturn:
 
 
 @contextlib.contextmanager
-def _released(conn: Any) -> Iterator[None]:
+def _released(conn: Any, what: str) -> Iterator[None]:
     """Unbind ``conn`` when the block ends, however it ends. An ldap3 error from the unbind is
-    logged at DEBUG, by type only, and never raised: by then the block has answered or raised.
+    logged at DEBUG, by type only and naming ``what`` connection it was, and never raised: by then
+    the block has answered or raised. Any other error from the unbind still propagates, so an
+    engine defect there does not hide as a log line.
+
+    **The socket is closed even when the unbind's send fails.** ldap3 2.9.1's ``unbind`` sends the
+    request and only then closes, so a failed send left the socket open until the object was
+    collected. ``BaseStrategy.close`` shuts it without sending anything, as :func:`_ldap3_call`
+    does after an undecodable response.
 
     **It never replaces an exception the block raised (BACKLOG #3010).** The block's own exception
     is the answer both bind branches give, so an unbind failing after an undecodable bind must not
@@ -1493,7 +1501,7 @@ def _released(conn: Any) -> Iterator[None]:
     from inside this block, and must still reach the step-up re-bind as a refused password, which
     it counts, rather than as an :class:`LdapError`, which it reads as ``directory_unavailable``
     and does not. The decoy bind (:meth:`LdapAuthenticator._equalizing_bind`) is released here
-    too, so an unbind error changes neither branch's answer (#3830).
+    too, so an ldap3 error from the unbind changes neither branch's answer (#3830).
     """
     import ldap3
 
@@ -1503,7 +1511,11 @@ def _released(conn: Any) -> Iterator[None]:
         try:
             conn.unbind()
         except ldap3.core.exceptions.LDAPException as failed:
-            logger.debug("AD unbind failed: %s", _type_name(failed))
+            logger.debug("AD %s unbind failed: %s", what, _type_name(failed))
+            try:
+                conn.strategy.close()
+            except (ldap3.core.exceptions.LDAPException, OSError) as unclosed:
+                logger.debug("AD %s socket close failed: %s", what, _type_name(unclosed))
 
 
 class LdapAuthenticator:
@@ -1664,7 +1676,7 @@ class LdapAuthenticator:
         unbind changes nothing the block answered or raised.
         """
         svc = self._service_conn()
-        with _released(svc):
+        with _released(svc, "service-account"):
             yield svc
 
     def _equalizing_bind(self, password: str) -> None:
@@ -1675,12 +1687,14 @@ class LdapAuthenticator:
         search base, and unbinds — so the absent/disabled branch costs the same Server build, TCP
         connect and bind round trip as the present-and-enabled one.
 
-        **Swallows nothing (BACKLOG #3017).** Every error propagates, and ``authenticate`` maps it
-        exactly as it maps the real bind's: an ``LDAPException`` to :class:`LdapError`, a socket
-        fault that is not an ldap3 error the same way (BACKLOG #2566), and a bind response ldap3
-        could not decode through :func:`_ldap3_call` as the "user bind" (BACKLOG #3010). Both
-        branches open a socket to the same directory, so a directory that fails the second connect
-        fails them alike, where a swallow here would tell them apart.
+        **Swallows nothing of its own (BACKLOG #3017).** Every error from the bind propagates, and
+        ``authenticate`` maps it exactly as it maps the real bind's: an ``LDAPException`` to
+        :class:`LdapError`, a socket fault that is not an ldap3 error the same way (BACKLOG #2566),
+        and a bind response ldap3 could not decode through :func:`_ldap3_call` as the "user bind"
+        (BACKLOG #3010). Both branches open a socket to the same directory, so a directory that
+        fails the second connect fails them alike, where a swallow here would tell them apart. The
+        one error not raised is the release's ldap3 error, which :func:`_released` logs on the real
+        bind's connection too, so it answers both branches alike (BACKLOG #3848).
 
         **Why a plain wrong user name still reads as a failed sign-in.** The swallow was there so
         that a bind against a DN that does not exist would not read as a directory error. It never
@@ -1719,7 +1733,7 @@ class LdapAuthenticator:
         )
         # Labelled as the real bind is, and released the same way, so an undecodable answer
         # fails both branches with the same text (_ldap3_call, _released).
-        with _released(conn):
+        with _released(conn, "user bind"):
             with _ldap3_call("user bind"):
                 bound = conn.bind()
             if not bound:
@@ -2016,9 +2030,10 @@ class LdapAuthenticator:
                     #
                     # Every error in the decoy is mapped HERE, the same way the real bind's is
                     # below, so an absent and a present account fail alike (BACKLOG #2566, #3017).
-                    # Swallowing it inside _equalizing_bind would tell the two apart. A bind result
-                    # code is not such an error: a busy one answers the two apart, by design
-                    # (_equalizing_bind, BACKLOG #3169).
+                    # Swallowing it inside _equalizing_bind would tell the two apart; the release's
+                    # ldap3 error is logged on both, by the _released they share (BACKLOG #3848).
+                    # A bind result code is not such an error: a busy one answers the two apart,
+                    # by design (_equalizing_bind, BACKLOG #3169).
                     with _socket_faults_as_ldap_error():
                         self._equalizing_bind(password)
                     return DirectoryBind(found.answer)
@@ -2038,7 +2053,7 @@ class LdapAuthenticator:
                 # Released on BOTH paths. A rejected password is the common adversarial case, so
                 # returning early without unbinding would leave the connection to GC under exactly
                 # the load that matters (ASVS 13.1.3 — resource release).
-                with _released(user_conn):
+                with _released(user_conn, "user bind"):
                     # BACKLOG #2566: the bind opens the socket, so only the bind is wrapped. The
                     # build above does no I/O, and the release runs on an open socket.
                     with _socket_faults_as_ldap_error(), _ldap3_call("user bind"):

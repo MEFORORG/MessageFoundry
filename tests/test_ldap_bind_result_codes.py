@@ -200,25 +200,30 @@ def test_real_ldap3_leaves_the_bind_code_where_the_refusal_reads_it(code: int) -
 # --- the step-up re-bind, where the lockout is charged ----------------------------------------------
 
 
-def _unbind_fails_after_a_bind(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
+def _unbind_fails_after_a_bind(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str | None]]:
     """Over the bind already installed, make ``unbind`` raise an ldap3 error on each connection
-    that ran an explicit bind, as a send failing on the release would. The service connection binds
-    in its constructor, so its unbind still succeeds. Returns the DN of each unbind that raised."""
-    bind = ldap3.Connection.bind
-    failed: list[str | None] = []
+    that ran an explicit bind, as a send failing on the release would, before ldap3 closes the
+    socket. The service connection binds in its constructor, so its unbind runs as installed.
+    Returns each failed unbind and each socket close, in order, as ``(event, DN)``."""
+    bind, unbind_before = ldap3.Connection.bind, ldap3.Connection.unbind
+    events: list[tuple[str, str | None]] = []
 
     def binding(self: Any) -> bool:
+        dn = getattr(self, "_bind_dn", None)
         self.mf_bind_ran = True
+        self.strategy = SimpleNamespace(close=lambda: events.append(("closed", dn)))
         return bool(bind(self))
 
     def unbind(self: Any) -> None:
-        if getattr(self, "mf_bind_ran", False):
-            failed.append(getattr(self, "_bind_dn", None))
-            raise LDAPSocketSendError("synthetic: the unbind's send failed")
+        if not getattr(self, "mf_bind_ran", False):
+            unbind_before(self)
+            return
+        events.append(("unbind failed", getattr(self, "_bind_dn", None)))
+        raise LDAPSocketSendError("synthetic: the unbind's send failed")
 
     monkeypatch.setattr(ldap3.Connection, "bind", binding)
     monkeypatch.setattr(ldap3.Connection, "unbind", unbind)
-    return failed
+    return events
 
 
 async def _rebind_after(
@@ -231,21 +236,23 @@ async def _rebind_after(
     ``ldap3.Connection.bind``), re-bind once with the right password, and return the elevation, the
     row's failed-attempt count, the ``auth.reauth`` details and the number of sessions the
     per-session re-proof budget has charged. ``unbind_fails`` makes the bound connection's unbind
-    raise (:func:`_unbind_fails_after_a_bind`)."""
+    raise, and checks that it did (:func:`_unbind_fails_after_a_bind`)."""
     async with _signed_in_estate(monkeypatch, ["alice"]) as (_directory, service, store, tokens):
         if isinstance(end, int):
             _bind_ends_with(monkeypatch, end)
         else:
             monkeypatch.setattr(ldap3.Connection, "bind", end)
-        failed_unbinds = _unbind_fails_after_a_bind(monkeypatch) if unbind_fails else []
+        released = _unbind_fails_after_a_bind(monkeypatch) if unbind_fails else []
         identity = await service.identity_for_token(tokens["alice"])
         assert identity is not None
         elevation = await service.reauth(identity, _PASSWORD, token=tokens["alice"])
         row = await store.get_user(identity.user_id)
         assert row is not None
         details = [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.reauth")]
-        expected = 1 if unbind_fails else 0
-        assert len(failed_unbinds) == expected, "the scripted unbind fault did not fire once"
+        # The fault fired once. The close after it is checked by the authenticator arms below, so
+        # this helper's own check cannot turn the count arms red on the code without the fix.
+        failed_unbinds = [event for event, _dn in released if event == "unbind failed"]
+        assert len(failed_unbinds) == (1 if unbind_fails else 0), "the unbind fault did not fire"
         return elevation, row.failed_attempts, details, len(service._reproof_session_failures)
 
 
@@ -309,17 +316,17 @@ def test_a_failing_unbind_changes_neither_bind_branchs_answer(
     decoy on an absent one each keep the answer they give when the unbind succeeds. Before, the
     unbind error replaced both answers with the same ``LdapError``; now it replaces neither, so
     neither branch answers it differently from the other. Each unbind that raised is the bind's own
-    connection, so the fault fired on both branches."""
+    connection, so the fault fired on both branches, and each socket was closed after it."""
     _install_fakes(monkeypatch)
     binds = _bind_ends_with(monkeypatch, RESULT_INVALID_CREDENTIALS)
-    failed = _unbind_fails_after_a_bind(monkeypatch)
+    released = _unbind_fails_after_a_bind(monkeypatch)
     real = LdapAuthenticator(_ad_settings()).authenticate("alice", _PASSWORD)
     assert real.answer is DirectoryAnswer.FOUND and real.principal is None
     _search_finds_nothing(monkeypatch)
     decoy = LdapAuthenticator(_ad_settings()).authenticate("nobody", _PASSWORD)
     assert decoy.answer is DirectoryAnswer.NOT_FOUND
-    assert failed == binds and len(failed) == 2
-    assert "mf-nonexistent-timing-equalizer" in str(failed[1])
+    assert len(binds) == 2 and "mf-nonexistent-timing-equalizer" in str(binds[1])
+    assert released == [(event, dn) for dn in binds for event in ("unbind failed", "closed")]
 
 
 def test_a_bound_password_whose_unbind_fails_still_signs_in(
@@ -327,12 +334,14 @@ def test_a_bound_password_whose_unbind_fails_still_signs_in(
 ) -> None:
     """The bound arm of the same rule: the password was proved before the release, and the group
     read runs on the service connection, so a failing unbind on the user's connection no longer
-    turns a proved password into an outage."""
-    _install_fakes(monkeypatch)
-    failed = _unbind_fails_after_a_bind(monkeypatch)
+    turns a proved password into an outage. The user's socket is still closed."""
+    rec = _install_fakes(monkeypatch)
+    released = _unbind_fails_after_a_bind(monkeypatch)
     bind = LdapAuthenticator(_ad_settings()).authenticate("alice", _PASSWORD)
     assert bind.answer is DirectoryAnswer.FOUND and bind.principal is not None
-    assert len(failed) == 1
+    alice = "CN=alice,OU=Users,DC=example,DC=com"
+    assert released == [("unbind failed", alice), ("closed", alice)]
+    assert len(rec.unbinds) == 1 and alice not in rec.unbinds, "the service unbind did not run"
 
 
 # --- 52 as a Notice of Disconnection: a different path, to the same reading ----------------------
