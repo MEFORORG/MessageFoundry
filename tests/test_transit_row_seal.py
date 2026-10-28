@@ -374,6 +374,30 @@ async def test_a_refusal_of_the_newest_version_seen_is_a_lagging_node(
     assert await service.identity_for_token(token) is not None
 
 
+async def test_a_retirement_this_process_never_sealed_past_is_unverifiable_not_an_outage(
+    transit_store: Opened,
+) -> None:
+    """Vault rotates and raises the minimum while this process seals nothing new, so the newest
+    version it has seen is the retired one. The key probe names the new latest version, which the
+    sealer learns first, so the refusal reads as unverifiable, never as a 503 loop."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    store, path, transit = transit_store
+    transit.refusal = hvac_exceptions.InvalidRequest
+    service = AuthService(store, AuthSettings())
+    await _user(store, "seal-u1")
+    token = await _mint(store)  # sealed under v1, the newest this process has seen
+    assert await service.identity_for_token(token) is not None
+    sealer = store.row_sealer()
+    assert isinstance(sealer, TransitRowSealer)
+    sealer._cache.clear()
+    transit.rotate()
+    transit.min_decryption = 2  # retired outside the engine; nothing re-sealed meanwhile
+    assert await service.identity_for_token(token) is None
+    assert _seal_failures(path, AUTHORITY_SEAL_UNVERIFIABLE_ACTION) == 1
+    row = await store.get_session(hash_token(token))
+    assert row is not None and row.revoked_at is not None
+
+
 async def test_a_planted_well_formed_seal_is_unverifiable_and_alerted(
     transit_store: Opened, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -572,7 +596,7 @@ async def test_an_outage_alerts_once_per_window(
     assert row_seal.TRANSIT_UNVERIFIABLE_CAUSE == "transit-unverifiable"
     transit.down = False
     with pytest.raises(TransitSealUnverifiableError):
-        raise sealer._unverifiable(RowSealUnverifiableError())
+        raise sealer._unverifiable(RowSealUnverifiableError("vault:v1:probe"))
     assert [name for name, _ in raised] == [TRANSIT_SEAL_SUBJECT, TRANSIT_SEAL_UNVERIFIABLE_SUBJECT]
     assert "synthetic Vault outage" not in raised[0][1]  # a fixed sentence, never Vault's text
 

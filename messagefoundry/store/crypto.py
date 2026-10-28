@@ -655,7 +655,14 @@ class RowSealUnverifiableError(CipherError):
     ``min_decryption_version``, one newer than the Vault node that answered holds, or a planted
     version. The reply cannot tell those apart, so the sealer denies, and its callers treat the
     row as they treat a failed seal, under their own audit action. Its text is fixed, never row
-    data or Vault's text."""
+    data or Vault's text.
+
+    ``probe_mac`` is the key probe's own MAC, which names the latest version the node that answered
+    the probe holds; the sealer reads that version, never a row value, from it."""
+
+    def __init__(self, probe_mac: str) -> None:
+        super().__init__()
+        self.probe_mac = probe_mac
 
     def __str__(self) -> str:
         return "Transit refused to check a well-formed row seal while its key still answers"

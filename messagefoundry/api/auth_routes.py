@@ -608,9 +608,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     app.add_exception_handler(TransitSealUnavailableError, _transit_seal_unavailable)
 
     async def _transit_seal_unverifiable(request: Request, exc: Exception) -> Response:
-        # BACKLOG #2592: a write or read outside the loaders met a stored seal Vault transit refused
-        # to check. It does not pass by itself, so a 409 with a fixed text and no Retry-After. The
-        # sealer has already logged it, throttled, and raised the alert.
+        # BACKLOG #2592: a backstop. The loaders and the store's write helpers catch a seal Vault
+        # transit refused to check, so only a check outside both reaches here. It does not pass by
+        # itself, so a 409 with a fixed text and no Retry-After. The sealer has already logged it.
         return await http_exception_handler(
             request,
             HTTPException(

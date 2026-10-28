@@ -342,9 +342,11 @@ _TRANSIT_KEY_ID_LEN: Final = 16
 _TRANSIT_MAC_MAX_LEN: Final = 128
 _TRANSIT_MAC_PREFIX: Final = "vault:v"
 #: The digest length a well-formed seal's MAC decodes to: SHA-256's, the hash
-#: :data:`~messagefoundry.store.crypto.AUDIT_TRANSIT_HASH_ALGO` names. The assert ties the two.
+#: :data:`~messagefoundry.store.crypto.AUDIT_TRANSIT_HASH_ALGO` names. The check below ties the two,
+#: and is not an assert, so ``python -O`` does not strip it.
 _TRANSIT_DIGEST_LEN: Final = AUDIT_MAC_HEX_LEN // 2
-assert AUDIT_TRANSIT_HASH_ALGO == "sha2-256", "the seal digest length assumes sha2-256"
+if AUDIT_TRANSIT_HASH_ALGO != "sha2-256":
+    raise RuntimeError("the row seal digest length assumes AUDIT_TRANSIT_HASH_ALGO is sha2-256")
 #: The kind the start probe seals under. No row is of this kind, so a probe seal verifies as no
 #: row's.
 _PROBE_KIND: Final = "start-probe"
@@ -560,6 +562,11 @@ class TransitRowSealer:
         try:
             valid = await asyncio.to_thread(self._backend.verify_seal_hmac, data, mac)
         except RowSealUnverifiableError as exc:
+            # The key probe's MAC names the latest version the probing node holds, so a rotation
+            # this process never sealed under is learned here, before the version is compared.
+            probed = _transit_version(exc.probe_mac)
+            if probed is not None:
+                self._saw_version(probed)
             if version == self._latest_version:
                 # Transit itself named this version to this process, and Vault never lets the
                 # minimum pass the latest version, so a refusal of it cannot be a retirement: the

@@ -250,7 +250,8 @@ class TransitCipher(_UnmarkedPolicy):
         below ``min_decryption_version`` or above the latest version the answering node holds, and
         for a missing key. So a 400 raises
         :class:`~messagefoundry.store.crypto.RowSealUnverifiableError` when the key still answers an
-        ``hmac`` call over fixed input (:meth:`_key_answers`), and is an outage otherwise. No
+        ``hmac`` call over fixed input (:meth:`_probe_mac`; the error carries that MAC, so the
+        sealer learns the latest version the probe saw), and is an outage otherwise. No
         version arithmetic: the verify and a key read can reach different nodes, so the numbers
         would not describe the node that refused.
 
@@ -271,8 +272,9 @@ class TransitCipher(_UnmarkedPolicy):
                     f"Transit row seal verify failed (key={self._audit_key!r}): "
                     f"{vault_failure_text(exc)}"
                 ) from exc
-            if self._key_answers():
-                raise RowSealUnverifiableError() from exc
+            probe = self._probe_mac("a row seal check")
+            if isinstance(probe, str) and probe:
+                raise RowSealUnverifiableError(probe) from exc
             raise CipherError(
                 f"Transit refused a row seal check and its key did not answer either "
                 f"(key={self._audit_key!r}): {vault_failure_text(exc)}"
@@ -342,11 +344,6 @@ class TransitCipher(_UnmarkedPolicy):
             )
             return None
         return answered
-
-    def _key_answers(self) -> bool:
-        """Whether the audit key answers an ``hmac`` call over fixed input (BACKLOG #2592)."""
-        answered = self._probe_mac("a row seal check")
-        return isinstance(answered, str) and bool(answered)
 
     def _refuses_only_version(self, exc: Exception, key_version: int) -> bool:
         """Whether ``exc``, raised by a call pinned to ``key_version``, is Transit refusing that

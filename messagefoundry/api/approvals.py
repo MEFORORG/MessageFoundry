@@ -2298,7 +2298,7 @@ class ApprovalGate:
             actor="system",
             detail=json.dumps({"kind": APPROVAL_KIND, "approval_id": approval_id}),
             client=None,
-            context="a request failed its integrity seal",
+            context=f"a request {verb}",
         )
         if not unverifiable:  # that one pages from the sealer, under its own subject
             authority_seal_alert(self._alert_sink)(reason)
