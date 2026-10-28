@@ -528,7 +528,10 @@ password was presented for it. The refusal is the generic one for a session that
 and on the console a redirect to the sign-in page saying the session ended. It deliberately does
 not name the reason. So a session opened a second before the deadline cannot go on to finish its
 second factor or rotate. `POST /auth/mfa-verify`, the passkey leg and every re-key ask the same
-question inside the request, with their own `at` values. The remedy is an administrator reset.
+question inside the request, with their own `at` values. So does a sign-out that ends such a
+session, with `"at": "logout"`, and a sign-in that supersedes one, with `"at": "superseded"`, each
+with its own request's client address (BACKLOG #3749; see the supersession and sign-out paragraphs
+under ASVS 7.2.4). The remedy is an administrator reset.
 
 **Where `[security].require_mfa` covers a local account, the holder enrols an authenticator app
 before choosing a password.** Changing the password ends every session, so rotating first would pass through a chosen
@@ -5129,10 +5132,13 @@ engine cannot offer anything at that moment, so those changes are a stated bound
 password form, Windows SSO and federated sign-in) answers with a cookie that replaces the browser's
 session cookie. Once the new sign-in succeeds, the engine revokes the session the browser presented
 and audits `auth.session_revoked` with scope `superseded`, under the name of the user who owned
-that session. The supersession itself ends only that one session and runs only when the sign-in
-succeeds; other controls at sign-in, such as a directory role change, can end more. It runs before
-the per-user session cap, so the cap does not push out another device's oldest session to make
-room for the one being replaced.
+that session. A session that was already over is ended with no row. When the owner's
+admin-issued temporary credential is past its deadline, a gate would end the session too, so it
+gets the gate's `auth.temp_password_expired` row instead, with `"at": "superseded"` and the same
+`session` and `presented` references (BACKLOG #3749). The supersession itself ends only that one
+session and runs only when the sign-in succeeds; other controls at sign-in, such as a directory
+role change, can end more. It runs before the per-user session cap, so the cap does not push out another
+device's oldest session to make room for the one being replaced.
 Federated sign-in reads the cookie on its start leg, because the identity provider's redirect back
 is cross-site and the browser withholds the Strict cookie there. Windows SSO has no such hop, so a
 cross-site link straight into `/ui/sso` presents no cookie. That prior session is then not ended
@@ -5172,8 +5178,9 @@ as before this change:
   size of the step, in either direction.
 
 **A retired token authenticates nothing.** No session read, the validator included, consults the
-links; the supersession is their one reader. For the length of the bound, a retired token has one
-power: presented at a sign-in that succeeds, it ends the session it became. That power is new, and
+links; only a revoke follows them, at a sign-in's supersession or at a sign-out (below). For the
+length of the bound, a retired token has one power at a sign-in: presented at a sign-in that
+succeeds, it ends the session it became. That power is new, and
 it can only end a session, never open or extend one. Whoever held that token before the elevation
 could already end the session with `POST /auth/logout`; the link lets them do it for the length of
 the bound after the elevation too, through a sign-in whose first credential passes; with MFA
@@ -5182,6 +5189,49 @@ so a password alone is enough. A wall
 clock that stepped forward at the elevation, or back before the sign-in, lengthens that time by the
 step; the reaper's clock-step guard covers its own purge, not this. The links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
 revoke, and a revoke needs no key on any backend.
+
+**A sign-out follows the links too, for far less time (BACKLOG #3715).** An elevation in another
+tab can re-key the session while a sign-out is in flight, and the sign-out then ends the session
+under its new token, in the same transaction as the revoke. `POST /auth/logout` follows links
+written up to 5 seconds before its request arrived; the slack covers a link stamped before its
+rotation commits, and clocks that differ between engine processes. Its sign-in check proved the
+token live after the request arrived, so any link from it was written after that proof, and the
+route gains no reach. `/ui/logout` carries no credential, so it follows links written up to 5
+seconds before the call. **That is a separate power, credential-free and end-only:** for 5 seconds
+after an elevation, anyone who presents the RETIRED token to `/ui/logout` ends the session it
+became, with no sign-in. It cannot open or extend a session. At least these cases stay open, and
+the session lives on under its new token: an elevation older than the bound, more than 32
+elevations in a row inside it, and a wall clock that stepped between the elevation and the
+sign-out, which moves the bound by the step. The `auth.logout` row names the
+session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
+was presented. The `outcome` is `lapsed` instead when the session's own clock checks fail at the
+revoke, or when the session passes them but the owner's admin-issued temporary credential is past
+its deadline, the test `identity_for_token` applies under every gate (a disabled account excepted,
+as that check excepts it). At least a session over its idle or absolute limit fails the clock
+checks. The temporary-credential case also writes the gate's `auth.temp_password_expired` row, with
+`"at": "logout"` and the sign-out's client address. A `lapsed` row still names the owner. If the
+owner cannot be read, the temporary credential is not checked, and a session that passed its clock
+checks is recorded `revoked`. So is a session minted under an older session epoch than its
+account's, which a gate would end: the sign-out reads the account after its revoke, so a
+whole-account revoke landing between the two would make a session that was live look stale. The
+owner is read through the ended row's `user_id`, which the revoke does not check against the row's
+seal (BACKLOG #3716), so a tampered row could let another account decide the outcome and whether
+a lapse row is written, and put that lapse row on it; on `/ui/logout`, which names no caller, the
+`auth.logout` row's actor is that account too.
+
+**A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
+clears the cookie. That row is then missing, with an ERROR log line; the line names the session
+when the sign-out ended one. A failed owner lookup on `/ui/logout`, which names no caller, writes
+the row with no actor, so it does not reach that user's security-events feed. On a session that
+passed its clock checks it also leaves the temporary credential unchecked, as above.
+
+**Open gap: `/ui/logout` audit rows for sign-outs that end no session are unbounded.** A request
+to `/ui/logout` whose session cookie ends no session can still write an `auth.logout` row, with
+`outcome` `nothing_to_revoke`. Nothing in the engine bounds how many such rows a caller who can
+reach the route can append, and nothing prunes `audit_log` (see
+[retention](CONFIGURATION.md#retention)). A bound in the engine is a follow-up, not yet filed.
+Until it exists, treat `/ui/logout` as an unbounded audit-write surface to any caller that can
+reach the console, on the engine's own host or beyond it.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
@@ -5952,7 +6002,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
 | `POST /ui/account/webauthn/verify` | per-actor ceremony budget | the passkey registration finish (BACKLOG #3014); its 429 is a `JSONResponse` with **no** `Retry-After`, charged after the gate's admin-write floor |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
-| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate, and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
+| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate (the sign-out's unbounded `nothing_to_revoke` audit rows are an open gap under [Session inventory](#session-inventory--targeted-revocation-wp-10)), and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
 
 The console calls the ceremony gate directly. It used to resolve it through a `getattr` shim that
 fell back to the **sign-in** budget on an engine without the method. The console pins one engine
@@ -6091,8 +6141,9 @@ In their place, every refused sign-in on an existing, enabled local account writ
 whether a wrong credential or a live lock refused it. Two refusals keep their own rows: an unknown or
 disabled name (`reason: unknown_or_disabled`), and a right password on an expired temporary
 credential (`auth.temp_password_expired`). That action also records a session ended because its
-temporary credential lapsed, with `"at": "session"` and no sign-in attempt behind it (BACKLOG
-#2298; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
+temporary credential lapsed, with at least these `at` values: `"session"` with no sign-in attempt
+behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on the same browser,
+which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
 `users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
 never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
 selects rows by the caller's own username, so it shows the holder their own lock and no one else's.

@@ -273,6 +273,12 @@ async def _service(request: Request) -> AuthService:
     return auth
 
 
+async def _arrival() -> float:
+    """The wall-clock moment a route's dependencies began to be solved, for ``POST /auth/logout``
+    (BACKLOG #3715). Wall clock, because the store stamps a lineage link with ``time.time()``."""
+    return time.time()
+
+
 def _current_user(identity: Identity) -> CurrentUser:
     return CurrentUser(
         user_id=identity.user_id,
@@ -702,11 +708,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post("/auth/logout", response_model=SimpleMessage)
     async def logout(
         request: Request,
+        arrived: float = Depends(_arrival),
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
     ) -> SimpleMessage:
+        # BACKLOG #3715: the gate proved the token live after ``arrived``, which is declared first
+        # so FastAPI solves it before the gate. See AuthService.logout for the bound.
         await service.logout(
-            bearer_token(request), actor=identity.username, client=client_ip(request)
+            bearer_token(request),
+            actor=identity.username,
+            client=client_ip(request),
+            proven_at=arrived,
         )
         return SimpleMessage(detail="logged out")
 
