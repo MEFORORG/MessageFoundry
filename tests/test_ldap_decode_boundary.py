@@ -699,9 +699,10 @@ def test_an_unbind_error_never_replaces_how_the_block_ended(
 ) -> None:
     """Round-one review finding. Both bind branches answer with the block's own exception, so an
     unbind failing after an undecodable bind must not replace it on one branch only. After a
-    clean block the unbind's error is logged and not raised either (BACKLOG #3848): a refused bind
-    returns from inside the block, and an unbind error raised over it read as an outage. Either
-    way the socket is closed without sending, because ldap3 closes only after a successful send."""
+    clean block that marked its answer as standing, a refusal, the unbind's error is logged and
+    not raised either (BACKLOG #3848). After a clean block that did not, a pass, it is raised: an
+    unbind error never upgrades an answer toward a pass. Every time the socket is closed without
+    sending, because ldap3 closes only after a successful send."""
     unbind_fault = ldap3.core.exceptions.LDAPSocketSendError("synthetic")
     closes: list[str] = []
     conn = SimpleNamespace(
@@ -715,22 +716,30 @@ def test_an_unbind_error_never_replaces_how_the_block_ended(
     caplog.clear()
     with (
         caplog.at_level("DEBUG", logger=ldap_module.logger.name),
-        ldap_module._released(conn, "user bind"),
+        ldap_module._released(conn, "user bind") as release,
     ):
-        pass
+        release.answer_stands = True
     assert [r.getMessage() for r in caplog.records] == [
         "AD user bind unbind failed: ldap3.core.exceptions.LDAPSocketSendError"
     ]
     assert closes == ["x", "x"]
+    with (
+        pytest.raises(ldap3.core.exceptions.LDAPSocketSendError) as unmarked,
+        ldap_module._released(conn, "user bind"),
+    ):
+        pass
+    assert unmarked.value is unbind_fault
+    assert closes == ["x", "x", "x"]
 
 
 def test_an_unbind_error_that_is_not_ldap3s_still_propagates() -> None:
     """THE NARROWING GUARD for the release: only an ldap3 error is logged and dropped. A
-    ``TypeError`` from the unbind is an engine defect, and escapes a clean block as itself."""
+    ``TypeError`` from the unbind is an engine defect, and escapes as itself even a block whose
+    answer stands."""
     defect = TypeError("synthetic engine defect")
     conn = SimpleNamespace(unbind=_raise(defect))
-    with pytest.raises(TypeError) as raised, ldap_module._released(conn, "user bind"):
-        pass
+    with pytest.raises(TypeError) as raised, ldap_module._released(conn, "user bind") as release:
+        release.answer_stands = True
     assert raised.value is defect
 
 
