@@ -526,6 +526,17 @@ def test_malformed_comment_or_review_connection_is_an_error_row(
     assert rows[36]["turn"] == "LANDER"
 
 
+def test_an_unreadable_submitted_at_does_not_fall_back_to_created_at(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # createdAt predates the hold, so a fall back would date this reply before it: AUTHOR, wrong.
+    review = _review("Manager: fixed.", "garbage")
+    review["createdAt"] = "2026-10-28T11:00:00Z"
+    pr = _pr(43, comments=[_hold("2026-10-28T12:00:00Z", _sha(43))], reviews=[review])
+    row = _engine_rows(tmp_path, capsys, pr)[43]
+    assert row["turn"] == "ERROR" and "submittedAt" in row["error"]
+
+
 def test_undatable_comment_is_an_error_row_not_dropped(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -716,6 +727,30 @@ def test_queue_and_auto_merge_are_flagged(
     rows = _engine_rows(tmp_path, capsys, queued, armed)
     assert rows[60]["flags"] == ["no-hold", "in-queue"]
     assert rows[61]["flags"] == ["no-hold", "auto-armed"]
+
+
+def test_a_held_pr_in_the_queue_or_armed_is_the_landers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # It merges with no move from its author, so dequeuing or disarming is the Lander's move.
+    queued = _pr(65, comments=[_hold("2026-10-28T12:00:00Z", _sha(65))])
+    queued["mergeQueueEntry"] = {"state": "QUEUED"}
+    armed = _pr(66, comments=[_hold("2026-10-28T12:00:00Z", _sha(66))])
+    armed["autoMergeRequest"] = {"enabledAt": "2026-10-28T10:00:00Z"}
+    rows = _engine_rows(tmp_path, capsys, queued, armed)
+    assert _turn(rows[65]) == ("LANDER", ["held", "in-queue"])
+    assert _turn(rows[66]) == ("LANDER", ["held", "auto-armed"])
+
+
+@pytest.mark.parametrize("draft", ["false", 1, None])
+def test_a_non_bool_is_draft_is_an_error_row_not_skipped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], draft: object
+) -> None:
+    pr = _pr(67, comments=[_hold("2026-10-28T12:00:00Z", _sha(67))])
+    pr["isDraft"] = draft
+    rows = _engine_rows(tmp_path, capsys, pr, _pr(68))
+    assert rows[67]["turn"] == "ERROR" and "isDraft" in rows[67]["error"]
+    assert rows[68]["turn"] == "LANDER"
 
 
 def test_draft_pr_is_excluded(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

@@ -83,16 +83,22 @@ itself is caught as a new head. A non-Lander event dates from its latest edit
 event at or after the hold, the hold's own included, also hands the turn back: every seat posts
 under one login, so an edit cannot be told apart from an author answering in place. An event with no
 readable time, or a node that is not an object, is an ERROR row, never dropped, since dropping a
-reply could park the PR on its author. So is a ``comments`` or ``reviews`` connection that is
-null, not an object, or has no ``nodes`` list: it is never read as zero events. Inline review-thread comment bodies are not
+reply could park the PR on its author. So is a stamp that is present but unreadable, rather than
+a fall back to the next stamp, and a ``comments`` or ``reviews`` connection that is null, not an
+object, or has no ``nodes`` list: it is never read as zero events. A PR whose ``isDraft`` is not a
+bool is an ERROR row too, never skipped as a draft. Inline review-thread comment bodies are not
 read. Only the latest ``COMMENT_PAGE`` issue comments and ``REVIEW_PAGE`` reviews are fetched.
 
-FLAGS. ``held`` (AUTHOR's turn); ``no-hold`` (no Lander event, or the newest is not a marker
+A HOLD ON A QUEUED OR ARMED PR IS THE LANDER'S. A PR in the merge queue, or with auto-merge armed,
+merges without its author moving, so a hold on it reads LANDER with ``held`` kept beside the
+``in-queue`` or ``auto-armed`` flag: dequeuing or disarming it is the Lander's move.
+
+FLAGS. ``held`` (a hold stands: AUTHOR's turn, unless the PR is queued or armed); ``no-hold`` (no Lander event, or the newest is not a marker
 hold); ``new-commit`` (the head does not start with the marker's SHA); ``replied`` (a non-Lander
 event at or after the hold); ``edited`` (a comment or review, of any author, the hold included,
 edited at or after the hold); ``no-new-commit`` (replied or edited, but the head still matches the
-marker: the Lander must read the reply or edit, but can bounce it fast); ``in-queue`` / ``auto-armed`` (the PR is
-already in the merge queue or has auto-merge armed).
+marker: the Lander must read the reply or edit, but can bounce it fast); ``in-queue`` /
+``auto-armed`` (the PR is already in the merge queue or has auto-merge armed).
 
 Stdlib only.
 """
@@ -290,9 +296,15 @@ def _events(pr: dict[str, Any]) -> list[Event]:
                 raise ReadError(f"a {kind[:-1]} node is not an object")
             if node.get("state") == "PENDING":
                 continue
-            when = next(
-                (w for k in stamp_keys if (w := pr_state.parse_iso(node.get(k))) is not None), None
-            )
+            when = None
+            for key in stamp_keys:
+                if node.get(key) is None:
+                    continue
+                when = pr_state.parse_iso(node.get(key))
+                if when is None:
+                    # Falling back to an older stamp could date a reply before the hold.
+                    raise ReadError(f"a {kind[:-1]} has an unreadable {key}")
+                break
             if when is None:
                 # Dropping it could hide a reply after the hold and park the PR on its author.
                 raise ReadError(f"a {kind[:-1]} has no readable timestamp")
@@ -401,6 +413,9 @@ def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[s
         flags.append("in-queue")
     if pr.get("autoMergeRequest"):
         flags.append("auto-armed")
+    if turn == AUTHOR and ("in-queue" in flags or "auto-armed" in flags):
+        # Queued or armed, a held PR merges with no move from its author.
+        turn = LANDER
     green, verdict = _required_green(pr, head, read)
     stamps = [e.latest for e in events] + ([committed] if committed else [])
     newest = max(stamps) if stamps else None
@@ -431,9 +446,13 @@ def build_rows(repo: str, read: RepoRead, now: datetime) -> list[dict[str, Any]]
         if not isinstance(pr, dict):
             rows.append(error_row(repo, f"a PR node is not an object: {type(pr).__name__}"))
             continue
-        if pr.get("isDraft"):
-            continue
         try:
+            draft = pr.get("isDraft")
+            if draft is True:
+                continue
+            if draft is not False:
+                # Skipping it as a draft would drop the PR from the report unseen.
+                raise ReadError(f"isDraft is not a bool: {draft!r}"[:100])
             rows.append(_row(repo, pr, read, now))
         # One bad PR is one ERROR row; its siblings still print.
         except ReadError as exc:
