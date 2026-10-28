@@ -63,12 +63,13 @@ from messagefoundry.pipeline.alerts import (
     remote_debug_refused_detail,
     sandbox_worker_refused_detail,
 )
+from messagefoundry.transports.base import NegativeAckError
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
 # add no import cost.
 from messagefoundry.transports.bounded_read import NoRedirectHandler, build_strict_opener
-from messagefoundry.transports.email import checked_envelope
+from messagefoundry.transports.email import checked_envelope, partial_refusal_under
 
 __all__ = [
     "AlertTransport",
@@ -555,29 +556,59 @@ def send_plain_email(
         else None
     )
     msg = EmailMessage()
-    msg["Subject"] = subject
+    # The Subject header refuses some lone surrogates as it is set, and set_content() and
+    # add_alternative() encode with a bare str.encode(). Each raises a UnicodeEncodeError whose text
+    # names the character and whose `.object` is the whole value, and the notifier logs a failed
+    # send with exc_info. Keep only the type name, and raise outside the handler so neither chain
+    # link holds that error (vault BACKLOG #3011). The subject and the body get separate arms, as
+    # the Email destination's headers and body do, so the refusal names the right one.
+    failure = ""
+    try:
+        msg["Subject"] = subject
+    except UnicodeError as exc:
+        failure = type(exc).__name__
+    if failure:
+        raise ValueError(f"{ALERTS_SMTP_CELL}: the alert subject could not be encoded ({failure})")
     envelope.address(msg)
-    msg.set_content(body)  # plain-text part is always kept (never HTML-only)
-    if html_body is not None:
-        msg.add_alternative(html_body, subtype="html")
-    with smtplib.SMTP(host, port, timeout=timeout) as smtp:
-        if use_tls:
-            # context= is REQUIRED (#323): starttls()'s own default verifies NOTHING.
-            smtp.starttls(context=tls_context)
-        if username is not None:
-            # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG #1171,
-            # ASVS 11.4.1). The refusal above already guarantees use_tls here, so
-            # channel_encrypted is not merely asserted -- it is the same value that gate read.
-            # The helper's own cleartext-AUTH refusal is absolute, matching that gate: this cell
-            # has no escape, and neither do the two connectors.
-            smtp_login_approved(
-                smtp,
-                username,
-                password or "",
-                channel_encrypted=use_tls,
-                cell=ALERTS_SMTP_CELL,
-            )
-        envelope.send(smtp, msg)
+    try:
+        msg.set_content(body)  # plain-text part is always kept (never HTML-only)
+        if html_body is not None:
+            msg.add_alternative(html_body, subtype="html")
+    except UnicodeError as exc:
+        failure = type(exc).__name__
+    if failure:
+        raise ValueError(f"{ALERTS_SMTP_CELL}: the alert body could not be encoded ({failure})")
+    partial: NegativeAckError | None = None
+    try:
+        with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+            if use_tls:
+                # context= is REQUIRED (#323): starttls()'s own default verifies NOTHING.
+                smtp.starttls(context=tls_context)
+            if username is not None:
+                # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG #1171,
+                # ASVS 11.4.1). The refusal above already guarantees use_tls here, so
+                # channel_encrypted is not merely asserted -- it is the same value that gate read.
+                # The helper's own cleartext-AUTH refusal is absolute, matching that gate: this
+                # cell has no escape, and neither do the two connectors.
+                smtp_login_approved(
+                    smtp,
+                    username,
+                    password or "",
+                    channel_encrypted=use_tls,
+                    cell=ALERTS_SMTP_CELL,
+                )
+            # A partial RCPT refusal raises a NegativeAckError that names the cell and two counts,
+            # never an address (vault BACKLOG #2924). A refusal of EVERY recipient is still
+            # smtplib's own SMTPRecipientsRefused, whose args hold each address and the reply.
+            envelope.send(smtp, msg, cell=ALERTS_SMTP_CELL)
+    except smtplib.SMTPException as exc:
+        # A QUIT refused after a partial refusal must not hide it; raised below, outside this
+        # handler. Any other SMTP failure propagates unchanged.
+        partial = partial_refusal_under(exc)
+        if partial is None:
+            raise
+    if partial is not None:
+        raise partial
 
 
 class EmailTransport:
