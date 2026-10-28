@@ -7,10 +7,12 @@ safe_name() derives a safe label for a partner-chosen file name, which redact() 
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import logging
 import random
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator
 from typing import Any, SupportsIndex
@@ -231,24 +233,34 @@ _CPU_GROWTH_LINE = 24.0
 _CPU_CEILING_SECONDS = 0.5
 
 
-def _thread_cpu_sample(work: Callable[[], object]) -> float:
-    """CPU seconds per call of ``work`` on the CALLING THREAD's clock, over one sample at least
-    ``CPU_SAMPLE_FLOOR_SECONDS`` long, for the reason ``tests._cpu_clock`` gives.
+def _thread_cpu_sample(
+    work: Callable[[], object], clock: Callable[[], float] = time.thread_time
+) -> float:
+    """CPU seconds per call of ``work``, over one sample at least ``CPU_SAMPLE_FLOOR_SECONDS`` of
+    ``clock`` long, for the reason ``tests._cpu_clock`` gives.
 
-    **The thread clock, not the process clock that helper reads (BACKLOG #3721).** The process clock
-    charges every thread in the worker, so a thread an earlier test left running is billed to
-    whichever side of a ratio it overlaps. Busy while the small side is sampled and gone before the
-    large one, it deflates the ratio, which is the direction that reds a control. Measured 2026-10-27
-    on a 32-way Windows box, with six GIL-free threads running for 0.3 s from the start of the
-    control: the process clock read 25.0, 36.0 and 57.4; this clock read 66.5 to 79.7. Unloaded, both
-    read 60 to 82. Load from OTHER processes is not this: 40 busy processes on the same box moved
-    neither clock outside that range."""
+    **The CALLING THREAD's clock, not the process clock that helper reads (BACKLOG #3721).** The
+    process clock charges every thread in the worker, so a thread an earlier test left running is
+    billed to whichever side of a ratio it overlaps. Busy while the small side is sampled and gone
+    before the large one, it deflates the ratio, which is the direction that reds a control. The
+    readings are under :func:`test_a_credential_search_from_index_0_is_quadratic_on_the_same_line`;
+    :func:`test_the_cpu_sample_charges_the_measuring_thread_only` pins the property. ``clock`` is a
+    parameter for that test's control alone.
+
+    **What it gives up: work moved off the calling thread reads as free.** Every arm on it times a
+    call that runs synchronously on the caller's thread, which is the property the event-loop
+    argument rests on; a scan moved to a helper thread would need its arm re-derived.
+
+    **Not exact either.** On Windows this clock moves in the same 15.625 ms ticks as the process
+    clock, and while another thread shares the GIL each tick is charged to whichever thread holds
+    the core, so a sample can read LOW as well as high. The floor bounds the tick error, not that
+    sharing."""
     calls = 0
-    start = time.thread_time()
+    start = clock()
     while True:
         work()
         calls += 1
-        spent = time.thread_time() - start
+        spent = clock() - start
         if spent >= CPU_SAMPLE_FLOOR_SECONDS:
             return spent / calls
 
@@ -256,19 +268,68 @@ def _thread_cpu_sample(work: Callable[[], object]) -> float:
 def _interleaved_growth(
     small: Callable[[], object], large: Callable[[], object], large_reps: int = 3
 ) -> tuple[float, float]:
-    """``(ratio, large)``: the best of three ``small`` samples and of ``large_reps`` ``large`` ones,
-    taken alternately, and the large reading alone.
+    """``(ratio, large)``: the best of at least three ``small`` samples over the best of
+    ``large_reps`` ``large`` ones, and the large reading alone.
 
-    **Alternately, not in two blocks (BACKLOG #3721).** In blocks every small sample came first, so a
-    slow spell that ended during the test landed on the small side alone and deflated the ratio.
-    Alternating puts small samples after a large one too. The minimum is kept on each side, because
-    noise can only inflate a sample."""
+    **Paired rounds in a drawn order, not two blocks (BACKLOG #3721).** In blocks every small sample
+    came first, so a slow spell that ended during the test landed on the small side alone and
+    deflated the ratio. Each round here takes a small and a large sample, which goes first drawn from
+    an unseeded generator, the rule ``_growth_between`` in ``tests/test_log_redaction_secret_domain.py``
+    measured against a co-tenant with a fixed rhythm. Rounds past ``large_reps`` take a small sample
+    alone, so the small side always has three. A spell covering every sample of one side still moves
+    the ratio; nothing that keeps a minimum per side can cancel that."""
+    if large_reps < 1:
+        raise ValueError(
+            f"large_reps must be at least 1, not {large_reps}: no sample is no reading"
+        )
+    order = random.Random()
     best_small = best_large = float("inf")
-    for rep in range(3):
-        best_small = min(best_small, _thread_cpu_sample(small))
-        if rep < large_reps:
-            best_large = min(best_large, _thread_cpu_sample(large))
+    for rep in range(max(3, large_reps)):
+        sides = [True, False] if rep < large_reps else [True]
+        order.shuffle(sides)
+        for is_small in sides:
+            if is_small:
+                best_small = min(best_small, _thread_cpu_sample(small))
+            else:
+                best_large = min(best_large, _thread_cpu_sample(large))
     return best_large / best_small, best_large
+
+
+def test_the_cpu_sample_charges_the_measuring_thread_only() -> None:
+    """The property :func:`_thread_cpu_sample` exists for (BACKLOG #3721), with the process clock as
+    its control.
+
+    Each call does a fixed piece of work here and waits on a second thread hashing a 4 MiB buffer,
+    which ``hashlib`` does without the GIL. On the thread clock that call costs what the fixed work
+    alone costs, plus starting a thread. On the process clock it also costs the hash, so the control
+    proves the other thread really burned CPU; without it, a hash too cheap to see would pass this
+    arm too. Measured 2026-10-28 on a 32-way Windows box, over four runs: 4.79 to 7.17 on the
+    process clock and 0.82 to 1.39 on the thread clock, so the 2.5 line has about 1.8 times either way."""
+    payload = bytes(4 << 20)
+
+    def own_work() -> None:
+        sum(range(60_000))
+
+    def own_work_beside_a_hash() -> None:
+        helper = threading.Thread(target=hashlib.sha256, args=(payload,))
+        helper.start()
+        own_work()
+        helper.join()
+
+    def charged(**clock: Callable[[], float]) -> float:
+        return _thread_cpu_sample(own_work_beside_a_hash, **clock) / _thread_cpu_sample(
+            own_work, **clock
+        )
+
+    assert charged(clock=time.process_time) > 2.5, (
+        "the process clock charged the hashing thread too little to tell apart, so this fixture no "
+        "longer shows a second thread's work at all"
+    )
+    # The default clock, the one every arm here reads.
+    assert charged() < 2.5, (
+        "the CPU sample charged the measuring thread for another thread's work, which is how a "
+        "leftover thread deflates a growth ratio"
+    )
 
 
 def _redact_seconds(reps: int) -> float:
@@ -1109,17 +1170,16 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     ratio of 7.3 to 9.1, and 5.8 to 7.0 ms at the shipped window, under ``_CPU_CEILING_SECONDS`` by
     about 70 times. The control below reads 62 to 76 for a search that restarts at index 0.
 
-    **Re-measured 2026-10-27 on the thread clock with alternating samples (BACKLOG #3721)**, on a
-    32-way Windows box: this arm read 7.1 to 8.8 idle and 7.3 to 8.3 beside a ``pytest -n 4`` run of
-    unrelated suites, at least 2.7 times under the line. The control read 61.8 to 74.3, at least 2.6
-    times over it. The hosted ``windows-2022`` leg is not measured here.
+    **Re-measured 2026-10-28 on the instrument BACKLOG #3721 moved it to**, on a 32-way Windows box:
+    6.6 to 8.0 idle over six runs, at least 3 times under the line. The control's readings, and why
+    the instrument moved, are under the control below.
 
     **An absolute bound is kept, but it is ten times looser than the old one.** BACKLOG #2952 limit 3
     asks that an absolute bound on one clamp's cost survive. A pure ratio would give it up, so the
     shipped window is also held under ``_CPU_CEILING_SECONDS``. That ceiling passes a walk that stays
     linear but costs up to about 70 times today's, where the old budget caught about 8 times. The
     batch 255 Manager ruling on #2952 and #2958 (2026-10-13) chose that trade for headroom on a loaded
-    runner. The ratio's own margin is smaller, about 2.6 times, so load can still turn it red."""
+    runner. The ratio's own margin is smaller, about 3 times, so load can still turn it red."""
     growth, large = _credential_walk_growth()
     assert growth < _CPU_GROWTH_LINE, (
         f"an eight times wider window cost the credential walk {growth:.1f} times the CPU time, over "
@@ -1145,12 +1205,15 @@ def test_a_credential_search_from_index_0_is_quadratic_on_the_same_line(
     One rep for the large input, because a slow sample there only helps this assertion.
 
     **A slow SMALL sample is what hurts it, and that is how it went red (BACKLOG #3721).** It read 13.6
-    and 15.3 on ``windows-2022`` merge-group legs, against 62 to 76 here. On the old instrument -- the
-    process clock, every small sample first -- twelve GIL-free threads left running for 0.25 s from
-    the start read 7.9 to 23.8 on a Windows box, over twelve runs, every one under the line.
-    ``_thread_cpu_sample`` and ``_interleaved_growth`` read 61.8 to 103.4 under the same load. What
-    ran on the hosted runner is not known; this is a mechanism that can give the reading, not its
-    established cause."""
+    and 15.3 on ``windows-2022`` merge-group legs, against 62 to 76 here. Measured 2026-10-27 and
+    2026-10-28 on a 32-way Windows box, with twelve GIL-free threads started with the control and
+    left running for 0.25 s, the shape of a thread an earlier test leaves behind: the old instrument
+    (the process clock, every small sample first) read 7.9 to 23.8 over eighteen runs, every one
+    under the line. The one now in :func:`_thread_cpu_sample` and :func:`_interleaved_growth` read
+    63.4 to 90.0 under that load, and 54.2 to 80.8 idle, at least 2.2 times over the line. Forty busy
+    PROCESSES on that box moved neither clock out of its idle range, but a 4-vCPU runner, whose
+    workers share cores, is not measured. What ran on the hosted runner is not known either; this is
+    a mechanism that can give the reading, not its established cause."""
 
     def search_from_zero(text: str, cut: int) -> int:
         pos = 0
@@ -1367,6 +1430,9 @@ def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs() -> None:
     the same day in CPU time, over four runs: a ratio of 0.9 to 1.3, and 4.8 to 5.6 ms for the frame
     cap, under ``_CPU_CEILING_SECONDS`` by about 90 times. The control below reads 282 to 320 for the
     unbounded scan.
+
+    **Those readings are the process clock's.** Re-measured 2026-10-28 on the instrument BACKLOG #3721
+    moved this file to, over four runs: 0.84 to 1.14, 4.95 to 7.25 ms, and 237 to 275 for the control.
 
     **The ceiling is an absolute bound of the kind BACKLOG #2952 limit 3 asks to keep**, ten times looser than
     the old line: it passes a scan up to about 90 times today's. ``safe_text`` runs the whole clamp on
