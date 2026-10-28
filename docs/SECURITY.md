@@ -5175,13 +5175,18 @@ clears the cookie. That row is then missing, with an ERROR log line; the line na
 when the sign-out ended one. A failed owner lookup writes the row with no actor, so it does not
 reach that user's security-events feed.
 
-**Open gap: nothing in the engine bounds sign-outs that end nothing.** Such a sign-out still
-writes an `auth.logout` row, with `outcome` `nothing_to_revoke`. `/ui/logout` has no sign-in
-check and charges no budget. So an unauthenticated caller could append these rows without limit
-on a deployment. Each one is also a write transaction on the shared store, competing with message
-intake for the writer. This is an exception to the abuse-protection inventory below. At least
-these narrow it: the default `127.0.0.1` bind, `[security].allowed_client_networks`, and a proxy
-limiter in front of `/ui/logout`. `[retention].audit_log_warn_rows` warns as `audit_log` grows.
+**Open gap: nothing in the engine bounds sign-outs that end nothing.** A sign-out whose cookie
+names no live session still writes an `auth.logout` row, with `outcome` `nothing_to_revoke`; one
+with no cookie, or an empty one, writes none. `/ui/logout` has no sign-in check and charges no
+budget. So an unauthenticated caller who can reach it could append these rows without limit on a
+deployment, and nothing prunes `audit_log`: `[retention].audit_log_warn_rows` only warns as it
+grows. Each such sign-out also opens two write transactions, the revoke attempt and the row, so on
+SQLite each takes the single writer that message intake also needs, whether or not a session
+matched. This is an exception to the [abuse-protection inventory](#brute-force--abuse-protection)
+below, which does not list it. On a stock install only the default `127.0.0.1` bind narrows it.
+Once the bind is opened, an operator must narrow it: `[security].allowed_client_networks`, which
+defaults to no restriction and always admits loopback, or a proxy limiter in front of
+`/ui/logout`, which nothing in the engine checks for.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was

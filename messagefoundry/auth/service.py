@@ -10798,8 +10798,8 @@ class AuthService:
         1).** Once a session ended, a raise would report a sign-out that already happened as a
         failure, and ``/ui/logout`` answered 500 without clearing the cookie. A failed owner lookup
         leaves the row with no actor rather than no row; a refused row write leaves no row and an
-        ERROR log line, which names the session when one ended. A fault in the revoke itself still raises: the session
-        may not have ended, and the caller must not say it did.
+        ERROR log line, which names the session when one ended. A fault in the revoke itself still
+        raises: the session may not have ended, and the caller must not say it did.
 
         The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
         caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
