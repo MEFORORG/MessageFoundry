@@ -36,6 +36,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from messagefoundry.auth import ldap as ldap_auth
 from messagefoundry.auth import ldap_tls
 from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import ServiceSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
@@ -44,6 +45,7 @@ from messagefoundry.config.tls_policy import (
     context_checks_revocation,
 )
 from messagefoundry.privilege_probes import read_ldap_bind
+from messagefoundry.store.store import MessageStore
 from tests._ast_sites import call_sites, parse_source
 from tests.test_hop_refusal_revocation import (
     _crl_coverage_ca,
@@ -186,8 +188,17 @@ def test_an_ldaps_bind_built_with_no_posture_is_unchanged() -> None:
 
 def test_an_ldaps_server_that_names_no_host_is_refused_whatever_the_posture() -> None:
     for posture in (ENFORCING, NOT_ENFORCING, None):
-        with pytest.raises(LdapError):
+        with pytest.raises(LdapError, match="names no host"):
             _authenticator(posture, ad_server="ldaps://:636")
+
+
+def test_the_guard_judges_the_host_ldap3_dials_not_the_one_a_url_parser_reads() -> None:
+    """``urlsplit`` reads ``127.0.0.1`` out of this address, and ldap3 dials ``dc.corp@127.0.0.1``.
+    A guard on the URL reader's host would let it cross as on the box. The control is the plain
+    loopback address, which does cross."""
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        _authenticator(ENFORCING, ad_server="ldaps://dc.corp@127.0.0.1:636")
+    _authenticator(ENFORCING, ad_server=LOOPBACK_DC)
 
 
 def test_a_refused_bind_never_resolves_the_bind_password(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -224,8 +235,13 @@ def test_a_crl_that_goes_missing_after_start_fails_the_next_bind(
     crl.write_bytes(Path(directory_pki["clean_crl"]).read_bytes())
     auth = _authenticator(ENFORCING, crl=str(crl), ad_tls_ca_cert_file=directory_pki["anchor"])
     crl.unlink()
-    with pytest.raises(ValueError, match=r"\[auth\]\.ad_tls_crl_file"):
+    with (
+        _guard_log("messagefoundry.auth.ldap_tls") as log,
+        pytest.raises(ValueError, match=r"\[auth\]\.ad_tls_crl_file"),
+    ):
         _context_ldap3_builds(auth._tls)
+    # ldap3 reports the refusal by type alone, so the setting is named in the operator log here.
+    assert log.has("[auth].ad_tls_crl_file"), log.state()
 
 
 def test_a_missing_ad_crl_path_is_refused_at_load() -> None:
@@ -267,6 +283,19 @@ def test_a_crl_from_another_ca_fails_the_bind_closed(
 # --- the posture reaches the guard ----------------------------------------------------------------
 
 
+async def test_auth_service_passes_its_posture_to_the_guard() -> None:
+    """``serve`` and ``provision-admin`` build the authenticator through ``AuthService``, with the
+    posture passed as the lifespan passes it. The loopback DC is the control: the same service
+    builds, so the refusal is the guard and not the harness."""
+    store = await MessageStore.open(":memory:")
+    try:
+        with pytest.raises(InsecureHopRefused, match=r"\[auth\] AD LDAPS bind"):
+            AuthService(store, _ad_settings(), hop_posture=ENFORCING)
+        AuthService(store, _ad_settings(ad_server=LOOPBACK_DC), hop_posture=ENFORCING)
+    finally:
+        await store.close()
+
+
 def test_the_privilege_probe_passes_its_posture_to_the_guard() -> None:
     """``read_ldap_bind`` builds the authenticator with the arguments AuthService gives it, so an
     enforcing probe is refused the same way, and reports it rather than binding."""
@@ -293,7 +322,9 @@ def test_every_engine_build_of_the_authenticator_passes_a_posture() -> None:
     (``tests/test_revocation_guard_census.py``). That entry proves ``LdapAuthenticator.__init__``
     calls the guard. It cannot see a caller that stops passing ``hop_posture``, which would leave
     the guard the unstamped no-op with every behaviour test above still green. So every engine
-    call that builds the authenticator must pass the keyword, a new one included."""
+    call that builds the authenticator must pass the keyword, a new one included, and pass it a
+    name rather than a literal ``None``. A variable that is always ``None`` still passes this; the
+    behaviour tests through ``AuthService`` and the probe hold the two callers that exist."""
     builds = _authenticator_builds()
     # At least AuthService and the privilege probe build it, so the loop below checks something.
     assert len(builds) >= 2, builds
@@ -301,9 +332,10 @@ def test_every_engine_build_of_the_authenticator_passes_a_posture() -> None:
         "messagefoundry/auth/service.py",
         "messagefoundry/privilege_probes.py",
     }, builds
-    missing = [
-        f"{rel}: {ast.unparse(call)}"
-        for rel, call in builds
-        if "hop_posture" not in {kw.arg for kw in call.keywords}
-    ]
+    missing = []
+    for rel, call in builds:
+        given = {kw.arg: kw.value for kw in call.keywords}
+        value = given.get("hop_posture")
+        if value is None or (isinstance(value, ast.Constant) and value.value is None):
+            missing.append(f"{rel}: {ast.unparse(call)}")
     assert not missing, f"LdapAuthenticator built with no hop_posture: {missing}"

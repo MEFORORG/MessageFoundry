@@ -45,7 +45,7 @@ from messagefoundry.config.settings import (
     is_ldaps_address,
     split_kerberos_spn,
 )
-from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard, hop_url_host
+from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.redaction import safe_name
 
 if TYPE_CHECKING:
@@ -86,17 +86,31 @@ def _refuse_ad_revocation(
     guard says. ``None`` leaves the guard the shipped no-op.
 
     ``attested=False``: the owner ruling of 2026-10-27 gave this hop the guard and a CRL setting,
-    and no attestation, as the OIDC legs have none. ``ad_server`` is an ``ldaps://`` address by
-    the time this runs, so the shared reader takes its host; one that names no host is refused here,
-    whatever the posture, since a bind to it could not be classified as on the box or off it.
+    and no attestation, as the OIDC legs have none.
+
+    **The host is the one ldap3 dials, read with ldap3's own parser** (``Server.host``, as
+    :meth:`LdapAuthenticator._server` builds it), never ``urlsplit``. The two disagree on at least
+    userinfo: ``ldaps://dc.corp@127.0.0.1`` is loopback to ``urlsplit`` and ``dc.corp@127.0.0.1``
+    to ldap3, so a URL reader would let a hop it misread cross as on the box. The Vault guard reads
+    its address with the parser that dials for the same reason. An address that names no host, or
+    one ldap3 refuses, is refused here, whatever the posture, since a bind to it could not be
+    classified as on the box or off it.
 
     A Kerberos sign-in adds no hop here. The SPNEGO acceptor reads a ticket the browser sent and
     builds no TLS context, and every bind in this module is an ldap3 SIMPLE bind over this one
     context, so the lookups a Kerberos or OIDC sign-in makes ride the hop this guards."""
+    import ldap3  # lazy, like every ldap3 import here
+    from ldap3.core.exceptions import LDAPException
+
     try:
-        host = hop_url_host(str(settings.ad_server).strip(), cell="[auth] AD LDAPS bind")
-    except ValueError as exc:
-        raise LdapError(str(exc)) from exc
+        host = str(ldap3.Server(str(settings.ad_server), get_info=ldap3.NONE).host)
+    except LDAPException as exc:
+        raise LdapError(f"ad_server is not an address ldap3 can dial: {exc}") from exc
+    if not host:
+        raise LdapError(
+            "ad_server names no host, so the LDAPS bind cannot be judged on or off this box; "
+            "name the domain controller in ad_server"
+        )
     RevocationHopGuard.capture(
         host=host,
         cell="[auth] AD LDAPS bind (verified TLS, no revocation check)",

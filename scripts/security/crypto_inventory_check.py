@@ -310,8 +310,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # used for one handshake, and never returned. Not a data path — do not reuse these settings.
     "messagefoundry/config/tls_probe.py": frozenset({"ssl"}),
     # Vault BACKLOG #3533: tls_policy left with the posture keyword; the context is ldap_tls.py's.
-    # BACKLOG #2193: tls_policy is back, for the LDAPS revocation-hop guard (RevocationHopGuard,
-    # hop_url_host). It reads the check flag off a context ldap_tls.py builds; it builds none.
+    # BACKLOG #2193: tls_policy is back, for the LDAPS revocation-hop guard (RevocationHopGuard).
+    # It reads the check flag off a context ldap_tls.py builds; it builds none.
     "messagefoundry/auth/ldap.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # BACKLOG #2494: the engine ldap3.Tls. It wraps each LDAPS socket with a context that
     # tls_policy.assert_ldap3_tls_suites built, narrowed and asserted.

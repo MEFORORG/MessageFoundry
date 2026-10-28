@@ -943,7 +943,10 @@ bind-guard ladder above:
   way: it is recorded failed, every Handler call to it fails closed, and the other feeds start, on
   a clustered node too (BACKLOG #3008). `check`, dry-run and reload fail as a whole. **The OIDC token and JWKS legs** are refused on the same terms,
   each leg on its own host, when `serve` builds the auth service, and so is **the LDAPS AD bind**
-  (BACKLOG #2193); `messagefoundry check` does not build that service, so it does not reach them. A non-enforcing instance **warns** instead, and that is the only
+  (BACKLOG #2193). `messagefoundry check` does not build that service: it reports the OIDC legs
+  through its required `oidc-revocation` leg (BACKLOG #2131), and has no leg for the LDAPS bind,
+  which `serve`, `provision-admin` and `check-privileges` reach. *(Until 2026-10-28 this said
+  `check` does not reach the OIDC legs.)* A non-enforcing instance **warns** instead, and that is the only
   dial left: declaring the instance synthetic used to exempt it and
   [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)
   removed that (see *The ways across*, below).

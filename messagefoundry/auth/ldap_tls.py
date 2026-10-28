@@ -22,7 +22,9 @@ never loads it.
 
 from __future__ import annotations
 
+import logging
 import ssl
+import threading
 from typing import Any
 
 import ldap3
@@ -31,6 +33,26 @@ from ldap3.core.tls import check_hostname
 from messagefoundry.config.tls_policy import assert_ldap3_tls_suites
 
 __all__ = ["NarrowedTls"]
+
+logger = logging.getLogger(__name__)
+
+#: The context refusals already logged by this process, so a bind that fails the same way on every
+#: connection logs once. Binds run on worker threads, hence the lock.
+_REFUSALS_LOGGED: set[str] = set()
+_REFUSALS_LOCK = threading.Lock()
+
+
+def _warn_context_refusal(text: str) -> None:
+    """Log a bind's context refusal at WARNING, the first time this process sees that text."""
+    with _REFUSALS_LOCK:
+        if text in _REFUSALS_LOGGED:
+            return
+        _REFUSALS_LOGGED.add(text)
+    logger.warning(
+        "LDAPS bind refused before the handshake, because its TLS context could not be built: %s "
+        "Reported once per distinct reason.",
+        text,
+    )
 
 
 class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type information
@@ -70,8 +92,19 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
         return self._context_factory()
 
     def wrap_socket(self, connection: Any, do_handshake: bool = False) -> None:
-        """ldap3's wrap step on a fresh engine context; ldap3 calls this for LDAPS and StartTLS."""
-        wrapped = self._context_factory().wrap_socket(
+        """ldap3's wrap step on a fresh engine context; ldap3 calls this for LDAPS and StartTLS.
+
+        A context that cannot be built refuses the bind. Since BACKLOG #2193 that is most often an
+        ``[auth].ad_tls_crl_file`` that went missing, stale or unreadable after start. ldap3 wraps
+        the refusal into ``LDAPSocketOpenError`` and the engine reports that by type alone, so the
+        refusal's own text, the only place that names the setting, is logged here at WARNING, once
+        per distinct text, or an operator would read a lapsed CRL as a directory outage."""
+        try:
+            context = self._context_factory()
+        except ValueError as exc:
+            _warn_context_refusal(str(exc))
+            raise
+        wrapped = context.wrap_socket(
             connection.socket,
             server_side=False,
             do_handshake_on_connect=do_handshake,
