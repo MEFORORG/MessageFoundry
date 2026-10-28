@@ -148,8 +148,16 @@ function assertDiscarded(payload: Payload, why: string): Bench {
   assert.strictEqual(b.detail.innerHTML, before.html, `${why}: detail was re-rendered`);
   assert.strictEqual(b.detail.style.display, before.d, `${why}: detail visibility changed`);
   assert.strictEqual(b.results.style.display, before.r, `${why}: results visibility changed`);
+  // A discard may warn, but only in one of the two fixed forms, so no case echoes message text.
+  for (const w of b.warnings) {
+    assert.match(w, DISCARD_WARNING, `${why}: the warning is not one of the fixed forms: ${w}`);
+  }
   return b;
 }
+
+/** The only warnings a discard writes: a type the page declares, or the fixed unknown-kind phrase. */
+const DISCARD_WARNING =
+  /^MessageFoundry Test Bench: discarded a malformed (?:"(?:detail|trace|hex|collections|collectionRun|caseDetail)" message|message of an unknown kind)$/;
 
 /** Assert that `payload` RENDERS, and return the bench so the caller can inspect what rendered. */
 function assertRendered(payload: Payload, why: string, state: Record<string, unknown> | null = null): Bench {
@@ -733,7 +741,11 @@ suite("Test Bench webview — a collection run reveals values one case at a time
       assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw instead of discarding`);
       assert.strictEqual(b.detail.innerHTML, shown, `${why}: detail was re-rendered`);
       // The discard must come from the shape check, not from the stale-reply check behind it.
-      assert.ok(b.warnings.some((w) => w.includes('discarded a malformed "caseDetail"')), `${why}: not a shape discard`);
+      assert.deepStrictEqual(
+        b.warnings,
+        ['MessageFoundry Test Bench: discarded a malformed "caseDetail" message'],
+        `${why}: not a shape discard, or the warning carried more`,
+      );
     }
   });
 
