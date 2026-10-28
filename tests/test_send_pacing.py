@@ -189,7 +189,7 @@ def test_validate_config_reports_an_unexpected_toml_loader_failure_as_a_diagnost
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("loader fell over")
 
-    monkeypatch.setattr(cf, "load_connections_file", _boom)
+    monkeypatch.setattr(cf, "load_connections_data", _boom)
     d = tmp_path / "unexpected"
     d.mkdir()
     (d / "connections.toml").write_text("", encoding="utf-8")
@@ -228,7 +228,7 @@ def test_an_unexpected_loader_failure_is_scrubbed_before_it_becomes_a_diagnostic
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError(f"connect failed password={secret}")
 
-    monkeypatch.setattr(cf, "load_connections_file", _boom)
+    monkeypatch.setattr(cf, "load_connections_data", _boom)
     d = tmp_path / "leaky"
     d.mkdir()
     (d / "connections.toml").write_text("", encoding="utf-8")

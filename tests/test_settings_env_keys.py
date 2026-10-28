@@ -145,7 +145,10 @@ def test_a_real_field_still_loads_from_the_environment() -> None:
 
 
 def test_every_spared_name_loads() -> None:
-    _load(dict.fromkeys(_OUT_OF_BAND_ENV, "1"))
+    # The secrets directory is read by the load itself, so "1" is refused as a relative path; that
+    # refusal is tests/test_engine_secrets.py's to pin. Here it only has to be spared.
+    environ = dict.fromkeys(_OUT_OF_BAND_ENV, "1")
+    _load({**environ, "MEFOR_SECRETS_DIRECTORY": ""})
 
 
 def test_a_spared_name_is_spared_only_as_spelled() -> None:

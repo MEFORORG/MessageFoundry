@@ -1677,6 +1677,20 @@ class MessageSearchResult:
     truncated: bool
 
 
+class DiskFreeStatus(StrEnum):
+    """Whether :attr:`DbStatus.disk_free_bytes` is a reading, and if not, why (BACKLOG #1563).
+
+    The backend STATES this, so no reader has to infer it from which store answered. Only
+    ``OBSERVED`` carries a figure, and a figure of ``0`` is a measured empty drive that must alarm.
+    ``NOT_APPLICABLE`` is a server backend whose disk this process never looks at: it claims nothing
+    about the drive. ``UNOBSERVABLE`` is a measurement this process should have been able to take
+    and could not, such as a failed ``disk_usage`` on the SQLite store's own directory."""
+
+    OBSERVED = "observed"
+    NOT_APPLICABLE = "not_applicable"
+    UNOBSERVABLE = "unobservable"
+
+
 @dataclass(frozen=True)
 class DbStatus:
     """Database health snapshot for the Engine Status page."""
@@ -1688,6 +1702,9 @@ class DbStatus:
     # different facts and must stay so: 0 is a MEASURED empty drive and has to keep raising the
     # operator-health alarm, while None carries no claim about the drive at all (BACKLOG #1563).
     disk_free_bytes: int | None
+    # Which reading disk_free_bytes is, stated by the backend (BACKLOG #1563). Checked against
+    # disk_free_bytes in __post_init__, so the pair cannot contradict itself.
+    disk_free_status: DiskFreeStatus
     journal_mode: str
     messages: int
     events: int
@@ -1698,6 +1715,18 @@ class DbStatus:
     # server backends, where it is not a SQLite-style knob (SQL Server recovery model / Postgres WAL
     # durability is reported through journal_mode instead).
     synchronous: str | None = None
+
+    def __post_init__(self) -> None:
+        # Coerced, so a store passing the plain string gets the member every reader expects; an
+        # unknown string raises ValueError here, where it was built.
+        object.__setattr__(self, "disk_free_status", DiskFreeStatus(self.disk_free_status))
+        # A figure exactly when OBSERVED: a status claiming a reading over a None, or a None status
+        # over a figure, would let a reader trust the wrong half.
+        if (self.disk_free_status is DiskFreeStatus.OBSERVED) != (self.disk_free_bytes is not None):
+            raise ValueError(
+                f"disk_free_status={self.disk_free_status!r} contradicts"
+                f" disk_free_bytes={self.disk_free_bytes!r}"
+            )
 
 
 #: Who last wrote ``users.channel_scope`` (BACKLOG #1927). The AD login sync writes
@@ -16996,10 +17025,23 @@ class MessageStore:
             cur = await db.execute("PRAGMA journal_mode")
             row = await cur.fetchone()
             journal = str(row[0]) if row else ""
+            # Off the loop: stat and disk_usage block, and longest on the failing mount that
+            # UNOBSERVABLE exists to report (an SMB or NFS share that stopped answering).
+            size = await asyncio.to_thread(self._db_size_bytes)
+            if self.path == ":memory:":
+                # No file, so no drive: any figure would be the working directory's, not the DB's.
+                free, disk_status = None, DiskFreeStatus.NOT_APPLICABLE
+            else:
+                free = await asyncio.to_thread(self._disk_free_bytes)
+                # The engine stats this drive itself, so a None is a failed probe, never N/A.
+                disk_status = (
+                    DiskFreeStatus.OBSERVED if free is not None else DiskFreeStatus.UNOBSERVABLE
+                )
             return DbStatus(
                 path=self.path,
-                size_bytes=self._db_size_bytes(),
-                disk_free_bytes=self._disk_free_bytes(),
+                size_bytes=size,
+                disk_free_bytes=free,
+                disk_free_status=disk_status,
                 journal_mode=journal,
                 messages=await self._count(db, "messages"),
                 events=await self._count(db, "message_events"),

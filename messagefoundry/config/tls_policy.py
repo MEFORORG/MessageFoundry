@@ -570,7 +570,11 @@ _UNCONFIRMED_SIGNATURE = {
         "verify the CRL, but the CRL does not "
         "name that CA's key, so a renewed CA key could explain it"
     ),
-    "uncheckable": "the engine cannot check its signature with the listed CA's key",
+    "uncheckable": (
+        "the engine cannot check its signature with the key of a listed CA that fits it and whose "
+        "key the CRL names by key identifier or, where it names no such CA's key, with the key of "
+        "some listed CA that fits it"
+    ),
 }
 #: How many CRLs that warning describes before it only counts the rest.
 _UNCONFIRMED_SHOWN = 3
@@ -590,8 +594,10 @@ def _check_crl_signatures(
 
     **Everything short of proof loads, with one warning.** That covers at least a CRL that names
     no key, a key the engine cannot check with, and a CRL the engine matches to no listed CA. The
-    last is the usual case in a two-tier PKI, where the peer sends the intermediate that issued
-    the CRL, so it must not log per hop. The warning is one line for the file, and
+    key is the one the CRL names or, where it names no listed CA's key, that of any listed CA
+    that fits it, one with no Subject Key Identifier included. A CRL matched to no listed CA is
+    the usual case in a two-tier PKI, where the peer sends the intermediate that issued the CRL,
+    so it must not log per hop. The warning is one line for the file, and
     :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` decides how often it is
     logged. That function is asked only when there is a line to log. So it holds the last file
     version that logged one, and an earlier version is logged again only when it returns after
@@ -641,9 +647,10 @@ def _check_crl_signatures(
     if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
         raise ValueError(
             f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "
-            "key does not verify the CRL's signature. A handshake OpenSSL judges by this CRL "
-            "fails with 'CRL signature failure'. Give this setting the CRL that CA signed, or "
-            "remove this CRL if a good one from that issuer is already in the file"
+            "key does not verify the CRL's signature. A handshake whose chain runs through that "
+            "CA and that OpenSSL judges by this CRL fails with 'CRL signature failure'. Give this "
+            "setting the CRL that CA signed, or remove this CRL if a good one from that issuer is "
+            "already in the file"
         )
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
     finding = tuple(signature.state for signature in judged)

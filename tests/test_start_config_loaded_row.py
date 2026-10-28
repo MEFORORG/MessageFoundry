@@ -133,7 +133,7 @@ async def test_an_unreadable_vcs_head_degrades_the_same_way_at_every_load(
 
     app, cfg = _app(tmp_path)
 
-    def _undecodable(_path: Path) -> dict[str, object]:
+    def _undecodable(_path: Path, **_snapshot: object) -> dict[str, object]:
         raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
 
     monkeypatch.setattr(fp_mod, "config_fingerprint_detail", _undecodable)

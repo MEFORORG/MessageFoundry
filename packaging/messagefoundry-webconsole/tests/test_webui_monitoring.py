@@ -6,6 +6,7 @@ step-up-to-unlock primitive (BACKLOG #75 phases 1 and 3)."""
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import httpx
@@ -195,6 +196,7 @@ def test_status_builder_escapes_and_formats() -> None:
             path="/data/mf.db",
             size_bytes=2_500_000,
             disk_free_bytes=10_000_000_000,
+            disk_free_status="observed",
             journal_mode="wal",
             messages=10,
             events=5,
@@ -235,6 +237,31 @@ def test_status_builder_escapes_and_formats() -> None:
     svc = ServiceStatusInfo(enabled=True, state="running", service_name="MEFOR_Engine")
     html = str(status(sys_status, posture, cluster, nodes, dr, svc))
     assert "2.4 MiB" in html  # _bytes formatting
+
+    # BACKLOG #1563: the "Disk free" row renders by the backend's stated disk_free_status, so a
+    # store whose disk this engine does not measure (nothing wrong) and a failed local probe
+    # (something wrong) never read alike, and neither reads as a quantity. Read the row's own
+    # cell, so a match elsewhere on the page can neither pass nor fail these.
+    def _disk_free_cell(page_html: str) -> str:
+        found = re.search(r"<td>Disk free</td><td>(.*?)</td>", page_html)
+        assert found is not None
+        return found.group(1)
+
+    def _unmeasured(disk_status: str) -> str:
+        db = sys_status.db.model_copy(
+            update={"disk_free_bytes": None, "disk_free_status": disk_status}
+        )
+        return _disk_free_cell(
+            str(status(sys_status.model_copy(update={"db": db}), posture, cluster, nodes, dr, svc))
+        )
+
+    assert _disk_free_cell(html) == "9.3 GiB"  # observed: the figure, unchanged
+    assert _unmeasured("not_applicable") == (
+        "not measured by this engine (a server backend, or an in-memory store)"
+    )
+    assert _unmeasured("unobservable") == (
+        '<span class="status status-failed">db directory missing or unreadable</span>'
+    )
     assert "yes" in html and "single-node" in html  # _yn + role
     assert "<b>host</b>" not in html  # hostile node host escaped
     assert "&lt;b&gt;host&lt;/b&gt;" in html
