@@ -6338,16 +6338,19 @@ re-checked against a **running** engine alarms on every boot, because a running 
 rows; for continuous coverage the off-box tee is still the control ([BACKLOG #328](BACKLOG.md); the
 `[retention].audit_days` row in [`CONFIGURATION.md`](CONFIGURATION.md) is the source of record).
 To check the store against that tee, pass the pairs it forwarded back as `messagefoundry audit-verify
---expected-row SEQ:ROW_HASH` (repeatable), or `--expected-rows-file PATH` with one pair per line
-(vault BACKLOG #2612). Each pair asks whether the row at `seq` is still in the chain with that
-`row_hash`. Each row hash chains in the one before it, so a pair that matches also vouches for every
-row below it, and unlike the exact anchor a pair stays valid as the chain grows. A pair whose row is
-gone, or whose hash differs, is a broken chain, exit 1. A malformed pair, a pair at `seq` 0, or a
-file that holds no pair is exit 2. Key the pairs on `seq`, never on the record's `row_id`, which can
-skip numbers. All the pairs are checked in one walk of the chain, which matters under
-`vault_transit`, where each row costs a Transit round trip. A check run with no key compares each
-pair with the stored hash only, so it cannot see a row whose content was edited and whose stored
-hash was left as it was; only a check with the key sees that. Every audit row carries a
+--expected-row SEQ:ROW_HASH` (repeatable), or `--expected-rows-file PATH` with one pair per line, in
+a UTF-8 file of at most 256 MiB (vault BACKLOG #2612). Each pair asks whether the row at `seq` is
+still in the chain with that `row_hash`. Each row hash chains in the one before it, so a pair that
+matches also vouches for every row below it, and unlike the exact anchor a pair stays valid as the
+chain grows. Once the store opens and the walk finishes, a pair whose row is gone, or whose hash
+differs, is a broken chain, exit 1; the exit table above still governs a store that does not open.
+Exit 2 covers at least a malformed pair, a pair at `seq` 0, and a file that cannot be read, is not
+UTF-8, is over the bound, or holds no pair. Key the pairs on `seq`, never on the record's `row_id`,
+which can skip numbers. All the pairs are checked in one walk of the chain, which matters under
+`vault_transit`, where each row costs a Transit round trip. **The pairs witness only as well as the
+copy they came from.** A pair is only as authentic as the collector's record of it, and a forwarder
+hop that drops lines loses witnesses with nothing reporting it; read the tee's own limits, in
+`messagefoundry/store/audit_tee.py`, before resting a control on an export. Every audit row carries a
 `row_hash` from the moment it is written: the column is `NOT NULL` on all three backends and the
 startup backfill that used to chain pre-feature rows was deleted with it (BACKLOG #1198), because a
 row it could repair can no longer be written. The `client` address is folded **inside** the chained

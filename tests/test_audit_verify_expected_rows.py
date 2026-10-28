@@ -12,6 +12,7 @@ a Transit round trip, so a walk per pair would multiply them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sqlite3
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -42,7 +43,7 @@ def _seed(db: Path, n: int) -> list[tuple[int, str]]:
         await s.close()
 
     asyncio.run(run())
-    with sqlite3.connect(db) as conn:
+    with contextlib.closing(sqlite3.connect(db)) as conn:
         return [
             (int(r[0]), str(r[1]))
             for r in conn.execute("SELECT seq, row_hash FROM audit_log ORDER BY seq")
@@ -79,20 +80,21 @@ def test_a_pair_with_a_wrong_hash_fails(tmp_path: Path, capsys: pytest.CaptureFi
     wrong = (pairs[1][0], pairs[2][1])  # a real hash, at the wrong seq
     assert main(_args(db, [pairs[0], wrong, pairs[3]])) == 1
     out = capsys.readouterr().out
-    assert out.startswith("FAIL: ") and "1 of 3 expected audit row(s)" in out, out
+    assert out.startswith("FAIL: ") and "1 of 3 distinct expected audit row(s)" in out, out
 
 
 def test_a_pair_beyond_the_head_fails(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     # The truncation case: the collector witnessed row 6, the store now ends at row 4.
     db = tmp_path / "c.db"
     pairs = _seed(db, 6)
-    with sqlite3.connect(db) as conn:
+    with contextlib.closing(sqlite3.connect(db)) as conn:
         conn.execute("DELETE FROM audit_log WHERE seq > 4")
+        conn.commit()
     assert main(["audit-verify", "--db", str(db)]) == 0  # the bare walk cannot see it
     capsys.readouterr()
     assert main(_args(db, [pairs[5]])) == 1
     out = capsys.readouterr().out
-    assert "FAIL: " in out and "(never reached)" in out, out
+    assert "FAIL: " in out and "is past the chain's end" in out, out
 
 
 @pytest.mark.parametrize(
@@ -106,7 +108,7 @@ def test_a_malformed_pair_exits_2(
     _seed(db, 2)
     assert main(["audit-verify", "--db", str(db), "--expected-row", value]) == 2
     err = capsys.readouterr().err
-    assert "malformed --expected-row" in err and "SEQ:ROW_HASH" in err, err
+    assert "malformed audit row pair" in err and "SEQ:ROW_HASH" in err, err
 
 
 def test_the_rows_file_round_trips_and_refuses_a_bad_line(
@@ -116,7 +118,7 @@ def test_the_rows_file_round_trips_and_refuses_a_bad_line(
     pairs = _seed(db, 3)
     good = tmp_path / "rows.txt"
     # A BOM and a blank line, as PowerShell 5.1's `Set-Content -Encoding utf8` and an export leave.
-    good.write_text("﻿" + "\n".join(f"{s}:{h}" for s, h in pairs) + "\n\n", encoding="utf-8")
+    good.write_text("\ufeff" + "\n".join(f"{s}:{h}" for s, h in pairs) + "\n\n", encoding="utf-8")
     assert main(["audit-verify", "--db", str(db), "--expected-rows-file", str(good)]) == 0
     capsys.readouterr()
 
@@ -126,6 +128,13 @@ def test_the_rows_file_round_trips_and_refuses_a_bad_line(
     err = capsys.readouterr().err
     # The line number and the reason, never the line: the path may point at another file.
     assert "line 2" in err and "SECRETMARKER" not in err, err
+
+    # A numeric line too: the reason quotes no number from it (round-one review finding).
+    numeric = tmp_path / "numeric.txt"
+    numeric.write_text("987654321:\n-55555:" + "a" * 64 + "\n", encoding="utf-8")
+    assert main(["audit-verify", "--db", str(db), "--expected-rows-file", str(numeric)]) == 2
+    err = capsys.readouterr().err
+    assert "line 1" in err and "987654321" not in err, err
 
 
 @pytest.mark.parametrize("content", [b"", b"\n\n", "1:abc".encode("utf-16")])
@@ -181,3 +190,58 @@ def test_k_pairs_cost_one_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert reads == [1], reads
     # Positive control: the instrument does count per row, so equal counts are not two zeros.
     assert baseline >= 6, baseline
+
+
+# --- the shared walk, below the CLI -------------------------------------------------------------
+
+
+async def _rows(db: Path) -> list[Mapping[str, Any]]:
+    s = await MessageStore.open(db)
+    try:
+        return await s._audit_rows()
+    finally:
+        await s.close()
+
+
+def _walk(db: Path, **kw: Any) -> store_mod.AuditVerdict:
+    return store_mod.verify_audit_rows(
+        asyncio.run(_rows(db)), mac_keys={}, mac_fn=None, capable=False, **kw
+    )
+
+
+def test_the_prefix_alone_keeps_its_own_message(tmp_path: Path) -> None:
+    # The engine routes a prefix failure on its marker (BACKLOG #328); merging the prefix into the
+    # witness set must not change the message it reads.
+    db = tmp_path / "h.db"
+    pairs = _seed(db, 3)
+    ok, msg = _walk(db, expected_prefix=(5, pairs[0][1]))
+    assert not ok and msg is not None and store_mod.AUDIT_PREFIX_BREAK_MARKER in msg
+    assert "expected audit row" not in msg, msg
+
+
+def test_an_anchor_failure_does_not_hide_a_row_failure(tmp_path: Path) -> None:
+    db = tmp_path / "i.db"
+    pairs = _seed(db, 3)
+    stale_anchor = (2, pairs[1][1])
+    ok, msg = _walk(db, expected_anchor=stale_anchor, expected_rows=[(1, pairs[2][1])])
+    assert not ok and msg is not None
+    assert "diverges from recorded anchor" in msg and "1 of 1 distinct expected" in msg, msg
+
+
+def test_a_pair_may_be_a_list_and_below_1_is_refused(tmp_path: Path) -> None:
+    db = tmp_path / "j.db"
+    pairs = _seed(db, 2)
+    as_lists: Any = [list(p) for p in pairs]  # as a decoded JSON tee record would give them
+    assert _walk(db, expected_rows=as_lists)[0]
+    with pytest.raises(ValueError, match="below 1"):
+        _walk(db, expected_rows=[(0, pairs[0][1])])
+
+
+def test_parse_audit_row_pair_shares_the_anchor_head_rule() -> None:
+    head = "A" * 64
+    assert store_mod.parse_audit_row_pair(f" 7:{head} ") == (7, head.lower())
+    assert store_mod.parse_audit_row_pair("7:vault:v1:abc") == (7, "vault:v1:abc")
+    for bad in ("7:", "0:" + head, "7:" + "a" * 12, "7:zz", "seven:" + head):
+        with pytest.raises(store_mod.AuditRowPairError) as exc:
+            store_mod.parse_audit_row_pair(bad)
+        assert bad.strip() not in exc.value.reason, exc.value.reason

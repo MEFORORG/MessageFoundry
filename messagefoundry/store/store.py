@@ -4159,21 +4159,75 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
                 text,
             )
         return count, head
+    refusal, head = _audit_head_shape(head)
+    if refusal is not None:
+        raise AuditAnchorError(refusal, text)
+    return count, head
+
+
+def _audit_head_shape(head: str) -> tuple[str | None, str]:
+    """``(why a non-empty head is refused, or None; the head normalised)``. The one statement of
+    which heads the store can emit, shared by :func:`parse_audit_anchor` and
+    :func:`parse_audit_row_pair`, so a hardening of it reaches both. The reason quotes no part of the
+    head."""
     if all(c in _AUDIT_ANCHOR_HEX for c in head):
         if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
-            raise AuditAnchorError(
+            return (
                 f"the head is {len(head)} hex characters, not a full "
                 f"{AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest",
-                text,
+                head,
             )
-        return count, head.lower()
+        return None, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
-        return count, head  # opaque by construction; never normalise what we do not define
-    raise AuditAnchorError(
+        return None, head  # opaque by construction; never normalise what we do not define
+    return (
         f"the head is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
         f"isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138)",
-        text,
+        head,
     )
+
+
+#: The operator-facing shape of a row pair, quoted into every :class:`AuditRowPairError`.
+AUDIT_ROW_PAIR_FORM = (
+    "expected SEQ:ROW_HASH, a row's sequence number (1 or more) and its full row_hash, as the "
+    "off-box audit record carries them as 'seq' and 'row_hash' (never the row id)"
+)
+
+
+class AuditRowPairError(ValueError):
+    """A ``SEQ:ROW_HASH`` pair :func:`parse_audit_row_pair` refuses. As :class:`AuditAnchorError`,
+    ``str(exc)`` quotes the text and ``reason`` never includes any of it, so a caller reading pairs
+    from a file can name the line without putting the file's content on its output."""
+
+    def __init__(self, reason: str, text: str) -> None:
+        self.reason = reason
+        self.text = text
+        super().__init__(f"malformed audit row pair {text!r}: {reason} — {AUDIT_ROW_PAIR_FORM}")
+
+
+def parse_audit_row_pair(text: str) -> tuple[int, str]:
+    """Parse a ``SEQ:ROW_HASH`` pair, one row the off-box tee witnessed, into the tuple
+    ``verify_audit_chain(expected_rows=...)`` takes (vault BACKLOG #2612).
+
+    It refuses, as :func:`parse_audit_anchor` does and for the same reason, any head the store can
+    never emit, since a comparator would report it as tampering. Unlike an anchor, a pair names a
+    ROW, so its sequence number is at least 1 and its head is never empty."""
+    seq_text, sep, head = text.strip().partition(":")
+    if not sep:
+        raise AuditRowPairError("no ':' separator", text)
+    try:
+        seq = int(seq_text)
+    except ValueError:
+        raise AuditRowPairError("the sequence number is not an integer", text) from None
+    if seq < 1:
+        raise AuditRowPairError("the sequence number is below 1, so it names no row", text)
+    head = head.strip()
+    if not head:
+        raise AuditRowPairError("the row_hash is empty", text)
+    refusal, head = _audit_head_shape(head)
+    if refusal is not None:
+        raise AuditRowPairError(refusal.replace("the head", "the row_hash", 1), text)
+    return seq, head
 
 
 def audit_mac_bytes(value: object) -> bytes:
@@ -4855,9 +4909,14 @@ def verify_audit_rows(
     # of (seq, head) witnesses, each head captured AT its position in this same walk. A repeated pair
     # is checked once. A position the walk never reaches stays absent from `witness_heads`, which is
     # the truncation case and must FAIL rather than pass vacuously.
-    witnesses = sorted(
-        {*(() if expected_prefix is None else (expected_prefix,)), *(expected_rows or ())}
-    )
+    # Unpacked into tuples, so a pair given as a list (a decoded JSON record) is hashable too.
+    row_pairs = {(seq, head) for seq, head in expected_rows or ()}
+    if any(seq < 1 for seq, _ in row_pairs):
+        # A pair names a ROW. Below 1 it can name none, and would read as a truncation: refuse the
+        # input rather than raise a false tamper alarm on an intact chain (parse_audit_row_pair).
+        raise ValueError("an expected audit row's sequence number is below 1")
+    prefix_pair = None if expected_prefix is None else (expected_prefix[0], expected_prefix[1])
+    witnesses = sorted(row_pairs if prefix_pair is None else row_pairs | {prefix_pair})
     witness_positions = frozenset(seq for seq, _ in witnesses)
     witness_heads: dict[int, str] = {}
     # The range being walked: its key, its first position and that row's id, and its digest.
@@ -5017,6 +5076,9 @@ def verify_audit_rows(
             f"audit chain broken at seq={first_pos}, row id={first_id}"
             + (f" ({reason})" if reason else ""),
         )
+    # Every comparator below runs before any verdict is returned, and each failing one is reported,
+    # so one run names everything it found.
+    failures: list[str] = []
     if expected_anchor is not None:
         exp_count, exp_head = expected_anchor
         # Evaluate the head compare UNCONDITIONALLY (not behind `or`): the anchor head is a MAC too,
@@ -5024,27 +5086,35 @@ def verify_audit_rows(
         # the row count.
         head_ok = hmac.compare_digest(audit_mac_bytes(prev), audit_mac_bytes(exp_head))
         if count < exp_count or not head_ok:
-            return AuditVerdict(
-                False,
+            failures.append(
                 f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
-                f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten",
+                f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten"
             )
-    # Every witness is compared, in seq order, before any is reported: the comparator count does not
-    # depend on where the first mismatch sits (ASVS 11.2.4, as above).
-    failed: list[str | None] = []
-    for pair in witnesses:
-        ok, msg = audit_prefix_verdict(pair, witness_heads.get(pair[0]), count)
-        if not ok:
-            failed.append(msg)
-    if failed:
-        if not expected_rows:
-            # The prefix alone keeps its own message: the engine routes on its marker (#328).
-            return AuditVerdict(False, failed[0])
-        return AuditVerdict(
-            False,
-            f"{len(failed)} of {len(witnesses)} expected audit row(s) are not in the chain as "
-            f"it stands; the first by seq: {failed[0]}",
+    if prefix_pair is not None:
+        ok, msg = audit_prefix_verdict(prefix_pair, witness_heads.get(prefix_pair[0]), count)
+        if not ok and msg is not None:
+            failures.append(msg)  # its own message: the engine routes on its marker (#328)
+    missing: list[tuple[int, str]] = []
+    for seq, head in sorted(row_pairs):
+        # The prefix comparator answers the same question for one row: is this head the chain's head
+        # at that position? It compares in constant time once the position was reached.
+        if not audit_prefix_verdict((seq, head), witness_heads.get(seq), count)[0]:
+            missing.append((seq, head))
+    if missing:
+        seq, head = missing[0]
+        have = witness_heads.get(seq)
+        failures.append(
+            f"{len(missing)} of {len(row_pairs)} distinct expected audit row(s) are not in the chain "
+            f"as it stands (have {count} row(s)); the first by seq: row {seq} "
+            + (
+                "is past the chain's end"
+                if have is None
+                else f"carries {have[:12]!r}, expected {head[:12]!r}"
+            )
+            + " — truncated or rewritten"
         )
+    if failures:
+        return AuditVerdict(False, "; ".join(failures))
     if key_unavailable:
         # Last, after every check that needs no key has passed: a break those checks found is a
         # break, and outranks "could not check".
@@ -5055,7 +5125,7 @@ def verify_audit_rows(
         ]
         if expected_anchor is not None or expected_prefix is not None:
             checked.append("the expected anchor")
-        if expected_rows:
+        if row_pairs:
             checked.append("the expected rows")
         return AuditVerdict(
             False,

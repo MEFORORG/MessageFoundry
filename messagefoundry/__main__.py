@@ -1026,8 +1026,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--expected-rows-file",
         default=None,
         metavar="PATH",
-        help="read SEQ:ROW_HASH pairs, one per line, from a UTF-8 text file, such as pairs exported "
-        "from the off-box audit copy. Blank lines are skipped. Checked as --expected-row is",
+        help="read SEQ:ROW_HASH pairs, one per line, from a UTF-8 text file of at most 256 MiB, such "
+        "as pairs exported from the off-box audit copy. Blank lines are skipped. Checked as "
+        "--expected-row is",
     )
 
     audit_anchor = sub.add_parser(
@@ -6685,77 +6686,72 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         return 2
 
 
-#: How much of an ``--expected-rows-file`` is read before it is refused. A bound against a path typo'd
-#: onto something that is not a pair file, not a size any deployment was measured against: one pair is
-#: under 200 bytes, so this holds tens of thousands of them.
-_AUDIT_ROWS_FILE_MAX_BYTES = 16 * 1024 * 1024
-
-_AUDIT_ROW_PAIR_FORM = (
-    "expected SEQ:ROW_HASH, a row's sequence number and its full row_hash as the off-box audit "
-    "record carries them"
-)
+#: How much of an ``--expected-rows-file`` is read before it is refused: a bound against a path typo'd
+#: onto something that is not a pair file, not a size any deployment was measured against. A pair line
+#: is about 72 bytes, so this holds over three million pairs; the walk itself already loads every
+#: audit row into memory, which a log that size dwarfs.
+_AUDIT_ROWS_FILE_MAX_BYTES = 256 * 1024 * 1024
 
 
 def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | int:
     """The ``(seq, row_hash)`` pairs for ``audit-verify``, or the exit code 2 if one is unusable
     (vault BACKLOG #2612). An empty list when neither flag was given.
 
-    Each pair is parsed by :func:`parse_audit_anchor`, the anchor's own parser, so a pair and an
-    anchor accept and refuse the same heads. A pair must name a row, so ``SEQ`` 0 is refused here.
-    A refusal for a ``--expected-row`` value quotes it, since the operator typed it; one for a file
-    line names the line number and the reason only, so a path typo'd onto another file does not put
-    that file's content on the job's output.
+    Each pair is parsed by :func:`parse_audit_row_pair`, which shares the anchor parser's rule for
+    which heads the store can emit. A refusal for a ``--expected-row`` value quotes it, since the
+    operator typed it; one for a file line names the line number and a reason that quotes nothing,
+    so a path typo'd onto another file does not put that file's content on the job's output.
     """
     from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.store import (
-        AuditAnchorError,
-        parse_audit_anchor,
+        AUDIT_ROW_PAIR_FORM,
+        AuditRowPairError,
+        parse_audit_row_pair,
         read_bounded_utf8_lines,
     )
 
-    #: (what a refusal calls the value, the text to parse)
-    items = [(f"--expected-row {text!r}", text) for text in args.expected_row or ()]
-    path = args.expected_rows_file
-    if path is not None:
+    pairs: list[tuple[int, str]] = []
+    for text in args.expected_row or ():
         try:
-            lines = read_bounded_utf8_lines(
-                path,
-                _AUDIT_ROWS_FILE_MAX_BYTES,
-                too_large=f"the file is larger than {_AUDIT_ROWS_FILE_MAX_BYTES} bytes",
-            )
-        except (OSError, UnicodeDecodeError) as exc:
-            # `UnicodeDecodeError` is a `ValueError`: uncaught it would exit 1, a broken chain's code.
+            pairs.append(parse_audit_row_pair(text))
+        except AuditRowPairError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    path = args.expected_rows_file
+    if path is None:
+        return pairs
+    try:
+        lines = read_bounded_utf8_lines(
+            path,
+            _AUDIT_ROWS_FILE_MAX_BYTES,
+            too_large=f"the file is larger than {_AUDIT_ROWS_FILE_MAX_BYTES} bytes",
+        )
+    except (OSError, UnicodeDecodeError) as exc:
+        # `UnicodeDecodeError` is a `ValueError`: uncaught it would exit 1, a broken chain's code.
+        print(
+            f"error: cannot read --expected-rows-file {path!r}: {codec_safe_str(exc)}. It must be "
+            f"a UTF-8 text file of SEQ:ROW_HASH lines; {_UTF16_HINT}",
+            file=sys.stderr,
+        )
+        return 2
+    before = len(pairs)
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            pairs.append(parse_audit_row_pair(line))
+        except AuditRowPairError as exc:
             print(
-                f"error: cannot read --expected-rows-file {path!r}: {codec_safe_str(exc)}. It must "
-                f"be a UTF-8 text file of SEQ:ROW_HASH lines; {_UTF16_HINT}",
+                f"error: malformed --expected-rows-file line {number}: {exc.reason} — "
+                f"{AUDIT_ROW_PAIR_FORM}",
                 file=sys.stderr,
             )
             return 2
-        in_file = [
-            (f"--expected-rows-file line {n}", line)
-            for n, line in enumerate(lines, start=1)
-            if line.strip()
-        ]
-        if not in_file:
-            # Refused, not read as "nothing to compare": a job pointed at an empty export would
-            # otherwise report a clean walk with no witness checked, which is what the flag is for.
-            print(
-                f"error: --expected-rows-file {path!r} holds no SEQ:ROW_HASH line", file=sys.stderr
-            )
-            return 2
-        items += in_file
-    pairs: list[tuple[int, str]] = []
-    for label, text in items:
-        try:
-            seq, head = parse_audit_anchor(text)
-            if seq == 0:
-                raise AuditAnchorError("sequence number 0 names no row; rows start at 1", text)
-        except AuditAnchorError as exc:
-            print(
-                f"error: malformed {label}: {exc.reason} — {_AUDIT_ROW_PAIR_FORM}", file=sys.stderr
-            )
-            return 2
-        pairs.append((seq, head))
+    if len(pairs) == before:
+        # Refused, not read as "nothing to compare": a job pointed at an empty export would
+        # otherwise report a clean walk with no witness checked, which is what the flag is for.
+        print(f"error: --expected-rows-file {path!r} holds no SEQ:ROW_HASH line", file=sys.stderr)
+        return 2
     return pairs
 
 
@@ -9404,10 +9400,16 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # chain as plain SHA-256 changes every row hash, the head included. `audit-anchor` verifies
         # nothing, so an anchor taken after a rewrite matches it, and the cause stays named, scoped
         # to before the anchor (vault BACKLOG #3110, item 2).
+        # Matched expected rows rule a rewrite out the same way, for the rows they witness: the tee
+        # captured each pair as the row was written (vault BACKLOG #2612).
         rewrite = (
             "Or the chain was rewritten as keyless before the expected anchor was taken: it "
             "matched, which rules out a rewrite since then and no earlier one."
             if expected_anchor is not None
+            else "Or the chain was rewritten as keyless before the expected rows were captured: "
+            "they matched, which rules out a rewrite since the earliest was captured and no "
+            "earlier one."
+            if expected_rows
             else "Or the chain was rewritten as keyless, which a keyless check cannot see."
         )
         print(
