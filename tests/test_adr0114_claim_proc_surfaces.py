@@ -212,6 +212,7 @@ def _page(claim_proc: object) -> str:
             path="mem",
             size_bytes=0,
             disk_free_bytes=10 * 1024**3,
+            disk_free_status="observed",
             journal_mode="wal",
             messages=0,
             events=0,

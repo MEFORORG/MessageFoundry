@@ -30,7 +30,7 @@ from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.store import MessageStore, OutboxStatus, open_store
-from messagefoundry.store.store import DbStatus
+from messagefoundry.store.store import DbStatus, DiskFreeStatus
 
 DAY = 86_400.0
 
@@ -928,6 +928,7 @@ async def test_max_db_mb_alert_fires(store: MessageStore, monkeypatch) -> None:
         path=store.path,
         size_bytes=5_000_000,
         disk_free_bytes=0,
+        disk_free_status=DiskFreeStatus.OBSERVED,
         journal_mode="wal",
         messages=0,
         events=0,
