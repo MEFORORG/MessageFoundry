@@ -417,8 +417,13 @@ def test_every_guard_name_reaches_a_root() -> None:
     matched only on ``RevocationHopGuard``, and ``transports/mllp.py`` defines another one."""
     defs = _scan().defs
     assert callable(getattr(RevocationHopGuard, "capture", None))
+    # Pinned exactly, so a hollow wrapper moved into the roots needs an edit here that review sees.
+    assert sorted(_GUARD_ROOTS) == ["_refuse_an_unrevoked_vault_hop", "capture"], _GUARD_ROOTS
     # Counted from the source, not imported: the Vault guard's module needs the [vault] extra.
     counts = {name: _def_count(name) for name in sorted(_GUARDS - {"capture"})}
+    # 8 names when this floor was set; 4 is the Vault root plus the wrapper floor below. It fails a
+    # walk over nothing, over which the one-def check would pass.
+    assert len(counts) >= 4, f"only {len(counts)} guard names besides capture, floor 4"
     not_one = {name: n for name, n in counts.items() if n != 1}
     assert not not_one, f"guard name(s) without exactly one def in messagefoundry/: {not_one}"
     # 5 wrappers when this floor was set, so 3 lets two go with no edit here (BACKLOG #3512). It
