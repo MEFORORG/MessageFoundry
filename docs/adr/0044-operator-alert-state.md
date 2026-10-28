@@ -257,7 +257,9 @@ escalation chains (still deferred, ADR 0014 §3). The cross-node durable dedup o
   rely on the deferred staleness sweep or manual resolve until it lands. *Resolved 2026-10-27 (BACKLOG
   #1741):* the runner now raises `connection_started` when an inbound genuinely starts, with no open
   cause on it or on an outbound of the same name, so an inbound's bind-failure `connection_stopped`
-  resolves itself. At least these still need a manual resolve: an outbound's start failure, a halt whose
+  resolves itself. A start inside the `restart_inbound` that a `connection_stopped` rule
+  dispatched for its own inbound resolves nothing, so a rule-driven crash loop keeps one open, escalating
+  instance. At least these still need a manual resolve: a stop that rule restarted, an outbound's start failure, a halt whose
   name has no inbound, an inbound that is never started again, an inbound whose outbound namesake still
   has an open cause, and any alert raised in a cluster or under an engine shard that does not own the
   namesake outbound.
