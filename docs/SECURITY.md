@@ -3357,12 +3357,12 @@ write races.
   account keeps its TOTP, removing any discoverable passkey needs a TOTP that is a way past, and
   a passkey-only account must enrol TOTP before it rotates and is named in `no_way_past`. That is
   the shipped default on a loopback bind. The census's reset warning
-  (`reset_would_remove_a_passkey`) counts a passkey under that `rp_id` too, and any discoverable
-  passkey when none is configured, since it asks whether a reset would remove one that may sign
-  the holder in. After an origin change
+  (`reset_would_remove_a_passkey`) counts a passkey under the configured `rp_id` too, and any
+  discoverable passkey when none is configured, since it asks whether a reset would remove one that
+  may sign the holder in. After an origin change
   ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
-  visibly unusable) a passkey under the old `rp_id` no longer counts, so the census names an
-  account whose only way past it was.
+  visibly unusable) a passkey under the old `rp_id` no longer counts at the gates, so the census
+  names an account whose only way past it was.
 - Without the `[webauthn]` extra no passkey is a way past: the gates and the census do not count
   one, and the sign-in treats an assertion as absent. `POST /users/{id}/reset-mfa` clears passkeys alongside TOTP — the
 always-available recovery, because passkeys mint **no recovery codes by design** (codes are phishable

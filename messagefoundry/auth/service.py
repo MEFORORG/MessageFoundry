@@ -2326,10 +2326,10 @@ class LockableAccountCensus:
     credential (``password_generated`` unset) and no factor with a way past the sign-in lock: no TOTP,
     and no passkey recorded as discoverable under the configured relying party (wave 2; BACKLOG
     #3937: with none configured, no passkey counts here). ``passkey_only`` and
-    ``unknown_beside_a_passkey`` count a discoverable passkey under that relying party too, and any
-    discoverable passkey when none is configured, since they answer whether a reset would remove
-    one that may sign the holder in, so an account can be named in ``no_way_past`` and
-    ``passkey_only`` at once. ``undecryptable_totp`` names every account
+    ``unknown_beside_a_passkey`` count a discoverable passkey under the configured relying party
+    too, and any discoverable passkey when none is configured, since they answer whether a reset
+    would remove one that may sign the holder in. So with none configured an account can be named
+    in ``no_way_past`` and ``passkey_only`` at once. ``undecryptable_totp`` names every account
     whose ENABLED TOTP secret the engine cannot decrypt or compute with (BACKLOG #3422), which turns
     the owner's combined sign-in into "right password, wrong code". All are usernames only, sorted;
     none carries a secret.
@@ -2563,8 +2563,9 @@ async def lockable_account_census(
     site-wide veto.
 
     ``way_past_rp_id`` is the relying party the configuration names
-    (:func:`webauthn.configured_rp_id`): a passkey counts as a way past only under it, and under none
-    when it is ``None``, as the factor-drop gates count it (BACKLOG #3937)."""
+    (:func:`webauthn.configured_rp_id`): for ``no_way_past`` a passkey counts as a way past only
+    under it, and under none when it is ``None``, as the factor-drop gates count it (BACKLOG
+    #3937)."""
     no_way_past: list[str] = []
     undecryptable: list[str] = []
     unknown: list[str] = []
