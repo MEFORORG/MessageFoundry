@@ -2378,24 +2378,24 @@ What the `date` kind does to a value:
 - An `OBX-5` result whose `OBX-2` type is `NM`, `SN` or `TM` is kept whole only when it fits the
   grammar of that type (vault BACKLOG #2961). `NM` is an optional comparator, an optional sign,
   digits and at most one decimal point. `SN` is a comparator, a number, a separator and a second
-  number, each optional. `TM` is a time of day with every part in range, and an offset, if any, in
-  whole quarter hours. A value that does not fit
-  becomes `[REDACTED]`. So `123-45-6789` or `555-555-0100` under a numeric label would no longer
-  leave whole, and neither would an eight-digit date under `TM`. **The grammar cannot tell a
-  number from an identifier written as a number.** At least these would still leave whole under
-  `NM`, and in a number part of an `SN`: an undashed nine-digit number, which is the shape of an
-  SSN; an undashed ten-digit number, or eleven digits after a `+`, which is the shape of a phone
-  number; an eight-digit number that reads as a date; and an identifier split across repetitions.
-  Under `TM`, at least these would still leave whole: a six-digit date whose parts are in range
-  for a time, as `150312` reads as 15:03:12; and a date written `YYYY-MMDD` on the 15th or the
-  30th, as `1945-0615` reads as 19:45 at an offset of -06:15. The leak-check's shape detectors do not scan `OBX-5`,
-  because a rule maps it, so nothing refuses these. A message that declares a digit, a whitespace
-  character or one of `+ - . : / < > =` as its component, repetition or subcomponent separator
-  keeps no numeric `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, at
-  least a value such as `000-12-3456` would still leave whole. The message itself splits it
-  across `OBX-5`, `OBX-6` and `OBX-7`. The first part is a valid number, and no rule maps the
-  other two fields. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
-  under one of them, such as a surname, would still leave whole.
+  number, each optional. `TM` is a time of day with every part in range and no offset, since the
+  `date` kind never keeps an offset either. A value that does not fit becomes `[REDACTED]`. So
+  `123-45-6789` or `555-555-0100` under a numeric label would no longer leave whole, and neither
+  would an eight-digit date, a date written `YYYY-MMDD` or a phone number written `NNNNNN-NNNN`
+  under `TM`. **The grammar cannot tell a number from an identifier written as a number.** At
+  least these would still leave whole under `NM`, and in a number part of an `SN`: an undashed
+  nine-digit number, which is the shape of an SSN; an undashed ten-digit number, or eleven digits
+  after a `+`, which is the shape of a phone number; an eight-digit number that reads as a date;
+  and an identifier split across repetitions. Under `TM`, at least a six-digit date whose parts
+  are in range for a time would still leave whole: `150312` reads as 15:03:12. The leak-check's
+  shape detectors do not scan `OBX-5`, because a rule maps it, so nothing refuses these. A message
+  that declares a digit or one of `+ - . : / < > =` as its component, repetition or subcomponent
+  separator keeps no numeric `OBX-5` value, and one that declares a whitespace character there
+  keeps no `OBX-5` value of any type. The guard does not read the field separator. Under a field
+  separator of `-`, at least a value such as `000-12-3456` would still leave whole. The message
+  itself splits it across `OBX-5`, `OBX-6` and `OBX-7`. The first part is a valid number, and no
+  rule maps the other two fields. Under the coded types `ID`, `IS`, `CE` and `CWE` a single word,
+  such as a surname, would still leave whole.
 - When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
   site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
   kind filled, so the filled date stays a date. Two things follow. A site code that reads as a

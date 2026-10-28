@@ -628,29 +628,22 @@ _CODED_ELEMENT_TEXT_COMPONENTS = (2, 5, 9)
 _COMPARATOR = r"(?:<=|>=|<>|[<>=])"
 #: An HL7 NM: an optional sign, digits, and at most one decimal point.
 _NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
-#: An HL7 TM, ``HH[MM[SS[.S[S[S[S]]]]]][+/-ZZZZ]``, with every group in range. The ranges matter: an
-#: eight-digit date is not a time of day, and it does not fit. Every UTC offset in use is a whole
-#: quarter hour, so an offset's minutes are 00, 15, 30 or 45. That refuses most dates written
-#: ``YYYY-MMDD``, which read as an hour, a minute and an offset; a day of 15 or 30 still fits.
+#: An HL7 TM, ``HH[MM[SS[.S[S[S[S]]]]]]``, with every group in range. The ranges matter: an
+#: eight-digit date is not a time of day, and it does not fit. A time with an offset is not kept,
+#: as the ``DATE`` and ``DOB`` kinds never keep one (vault BACKLOG #2767): an offset can name a
+#: small region, and a date written ``YYYY-MMDD`` or a phone number written ``NNNNNN-NNNN`` reads as
+#: a time and an offset.
 _TIME_OF_DAY = r"""
     (?:[01][0-9]|2[0-3])                    # hour
     (?:[0-5][0-9]                           # minute
       (?:[0-5][0-9]                         # second
         (?:\.[0-9]{1,4})?                   # fraction, only after the seconds
       )?)?
-    (?:[+-](?:(?:0[0-9]|1[0-3])(?:00|15|30|45)|1400))?  # offset, no wider than 1400 either way
 """
 #: Every character the three grammars are written in. No numeric value is kept when one of them is
 #: the component, repetition or subcomponent separator: under a repetition separator of ``-``,
-#: ``000-12-3456`` splits into three valid numbers. A whitespace separator is refused the same way,
-#: because a space is how an identifier is written unpunctuated: ``000 12 3456`` splits just as
-#: well. The field separator is not read.
+#: ``000-12-3456`` splits into three valid numbers. The field separator is not read.
 _NUMERIC_GRAMMAR_CHARS = frozenset("0123456789+-.:/<>=")
-
-
-def _splits_a_numeric_value(mark: str) -> bool:
-    """True if a separator ``mark`` could cut an identifier into parts that each fit a grammar."""
-    return mark in _NUMERIC_GRAMMAR_CHARS or mark.isspace()
 
 
 #: What each COMPONENT of a preserved numeric value must match, by position. A value with more
@@ -686,9 +679,8 @@ def _fits_numeric_grammar(grammar: tuple[re.Pattern[str], ...], value: str, seps
     """True if every repetition of ``value`` fits ``grammar``, component by component. An empty
     component is legal, because an ``SN`` leaves out the parts it does not use. No numeric type has
     subcomponents, and the patterns refuse that separator. Nothing is kept when a grammar uses the
-    component, repetition or subcomponent separator, or when one of them is whitespace. The field
-    separator is not read."""
-    if any(map(_splits_a_numeric_value, (seps.component, seps.repetition, seps.subcomponent))):
+    component, repetition or subcomponent separator. The field separator is not read."""
+    if not _NUMERIC_GRAMMAR_CHARS.isdisjoint((seps.component, seps.repetition, seps.subcomponent)):
         return False
     for rep in value.split(seps.repetition):
         comps = _components(rep, seps)
@@ -742,6 +734,11 @@ def preserve_obx5_value(value_type: str | None, value: str | None, seps: Seps) -
     """
     declared = (value_type or "").strip().upper()
     text = value or ""
+    # A space is how words and digit groups are written apart. Under a whitespace component,
+    # repetition or subcomponent separator, ``000 12 3456`` splits into three valid numbers and a
+    # sentence into bare tokens, so no type is kept. The field separator is not read.
+    if any(mark.isspace() for mark in (seps.component, seps.repetition, seps.subcomponent)):
+        return False
     if (grammar := _NUMERIC_OBX_GRAMMAR.get(declared)) is not None:
         return _fits_numeric_grammar(grammar, text, seps)
     if declared in _CODED_OBX_TYPES:

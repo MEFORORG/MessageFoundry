@@ -85,8 +85,10 @@ _REFUSED: dict[str, tuple[str, str]] = {
     "TM five fraction digits": ("TM", "120000.12345"),
     "TM offset out of range": ("TM", "1200+9900"),
     "TM offset past the widest": ("TM", "1200+1459"),
-    "TM offset off the quarter hour": ("TM", "1200-0520"),
-    "TM date written YYYY-MMDD": ("TM", "1945-0612"),
+    "TM offset": ("TM", "1200-0500"),
+    "TM widest offset": ("TM", "000000+1400"),
+    "TM date written YYYY-MMDD": ("TM", "1945-0615"),
+    "TM phone shape read as a time and an offset": ("TM", "212555-0100"),
     "TM colons": ("TM", "12:30"),
     "SN unsplit comparator and number": ("SN", "<5"),
     "TM comparator": ("TM", ">1200"),
@@ -113,10 +115,6 @@ _KEPT: dict[str, tuple[str, str]] = {
     "TM hours and minutes": ("TM", "1200"),
     "TM seconds": ("TM", "235959"),
     "TM fraction": ("TM", "120000.1234"),
-    "TM offset": ("TM", "1200-0500"),
-    "TM widest offset": ("TM", "000000+1400"),
-    "TM half hour offset": ("TM", "1200+0530"),
-    "TM three quarter hour offset": ("TM", "1200+0545"),
 }
 
 
@@ -182,17 +180,51 @@ def test_nothing_is_kept_under_a_separator_that_splits_a_value(
 ) -> None:
     """A message may declare any separators. Under a repetition separator of ``-`` the value splits
     into ``000``, ``12`` and ``3456``, and each is a valid number, so the grammar alone keeps it. A
-    space splits an identifier written unpunctuated the same way, and ``\\x1f`` is whitespace too."""
+    space splits an identifier written unpunctuated the same way, and ``\\x1f`` is whitespace too.
+    Only the repetition separator is varied: an ``NM`` or ``TM`` has one component and is never
+    split into subcomponents, so the grammar refuses the other two splits by itself."""
     # The case discriminates: every part fits the grammar alone, so only the separator guard refuses.
     assert all(module.preserve_obx5_value(value_type, p, module.Seps()) for p in value.split(mark))
-    for seps in (
-        module.Seps(repetition=mark),
-        module.Seps(component=mark),
-        module.Seps(subcomponent=mark),
-    ):
-        assert module.preserve_obx5_value(value_type, value, seps) is False
+    assert module.preserve_obx5_value(value_type, value, module.Seps(repetition=mark)) is False
     # Control: the same call keeps a plain value under the usual separators.
     assert module.preserve_obx5_value(value_type, "12", module.Seps()) is True
+
+
+_SENTENCE = "Patient DOE JOHN"
+
+
+@pytest.mark.parametrize(
+    ("value_type", "field"),
+    (
+        *(("ID", f) for f in ("component", "repetition", "subcomponent")),
+        *(("IS", f) for f in ("component", "repetition", "subcomponent")),
+        *((t, f) for t in ("CE", "CWE") for f in ("repetition", "subcomponent")),
+    ),
+)
+@_EACH_MODULE
+def test_no_coded_value_is_kept_under_a_whitespace_separator(
+    module: Any, value_type: str, field: str
+) -> None:
+    """A coded value is kept only as bare tokens, and a space is how a bare-token test tells a
+    sentence from a code. Under a whitespace separator the sentence splits into bare tokens. A
+    ``CE`` or ``CWE`` split on its component separator puts words in a text component, which is
+    refused by itself, so that split is not varied for them."""
+    seps = module.Seps(**{field: " "})
+    assert module.preserve_obx5_value(value_type, _SENTENCE, seps) is False
+    # Control: a bare code under the usual separators is kept.
+    assert module.preserve_obx5_value(value_type, "POS", module.Seps()) is True
+
+
+@_EACH_CHECKED
+def test_the_checked_run_redacts_a_coded_sentence_under_a_space_repetition_separator(
+    checked: Callable[..., str],
+) -> None:
+    """The coded case end to end, read from the message's own MSH-2."""
+    message = _message("ID", _SENTENCE).replace(r"|^~\&|", r"|^ \&|")
+    assert r"|^ \&|" in message
+    out = checked(message, salt=_SALT)
+    assert set(_obx5_of(out).split(" ")) == {"[REDACTED]"}
+    assert "Patient" not in out
 
 
 @pytest.mark.parametrize("mark", ("-", " "), ids=("dash", "space"))
@@ -229,7 +261,6 @@ _STILL_KEPT_BY_DESIGN: dict[str, tuple[str, str]] = {
     "SN undashed nine digits": ("SN", "^900000001"),
     "NM identifier split across repetitions": ("NM", "000~12~3456"),
     "TM six digits that read as a date": ("TM", "150312"),
-    "TM date written YYYY-MMDD on the fifteenth": ("TM", "1945-0615"),
 }
 
 
