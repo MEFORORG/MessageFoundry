@@ -2241,10 +2241,9 @@ ahead of the header is refused, whatever it holds. That includes a leading bare 
 on both anonymizers (vault BACKLOG #3001). A leading `MSH|^~\&` line is still taken as the
 header, and the version then reads as empty.
 
-The refusal covers a gap in the engine's HL7 parser, and the gap itself is still open. Once a
-field of the message is set, the parser writes a later header line of that kind back out of
-shape: `BHS|TEXT` comes back as `BHS|TEX|BHS|TEXT`. The anonymizers refuse such a message. Any
-other caller of the parser would still get the misshapen line.
+The refusal stands because such a line holds its text in field 2, which no rule may rewrite. The
+engine's HL7 parser once also wrote such a line back out of shape (`BHS|TEXT` as
+`BHS|TEX|BHS|TEXT`); it now reads and writes it in shape (vault BACKLOG #2589, #2998).
 
 A second MSH line in capitals is checked. Its fields, and the fields of every `BHS` and `FHS`
 line, are numbered the header way: field 1 is the field separator. So the leak-check and the
@@ -2268,8 +2267,6 @@ that line.
 **The two anonymizers still differ on some inputs, at least these:**
 
 - A header not in capitals, such as `Msh`. The engine refuses the message. The tee emits it.
-- A first `MSH` line with no separator after its encoding characters, such as `MSH|^~\&`. The
-  tee emits the message. The engine refuses it at least when a line that a rule names follows.
 - A line ahead of the header that the check does not refuse: a line with fields, or a bare id
   the header's version defines. The tee emits the line, and its leak-check walks it against the
   header's version. The engine's parser refuses at least a message that leads with a `PID` line
