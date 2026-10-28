@@ -195,6 +195,7 @@ def test_status_builder_escapes_and_formats() -> None:
             path="/data/mf.db",
             size_bytes=2_500_000,
             disk_free_bytes=10_000_000_000,
+            disk_free_status="observed",
             journal_mode="wal",
             messages=10,
             events=5,

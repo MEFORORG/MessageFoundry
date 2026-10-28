@@ -387,7 +387,7 @@ def test_derive_health_critical_on_very_low_disk() -> None:
         ({"disk_free": 0, "journal_mode": "postgres"}, "db"),
         ({"disk_free": 50 * _GIB, "logs_free": 0}, "logs"),
     ],
-    ids=["db", "db-server-backend", "logs"],
+    ids=["db", "db-server-journal-mode", "logs"],
 )
 def test_derive_health_still_critical_on_a_measured_zero_drive(
     kwargs: dict[str, object], label: str
@@ -396,16 +396,13 @@ def test_derive_health_still_critical_on_a_measured_zero_drive(
 
     A drive the engine MEASURED at 0 bytes free is the real emergency this rule exists for, and it
     must keep firing after unmeasurable values stop doing so. It holds because the rule tests
-    ``free is None`` — an identity check, never ``not free``. If any case here goes green, the fix
+    ``free is None`` -- an identity check, never ``not free``. If any case here goes green, the fix
     has silenced the alarm rather than narrowing it. The reason names WHICH drive, so the operator
     knows which one to go and clear.
 
-    The ``db-server-backend`` arm is a REGRESSION guard, not a live path, and says so because the
-    id alone reads like end-to-end coverage of the server stores. No server store can emit a 0 any
-    more — both hardcode ``disk_free_bytes=None`` — so the only defect it can catch is the
-    discriminator being widened to skip server backends BEFORE the null check instead of inside it.
-    That would silence a measured figure on the strength of which store reported it, and the check
-    is cheap enough to keep for that one shape."""
+    The ``db-server-journal-mode`` arm is a REGRESSION guard: an ``observed`` 0 alarms whatever
+    ``journal_mode`` reads, because the rollup keys on the stated status and never on the backend's
+    mode string. A rollup that went back to inferring the backend would silence it."""
     from messagefoundry_webconsole.routes.status import _derive_health
 
     health, reason = _derive_health(_sysinfo(**kwargs), None, None, None)  # type: ignore[arg-type]
@@ -413,50 +410,34 @@ def test_derive_health_still_critical_on_a_measured_zero_drive(
     assert reason == f"low disk ({label}): 0.0 GiB free"
 
 
-@pytest.mark.parametrize("journal_mode", ["postgres", "FULL", "SIMPLE", "BULK_LOGGED", "Full"])
-def test_derive_health_ignores_an_unmeasurable_db_disk_on_a_server_backend(
-    journal_mode: str,
-) -> None:
+@pytest.mark.parametrize(
+    "journal_mode", ["postgres", "FULL", "SIMPLE", "BULK_LOGGED", "", "wal", "mysql"]
+)
+def test_derive_health_ignores_a_not_applicable_db_disk(journal_mode: str) -> None:
     """BACKLOG #1563: both server stores hardcoded ``disk_free_bytes=0`` to mean "I cannot see this
-    disk", and every threshold here read that as a full drive — so a healthy Postgres or SQL Server
-    deployment WOULD come up with the engine-health heart pinned critical and a tooltip reading
-    "low disk (db): 0.0 GiB free". The value is now ``None``, and on a SERVER backend it is skipped,
-    claiming nothing — the engine was never meant to stat that disk.
+    disk", and every threshold here read that as a full drive -- so a healthy Postgres or SQL Server
+    deployment WOULD come up with the engine-health heart pinned critical. The server stores now
+    report ``None`` and STATE ``not_applicable``, and the rollup skips it, claiming nothing.
 
-    Parametrized over both server spellings of ``journal_mode``, including SQL Server's three
-    recovery models and a lowercase one: the discriminator case-folds, because SQLite reports its
-    journal mode lowercase and SQL Server reports its recovery model uppercase."""
+    Parametrized over journal_mode values to show the mode no longer decides anything. The empty
+    string is the case the deleted journal_mode inference got wrong on purpose: a SQL Server whose
+    recovery-model read came back empty used to warn about a disk that was never the engine's to
+    see. A stated ``not_applicable`` keeps it silent."""
     from messagefoundry_webconsole.routes.status import _derive_health
 
-    assert _derive_health(_sysinfo(None, journal_mode=journal_mode), None, None, None) == (
-        "ok",
-        None,
-    )
+    sysinfo = _sysinfo(None, journal_mode=journal_mode, disk_free_status="not_applicable")
+    assert _derive_health(sysinfo, None, None, None) == ("ok", None)
 
 
-@pytest.mark.parametrize(
-    "journal_mode", ["wal", "delete", "truncate", "persist", "memory", "off", "", "mysql"]
-)
-def test_derive_health_warns_on_an_unmeasurable_db_disk_on_a_local_backend(
-    journal_mode: str,
-) -> None:
+@pytest.mark.parametrize("journal_mode", ["wal", "delete", "", "postgres"])
+def test_derive_health_warns_on_an_unobservable_db_disk(journal_mode: str) -> None:
     """The other half of the rule, and the regression it was written against.
 
-    On the DEFAULT SQLite backend there is no not-applicable reading: ``_disk_free_bytes`` returns
-    ``None`` ONLY when a local ``shutil.disk_usage`` raised, so a null is a probe that FAILED on a
-    drive that should have been readable. Skipping it for every backend alike turned a real
-    emergency into a silent ``ok`` — SQLite holds its file handle open, so queries keep succeeding
-    while the parent directory's ACL or mount goes bad, and nothing else in the rollup would notice.
-
-    The five SQLite journal modes pin the module's claim that the two vocabularies cannot collide:
-    none of them may ever fall into ``_SERVER_DB_JOURNAL_MODES``.
-
-    ``"mysql"`` and ``""`` are the unrecognised arms. An unknown ``journal_mode`` counts as a LOCAL
-    disk and alarms, because silence is the failure this rule exists to prevent: a backend nobody
-    listed should read louder than it deserves, never quieter. ``""`` is the one arm that is a
-    judgement rather than a reading — it names no backend, and a SQL Server whose recovery-model
-    read came back empty reaches it too. Pinned here so that flipping it is a deliberate act with a
-    failing test behind it, not a quiet edit; see ``_SERVER_DB_JOURNAL_MODES`` for the reasoning."""
+    ``unobservable`` is the engine's own probe failing: on the default SQLite backend
+    ``_disk_free_bytes`` returns ``None`` ONLY when a local ``shutil.disk_usage`` raised, so a null
+    is a probe that FAILED on a drive that should have been readable. Skipping it turned a real
+    emergency into a silent ``ok`` -- SQLite holds its file handle open, so queries keep succeeding
+    while the parent directory's ACL or mount goes bad. It warns whatever ``journal_mode`` reads."""
     from messagefoundry_webconsole.routes.status import _derive_health
 
     health, reason = _derive_health(_sysinfo(None, journal_mode=journal_mode), None, None, None)
@@ -464,22 +445,107 @@ def test_derive_health_warns_on_an_unmeasurable_db_disk_on_a_local_backend(
     assert reason == "db directory missing or unreadable"
 
 
-@pytest.mark.parametrize("journal_mode", ["wal", "postgres"], ids=["sqlite", "server"])
-def test_derive_health_unmeasurable_disk_skips_only_itself(journal_mode: str) -> None:
+@pytest.mark.parametrize(
+    ("free", "status"),
+    [(None, "observed"), (0, "unobservable"), (0, "not_applicable")],
+)
+def test_db_info_refuses_a_status_that_contradicts_its_figure(
+    free: int | None, status: str
+) -> None:
+    """The wire model refuses the pairs DbStatus refuses, so the rollup never meets one."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="contradicts"):
+        _sysinfo(free, disk_free_status=status)
+
+
+def test_derive_health_warns_on_an_unrecognised_db_disk_status() -> None:
+    """A status this build does not know fails LOUD, naming the value. DbInfo's Literal refuses one
+    at validation, so the only way here is a model built around it (``model_construct``) -- the
+    shape a newer engine's value would take in a reader that skipped validation. Silence is the
+    failure #1563 exists to prevent."""
+    from pydantic import ValidationError
+
+    from messagefoundry.api.models import DbInfo
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    sysinfo = _sysinfo(50 * _GIB)
+    with pytest.raises(ValidationError):
+        DbInfo.model_validate({**sysinfo.db.model_dump(), "disk_free_status": "remote"})
+    sysinfo.db = DbInfo.model_construct(**{**sysinfo.db.model_dump(), "disk_free_status": "remote"})
+    assert _derive_health(sysinfo, None, None, None) == (
+        "warn",
+        "db disk status not recognised: 'remote'",
+    )
+
+
+@pytest.mark.parametrize(
+    "disk_free_status", ["unobservable", "not_applicable"], ids=["sqlite", "server"]
+)
+def test_derive_health_unmeasurable_disk_skips_only_itself(disk_free_status: str) -> None:
     """The skip is a ``continue``, not an early exit: an unmeasurable disk must not take the rest of
     the rollup down with it. An engine with a failed inbound still warns and still names the inbound
-    — otherwise #1563's fix would have blinded the heart to everything else.
+    -- otherwise #1563's fix would have blinded the heart to everything else.
 
-    Both backends are covered, because they reach this line by different routes: the server one
-    appends no disk issue at all, the SQLite one appends its own warn and must still lose the
-    tooltip to the connection failure. Insertion order IS that tie-break, so this pins it."""
+    Both statuses are covered, because they reach this line by different routes: not_applicable
+    appends no disk issue at all, unobservable appends its own warn and must still lose the tooltip
+    to the connection failure. Insertion order IS that tie-break, so this pins it."""
     from messagefoundry_webconsole.routes.status import _derive_health
 
     health, reason = _derive_health(
-        _sysinfo(None, failed_names=["IB_ACME_ADT"], journal_mode=journal_mode), None, None, None
+        _sysinfo(None, failed_names=["IB_ACME_ADT"], disk_free_status=disk_free_status),
+        None,
+        None,
+        None,
     )
     assert health == "warn"
     assert reason == "inbound IB_ACME_ADT failed to start"
+
+
+@pytest.mark.parametrize("free", [None, 0, 5])
+@pytest.mark.parametrize("status", ["observed", "not_applicable", "unobservable"])
+def test_db_info_and_db_status_accept_the_same_pairs(free: int | None, status: str) -> None:
+    """The pairing rule is written twice, once per layer; this keeps it one rule, so a DbStatus the
+    store builds always converts to a DbInfo and a refused one is refused on both sides."""
+    from pydantic import ValidationError
+
+    from messagefoundry.api.models import DbInfo
+    from messagefoundry.store.store import DbStatus, DiskFreeStatus
+
+    common = {"path": "p", "size_bytes": 0, "journal_mode": "wal", "messages": 0, "events": 0}
+
+    def store_ok() -> bool:
+        try:
+            DbStatus(
+                **common,  # type: ignore[arg-type]
+                audit=0,
+                disk_free_bytes=free,
+                disk_free_status=DiskFreeStatus(status),
+            )
+        except ValueError:
+            return False
+        return True
+
+    def wire_ok() -> bool:
+        try:
+            DbInfo(**common, audit=0, disk_free_bytes=free, disk_free_status=status)  # type: ignore[arg-type]
+        except ValidationError:
+            return False
+        return True
+
+    assert store_ok() == wire_ok()
+
+
+def test_db_info_status_values_are_the_store_enum() -> None:
+    """The API spells the store's DiskFreeStatus out as a Literal so its models import nothing from
+    the store. This keeps the two spellings one set."""
+    import typing
+
+    from messagefoundry.api.models import DbInfo
+    from messagefoundry.store.store import DiskFreeStatus
+
+    annotation = DbInfo.model_fields["disk_free_status"].annotation
+    assert set(typing.get_args(annotation)) == {s.value for s in DiskFreeStatus}
 
 
 def test_derive_health_warns_on_an_unmeasurable_log_drive() -> None:
@@ -489,7 +555,7 @@ def test_derive_health_warns_on_an_unmeasurable_log_drive() -> None:
     is always a failed probe. Skipping it would have traded #1563's loud wrong answer for a silent
     one, leaving a vanished log directory reading green forever. The DB drive reaches the same
     answer on the default SQLite backend for the same reason; only a server backend's DB null is
-    genuinely not-applicable, and ``journal_mode`` is what tells those apart."""
+    genuinely not-applicable, and the backend states that through ``disk_free_status``."""
     from messagefoundry_webconsole.routes.status import _derive_health
 
     health, reason = _derive_health(_sysinfo(50 * _GIB, logs_free="unmeasured"), None, None, None)
