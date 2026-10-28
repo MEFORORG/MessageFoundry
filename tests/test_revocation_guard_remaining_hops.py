@@ -519,12 +519,15 @@ def _ftps(
     *,
     protocol: str = "ftps",
     tls_verify: bool = True,
+    allow_expired: bool = False,
     attested: bool = False,
     policy: TrustAnchorPolicy | None = None,
 ) -> Destination:
     settings: dict[str, object] = {"host": host, "remote_dir": "/in", "protocol": protocol}
     if not tls_verify:
         settings["tls_verify"] = False
+    if allow_expired:
+        settings["tls_allow_expired"] = True
     return _dest("OB_FTPS", ConnectorType.REMOTEFILE, settings, attested=attested, policy=policy)
 
 
@@ -632,12 +635,15 @@ def _poll(
     *,
     protocol: str = "ftps",
     tls_verify: bool = True,
+    allow_expired: bool = False,
     attested: bool = False,
     policy: TrustAnchorPolicy | None = None,
 ) -> Source:
     settings: dict[str, object] = {"host": host, "remote_dir": "/in", "protocol": protocol}
     if not tls_verify:
         settings["tls_verify"] = False
+    if allow_expired:
+        settings["tls_allow_expired"] = True
     return Source(
         type=ConnectorType.REMOTEFILE,
         name="IB_FTPS",
@@ -678,6 +684,22 @@ def test_a_configured_crl_does_not_admit_an_ftps_poll_whose_context_lacks_it(
         RemoteFileSource(_poll(REMOTE, policy=_crl_policy(bare_crl)))
 
 
+def test_a_crl_does_not_admit_an_ftps_hop_that_ignores_certificate_expiry(bare_crl: str) -> None:
+    """``tls_allow_expired`` sets ``X509_V_FLAG_NO_CHECK_TIME``, which OpenSSL applies to the CRL's
+    validity window too, so a CRL past ``nextUpdate`` would still be accepted at the handshake. A
+    CRL on that context is not a check that may relax the refusal, as on REST (vault BACKLOG
+    #2188). Both directions share the guard, so both are read here."""
+    with active_hop_posture(ENFORCING):
+        with pytest.raises(InsecureHopRefused, match="revocation"):
+            RemoteFileSource(_poll(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
+        with pytest.raises(InsecureHopRefused, match="revocation"):
+            RemoteFileDestination(_ftps(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
+        # The control: the same hop without the relaxation is admitted by that CRL.
+        RemoteFileSource(_poll(REMOTE, policy=_crl_policy(bare_crl)))
+        # And the attestation still crosses it.
+        RemoteFileSource(_poll(REMOTE, allow_expired=True, attested=True))
+
+
 @pytest.mark.parametrize("shape", ["missing", "not a crl"])
 def test_an_ftps_poll_whose_configured_crl_cannot_be_read_is_refused(
     shape: str, tmp_path: Path
@@ -698,6 +720,20 @@ def test_an_ftps_poll_crosses_on_its_attestation_and_is_audited() -> None:
     shipped = _shipped(log.audit)
     assert "connection 'inbound:IB_FTPS';" in shipped and REASON in shipped, log.state()
     assert "REMOTEFILE ftps source" in shipped
+
+
+def test_an_ftps_poll_refused_for_another_reason_logs_no_crossing() -> None:
+    """The guard runs last in the constructor, so a poll refused by another check has logged no
+    attested crossing for a hop that never built. The control is the same poll, valid, which does
+    log its crossing in the same capture."""
+    bad = _poll(REMOTE, attested=True)
+    bad.settings["after_read"] = "archive"
+    with active_hop_posture(ENFORCING), _guard_log() as log:
+        with pytest.raises(ValueError, match="after_read"):
+            RemoteFileSource(bad)
+        assert not log.audit, log.state()
+        RemoteFileSource(_poll(REMOTE, attested=True))
+    assert "connection 'inbound:IB_FTPS';" in log.audit, log.state()
 
 
 def test_an_ftps_poll_on_loopback_still_crosses() -> None:

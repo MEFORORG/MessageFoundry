@@ -314,7 +314,8 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > each construction it lets through on an enforcing instance logs a WARNING carrying the reason
 > ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)).
 > The same pair on an `inbound()` mTLS listener clears the listener's revocation gate, where
-> `tls_crl_file` is the in-engine fix to prefer. The process-wide
+> `tls_crl_file` is the in-engine fix to prefer. On an `Ftp(tls=True)` poller, an inbound that
+> dials out, the `inbound()` pair is this hop's attestation too (BACKLOG #2193). The process-wide
 > `MEFOR_TLS_REVOCATION_ATTESTED=1` no longer crosses an enforcing outbound hop (BACKLOG #299): one
 > variable cannot say which hop's PKI was reviewed. Routing egress through a revocation-checking
 > proxy does **not** change the decision: the authority has no input for one. Anything else is a

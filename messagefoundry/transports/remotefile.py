@@ -77,7 +77,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any, Literal, NamedTuple, TypeVar
+from typing import Any, Final, Literal, NamedTuple, TypeVar
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -541,8 +541,9 @@ class _RemoteClient(abc.ABC):
     @property
     def tls_context(self) -> ssl.SSLContext | None:
         """The TLS context this client dials with, or ``None`` for a client that uses none (SFTP,
-        plain FTP). The destination's revocation guard reads it (BACKLOG #2193), so a client that
-        gains TLS must return its context here to be guarded."""
+        plain FTP). The revocation guard of both directions, upload and poll, reads it (BACKLOG
+        #2193), so a client that gains TLS must return its context here to be guarded: ``None``
+        means no guard at all."""
         return None
 
     @abc.abstractmethod
@@ -2059,12 +2060,15 @@ def _make_client(
     raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
 
 
+#: What each direction of an FTPS hop does, in the revocation refusal's own words.
+_FTPS_HOP_NOUN: Final = {"destination": "upload", "source": "poll"}
+
+
 def _guard_ftps_revocation(
-    client: _RemoteClient,
+    context: ssl.SSLContext | None,
     s: dict[str, Any],
     *,
     direction: Literal["destination", "source"],
-    what: Literal["upload", "poll"],
     attested: bool,
     attested_reason: str | None,
     connection: str | None,
@@ -2078,18 +2082,24 @@ def _guard_ftps_revocation(
     it (vault BACKLOG #2188). Keyed on the context, as MLLP's is: sftp and plain ftp build none,
     and a ``tls_verify=false`` context verifies nothing, so the refusals that own those hops stay
     the only gate on them. A CRL that is configured but cannot be loaded never gets here: the
-    context build refuses it first (``harden_crl_check``)."""
-    context = client.tls_context
+    context build refuses it first (``harden_crl_check``).
+
+    A ``tls_allow_expired`` hop hands the guard no context, so a CRL cannot relax its refusal and
+    only an attestation crosses it. ``relax_verify_expiry`` sets ``X509_V_FLAG_NO_CHECK_TIME``,
+    which OpenSSL applies to a CRL's validity window as well as the certificate's, so a CRL past
+    ``nextUpdate`` would still be accepted. The REST family reads the same setting for the same
+    reason (``refuse_unrevoked_verified_hop``, vault BACKLOG #2188); the truthiness here is the
+    one ``_ftps_ssl_context`` relaxes on."""
     if context is None or context.verify_mode is ssl.CERT_NONE:
         return
     RevocationHopGuard.capture(
         host=str(s["host"]),
         cell=f"REMOTEFILE ftps {direction}",
-        description=f"verified FTPS {what} (no revocation check)",
+        description=f"verified FTPS {_FTPS_HOP_NOUN[direction]} (no revocation check)",
         attested=attested,
         attested_reason=attested_reason,
         connection=connection,
-        context=context,
+        context=None if s.get("tls_allow_expired") else context,
     ).enforce_construction()
 
 
@@ -2214,10 +2224,9 @@ class RemoteFileDestination(DestinationConnector):
             s, trust_anchor_policy=config.trust_anchor_policy, name=config.name
         )
         _guard_ftps_revocation(
-            self._client,
+            self._client.tls_context,
             s,
             direction="destination",
-            what="upload",
             attested=config.tls_revocation_attested,
             attested_reason=config.tls_revocation_attested_reason,
             connection=config.name,
@@ -2467,18 +2476,6 @@ class RemoteFileSource(SourceConnector):
         self._client = _make_client(
             s, trust_anchor_policy=config.trust_anchor_policy, name=self._connection
         )
-        # BACKLOG #2193 slice (a): the poll sends the same FTP login and reads message files, so it
-        # takes the upload's guard. Its [tls].crl_file arrives through the policy above (#2370), and
-        # its attestation is the inbound's typed tls_revocation_attested pair.
-        _guard_ftps_revocation(
-            self._client,
-            s,
-            direction="source",
-            what="poll",
-            attested=config.tls_revocation_attested,
-            attested_reason=config.tls_revocation_attested_reason,
-            connection=self._connection or None,
-        )
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
         self._pattern: str = s.get("pattern", "*.hl7")
@@ -2537,6 +2534,18 @@ class RemoteFileSource(SourceConnector):
         self._other_form_warned_at: float | None = None
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        # BACKLOG #2193 slice (a): the poll sends the same FTP login and reads message files, so it
+        # takes the upload's guard. Its [tls].crl_file arrives through the policy (#2370), and its
+        # attestation is the inbound's typed tls_revocation_attested pair. Last of the checks, so a
+        # poll this constructor refuses for another reason has not logged a crossing or a WARN.
+        _guard_ftps_revocation(
+            self._client.tls_context,
+            s,
+            direction="source",
+            attested=config.tls_revocation_attested,
+            attested_reason=config.tls_revocation_attested_reason,
+            connection=self._connection or None,
+        )
         if self._max_file_bytes is None:
             # Turning the cap off is documented, so it is allowed, but never silent (BACKLOG #2749,
             # as FileSource does for its caps). Logged after every check in this constructor, so a

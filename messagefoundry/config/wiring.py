@@ -6263,7 +6263,8 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     -- this is. It lists what is DECLARED, not only hops where a refusal was actually lifted.
 
     It walks **all three** tables the pair is authorable on: ``inbound`` (an mTLS listener, the
-    ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and
+    ``check_inbound_revocation`` refusal, or an FTPS poller, the ``RevocationHopGuard`` its
+    constructor runs, BACKLOG #2193), ``outbound`` (the ``RevocationHopGuard``) and
     ``fhir_lookups`` (a lookup's https read and the SMART token hop it signs in to). All three carry
     it as typed fields, like ``cleartext_accepted``, and this reads those fields: a copy in a
     ``FhirLookupSpec``'s

@@ -10881,7 +10881,8 @@ def _source_config(
         tls_hop_attested_reason=ic.tls_hop_attested_reason,
         # ADR 0173: the mTLS listener's revocation attestation. A TOP-LEVEL inbound key, read off the
         # InboundConnection (not the env-resolved settings), so check_inbound_revocation's attested
-        # branch is reachable from config. Default off -> byte-identical.
+        # branch is reachable from config. The FTPS poller's revocation guard reads the same pair
+        # (BACKLOG #2193). Default off -> byte-identical.
         tls_revocation_attested=ic.tls_revocation_attested,
         tls_revocation_attested_reason=ic.tls_revocation_attested_reason,
         # Vault BACKLOG #2370: the FTPS poller verifies its server under [tls], as the outbound does.
