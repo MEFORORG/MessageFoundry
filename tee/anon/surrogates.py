@@ -91,7 +91,9 @@ def _load_site_prefixes() -> tuple[str, ...]:
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1].strip().lower()
             continue
-        if section == "site_prefix" and line.isdigit() and len(line) == 2:
+        # ASCII only, as the guard reads it: ``isdigit`` alone takes a fullwidth or superscript
+        # digit, which no site code holds, and the prefix would load and match nothing.
+        if section == "site_prefix" and line.isascii() and line.isdigit() and len(line) == 2:
             prefixes.append(line)
     return tuple(dict.fromkeys(prefixes))
 

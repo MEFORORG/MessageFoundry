@@ -66,6 +66,17 @@ def test_a_marked_token_source_loads_its_prefix(
     assert "771234" not in scrubbed
 
 
+@_BOTH
+def test_a_prefix_of_non_ascii_digits_does_not_load(
+    module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fullwidth ``77`` passes ``isdigit`` and no site code holds it, so loaded it would match
+    nothing while reading as loaded. The guard takes ASCII digits only; so does this loader."""
+    monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", "[site_prefix]\n" + chr(0xFF17) * 2 + "\n77\n")
+    module.reload_site_prefixes()
+    assert module._SITE_PREFIXES == ("77",)
+
+
 # --- #3609 finding 4: a keep and a rewrite on one path ----------------------------------------------
 
 

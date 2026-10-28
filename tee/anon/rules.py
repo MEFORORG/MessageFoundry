@@ -370,7 +370,8 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
 
     Both warnings are logged once for one set of lines, not once per call, so a caller that
     passes ``overlay=`` for every message does not repeat them. The record of logged sets is
-    emptied when it reaches :data:`_WARNED_LIMIT` entries, so a set can then be logged again.
+    emptied when a new set arrives while it holds :data:`_WARNED_LIMIT` entries, so a set
+    logged before can then be logged again.
 
     A schema refusal quotes at most :data:`_QUOTE_LIMIT` characters of any one overlay key or
     value, and of the whole list of unknown keys.

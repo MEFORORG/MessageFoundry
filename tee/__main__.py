@@ -673,7 +673,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # The store is read AFTER both checks above. Read before them, a run with no captured bodies
+    # The store is read AFTER the salt and overlay checks above, and after the warning. Read before them, a run with no captured bodies
     # returned here and never read the overlay, so a bad one stayed hidden until a run that had
     # bodies (BACKLOG #3003).
     store = await RelayStore.open(args.db)

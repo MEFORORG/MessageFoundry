@@ -136,7 +136,10 @@ def test_a_retarget_that_leaves_part_of_a_field_warns(
     # with the default rules it is not. Read in the field, so another field's surrogate cannot
     # supply the same characters.
     assert left_behind in _field_of(anon.anonymize(_MESSAGE, salt=_SALT, rules=loaded), path)
-    assert left_behind not in _field_of(anon.anonymize(_MESSAGE, salt=_SALT), path)
+    # Nowhere in the default output. A bare year is read in its field alone, since another
+    # field's fabricated digits could hold the same four characters.
+    default = anon.anonymize(_MESSAGE, salt=_SALT)
+    assert left_behind not in (_field_of(default, path) if left_behind.isdigit() else default)
     # A field address and kinds only: nothing of the message, which the loader never saw.
     assert "ZZTEST" not in line
 
