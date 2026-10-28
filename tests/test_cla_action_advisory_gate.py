@@ -8,13 +8,17 @@ thing to avoid here.* So most tests below are controls: each plants one failure 
 catch and requires the gate to name it.
 
 NO NETWORK. The report the gate judges is npm's verbatim stdout from ``npm audit --json``. It was
-taken on 2026-10-24 with npm 11.19.0, through this gate's own runner, against the vendored lockfile.
-It lives under ``tests/fixtures/cla_action_audit/``. It replaced the 2026-10-07 reading, taken with
-npm 11.5.2, after GitHub withdrew two advisories that reading reported. The findings the gate
-compares differ by exactly those two. Other fields differ too. Some follow from the withdrawals,
-such as the braces and js-yaml ranges and js-yaml's ``via``. The rest, such as some ``effects``
-and ``fixAvailable`` values, were not traced to a cause. The live call is replaced by an injected
-runner, so nothing here needs npm.
+taken on 2026-10-28 with npm 11.19.0, through this gate's own runner, against the vendored lockfile.
+It lives under ``tests/fixtures/cla_action_audit/``. It replaced the 2026-10-24 reading, also npm
+11.19.0, after GitHub published deepmerge GHSA-gcqx-w48m-w2h4. The findings the gate compares differ
+by exactly that one. The report adds seven ``vulnerabilities`` entries, deepmerge and six packages
+that reach it, and the low and total counts rise by seven; every entry the 2026-10-24 reading held
+is unchanged. That reading had itself replaced the 2026-10-07 one, taken with npm 11.5.2, after
+GitHub withdrew two advisories. Those two readings' findings differed by exactly the two withdrawn
+ids. Other fields differed too: some followed from the withdrawals, such as the braces and js-yaml
+ranges and js-yaml's ``via``, and the rest, such as some ``effects`` and ``fixAvailable`` values,
+were not traced to a cause. The live call is replaced by an injected runner, so nothing here needs
+npm.
 
 THE FALSE CLEAN IS A RECORDED READING, NOT A GUESS. :data:`_NO_MANIFEST_REPORT` is npm's verbatim
 output with the lockfile and no ``package.json``. The gate must fail it even with an EMPTY baseline,
@@ -37,7 +41,7 @@ from tests._workflow_contexts import jobs_of
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = REPO_ROOT / "scripts" / "security"
-_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-10-24.json"
+_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-10-28.json"
 
 
 def _load(name: str) -> ModuleType:
@@ -376,10 +380,17 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
     )
 
 
-#: Identifiers of at least these packages on the braces and js-yaml chains, measured ABSENT from the
-#: bundle. What the reading settles is stated once, in cla-action-advisories.toml, in the header
-#: paragraph "A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT". Each must count 0 in ``dist/index.js``. Removing one
-#: needs that reading redone, not just this edit.
+#: Identifiers measured ABSENT from the bundle, from two readings recorded in
+#: cla-action-advisories.toml. Each must count 0 in ``dist/index.js``. Removing one needs its
+#: reading redone, not just this edit.
+#:
+#: - Packages on the braces and js-yaml chains: what that reading settles is stated in the header
+#:   paragraph "A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT".
+#: - deepmerge, read 2026-10-28: what that reading settles is stated in the triage comment above
+#:   deepmerge's entry. Only names deepmerge alone defines are re-run here, two of the six it
+#:   measured. The other four are left out because other code uses them too: the
+#:   is-mergeable-object package exports ``isMergeableObject``, ``arrayMerge`` and ``mergeObject``
+#:   are common helper names, and "deepmerge" is in other packages' names, such as deepmerge-ts.
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse
@@ -387,6 +398,8 @@ _ABSENT_FROM_BUNDLE = (
     re.compile("Toolkit"),  # actions-toolkit
     re.compile("CHAR_ZERO_WIDTH_NOBREAK_SPACE"),  # braces (and picomatch)
     re.compile("toRegexRange"),  # fill-range
+    re.compile("cloneUnlessOtherwiseSpecified"),  # deepmerge
+    re.compile("propertyIsUnsafe"),  # deepmerge
 )
 
 #: The control: two @actions/core functions the bundle does carry, so the probes can find code.
@@ -394,7 +407,9 @@ _PRESENT_IN_BUNDLE = re.compile("function getInput|function setFailed")
 
 
 def test_the_recorded_bundle_reading_still_holds() -> None:
-    """The baseline's recorded bundle reading of the braces and js-yaml chains still holds.
+    """The baseline's recorded bundle readings, of the braces and js-yaml chains, still hold.
+
+    So does the later reading of deepmerge, taken 2026-10-28.
 
     The provenance gate lets ``dist/index.js`` change whenever its record changes with it, so a
     re-vendored bundle could carry that code while the baseline still said it was absent. This reds
