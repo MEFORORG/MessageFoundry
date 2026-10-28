@@ -111,8 +111,6 @@ def _why(exc: BaseException) -> str:
     # hvac maps a 403 to Forbidden; say what it means without importing hvac here.
     if name == "Forbidden":
         return f"permission denied ({name})"
-    from messagefoundry.config.wiring import _raised_by_the_engine
-
     # Exactly ValueError, not a subclass: the probe's own shape refusals and the TLS-suite
     # assertion raise it with engine-written text. A subclass, such as a JSON decode error, can
     # quote what the server sent, so it keeps the type name alone. So does a ValueError a library
@@ -123,6 +121,20 @@ def _why(exc: BaseException) -> str:
     if type(exc) is ValueError and _raised_by_the_engine(exc):
         return f"{name}: {strip_control_chars(str(exc))[:200]}"
     return name
+
+
+def _raised_by_the_engine(exc: BaseException) -> bool:
+    """Whether the innermost frame of ``exc``'s traceback is in a ``messagefoundry`` module (vault
+    BACKLOG #3454), the rule ``config.wiring`` and ``__main__._is_engine_refusal`` apply too. A
+    copy, not an import of ``config.wiring``'s, so the probe neither loads that module nor imports
+    anything inside its exception handlers, where a failed import would raise."""
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    module = tb.tb_frame.f_globals.get("__name__", "")
+    return isinstance(module, str) and module.split(".")[0] == "messagefoundry"
 
 
 def _strings(value: object) -> tuple[str, ...]:

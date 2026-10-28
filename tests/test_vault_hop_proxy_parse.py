@@ -107,9 +107,8 @@ def test_a_proxy_that_appears_after_construction_is_refused_with_fixed_text(
     form: str, monkeypatch: pytest.MonkeyPatch, listener: _Listener
 ) -> None:
     """RED before the change: the send raised requests' own ``ValueError`` or
-    ``UnicodeEncodeError``, which held the password or the user name. Mutation: drop the send-time
-    call in ``get_connection_with_tls_context``; red on the first row, whose URL only
-    ``request_url`` reads raw."""
+    ``UnicodeEncodeError``, which held the password or the user name. Three hooks refuse on a
+    send, so dropping any one of them leaves this green; each is pinned by a direct test below."""
     from messagefoundry.config import secretprovider_vault
 
     client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN, revocation_attested=True)
@@ -280,6 +279,24 @@ def test_proxy_manager_for_refuses_it_on_its_own() -> None:
     with pytest.raises(InsecureHopRefused) as caught:
         adapter.proxy_manager_for(_UNSENDABLE[3].format(port=3128))
     assert str(caught.value) == f"Vault test hop: {_UNSENDABLE_PROXY_URL}"
+    assert adapter.proxy_manager == {}, "a manager was built for the refused proxy"
+
+
+def test_get_connection_with_tls_context_refuses_it_first() -> None:
+    """The hook requests calls first on a send, before it reads the proxy URL. On the first row
+    only the raw read fails, and ``proxy_manager_for`` gets the URL percent-encoded, so without
+    this check a manager is built and the call returns. Mutation: drop it; red."""
+    import requests
+
+    from messagefoundry.transports.strict_requests import _UNSENDABLE_PROXY_URL
+
+    adapter = _adapter()
+    prepared = requests.Request("GET", _HTTPS_VAULT + "/v1/sys/health").prepare()
+    proxies = {"https": _UNSENDABLE[0].format(port=3128)}
+    with pytest.raises(InsecureHopRefused) as caught:
+        adapter.get_connection_with_tls_context(prepared, True, proxies=proxies)
+    assert str(caught.value) == f"Vault test hop: {_UNSENDABLE_PROXY_URL}"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert adapter.proxy_manager == {}, "a manager was built for the refused proxy"
 
 

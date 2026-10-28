@@ -610,8 +610,9 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
 
     def request_url(self, request: requests.PreparedRequest, proxies: dict[str, str] | None) -> str:
         # Vault BACKLOG #3454: requests reads the RAW proxy URL here, with urllib.parse, after the
-        # pool is built. get_connection_with_tls_context checks the same URL first; this holds on
-        # a requests that calls neither of the two hooks above.
+        # pool is built. On every requests pyproject allows, get_connection_with_tls_context has
+        # already refused that URL, so this is defence only: it holds if requests stops calling
+        # that hook, as it once stopped calling get_connection. A test pins it directly.
         proxy = requests.utils.select_proxy(request.url or "", proxies)
         _refuse_an_unusable_proxy(proxy, connector=self._connector)
         return super().request_url(request, proxies)
@@ -1020,12 +1021,12 @@ _UNSENDABLE_PROXY_URL = (
     "the proxy in front of the Vault address has a URL that requests, the HTTP library this hop "
     "sends through, cannot read, or a user name or password in it that requests cannot send "
     "(it sends them as Latin-1 text). The library's own error is not shown, because it can carry "
-    "the URL or its credentials. Correct the proxy URL in HTTPS_PROXY, HTTP_PROXY, ALL_PROXY or "
-    "the system proxy settings; refusing (vault BACKLOG #3454)"
+    "the URL or its credentials. Correct the proxy URL where it is set, such as HTTPS_PROXY, "
+    "HTTP_PROXY or ALL_PROXY in either case, or the system proxy settings; refusing (vault "
+    "BACKLOG #3454)"
 )
 
 
-@functools.lru_cache(maxsize=16)
 def _proxy_url_requests_cannot_send(proxy: str) -> bool:
     """Whether requests' own reads of ``proxy`` on a send would raise (vault BACKLOG #3454).
 
@@ -1049,9 +1050,11 @@ def _proxy_url_requests_cannot_send(proxy: str) -> bool:
     answer. So a URL this refuses is one requests' send fails on before it dials.
     ``tests/test_vault_hop_proxy_parse.py`` pins that agreement, both ways, on the shapes it lists.
     It does not hold for every shape: a URL with no host fails requests' own host check, whose
-    error is fixed text, and passes this. Cached, because the Transit cipher sends once per stored
-    cell and each send asks up to three times; the cache holds no more proxy URLs than requests'
-    own cache of proxy managers does."""
+    error is fixed text, and passes this.
+
+    **Not cached, on purpose.** The URL holds the proxy password, and a process-wide cache keyed on
+    it would keep a refused or retired password after nothing else does. So each send pays these
+    parses again, up to three times, once per hook that checks."""
     try:
         urllib.parse.urlparse(proxy)
         prepended = requests.utils.prepend_scheme_if_needed(proxy, "http")
