@@ -4624,8 +4624,9 @@ on that session, for example) ends it as a revocation would.
   export cannot change its status. It raises instead, and the server drops the connection with the
   chunked body unfinished, so the client sees a transfer that failed rather than a short file that
   ends normally. `tests/test_export_stop_wire.py` measures both exports that way over cleartext
-  loopback, with uvicorn's h11 and httptools parsers. At least these are not measured: the
-  engine's TLS hop, a proxy in front, and an HTTP/1.0 client, whose body is framed by the
+  loopback, with uvicorn's stock h11 and httptools protocols. At least these are not measured:
+  the engine's TLS hop, the floored protocol class `serve` runs, a proxy in front, the console's
+  `/ui/audit/export`, and an HTTP/1.0 client. Under h11 an HTTP/1.0 body is framed by the
   connection close, so a dropped connection can read as a normal end there. The file itself
   carries no end marker, so a client that writes rows as they arrive (`curl -o`, for one) keeps
   every row it received and must check that the transfer succeeded. The

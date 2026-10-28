@@ -597,8 +597,9 @@ def _matched_route_path(request: Request) -> str | None:
     """The matched route's path TEMPLATE (``/connections/{name}/events``), or ``None``.
 
     The router writes the matched route into the request scope before the endpoint runs, so a
-    middleware can read it from ``http.response.start`` on, never before it calls downstream. ``None`` covers a 404 (nothing
-    matched) and a mount, neither of which is in :data:`_NO_STORE_ROUTE_PATHS`.
+    middleware can read it from ``http.response.start`` on, never before it calls downstream.
+    ``None`` covers a 404 (nothing matched) and a mount, neither of which is in
+    :data:`_NO_STORE_ROUTE_PATHS`.
     """
     return getattr(request.scope.get("route"), "path", None)
 
@@ -6824,9 +6825,9 @@ def create_app(
         caller is re-resolved before each row. Once its standing fails, or its channel scope differs
         from the one it started with, wider or narrower, the stream records
         ``messages_export.stopped`` and raises :class:`ExportStopped` (BACKLOG #1154, #3381), which
-        reaches the client as a failed download (BACKLOG #3907); see that class. Each streamed body is re-checked
-        against that row's per-channel scope, which is therefore the starting one (load-bearing for the
-        attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited
+        reaches the client as a failed download (BACKLOG #3907); see that class. Each streamed body
+        is re-checked against that row's per-channel scope, which is therefore the starting one
+        (load-bearing for the attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited
         (``auth.channel_denied``).
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so

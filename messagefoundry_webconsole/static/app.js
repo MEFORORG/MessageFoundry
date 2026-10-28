@@ -1541,6 +1541,7 @@
             progress.textContent =
               "Exported " + lines + " messages (" + bytes + " bytes)…";
         }
+        started = false; // the stream ended cleanly; a failure past here is not a stopped export
         var blob = new Blob(chunks, { type: "application/x-ndjson" });
         var href = URL.createObjectURL(blob);
         var a = document.createElement("a");

@@ -190,7 +190,9 @@ async def test_a_stopped_bulk_export_ends_as_a_failed_transfer(
     assert len(ids) == 1
     assert stops == [{"selected": 2, "streamed": 1, "reason": "standing_changed"}]
     # RemoteProtocolError on an incomplete chunked body; ReadError if the close lands as a reset.
-    assert isinstance(error, httpx.TransportError), "the download ended cleanly"
+    assert isinstance(error, (httpx.RemoteProtocolError, httpx.ReadError)), (
+        f"not dropped: {error!r}"
+    )
 
 
 @pytest.mark.parametrize("http", _PARSERS)
@@ -213,7 +215,9 @@ async def test_a_stopped_audit_export_ends_as_a_failed_transfer(
     assert [float(ln.split(",")[0]) for ln in rows] == [106.0, 105.0]
     assert stops == [{"count": 7, "streamed": 2, "reason": "standing_changed"}]
     # RemoteProtocolError on an incomplete chunked body; ReadError if the close lands as a reset.
-    assert isinstance(error, httpx.TransportError), "the download ended cleanly"
+    assert isinstance(error, (httpx.RemoteProtocolError, httpx.ReadError)), (
+        f"not dropped: {error!r}"
+    )
 
 
 @pytest.mark.parametrize("http", _PARSERS)

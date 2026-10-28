@@ -48,9 +48,9 @@ unprotected, only un-upgraded — so the cookie-and-CSP posture stays consistent
 exposure model rather than diverging from it.
 
 **Middleware ordering.** ``mount_ui`` adds this AFTER the engine's ``_security_headers``
-middleware (pure ASGI since BACKLOG #3907), so Starlette places it OUTSIDE that layer (``add_middleware`` inserts at
-index 0; ``create_app`` registers more layers further out still): on the response path its ``send``
-wrapper runs after the engine's and thus overrides the engine's static CSP
+middleware (pure ASGI since BACKLOG #3907), so Starlette places it OUTSIDE that layer
+(``add_middleware`` inserts at index 0; ``create_app`` registers more layers further out still): on
+the response path its ``send`` wrapper runs after the engine's and thus overrides the engine's static CSP
 with the nonce CSP for effective-https /ui responses. It is a PURE ASGI middleware (not
 ``BaseHTTPMiddleware``) specifically so the nonce ContextVar it binds before calling downstream
 propagates into the route that renders the page — ``BaseHTTPMiddleware`` runs the endpoint in a detached

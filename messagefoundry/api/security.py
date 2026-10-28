@@ -2027,8 +2027,8 @@ class ExportStopped(RuntimeError):
     instead: it leaves the app with the body unfinished, and the server drops the connection, so an
     HTTP/1.1 client sees a failed download (an incomplete chunked body) rather than a short file
     that looks complete. docs/SECURITY.md says what that measurement does not cover, such as an
-    HTTP/1.0 client. It holds only while every middleware in the response path is pure ASGI. Starlette's
-    ``BaseHTTPMiddleware`` (what ``@app.middleware("http")`` builds) sends the final body message
+    HTTP/1.0 client. It holds only while every middleware in the response path is pure ASGI.
+    Starlette's ``BaseHTTPMiddleware`` (what ``@app.middleware("http")`` builds) sends the final body message
     before it re-raises, which turned a stop into a cleanly ended 200 until BACKLOG #3907 converted
     the engine's two such layers. ``tests/test_export_stop_wire.py`` measures it over real uvicorn,
     with h11 and with httptools.
