@@ -3935,7 +3935,8 @@ def _phi_logging_probe(seen: dict[str, object]) -> Callable[[argparse.Namespace]
     return probe
 
 
-def _assert_redacted_on_stderr(capsys: pytest.CaptureFixture[str], command: str) -> None:
+def _assert_redacted_on_stderr(capsys: pytest.CaptureFixture[str], command: str) -> str:
+    """Assert the probe's record reached stderr redacted and stdout stayed empty; return stderr."""
     captured = capsys.readouterr()
     err = captured.err
     # The control: the record DID reach stderr. Without it an absent line would pass as redacted.
@@ -3951,6 +3952,7 @@ def _assert_redacted_on_stderr(capsys: pytest.CaptureFixture[str], command: str)
     assert "[redacted]" in err
     # stdout is the data channel; a diagnostic must never land there.
     assert captured.out == "", f"`{command}` wrote a log record to stdout: {captured.out!r}"
+    return err
 
 
 def test_backup_warning_is_redacted_through_the_real_argument_parser(
@@ -4054,13 +4056,10 @@ def _warn_in_serve_window(monkeypatch: pytest.MonkeyPatch, seen: dict[str, objec
     traceback carrying it, plus one INFO record on a logger whose own level lets INFO through."""
     import messagefoundry.crashdump as crashdump
 
+    warn = _phi_logging_probe(seen)
+
     def probe() -> None:
-        seen["handlers"] = list(logging.getLogger().handlers)
-        log = logging.getLogger("messagefoundry.store")
-        try:
-            raise ValueError(f"row rejected: {_SYNTHETIC_PID}")
-        except ValueError:
-            log.warning("probe: could not persist %s", _SYNTHETIC_PID, exc_info=True)
+        warn(argparse.Namespace())
         chatty = logging.getLogger("messagefoundry.test_serve_window_info")
         chatty.setLevel(logging.INFO)
         try:
@@ -4080,17 +4079,10 @@ def test_serve_redacts_a_warning_logged_before_its_handlers(
     _warn_in_serve_window(monkeypatch, seen)
     with _handlerless_root():
         assert main(["serve", "--service-config", str(tmp_path)]) == 2
-    captured = capsys.readouterr()
-    err = captured.err
-    # The control: the record DID reach stderr, message and traceback, exactly once.
-    assert err.count("probe: could not persist") == 1, err
-    assert "row rejected" in err, err
-    for fragment in _PID_FRAGMENTS:
-        assert fragment not in err, f"the synthetic PID segment reached stderr unredacted:\n{err}"
-    assert "[redacted]" in err
+    err = _assert_redacted_on_stderr(capsys, "serve")
+    assert err.count("probe: could not persist") == 1, err  # one handler, so printed once
     assert "probe-info-line" not in err, "the window printed below WARNING, as lastResort did not"
     assert "error: " in err  # the refusal: the run entered the window and left it before logging
-    assert captured.out == ""
     handlers = seen["handlers"]
     assert isinstance(handlers, list) and len(handlers) == 1, handlers
     assert handlers[0].level == logging.WARNING
@@ -4116,24 +4108,20 @@ def test_serve_window_without_the_startup_sink_leaks_the_same_value(
     assert "error: " in err  # the refusal, so the run left the window the same way
 
 
-def test_a_real_serve_process_redacts_a_warning_before_its_handlers(tmp_path: Path) -> None:
-    """The premise the in-process tests stand on, measured in a child: a real process reaches
-    ``_serve`` with no root handler, so the startup sink is the one handler in the window, and
-    the WARNING reaches stderr redacted. The child exits 2 on the directory ``--service-config``."""
+def _run_warning_driver(
+    tmp_path: Path, name: str, body: str, *, returncode: int, handlers_line: str
+) -> None:
+    """Run ``body`` in a child after ``import logging`` and the CLI module, then assert it reached
+    main() with no root handler, printed ``handlers_line``, and logged the probe once, redacted.
+    ``body`` prints ``handlers_line`` itself, at the moment it means to measure."""
     import subprocess
     import sys
 
-    driver = tmp_path / "warn_in_the_serve_window.py"
+    driver = tmp_path / name
     driver.write_text(
         "import logging\n"
         "import messagefoundry.__main__ as m\n"
-        "import messagefoundry.crashdump as crashdump\n"
-        "def _probe():\n"
-        "    print('handlers-in-window', len(logging.getLogger().handlers), flush=True)\n"
-        f"    logging.getLogger('messagefoundry.store').warning('probe: %s', {_SYNTHETIC_PID!r})\n"
-        "crashdump.suppress_crash_dumps = _probe\n"
-        "print('handlers-before-main', len(logging.getLogger().handlers), flush=True)\n"
-        f"raise SystemExit(m.main(['serve', '--service-config', {str(tmp_path)!r}]))\n",
+        "print('handlers-before-main', len(logging.getLogger().handlers), flush=True)\n" + body,
         encoding="utf-8",
     )
     proc = subprocess.run(
@@ -4143,13 +4131,37 @@ def test_a_real_serve_process_redacts_a_warning_before_its_handlers(tmp_path: Pa
         text=True,
         timeout=60,
     )
-    assert proc.returncode == 2, f"rc={proc.returncode}\n{proc.stderr}"
+    assert proc.returncode == returncode, f"rc={proc.returncode}\n{proc.stderr}"
     assert "handlers-before-main 0" in proc.stdout, proc.stdout
-    assert "handlers-in-window 1" in proc.stdout, proc.stdout
-    assert "probe: PID|" in proc.stderr, f"the WARNING never reached stderr: {proc.stderr!r}"
-    assert proc.stderr.count("probe: PID|") == 1, proc.stderr
+    assert handlers_line in proc.stdout, proc.stdout
+    assert proc.stderr.count("probe: PID|") == 1, f"the WARNING did not print once: {proc.stderr!r}"
     for fragment in _PID_FRAGMENTS:
         assert fragment not in proc.stderr + proc.stdout, proc.stderr
+
+
+#: The child's probe line: one WARNING carrying the synthetic segment, at four spaces of indent.
+_CHILD_PROBE = (
+    f"    logging.getLogger('messagefoundry.store').warning('probe: %s', {_SYNTHETIC_PID!r})\n"
+)
+
+
+def test_a_real_serve_process_redacts_a_warning_before_its_handlers(tmp_path: Path) -> None:
+    """The premise the in-process ``serve`` tests stand on, measured in a child: a real process
+    reaches ``_serve`` with no root handler, so the startup sink is the one handler in the window,
+    and the WARNING reaches stderr redacted. The child exits 2 on the directory
+    ``--service-config``."""
+    _run_warning_driver(
+        tmp_path,
+        "warn_in_the_serve_window.py",
+        "import messagefoundry.crashdump as crashdump\n"
+        "def _probe():\n"
+        "    print('handlers-in-window', len(logging.getLogger().handlers), flush=True)\n"
+        + _CHILD_PROBE
+        + "crashdump.suppress_crash_dumps = _probe\n"
+        f"raise SystemExit(m.main(['serve', '--service-config', {str(tmp_path)!r}]))\n",
+        returncode=2,
+        handlers_line="handlers-in-window 1",
+    )
 
 
 def test_a_real_cli_process_starts_with_no_root_handler_and_redacts(tmp_path: Path) -> None:
@@ -4158,35 +4170,18 @@ def test_a_real_cli_process_starts_with_no_root_handler_and_redacts(tmp_path: Pa
     hand. This runs a child, not ``--json`` (which has its own path, #1489), so the premise is
     measured. If an import ever started adding a root handler, main() would skip its sink and the
     in-process tests would stay green."""
-    import subprocess
-    import sys
-
-    driver = tmp_path / "warn_in_a_subcommand.py"
-    driver.write_text(
-        "import logging\n"
-        "import messagefoundry.__main__ as m\n"
+    _run_warning_driver(
+        tmp_path,
+        "warn_in_a_subcommand.py",
         "def _probe(args):\n"
-        "    print('handlers-at-dispatch', len(logging.getLogger().handlers))\n"
-        f"    logging.getLogger('messagefoundry.store').warning('probe: %s', {_SYNTHETIC_PID!r})\n"
-        "    return 0\n"
-        "print('handlers-before-main', len(logging.getLogger().handlers))\n"
+        "    print('handlers-at-dispatch', len(logging.getLogger().handlers), flush=True)\n"
+        + _CHILD_PROBE
+        + "    return 0\n"
         "m._DISPATCH['hl7schema'] = _probe\n"
         "raise SystemExit(m.main(['hl7schema']))\n",
-        encoding="utf-8",
+        returncode=0,
+        handlers_line="handlers-at-dispatch 1",
     )
-    proc = subprocess.run(
-        [sys.executable, str(driver)],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stderr}"
-    assert "handlers-before-main 0" in proc.stdout, proc.stdout
-    assert "handlers-at-dispatch 1" in proc.stdout, proc.stdout
-    assert "probe: PID|" in proc.stderr, f"the WARNING never reached stderr: {proc.stderr!r}"
-    for fragment in _PID_FRAGMENTS:
-        assert fragment not in proc.stderr + proc.stdout, proc.stderr
 
 
 def test_a_host_that_already_configured_logging_is_left_alone(
