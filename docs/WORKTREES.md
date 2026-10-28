@@ -895,9 +895,7 @@ other than `-ExpectedHost`; that decides only who registers the task, not what i
 ## Ledger acts owed to the Lander — `owed_ledger_acts.py`
 
 **A Lander ledger pass is briefed from this report's output, never from memory or a notes file.**
-On 2026-10-28 two flips asked on engine PRs 2545 and 2546 (rows #3844 and #3025) were held only in
-the Lander's context and an untracked notes file, survived a compaction as a summary, and were left
-out of the next pass's brief.
+The script's docstring says why (the 2026-10-28 incident).
 
 [`scripts/coord/owed_ledger_acts.py`](../scripts/coord/owed_ledger_acts.py) reads the comments on
 pull requests merged in a window (engine and korus by default) and, through `git` only, a vault
@@ -919,10 +917,8 @@ prose, even when it also sends mail:
     <!-- lander-ledger-ask rows=#3844,#3025 file=2 -->
 
 `rows` names rows whose banner is owed; `file` counts new rows to file. Either may be left out.
-A marker inside backticks, a fenced block or a quoted line is an example and is not read. Without
-the marker the report falls back to a loose prose read. That read errs toward over-reporting, but
-it can still miss an ask worded in a way it does not know. It cannot see at least an ask sent only
-by mail, or one in an inline review comment. Tests:
+Without the marker the report falls back to a prose read that can miss an ask; what it reads, and
+what it cannot see, are in the script's docstring. Tests:
 [`tests/test_owed_ledger_acts.py`](../tests/test_owed_ledger_acts.py).
 
 ## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`

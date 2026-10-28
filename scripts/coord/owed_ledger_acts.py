@@ -17,8 +17,9 @@ done (an over-report a person clears in seconds) rather than calling one DONE th
 READ-ONLY, AND ALWAYS EXIT 0. It is a report, not a gate. It reads GitHub with ``gh`` and the vault
 ledger as text with ``git log`` / ``ls-tree`` / ``cat-file`` against a ref (``origin/main`` by
 default); it never fetches, checks out, reads the working tree, writes, or runs any code from the
-vault. The ledger's heading and status-banner grammar is restated here (``parse_ledger``) rather than loaded
-from the vault, so whoever can push the vault cannot run code as the reader. A read that fails
+vault. The ledger's heading and status-banner grammar is restated here (``parse_ledger``) rather
+than loaded from the vault, so whoever can push the vault cannot run code as the reader. A read
+that fails
 prints an ERROR line naming the reason, never an empty list, because "nothing owed" and "could not
 read" must not look alike. A bad command line still exits 2, argparse's usage error.
 
@@ -28,46 +29,51 @@ minimized:
 
 * PRIMARY, machine-readable: ``<!-- lander-ledger-ask rows=#3844,#3025 file=2 -->``. ``rows`` names
   existing rows whose banner the Lander owes; ``file`` counts new rows to file. Either may be left
-  out. It may also sit in the PR body. A marker inside a code span, a fenced block or a quoted line
-  is an example, not an ask. A comment carrying a marker is read for its marker only. A marker
-  that names nothing, carries an unknown key or a malformed value, or is not closed prints as READ,
-  beside whatever it did name.
-* FALLBACK, prose. A comment that names the Lander (any case), and whose first line is not one of
-  the Lander's own (``<!-- lander-hold`` or ``Lander (session``), is split into sentences. A
-  sentence with an ask word (at least flip, banner, owed, close, mark, re-open, status, retire,
-  decline, or "file ... rows/findings") contributes its row numbers (``#N``, ``row(s) N and M``,
-  ``BACKLOG #N``; pull request citations and ``repo#N`` are removed first). A flip sentence with no
-  row borrows the rows of the nearest sentence before it (two back), else the next one. A filing
-  sentence contributes the count it states ("13 open findings ... to file as rows", "a row"); a
-  filing sentence with no stated count makes the count UNKNOWN. With an ask word but no row and no
-  filing anywhere, every ``BACKLOG #N`` of the comment is taken, then of the PR title; with none at
-  all it prints as READ, for a person to read. This read errs toward over-reporting, but it can
-  still miss an ask phrased in words it does not know, which is why the marker is the reliable form.
+  out. It may also sit in the PR body; on a fork PR's body it prints as READ, since an outside
+  account wrote it. A marker inside a code span, a fenced block or a quoted line is an example, not
+  an ask. A comment carrying a marker is read for its marker only. A marker that names nothing,
+  carries an unknown key or a malformed value, or is not closed prints as READ, beside whatever it
+  did name.
+* FALLBACK, prose. A comment that names the Lander (any case) is split into sentences. A sentence
+  with an ask word (at least flip, banner, owed, close, mark, re-open, status, retire, decline, or
+  "file ... rows/findings", "rows follow") contributes its row numbers (``#N``, ``row(s) N and M``,
+  a range ``N-M``, ``BACKLOG #N``; pull request citations and ``repo#N`` are removed first). A flip
+  sentence with no row borrows the rows of the nearest sentence before it (two back), else the next
+  one, and adds every ``BACKLOG #N`` of the comment, else of the PR title; with no row at all and
+  no filing it prints as READ, for a person to read. A filing sentence's count is the nearest count
+  before each "rows"/"findings" in it, summed ("13 open findings", "2 rows for A and 3 rows for B");
+  a filing sentence with no count, or "a row for each finding", makes the count UNKNOWN. The
+  Lander's own comments (first line ``<!-- lander-hold`` or ``Lander (session``) are read for their
+  filings only: its enqueue comment is where the rows it owes after a merge are recorded. This read
+  errs toward over-reporting, but it can still miss an ask phrased in words it does not know, which
+  is why the marker is the reliable form.
 
 WHEN AN ASK COUNTS AS DONE. Prose asks for one row are read as one, from the EARLIEST, so a later
 reminder or acknowledgement cannot move the baseline past the act. Each marker is its own ask. A
 row's baseline is the later of the merge and the ask, read at the vault's last first-parent commit
 at or before it. A row is DONE only when it CHANGED after the baseline: it was OPEN there and is
-CLOSED at the ref, or its set of status glyphs changed and a banner line that is new since the
-baseline cites the PR and does not say the act is still owed (owed, flip, pending, waits). A row
-already CLOSED at the baseline, absent there, or with no banner line the grammar recognises (a
-grammar change), stays OWED. A citation is ``engine PR <N>``, ``vault PRs <N> and <M>``,
-``korus PR <N>`` or a ``/pull/<N>`` URL; a ledger citation without its repository word counts for
-nothing, because the vault writes a bare ``PR <N>`` for its own pull requests too. (In an ask, a
-bare PR is the repository the comment sits on.) The PR itself or one named in the ask sentence
-counts. FILING asks on one PR are SUMMED, every marker and prose ask alike, and are DONE only when
-the total is known and at least that many rows absent at the earliest filing ask now exist and cite
-this PR, with its repository word, anywhere in their block (filing may precede the merge). Statuses
-printed: OWED, MISSING (the row is in neither ledger file at the ref), READ, ERROR (a failed read,
-or no ledger commit before a baseline: a shallow clone), and DONE with ``--all``.
+CLOSED at the ref; or a banner line new since the baseline cites the PR and does not say the act is
+still owed (owed, flip, pending, waits), and either the row was CLOSED at the baseline (a re-open or
+a re-banner) or its set of status glyphs changed. A row absent at the baseline, or with no banner
+line the grammar recognises there (a grammar change), stays OWED. A citation is ``engine PR <N>``,
+``vault PRs <N> and <M>``, ``korus PR <N>`` or a ``/pull/<N>`` URL; a ledger citation without its
+repository word counts for nothing, because the vault writes a bare ``PR <N>`` for its own pull
+requests too. (In an ask, a bare PR is the repository the comment sits on.) The PR itself or one
+named in the ask sentence counts. FILING asks on one PR are SUMMED, every marker and prose ask
+alike, and are DONE only when the total is known and at least that many rows absent at the earliest
+filing ask now exist and cite this PR, with its repository word, anywhere in their block (filing may
+precede the merge). Statuses printed: OWED, MISSING (the row is in neither ledger file at the ref),
+READ, ERROR (a failed read, or no ledger commit before a baseline: a shallow clone), and DONE with
+``--all``.
 
 WHAT IT CANNOT SEE. At least: an ask sent only by fleet mail (so a Manager should also put the
 marker on the PR), an ask in an inline review comment, an ask past the first 100 comments ``gh``
 returns, a pull request merged before the window, a prose ask in words it does not know, a ledger
 file the vault adds beyond ``LEDGER_SOURCES`` (its rows print as MISSING), and an act a pass
-recorded without citing the PR, with its repository word, in a banner line. A later re-banner that
-drops the citation puts a done act back on the report, the safe direction. The vault ledger's own
-PRs are not read by default (``--repo`` adds them): a ledger PR's comments cite rows that the PR
+recorded without citing the PR, with its repository word, in a banner line. A row filed after the
+ask that cites the PR for another reason (an ASVS follow-up, say) counts toward its filing. A later
+re-banner that drops the citation puts a done act back on the report, the safe direction. The
+vault ledger's own PRs are not read by default (``--repo`` adds them): a ledger PR's comments cite rows that the PR
 itself changed, before its merge, and would read as owed.
 
 Stdlib only. It loads ``pr_state.py`` by path for its gh runner.
@@ -119,6 +125,13 @@ _HEADING = re.compile(r"^## (?P<num>\d+)\.\s")
 #: A line shaped like a banner whose first character is outside ASCII, to catch a glyph the
 #: vault added after this copy was written.
 _BANNER_SHAPE = re.compile(r"^>\s(?P<glyph>[^\x00-\x7f])")
+#: The decorative glyphs that open blockquote lines in the vault ledger, measured over both files
+#: at vault ``origin/main`` on 2026-10-28 (warning sign, tools, pushpin, ruler, up arrow, magnifier,
+#: circles, compass, lock, repeat, star). They are not statuses, so a row carrying one keeps the
+#: vault's verdict. Any other symbol in that place is treated as a status this copy does not know.
+_DECORATION = frozenset(
+    map(chr, (0x26A0, 0x1F6E0, 0x1F4CC, 0x1F4D0, 0x2B06, 0x1F50E, 0x1F7E2, 0x1F536, 0x1F9ED))
+) | frozenset(map(chr, (0x1F512, 0x1F501, 0x2B50)))
 #: The vault parser refuses a conflicted ledger, which would otherwise yield rows from both sides.
 _CONFLICT = re.compile(r"^(?:<{7}|>{7})(?:\s|$)", re.MULTILINE)
 
@@ -136,26 +149,35 @@ _MARKER_KEY = re.compile(r"(?P<key>[A-Za-z_][\w-]*)\s*=")
 _NUMBER = re.compile(r"\d{1,6}")
 #: What may separate a marker's row numbers, once the numbers are taken out.
 _MARKER_ROW_JUNK = re.compile(r"[\s,;#]+|\band\b", re.IGNORECASE)
-#: The opening of a fenced code block, indented at most three spaces.
-_FENCE = re.compile(r"^ {0,3}(?P<run>`{3,}|~{3,})")
+#: The opening of a fenced code block, indented at most three spaces. A backtick fence's info
+#: string holds no backtick, so a line like ```x``` is an inline span, not a fence.
+_FENCE = re.compile(r"^ {0,3}(?P<run>`{3,}|~{3,})(?P<info>.*)$")
 _CODE_SPAN = re.compile(
     r"(?<!`)(?P<run>`+)(?!`)(?:(?!\n[ \t]*\n).)+?(?<!`)(?P=run)(?!`)", re.DOTALL
 )
 
 #: One number in a list: not the start of a date, a time or a dotted version.
-_N = r"#?\d{1,6}\b(?![-:/.]\d)"
+_END = r"\b(?![-:/.]\d)"
+_N = rf"#?\d{{1,6}}{_END}"
+#: A row in a list may be a range, ``3844-3846``.
+_ITEM = rf"#?\d{{1,6}}(?:\s*-\s*#?\d{{1,6}})?{_END}"
 _SEP = r"(?:\s*[,;]\s*(?:and\s+)?|\s+and\s+|\s*/\s*)"
 _LIST = rf"{_N}(?:{_SEP}{_N})*"
+_ROW_LIST = rf"{_ITEM}(?:{_SEP}{_ITEM})*"
+#: A number, or a range of them, inside a matched list.
+_RANGE = re.compile(r"(\d{1,6})(?:\s*-\s*#?(\d{1,6}))?")
+#: The widest range read as every row in it; a wider one is read as its two ends.
+_RANGE_MAX = 50
 #: ``BACKLOG``, ``BACKLOG rows``, ``BACKLOG item``: the word before a row list.
 _BACKLOG_WORD = r"BACKLOG(?:\s+(?:rows?|items?))?"
 #: A row reference: ``#N``, ``row N``, ``rows N and M``, ``BACKLOG #N, #M``. Pull request citations
 #: are removed before this runs.
 _ROW_REF = re.compile(
-    rf"(?<![\w/])#(?P<hash>\d{{1,6}})\b"
-    rf"|\b(?:rows?|{_BACKLOG_WORD})\s+(?P<list>{_LIST})",
+    r"(?<![\w/])#(?P<hash>\d{1,6}(?:\s*-\s*#?\d{1,6}\b)?)\b"
+    rf"|\b(?:rows?|{_BACKLOG_WORD})\s+(?P<list>{_ROW_LIST})",
     re.IGNORECASE,
 )
-_BACKLOG_REF = re.compile(rf"\b{_BACKLOG_WORD}\s+(?P<list>{_LIST})", re.IGNORECASE)
+_BACKLOG_REF = re.compile(rf"\b{_BACKLOG_WORD}\s+(?P<list>{_ROW_LIST})", re.IGNORECASE)
 #: A pull request citation. A plural (``engine PRs 2545 and 2546``) takes a list; a singular takes
 #: one number, so "PR #2546 and #3025" leaves row #3025 alone. The repository word is optional and
 #: its absence is reported as ``None`` unless the caller names a default.
@@ -182,15 +204,19 @@ _COUNT_WORDS = {
     )
 }
 _NOUN = r"(?:rows?|findings?|items?|entries|entry)"
-#: The count a filing sentence states: "Eight NEW ledger rows", "13 open findings", "a row".
-_FILE_COUNT = re.compile(
-    rf"(?<![#\w-])(?P<n>\d{{1,3}}|{'|'.join(_COUNT_WORDS)}|an?)\s+(?:[\w-]+\s+){{0,4}}?"
-    rf"(?P<noun>{_NOUN})\b",
-    re.IGNORECASE,
+_NOUN_RE = re.compile(rf"\b(?P<noun>{_NOUN})\b", re.IGNORECASE)
+#: A count word: "8", "eight", or the article in "a row".
+_COUNT_TOKEN = re.compile(
+    rf"(?<![#\w-])(?:\d{{1,3}}|{'|'.join(_COUNT_WORDS)}|an?)(?![\w-])", re.IGNORECASE
 )
+#: How many words before a noun its count may sit: "Eight NEW ledger rows".
+_COUNT_REACH = 5
+#: "a row for each finding": the count is per finding, so it is not stated.
+_EACH = re.compile(r"\s+(?:for\s+(?:each|every)|per|each)\b", re.IGNORECASE)
 _PLURAL_NOUNS = frozenset({"rows", "findings", "items", "entries"})
 _FILE_ASK = re.compile(
-    rf"\bfil(?:e|ing)\b[^.\n]{{0,60}}?\b{_NOUN}\b|\b{_NOUN}\b[^.\n]{{0,40}}?\bto (?:be )?filed?\b",
+    rf"\bfil(?:e|ing)\b[^.\n]{{0,60}}?\b{_NOUN}\b|\b{_NOUN}\b[^.\n]{{0,40}}?\bto (?:be )?filed?\b"
+    r"|\brows?\b[^.\n]{0,20}?\bfollow",
     re.IGNORECASE,
 )
 _FLIP_WORD = re.compile(
@@ -240,7 +266,8 @@ class Block(NamedTuple):
 
     text: str
     banners: tuple[str, ...]
-    #: A CLOSED glyph and no OPEN one, the vault's own verdict.
+    #: A CLOSED glyph and no OPEN one, the vault's own verdict; never True when a banner-shaped
+    #: line carries a symbol this copy of the grammar does not know.
     closed: bool = False
     #: The status glyphs its banner lines carry.
     status: frozenset[str] = frozenset()
@@ -258,7 +285,8 @@ def _unknown_glyph(line: str) -> bool:
     if shape is None or _BANNER.match(line):
         return False
     glyph = shape.group("glyph")
-    return unicodedata.category(glyph) == "So" and glyph not in _CLOSED_GLYPHS + _OPEN_GLYPHS
+    known = glyph in _CLOSED_GLYPHS or glyph in _OPEN_GLYPHS or glyph in _DECORATION
+    return unicodedata.category(glyph) == "So" and not known
 
 
 def _put(out: dict[int, Block], num: int, block: Block) -> None:
@@ -348,7 +376,7 @@ def _live_text(text: str) -> str:
                 fence = ""
             continue
         opened = _FENCE.match(line)
-        if opened is not None:
+        if opened is not None and not (opened["run"][0] == "`" and "`" in opened["info"]):
             fence = opened.group("run")
             continue
         if line.lstrip().startswith(">"):
@@ -369,10 +397,12 @@ def _marker_attrs(attrs: str) -> Marker:
         end = keys[k + 1].start() if k + 1 < len(keys) else len(attrs)
         key, value = m.group("key").lower(), attrs[m.end() : end].strip()
         if key in ("rows", "row"):
-            numbers = [int(n) for n in _NUMBER.findall(value)]
-            if not numbers or _MARKER_ROW_JUNK.sub("", _NUMBER.sub("", value)):
+            digits = re.findall(r"\d+", value)
+            if not digits or _MARKER_ROW_JUNK.sub("", re.sub(r"\d+", "", value)):
                 problems.append(f"{key}={value[:40]!r} is not a list of row numbers")
-            rows.extend(n for n in numbers if n not in rows)
+            if any(len(d) > 6 for d in digits):  # "#38443025": a missing separator
+                problems.append(f"{key}={value[:40]!r} holds a number too long for a row")
+            rows.extend(n for n in map(int, digits) if len(str(n)) <= 6 and n not in rows)
         elif key == "file":
             if re.fullmatch(r"\d{1,3}", value):
                 files += int(value)
@@ -412,11 +442,13 @@ def cited_prs(text: str, bare: str | None = None) -> list[Cite]:
 
 
 def _numbers(found: Iterable[str]) -> list[int]:
+    """The numbers in each matched list, a range ``a-b`` read as every row in it."""
     out: list[int] = []
     for chunk in found:
-        for n in (int(x) for x in _NUMBER.findall(chunk)):
-            if n not in out:
-                out.append(n)
+        for m in _RANGE.finditer(chunk):
+            first, last = int(m.group(1)), int(m.group(2) or m.group(1))
+            span = range(first, last + 1) if 0 < last - first <= _RANGE_MAX else (first, last)
+            out.extend(n for n in span if n not in out)
     return out
 
 
@@ -433,16 +465,28 @@ def backlog_refs(text: str) -> list[int]:
 
 
 def file_count_of(sentence: str) -> int | None:
-    """The count a filing sentence states (the largest, if several), or ``None``."""
-    counts = []
-    for m in _FILE_COUNT.finditer(_PR_CITE.sub(" ", sentence)):
-        word, noun = m.group("n").lower(), m.group("noun").lower()
-        if word in ("a", "an"):
-            if noun not in _PLURAL_NOUNS:  # "a row" is one; "a few rows" is no count
-                counts.append(1)
+    """The count a filing sentence states, or ``None`` when it states none.
+
+    Each noun takes the nearest count in the few words before it, and the nouns' counts are
+    SUMMED: "2 rows for slice A and 3 rows for slice B" is five. Summing can over-count ("13
+    findings ... as 2 rows"), the safe direction; an under-count would let a filing read DONE early.
+    "A row for each finding" states no count.
+    """
+    text = _PR_CITE.sub(" ", sentence)
+    total, start = 0, 0
+    for m in _NOUN_RE.finditer(text):
+        before, start = " ".join(text[start : m.start()].split()[-_COUNT_REACH:]), m.end()
+        tokens = _COUNT_TOKEN.findall(before)
+        if not tokens:
             continue
-        counts.append(int(word) if word.isdigit() else _COUNT_WORDS[word])
-    return max(counts) if counts else None
+        if _EACH.match(text, m.end()):
+            return None
+        word, noun = tokens[-1].lower(), m.group("noun").lower()
+        if word in ("a", "an"):
+            total += 0 if noun in _PLURAL_NOUNS else 1  # "a few rows" states no count
+        else:
+            total += int(word) if word.isdigit() else _COUNT_WORDS[word]
+    return total or None
 
 
 class Prose(NamedTuple):
@@ -460,23 +504,30 @@ def _is_landers_own(text: str) -> bool:
 
 def parse_prose(text: str, title: str = "", repo: str = ENGINE_REPO) -> Prose | None:
     """The ask in a Lander-addressed prose comment on a ``repo`` PR, else ``None``."""
-    if not _LANDER.search(text) or _is_landers_own(text):
+    if not _LANDER.search(text):
         return None
+    # The Lander's own comment is not an ask of it, except that its enqueue comment is where the
+    # filings it owes after a merge are recorded ("Rows follow in a Lander ledger pass"), so only
+    # its filings are read.
+    own = _is_landers_own(text)
     sentences = [s for s in _SENTENCE.split(text) if s.strip()]
-    flips = [bool(_FLIP_WORD.search(s)) for s in sentences]
+    flips = [not own and bool(_FLIP_WORD.search(s)) for s in sentences]
     filings = [bool(_FILE_ASK.search(s)) for s in sentences]
     if not any(flips) and not any(filings):
         return None
     refs = [row_refs(s) for s in sentences]
     rows: list[int] = []
     cites: set[Cite] = set()
-    file_count, file_unknown = 0, False
+    file_count, file_unknown, orphan = 0, False, False
     for k, sentence in enumerate(sentences):
         if not flips[k] and not filings[k]:
             continue
-        found = refs[k]
+        found = [] if own else refs[k]
         if not found and flips[k]:
-            # "Please flip it.": the row is named before, or failing that, just after.
+            # "Please flip it.": the row is named before, or failing that, just after. The
+            # comment's and the title's BACKLOG rows are added below too, since a borrowed row may
+            # be a different one.
+            orphan = True
             for j in (k - 1, k - 2, k + 1):
                 if 0 <= j < len(sentences) and refs[j]:
                     found = refs[j]
@@ -491,9 +542,9 @@ def parse_prose(text: str, title: str = "", repo: str = ENGINE_REPO) -> Prose | 
             else:
                 file_count += count  # two filing sentences are two asks: summed, never merged
     filing = file_count > 0 or file_unknown
-    if not rows and not filing:
-        # No sentence put a row near its ask word: the comment's BACKLOG rows, then the title's.
-        rows = backlog_refs(text) or backlog_refs(title)
+    if orphan:
+        # A flip sentence named no row: the comment's BACKLOG rows, then the title's.
+        rows.extend(n for n in backlog_refs(text) or backlog_refs(title) if n not in rows)
         cites |= set(cited_prs(text, repo))
     return Prose(tuple(rows), file_count, file_unknown, frozenset(cites), not rows and not filing)
 
@@ -521,9 +572,15 @@ def extract_asks(repo: str, pr: dict[str, Any]) -> list[Ask]:
             cites=own, unread=bool(mk.problems) or not named, note=note,
         )  # fmt: skip
 
-    # A marker in the body was written by the PR's creation at the latest.
+    # A marker in the body was written by the PR's creation at the latest. A fork PR's body is
+    # written by an outside account, which the comment trust gate keeps out: a person reads it.
     opened = _when(pr.get("createdAt")) or merged
     asks = [marked(opened, url, mk) for mk in parse_marker(str(pr.get("body") or ""))]
+    if pr.get("isCrossRepository") is not False:
+        asks = [
+            replace(a, rows=(), file_count=0, unread=True, note="a marker in a fork PR's body")
+            for a in asks
+        ]
     for c in pr.get("comments") or []:
         if not isinstance(c, dict) or c.get("isMinimized"):
             continue
@@ -634,13 +691,17 @@ def _judge_row(ask: Ask, n: int, ledger: Ledger, tip: dict[int, Block]) -> Row:
         return Row(OWED, ask, what, "the row did not exist at the baseline")
     if not before.banners:
         return Row(OWED, ask, what, "the baseline row has no banner the grammar reads")
+    recorded = any(ln not in before.banners and not _STILL_OWED.search(ln) for ln in citing)
     if before.closed:
-        return Row(OWED, ask, what, "already CLOSED at the baseline, so no change after the ask")
+        # A re-open, or a re-banner of a closed row, shows only as a new banner line.
+        if recorded:
+            return Row(DONE, ask, what, "CLOSED at the baseline; a new banner line cites the PR")
+        return Row(OWED, ask, what, "CLOSED at the baseline, and no new banner line cites the PR")
     if now.closed:
         return Row(DONE, ask, what, "OPEN at the baseline, CLOSED at the ref")
     if now.status == before.status:
         return Row(OWED, ask, what, "its status glyphs are unchanged since the baseline")
-    if not any(ln not in before.banners and not _STILL_OWED.search(ln) for ln in citing):
+    if not recorded:
         return Row(OWED, ask, what, "its status changed, but no new banner line records the act")
     return Row(DONE, ask, what, "its status changed and a new banner line cites the PR")
 
@@ -694,7 +755,7 @@ def fetch_merged(gh: Gh, repo: str, since: datetime) -> list[dict[str, Any]]:
             "--limit",
             str(PR_LIMIT),
             "--json",
-            "number,title,url,createdAt,mergedAt,body,comments",
+            "number,title,url,createdAt,mergedAt,body,comments,isCrossRepository",
         ],
         None,
     )
@@ -718,8 +779,11 @@ class GitLedger:
         self.ref = ref
         #: Parses keyed by the ledger files' blob ids: most vault commits leave them untouched.
         self._cache: OrderedDict[tuple[str, ...], dict[int, Block]] = OrderedDict()
-        #: The ref's first-parent history, newest first, as ``(committer time, sha)``.
+        #: The tip's first-parent history, newest first, as ``(committer time, sha)``.
         self._history: list[tuple[int, str]] | None = None
+        self._tip: str | None = None
+        #: Each commit's ledger blob ids, so a commit is listed once.
+        self._keys: dict[str, tuple[str, ...]] = {}
 
     def _git(self, *args: str) -> str:
         try:
@@ -741,41 +805,49 @@ class GitLedger:
 
     def tip(self) -> tuple[str, str]:
         sha, _, date = self._git("log", "-1", "--format=%H %cI", self.ref).strip().partition(" ")
+        self._tip = sha  # baselines are read from this commit, not the ref a peer may move
         return sha, date
 
     def sha_before(self, when: datetime) -> str | None:
         # What ``rev-list -1 --first-parent --before`` answers, from one history read: the first
         # commit in first-parent order whose committer time is not after ``when``.
         if self._history is None:
-            out = self._git("log", "--first-parent", "--format=%ct %H", self.ref)
-            self._history = []
+            out = self._git("log", "--first-parent", "--format=%ct %H", self._tip or self.ref)
+            history = []
             for line in out.splitlines():
                 stamp, _, sha = line.strip().partition(" ")
                 if not stamp.isdigit() or not sha:
                     raise ReadError(f"git log printed an unexpected line: {line[:80]!r}")
-                self._history.append((int(stamp), sha))
+                history.append((int(stamp), sha))
+            self._history = history
         cutoff = int(when.timestamp())
         return next((sha for stamp, sha in self._history if stamp <= cutoff), None)
 
+    def _blobs(self, sha: str) -> tuple[str, ...]:
+        """The ledger files' blob ids at ``sha``, ``""`` for a file absent there."""
+        if sha not in self._keys:
+            # An absent path (an archive file that did not exist yet) is simply not listed.
+            listing = self._git("ls-tree", "-z", sha, "--", *LEDGER_SOURCES)
+            blobs: dict[str, str] = {}
+            for entry in filter(None, listing.split("\0")):
+                meta, _, path = entry.partition("\t")
+                kind, oid = meta.split()[1:3]
+                if kind != "blob":
+                    raise ReadError(f"{path} at {sha[:10]} is a {kind}, not a file")
+                blobs[path] = oid
+            self._keys[sha] = tuple(blobs.get(source, "") for source in LEDGER_SOURCES)
+        return self._keys[sha]
+
     def blocks(self, sha: str) -> dict[int, Block]:
-        # An absent path (an archive file that did not exist yet) is simply not listed.
-        listing = self._git("ls-tree", "-z", sha, "--", *LEDGER_SOURCES)
-        blobs: dict[str, str] = {}
-        for entry in filter(None, listing.split("\0")):
-            meta, _, path = entry.partition("\t")
-            kind, oid = meta.split()[1:3]
-            if kind != "blob":
-                raise ReadError(f"{path} at {sha[:10]} is a {kind}, not a file")
-            blobs[path] = oid
-        key = tuple(blobs.get(source, "") for source in LEDGER_SOURCES)
+        key = self._blobs(sha)
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
         result: dict[int, Block] = {}
-        for source in LEDGER_SOURCES:
-            if source not in blobs:
+        for source, oid in zip(LEDGER_SOURCES, key, strict=True):
+            if not oid:
                 continue
-            text = self._git("cat-file", "blob", blobs[source])
+            text = self._git("cat-file", "blob", oid)
             try:
                 parsed = parse_ledger(text)
             except ReadError as exc:
@@ -817,8 +889,9 @@ def collect(
                 acts.extend(split_acts(extract_asks(repo, pr)))
             except (ReadError, LookupError, TypeError, ValueError) as exc:
                 rows.append(Row(ERROR, None, f"{repo} PR {pr.get('number')}", str(exc)[:300]))
-    # In baseline order, so asks sharing a baseline commit share one cached parse.
-    for ask in sorted(acts, key=lambda a: a.baseline):
+    # In the order of the commit each act reads (a filing reads at its ask), so acts sharing a
+    # ledger snapshot share one cached parse.
+    for ask in sorted(acts, key=lambda a: a.baseline if a.rows else a.asked_at):
         try:
             rows.extend(judge(ask, ledger, tip, index))
         except ReadError as exc:

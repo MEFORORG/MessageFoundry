@@ -119,6 +119,7 @@ def _pr(
         "mergedAt": merged,
         "body": body,
         "comments": comments,
+        "isCrossRepository": False,
     }
 
 
@@ -569,7 +570,10 @@ def test_row_extraction_skips_repo_refs_and_pr_lists() -> None:
         ("Eight NEW ledger rows to file.", 8),
         ("Please file 3 rows.", 3),
         ("File a row.", 1),
-        ("The 13 open findings from round 2 are to file as rows.", 13),
+        ("The 13 open findings are to file as rows.", 13),
+        ("Please file findings 1 and 2 as two rows.", 2),
+        ("Please file findings 1 to 3 as three rows.", 3),
+        ("File 2 rows for slice A and 3 rows for slice B.", 5),
     ],
 )
 def test_a_prose_file_ask_takes_its_count(text: str, count: int) -> None:
@@ -585,7 +589,7 @@ def test_b1_a_row_closed_before_the_ask_is_not_done(capsys: pytest.CaptureFixtur
     shipped = {3844: "## 3844. gap\n\n> SHIPPED by engine PR 2500", 3025: PARTIAL_3025}
     ledger = FakeLedger([("2026-10-20T00:00:00Z", "a" * 40, shipped)])
     out = _run(_one("For the Lander: please flip #3844."), ledger, capsys, "--repo", ENGINE)
-    assert "row #3844" in out and "OWED" in out and "already CLOSED" in out
+    assert "row #3844" in out and "OWED" in out and "CLOSED at the baseline" in out
 
 
 def test_b2_a_new_citing_banner_without_a_status_change_is_not_done(
@@ -756,3 +760,81 @@ def test_git_ledger_baselines_match_rev_list(tmp_path: Path) -> None:
     _git(repo, "commit", "-q", "-m", "y")
     later = _git(repo, "rev-parse", "HEAD").strip()
     assert ledger.blocks(later) is ledger.blocks(shas[-1])
+
+
+# ---- Regressions for the round-a65953d4b9 findings. ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text", ["File a row for each open finding.", "File a row per finding.", "File one row each."]
+)
+def test_a_count_per_finding_is_not_a_count(text: str) -> None:
+    parsed = oa.parse_prose("For the Lander. " + text)
+    assert parsed is not None and parsed.file_unknown
+
+
+def test_the_landers_own_enqueue_comment_records_the_filings_it_owes() -> None:
+    body = (
+        "Lander (session 8a04c9f3), 2026-10-28. Enqueuing at pinned head abc.\n"
+        "Open findings, none blocking. Rows follow in a Lander ledger pass:\n"
+        "1. one\n2. two\nThe banner on #3844 is owed."
+    )
+    parsed = oa.parse_prose(body)
+    assert parsed is not None and parsed.file_unknown and parsed.rows == ()
+
+
+def test_a_flip_with_no_row_takes_the_title_rows_beside_a_filing_or_a_borrowed_row() -> None:
+    body = "Lander: the findings are listed for filing as ledger rows; flip the banner when done."
+    parsed = oa.parse_prose(body, "Seat worktrees lock (BACKLOG #2524, #2525)")
+    assert parsed is not None and parsed.rows == (2524, 2525) and parsed.file_unknown
+    body = "Lander: please flip the banner on this PR's row. Separately, #3025 needs its status."
+    parsed = oa.parse_prose(body, "Fix (BACKLOG #3844)")
+    assert parsed is not None and set(parsed.rows) == {3025, 3844}
+
+
+def test_a_row_range_is_every_row_in_it() -> None:
+    assert oa.row_refs("Lander: please flip rows 3844-3846.") == [3844, 3845, 3846]
+    assert oa.row_refs("flip #3844-3846") == [3844, 3845, 3846]
+    assert oa.row_refs("rows 2026-10-28") == []
+
+
+def test_an_inline_triple_backtick_span_is_not_a_fence() -> None:
+    body = "```x``` is inline\n<!-- lander-ledger-ask rows=#3844 -->"
+    assert oa.parse_marker(body) == [oa.Marker((3844,), 0)]
+
+
+def test_a_fork_prs_body_marker_prints_read(capsys: pytest.CaptureFixture[str]) -> None:
+    pr = _pr(2545, "2026-10-27T04:55:16Z", [], body="<!-- lander-ledger-ask rows=#3844 -->")
+    pr["isCrossRepository"] = True
+    out = _run({ENGINE: [pr]}, _ledger_433(), capsys, "--repo", ENGINE)
+    assert "READ" in out and "fork" in out and "row #3844" not in out
+
+
+def test_a_closed_row_rebannered_after_the_ask_is_done(capsys: pytest.CaptureFixture[str]) -> None:
+    before = {3844: "## 3844. gap\n\n> SHIPPED by engine PR 2500"}
+    after = {3844: "## 3844. gap\n\n> SHIPPED by engine PR 2545\n> SHIPPED by engine PR 2500"}
+    ledger = FakeLedger(
+        [("2026-10-20T00:00:00Z", "a" * 40, before), ("2026-10-28T10:00:00Z", "b" * 40, after)]
+    )
+    out = _run(_one("For the Lander: please flip #3844."), ledger, capsys, "--repo", ENGINE)
+    assert "nothing owed" in out
+
+
+def test_a_decorative_glyph_keeps_the_vaults_verdict() -> None:
+    warning = chr(0x26A0)
+    rows = oa.parse_ledger(f"## 1. x\n> {SHIPPED_GLYPH} SHIPPED\n> {warning} AMENDED: note\n")
+    assert rows[1].closed
+
+
+def test_baselines_come_from_the_tip_read_not_a_moved_ref(tmp_path: Path) -> None:
+    repo, commit = _vault(tmp_path)
+    first = commit(f"## 1. x\n\n> {OPEN_GLYPH} a\n", "2026-10-20T00:00:00+00:00")
+    ledger = oa.GitLedger(repo, "main")
+    assert ledger.tip()[0] == first
+    commit(f"## 1. x\n\n> {OPEN_GLYPH} b\n", "2026-10-21T00:00:00+00:00")  # a peer's fetch
+    assert ledger.sha_before(NOW) == first
+
+
+def test_an_over_long_marker_row_prints_read() -> None:
+    (marker,) = oa.parse_marker("<!-- lander-ledger-ask rows=#38443025 -->")
+    assert marker.problems and marker.rows == ()
