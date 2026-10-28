@@ -483,6 +483,23 @@ def test_non_object_comment_node_is_an_error_row_not_dropped(
     assert row["turn"] == "ERROR" and "PR unreadable" in row["error"]
 
 
+@pytest.mark.parametrize("kind", ["comments", "reviews"])
+@pytest.mark.parametrize("conn", [None, "x", [], {}, {"nodes": None}, {"nodes": {}}, "absent"])
+def test_malformed_comment_or_review_connection_is_an_error_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], kind: str, conn: object
+) -> None:
+    # Read as zero events, a lost connection could hide the reply that ends a hold.
+    pr = _pr(35, comments=[_hold("2026-10-28T12:00:00Z", _sha(35))])
+    if conn == "absent":
+        del pr[kind]
+    else:
+        pr[kind] = conn
+    rows = _engine_rows(tmp_path, capsys, pr, _pr(36))
+    assert rows[35]["turn"] == "ERROR" and "PR unreadable" in rows[35]["error"]
+    assert kind in rows[35]["error"]
+    assert rows[36]["turn"] == "LANDER"
+
+
 def test_undatable_comment_is_an_error_row_not_dropped(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -80,7 +80,8 @@ though still counted toward the newest-event age: anything authored by a GitHub 
 itself is caught as a new head. A non-Lander event dates from its latest edit
 (``lastEditedAt``), so editing an older comment to answer a hold is a reply. An event with no
 readable time, or a node that is not an object, is an ERROR row, never dropped, since dropping a
-reply could park the PR on its author. Inline review-thread comment bodies are not
+reply could park the PR on its author. So is a ``comments`` or ``reviews`` connection that is
+null, not an object, or has no ``nodes`` list: it is never read as zero events. Inline review-thread comment bodies are not
 read. Only the latest ``COMMENT_PAGE`` issue comments and ``REVIEW_PAGE`` reviews are fetched.
 
 FLAGS. ``held`` (AUTHOR's turn); ``no-hold`` (no Lander event, or the newest is not a marker
@@ -274,7 +275,11 @@ def _events(pr: dict[str, Any]) -> list[Event]:
         ("comments", ("createdAt",)),
         ("reviews", ("submittedAt", "createdAt")),
     ):
-        for node in _nodes(pr.get(kind)):
+        conn = pr.get(kind)
+        if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
+            # Reading it as no events could hide a reply and park the PR on its author.
+            raise ReadError(f"the {kind} connection is missing or has no nodes list")
+        for node in conn["nodes"]:
             if not isinstance(node, dict):
                 # Skipping it could drop a reply after the hold and park the PR on its author.
                 raise ReadError(f"a {kind[:-1]} node is not an object")
