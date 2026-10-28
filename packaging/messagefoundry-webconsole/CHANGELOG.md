@@ -31,11 +31,12 @@ this line.**
 
 ### Security
 
-- **A message export the engine stops no longer reads as saved.** With an engine that ends a
-  stopped export as a failed transfer, the console's export now says it did not finish after N
-  messages, that the engine stopped it or the connection failed, and that nothing was saved. It
-  used to say "Network error during export." for any failed read. Before that engine, a stopped
-  export reached the console as a clean end, and it said "Saved N messages" over a partial file.
+- **The message-export script reports a stopped export as unfinished.** The engine now ends a
+  stopped export as a failed transfer. Once a download has started, the `[data-mf-msg-export]`
+  script in `static/app.js` now says the export did not finish after N messages, that the engine
+  stopped it or the connection failed, and that nothing was saved, rather than "Network error
+  during export.". No console page renders that control today, so no operator sees this message
+  yet; the change keeps the script from reporting a partial file as saved if a page wires it up.
   No seam change. (BACKLOG #3907)
 - **An IdP step-up's return is charged to the operator's own re-authentication budget, not the
   sign-in budget.** `GET /ui/oidc/callback` now reads the user its staged step-up flow names and

@@ -109,7 +109,7 @@ async def _probe(
             await act(service, uid)
         return result
 
-    async with _client(create_app(engine, auth=service), http) as c:
+    async with _client(create_app(engine, auth=service, serve_ui=True), http) as c:
         r = await c.post(
             "/auth/login", json={"username": username, "password": PW, "provider": "local"}
         )
@@ -189,7 +189,8 @@ async def test_a_stopped_bulk_export_ends_as_a_failed_transfer(
     assert status == 200  # the response had started before the stop
     assert len(ids) == 1
     assert stops == [{"selected": 2, "streamed": 1, "reason": "standing_changed"}]
-    assert isinstance(error, httpx.RemoteProtocolError), f"the download ended cleanly: {error!r}"
+    # RemoteProtocolError on an incomplete chunked body; ReadError if the close lands as a reset.
+    assert isinstance(error, httpx.TransportError), "the download ended cleanly"
 
 
 @pytest.mark.parametrize("http", _PARSERS)
@@ -211,7 +212,8 @@ async def test_a_stopped_audit_export_ends_as_a_failed_transfer(
     assert status == 200
     assert [float(ln.split(",")[0]) for ln in rows] == [106.0, 105.0]
     assert stops == [{"count": 7, "streamed": 2, "reason": "standing_changed"}]
-    assert isinstance(error, httpx.RemoteProtocolError), f"the download ended cleanly: {error!r}"
+    # RemoteProtocolError on an incomplete chunked body; ReadError if the close lands as a reset.
+    assert isinstance(error, httpx.TransportError), "the download ended cleanly"
 
 
 @pytest.mark.parametrize("http", _PARSERS)
@@ -226,18 +228,31 @@ async def test_an_unstopped_audit_export_ends_cleanly(
 def test_no_layer_in_the_app_is_a_base_http_middleware() -> None:
     """The wire tests hold only while every middleware in the response path is pure ASGI: one
     ``BaseHTTPMiddleware`` anywhere, the web console's included, turns a stop back into a clean
-    short file. So refuse one structurally, over the stack ``serve_ui`` builds. The control: an
-    ``@app.middleware("http")`` added to the same app is found."""
+    short file. So refuse one structurally, over the BUILT stack ``serve_ui`` makes, so a factory
+    that returns one is seen as well as a class. The walk follows each layer's ``app``, or a
+    factory closure's ``inner``, down to the router; the mounted ``/ui`` sub-app is not walked.
+    The control: an ``@app.middleware("http")`` added to the same app is found."""
+
+    def layers(app: FastAPI) -> list[Any]:
+        node: Any = app.build_middleware_stack()
+        out: list[Any] = []
+        while node is not None and len(out) < 100:
+            out.append(node)
+            nxt = getattr(node, "app", None)
+            code = getattr(node, "__code__", None)
+            if nxt is None and code is not None and "inner" in code.co_freevars:
+                nxt = node.__closure__[code.co_freevars.index("inner")].cell_contents
+            node = nxt
+        return out
 
     def is_base(app: FastAPI) -> bool:
-        return any(
-            isinstance(m.cls, type) and issubclass(m.cls, BaseHTTPMiddleware)
-            for m in app.user_middleware
-        )
+        return any(isinstance(layer, BaseHTTPMiddleware) for layer in layers(app))
 
     app = create_app(serve_ui=True)
-    assert app.user_middleware, "the app has no user middleware, so this guard reads nothing"
-    assert not is_base(app), [m.cls for m in app.user_middleware]
+    walked = [type(layer).__name__ for layer in layers(app)]
+    # Non-vacuity: the walk got past the engine's own factories to the innermost Starlette layer.
+    assert "ExceptionMiddleware" in walked, walked
+    assert not is_base(app), walked
 
     @app.middleware("http")
     async def _probe_layer(request: Any, call_next: Any) -> Any:

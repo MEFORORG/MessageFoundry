@@ -1509,6 +1509,7 @@
       setBusy(true);
       if (progress) progress.textContent = "Starting…";
       var lines = 0;
+      var started = false;
       try {
         var resp = await fetch(url, {
           credentials: "same-origin",
@@ -1525,6 +1526,7 @@
           if (progress) progress.textContent = "Export failed (" + resp.status + ").";
           return;
         }
+        started = true;
         var reader = resp.body.getReader();
         var chunks = [];
         var bytes = 0;
@@ -1552,7 +1554,7 @@
       } catch (e) {
         if (e && e.name === "AbortError") {
           if (progress) progress.textContent = "Export stopped.";
-        } else if (progress && lines > 0) {
+        } else if (progress && started) {
           // The engine ends a download it stops mid-stream (a revoked session, a withdrawn
           // permission, a changed channel scope) as a failed transfer, so a stop lands here, not on
           // the "Saved" line above (BACKLOG #3907). The rows already read are not saved: a partial

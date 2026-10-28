@@ -555,8 +555,8 @@ _NO_STORE_PREFIXES = ("/messages", "/dead-letters", "/search", "/logs", "/upload
 #:
 #: TEMPLATES, because ``/connections/{name}/events`` cannot be written as a prefix without blanketing
 #: the whole ``/connections`` dashboard family — most of which returns no classified column. The
-#: middleware reads the template off ``request.scope["route"]``, which the router populates during
-#: ``call_next``. An exact set is safe here only because
+#: middleware reads the template off ``request.scope["route"]``, which the router populates before
+#: the response starts. An exact set is safe here only because
 #: ``tests/test_no_store_phi_coverage.py`` selects routes by what their response model CARRIES rather
 #: than by what permission gates it: a new classified route that nobody adds here reds that guard.
 #:
@@ -596,8 +596,8 @@ _ReasonInfo = TypeVar("_ReasonInfo", ConnectionEventInfo, AlertInstanceInfo)
 def _matched_route_path(request: Request) -> str | None:
     """The matched route's path TEMPLATE (``/connections/{name}/events``), or ``None``.
 
-    The router writes the matched route into the request scope while ``call_next`` runs, so this is
-    readable in a middleware only AFTER the downstream call returns. ``None`` covers a 404 (nothing
+    The router writes the matched route into the request scope before the endpoint runs, so a
+    middleware can read it from ``http.response.start`` on, never before it calls downstream. ``None`` covers a 404 (nothing
     matched) and a mount, neither of which is in :data:`_NO_STORE_ROUTE_PATHS`.
     """
     return getattr(request.scope.get("route"), "path", None)

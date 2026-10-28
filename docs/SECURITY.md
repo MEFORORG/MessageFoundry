@@ -4620,15 +4620,18 @@ on that session, for example) ends it as a revocation would.
   server log carries a WARNING with the counts beside that audit row, not an error with a
   traceback.
 
-  **A stop reaches the client as a failed download.** The 200 has already started, so the export
-  cannot change its status. It raises instead, and the server drops the connection with the body
-  unfinished. A client therefore sees a transfer that failed, never a short file that ends
-  normally. The console's export says it did not finish and saves nothing. A browser download of
-  the audit export shows as failed. The `messages_export.stopped` row and the server's WARNING
-  record how many rows were sent before the stop. This holds only while every middleware in the
-  engine's response path is pure ASGI: until BACKLOG #3907, two `@app.middleware("http")` layers
-  ended the response cleanly before the raise left them, so a stop arrived as a complete-looking
-  short file. `tests/test_export_stop_wire.py` measures both exports over a real server. The same
+  **A stop reaches an HTTP/1.1 client as a failed download.** The 200 has already started, so the
+  export cannot change its status. It raises instead, and the server drops the connection with the
+  chunked body unfinished, so the client sees a transfer that failed rather than a short file that
+  ends normally. `tests/test_export_stop_wire.py` measures both exports that way over cleartext
+  loopback, with uvicorn's h11 and httptools parsers. At least these are not measured: the
+  engine's TLS hop, a proxy in front, and an HTTP/1.0 client, whose body is framed by the
+  connection close, so a dropped connection can read as a normal end there. The file itself
+  carries no end marker, so a client that writes rows as they arrive (`curl -o`, for one) keeps
+  every row it received and must check that the transfer succeeded. The
+  `messages_export.stopped` row and the server's WARNING record how many rows the engine handed to
+  the server before the stop, which is not proof the client received them. This holds only while
+  every middleware in the engine's response path is pure ASGI; see `ExportStopped`. The same
   holds for the audit export below.
 
   While rows flow, the export moves the session's idle clock at most every quarter of the idle
