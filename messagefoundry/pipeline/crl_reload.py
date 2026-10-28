@@ -201,7 +201,7 @@ BAD_SIGNATURE = (
     "signature does not stop a start: unless another rule refuses the file, a start loads it "
     "with a warning, and each handshake then decides. That covers at least a CRL that names no "
     "key and a signature the engine cannot check with the key the CRL names, or, where it names "
-    "no listed CA's key, with some listed CA that fits it. The handshake passes where the peer's "
+    "no listed CA's key, with the key of some listed CA that fits it. The handshake passes where the peer's "
     "chain carries the CA that signed the CRL, as after a CA renews its key, and fails where it "
     "does not"
 )

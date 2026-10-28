@@ -910,8 +910,8 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     The flag is True when a listed CA fits the CRL and no CA judged verifies it, whether the check
     failed or could not run, and False when no listed CA fits. :class:`CrlSignature` says what
     "fits" means and which CAs are judged. A block with the True flag is reported over one with
-    the False flag, wherever it sits in the file. OpenSSL checks a CRL's signature at the handshake, not at the load. So OpenSSL
-    itself loads a CRL with the right issuer name and Authority Key Identifier but a bad
+    the False flag, wherever it sits in the file. OpenSSL checks a CRL's signature at the
+    handshake, not at the load. So OpenSSL itself loads a CRL with the right issuer name and Authority Key Identifier but a bad
     signature, and then every handshake it judges fails with ``CRL signature failure``. The
     running-hop reload calls this before a live load, because a load cannot be undone
     (BACKLOG #299).
@@ -992,12 +992,9 @@ def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
     signature over SHA-1 that the CA did make, and a handshake takes that CRL and judges the peer
     by it. Before #4159 such a signature read ``None``. A forged one reads False.
 
-    **True says the CA's key made the signature, not that every TLS library takes it.** The key
-    is asked through ``cryptography``'s own OpenSSL, and the handshake runs on the ``ssl``
-    module's, which can be another build with another policy. A policy that refuses the digest,
-    such as a system crypto policy that refuses SHA-1 signatures, fails the handshake on a CRL
-    read ``verified`` here. That holds for any verified signature, not only one
-    ``is_signature_valid`` refused; ``docs/CONFIGURATION.md`` states it beside the warn cases."""
+    True says the CA's key made the signature, not that every TLS library or policy takes it;
+    ``docs/CONFIGURATION.md`` states that residual, in the bullet on a signature the engine
+    cannot check."""
     try:
         key = ca.public_key()
         if crl.is_signature_valid(key):  # type: ignore[arg-type]

@@ -2056,10 +2056,10 @@ three cases warn:
   shape, where the peer sends the renewed CA certified by the old key.
 - The engine cannot check the signature with a fitting listed CA's key, at least where it does
   not support that algorithm or that pairing of key and signature, or where reading the key or
-  checking with it raises an error. Where the CRL names a listed CA's key, only that CA counts
-  here (the paragraph that starts "Why a CA with no subject key identifier" says why). Where it
-  names no listed CA's key, as when it names a key no listed CA carries, every fitting CA counts,
-  one with no subject key identifier included. A measured example is an ECDSA signature on a CRL
+  checking with it raises an error. Where the CRL names the key of a listed CA that fits it, only
+  such a CA counts here (the paragraph that starts "Why a CA with no subject key identifier" says
+  why). Where it names no such CA's key, as when it names a key no listed CA carries, every
+  fitting CA counts, one with no subject key identifier included. A measured example is an ECDSA signature on a CRL
   that names an RSA key. A signature the CA's key accepts is verified even where the
   `cryptography` library's own check refuses it, as for an RSA signature over SHA-1 that the CA
   did make; OpenSSL 3.5.7 was measured to judge a peer by such a CRL (vault BACKLOG #4159).

@@ -570,8 +570,20 @@ def test_a_crl_its_named_ca_proves_bad_refuses_beside_a_ca_with_no_ski_that_veri
     # no SKI whose key could also verify this CRL must be of the CRL's kind, and so of the leaf's.
     raw = _raw_hop(mixed, twins.crl)
     assert raw.verify_flags & ssl.VERIFY_X509_STRICT
-    with pytest.raises(ssl.SSLError, match="CRL signature failure|Missing Subject Key Identifier"):
+    with pytest.raises(
+        ssl.SSLError, match="CRL signature failure|Missing Subject Key Identifier"
+    ) as on_bad:
         _handshake(raw, twins.server(sends_renewed=False))
+    # Which order this runtime took decides what a CRL the named CA signed must do. Where this
+    # CRL was reached and failed, that one passes, so the CRL was the fault. Where the chain failed
+    # on the missing SKI, that one fails the same way, so the CRL was never consulted.
+    twins.write_crl("new", "new")
+    good = _raw_hop(mixed, twins.crl)
+    if "CRL signature failure" in str(on_bad.value):
+        _handshake(good, twins.server(sends_renewed=False))  # raises if refused
+    else:
+        with pytest.raises(ssl.SSLError, match="Missing Subject Key Identifier"):
+            _handshake(good, twins.server(sends_renewed=False))
 
 
 def test_a_strict_engine_context_refuses_a_chain_through_a_ca_with_no_ski(tmp_path: Path) -> None:
@@ -1109,9 +1121,10 @@ def test_one_signer_gets_one_verdict_under_sha256_and_sha1(
     """Finding 2 of the Lander's covering review on engine PR 2585. A ``None`` from
     :func:`messagefoundry.pki._verifies` meant either a key the engine cannot check or a signature
     the key accepts that ``cryptography``'s own check refused, and SHA-1 is refused there. So one
-    signer's verdict could differ by digest alone: a CA with no SKI signing beside the named CA
-    read ``verified`` over SHA-256 and ``bad`` over SHA-1, and the named CA signing read
-    ``verified`` and ``uncheckable``. Each row now gives one verdict for both digests."""
+    signer's verdict could differ by digest alone. On main, a CA with no SKI signing beside the
+    named CA read ``verified`` over SHA-256 and ``uncheckable`` over SHA-1, and so did the named
+    CA signing; the head the review read gave ``bad`` over SHA-1 for the first. Each row now
+    gives one verdict for both digests."""
     keys = {"named": _rsa_key(0), "no-ski": _rsa_key(1)}
     cas = {"named": _ca(keys["named"], keys["named"]), "no-ski": _ca_without_ski(keys["no-ski"])}
     shape = _crl(keys[signer], names=None if names is None else keys[names])

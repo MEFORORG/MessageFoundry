@@ -571,9 +571,9 @@ _UNCONFIRMED_SIGNATURE = {
         "name that CA's key, so a renewed CA key could explain it"
     ),
     "uncheckable": (
-        "the engine cannot check its signature with the key of the listed CA the CRL names by key "
-        "identifier or, where the CRL names no listed CA's key, with the key of some listed CA "
-        "that fits it"
+        "the engine cannot check its signature with the key of a listed CA that fits it and whose "
+        "key the CRL names by key identifier or, where it names no such CA's key, with the key of "
+        "some listed CA that fits it"
     ),
 }
 #: How many CRLs that warning describes before it only counts the rest.
