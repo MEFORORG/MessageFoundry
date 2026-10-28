@@ -204,15 +204,17 @@ def test_a_refusal_naming_many_retargets_is_bounded(anon: ModuleType, tmp_path: 
 
 
 @_BOTH
-@pytest.mark.parametrize("key", [_ACK, "keep", "drop"])
+@pytest.mark.parametrize("key", [_ACK, "keep", "drop", "Keep", "DROP"])
 def test_a_list_key_written_under_fields_gets_a_hint(
     anon: ModuleType, tmp_path: Path, key: str
 ) -> None:
     # In TOML a key after the [hl7.fields] header belongs to that table.
     body = f'[hl7.fields]\n"PID-5" = "id"\n{key} = ["PID-5"]\n'
     message = _refusal(anon.rules, _overlay(tmp_path, body))
-    assert f"[hl7.fields] holds {key}, which belongs under [hl7]" in message
-    assert "not a whole-field HL7 address" not in message
+    assert f"[hl7.fields] holds ['{key}'], which belongs under [hl7]" in message
+    assert "Put it under an [hl7] header" in message
+    # Before the hint, the list was read as a field rule's kind and refused as not a string.
+    assert "must name a surrogate kind" not in message
 
 
 @_BOTH

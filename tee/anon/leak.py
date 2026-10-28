@@ -667,7 +667,8 @@ def leak_check(
 ) -> list[str]:
     """Forbidden-token + structural PHI hits in ``text`` (empty list = clean) — a thin wrapper over
     :func:`leak_report`. ``rules`` scopes the structural PHI-shape detectors to the fields no rule
-    matched and to what a retarget left; omitting it (a bare-string call) runs the legacy token-only check. A caller that
+    matched and to what a retarget left; omitting it (a bare-string call) runs the legacy
+    token-only check. A caller that
     ran ``anonymize`` itself passes ``version=message_version(raw)``, as :func:`leak_report` says.
     """
     return leak_report(text, rules=rules, version=version).hits
@@ -691,6 +692,15 @@ def denylist_is_live(report: LeakReport) -> bool:
     return report.token_tables_live and report.token_floor_reason is None
 
 
+#: What to do about a hit in what a retarget left. A keep would leave the whole field instead.
+RETARGET_ADVICE = "Point each retargeted field back at its default kind, or at drop or freetext."
+
+
+def has_retarget_residue(report: LeakReport) -> bool:
+    """True if ``report`` holds a hit from :func:`retarget_residue_hits`."""
+    return any(RETARGET_RESIDUE in hit for hit in report.structural_hits)
+
+
 def refusal_advice(
     report: LeakReport, *, denylist_refused: bool = False, coverage_refused: bool = False
 ) -> str:
@@ -699,16 +709,13 @@ def refusal_advice(
     (BACKLOG #2247). PHI-safe: fixed text, chosen by the kind of hit and never by a value."""
     steps: list[str] = []
     token_hit = len(report.hits) > len(report.structural_hits)
-    residue_hit = any(RETARGET_RESIDUE in hit for hit in report.structural_hits)
     shape_hit = any(
         hit != MALFORMED_LINE_HIT and RETARGET_RESIDUE not in hit for hit in report.structural_hits
     )
     if token_hit or shape_hit:
         steps.append("Extend the rule map so the field that carries it is scrubbed.")
-    if residue_hit:
-        steps.append(
-            "Point each retargeted field back at its default kind, or at drop or freetext."
-        )
+    if has_retarget_residue(report):
+        steps.append(RETARGET_ADVICE)
     if coverage_refused:
         steps.append("Add a rule for each field named, or a keep for one you reviewed.")
         if any(address.endswith(BARE_LINE) for address in report.undecided_fields):

@@ -48,7 +48,7 @@ from pathlib import Path
 from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
-from tee.anon.leak import RETARGET_RESIDUE, CoverageTally, LeakReport
+from tee.anon.leak import RETARGET_ADVICE, CoverageTally, LeakReport, has_retarget_residue
 from tee.anon.rules import (
     RETARGET_ACKNOWLEDGED,
     AnonError,
@@ -697,8 +697,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         )
     # Printed for the same reason. load_rules refused every retarget the overlay did not list under
     # [hl7].retarget_acknowledged, so each one here was listed. A different kind can still leave
-    # part of a field in the dataset while the leak-check counts the field as scrubbed (BACKLOG
-    # #3000).
+    # part of a field in the dataset, and the leak-check scans what is left only for a dashed SSN
+    # or a punctuated phone (BACKLOG #3000, #3493).
     retargeted = retargeted_defaults(rules)
     if retargeted:
         print(
@@ -723,7 +723,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     def _tally(report: LeakReport) -> None:
         nonlocal residue_reports
         coverage.add(report)
-        residue_reports += any(RETARGET_RESIDUE in hit for hit in report.structural_hits)
+        residue_reports += has_retarget_residue(report)
 
     for row in rows:
         text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
@@ -774,20 +774,23 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             if coverage.refused
             else ""
         )
-        first_step = (
-            f"{residue_reports} of them carried a PHI shape that a retarget of a default field "
-            "left past its first component: point each retargeted field back at its default "
-            "kind, or at drop or freetext. A keep would leave the whole field. For any other, "
-            "extend"
-            if residue_reports
-            else "Extend"
-        )
+        steps = [
+            "Extend the rule map or add a keep in an anon.toml overlay, or repair each line no "
+            "rule can reach (a malformed segment id, or a header line with no separator after "
+            "its encoding characters), then retry."
+        ]
+        if residue_reports:
+            # A keep is the wrong advice here: it would leave the whole field.
+            steps = [
+                f"{residue_reports} of them carried a PHI shape that a retarget of a default field "
+                f"left past its first component. {RETARGET_ADVICE} A keep would leave the whole "
+                "field.",
+                *(["For the others:", *steps] if residue_reports < failed else ["Then retry."]),
+            ]
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "
             "forbidden token or had a field nobody decided — refusing to write a dataset (fail "
-            f"closed). {before_check}{first_step} the rule map or add a keep in an anon.toml "
-            "overlay, or repair each line no rule can reach (a malformed segment id, or a header line "
-            "with no separator after its encoding characters), then retry.",
+            f"closed). {before_check}{' '.join(steps)}",
             file=sys.stderr,
         )
         return 1

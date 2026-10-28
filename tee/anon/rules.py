@@ -255,7 +255,8 @@ RETARGET_ACKNOWLEDGED = "retarget_acknowledged"
 _RETARGETS_NAMED = 3
 
 #: The ``[hl7]`` keys an overlay can write by mistake under ``[hl7.fields]``: in TOML, a key after
-#: that header belongs to it. Each is named with a hint rather than refused as a bad field path.
+#: that header belongs to it. Each is named with a hint, matched in any case, rather than refused
+#: as a field rule whose kind is not a string.
 _HL7_LIST_KEYS = frozenset({"keep", "drop", RETARGET_ACKNOWLEDGED})
 
 
@@ -425,12 +426,13 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     fields = hl7.get("fields", {})
     if not isinstance(fields, dict):
         raise RuleError("anon overlay [hl7.fields] must be a table of path = kind")
-    misplaced = sorted(_HL7_LIST_KEYS.intersection(fields))
+    misplaced = sorted(key for key in fields if key.lower() in _HL7_LIST_KEYS)
     if misplaced:
         raise RuleError(
-            f"anon overlay [hl7.fields] holds {', '.join(misplaced)}, which belongs under [hl7]. "
-            "In TOML a key written after the [hl7.fields] header is part of that table, so move "
-            "it above that header"
+            f"anon overlay [hl7.fields] holds {_quoted(misplaced)}, which belongs under [hl7]. "
+            "In TOML a key written after the [hl7.fields] header is part of that table. Put it "
+            "under an [hl7] header, written in lower case, and merge it into a list of that name "
+            "already there"
         )
     effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     for path, raw_kind in fields.items():
@@ -534,7 +536,8 @@ def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, 
     ``(default rule, last rule on that path)``, in :data:`DEFAULT_RULES` order.
 
     The kinds do not rewrite the same parts of a field, so a retarget can leave part of a real
-    value behind while the leak-check still counts the field as scrubbed. ``id``, ``mrn`` and
+    value behind, and the leak-check scans what is left only for a dashed SSN or a punctuated
+    phone (``leak.retarget_residue_hits``). ``id``, ``mrn`` and
     ``ssn`` rewrite the first component only: on ``PID-5`` that leaves the given name, on
     ``PID-11`` the city and postal code, on ``PV1-7`` the clinician's name. ``date`` keeps the
     year, so on ``PID-7`` it keeps the birth year. No ordering of the kinds says which retarget is

@@ -212,29 +212,43 @@ def test_retargeting_a_default_scrubbed_field_is_printed(
     assert "JOHN" not in line
 
 
-@pytest.mark.parametrize("with_residue", [True, False], ids=["residue", "control"])
+_RESIDUE_ROW = "PID|1||999^^^H^MR||DOE^JOHN||19800101|M|||||5550100^PRN^PH^^^^^^(555) 555-0199"
+_SSN_ROW = "PID|1||999^^^H^MR||DOE^JOHN||19800101|M\rZPD|123-45-6789"
+_TOLD = "point each retargeted field back at its default kind, or at drop or freetext"
+_GENERAL = "xtend the rule map or add a keep"
+
+
+@pytest.mark.parametrize(
+    ("rows", "residue", "general"),
+    [
+        ((_RESIDUE_ROW,), True, False),
+        ((_RESIDUE_ROW, _SSN_ROW), True, True),
+        ((_SSN_ROW,), False, True),
+    ],
+    ids=["residue", "mixed", "control"],
+)
 def test_a_residue_refusal_is_not_told_to_add_a_keep(
-    with_residue: bool,
+    rows: tuple[str, ...],
+    residue: bool,
+    general: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     # An acknowledged retarget of PID-13 to id leaves XTN.9, which here holds a punctuated phone
     # number, so the leak-check refuses the row. A keep would leave the whole field, so the run
-    # line names the right fix first (BACKLOG #3493). The control row carries a dashed SSN in an
-    # unmapped field instead, and gets the advice it always had.
+    # line names the right fix (BACKLOG #3493), and gives the old advice only for other refusals.
+    # The control row carries a dashed SSN in an unmapped field, and gets the advice it always had.
     path = str(tmp_path / "residue.db")
-    pid = (
-        "PID|1||999^^^H^MR||DOE^JOHN||19800101|M|||||5550100^PRN^PH^^^^^^(555) 555-0199"
-        if with_residue
-        else "PID|1||999^^^H^MR||DOE^JOHN||19800101|M\rZPD|123-45-6789"
-    )
-    raw = f"MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|R1|P|2.5.1\r{pid}".encode("latin-1")
 
     async def seed() -> None:
         store = await RelayStore.open(path)
         try:
-            await store.record_capture(direction="corepoint_copy", control_id="R1", raw=raw)
+            for n, row in enumerate(rows):
+                raw = f"MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|R{n}|P|2.5.1\r{row}"
+                await store.record_capture(
+                    direction="corepoint_copy", control_id=f"R{n}", raw=raw.encode("latin-1")
+                )
         finally:
             await store.close()
 
@@ -247,12 +261,11 @@ def test_a_residue_refusal_is_not_told_to_add_a_keep(
     assert _run(path, tmp_path / "ds.jsonl", "--overlay", overlay) == 1
 
     (error,) = [line for line in capsys.readouterr().err.splitlines() if line.startswith("error:")]
-    told = "point each retargeted field back at its default kind, or at drop or freetext"
-    assert (told in error) is with_residue
-    assert ("A keep would leave the whole field. For any other, extend the rule map" in error) is (
-        with_residue
-    )
-    assert ("Extend the rule map or add a keep" in error) is not with_residue
+    assert (_TOLD.capitalize() in error) is residue
+    assert ("A keep would leave the whole field." in error) is residue
+    assert (_GENERAL in error) is general
+    assert ("For the others: Extend" in error) is (residue and general)
+    assert ("Then retry." in error) is (residue and not general)
     assert "555-0199" not in error
 
 
