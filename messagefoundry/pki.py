@@ -439,25 +439,21 @@ class CrlSignature:
     :func:`_issuer_name_key` names, so every text that describes ``unlisted`` must stay true of
     a CA OpenSSL takes for the issuer and this test does not.
 
-    * ``verified``: a CA that fits verifies the CRL.
-    * ``bad``: **proven** badly signed. The CRL's key identifier equals a fitting CA's Subject Key
-      Identifier, every fitting CA so named was checked and its key does not verify the CRL, and
-      no fitting CA verifies it. The CRL names that key, and that key did not sign it. A fitting
-      CA with no Subject Key Identifier that could not be checked does not lift this to
-      ``uncheckable`` (vault BACKLOG #4159, the reading of #2905 item 1 decided 2026-10-26). The
-      reason: the verifying engine contexts set ``VERIFY_X509_STRICT``, by the decision's
-      reading of the call sites, and under it OpenSSL 3 refuses a chain of two or more
-      certificates through a CA with no Subject Key Identifier, so such a CA cannot make the CRL
-      valid for that chain. Measured 2026-10-27 on CPython 3.14.7 with OpenSSL 3.5.7. **At least two residuals, where the start refuses a CRL a
-      handshake could pass.** OpenSSL skips its strict checks on a one-certificate chain: a peer
-      that presents a self-signed CA with no Subject Key Identifier, listed here, passed a strict
-      handshake judged by a CRL that CA signed, measured the same day. And an OpenSSL build or a
-      context without the strict check could take such a CA for the issuer; the engine sets no
-      OpenSSL floor. A fitting CA with no Subject Key Identifier that verifies the CRL still
-      makes it ``verified``.
-    * ``uncheckable``: no fitting CA verifies, and some fitting CA could not be checked: one the
-      CRL names by key identifier, or, where the CRL names no fitting CA's key, any. "Cannot check"
-      is not "does not verify" (:func:`_verifies`).
+    Where the CRL's key identifier equals some fitting CA's Subject Key Identifier, the CRL
+    **names** that CA, and only the named CAs are judged; otherwise every fitting CA is. A
+    fitting CA with no Subject Key Identifier then counts for nothing, whether its key verifies
+    the CRL, does not, or cannot be checked (vault BACKLOG #4159, the reading of #2905 item 1
+    decided 2026-10-26). Why, and the residuals where that refuses at start a CRL a handshake
+    could pass, are stated once, in
+    ``docs/CONFIGURATION.md``, in the paragraph that starts "Why a CA with no subject key
+    identifier counts for nothing there".
+
+    * ``verified``: a CA that is judged verifies the CRL.
+    * ``bad``: **proven** badly signed. The CRL names a fitting CA, and every named CA was checked
+      and its key does not verify the CRL. The CRL names that key, and that key did not sign it.
+    * ``uncheckable``: no judged CA verifies, and some judged CA could not be checked: one the CRL
+      names, or, where it names none, any fitting CA. "Cannot check" is not "does not verify"
+      (:func:`_verifies`).
     * ``unproven``: every fitting CA was checked and none verifies, but the CRL names none of them
       by key identifier. A CRL with no key identifier fits every CA of that name. So a CA that
       renewed its key reads this way, while the peer's own chain may still carry the CA that
@@ -869,31 +865,31 @@ def _signature_state(
         akid = _crl_extensions(crl).akid  # once per CRL, not once per CA
     except _UNREADABLE_CA:
         return "unlisted"  # its extensions do not read: no CA is shown to fit
-    fitting = False
-    named = False  # the CRL names some fitting CA's key
-    unchecked = False
-    named_unchecked = False  # a CA whose key the CRL names could not be checked
+    fitting: list[x509.Certificate] = []
+    named: list[x509.Certificate] = []  # the fitting CAs whose key the CRL names
     for ca in named_cas:
         try:
             names_key = _akid_fit(akid, ca)
         except _UNREADABLE_CA:
             continue  # the CA's extensions or its issuer name do not read: not shown to fit
-        if names_key is None:
-            continue
-        fitting = True
-        named = named or names_key
-        answer = _verifies(crl, ca.cert)
+        if names_key is not None:
+            fitting.append(ca.cert)
+            if names_key:
+                named.append(ca.cert)
+    if not fitting:
+        return "unlisted"
+    # Where the CRL names a key, _akid_fit drops a CA whose identifier differs, so a fitting CA it
+    # does not name carries none. Only the named CAs are tried then, whatever the other's key
+    # would say, and whatever the CA-file order (vault BACKLOG #4159); CrlSignature says why.
+    unchecked = False
+    for cert in named or fitting:
+        answer = _verifies(crl, cert)
         if answer:
             return "verified"
         unchecked = unchecked or answer is None
-        named_unchecked = named_unchecked or (answer is None and names_key)
-    if not fitting:
-        return "unlisted"
-    if named:
-        # Where the CRL names a key, _akid_fit drops a CA whose identifier differs, so a fitting
-        # CA it does not name carries none; CrlSignature says why that one cannot lift ``bad``.
-        return "uncheckable" if named_unchecked else "bad"
-    return "uncheckable" if unchecked else "unproven"
+    if unchecked:
+        return "uncheckable"
+    return "bad" if named else "unproven"
 
 
 #: Why a CRL reads :class:`CrlSignature` state ``unlisted``, for a start's warning and a reload's
@@ -911,10 +907,10 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     """Why a CA in ``ca_ders`` is not confirmed to have signed some CRL in ``pem``, or ``None``
     when each CRL is confirmed.
 
-    The flag is True when a listed CA fits the CRL and none verifies it, whether the check failed
-    or could not run, and False when no listed CA fits. :class:`CrlSignature` says what "fits"
-    means. A block with the True flag is reported over one with the False flag, wherever it sits
-    in the file. OpenSSL checks a CRL's signature at the handshake, not at the load. So OpenSSL
+    The flag is True when a listed CA fits the CRL and no CA judged verifies it, whether the check
+    failed or could not run, and False when no listed CA fits. :class:`CrlSignature` says what
+    "fits" means and which CAs are judged. A block with the True flag is reported over one with
+    the False flag, wherever it sits in the file. OpenSSL checks a CRL's signature at the handshake, not at the load. So OpenSSL
     itself loads a CRL with the right issuer name and Authority Key Identifier but a bad
     signature, and then every handshake it judges fails with ``CRL signature failure``. The
     running-hop reload calls this before a live load, because a load cannot be undone
@@ -983,12 +979,16 @@ def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
     ``is_signature_valid`` answers False for a signature it cannot check as well as for one that
     fails, because it turns every error inside its own verification into False. So a False from
     it is not proof. The key is then asked directly (:func:`_verify_with`), and only its
-    ``InvalidSignature`` counts as proof. Everything else is ``None``: a key or an algorithm
-    ``cryptography`` does not support, a key of another kind than the signature, and a
-    ``ValueError`` or ``TypeError`` from either call. So is a signature the key accepts after
-    ``is_signature_valid`` refused it. Measured 2026-10-13 with ``cryptography`` 50.0.2: an RSA
-    PKCS1v15 signature over SHA-1 that the CA did make reads ``None`` that way, and a forged one
-    reads False."""
+    ``InvalidSignature`` counts as proof. ``None`` is only what the key cannot be asked: a key or
+    an algorithm ``cryptography`` does not support, a key of another kind than the signature, and
+    a ``ValueError`` or ``TypeError`` from either call.
+
+    **A signature the key accepts is True, even where ``is_signature_valid`` refused it** (vault
+    BACKLOG #4159). The key's own check passed, so the key made the signature, and a verdict that
+    followed the refusal would differ for one signer by digest alone. Measured 2026-10-27
+    with ``cryptography`` 50.0.2 and OpenSSL 3.5.7: ``is_signature_valid`` refuses an RSA PKCS1v15
+    signature over SHA-1 that the CA did make, and a handshake takes that CRL and judges the peer
+    by it. Before #4159 such a signature read ``None``. A forged one reads False."""
     try:
         key = ca.public_key()
         if crl.is_signature_valid(key):  # type: ignore[arg-type]
@@ -998,7 +998,7 @@ def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
         return False
     except (ValueError, TypeError, UnsupportedAlgorithm):
         return None
-    return None  # the key accepts what ``is_signature_valid`` refused: no proof either way
+    return True  # the key accepts what ``is_signature_valid`` refused, as for SHA-1 above
 
 
 _DSA_SIGNATURES = frozenset(

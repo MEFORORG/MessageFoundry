@@ -2001,19 +2001,29 @@ otherwise (the first bullet below says what that leaves out). The CRL names that
 key identifier. The engine ran the signature check with that key, and the check failed. Where
 several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
-authority key identifier and that carries a subject key identifier, and no fitting CA may
-verify the CRL. A fitting CA with no subject key identifier that the engine cannot check does not
-stop the refusal (vault BACKLOG #4159). The verifying contexts the engine builds use strict
-verification, as read from their call sites and measured for at least the outbound one. Under it
-OpenSSL 3 refuses a chain of two or more certificates through such a CA, so it cannot make the
-CRL valid for that chain. At least two cases are left where the start refuses a CRL that a
-handshake could pass. OpenSSL skips its strict checks when the peer presents one certificate: a
-peer whose certificate is such a self-signed CA, listed for the hop, was measured to pass a strict
-handshake judged by a CRL that CA signed. And an OpenSSL build without the strict check could take
-such a CA for the CRL's issuer; the engine sets no OpenSSL version floor. A handshake whose chain
-runs through the named CA, judged by such a CRL, fails with `CRL signature failure`, an error that
-does not name the file. The refusal names the setting, the file and the CRL. Give the setting the CRL that CA signed. No setting turns this check off, as for
-an expired CRL.
+authority key identifier and that carries the subject key identifier the CRL names. A fitting CA
+with no subject key identifier counts for nothing then, whether its key verifies the CRL, does
+not, or cannot be checked (vault BACKLOG #4159). A handshake whose chain runs through the named CA
+and that OpenSSL judges by such a CRL fails with `CRL signature failure`, an error that does not
+name the file. The refusal names the setting, the file and the CRL. Give the setting the CRL that
+CA signed. No setting turns this check off, as for an expired CRL.
+
+**Why a CA with no subject key identifier counts for nothing there, and where that refuses a CRL a
+handshake could pass.** This paragraph is the one statement of that premise and its residuals;
+the code and the changelog point here. The verifying contexts the engine builds set OpenSSL's
+strict verification, as read from their call sites and measured for at least the outbound one.
+Under it OpenSSL 3 refuses a verified chain of two or more certificates through a CA with no
+subject key identifier, so such a CA cannot make the CRL valid for that chain. At least two cases
+are left where the start refuses a CRL that a handshake could pass:
+
+- OpenSSL skips those strict checks where the chain it verifies is one certificate long. That is
+  the length of the chain it builds, which ends at a listed CA, not the number of certificates the
+  peer sends. So a peer whose own certificate is such a CA, self-signed and listed for the hop,
+  passes. It was measured, on CPython 3.14.7 with OpenSSL 3.5.7, to pass a strict handshake judged
+  by a CRL that CA signed and that names the key of another listed CA of the same name, a CRL the
+  start refuses.
+- An OpenSSL build or a verifying context without the strict check could take such a CA for the
+  CRL's issuer. The engine sets no OpenSSL version floor.
 
 The check reads only the file a CRL setting names. A CRL can also reach a hop through its CA file
 alone, on at least the hops that the paragraph on a CRL inside a CA file, further down, names. The
@@ -2044,11 +2054,14 @@ three cases warn:
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
-- The engine cannot check the signature with the listed CA's key, even where the CRL names that key.
-  Where the CRL names a listed CA's key, only that CA counts here; a CA of that name with no subject
-  key identifier that cannot be checked does not (the refusal above says why). Two measured
-  examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature over SHA-1
-  that the CA did make.
+- The engine cannot check the signature with a fitting listed CA's key, because it does not support
+  that algorithm or that pairing of key and signature. Where the CRL names a listed CA's key, only
+  that CA counts here (the refusal above says why). Where it names no listed CA's key, as when it
+  names a key no listed CA carries, every fitting CA counts, one with no subject key identifier
+  included. A measured example is an ECDSA signature on a CRL that names an RSA key. A signature
+  the CA's key accepts is verified even where the `cryptography` library's own check refuses it,
+  as for an RSA signature over SHA-1 that the CA did make; OpenSSL 3.5.7 was measured to judge a
+  peer by such a CRL (vault BACKLOG #4159).
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
 it judged before the failure is proved badly signed, which refuses the file. Where it loads, the

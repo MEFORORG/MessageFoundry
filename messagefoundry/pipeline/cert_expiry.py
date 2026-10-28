@@ -772,8 +772,8 @@ def _ca_file_crl_refusal(
         return (
             "whose CA file now holds a CRL that the CA key it names does not verify",
             "Replace the CRL in the CA file with one its CA signed before restarting: a handshake "
-            "OpenSSL judges by it fails. If a good CRL from that issuer is already in the file, "
-            "remove this one instead",
+            "OpenSSL judges by it through the CA it names fails. If a good CRL from that issuer "
+            "is already in the file, remove this one instead",
         )
     if states - _PASSING - _UNCONFIRMED:
         # A state this scan does not name, beside any other: never a pass and never the weaker
