@@ -1026,7 +1026,7 @@ about a missing or failing forwarder two ways (BACKLOG #2612).
   - `dropping`: a loss count rose. The reason names which. `count` is `lost` from the status
     field below: the records the engine has counted as lost since the process started. It is a
     floor, because some losses are not counted. An audit tee line dropped because the audit
-    lane was full adds `audit_queue_full` to the reason, beside `queue_full`.
+    lane was full adds `audit_queue_full` to the reason, as well as `queue_full`.
   - `spool_unreadable`: a read of the on-disk spool failed. The spool keeps its records, and
     they are not sent until a read succeeds.
   - `not_sending`: every check for five minutes found `send_failing` true, and a send has
@@ -1076,14 +1076,14 @@ its own forwarder and watches its own: every engine shard, and a cluster standby
 
 **Audit tee lines have their own lane of that queue** (vault BACKLOG #2612). Each lane holds up
 to 10,000 records, so a flood of general log lines against a collector that is not taking them
-fills the general lane and leaves the audit lane room. The forwarder sends the next audit line
-before the next general one, so an audit line can reach the collector ahead of a general line
-logged before it. The line's own time stamp has whole seconds only, so it cannot restore the
+fills the general lane and leaves the audit lane room. The forwarder sends audit lines first, up
+to four in a row while a general line waits, so an audit line can reach the collector ahead of a
+general line logged before it. The line's own time stamp has whole seconds only, so it cannot restore the
 order of two lines logged in the same second; an audit line's JSON body carries a `ts` with
 fractions of a second, and a general line has nothing like it. `queue_dropped` counts drops from
 both lanes, and `lost` counts each once. The audit lane fills on audit traffic alone, and the
 alert reason above says when it has. The drop warning in the engine log names dropped audit
-lines without counting them. Both lanes share one sending thread, one connection and one on-disk
+lines but never counts them on their own. Both lanes share one sending thread, one connection and one on-disk
 spool, so a full spool refuses audit lines as it refuses general ones.
 `GET /status` reports the process that answered.
 

@@ -108,7 +108,7 @@ def _report_tee_failure() -> None:
     failed tees counts the rows written, the hidden lock rows included. A later line says only that
     a tee failed again, so it tells a reader at most that an audit row was written, once per
     interval. That timing is the residual ``docs/SECURITY.md`` names. The first line carries the
-    traceback; later ones carry none, not even the exception type, which could differ by row kind."""
+    traceback, as it did before #2612; later ones carry no traceback and no exception type."""
     global _tee_failure_reported_at
     now = time.monotonic()
     with _tee_failure_lock:

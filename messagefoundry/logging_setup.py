@@ -568,6 +568,9 @@ _FORWARD_QUEUE_MAXSIZE = 10_000
 #: :data:`AUDIT_LOGGER_NAME` use it, so only audit traffic can fill it.
 _FORWARD_AUDIT_QUEUE_MAXSIZE = 10_000
 
+#: The most audit lines :class:`_ForwardLanes` sends in a row while a general record waits.
+_FORWARD_AUDIT_BURST = 4
+
 #: The logger the off-box audit tee writes to (:mod:`messagefoundry.store.audit_tee`). Defined here
 #: because the forwarder routes on it, and that module already imports this one.
 AUDIT_LOGGER_NAME = "messagefoundry.audit"
@@ -984,11 +987,13 @@ class _ForwardLanes(queue.Queue[Any]):
     is not draining fills the general lane and drops general records, and the audit lane still has
     room. With one shared queue, the flood dropped the audit lines too.
 
-    ``get`` takes from the audit lane first. So under a flood the next record sent is an audit
-    line, and an audit line can reach the collector ahead of a general line logged before it. A
-    reader orders the two streams by their timestamps, not by arrival. A sustained stream of audit
-    rows holds general lines back; only audit traffic can do that, and the general lane's bound
-    still applies to them.
+    ``get`` takes from the audit lane first, but at most :data:`_FORWARD_AUDIT_BURST` audit lines in
+    a row while a general record waits. So an audit line can reach the collector ahead of a general
+    line logged before it, and the time stamps cannot always undo that: a line's own stamp has whole
+    seconds only. The cap is there because failed sign-ins write audit rows, so an unauthenticated
+    client can drive the audit rate; uncapped, it would hold every general line back, the
+    forwarder's own drop reports included. The stop sentinel is served only once the audit lane is
+    empty, so a clean stop never leaves an audit line behind it.
 
     The bound is checked in :meth:`_put`, under the queue's own lock, and raises ``queue.Full``
     there. The base ``put`` raises it before it counts the item, so a refused record leaves no
@@ -1006,6 +1011,8 @@ class _ForwardLanes(queue.Queue[Any]):
     def _init(self, maxsize: int) -> None:
         super()._init(maxsize)
         self.audit: collections.deque[Any] = collections.deque()
+        #: Audit lines served in a row since the last general record. Read under the queue's lock.
+        self._audit_run = 0
 
     def _qsize(self) -> int:
         return len(self.queue) + len(self.audit)
@@ -1018,7 +1025,13 @@ class _ForwardLanes(queue.Queue[Any]):
         lane.append(item)
 
     def _get(self) -> Any:
-        return self.audit.popleft() if self.audit else self.queue.popleft()
+        if self.audit and (
+            not self.queue or self.queue[0] is None or self._audit_run < _FORWARD_AUDIT_BURST
+        ):
+            self._audit_run += 1
+            return self.audit.popleft()
+        self._audit_run = 0
+        return self.queue.popleft()
 
 
 class _ForwardQueueListener(logging.handlers.QueueListener):
@@ -1459,34 +1472,26 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
                 audit_total,
             )
             self._dropped_since_report = 0
-        # The numbers in this line count GENERAL records only. A count of dropped audit tee lines
-        # counts the audit rows written, the hidden lock rows included, and this line reaches
-        # ``GET /logs/tail`` (BACKLOG #1131). So an audit drop is named, never counted.
-        general_batch, general_total = batch - audit_batch, total - audit_total
+        # The audit lines among these drops are named, not counted on their own (BACKLOG #1131):
+        # that count is the audit rows written, the hidden lock rows included, and this line
+        # reaches ``GET /logs/tail``. The totals stay combined, as ``queue_dropped`` on ``GET
+        # /status`` is, because a general-only total minus that field is the same count.
         audit_note = (
-            " Audit tee lines were dropped as well, because their own lane of the queue is full."
+            " Audit tee lines were among them: their own lane of the queue is full."
             if audit_batch
             else ""
         )
         self._reporting.active = True
         try:
-            if general_batch:
-                _log.warning(
-                    "off-box log forwarding dropped %d record(s) of general log traffic: the hand-off "
-                    "queue is full (depth %d) because the collector is not draining it; %d dropped "
-                    "since this process started, audit tee lines not counted. Evidence for this "
-                    "window does not reach the collector.%s",
-                    general_batch,
-                    _FORWARD_QUEUE_MAXSIZE,
-                    general_total,
-                    audit_note,
-                )
-            else:
-                _log.warning(
-                    "off-box log forwarding dropped audit tee lines: their lane of the hand-off "
-                    "queue is full because the collector is not draining it. Evidence for this "
-                    "window does not reach the collector."
-                )
+            _log.warning(
+                "off-box log forwarding dropped %d record(s): the hand-off queue is full (depth %d) "
+                "because the collector is not draining it; %d dropped since this process started. "
+                "Evidence for this window does not reach the collector.%s",
+                batch,
+                _FORWARD_QUEUE_MAXSIZE,
+                total,
+                audit_note,
+            )
         finally:
             self._reporting.active = False
 
@@ -1736,8 +1741,9 @@ def forwarder_status() -> ForwarderStatus:
     """Read the forwarder's health from memory. It touches no socket and no disk, so it is safe on
     the event loop and still answers when the collector does not.
 
-    The counters belong to other threads and are read without their locks. Each is one integer
-    that only goes up, so a reading is at worst one record behind."""
+    The counters belong to other threads. Each is one integer that only goes up, so a reading is
+    at worst one record behind. The two drop counters are the exception and are read together
+    under their lock, so the audit part can never read ahead of the total it is part of."""
     configured, start_failure = _forward_configured, _forward_start_failure
     confirmed = _forward_delivery_confirmed
     for handler in logging.getLogger().handlers:

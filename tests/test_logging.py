@@ -1384,24 +1384,63 @@ def test_the_drop_report_names_dropped_audit_lines_without_counting_them(
 ) -> None:
     """A count of dropped audit tee lines counts the audit rows written, the hidden lock rows
     included, and the drop report reaches ``GET /logs/tail`` (BACKLOG #1131, #2612). So the report
-    names an audit drop and puts no number on it. The status counter still counts it."""
+    names an audit drop and gives it no number of its own: its only numbers are the combined batch,
+    the general lane's depth and the combined total, which ``queue_dropped`` already serves."""
     from messagefoundry.store import audit_tee
 
     monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_QUEUE_MAXSIZE", 2)
     target = _CapturingHandler()
     fwd = _build_queued_forwarder(target, fmt="text")
     assert fwd._listener.stop_within(1.0)  # nothing drains, so the lane fills
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
-        for i in range(7):
-            fwd.handle(
-                logging.LogRecord(
-                    audit_tee.audit_logger.name, logging.INFO, __file__, 1, f"row {i}", None, None
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            for i in range(7):
+                fwd.handle(
+                    logging.LogRecord(
+                        audit_tee.audit_logger.name,
+                        logging.INFO,
+                        __file__,
+                        1,
+                        f"row {i}",
+                        None,
+                        None,
+                    )
                 )
-            )
+    finally:
+        fwd.close()
     assert fwd.audit_dropped == 5 and fwd.dropped == 5  # counted for the status surface
-    reports = [r.getMessage() for r in caplog.records if "audit tee lines" in r.getMessage()]
+    reports = [
+        r.getMessage() for r in caplog.records if "Audit tee lines were among" in r.getMessage()
+    ]
     assert len(reports) == 1, reports
-    assert not any(ch.isdigit() for ch in reports[0]), reports[0]  # named, never counted
+    depth = str(logging_setup._FORWARD_QUEUE_MAXSIZE)
+    assert re.findall(r"\d+", reports[0]) == ["1", depth, "1"], reports[0]
+
+
+def test_the_audit_lane_cannot_hold_general_lines_back_for_good() -> None:
+    """Failed sign-ins write audit rows, so an unauthenticated client drives the audit rate. The
+    lanes serve at most ``_FORWARD_AUDIT_BURST`` audit lines in a row while a general record waits,
+    and serve the stop sentinel only once the audit lane is empty (BACKLOG #2612)."""
+    from messagefoundry.store import audit_tee
+
+    def rec(name: str, msg: str) -> logging.LogRecord:
+        return logging.LogRecord(name, logging.INFO, __file__, 1, msg, None, None)
+
+    burst = logging_setup._FORWARD_AUDIT_BURST
+    lanes = logging_setup._ForwardLanes(100, 100)
+    for i in range(burst * 3):
+        lanes.put_nowait(rec(audit_tee.audit_logger.name, f"a{i}"))
+    lanes.put_nowait(rec("mefor.test", "g0"))
+    lanes.put_nowait(rec("mefor.test", "g1"))
+    lanes.put_nowait(None)
+    order = []
+    while lanes.qsize():
+        item = lanes.get_nowait()
+        order.append(None if item is None else item.getMessage())
+    audit_order = [m for m in order if m is not None and m.startswith("a")]
+    assert audit_order == [f"a{i}" for i in range(burst * 3)]  # each lane stays FIFO
+    assert order.index("g0") == burst and order.index("g1") == 2 * burst + 1
+    assert order[-1] is None  # every audit line went out ahead of the stop sentinel
 
 
 def test_the_drop_report_does_not_recurse_on_the_root_logger(

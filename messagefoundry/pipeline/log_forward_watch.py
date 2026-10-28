@@ -24,7 +24,7 @@ same :func:`~messagefoundry.pipeline.intake_bound.process_alert_subject`.
   later.
 * ``dropping``: a loss counter rose. The count is :attr:`ForwarderStatus.lost`, a floor on the
   records lost since the process started. An audit tee line dropped for a full audit lane adds
-  ``audit_queue_full`` to the reason, beside ``queue_full`` (BACKLOG #2612).
+  ``audit_queue_full`` to the reason, as well as ``queue_full`` (BACKLOG #2612).
 * ``spool_unreadable``: the on-disk spool could not be read. Held, not lost.
 * ``not_sending``: every pass for a whole re-alert window found
   :attr:`ForwarderStatus.send_failing` set, and a send has failed since the last alert. Not raised
