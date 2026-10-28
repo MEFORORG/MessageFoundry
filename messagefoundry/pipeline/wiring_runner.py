@@ -4407,27 +4407,28 @@ class RegistryRunner:
         the bare name while every cause here keys on direction (#1813). The alert row lives in the
         store every process shares, so a clustered node, or an engine shard that does not own the
         outbound namesake, cannot see every cause and resolves nothing. A pooled lane a dispatcher
-        STOPPED on its own account without a hold (a leadership-loss STOP) counts as a cause too. A
-        skipped resolve leaves an alert open for an operator, which is the safe direction. Never
-        raises: an alert failure must not break a start."""
-        blocked = (
-            not self.inbound_running(name)
-            or ("inbound", name) in self._stop_held
-            or name in self._log_halted
-            or self._delivery_halted
-            or not isinstance(self._coordinator, NullCoordinator)
-            or not self._owns_destination(name)
-            or self.outbound_failed(name) is not None
-            or ("outbound", name) in self._stop_held
-            or name in self._outbound_paused
-            or any(d.stopped(name) for d in self._dispatchers.values())
-        )
-        if blocked:
-            return
+        STOPPED on its own account without a hold (a leadership-loss STOP) counts as a cause too, and
+        so does any pause of the outbound namesake. A skipped resolve leaves an alert open for an
+        operator, which is the safe direction, and nothing retries it. This docstring is the one
+        statement of when the inverse fires. Never raises: an alert failure must not break a start
+        or the tail of a committed reload."""
         try:
-            self._alert_sink.connection_started(name)
+            blocked = (
+                not self.inbound_running(name)
+                or ("inbound", name) in self._stop_held
+                or name in self._log_halted
+                or self._delivery_halted
+                or self._coordinator.is_clustered()
+                or (name in self.registry.outbound and not self._owns_destination(name))
+                or self.outbound_failed(name) is not None
+                or ("outbound", name) in self._stop_held
+                or name in self._outbound_paused
+                or any(d.stopped(name) for d in self._dispatchers.values())
+            )
+            if not blocked:
+                self._alert_sink.connection_started(name)
         except Exception:
-            log.exception("alert sink raised on connection_started for %r", name)
+            log.exception("connection_started for %r failed; the alert stays open", name)
 
     def _release_operator_hold(self, name: str, kind: Direction) -> None:
         """The lane was re-armed (or an operator asked for it), so the scheduler owns its calendar
@@ -7356,8 +7357,8 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
-            # BACKLOG #1741: the swap committed, and step 3 has settled every outbound, so a held
-            # start is read against the graph that stays.
+            # BACKLOG #1741: the swap committed, so a held start is read against the graph that stays.
+            # Before step 3a, so a schedule change it makes to an outbound namesake is not seen.
             started = self._started_pending or ()
             self._started_pending = None
             for name in started:

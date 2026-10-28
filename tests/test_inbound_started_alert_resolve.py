@@ -294,22 +294,35 @@ class _ClusterNode:
     def is_leader(self) -> bool:
         return True
 
+    def is_clustered(self) -> bool:
+        return True
+
 
 async def test_a_clustered_node_or_unowned_namesake_resolves_nothing(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The alert row is in the store every process shares; another process's causes are invisible.
     reg = Registry()
     reg.add_inbound(build_inbound_connection("SHARED", MLLP(port=0), router="r"))
+    reg.add_inbound(build_inbound_connection("ALONE", MLLP(port=0), router="r"))
     reg.add_router("r", lambda m: [])
+    reg.add_outbound(
+        OutboundConnection(
+            "SHARED", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "out")})
+        )
+    )
     sink = _Recording()
     runner = _runner(reg, store, sink)
     await runner.start()
     try:
         sink.started.clear()
+        # Another engine shard owns the namesake outbound. An inbound with no namesake is not
+        # held back by where its bare name would hash.
         monkeypatch.setattr(runner, "_owns_destination", lambda name: False)
         await runner.restart_inbound("SHARED", operator=True)
-        assert sink.started == []
+        await runner.restart_inbound("ALONE", operator=True)
+        assert sink.started == ["ALONE"]
+        sink.started.clear()
         monkeypatch.undo()
         monkeypatch.setattr(runner, "_coordinator", _ClusterNode())
         await runner.restart_inbound("SHARED", operator=True)
