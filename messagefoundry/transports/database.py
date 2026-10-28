@@ -45,15 +45,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import errno
 import json
 import logging
 import os
 import re
 import stat
+import weakref
 from collections.abc import Callable, Generator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
+from functools import partial
 from typing import Any, NamedTuple
 
 from messagefoundry.auth.trust_anchors import (
@@ -996,9 +999,6 @@ def _read_only_message(subject: str) -> str:
     )
 
 
-_READ_ONLY_MESSAGE = _read_only_message("db_lookup statement")
-
-
 def _scan_sql_tokens(
     statement: str, *, subject: str = "db_lookup statement"
 ) -> list[tuple[str, str]]:
@@ -1291,10 +1291,15 @@ async def _confirm_autocommit(conn: Any) -> None:
     Setting it here sends it to the driver every time. A driver that rejects the set raises its own
     error from the setter.
 
-    The read-back is pyodbc's own record of the mode, which a successful set has just written. So it
-    catches a set that did not take, not a driver that later leaves autocommit by itself. A
-    connection with no driver connection on ``_conn`` (aioodbc 0.5.0's attribute) is refused rather
-    than trusted, because its mode cannot be set. Both driver calls run off the event loop."""
+    **What the read-back proves is narrow.** It reads pyodbc's own record of the mode, which pyodbc
+    writes only after the driver accepted the set. So with pyodbc it cannot come back False; it
+    guards the binding (a ``_conn`` that is not pyodbc's, or a later pyodbc that stops recording the
+    mode), not the server session. The control is the set itself. A connection with no driver
+    connection on ``_conn`` (aioodbc 0.5.0's attribute) is refused rather than trusted, because its
+    mode cannot be set. Both driver calls run off the event loop.
+
+    Setting ``SQL_AUTOCOMMIT_ON`` is valid on every ODBC driver, including one with no transaction
+    support, for which ON is the only valid value (the ODBC ``SQLSetConnectAttr`` reference)."""
     raw = getattr(conn, "_conn", None)
     if raw is None:
         raise AutocommitNotConfirmed(
@@ -1315,15 +1320,33 @@ async def _confirm_autocommit(conn: Any) -> None:
 
 async def _discard_connection(pool: Any, conn: Any) -> None:
     """Close ``conn`` and hand it back to ``pool``, which drops a closed connection rather than
-    reusing it. Never raises: the caller is already raising the reason the connection is discarded."""
+    reusing it. Raises nothing but a cancellation: the caller is already raising the reason the
+    connection is discarded.
+
+    The release is in a ``finally``, so a cancellation that lands during the close still returns
+    the slot; a slot nobody returns would leave ``wait_closed`` waiting forever. A connection whose
+    close failed goes back open. It is not marked confirmed, so its next borrow sets autocommit again
+    before anything runs on it."""
     try:
         await conn.close()
     except Exception as exc:  # noqa: BLE001 - the caller's refusal is the error that matters
-        logger.debug("DATABASE: closing a refused pooled connection failed: %s", safe_exc(exc))
-    try:
-        await pool.release(conn)
-    except Exception as exc:  # noqa: BLE001 - same
-        logger.debug("DATABASE: returning a refused pooled connection failed: %s", safe_exc(exc))
+        logger.warning(
+            "DATABASE: closing a refused pooled connection failed; it goes back to the pool and is "
+            "checked again on its next borrow: %s",
+            safe_exc(exc),
+        )
+    finally:
+        try:
+            await pool.release(conn)
+        except Exception as exc:  # noqa: BLE001 - same
+            logger.debug(
+                "DATABASE: returning a refused pooled connection failed: %s", safe_exc(exc)
+            )
+
+
+#: Connections settled after their borrower stopped waiting (see ``_AutocommitPool``). The loop holds
+#: a task only weakly (ruff RUF006), so this set keeps each one alive until it ends.
+_DETACHED_SETTLES: set[asyncio.Task[None]] = set()
 
 
 class _ConfirmedAcquire:
@@ -1352,24 +1375,70 @@ class _AutocommitPool:
     """An aioodbc pool whose every borrowed connection has passed :func:`_confirm_autocommit`
     (BACKLOG #2148). :func:`_make_pool` returns one for ``autocommit=True``, which covers the poll
     source's mark pool, the ``db_lookup`` pools and the ``DatabaseRef`` sync pool. The check is in the
-    borrow, so a call site cannot skip it, and it runs on every borrow, since nothing in the pool
-    guarantees a connection kept its mode while it sat there. Everything else passes through."""
+    borrow, so a call site cannot skip it. Everything else passes through.
+
+    **Once per physical connection, not once per borrow.** A connection that passed is remembered,
+    weakly, and later borrows of it skip the driver call. Nothing the engine runs on these pools
+    turns autocommit off, so the mode pyodbc set holds while the connection sits in the pool. An
+    operator statement that changes the session's own transaction mode is outside this check. A
+    connection object that cannot be held weakly is confirmed on every borrow instead.
+
+    **A borrower that stops waiting does not close the connection under a running call.** The
+    driver call runs on a worker thread and may still be inside the driver when ``acquire_timeout``
+    expires or the task is cancelled. Closing the connection then would free handles that call is
+    using, the crash shape BACKLOG #2049 recorded. So the call is shielded: the borrower leaves at
+    once, which keeps the ``acquire_timeout`` bound, and the connection is released or discarded
+    only once the call has returned."""
 
     def __init__(self, pool: Any) -> None:
         self._pool = pool
+        self._confirmed: weakref.WeakSet[Any] = weakref.WeakSet()
 
     def acquire(self) -> _ConfirmedAcquire:
         return _ConfirmedAcquire(self)
 
+    def _mark_confirmed(self, conn: Any) -> None:
+        # Not weakly referenceable: it is confirmed on every borrow instead.
+        with contextlib.suppress(TypeError):
+            self._confirmed.add(conn)
+
     async def _acquire_confirmed(self) -> Any:
         conn = await self._pool.acquire()
+        if conn in self._confirmed:  # False, not an error, for an object with no weak reference
+            return conn
+        confirm = asyncio.ensure_future(_confirm_autocommit(conn))
         try:
-            await _confirm_autocommit(conn)
+            await asyncio.shield(confirm)
+        except asyncio.CancelledError:
+            confirm.add_done_callback(partial(self._settle_detached, conn))
+            raise
         except BaseException:
-            # A cancellation lands here too, and the connection still has to go back.
+            # The confirm task has ended, so no driver call is running on this connection.
             await _discard_connection(self._pool, conn)
             raise
+        self._mark_confirmed(conn)
         return conn
+
+    def _settle_detached(self, conn: Any, confirm: asyncio.Future[None]) -> None:
+        """Return or discard ``conn`` once a confirm its borrower abandoned has ended. A done
+        callback, so it never raises; the work it schedules logs its own failure."""
+        passed = not confirm.cancelled() and confirm.exception() is None
+        if passed:
+            self._mark_confirmed(conn)
+        task = asyncio.ensure_future(self._settle(conn, passed=passed))
+        _DETACHED_SETTLES.add(task)
+        task.add_done_callback(_DETACHED_SETTLES.discard)
+
+    async def _settle(self, conn: Any, *, passed: bool) -> None:
+        if not passed:
+            await _discard_connection(self._pool, conn)
+            return
+        try:
+            await self._pool.release(conn)
+        except Exception as exc:  # noqa: BLE001 - no borrower is left to tell
+            logger.debug(
+                "DATABASE: returning an abandoned pooled connection failed: %s", safe_exc(exc)
+            )
 
     async def release(self, conn: Any) -> None:
         await self._pool.release(conn)
@@ -2206,6 +2275,24 @@ def _lookup_connect_failure(connection: str, exc: Exception) -> str:
 DEFAULT_DB_LOOKUP_MAX_ROWS = 500
 
 
+async def fetch_at_most(cur: Any, limit: int) -> tuple[list[Any], bool]:
+    """Fetch up to ``limit`` rows from an executed cursor, and say whether the result holds more.
+
+    The one ceiling-at-the-fetch loop, for ``db_lookup`` (BACKLOG #1730) and the ``DatabaseRef`` sync
+    (BACKLOG #2617); each caller raises its own refusal on ``True``. It asks the driver for at most
+    ``limit + 1`` rows in all, never ``fetchall``, so a result far past the ceiling is judged having
+    buffered one row more than it. The +1 row is the only way to tell "exactly ``limit``" from "more".
+    It loops because a driver may return fewer rows than asked while more remain. When the answer is
+    ``True`` the list holds ``limit + 1`` rows, and the caller must not use them as a result."""
+    rows: list[Any] = []
+    while len(rows) <= limit:
+        batch = list(await cur.fetchmany(limit + 1 - len(rows)))
+        if not batch:
+            break
+        rows.extend(batch)
+    return rows, len(rows) > limit
+
+
 def _lookup_max_rows(value: Any, connection: str) -> int | None:
     """Read one lookup connection's ``max_rows``: a positive ceiling, or ``None`` for the documented
     ``0`` opt-out. Unset (``None``) takes :data:`DEFAULT_DB_LOOKUP_MAX_ROWS`.
@@ -2398,16 +2485,10 @@ class DatabaseLookupExecutor:
             if limit is None:
                 rows = list(await cur.fetchall())
             else:
-                # Loop because a driver may hand back fewer rows than asked while more remain. The +1
-                # row is the only way to tell "exactly max_rows" from "more than max_rows"; the source
-                # poll avoids it because its rows can carry a whole message body, but here the extra
-                # row is read only on the way to refusing the lookup.
-                while len(rows) <= limit:
-                    batch = list(await cur.fetchmany(limit + 1 - len(rows)))
-                    if not batch:
-                        break
-                    rows.extend(batch)
-                if len(rows) > limit:
+                # The source poll avoids the +1 row because its rows can carry a whole message body,
+                # but here the extra row is read only on the way to refusing the lookup.
+                rows, over = await fetch_at_most(cur, limit)
+                if over:
                     # PHI-free: the connection and the ceiling only, never the statement or a row.
                     raise DbLookupError(
                         f"db_lookup on {connection!r} returned more than max_rows={limit} rows; "

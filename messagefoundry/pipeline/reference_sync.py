@@ -167,8 +167,9 @@ def reference_statement(settings: Mapping[str, Any], *, name: str | None = None)
     The test is ``db_lookup``'s own (``transports.database._require_read_only``), so the two gates
     cannot drift: the statement must open with ``SELECT`` or ``WITH``, carry no write, ``EXEC`` or DDL
     keyword outside a literal or comment, and chain no second statement. A stored procedure is
-    therefore refused. ``build_check_registry`` calls this, and so does every sync, as a backstop for a
-    spec that reached the runner some other way.
+    therefore refused. ``DatabaseRef`` runs the same test when declared, ``build_check_registry`` calls
+    this, and so does every sync, as a backstop for a spec built without ``DatabaseRef``. An absent
+    statement raises the plain :class:`ReferenceSyncError` for a missing setting instead.
 
     It is a shape test on text, not read-only authority, and the sync pool is autocommit, so a write
     that passed it would commit. The login's privilege is the control (docs/CONNECTIONS.md).
@@ -177,14 +178,17 @@ def reference_statement(settings: Mapping[str, Any], *, name: str | None = None)
     the fixed refusal vocabulary and the set's name, never the statement."""
     from messagefoundry.transports.database import _require_read_only
 
-    statement = str(settings.get("statement", ""))
+    where = "" if name is None else f"reference set {name!r}: "
+    statement = str(settings.get("statement") or "")
+    if not statement:
+        # A missing statement is a missing setting, not a statement the gate refused.
+        raise ReferenceSyncError(f"{where}DATABASE reference source requires a 'statement'")
     refusal: str | None = None
     try:
         _require_read_only(statement, subject="DatabaseRef statement")
     except DbLookupError as exc:
         refusal = str(exc)
     if refusal is not None:
-        where = "" if name is None else f"reference set {name!r}: "
         raise ReferenceStatementRefused(f"{where}{refusal}")
     return statement
 
@@ -199,7 +203,9 @@ def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None =
 
     The DSN advertises ``ApplicationIntent=ReadOnly``, as the ``db_lookup`` DSN does (BACKLOG #2617).
     Against an Always On listener with read-only routing, the sync then reads a readable secondary,
-    whose data can lag the primary's. Elsewhere the keyword changes nothing."""
+    whose data can lag the primary's. An availability-group replica's ``ALLOW_CONNECTIONS`` setting
+    can also refuse a read-intent connection, as a primary set to ``READ_WRITE`` does; outside an
+    availability group the keyword changes nothing (docs/CONNECTIONS.md)."""
     from messagefoundry.transports.database import _build_dsn
 
     attested = hop_attestation_from_settings(settings)
@@ -209,19 +215,15 @@ def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None =
 async def _fetch_reference_rows(cur: Any, limit: int | None, name: str | None) -> list[Any]:
     """Fetch a reference statement's rows, refusing more than ``limit`` (BACKLOG #2617).
 
-    Never ``fetchall`` under a ceiling: the driver is asked for at most ``limit + 1`` rows in all,
-    so a statement that matches far more is refused having buffered one row past the ceiling, not
-    the whole result. The loop is there because a driver may return fewer rows than asked while more
-    remain. ``None`` (``max_rows=0``) is the operator's opt-out, and fetches everything as before."""
+    Under a ceiling the fetch is ``db_lookup``'s own (``transports.database.fetch_at_most``), so the
+    driver is asked for at most ``limit + 1`` rows and never the whole result. ``None``
+    (``max_rows=0``) is the operator's opt-out, and fetches everything as before."""
+    from messagefoundry.transports.database import fetch_at_most
+
     if limit is None:
         return list(await cur.fetchall())
-    rows: list[Any] = []
-    while len(rows) <= limit:
-        batch = list(await cur.fetchmany(limit + 1 - len(rows)))
-        if not batch:
-            break
-        rows.extend(batch)
-    if len(rows) > limit:
+    rows, over = await fetch_at_most(cur, limit)
+    if over:
         # PHI-free: the set and the ceiling only, never the statement or a row.
         where = "" if name is None else f"reference set {name!r}: "
         raise ReferenceRowCeilingExceeded(
@@ -269,12 +271,12 @@ async def _load_database_source(
         raise ReferenceSyncError(str(exc)) from exc
     key_col = settings.get("key_column")
     value_col = settings.get("value_column")
-    statement = str(settings.get("statement", ""))
-    if not key_col or not statement:
+    if not key_col or not settings.get("statement"):
         raise ReferenceSyncError("DATABASE reference source requires 'statement' and 'key_column'")
-    # BACKLOG #2617: build_check refuses the statement already; this backstop holds for a spec that
-    # reached the runner without a build check. Before the DSN and the pool, so nothing is dialled.
-    reference_statement(settings, name=name)
+    # BACKLOG #2617: DatabaseRef and build_check refuse the statement already; this backstop holds
+    # for a spec that reached the runner without either. Before the DSN and the pool, so nothing is
+    # dialled. The statement executed below is the value this returned, the one the gate read.
+    statement = reference_statement(settings, name=name)
     # Fail loud on weakened TLS or bad auth, before dialing; why the posture is stamped is in the
     # docstring. Unlike wiring_runner._build_lookup_executor, a None posture keeps the ambient one.
     with active_hop_posture(posture if posture is not None else current_hop_posture()):

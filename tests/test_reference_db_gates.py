@@ -22,6 +22,7 @@ from messagefoundry.config.settings import EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import (
     DEFAULT_REFERENCE_MAX_ROWS,
     DatabaseRef,
+    ReferenceSourceSpec,
     ReferenceSpec,
     Registry,
     WiringError,
@@ -155,12 +156,9 @@ async def test_the_sync_log_names_the_gate_and_not_the_lookup_error(
     """The sync logs the error CLASS only. That class has to say which control refused the set,
     and must not read as a ``db_lookup`` failure."""
     _no_pool(monkeypatch)
-    spec = ReferenceSpec(
-        name="codes",
-        source=DatabaseRef(
-            server="db.example", database="d", statement="EXEC dbo.p", key_column="code"
-        ),
-    )
+    # Built without DatabaseRef, which would refuse the statement when declared: this is the
+    # sync's backstop for a spec that reached the runner some other way.
+    spec = ReferenceSpec(name="codes", source=_raw_source(statement="EXEC dbo.p"))
     store = await MessageStore.open(tmp_path / "r.db")
     try:
         runner = ReferenceSyncRunner(store, lambda: [spec], ReferenceSettings(), egress=_EGRESS)
@@ -181,30 +179,53 @@ def _check(registry: Registry, env_values: dict[str, Any] | None = None) -> None
     )
 
 
+_REF_SETTINGS: dict[str, Any] = {
+    "server": "db.example.org",
+    "database": "d",
+    "statement": "SELECT code, value FROM codes",
+    "key_column": "code",
+}
+
+
 def _registry(**over: Any) -> Registry:
     registry = Registry()
-    settings: dict[str, Any] = {
-        "server": "db.example.org",
-        "database": "d",
-        "statement": "SELECT code, value FROM codes",
-        "key_column": "code",
-        **over,
-    }
-    registry.references["codes"] = ReferenceSpec(name="codes", source=DatabaseRef(**settings))
+    source = DatabaseRef(**{**_REF_SETTINGS, **over})
+    registry.references["codes"] = ReferenceSpec(name="codes", source=source)
     return registry
+
+
+def _raw_source(**over: Any) -> ReferenceSourceSpec:
+    """A database reference source built without ``DatabaseRef``, so no declaration check runs."""
+    return ReferenceSourceSpec("database", {**_REF_SETTINGS, **over})
+
+
+def _raw_registry(**over: Any) -> Registry:
+    registry = Registry()
+    registry.references["codes"] = ReferenceSpec(name="codes", source=_raw_source(**over))
+    return registry
+
+
+@pytest.mark.parametrize("statement", _REFUSED)
+def test_database_ref_refuses_the_statement_when_declared(statement: str) -> None:
+    """Every path that loads the config refuses it, not only the build check, which
+    ``messagefoundry check`` runs only with a ``messagefoundry.toml``."""
+    with pytest.raises(WiringError, match="DatabaseRef statement must be") as info:
+        DatabaseRef(**{**_REF_SETTINGS, "statement": statement})
+    assert statement not in str(info.value)
+    assert info.value.__cause__ is None and info.value.__context__ is None
 
 
 @pytest.mark.parametrize("statement", _REFUSED)
 def test_the_build_check_refuses_the_statement(statement: str) -> None:
     """Red before the fix: ``messagefoundry check`` passed a statement every sync would run."""
     with pytest.raises(WiringError, match="reference set 'codes': DatabaseRef statement must be"):
-        _check(_registry(statement=statement))
+        _check(_raw_registry(statement=statement))
 
 
 def test_the_build_check_refuses_the_statement_of_an_unprovisioned_set() -> None:
     """The statement is a literal, so it is tested even where an ``env()`` server does not resolve
     and the rest of the set is left to its sync."""
-    registry = _registry(server=env("MEFOR_TEST_2617_SERVER"), statement="EXEC dbo.p")
+    registry = _raw_registry(server=env("MEFOR_TEST_2617_SERVER"), statement="EXEC dbo.p")
     with pytest.raises(WiringError, match="DatabaseRef statement must be"):
         _check(registry)
     _check(_registry(server=env("MEFOR_TEST_2617_SERVER")))  # the control: a SELECT passes
@@ -221,8 +242,10 @@ def test_the_build_check_passes_a_read_only_statement() -> None:
 
 def test_reference_statement_returns_a_passing_statement() -> None:
     assert reference_statement({"statement": "SELECT a FROM t"}) == "SELECT a FROM t"
-    with pytest.raises(ReferenceStatementRefused):
-        reference_statement({})  # an absent statement is not a read
+    # An absent statement is a missing setting, not a statement the gate refused.
+    with pytest.raises(ReferenceSyncError, match="requires a 'statement'") as info:
+        reference_statement({}, name="codes")
+    assert not isinstance(info.value, ReferenceStatementRefused)
     assert issubclass(ReferenceStatementRefused, ReferenceSyncError)
 
 

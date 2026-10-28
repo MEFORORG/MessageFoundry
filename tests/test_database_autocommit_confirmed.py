@@ -16,7 +16,10 @@ no database.
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
+import time
 import types
 from collections.abc import Iterator
 from typing import Any
@@ -26,11 +29,13 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.transports import database
+from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.database import (
     AutocommitNotConfirmed,
     DatabaseLookupExecutor,
     DatabaseSource,
     _acquire,
+    _discard_connection,
     _make_pool,
 )
 
@@ -148,12 +153,15 @@ async def test_an_autocommit_pool_sets_autocommit_on_every_connection_it_hands_o
     assert conn._conn.autocommit is True
     assert conn._conn.sets == [True]
     await pool.release(conn)
-    # A second borrow of the same physical connection is set again: nothing else in the pool
-    # guarantees the mode held while it sat there.
+    # Once per physical connection: a later borrow of the same one skips the driver call.
     conn = await _acquire(pool, 5.0)
-    assert conn._conn.sets == [True, True]
+    assert conn._conn.sets == [True]
     await pool.release(conn)
     assert driver.pools[0].released == [conn, conn]
+    # A new physical connection is confirmed in its turn.
+    driver.pools[0].conn = _Connection(_RawConnection())
+    fresh = await _acquire(pool, 5.0)
+    assert fresh._conn.sets == [True] and fresh._conn.autocommit is True
 
 
 async def test_the_context_manager_form_is_confirmed_too(driver: _Driver) -> None:
@@ -186,6 +194,81 @@ async def test_a_connection_with_no_driver_handle_is_refused(driver: _Driver) ->
     with pytest.raises(AutocommitNotConfirmed):
         await _acquire(pool, 5.0)
     assert driver.pools[0].released == [driver.pools[0].conn]
+
+
+class _BlockingRaw(_RawConnection):
+    """A driver whose autocommit set hangs until released, as a stalled server would make it.
+    ``closed_during_set`` records a close that ran while the set was still inside the driver."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.proceed = threading.Event()
+        self.in_set = False
+        self.closed_during_set = False
+
+    @property
+    def autocommit(self) -> bool:
+        return self._autocommit
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        self.in_set = True
+        self.entered.set()
+        self.proceed.wait(10)
+        self._autocommit = value
+        self.in_set = False
+
+
+async def test_a_borrow_abandoned_mid_set_keeps_its_bound_and_never_closes_under_the_call(
+    driver: _Driver,
+) -> None:
+    """The set runs on a worker thread. When ``acquire_timeout`` expires during it, the borrower
+    leaves at once (the bound holds), and the connection is neither closed nor reused until the
+    driver call has returned. Closing it under the call would free handles the call is using."""
+    pool = await _make_pool("DSN=x", 2, autocommit=True, login_timeout=5)
+    inner = driver.pools[0]
+    raw = _BlockingRaw()
+    inner.conn = _Connection(raw)
+
+    async def close_spy() -> None:
+        raw.closed_during_set = raw.closed_during_set or raw.in_set
+        inner.conn.closed = True
+
+    inner.conn.close = close_spy  # type: ignore[method-assign]
+
+    started = time.monotonic()
+    with pytest.raises(DeliveryError, match="acquire timed out"):
+        await _acquire(pool, 0.2)
+    assert time.monotonic() - started < 5  # the bound held while the driver call hung
+    assert inner.released == []  # not handed back while the call is running
+    raw.proceed.set()
+    for _ in range(200):
+        if inner.released:
+            break
+        await asyncio.sleep(0.01)
+    assert inner.released == [inner.conn]  # settled once the call returned
+    assert raw.closed_during_set is False
+    assert raw.autocommit is True and inner.conn.closed is False  # the set passed: returned, kept
+
+
+async def test_a_discard_returns_the_slot_even_when_cancelled_during_the_close() -> None:
+    """A slot nobody returns would leave the pool's ``wait_closed`` waiting forever."""
+    entered = asyncio.Event()
+
+    class _SlowClose(_Connection):
+        async def close(self) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+    conn = _SlowClose(_RawConnection())
+    pool = _Pool(conn)
+    task = asyncio.ensure_future(_discard_connection(pool, conn))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert pool.released == [conn]
 
 
 async def test_a_manual_commit_pool_is_left_alone(driver: _Driver) -> None:

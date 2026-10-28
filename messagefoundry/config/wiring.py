@@ -881,7 +881,7 @@ def DatabaseRef(
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
-    max_rows: int = DEFAULT_REFERENCE_MAX_ROWS,  # refuse a larger result; 0 = no ceiling (#2617)
+    max_rows: int | EnvRef = DEFAULT_REFERENCE_MAX_ROWS,  # refuse a larger result; 0 = off (#2617)
     tls_hop_attested: bool = False,
     tls_hop_attested_reason: str | None = None,
 ) -> ReferenceSourceSpec:
@@ -892,10 +892,12 @@ def DatabaseRef(
     cadence and builds the snapshot from the rows. The statement passes the same read-only statement
     test as a ``db_lookup`` (BACKLOG #2617): it must open with ``SELECT`` or ``WITH``, carry no write,
     ``EXEC`` or DDL keyword outside a literal or comment, and chain no second statement. So a stored
-    procedure is refused. The test runs at ``messagefoundry check`` and again at every sync. It is a
-    shape test on text, not read-only authority: give the login only ``SELECT`` (docs/CONNECTIONS.md).
-    The connection also advertises ``ApplicationIntent=ReadOnly``; against an Always On listener with
-    read-only routing it is sent to a readable secondary, whose data can lag the primary's.
+    procedure is refused. The test runs here, when the set is declared, so every path that loads the
+    config refuses it, and again at every sync. It is a shape test on text, not read-only authority:
+    give the login only ``SELECT`` (docs/CONNECTIONS.md). The connection also advertises
+    ``ApplicationIntent=ReadOnly``; against an Always On listener with read-only routing it is sent to
+    a readable secondary, whose data can lag the primary's, and an availability-group replica that
+    admits only read-write connections refuses it.
     ``key_column`` is the lookup key; ``value_column`` (if given) is that
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
     shape). Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is
@@ -914,12 +916,26 @@ def DatabaseRef(
     stays, the AlertSink fires, and a set never synced stays unloaded. The result is never
     truncated, since a partial set would answer ``get`` wrongly with nothing to say so. ``0``
     removes the ceiling. Checked when declared, like ``acquire_timeout``; an ``env()`` value is
-    checked at ``messagefoundry check`` and at each sync, once resolved.
+    checked by the build check (``messagefoundry check``'s build leg, reload) and at each sync, once
+    resolved.
 
     ``tls_hop_attested`` with its mandatory ``tls_hop_attested_reason`` attests that this source's
     database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR
     0092). It is reported as a loosening; see docs/SECURITY-LOOSENING.md."""
     attestation = _hop_attestation_entries("DatabaseRef", tls_hop_attested, tls_hop_attested_reason)
+    # BACKLOG #2617: the statement is a literal, so the read-only statement test runs here and every
+    # load path refuses it, not only the build check, which `messagefoundry check` runs only with a
+    # messagefoundry.toml. Imported here: messagefoundry.transports imports this module at its top.
+    from messagefoundry.config.db_lookup import DbLookupError
+    from messagefoundry.transports.database import _require_read_only
+
+    statement_refusal: str | None = None
+    try:
+        _require_read_only(statement, subject="DatabaseRef statement")
+    except DbLookupError as exc:
+        statement_refusal = str(exc)
+    if statement_refusal is not None:
+        raise WiringError(statement_refusal)
     # Refused here, at declaration, because a reference set is first dialled at sync time, after
     # start (BACKLOG #2089). The other DATABASE declarations are checked when their connector is built.
     # An env() ref has no value yet; the sync checks it once resolved.

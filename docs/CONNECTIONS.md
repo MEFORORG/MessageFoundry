@@ -1878,19 +1878,25 @@ A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the
 - **The statement gate.** The `statement` goes through the same `_require_read_only` test as a
   `db_lookup` statement: it must open with `SELECT` or `WITH`, carry no write, `EXEC` or DDL keyword
   outside a literal or comment, and chain no second statement. **A stored procedure is therefore
-  refused**; read the procedure's tables or a view with a `SELECT` instead. `messagefoundry check`,
-  dry-run and reload refuse a statement that fails, and every sync tests it again before it dials.
-  A sync it refuses fails as `ReferenceStatementRefused`.
+  refused**; read the procedure's tables or a view with a `SELECT` instead. The test runs when the
+  `DatabaseRef(...)` is declared, so loading the config fails on every path (`serve`,
+  `messagefoundry check`, dry-run, reload). The build check and every sync test it again, for a
+  reference source built without `DatabaseRef`. A sync it refuses fails as `ReferenceStatementRefused`.
 - **Read intent.** The sync's DSN carries `ApplicationIntent=ReadOnly`, as a lookup's does. Against an
   Always On availability-group listener with read-only routing, the sync then reads a **readable
   secondary**, whose data can lag the primary's, so a fresh snapshot can trail the primary by the
-  replica's lag. Against any other server the keyword changes nothing.
+  replica's lag. A replica's `ALLOW_CONNECTIONS` setting can also refuse it: a primary set to
+  `READ_WRITE` refuses a read-intent connection, and every sync of that set then fails. Point the
+  `DatabaseRef` at a listener or replica that admits read-intent connections. Outside an availability
+  group the keyword changes nothing.
 - **The row ceiling.** `DatabaseRef(max_rows=…)`, default `100000`, bounds one sync. The driver is asked
   for at most `max_rows + 1` rows, and a statement that returns more fails that sync as
   `ReferenceRowCeilingExceeded`: the last-good snapshot keeps serving, the AlertSink fires, and a set
-  that never synced stays unloaded. The set is never built from a truncated result. `max_rows=0`
-  removes the ceiling. A negative or fractional value is refused when the `DatabaseRef` is declared;
-  an `env()` value is refused at `messagefoundry check` and at each sync.
+  that never synced stays unloaded. The set is never built from a truncated result. The driver may
+  still spend time discarding the unread rows when the cursor closes, inside that set's sync.
+  `max_rows=0` removes the ceiling. A negative or fractional value is refused when the `DatabaseRef`
+  is declared. An `env()` value is refused by the build check, which `messagefoundry check` runs in
+  its build leg when the config has a `messagefoundry.toml`, and at each sync.
 
 The sync's log line and alert carry the error's class name only, never its text, because a source
 error can hold a reference key. The two class names above are what tell those failures apart.
