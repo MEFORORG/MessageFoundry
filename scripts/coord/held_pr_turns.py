@@ -10,9 +10,14 @@ from the PR's own comments and commits, so nothing depends on what a session rem
 
 READ-ONLY, AND EXIT 0 ON A FAILED READ. It is a report, not a gate. A repository whose read fails
 prints as an ERROR row naming the reason; it is never omitted, and never printed as an empty list,
-because "no PRs" and "could not read" must not look alike. A reply this script could not turn into
-rows is an ERROR row too, worded as a report defect rather than a read failure. A bad command line
-still exits 2, argparse's usage error.
+because "no PRs" and "could not read" must not look alike. A PR this script could not turn into a
+row (a missing field, a crafted stamp whose offset overflows the date range) is one ERROR row for
+that PR, worded as a report defect rather than a read failure, and its siblings still print. A bad
+command line still exits 2, argparse's usage error.
+
+THE UNSAFE DIRECTION. Marking a PR AUTHOR's turn when it is really the Lander's is the failure this
+script exists to prevent, so every ambiguity below resolves to LANDER: a same-second tie, a head it
+cannot read, two heads named in one hold, a negated or past-tense hold.
 
 WHY PYTHON, AND WHAT IT REUSES. ``pr_state.py`` beside it says why coord tooling reading GitHub is
 Python. This script loads ``pr_state.py`` by path and reuses its gh runner, GraphQL wrapper,
@@ -41,26 +46,44 @@ login, so the login says nothing about which seat wrote a comment.
   a seat check: it only stops an outside account on a public repository from posting a fake hold
   that would park a PR on its author. A comment from an outside account still counts as a newer
   non-Lander comment, which can only hand the turn TO the Lander, the safe direction.
-* A hold is a Lander comment whose headline opens with the word ``Held`` or ``Still held`` (any
-  case). The headline is the first bold run (``**...**``), and only when it starts within
-  ``HEADLINE_REACH`` characters of the ``)`` closing the session marker, as in
-  ``Lander (session 8a04c9f3), 2026-10-28. **Held, ...**``. A bold ``**Held**`` further into a
-  comment is a mention, not a hold. These are prose heuristics; a machine-readable hold marker
-  would be the sturdier contract, and no such marker exists yet.
+* A hold, by MARKER (the primary signal): a Lander comment carrying ``<!-- lander-hold
+  head=<sha> -->`` anywhere in its body, where ``<sha>`` is 7 to 40 hex characters. The marker's
+  SHA is the held head, and the prose is not read. A marker whose head is anything else is no
+  marker, and the prose decides.
+* A RELEASE, by marker: a Lander comment carrying ``<!-- lander-release -->`` is never a hold, even
+  beside a hold marker or a prose headline that reads as one. Strictly, a release needs no marker:
+  any newer Lander comment that is not a hold already hands the turn back. The marker exists so a
+  non-hold comment can opt out of the prose fallback below, whose misreading of a non-hold as a
+  hold is the unsafe direction.
+* A hold, by PROSE (the fallback, for comments older than the marker): a Lander comment whose
+  headline opens with the word ``Held`` or ``Still held`` (any case). The headline is the first
+  bold run (``**...**``), and only when nothing but a date and punctuation lies between it and the
+  ``)`` closing the session marker, within ``HEADLINE_REACH`` characters, as in
+  ``Lander (session 8a04c9f3), 2026-10-28. **Held, ...**``. So "No longer **held**" and "Earlier
+  **Held** answered" are mentions, not holds. A headline holding a word from ``_NOT_A_HOLD`` (no
+  longer, cleared, answered, earlier, ...) is negated or past tense, and no hold; for a headline
+  that is not a whole sentence, the rest of its sentence after the bold run is read too. That
+  word list errs wide: a real hold saying "finding 2 is not resolved" reads as no hold, which
+  costs the Lander a look, never a missed reply.
 * LANDER's turn: there is no Lander comment; or the latest Lander comment is not a hold; or there is
-  a commit newer than the latest hold; or a non-Lander comment newer than it.
-* AUTHOR's turn: the latest Lander comment is a hold and nothing is newer.
+  a commit newer than the latest hold; or a non-Lander comment at or after its second.
+* AUTHOR's turn: the latest Lander comment is a hold and nothing is as new.
 
-"A commit newer than the hold". A hold names the head it held at in backticks in its headline,
-e.g. ``**Held, back to the author, at `f4f4dd470`.**``. That is the preferred signal: if the hold
-names a SHA and the current head does not start with it, there is a new commit. Only a SHA after
-``at`` in the headline counts, so a headline naming the missing fix commit names no head. Only when
-the hold names no head does this fall back to the head commit's ``committedDate`` against the
-hold's ``createdAt``; where that date is unknown too, the row is LANDER's with ``head-unknown``,
-since "cannot tell" must not park a PR on its author. That is the weaker signal:
-``committedDate`` is the committer date, not the push time, so an old local commit pushed after the
-hold, or a rewrite with ``--committer-date-is-author-date``, can predate it. (A plain rebase rewrites
-the committer date, so it is caught.) Rows decided that way carry ``date-fallback``.
+"A commit newer than the hold". The held head is the marker's SHA; failing a marker, the SHA after
+``at`` in the prose headline (``**Held, back to the author, at `f4f4dd470`.**``); failing that,
+any backticked SHA in the headline (``**Held on `f4f4dd470`**``, ``at head `f4f4dd470```). If the
+current head does not start with the held head, there is a new commit. Reading any backticked SHA
+can mistake a named fix commit or a hex-spelled word for the head, but that makes a mismatch, a new
+commit, the safe direction. Two or more distinct heads are ambiguous: LANDER's, ``sha-ambiguous``.
+Only when the hold names no head does this fall back to the head commit's ``committedDate`` against
+the hold's ``createdAt``, a tie counting as a new commit; where that date is unknown too, the row is
+LANDER's with ``head-unknown``, since "cannot tell" must not park a PR on its author. That is the
+weaker signal: ``committedDate`` is the committer date, not the push time, so an old local commit
+pushed after the hold, or a rewrite with ``--committer-date-is-author-date``, can predate it. (A
+plain rebase rewrites the committer date, so it is caught.) Rows decided that way carry
+``date-fallback``. One residual stays even with a SHA: a prose headline naming only a fix commit
+that exists elsewhere, which the author then pushes as the head, reads as no new commit. The marker
+names the head explicitly and has no such case.
 
 WHAT COUNTS AS A COMMENT (the choice made here). Issue comments and submitted PR reviews both count,
 and both are classified by the same body prefix, so a Lander verdict posted as a review body is a
@@ -81,7 +104,7 @@ Inline review-thread comment bodies are not read. Only the latest ``COMMENT_PAGE
 FLAGS. ``no-lander-comment``, ``lander-not-hold``, ``new-commit``, ``no-new-commit`` (LANDER's turn
 caused only by a newer non-Lander comment, with no new commit since the hold: the Lander must still
 read it, but can bounce it fast), ``held`` (AUTHOR's turn), ``date-fallback``, ``head-unknown``,
-and ``in-queue`` / ``auto-armed`` (the PR is already in the merge queue or has auto-merge armed).
+``sha-ambiguous``, and ``in-queue`` / ``auto-armed`` (the PR is already in the merge queue or has auto-merge armed).
 
 Stdlib only.
 """
@@ -96,6 +119,7 @@ import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import cached_property
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -127,12 +151,36 @@ LANDER_PREFIX = "Lander (session"
 HOLD_HEADS = ("held", "still held")
 #: How far past the session marker's ")" the headline may start, e.g. ", 2026-10-28. ".
 HEADLINE_REACH = 40
-#: What may follow the word in a hold headline, so "Held-over" or "Heldout" is no hold.
-_HEAD_END = ("", " ", ",", ".", ":", ";", "!")
 #: Associations whose comments may be Lander comments: accounts with standing on the repository.
 TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 #: The held head, named after "at". Bounded and literal, so the ReDoS scanner resolves it statically.
 _SHA_AFTER_AT = re.compile(r"\bat `([0-9a-fA-F]{7,40})`")
+#: Any backticked SHA, the fallback when no head is named after "at".
+_BACKTICK_SHA = re.compile(r"`([0-9a-fA-F]{7,40})`")
+#: The machine-readable hold marker, the primary signal. A head outside 7-40 hex is no marker.
+_HOLD_MARKER = re.compile(r"<!--\s{0,8}lander-hold\s{1,8}head=([0-9a-fA-F]{7,40})\s{0,8}-->")
+#: The machine-readable release marker: this Lander comment is not a hold, whatever its prose says.
+_RELEASE_MARKER = re.compile(r"<!--\s{0,8}lander-release\s{0,8}-->")
+#: Words that make a prose hold headline negated or past tense, so it is no hold.
+_NOT_A_HOLD = (
+    "no longer",
+    "not held",
+    "unheld",
+    "was held",
+    "were held",
+    "released",
+    "lifted",
+    "cleared",
+    "answered",
+    "resolved",
+    "earlier",
+    "previously",
+    "formerly",
+)
+#: What may end a headline that is a whole sentence, so the text after it is a new sentence.
+_SENTENCE_END = (".", "!", ":", ";")
+#: What may follow the word in a hold headline, so "Held-over" or "Heldout" is no hold.
+_HEAD_END = ("", " ", ",", *_SENTENCE_END)
 
 LANDER = "LANDER"
 AUTHOR = "AUTHOR"
@@ -196,16 +244,11 @@ pr_state = _load("_held_pr_turns_pr_state", _HERE / "pr_state.py")
 #: ``gh(args, stdin) -> stdout``, pr_state's Gh restated: a by-path module is Any to mypy.
 Gh = Callable[[list[str], str | None], str]
 
+#: The failures building one PR's row can raise from a reply this script did not foresee. A crafted
+#: stamp raises OverflowError, an ArithmeticError, when its offset pushes it past year 1 or 9999.
+_ROW_ERRORS = (TypeError, KeyError, AttributeError, ValueError, ArithmeticError)
 #: The failures one repository's read can raise; any of them becomes that repository's ERROR row.
-_READ_ERRORS = (
-    pr_state.PollError,
-    pr_state.GhError,
-    ValueError,
-    TypeError,
-    KeyError,
-    AttributeError,
-    OSError,
-)
+_READ_ERRORS = (pr_state.PollError, pr_state.GhError, OSError, *_ROW_ERRORS)
 
 
 @dataclass
@@ -226,15 +269,14 @@ class Event:
     def lander(self) -> bool:
         return self.trusted and self.body.lstrip().startswith(LANDER_PREFIX)
 
+    @cached_property
+    def heads(self) -> tuple[str, ...] | None:
+        """``hold_heads`` of a Lander comment, parsed once; ``None`` when it is no hold."""
+        return hold_heads(self.body) if self.lander else None
+
     @property
     def hold(self) -> bool:
-        if not self.lander:
-            return False
-        text = headline(self.body).lstrip().casefold()
-        return any(
-            text.startswith(word) and text[len(word) : len(word) + 1] in _HEAD_END
-            for word in HOLD_HEADS
-        )
+        return self.heads is not None
 
 
 _nodes = pr_state._nodes
@@ -265,29 +307,69 @@ def _events(pr: dict[str, Any]) -> list[Event]:
     return out
 
 
-def headline(body: str) -> str:
-    """A Lander comment's headline: its first bold run, if it opens near the session marker.
+def _headline_and_tail(body: str) -> tuple[str, str]:
+    """``(headline, tail)``: the first bold run, and the rest of its sentence after the run.
 
-    ``""`` where the body has no session marker, no bold run, or a first bold run that starts more
-    than ``HEADLINE_REACH`` characters past the marker's ``)``: that run is a mention, not a headline.
+    The headline is ``""`` where the body has no session marker or no bold run, or where the text
+    between the marker's ``)`` and the run holds a letter or runs past ``HEADLINE_REACH``: then the
+    run is a mention ("No longer **held**", "Earlier **Held** answered"), not a headline. Only a
+    date and punctuation, as in ``), 2026-10-28. **``, may come between.
     """
     text = body.lstrip()
     close = text.find(")") if text.startswith(LANDER_PREFIX) else -1
     start = text.find("**", close) if close >= 0 else -1
-    if start < 0 or start - close > HEADLINE_REACH:
-        return ""
+    gap = text[close + 1 : start]
+    if start < 0 or len(gap) > HEADLINE_REACH or any(c.isalpha() for c in gap):
+        return "", ""
     end = text.find("**", start + 2)
-    return text[start + 2 : end] if end >= 0 else ""
+    if end < 0:
+        return "", ""
+    rest = text[end + 2 :]
+    stops = [i for i in (rest.find("."), rest.find("\n")) if i >= 0]
+    return text[start + 2 : end], rest[: min(stops)] if stops else rest
 
 
-def hold_sha(body: str) -> str | None:
-    """The head a hold names in its headline, lower-cased, or None.
+def _negated(text: str) -> bool:
+    words = " ".join("".join(c if c.isalnum() else " " for c in text.casefold()).split())
+    return any(f" {w} " in f" {words} " for w in _NOT_A_HOLD)
 
-    Only the headline is searched, so a SHA quoted later in the body (a fix commit, a parent, an
-    earlier hold recapped) is never mistaken for the held head. Only a SHA after ``at`` counts.
+
+def _prose_hold(body: str) -> str | None:
+    """The headline of a prose hold, or ``None`` when the body is no prose hold."""
+    head, tail = _headline_and_tail(body)
+    text = head.lstrip().casefold()
+    if not any(
+        text.startswith(word) and text[len(word) : len(word) + 1] in _HEAD_END
+        for word in HOLD_HEADS
+    ):
+        return None
+    # A bare "**Held**" leaves its predicate outside the run, so read the rest of that sentence.
+    whole = head if head.rstrip().endswith(_SENTENCE_END) else head + tail
+    return None if _negated(whole) else head
+
+
+def _distinct(shas: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(s.lower() for s in shas))
+
+
+def hold_heads(body: str) -> tuple[str, ...] | None:
+    """The heads a Lander comment holds at, lower-cased; ``None`` when it is no hold.
+
+    A ``lander-release`` marker makes it no hold, even beside a hold marker. A valid
+    ``lander-hold`` marker makes it a hold at the marker's head, whatever the prose says. Without
+    either, the prose headline decides, and its heads are the SHAs after ``at`` in the headline,
+    else every backticked SHA in it. ``()`` is a hold naming no head; two or more heads are
+    ambiguous. Only the headline is searched, so a SHA quoted later in the body is never read.
     """
-    match = _SHA_AFTER_AT.search(headline(body))
-    return match.group(1).lower() if match else None
+    if _RELEASE_MARKER.search(body):
+        return None
+    marked = _HOLD_MARKER.findall(body)
+    if marked:
+        return _distinct(marked)
+    head = _prose_hold(body)
+    if head is None:
+        return None
+    return _distinct(_SHA_AFTER_AT.findall(head) or _BACKTICK_SHA.findall(head))
 
 
 def classify(
@@ -303,15 +385,18 @@ def classify(
     if not latest.hold:
         return LANDER, ["lander-not-hold"]
     flags: list[str] = []
-    sha = hold_sha(latest.body)
-    if sha is not None:
-        new_commit = not head_oid.lower().startswith(sha)
+    heads = latest.heads or ()
+    if len(heads) > 1:
+        return LANDER, ["sha-ambiguous"]
+    if heads:
+        new_commit = not head_oid.lower().startswith(heads[0])
     elif committed is None:
         return LANDER, ["head-unknown", "date-fallback"]
     else:
         flags.append("date-fallback")
-        new_commit = committed > latest.when
-    newer_comment = any(e.when > latest.when and not e.lander for e in turn_events)
+        # A same-second tie is a new commit: a tie must never park a PR on its author.
+        new_commit = committed >= latest.when
+    newer_comment = any(e.when >= latest.when and not e.lander for e in turn_events)
     if new_commit:
         return LANDER, ["new-commit", *flags]
     if newer_comment:
@@ -356,46 +441,52 @@ def _required_green(
     ), verdict
 
 
+def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[str, Any]:
+    head = pr_state._head_commit(pr)
+    head_oid = str(pr.get("headRefOid") or "")
+    # commits(last: 1) may not be the head; another commit's date says nothing about a push.
+    on_head = head.get("oid") == head_oid
+    committed = pr_state.parse_iso(head.get("committedDate")) if on_head else None
+    events = _events(pr)
+    turn, flags = classify(head_oid, committed, events)
+    if pr.get("mergeQueueEntry"):
+        flags.append("in-queue")
+    if pr.get("autoMergeRequest"):
+        flags.append("auto-armed")
+    green, verdict = _required_green(pr, head, read)
+    stamps = [e.when for e in events] + ([committed] if committed else [])
+    newest = max(stamps) if stamps else None
+    age = int((now - newest).total_seconds()) if newest else None
+    return {
+        "repo": repo,
+        "number": pr.get("number"),
+        "title": str(pr.get("title") or ""),
+        "head": head_oid[:9],
+        "mergeable": pr.get("mergeable"),
+        "mergeStateStatus": pr.get("mergeStateStatus"),
+        "requiredGreen": green,
+        "required": {
+            k: verdict.get(k)
+            for k in ("state", "failing", "pending", "missing", "unknown", "reason")
+        },
+        "turn": turn,
+        "flags": flags,
+        "newestEvent": pr_state.iso(newest) if newest else None,
+        "age": age_text(age) if age is not None else "?",
+        "ageSeconds": age,
+    }
+
+
 def build_rows(repo: str, read: RepoRead, now: datetime) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for pr in read.prs:
         if not isinstance(pr, dict) or pr.get("isDraft"):
             continue
-        head = pr_state._head_commit(pr)
-        head_oid = str(pr.get("headRefOid") or "")
-        # commits(last: 1) may not be the head; another commit's date says nothing about a push.
-        on_head = head.get("oid") == head_oid
-        committed = pr_state.parse_iso(head.get("committedDate")) if on_head else None
-        events = _events(pr)
-        turn, flags = classify(head_oid, committed, events)
-        if pr.get("mergeQueueEntry"):
-            flags.append("in-queue")
-        if pr.get("autoMergeRequest"):
-            flags.append("auto-armed")
-        green, verdict = _required_green(pr, head, read)
-        stamps = [e.when for e in events] + ([committed] if committed else [])
-        newest = max(stamps) if stamps else None
-        age = int((now - newest).total_seconds()) if newest else None
-        rows.append(
-            {
-                "repo": repo,
-                "number": pr.get("number"),
-                "title": str(pr.get("title") or ""),
-                "head": head_oid[:9],
-                "mergeable": pr.get("mergeable"),
-                "mergeStateStatus": pr.get("mergeStateStatus"),
-                "requiredGreen": green,
-                "required": {
-                    k: verdict.get(k)
-                    for k in ("state", "failing", "pending", "missing", "unknown", "reason")
-                },
-                "turn": turn,
-                "flags": flags,
-                "newestEvent": pr_state.iso(newest) if newest else None,
-                "age": age_text(age) if age is not None else "?",
-                "ageSeconds": age,
-            }
-        )
+        try:
+            rows.append(_row(repo, pr, read, now))
+        except _ROW_ERRORS as exc:
+            # One malformed PR is one ERROR row; its siblings still print.
+            rows.append(error_row(repo, _defect(exc), pr.get("number")))
     return rows
 
 
@@ -480,8 +571,20 @@ def from_input(doc: object, repo: str) -> RepoRead:
     return read
 
 
-def error_row(repo: str, reason: str) -> dict[str, Any]:
-    return {"repo": repo, "turn": ERROR, "error": reason, "flags": [], "ageSeconds": None}
+def error_row(repo: str, reason: str, number: object = None) -> dict[str, Any]:
+    return {
+        "repo": repo,
+        "number": number,
+        "turn": ERROR,
+        "error": reason,
+        "flags": [],
+        "ageSeconds": None,
+    }
+
+
+def _defect(exc: Exception) -> str:
+    # Not a GitHub failure: say so, so a defect here is not chased as an outage.
+    return f"rows not built, a report defect: {type(exc).__name__}: {exc}"[:300]
 
 
 def render(rows: list[dict[str, Any]]) -> str:
@@ -490,7 +593,9 @@ def render(rows: list[dict[str, Any]]) -> str:
     for row in rows:
         short = row["repo"].split("/", 1)[-1]
         if row["turn"] == ERROR:
-            table.append((ERROR, "", short, "", "", "", "", "", "", row["error"]))
+            number = row.get("number")
+            pr = "" if number is None else str(number)
+            table.append((ERROR, "", short, pr, "", "", "", "", "", row["error"]))
             continue
         title = row["title"]
         if len(title) > TITLE_WIDTH:
@@ -537,10 +642,9 @@ def collect(
             continue
         try:
             rows.extend(build_rows(repo, read, now))
-        except (TypeError, KeyError, AttributeError, ValueError) as exc:
-            # Not a GitHub failure: say so, so a defect here is not chased as an outage.
-            reason = f"rows not built, a report defect: {type(exc).__name__}: {exc}"
-            rows.append(error_row(repo, reason[:300]))
+        # build_rows contains each PR's own defect; this catches a malformed PR list itself.
+        except _ROW_ERRORS as exc:
+            rows.append(error_row(repo, _defect(exc)))
     return sort_rows(rows)
 
 
