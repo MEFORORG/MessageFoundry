@@ -11,6 +11,9 @@ end of the line, nothing after it, and a re-encode that gives the line back. Syn
 
 from __future__ import annotations
 
+import random
+import tracemalloc
+
 import pytest
 
 from messagefoundry.parsing import _builtin_hl7
@@ -99,7 +102,9 @@ def test_the_delimiter_rewrite_keeps_a_later_header_line_in_shape(line: str) -> 
 
 
 #: Bodies whose first line ``strip`` would change: padded single lines, whitespace past the encoding
-#: characters, a trailing ``\r`` run, and a normal multi-line message as the control.
+#: characters, a trailing ``\r`` run, and a normal multi-line message as the control. The last two
+#: hold whitespace inside the head and data after it on the last line, pinning that the head is
+#: trimmed only when nothing but whitespace follows it.
 _ESCAPE_BODIES = [
     "MSH|^~!&|S\rPID|1\r",
     "MSH|^~!&|S\r",
@@ -112,28 +117,46 @@ _ESCAPE_BODIES = [
     "MSH|^~! \rPID|1",
     "\x0bMSH|^~\\&\x0c",
     "MSH|^~!#ABCDEFGH   \r ",
+    "MSH|^~  |S",
+    "MSH|^~  X",
 ]
+
+
+def _head_reference(body: str) -> str:
+    return body.strip().split("\r", 1)[0][: _builtin_hl7._SEPARATOR_HEAD]
 
 
 @pytest.mark.parametrize("body", _ESCAPE_BODIES)
 def test_the_escape_read_takes_the_first_line_parse_takes(body: str) -> None:
     """The pre-parse escape read finds the first line in place. It must be the line ``parse`` takes
     through ``strip``, or the budget and the parser could disagree on the escape character."""
-    assert _builtin_hl7._first_line_head(body) == body.strip().split("\r", 1)[0][:8]
+    assert _builtin_hl7._first_line_head(body) == _head_reference(body)
     assert message_escape_char(body) == _builtin_hl7.parse(body)["seps"][4]
+
+
+def test_the_escape_read_matches_strip_over_random_bodies() -> None:
+    """A seeded sweep of short bodies over header characters, separators and several kinds of
+    whitespace, so a shape the list above misses still meets the reference."""
+    rng = random.Random(2589)
+    alphabet = "MSH|^~\\&!X \t\r\n\x0b\x0c\x1c\x85　"
+    for _ in range(20_000):
+        body = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14)))
+        assert _builtin_hl7._first_line_head(body) == _head_reference(body), repr(body)
 
 
 @pytest.mark.parametrize("tail", ["\r", "\rPID|1\r"], ids=["single-line", "multi-line"])
 def test_the_escape_read_copies_nothing_of_the_body(tail: str) -> None:
-    """Round 1 of this change read the first line through ``strip``, which copies all of a body that
-    ends in ``\\r``, before the ACK on every message. The read is now bounded."""
-    import tracemalloc
-
+    """The pre-ACK escape read allocates a bounded amount, not a copy of a body ending in ``\\r``."""
     body = "MSH|^~!&|" + "A" * 2_000_000 + tail
-    tracemalloc.start()
+    started_here = not tracemalloc.is_tracing()
+    if started_here:
+        tracemalloc.start()
+    tracemalloc.reset_peak()
+    before, _ = tracemalloc.get_traced_memory()
     try:
         assert message_escape_char(body) == "!"
         _, peak = tracemalloc.get_traced_memory()
     finally:
-        tracemalloc.stop()
-    assert peak < 100_000
+        if started_here:
+            tracemalloc.stop()
+    assert peak - before < 100_000
