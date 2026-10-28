@@ -5132,8 +5132,14 @@ session's owner as actor, its `outcome` is `revoked`, and a `presented` field ho
 was presented. A row the sign-out ended that was already over its idle or absolute limit is
 recorded as `lapsed`, not `revoked`, and still names the owner.
 
-A refused audit write is logged, not raised, so `/ui/logout` still clears the cookie; that row is
-then missing, with an ERROR log line naming the session.
+**A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
+clears the cookie. That row is then missing, with an ERROR log line; the line names the session
+when the sign-out ended one.
+
+A sign-out that presents a token and ends nothing also writes an `auth.logout` row, with `outcome`
+`nothing_to_revoke`. `/ui/logout` has no sign-in check and charges no budget, so nothing in the
+engine bounds how many such rows an unauthenticated caller can append: on a deployment, a proxy
+limiter in front of `/ui/logout` is the only bound. That is an open gap, not a control.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was

@@ -604,9 +604,9 @@ async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(
 
 
 async def test_every_sign_out_that_ends_nothing_writes_its_row(store: MessageStore) -> None:
-    # BACKLOG #3749: no budget drops these rows. Every sign-out that presents a token writes its
-    # auth.logout row, as on main, so 150 misses from one client with nothing proven write 150
-    # rows. Bounding an audit flood is a separate concern from this item.
+    # BACKLOG #3749: no budget drops these rows. A sign-out that presents a token writes its
+    # auth.logout row, so 150 misses from one client with nothing proven write 150 rows. A later
+    # bound on this flood would change this test on purpose; docs/SECURITY.md names the gap.
     service = await _service(store, session_idle_timeout_minutes=30)
     count = 150
     for n in range(count):
@@ -614,8 +614,6 @@ async def test_every_sign_out_that_ends_nothing_writes_its_row(store: MessageSto
             await service.logout(f"no-such-token-{n}", client="203.0.113.9", proven_at=None)
             == "nothing_to_revoke"
         )
-    rows = await store.list_audit(action="auth.logout", limit=count * 2)
+    rows = await logout_rows(store, limit=count * 2)
     assert len(rows) == count, "a sign-out that ended nothing wrote no row"
-    assert {(row["client"], json.loads(str(row["detail"]))["outcome"]) for row in rows} == {
-        ("203.0.113.9", "nothing_to_revoke")
-    }
+    assert set(rows) == {(None, "203.0.113.9", "nothing_to_revoke")}

@@ -11,12 +11,12 @@ import json
 from typing import Any
 
 
-async def logout_rows(store: Any) -> list[tuple[object, object, object]]:
+async def logout_rows(store: Any, *, limit: int = 50) -> list[tuple[object, object, object]]:
     """Each ``auth.logout`` row, newest first, as its actor, client address and
-    ``detail.outcome``."""
+    ``detail.outcome``. ``limit`` is passed to ``list_audit``, whose default is 50."""
     return [
         (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")).get("outcome"))
-        for row in await store.list_audit(action="auth.logout")
+        for row in await store.list_audit(action="auth.logout", limit=limit)
     ]
 
 

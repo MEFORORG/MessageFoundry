@@ -10829,7 +10829,8 @@ class AuthService:
                 ),
                 log=_log,
                 message="a sign-out that ended nothing could not write its auth.logout row",
-                # A raise would fail a sign-out the caller is owed (see below).
+                # A raise would fail a sign-out the caller is owed: /ui/logout would answer 500
+                # without clearing the cookie (BACKLOG #3884).
                 defects=(),
             )
             return "nothing_to_revoke"
