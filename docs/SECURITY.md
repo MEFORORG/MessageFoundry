@@ -5175,13 +5175,13 @@ clears the cookie. That row is then missing, with an ERROR log line; the line na
 when the sign-out ended one. A failed owner lookup writes the row with no actor, so it does not
 reach that user's security-events feed.
 
-**Open gap: audit rows for sign-outs that end no session are unbounded.** A `/ui/logout` request
-whose session cookie ends no session can still write an `auth.logout` row, with `outcome`
-`nothing_to_revoke`. Nothing in the engine bounds how many such rows a caller who can reach the
-route can append, and nothing prunes `audit_log` (see [retention](CONFIGURATION.md#retention)). A
-bound in the engine is a follow-up, not yet filed. Until it exists, treat `/ui/logout` as an
-unbounded audit-write surface to any caller that can reach the console, on the engine's own host
-or beyond it.
+**Open gap: `/ui/logout` audit rows for sign-outs that end no session are unbounded.** A request
+to `/ui/logout` whose session cookie ends no session can still write an `auth.logout` row, with
+`outcome` `nothing_to_revoke`. Nothing in the engine bounds how many such rows a caller who can
+reach the route can append, and nothing prunes `audit_log` (see
+[retention](CONFIGURATION.md#retention)). A bound in the engine is a follow-up, not yet filed.
+Until it exists, treat `/ui/logout` as an unbounded audit-write surface to any caller that can
+reach the console, on the engine's own host or beyond it.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
