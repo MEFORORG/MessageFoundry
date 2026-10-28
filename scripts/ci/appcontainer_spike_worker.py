@@ -104,6 +104,13 @@ _NCRYPT_SILENT_FLAG = 0x40
 #: returned when this was first run, on Windows 11 build 26300.
 _KEY_OPEN_REFUSALS = frozenset({0x80090016, 0x80070002, 0x80090011, 0x80090010, 0x80070005})
 _SIGN_REFUSALS = frozenset({0x80090010, 0x80070005})
+#: CreateProcessW failures that are a refusal of the launch: access denied, a privilege not held.
+_LAUNCH_REFUSALS = frozenset({5, 1314})
+#: An exit code at or above this is an NTSTATUS error, which the loader gives a process that died
+#: before its own code ran. CPython's own exits are small.
+_NTSTATUS_ERROR = 0xC0000000
+#: CreateAppContainerProfile's HRESULT when the profile is there already.
+_PROFILE_EXISTS = 0x800700B7
 #: The digest the owner and the container sign, and the owner checks.
 _DIGEST = hashlib.sha256(PAYLOAD).digest()
 
@@ -170,8 +177,9 @@ def _win() -> Any:
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     adv = ctypes.WinDLL("advapi32", use_last_error=True)
     ncrypt = ctypes.WinDLL("ncrypt", use_last_error=True)
-    userenv: Any = ctypes.WinDLL("userenv", use_last_error=True)
+    userenv: Any = None
     try:
+        userenv = ctypes.WinDLL("userenv", use_last_error=True)
         sid_out = ctypes.POINTER(ctypes.c_void_p)
         for name, args in {
             "CreateAppContainerProfile": (
@@ -188,7 +196,7 @@ def _win() -> Any:
             fn = getattr(userenv, name)
             fn.argtypes = args
             fn.restype = ctypes.c_long
-    except AttributeError:
+    except (OSError, AttributeError):
         userenv = None
 
     k32.InitializeProcThreadAttributeList.argtypes = (
@@ -477,7 +485,7 @@ class _NCrypt:
         self._call("NCryptFreeObject", key)
 
     def delete(self, key: int) -> int:
-        return self._call("NCryptDeleteKey", key, 0)
+        return self._call("NCryptDeleteKey", key, _NCRYPT_SILENT_FLAG)
 
 
 def _record(status: int, **extra: Any) -> dict[str, Any]:
@@ -815,7 +823,7 @@ def run_owner(folder: Path, shared: Path) -> dict[str, Any]:
             if made and prov is not None:
                 status, key = nc.open(prov, KEY_NAME)
                 report["key_delete"] = status_text(nc.delete(key) if key is not None else status)
-    report["profile_delete"] = delete_appcontainer_profile(PROFILE)
+            report["profile_delete"] = delete_appcontainer_profile(PROFILE)
     _write_report(folder / OWNER_REPORT, report)
     return report
 
@@ -1078,8 +1086,11 @@ def judge_reports(
                 UNANSWERED,
                 "a report came back, but not from a container of this profile",
             )
-    elif launch.get("started") is False:
+    elif launch.get("started") is False and launch.get("win32") in _LAUNCH_REFUSALS:
         q1, q1_detail = NO, f"the service could not start the container: {launch.get('error')}"
+    elif launch.get("started") is False:
+        q1 = UNANSWERED
+        q1_detail = f"the launch failed, but not as a refusal: {launch.get('error')}"
     elif o.get("container_fatal") is not False:
         # The container writes its report before anything else, so a crash file with no report is
         # this script failing inside the container, not the account refusing to run it.
@@ -1088,8 +1099,20 @@ def judge_reports(
             "no report, and the worker crashed inside the container or its crash file was not "
             f"looked for (container_fatal={o.get('container_fatal')}); read container-fatal.txt"
         )
-    elif launch.get("started") is True:
+    elif (
+        launch.get("started") is True
+        and not launch.get("timed_out")
+        and int(launch.get("exit_code") or 0) >= _NTSTATUS_ERROR
+    ):
+        # An NTSTATUS error exit, such as a DLL that did not load: the process died before CPython
+        # could run anything. A small exit code is CPython's own, so CPython did start.
         q1 = NO
+        q1_detail = (
+            f"the container started and died before CPython ran: exit {launch.get('exit_text')}; "
+            f"its output is in {CONTAINER_LOG}"
+        )
+    elif launch.get("started") is True:
+        q1 = UNANSWERED
         q1_detail = (
             f"the container started and wrote no report: exit {launch.get('exit_text')}, "
             f"timed out={launch.get('timed_out')}; its output is in {CONTAINER_LOG}"
@@ -1200,7 +1223,14 @@ def judge_reports(
         (
             "CNG works inside the container: an ephemeral key signed and checked",
             _ok(c.get("ephemeral")),
-            f"stage {_get(c, 'ephemeral', 'stage')}, {_get(c, 'ephemeral', 'status_text')}",
+            f"provider {_why(c.get('provider'))}; stage {_get(c, 'ephemeral', 'stage')}, "
+            f"{_get(c, 'ephemeral', 'status_text')}",
+        ),
+        (
+            "the container's AppContainer profile exists, made now or already there",
+            _get(o, "profile", "created") is True
+            or str(_get(o, "profile", "create")).startswith(status_text(_PROFILE_EXISTS)),
+            f"create {_get(o, 'profile', 'create')}",
         ),
     ]
     same_as_absent = (

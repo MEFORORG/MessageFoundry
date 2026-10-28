@@ -229,9 +229,8 @@ def test_a_refusal_beside_every_control_is_a_no(
                 "exit_text": "0xC0000135",
                 "timed_out": False,
             },
-            "no report",
+            "died before CPython ran",
         ),
-        ({"started": True, "exit_code": 1, "timed_out": True}, "timed out=True"),
     ],
 )
 def test_a_container_the_service_could_not_run_is_a_no_and_the_rest_are_not_run(
@@ -258,6 +257,13 @@ def test_a_container_the_service_could_not_run_is_a_no_and_the_rest_are_not_run(
         ({"started": True, "exit_code": 1, "timed_out": False}, _DELETE),
         # The launcher failed before CreateProcessW: no "started" at all.
         ({"error": "UpdateProcThreadAttribute(0x20009) failed (win32 error 87)"}, False),
+        # CreateProcessW failed, but not as a refusal: a bad parameter is the launcher's own.
+        ({"started": False, "error": "CreateProcessW failed (win32 error 87)", "win32": 87}, False),
+        # CPython's own exit codes: it started, so a missing report is not the account's NO.
+        ({"started": True, "exit_code": 2, "exit_text": "0x00000002", "timed_out": False}, False),
+        ({"started": True, "exit_code": 1, "timed_out": False}, False),
+        # A container that hung until the owner killed it may or may not have started CPython.
+        ({"started": True, "exit_code": 0xC0000135, "timed_out": True}, False),
     ],
 )
 def test_a_missing_report_the_instrument_explains_is_unanswered(
@@ -267,6 +273,11 @@ def test_a_missing_report_the_instrument_explains_is_unanswered(
     case["owner"]["launch"] = launch
     case["container"] = None
     assert _answers(case) == dict.fromkeys(ALL_YES, "UNANSWERED")
+
+
+def test_a_profile_that_was_there_already_still_counts() -> None:
+    case = _mutate("owner.profile", {"created": False, "create": "0x800700B7", "sid": PACKAGE})
+    assert _answers(case) == ALL_YES
 
 
 def test_the_arguments_the_owner_hands_the_container_parse() -> None:
@@ -350,6 +361,12 @@ def test_the_arguments_the_owner_hands_the_container_parse() -> None:
         ("owner.container_signature_verified", _DELETE, "Q4"),
         ("container.key", None, "Q4"),
         ("container.key", {"open": OK}, "Q4"),
+        # A container on a derived SID with no profile has no key store of its own to ask.
+        (
+            "owner.profile",
+            {"created": False, "create": "0x80070005 E_ACCESSDENIED", "sid": PACKAGE},
+            "Q4",
+        ),
         # A failure that is not a refusal is not a NO: a bad parameter, or an RPC that went away.
         ("container.key", {"open": _status(0x80090027)}, "Q4"),
         ("container.key", {"open": _status(0x800706BA)}, "Q4"),
