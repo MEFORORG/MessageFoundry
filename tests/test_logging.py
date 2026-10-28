@@ -281,8 +281,9 @@ def test_redaction_filter_scrubs_stack_info() -> None:
 
 def test_redaction_filter_residual_bare_name_not_caught() -> None:
     # DOCUMENTED RESIDUAL (redaction.py / PHI.md §7): a bare free-text name with <2 HL7 delimiters and
-    # no segment header is not HL7-shaped, so the filter does NOT catch it — the "never put PHI in an
-    # exception message" convention is the control. Pin the boundary so a future change is deliberate.
+    # no segment header is not HL7-shaped, so the filter does NOT catch it. The "never put PHI in an
+    # exception message" convention covers it only in text the engine's own authors write (docs/PHI.md
+    # section 7, "Who the exception-message convention binds"). Pin the boundary so a change is deliberate.
     rec = logging.LogRecord(
         "t", logging.ERROR, __file__, 1, "invalid patient %s", ("DOE^JANE",), None
     )

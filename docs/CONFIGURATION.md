@@ -974,8 +974,9 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 > ([`redaction.py`](../messagefoundry/redaction.py)): a stdlib-regex pass over HL7 segment/field-delimited
 > spans plus a free-text date/DOB and multi-token-name heuristic, erring toward over-redaction. Its own
 > named residual is **an adversarially-crafted single-token or non-name-shaped identifier** — a lone MRN
-> or surname with no second token and no delimiter — for which *"never put PHI in an exception message"*
-> remains the control. So "always-on, every sink" is the coverage guarantee; it is **not** a guarantee
+> or surname with no second token and no delimiter. The *"never put PHI in an exception message"*
+> convention covers it only in text the engine's own authors write, not in text a remote peer wrote
+> ([PHI.md](PHI.md) section 7, *Who the exception-message convention binds*). So "always-on, every sink" is the coverage guarantee; it is **not** a guarantee
 > that PHI cannot reach a log. Size log-handling risk accordingly, and keep `level` off `debug`.
 > For an encrypted hop set `forward_protocol = "tls"`
 > (native RFC 5425, no agent needed); the one plaintext alternative that still starts on a stock

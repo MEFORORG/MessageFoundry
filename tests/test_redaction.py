@@ -544,8 +544,9 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
 
     The sniff reads MSH-1 and MSH-2. A fragment carrying custom delimiters but no MSH header declares
     nothing, so there is no delimiter set to recover and it passes through. This fix does NOT claim
-    completeness: the "never put PHI in an exception message" convention remains the control for a
-    headerless fragment, exactly as it does for a bare single-token identifier.
+    completeness. The "never put PHI in an exception message" convention covers a headerless fragment,
+    and a bare single-token identifier, only in text the engine's own authors write (docs/PHI.md
+    section 7, *Who the exception-message convention binds*).
 
     The fixture read ``mrn MRN123$$$H$MR here`` until BACKLOG #2079, whose labelled-MRN pass now
     scrubs the value after that ``mrn`` label. That is a different pass reaching it, not the sniff, so
@@ -553,6 +554,23 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
     beside it."""
     assert redact("id MRN123$$$H$MR here") == "id MRN123$$$H$MR here"
     assert redact("mrn MRN123$$$H$MR here") == "mrn [redacted]$$$H$MR here"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("x Ann Jo Lee Smith y", "x [redacted] y"),  # control: four tokens go whole
+        ("x Mary Ann Jo Lee Smith y", "x [redacted] Smith y"),
+        ("x MARY ANN JO LEE SMITH y", "x [redacted] SMITH y"),
+        ("x Mary Ann Jo Lee Smith Doe y", "x [redacted] [redacted] y"),  # six: four, then two
+    ],
+)
+def test_a_five_token_name_keeps_its_fifth_token(text: str, expected: str) -> None:
+    """DOCUMENTED RESIDUAL (BACKLOG #2079), pinned so a change to it is deliberate.
+
+    Each ``_NAME_RUN`` arm takes two to four tokens and the scan resumes after a match, so a run of
+    five leaves its fifth token alone. The comment above ``_NAME_RUN`` states it."""
+    assert redact(text) == expected
 
 
 # --- safe_name: a partner-chosen FILE NAME (BACKLOG #1748) --------------------
