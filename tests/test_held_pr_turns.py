@@ -290,15 +290,22 @@ def test_review_bodies_and_inline_only_reviews_count_as_replies(
     assert (rows[13]["turn"], rows[13]["flags"]) == ("LANDER", ["no-new-commit"])
 
 
-def test_pending_review_and_minimized_comment_are_ignored(
+def test_pending_review_is_ignored_and_minimized_comment_is_never_a_hold(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     pending = _review("Manager: draft, not submitted.", "2026-10-28T15:00:00Z", state="PENDING")
-    hidden = _comment("Manager: ready for landing.", "2026-10-28T15:00:00Z")
+    pr = _pr(14, comments=[_hold("2026-10-28T12:00:00Z", _sha(14))], reviews=[pending])
+    # A minimized reply after the hold still hands the turn back: hiding it is no new hold.
+    hidden = _comment("Manager: answered in thread.", "2026-10-28T15:00:00Z")
     hidden["isMinimized"] = True
-    pr = _pr(14, comments=[_hold("2026-10-28T12:00:00Z", _sha(14)), hidden], reviews=[pending])
-    row = _engine_rows(tmp_path, capsys, pr)[14]
-    assert (row["turn"], row["flags"]) == ("AUTHOR", ["held"])
+    replied = _pr(15, comments=[_hold("2026-10-28T12:00:00Z", _sha(15)), hidden], reviews=[pending])
+    # A minimized hold is no hold.
+    old = _hold("2026-10-28T12:00:00Z", _sha(16))
+    old["isMinimized"] = True
+    rows = _engine_rows(tmp_path, capsys, pr, replied, _pr(16, comments=[old]))
+    assert (rows[14]["turn"], rows[14]["flags"]) == ("AUTHOR", ["held"])
+    assert (rows[15]["turn"], rows[15]["flags"]) == ("LANDER", ["no-new-commit"])
+    assert (rows[16]["turn"], rows[16]["flags"]) == ("LANDER", ["no-lander-comment"])
 
 
 def test_outside_account_cannot_post_a_hold(
@@ -788,3 +795,48 @@ def test_listed_commit_not_the_head_names_why_green_is_unknown(
     row = _engine_rows(tmp_path, capsys, pr)[116]
     assert row["requiredGreen"] == "?"
     assert "not the head" in row["required"]["reason"]
+    # ...but a base other than main keeps its own reason, which a re-run cannot fix.
+    other = _pr(117)
+    other["headRefOid"] = _sha(998)
+    other["baseRefName"] = "release/1.0"
+    row = _engine_rows(tmp_path, capsys, other)[117]
+    assert "release/1.0" in row["required"]["reason"]
+
+
+def test_hold_waiting_on_someone_else_is_not_the_authors_turn() -> None:
+    heads = hpt.hold_heads
+    assert (
+        heads("Lander (session x). **Held for an owner ruling on finding 3, at `abcdef1`.**")
+        is None
+    )
+    assert (
+        heads("Lander (session x). **Held pending CI on `abcdef1`; I merge when green.**") is None
+    )
+    assert heads("Lander (session x). **Held in the merge queue at `abcdef1`.**") is None
+    assert heads("Lander (session x). **Held, back to the author, at `abcdef1`.**") == ("abcdef1",)
+
+
+def test_live_text_follows_markdown_fences_spans_and_quotes() -> None:
+    heads = hpt.hold_heads
+    held = "Lander (session x). **Held, at `abcdef1`.**\n\n"
+    release = "<!-- lander-release -->"
+    # A fence closes only on its own kind and length, so a live release after it is read.
+    assert heads(held + "```\n~~~\n```\n" + release) is None
+    assert heads(held + "````\n```\n````\n" + release) is None
+    # A line opening with an inline triple-backtick span is no fence.
+    assert heads(held + "```x``` is shown\n" + release) is None
+    cleared = "Lander (session y), 2026-10-28. **Cleared; merging.**\n\n"
+    marker = "<!-- lander-hold head=abcdef1 -->"
+    # An indented code block, a double-backtick span and a lazy quote line show a marker.
+    assert heads(cleared + "Holds look like:\n\n    " + marker) is None
+    assert heads(cleared + "Shown as `` `" + marker + "` `` here.") is None
+    assert heads(cleared + "> Earlier hold said\nsee " + marker) is None
+    # A hold marker counts only on a line of its own.
+    assert heads(cleared + "Write " + marker + " to hold.") is None
+    assert heads(cleared + marker) == ("abcdef1",)
+
+
+def test_bare_headline_sentence_survives_an_inner_dot() -> None:
+    heads = hpt.hold_heads
+    assert heads("Lander (session x). **Held**, PR 2564 vs. main: answered.") is None
+    assert heads("Lander (session x). **Held** at v1.2, `abcdef1`.") == ("abcdef1",)

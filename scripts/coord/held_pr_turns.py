@@ -48,8 +48,8 @@ login, so the login says nothing about which seat wrote a comment.
   that would park a PR on its author. A comment from an outside account still counts as a newer
   non-Lander comment, which can only hand the turn TO the Lander, the safe direction.
 * A hold, by MARKER (the primary signal): a Lander comment carrying ``<!-- lander-hold
-  head=<sha> -->`` anywhere in its body outside a blockquote or code, where ``<sha>`` is 7 to 40
-  hex characters. A quoted or shown marker is not posted, so it is not read. The marker's
+  head=<sha> -->`` on a line of its own, outside a blockquote or code, where ``<sha>`` is 7 to
+  40 hex characters. A quoted or shown marker is not posted, so it is not read. The marker's
   SHA is the held head, and the prose is not read. A marker whose head is anything else is no
   marker, and the prose decides.
 * A RELEASE, by marker: a Lander comment carrying ``<!-- lander-release -->`` is never a hold, even
@@ -63,8 +63,9 @@ login, so the login says nothing about which seat wrote a comment.
   ``)`` closing the session marker, within ``HEADLINE_REACH`` characters, as in
   ``Lander (session 8a04c9f3), 2026-10-28. **Held, ...**``. So "No longer **held**" and "Earlier
   **Held** answered" are mentions, not holds. A headline holding a word from ``_NOT_A_HOLD`` (no
-  longer, cleared, answered, earlier, ...) is negated or past tense, and no hold; for a headline
-  that is not a whole sentence, the rest of its sentence after the bold run is read too. That
+  longer, cleared, answered, earlier, ...) is negated or past tense, or waits on someone other
+  than the author (pending, owner, ruling, queue, CI), and no hold; for a headline that is not a
+  whole sentence, the rest of its line after the bold run is read too. That
   word list errs wide: a real hold saying "finding 2 is not resolved" reads as no hold, which
   costs the Lander a look, never a missed reply.
 * LANDER's turn: there is no Lander comment; or the latest Lander comment is not a hold; or there is
@@ -74,7 +75,7 @@ login, so the login says nothing about which seat wrote a comment.
 "A commit newer than the hold". The held head is the marker's SHA; failing a marker, the SHA after
 ``at`` in the prose headline (``**Held, back to the author, at `f4f4dd470`.**``); failing that,
 any backticked SHA in the headline (``**Held on `f4f4dd470`**``, ``at head `f4f4dd470```). A
-headline that is not a whole sentence (``**Held**, at `f4f4dd470`.``) is read to its sentence's end. If the
+headline that is not a whole sentence (``**Held**, at `f4f4dd470`.``) is read to its line's end. If the
 current head does not start with the held head, there is a new commit. Reading any backticked SHA
 can mistake a named fix commit or a hex-spelled word for the head, but that makes a mismatch, a new
 commit, the safe direction. Two or more distinct heads are ambiguous: LANDER's, ``sha-ambiguous``.
@@ -94,8 +95,9 @@ Lander comment. A review with an empty body counts as a non-Lander comment, beca
 review is how an author answers a finding in its thread. The cost: every seat shares one login, so
 the Lander's own inline-only review after its hold also hands the turn back to it, the safe
 direction. Two Lander comments in the same second resolve to the non-hold. Skipped entirely: a PENDING review (every
-seat shares one login, so each sees the others' unsubmitted drafts, which the author cannot) and a
-minimized comment or review. Skipped for the TURN, though still counted toward the newest-event
+seat shares one login, so each sees the others' unsubmitted drafts, which the author cannot). A
+minimized comment or review still counts, but never as a Lander comment: hiding a reply must not
+bring back the hold before it, and a minimized hold is no hold. Skipped for the TURN, though still counted toward the newest-event
 age: anything authored by a GitHub App or bot (GraphQL ``author.__typename == "Bot"``), such as the
 greptile auto-approve review a push triggers. A bot reacting to a push is not the author moving;
 the push itself is the move, and it is caught as a new commit. This keys on the author's TYPE, not
@@ -164,7 +166,8 @@ _BACKTICK_SHA = re.compile(r"`([0-9a-fA-F]{7,40})`")
 _HOLD_MARKER = re.compile(r"<!--\s{0,8}lander-hold\s{1,8}head=([0-9a-fA-F]{7,40})\s{0,8}-->")
 #: The machine-readable release marker: this Lander comment is not a hold, whatever its prose says.
 _RELEASE_MARKER = re.compile(r"<!--\s{0,8}lander-release\s{0,8}-->")
-#: Words that make a prose hold headline negated or past tense, so it is no hold.
+#: Words that make a prose hold headline negated or past tense, or a hold waiting on someone other
+#: than the author (CI, the queue, an owner ruling), so it is no hold back to the author.
 _NOT_A_HOLD = (
     "no longer",
     "not held",
@@ -179,16 +182,20 @@ _NOT_A_HOLD = (
     "earlier",
     "previously",
     "formerly",
+    "pending",
+    "waiting on",
+    "owner",
+    "ruling",
+    "queue",
+    "ci",
 )
 #: What may end a headline that is a whole sentence, so the text after it is a new sentence. A
 #: colon or semicolon does not: "**Held:** answered" puts its predicate after the run.
 _SENTENCE_END = (".", "!")
 #: What may follow the word in a hold headline, so "Held-over" or "Heldout" is no hold.
 _HEAD_END = ("", " ", ",", ":", ";", *_SENTENCE_END)
-#: A run of backticks, which opens or closes a code span.
-_BACKTICKS = re.compile(r"`+")
-#: What opens or closes a fenced code block.
-_FENCES = ("```", "~~~")
+#: The characters a fenced code block's fence is made of.
+_FENCE_CHARS = "`~"
 
 LANDER = "LANDER"
 AUTHOR = "AUTHOR"
@@ -297,11 +304,7 @@ def _events(pr: dict[str, Any]) -> list[Event]:
         ("reviews", ("submittedAt", "createdAt")),
     ):
         for node in _nodes(pr.get(kind)):
-            if (
-                not isinstance(node, dict)
-                or node.get("isMinimized")
-                or node.get("state") == "PENDING"
-            ):
+            if not isinstance(node, dict) or node.get("state") == "PENDING":
                 continue
             when = next(
                 (w for k in stamp_keys if (w := pr_state.parse_iso(node.get(k))) is not None), None
@@ -311,13 +314,17 @@ def _events(pr: dict[str, Any]) -> list[Event]:
                 raise ValueError(f"a {kind[:-1]} has no readable timestamp")
             author = node.get("author")
             bot = isinstance(author, dict) and author.get("__typename") == "Bot"
-            trusted = node.get("authorAssociation") in TRUSTED_ASSOCIATIONS
+            # A minimized comment is never a Lander comment, so it can only hand the turn back.
+            trusted = (
+                not node.get("isMinimized")
+                and node.get("authorAssociation") in TRUSTED_ASSOCIATIONS
+            )
             out.append(Event(when, str(node.get("body") or ""), bot, trusted))
     return out
 
 
 def _headline_and_tail(body: str) -> tuple[str, str]:
-    """``(headline, tail)``: the first bold run, and the rest of its sentence after the run.
+    """``(headline, tail)``: the first bold run, and the rest of its line after the run.
 
     The headline is ``""`` where the body has no session marker or no bold run, or where the text
     between the marker's ``)`` and the run holds a letter or runs past ``HEADLINE_REACH``: then the
@@ -334,8 +341,10 @@ def _headline_and_tail(body: str) -> tuple[str, str]:
     if end < 0:
         return "", ""
     rest = text[end + 2 :]
-    stops = [i for i in (rest.find("."), rest.find("\n")) if i >= 0]
-    return text[start + 2 : end], rest[: min(stops)] if stops else rest
+    # The rest of the line, not of the sentence: a dot in "vs." or "v1.2" ends no sentence, and
+    # reading further only finds more negation or more heads, both of which go to the Lander.
+    stop = rest.find("\n")
+    return text[start + 2 : end], rest if stop < 0 else rest[:stop]
 
 
 def _negated(text: str) -> bool:
@@ -346,7 +355,7 @@ def _negated(text: str) -> bool:
 def _prose_hold(body: str) -> str | None:
     """The sentence of a prose hold, or ``None`` when the body is no prose hold.
 
-    That is the headline, plus the rest of its sentence when the headline is not a whole one.
+    That is the headline, plus the rest of its line when the headline is not a whole sentence.
     """
     head, tail = _headline_and_tail(body)
     text = head.lstrip().casefold()
@@ -355,32 +364,85 @@ def _prose_hold(body: str) -> str | None:
         for word in HOLD_HEADS
     ):
         return None
-    # A bare "**Held**" leaves its predicate outside the run, so read the rest of that sentence.
+    # A bare "**Held**" leaves its predicate outside the run, so read the rest of that line.
     whole = head if head.rstrip().endswith(_SENTENCE_END) else head + tail
     return None if _negated(whole) else whole
 
 
-def _live_text(body: str) -> str:
-    """``body`` without blockquotes, fenced code blocks and code spans, where markers are read.
+def _fence(stripped: str) -> tuple[str, int, str] | None:
+    """``(char, length, rest)`` when ``stripped`` opens with three or more of one fence char."""
+    for char in _FENCE_CHARS:
+        length = len(stripped) - len(stripped.lstrip(char))
+        if length >= 3:
+            return char, length, stripped[length:]
+    return None
+
+
+def _drop_spans(line: str) -> str:
+    """``line`` with each code span blanked. A span closes on a run of its own length only; a run
+    nothing closes is plain text, as Markdown renders it."""
+    out: list[str] = []
+    i = 0
+    while (j := line.find("`", i)) >= 0:
+        k = j + len(line[j:]) - len(line[j:].lstrip("`"))
+        close = k
+        while (a := line.find("`", close)) >= 0:
+            close = a + len(line[a:]) - len(line[a:].lstrip("`"))
+            if close - a == k - j:
+                out += [line[i:j], " "]
+                i = close
+                break
+        else:
+            out.append(line[i:k])
+            i = k
+    out.append(line[i:])
+    return "".join(out)
+
+
+def _live_lines(body: str) -> list[str]:
+    """``body``'s lines outside blockquotes and fenced code, code spans blanked: where markers are
+    read.
 
     A marker there is quoted or shown, not posted: a release quoting the hold it clears, or a hold
-    telling the author how to release it. An unclosed fence runs to the end of the body, as
-    Markdown renders it; an unclosed backtick is plain text, so it hides nothing.
+    telling the author how to release it. A fence closes only on its own char at its own length or
+    longer; an unclosed fence runs to the end of the body. A line after a quote line, up to a blank
+    line, is the quote's lazy continuation.
     """
     kept: list[str] = []
-    fenced = False
+    fence: tuple[str, int] | None = None
+    quoted = False
     for line in body.splitlines():
         stripped = line.lstrip()
-        if stripped.startswith(_FENCES):
-            fenced = not fenced
+        found = _fence(stripped)
+        if fence is not None:
+            if found and found[0] == fence[0] and found[1] >= fence[1] and not found[2].strip():
+                fence = None
             continue
-        if fenced or stripped.startswith(">"):
+        if found and (found[0] == "~" or "`" not in found[2]):
+            fence = found[0], found[1]
             continue
-        parts = _BACKTICKS.split(line)
-        # An odd run count leaves the last run unclosed, so its text is plain, not code.
-        plain = parts[0::2] if len(parts) % 2 else [*parts[0::2], parts[-1]]
-        kept.append(" ".join(plain))
-    return "\n".join(kept)
+        if stripped.startswith(">"):
+            quoted = True
+            continue
+        if quoted and stripped:
+            continue
+        quoted = False
+        kept.append(_drop_spans(line))
+    return kept
+
+
+def _hold_markers(lines: list[str]) -> list[str]:
+    """Heads from ``lander-hold`` markers on lines of their own, indented under four spaces.
+
+    Stricter than the release marker on purpose: reading a shown hold marker as posted parks a
+    PR on its author, while reading a shown release only costs the Lander a look.
+    """
+    return [
+        head
+        for line in lines
+        if line.lstrip(" ").startswith("<!--") and len(line) - len(line.lstrip(" ")) < 4
+        for head in _HOLD_MARKER.findall(line)
+    ]
 
 
 def _distinct(shas: Iterable[str]) -> tuple[str, ...]:
@@ -395,12 +457,13 @@ def hold_heads(body: str) -> tuple[str, ...] | None:
     either, the prose headline decides, and its heads are the SHAs after ``at`` in the headline's
     sentence, else every backticked SHA in it. ``()`` is a hold naming no head; two or more heads
     are ambiguous. Only that sentence is searched, so a SHA quoted later in the body is never read.
-    Markers are read only outside blockquotes and code (``_live_text``).
+    Markers are read only outside blockquotes and code (``_live_lines``), and a hold marker only
+    on a line of its own (``_hold_markers``).
     """
-    live = _live_text(body)
-    if _RELEASE_MARKER.search(live):
+    live = _live_lines(body)
+    if any(_RELEASE_MARKER.search(line) for line in live):
         return None
-    marked = _HOLD_MARKER.findall(live)
+    marked = _hold_markers(live)
     if marked:
         return _distinct(marked)
     head = _prose_hold(body)
@@ -474,7 +537,11 @@ def _required_green(
     )
     if read.required_error and verdict.get("reason") == "no required-context list":
         verdict["reason"] = read.required_error
-    elif contexts is None and verdict.get("state") != "SUCCESS":
+    elif (
+        head.get("oid")
+        and contexts is None
+        and str(verdict.get("reason")).startswith("required-context query returned nothing")
+    ):
         verdict["reason"] = "the commit listed is not the head (a push during the read?); re-run"
     state = verdict.get("state")
     return (
