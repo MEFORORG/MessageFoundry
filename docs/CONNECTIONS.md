@@ -1905,7 +1905,8 @@ when the cursor closes. The error names the connection and the ceiling, never th
 A lookup that shapes one message rarely needs more than a handful of rows. If a feed needs a large
 table, a synced `Reference(...)` is the better fit. `max_rows=0` removes the ceiling, and
 `max_rows` reads zero as every other cap does (`transports.base.cap_setting`), so an `env()` value
-of `"0"`, `"0.0"` or an empty string removes it too. A negative or fractional value stops `serve`
+of `"0"` or `"0.0"` removes it too. An empty or blank `env()` value is **refused**, where other caps
+read it as off: a provisioning slip must not remove a row ceiling. A negative or fractional value stops `serve`
 building the lookup. `messagefoundry check` refuses it in its build
 leg, which runs when the config has a `messagefoundry.toml`. The ceiling counts rows, not bytes.
 
@@ -1935,7 +1936,7 @@ A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the
   `ReferenceRowCeilingExceeded`: the last-good snapshot keeps serving, the AlertSink fires, and a set
   that never synced stays unloaded. The set is never built from a truncated result. The driver may
   still spend time discarding the unread rows when the cursor closes, inside that set's sync.
-  `max_rows=0` removes the ceiling, read as the lookup's is (an empty `env()` value included). A
+  `max_rows=0` removes the ceiling, read as the lookup's is: an explicit zero is off, an empty `env()` value is refused. A
   negative or fractional value is refused when the `DatabaseRef`
   is declared. An `env()` value is refused by the build check, which `messagefoundry check` runs in
   its build leg when the config has a `messagefoundry.toml`, and at each sync.

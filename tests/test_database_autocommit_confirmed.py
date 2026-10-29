@@ -17,6 +17,7 @@ no database.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import threading
 import time
@@ -37,6 +38,7 @@ from messagefoundry.transports.database import (
     _acquire,
     _close_and_release,
     _make_pool,
+    _thread_settled,
 )
 
 _SQLSERVER: dict[str, Any] = {"server": "db.example", "database": "d"}
@@ -500,3 +502,31 @@ async def test_a_reference_sync_runs_in_autocommit(driver: _Driver) -> None:
 
 def test_the_refusal_type_is_exported() -> None:
     assert database.AutocommitNotConfirmed is AutocommitNotConfirmed
+
+
+def test_a_thread_call_that_ends_after_the_loop_closed_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CLAUDE.md section 6: the loop-closed case in ``_thread_settled`` was swallowed with no log.
+    It now warns, from the worker thread, without the call's result or error text. Red at
+    e2c630d23."""
+    loop = asyncio.new_event_loop()
+    release = threading.Event()
+
+    def call() -> str:
+        release.wait(5)
+        return "a result that must not be logged"
+
+    async def start() -> asyncio.Future[str]:
+        return _thread_settled(call)
+
+    loop.run_until_complete(start())
+    loop.close()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        release.set()
+        for _ in range(500):
+            if "after the event loop closed" in caplog.text:
+                break
+            time.sleep(0.01)
+    assert "after the event loop closed" in caplog.text
+    assert "must not be logged" not in caplog.text

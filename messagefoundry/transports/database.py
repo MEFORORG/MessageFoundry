@@ -1492,8 +1492,16 @@ def _thread_settled[T](fn: Callable[[], T]) -> asyncio.Future[T]:
             value = fn()
         except BaseException as exc:  # noqa: BLE001 - handed to the awaiting side, not swallowed
             error = exc
-        with contextlib.suppress(RuntimeError):  # the loop closed first: nobody is left to tell
+        try:
             loop.call_soon_threadsafe(_resolve, value, error)
+        except RuntimeError:
+            # The loop closed before the call ended, so nobody is left to settle its connection.
+            # Logged from this thread, without the call's result or error text (CLAUDE.md
+            # section 6): the connection is not returned, and that is all an operator needs.
+            logger.warning(
+                "DATABASE: a worker-thread database call ended after the event loop closed; its "
+                "connection was not returned to its pool"
+            )
 
     loop.run_in_executor(None, _work)
     return settled
@@ -2611,8 +2619,8 @@ def _lookup_max_rows(value: Any, connection: str) -> int | None:
     """Read one lookup connection's ``max_rows``: a positive ceiling, or ``None`` for the documented
     ``0`` opt-out. Unset (``None``) takes :data:`DEFAULT_DB_LOOKUP_MAX_ROWS`.
 
-    Zero in any spelling, an empty ``env()`` value included, is the opt-out; anything else but a
-    whole, positive number is refused at construction, which ``serve`` reaches at
+    An explicit zero in any spelling is the opt-out; an empty value, and anything else but a whole,
+    positive number, is refused at construction, which ``serve`` reaches at
     start and ``messagefoundry check`` reaches in its build leg. The rule is :func:`max_rows_setting`."""
     return max_rows_setting(
         value, label=f"DatabaseLookup {connection!r}", default=DEFAULT_DB_LOOKUP_MAX_ROWS
@@ -2625,13 +2633,22 @@ def max_rows_setting(value: Any, *, label: str, default: int) -> int | None:
     (BACKLOG #1730, #2617), so the two cannot read one spelling two ways.
 
     Every value but ``None`` is a cap, read by ``transports.base.positive_cap``, so ``max_rows``
-    reads every spelling as every other ``int`` cap does (PR 2593 review). Zero in any spelling
-    (``0``, ``"0"``, ``"0.0"``, ``"0_0"``, and the ``""`` a set-but-empty ``env()`` gives) turns
-    the ceiling off. A bool, a fraction, a NaN or an infinity, text such as ``"1e-400"`` that only
+    reads a number as every other ``int`` cap does (PR 2593 review). An explicit zero in any
+    spelling (``0``, ``"0"``, ``"0.0"``, ``"0_0"``) turns the ceiling off. **An empty value is the
+    one exception:** the ``""`` or blank text a set-but-empty ``env()`` gives is refused, where
+    every other cap reads it as off, because this ceiling fails closed (Manager ruling, PR 2593). A
+    bool, a fraction, a NaN or an infinity, text such as ``"1e-400"`` that only
     rounds to zero, and a negative are refused; ``count_setting``'s docstring holds that rule. The
     refusals name ``label`` and the setting and withhold the value (BACKLOG #1183, #1796)."""
     if value is None:
         return default
+    if isinstance(value, str) and not value.strip():
+        # Manager ruling, PR 2593: a set-but-empty env() value is a provisioning slip, and a row
+        # ceiling fails closed on one. Every other cap reads it as off; this one refuses it, so an
+        # empty variable cannot remove the ceiling. Only an explicit zero turns it off.
+        raise ValueError(
+            f"{label} max_rows is empty; set a whole number of rows, or 0 for no ceiling"
+        )
     return positive_cap(
         value, int, knob="max_rows", transport=label, off_hint="or 0 for no ceiling"
     )

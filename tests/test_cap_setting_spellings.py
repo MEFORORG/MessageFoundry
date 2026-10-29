@@ -1036,7 +1036,7 @@ def test_the_reference_sync_max_rows_reads_zero_text_as_off() -> None:
     documented opt-out, exactly as ``0``, and refuses a negative in either spelling."""
     from messagefoundry.pipeline.reference_sync import reference_max_rows
 
-    for off in (0, "0", " 0 ", 0.0, "0.0", "0_0", ""):
+    for off in (0, "0", " 0 ", 0.0, "0.0", "0_0"):
         assert reference_max_rows({"max_rows": off}) is None, repr(off)
     assert reference_max_rows({"max_rows": " 7 "}) == 7
     for bad in (-1, "-1", "1e-400", True, 2.5):
@@ -1044,10 +1044,11 @@ def test_the_reference_sync_max_rows_reads_zero_text_as_off() -> None:
             reference_max_rows({"max_rows": bad})
 
 
-@pytest.mark.parametrize("off", ["0", "0.0", "0_0", " 0 ", "", 0, 0.0])
+@pytest.mark.parametrize("off", ["0", "0.0", "0_0", " 0 ", 0, 0.0])
 def test_a_lookup_and_a_reference_max_rows_read_zero_as_every_cap_does(off: object) -> None:
     """``max_rows`` is a cap, so it reads "off" by :func:`cap_setting`'s rule rather than its own.
-    Red at eb180654f: ``"0.0"`` and ``""`` were refused, where every other cap reads them as off."""
+    Red at eb180654f: ``"0.0"`` was refused, where every other cap reads it as off. An empty value
+    is the exception, refused by the test below (Manager ruling, PR 2593)."""
     from messagefoundry.pipeline.reference_sync import reference_max_rows
 
     assert cap_setting(off, int, knob="k", transport="t") is None
@@ -1057,3 +1058,23 @@ def test_a_lookup_and_a_reference_max_rows_read_zero_as_every_cap_does(off: obje
         egress=EgressSettings(deny_by_default=False),
     )
     assert executor._max_rows["clarity"] is None
+
+
+@pytest.mark.parametrize("empty", ["", " ", "	"])
+def test_an_empty_max_rows_is_refused_not_read_as_off(empty: str) -> None:
+    """An empty ``env()`` value is a provisioning slip, and a row ceiling fails closed on one: it is
+    refused, naming the setting, where every other cap reads it as off (Manager ruling, PR 2593).
+    An explicit zero still turns the ceiling off. Red at e2c630d23, which read it as off."""
+    from messagefoundry.pipeline.reference_sync import reference_max_rows
+
+    with pytest.raises(ValueError, match="DATABASE reference source max_rows is empty") as info:
+        reference_max_rows({"max_rows": empty})
+    assert info.value.__cause__ is None and info.value.__context__ is None
+    with pytest.raises(ValueError, match="DatabaseLookup 'clarity' max_rows is empty"):
+        DatabaseLookupExecutor(
+            {"clarity": {"server": "db.local", "database": "Clarity", "max_rows": empty}},
+            egress=EgressSettings(deny_by_default=False),
+        )
+    over: dict[str, Any] = {"max_rows": empty}
+    with pytest.raises(WiringError, match="DATABASE reference source max_rows is empty"):
+        DatabaseRef(server="s", database="d", statement="SELECT a", key_column="a", **over)
