@@ -3361,20 +3361,41 @@ class RegistryRunner:
             self._emit_inbound_started(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
-        """:meth:`_start_inbound_unsafe` after the lane check. A refused CA records the inbound
-        failed before it re-raises, so a poller an operator or an alert rule restarts reads
-        ``failed``, not ``stopped`` (vault BACKLOG #2371).
+        """:meth:`_start_inbound_unsafe` after the lane check. A failed start records the inbound
+        failed before it re-raises, so a listener an operator or an alert rule starts or restarts
+        reads ``failed``, with an alert, not ``stopped`` with none. A restart has already unbound
+        the listener when its start fails (BACKLOG #3859). Among the causes are at least a refused
+        CA (vault BACKLOG #2371), a start gate, a bind race, a hop guard, a CRL or key check in the
+        connector's constructor, and a startup validation.
+
+        Every ``Exception`` is recorded and re-raised, as :meth:`start` isolates one at boot: a
+        restart that fails for a type a narrower list missed would leave the feed down with no
+        status, which is the defect itself. At least these record nothing here: a
+        :class:`NotDeployedError` (that inbound reads ``not_deployed``), a name the graph does not
+        declare (the caller's ``KeyError``), and a raise after the bind with the listener still
+        serving, such as one from :meth:`_ensure_inbound_workers`. A record for that last one
+        would mark a serving listener failed and page, and a later start returns early on the
+        bound source, so only a restart or a reload would clear it. On the operator door it stays
+        unrecorded, as before #3859; the scheduler's :meth:`_record_window_open_failure` still
+        records it, as it did before.
 
         Once only, as :meth:`_record_window_open_failure` records: a scheduled poller retries at
-        every in-window tick, and :meth:`_record_failed` alerts and logs a traceback each time it
-        runs. Every alert could re-fire a ``restart_inbound`` control action."""
+        every in-window tick, and every alert could re-fire a ``restart_inbound`` control action,
+        so a page per refusal would be an alert-restart loop. A start that binds clears the record,
+        so the next refusal pages again."""
         try:
             await self._check_inbound_lane_anchor(name)
-        except TrustAnchorError as exc:
-            if ("inbound", name) not in self._failed:
+            await self._start_inbound_unsafe(name)
+        except NotDeployedError:
+            raise
+        except Exception as exc:
+            if (
+                name in self.registry.inbound
+                and not self.inbound_running(name)  # a raise after the bind leaves it serving
+                and ("inbound", name) not in self._failed
+            ):
                 self._record_failed(name, exc, kind="inbound")
             raise
-        await self._start_inbound_unsafe(name)
 
     async def stop_inbound(self, name: str) -> None:
         """Stop receiving on one inbound connection (its delivery workers keep draining)."""
@@ -4432,7 +4453,11 @@ class RegistryRunner:
         succeeds clears the record. While the record stands, a retry that fails is logged at DEBUG
         only, whatever its reason: keying on the reason text would re-alert every tick on an error
         whose message varies. A reload clears the record (see :meth:`reload`), so the next window
-        open alerts afresh."""
+        open alerts afresh.
+
+        :meth:`_checked_inbound_start` records a failed start before this runs (BACKLOG #3859), so
+        this usually finds the record and only logs the retry. It still records anything that
+        method leaves unrecorded, including a raise after the bind."""
         if ("inbound", name) in self._failed:
             log.debug(
                 "schedule: inbound connection %r still cannot start (%s); retrying next tick",
