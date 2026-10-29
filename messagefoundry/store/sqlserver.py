@@ -35,6 +35,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import queue
 import threading
 import time
@@ -84,6 +85,8 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
+    SchemaDdlLockTimeout,
+    SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
     StoreNotFoundError,
@@ -585,6 +588,9 @@ def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
 # diagnostic message embeds "(1222)"); match on the code without pinning to a specific SQLSTATE.
 _LOCK_TIMEOUT_NATIVE_ERROR = 1222
 
+#: Puts a session's LOCK_TIMEOUT back to the default, wait forever (BACKLOG #1726).
+_LOCK_TIMEOUT_RESET: Final = "SET LOCK_TIMEOUT -1"
+
 
 def _is_lock_timeout(exc: BaseException) -> bool:
     """True iff ``exc`` is a SQL Server lock-request timeout (native error 1222).
@@ -1017,9 +1023,11 @@ def _upload_quota_lock(uploader_id: str) -> str:
 
 def _applock_timeout_ms(command_timeout: int) -> int:
     """``@LockTimeout`` (ms) for :data:`_SQL_APPLOCK`: ``command_timeout*1000`` when set, else ``-1``
-    (wait forever, the pyodbc query timeout backstops). ``0`` -> ``-1`` is why the SYNC handoff pool
-    REFUSES to build when ``command_timeout==0`` (ADR 0071 invariant: a fused hop must never wait
-    unboundedly on the applock)."""
+    (wait forever; nothing else bounds it, since a 0 command timeout sets no pyodbc query timeout
+    either). ``0`` -> ``-1`` is why the SYNC handoff pool REFUSES to build when
+    ``command_timeout==0`` (ADR 0071 invariant: a fused hop must never wait unboundedly on the
+    applock). The schema lock does not use this: it passes ``[store].schema_lock_timeout`` instead
+    (BACKLOG #1726)."""
     return int(command_timeout * 1000) if command_timeout else -1
 
 
@@ -1027,11 +1035,30 @@ def _applock_params(resource: str, timeout_ms: int) -> tuple[Any, ...]:
     return (resource, timeout_ms)
 
 
+#: Largest ``@LockTimeout`` ``sp_getapplock`` takes: the parameter is a T-SQL ``int`` (ms).
+_APPLOCK_MAX_TIMEOUT_MS: Final[int] = 2**31 - 1
+
+
+def _schema_applock_timeout_ms(schema_lock_timeout: float) -> int:
+    """``@LockTimeout`` (ms) for the schema lock, from ``[store].schema_lock_timeout`` (BACKLOG
+    #1726). Rounded up so a sub-millisecond setting still waits, rather than becoming ``0`` (no
+    wait), and clamped to the T-SQL ``int`` range rather than overflowing it."""
+    return min(max(math.ceil(schema_lock_timeout * 1000), 1), _APPLOCK_MAX_TIMEOUT_MS)
+
+
+class _ApplockTimeout(RuntimeError):
+    """``sp_getapplock`` returned ``-1``: its ``@LockTimeout`` elapsed before the lock was granted.
+    A ``RuntimeError`` like every other refusal :func:`_applock_result` raises, so existing callers
+    are unchanged; the schema open alone tells it apart, to name its own setting."""
+
+
 def _applock_result(row: Any, resource: str) -> None:
     """Raise on a negative ``sp_getapplock`` return code (timeout/cancel/deadlock/bad-param) rather than
     proceeding unserialized — a swallowed timeout would fork the audit chain or double-finalize."""
     rc = int(row[0]) if row and row[0] is not None else -999
-    if rc < 0:  # -1 timeout, -2 cancelled, -3 deadlock victim, -999 bad param
+    if rc == -1:
+        raise _ApplockTimeout(f"sp_getapplock({resource!r}) failed: rc={rc}")
+    if rc < 0:  # -2 cancelled, -3 deadlock victim, -999 bad param
         raise RuntimeError(f"sp_getapplock({resource!r}) failed: rc={rc}")
 
 
@@ -1950,6 +1977,10 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_messages_channel ON messages(channel_id, received_at)""",
     """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_control','IndexID') IS NULL
         CREATE INDEX ix_messages_control ON messages(channel_id, control_id)""",
+    # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's
+    # plan is pinned by a test; this backend's plan has not been measured.
+    """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_received','IndexID') IS NULL
+        CREATE INDEX ix_messages_received ON messages(received_at, id)""",
     # Unified staged queue (ADR 0001) — ingress -> routed -> outbound, one row per stage-unit with a
     # `stage` discriminator. The SQL Server backend originally shipped a flat `outbox` table; it was
     # RECREATED by this very `_SCHEMA` on every open and read by nothing (the staged pipeline and every
@@ -4570,65 +4601,167 @@ class SqlServerStore:
         ):
             await self._verify_schema_external(expected)
             return False
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
+            locked = False  # the schema applock may be held by this connection's transaction
+            lock_bounded = False
             try:
-                # FAST PATH (ADR 0064): the marker says this exact DDL batch already ran — skip the
-                # batch AND the exclusive schema applock. Re-running the full guarded batch under one
-                # exclusive applock on EVERY open made N concurrent opens convoy (WS-B Finding 2: a
-                # loser blows the 30s lock timeout → startup failure). The probe is two cheap SELECTs
-                # under the normal command timeout; a virgin/pre-marker DB falls through to the full
-                # run. Out-of-band drift (an operator hand-dropping an object) is no longer healed on
-                # every open — the remedy is `DELETE FROM schema_meta`, which forces one full run.
-                if await self._schema_marker_current(cur, expected):
-                    await self._commit(conn)  # close the probe's read txn (autocommit=False pool)
-                    log.debug("sqlserver: schema current (%s…) — DDL batch skipped", expected[:12])
-                    return False
-                if not provisioning and not create and not await self._schema_meta_present(cur):
-                    # Raised inside the try, so the except below rolls the probe's read txn back.
-                    raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
+                async with self._cursor(conn) as cur:
+                    # FAST PATH (ADR 0064): the marker says this exact DDL batch already ran — skip
+                    # the batch AND the exclusive schema applock. Re-running the full guarded batch
+                    # under one exclusive applock on EVERY open made N concurrent opens convoy (WS-B
+                    # Finding 2: a loser blows the 30s lock timeout → startup failure). The probe is
+                    # two cheap SELECTs under the normal command timeout; a virgin/pre-marker DB falls
+                    # through to the full run. Out-of-band drift (an operator hand-dropping an object)
+                    # is no longer healed on every open — the remedy is `DELETE FROM schema_meta`,
+                    # which forces one full run.
+                    if await self._schema_marker_current(cur, expected):
+                        # Close the probe's read txn (autocommit=False pool).
+                        await self._commit(conn)
+                        log.debug(
+                            "sqlserver: schema current (%s…) — DDL batch skipped", expected[:12]
+                        )
+                        return False
+                    if not provisioning and not create and not await self._schema_meta_present(cur):
+                        # Raised inside the try, so the except below rolls the probe's txn back.
+                        raise StoreNotFoundError.server_schema(
+                            self.backend, self._settings.database
+                        )
+                # pyodbc copies the connection timeout into a cursor only when it creates the cursor,
+                # so each step below runs on its own cursor, opened after the connection timeout is set
+                # for that step, and closed before the next opens (no MARS: one active statement per
+                # connection). The applock and the DDL batch run with no query timeout; the
+                # double-check between them runs under command_timeout, as the probe does (BACKLOG
+                # #1726). _acquire re-applies command_timeout on the next borrow, so no restore is
+                # needed on the way out.
+                raw = getattr(conn, "_conn", None)
+                if raw is not None:
+                    raw.timeout = 0
+                async with self._cursor(conn) as cur:
+                    # Serialize schema-init across concurrent opens (e.g. a 2-node HA cold start
+                    # against a virgin DB) — the T-SQL analog of the Postgres store's schema advisory
+                    # lock. Without it the `IF OBJECT_ID(...) IS NULL CREATE` guards below are
+                    # check-then-create: two nodes both see NULL and both CREATE, and the loser dies on
+                    # a 2714 "There is already an object named ...". The applock is transaction-scoped,
+                    # so it auto-releases on the commit/rollback below; the second node then runs the
+                    # now-no-op guarded CREATEs cleanly. It is NOT this transaction's first statement
+                    # and must not become one: the ADR 0064 fast-path probe above already ran one or
+                    # two table-reading SELECTs on this connection with no commit between (closing the
+                    # probe's cursor does not end the transaction), so the autocommit=False pool has an
+                    # open transaction for `@LockOwner='Transaction'` to attach to. (An earlier comment
+                    # here read "this first statement opens the txn" — it predated the probe and was
+                    # stale, not a contradiction of the applock rule record_audit now follows.)
+                    # The wait is bounded by [store].schema_lock_timeout, not command_timeout;
+                    # PostgresStore._ensure_schema says why. Here the bound matters more: this
+                    # cursor carries no pyodbc query timeout, SQL Server has no lock_timeout that
+                    # reaches sp_getapplock, and cancelling the open cannot interrupt the driver
+                    # thread waiting in it, so @LockTimeout is the only thing that ends the wait.
+                    log.info("sqlserver: waiting for the schema lock to apply the DDL batch")
+                    wait = self._settings.schema_lock_timeout
+                    # Raised first: a grant whose round trip then failed is still held.
+                    locked = True
+                    try:
+                        await self._applock(
+                            cur, _SCHEMA_LOCK, timeout_ms=_schema_applock_timeout_ms(wait)
+                        )
+                    except _ApplockTimeout as exc:
+                        raise SchemaLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
+                # Double-check under the lock: the peer we queued behind may have just applied this
+                # exact batch and committed its marker, so this open has nothing to do. The read runs
+                # under command_timeout, as the probe above does, so with a non-zero command_timeout
+                # neither a lock wait on schema_meta nor a stalled link holds the schema lock forever
+                # (BACKLOG #1726); a query timeout here surfaces as the driver's own error and rolls
+                # back below. command_timeout = 0 means no limit here, as everywhere it applies.
+                if raw is not None:
+                    raw.timeout = self._settings.command_timeout
+                async with self._cursor(conn) as cur:
+                    if await self._schema_marker_current(cur, expected):
+                        await self._commit(conn)  # releases the txn-scoped applock
+                        log.debug(
+                            "sqlserver: schema applied by a peer (%s…) — skipped", expected[:12]
+                        )
+                        return False
                 # B10/ADR 0060: exempt the schema DDL from the per-statement command timeout. The first-
                 # upgrade FIFO index rebuild (DROP old + CREATE ix_queue_fifo_*_seq) over a large backlog
                 # can exceed command_timeout (30s default); being killed mid-CREATE would roll back this
                 # batch and re-fail on every restart — a startup crash-loop. raw.timeout=0 = no client
-                # statement timeout for this connection; _acquire re-applies command_timeout on the next
-                # borrow, so no restore is needed. (sp_getapplock below keeps its own server-side
-                # @LockTimeout from command_timeout, so a peer's in-progress migration still bounds the
-                # lock wait rather than hanging.)
-                raw = getattr(conn, "_conn", None)
+                # statement timeout for the batch's cursor.
                 if raw is not None:
                     raw.timeout = 0
-                # Serialize schema-init across concurrent opens (e.g. a 2-node HA cold start against a
-                # virgin DB) — the T-SQL analog of the Postgres store's schema advisory lock. Without it
-                # the `IF OBJECT_ID(...) IS NULL CREATE` guards below are check-then-create: two nodes
-                # both see NULL and both CREATE, and the loser dies on a 2714 "There is already an object
-                # named ...". The applock is transaction-scoped, so it auto-releases on the commit/
-                # rollback below; the second node then runs the now-no-op guarded CREATEs cleanly. It
-                # is NOT this transaction's first statement and must not become one: the ADR 0064 fast-
-                # path probe above already ran one or two table-reading SELECTs on this connection with
-                # no commit between, so the autocommit=False pool has an open transaction for
-                # `@LockOwner='Transaction'` to attach to. (An earlier comment here read "this first
-                # statement opens the txn" — it predated the probe and was stale, not a contradiction
-                # of the applock rule record_audit now follows.)
-                await self._applock(cur, _SCHEMA_LOCK)
-                # Double-check under the lock: the peer we queued behind may have just applied this
-                # exact batch and committed its marker — then this open has nothing to do.
-                if await self._schema_marker_current(cur, expected):
-                    await self._commit(conn)  # releases the txn-scoped applock
-                    log.debug("sqlserver: schema applied by a peer (%s…) — skipped", expected[:12])
-                    return False
-                for statement in _SCHEMA:
-                    await cur.execute(statement)
-                await cur.execute("DELETE FROM schema_meta WHERE id=1")
-                await cur.execute(
-                    "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, ?, ?)",
-                    (expected, time.time()),
-                )
-                await self._commit(conn)
-                log.info("sqlserver: schema DDL batch applied (%s…)", expected[:12])
-                return True
+                async with self._cursor(conn) as cur:
+                    # The HOLDER's own lock waits are bounded too (BACKLOG #1726). The cursor has
+                    # no query timeout and the session's LOCK_TIMEOUT is -1, so without this a
+                    # CREATE INDEX or ALTER queued behind any open transaction on its table waits
+                    # forever while holding the schema lock. LOCK_TIMEOUT bounds only the wait for
+                    # each lock, never how long a build runs once it has it. It is SESSION-scoped
+                    # and survives the commit, so it is reset before the pooled connection is
+                    # released: inside the transaction before the commit, or after the rollback
+                    # below. Set AFTER the applock, which takes its own @LockTimeout. The flag is
+                    # raised first: a SET the server applied but whose round trip then failed must
+                    # still be reset.
+                    lock_bounded = True
+                    try:
+                        await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
+                        for statement in _SCHEMA:
+                            await cur.execute(statement)
+                        await cur.execute("DELETE FROM schema_meta WHERE id=1")
+                        await cur.execute(
+                            "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, ?, ?)",
+                            (expected, time.time()),
+                        )
+                        await cur.execute(_LOCK_TIMEOUT_RESET)
+                    except Exception as exc:
+                        if _is_lock_timeout(exc):
+                            raise SchemaDdlLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
+                        raise
+                    await self._commit(conn)
+                    log.info("sqlserver: schema DDL batch applied (%s…)", expected[:12])
+                    return True
             except Exception:
-                await conn.rollback()  # roll back the partial DDL batch (M-6)
+                # A cancellation here, or during the rollback, skips the reset below: _acquire
+                # quarantines that connection rather than pooling it, and the cancelled statement
+                # may still be running on its executor thread.
+                try:
+                    await conn.rollback()  # roll back the partial DDL batch (M-6)
+                except Exception:
+                    if locked:
+                        # Neither the transaction, which may hold the schema applock, nor the
+                        # session bound is known to be gone.
+                        log.warning(
+                            "sqlserver: rollback after a failed schema batch failed; discarding"
+                            " the connection",
+                            exc_info=True,
+                        )
+                        _detach_connection(conn)
+                    raise
+                if lock_bounded:
+                    await self._reset_schema_lock_timeout(conn)
                 raise
+
+    async def _reset_schema_lock_timeout(self, conn: Any) -> None:
+        """After a failed schema batch has rolled back, put the session's LOCK_TIMEOUT back to -1
+        (BACKLOG #1726), so the pooled connection keeps the default. A ``SET`` is not undone by a
+        rollback, so the reset runs alone and is followed by a second rollback, which ends any
+        implicit transaction it opened. It runs under ``command_timeout`` again, like any other
+        statement on a borrowed connection: the batch had lifted the connection's query timeout. A
+        failed reset is logged, not raised, so it cannot mask the batch's own error, and the
+        connection is discarded rather than pooled with a LOCK_TIMEOUT nobody else expects."""
+        raw = getattr(conn, "_conn", None)
+        if raw is not None:
+            raw.timeout = self._settings.command_timeout
+        step = "reset LOCK_TIMEOUT"
+        try:
+            async with self._cursor(conn) as cur:
+                await cur.execute(_LOCK_TIMEOUT_RESET)
+            step = "roll back after the LOCK_TIMEOUT reset"
+            await conn.rollback()
+        except Exception:  # noqa: BLE001 - a reset failure must not mask the real outcome
+            log.warning(
+                "sqlserver: could not %s after a failed schema batch; discarding the connection",
+                step,
+                exc_info=True,
+            )
+            # Its future is deliberately not awaited, as in _rollback_or_discard.
+            _detach_connection(conn)
 
     async def _verify_schema_external(self, expected: str) -> None:
         """External mode's whole open-time schema step (#305): reads only, no DDL, no applock.
@@ -5502,15 +5635,17 @@ class SqlServerStore:
             (key, outbox_id, message_id, destination_name, seq, now, key),
         )
 
-    async def _applock(self, cur: Any, resource: str) -> None:
+    async def _applock(self, cur: Any, resource: str, *, timeout_ms: int | None = None) -> None:
         """Take a transaction-scoped exclusive ``sp_getapplock`` — the T-SQL analog of PG's advisory
         lock. A NAMED lock in its own space: it never locks ``queue``/``messages`` rows, so it cannot
         invert the producers' queue->messages lock order (no AB/BA deadlock), and it is re-entrant per
         (resource, transaction). ``@LockOwner='Transaction'`` auto-releases it at the caller's commit/
         rollback, so the caller MUST be in an open (autocommit=False) transaction. Raises on a negative
         return code (timeout/deadlock/error) rather than proceeding unserialized — a swallowed timeout
-        would fork the audit chain or double-finalize a message."""
-        timeout_ms = _applock_timeout_ms(self._settings.command_timeout)
+        would fork the audit chain or double-finalize a message. ``timeout_ms`` overrides the
+        ``command_timeout``-derived ``@LockTimeout``."""
+        if timeout_ms is None:
+            timeout_ms = _applock_timeout_ms(self._settings.command_timeout)
         await cur.execute(_SQL_APPLOCK, _applock_params(resource, timeout_ms))
         row = await cur.fetchone()
         _applock_result(row, resource)
@@ -12621,6 +12756,7 @@ class SqlServerStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns (ok, message) — see the SQLite store.
 
@@ -12642,6 +12778,7 @@ class SqlServerStore:
             capable=self._audit_keyed_capable(),
             expected_anchor=expected_anchor,
             expected_prefix=expected_prefix,
+            expected_rows=expected_rows,
         )
 
     # --- auth: users / roles / sessions --------------------------------------
@@ -14977,6 +15114,11 @@ class SqlServerStore:
             (MessageStatus.ERROR.value, since),
         )
         counts = {r["channel_id"]: (r["read"], r["errored"]) for r in count_rows}
+        # BACKLOG #1726: still reads every messages row. SQLite and Postgres walk this as a loose
+        # index scan (store.py _LAST_RECEIVED_SQL, a recursive CTE hopping distinct channel_id
+        # values), but SQL Server forbids scalar aggregation, TOP and subqueries in a recursive CTE
+        # member, so that form does not port. A ROW_NUMBER() variant could; it was left out of the
+        # #1726 slice, so this stays the GROUP BY.
         last_rows = await self._fetchall(
             "SELECT channel_id, MAX(received_at) AS last_at FROM messages GROUP BY channel_id"
         )

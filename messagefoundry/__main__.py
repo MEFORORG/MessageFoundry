@@ -1014,6 +1014,26 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "'messagefoundry audit-anchor' (on PowerShell 5.1 pipe to 'Set-Content -Encoding utf8' — "
         "its '>' writes UTF-16, which is refused)",
     )
+    # vault BACKLOG #2612. Not in the anchor's group: an anchor and a set of rows are different
+    # witnesses, and both may be checked in the one walk.
+    audit_verify.add_argument(
+        "--expected-row",
+        action="append",
+        default=None,
+        metavar="SEQ:ROW_HASH",
+        help="also check that the row at sequence number SEQ is still in the chain with this full "
+        "row_hash, as the off-box audit record carries them ('seq' and 'row_hash'; never the row "
+        "id). Repeatable. A row that is gone, or whose hash differs, is a broken chain (exit 1). "
+        "Every pair given here and in --expected-rows-file is checked in one walk of the chain",
+    )
+    audit_verify.add_argument(
+        "--expected-rows-file",
+        default=None,
+        metavar="PATH",
+        help="read SEQ:ROW_HASH pairs, one per line, from a UTF-8 text file of at most "
+        f"{_AUDIT_ROWS_FILE_MAX_BYTES // 2**20} MiB, such as pairs exported from the off-box audit "
+        "copy. Blank lines are skipped. Checked as --expected-row is",
+    )
 
     audit_anchor = sub.add_parser(
         "audit-anchor",
@@ -4762,6 +4782,7 @@ def _serve(args: argparse.Namespace) -> int:
     # BACKLOG #3402: the key files a graph's connections name are graph data, judged by an awaited
     # preflight at each load the engine runs, with that load's env() values, off the event loop.
     from messagefoundry.config.key_file_access import make_connection_key_file_preflight
+    from messagefoundry.pipeline.refused_body import RefusedBodyPolicy
 
     app = create_managed_app(
         store_settings=settings.store,
@@ -4783,6 +4804,11 @@ def _serve(args: argparse.Namespace) -> int:
         ack_after_default=settings.inbound.ack_after,
         stream_inflight_budget_bytes=settings.inbound.stream_inflight_budget_bytes,
         max_staged_depth=settings.inbound.max_staged_depth,
+        refused_body=RefusedBodyPolicy(
+            allowance_bytes=settings.inbound.refused_body_allowance_bytes,
+            window_seconds=settings.inbound.refused_body_window_seconds,
+            head_bytes=settings.inbound.refused_body_head_bytes,
+        ),
         priority_default=settings.delivery.priority,
         max_correlation_depth=settings.pipeline.max_correlation_depth,
         per_lane_wake=settings.pipeline.per_lane_wake,
@@ -6683,6 +6709,10 @@ def _protect_key(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The PowerShell 5.1 encoding hint both audit-verify file flags print on a read refusal.
+_UTF16_HINT = "PowerShell 5.1's '>' writes UTF-16 — pipe to 'Set-Content -Encoding utf8' there."
+
+
 def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None | int:
     """The anchor for ``audit-verify``, or the exit code 2 if the flags are unusable.
 
@@ -6694,7 +6724,12 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
     # artifact (BACKLOG #328). A copy here would be the one place a later hardening -- of the refusals,
     # the encoding handling, or the byte bound -- could reach the CLI and miss the engine.
     from messagefoundry.redaction import codec_safe_str
-    from messagefoundry.store.store import parse_audit_anchor, read_audit_anchor_file
+    from messagefoundry.store.store import (
+        AUDIT_ANCHOR_FORM,
+        AuditAnchorError,
+        parse_audit_anchor,
+        read_audit_anchor_file,
+    )
 
     raw: str | None
     if args.expected_anchor_file is not None:
@@ -6709,8 +6744,7 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
             print(
                 f"error: cannot read --expected-anchor-file {args.expected_anchor_file!r}: "
                 f"{codec_safe_str(exc)}. "
-                "It must be a UTF-8 text file holding the COUNT:HEAD line; PowerShell 5.1's '>' "
-                "writes UTF-16 — pipe to 'Set-Content -Encoding utf8' there.",
+                f"It must be a UTF-8 text file holding the COUNT:HEAD line; {_UTF16_HINT}",
                 file=sys.stderr,
             )
             return 2
@@ -6718,11 +6752,133 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         raw = args.expected_anchor
     if raw is None:
         return None
+    if args.expected_anchor_file is not None and not raw.strip():
+        # An empty file and a blank first line alike: the anchor is read from line 1 only.
+        print(
+            f"error: --expected-anchor-file {args.expected_anchor_file!r}: line 1 is empty; the "
+            "COUNT:HEAD line must be the file's first line",
+            file=sys.stderr,
+        )
+        return 2
     try:
         return parse_audit_anchor(raw)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except AuditAnchorError as exc:
+        if args.expected_anchor_file is None:
+            print(f"error: {exc}", file=sys.stderr)  # the operator typed it, so it is quoted
+        else:
+            # Never the file's text (vault BACKLOG #2612): a path typo'd onto a key file, a config
+            # or a captured message would put its first line on the job's output. The line number
+            # and a reason that quotes nothing are enough to find the fault in an editor.
+            print(
+                f"error: malformed --expected-anchor-file line 1: {exc.reason} — "
+                f"{AUDIT_ANCHOR_FORM}",
+                file=sys.stderr,
+            )
         return 2
+
+
+#: How much of an ``--expected-rows-file`` is read before it is refused: a bound against a path typo'd
+#: onto something that is not a pair file, not a size any deployment was measured against. A pair line
+#: is about 72 bytes, so this holds over three million pairs; the walk itself already loads every
+#: audit row into memory, which a log that size dwarfs.
+_AUDIT_ROWS_FILE_MAX_BYTES = 256 * 1024 * 1024
+
+
+def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | int:
+    """The ``(seq, row_hash)`` pairs for ``audit-verify``, or the exit code 2 if one is unusable
+    (vault BACKLOG #2612). An empty list when neither flag was given.
+
+    Each pair is parsed by :func:`parse_audit_row_pair`, which shares the anchor parser's rule for
+    which heads the store can emit. A refusal for a ``--expected-row`` value quotes it, since the
+    operator typed it; one for a file line names the line number and a reason that quotes nothing,
+    so a path typo'd onto another file does not put that file's content on the job's output.
+    """
+    from messagefoundry.redaction import codec_safe_str
+    from messagefoundry.store.store import (
+        AUDIT_ROW_PAIR_FORM,
+        AuditRowPairError,
+        parse_audit_row_pair,
+        read_bounded_utf8_lines,
+    )
+
+    #: Each pair with where it came from, by position and never by content, for the refusal below:
+    #: ``-n`` is the n-th ``--expected-row``, ``n`` is line n of the file. An int, not a label, so a
+    #: file of millions of pairs carries no string per pair.
+    pairs: list[tuple[int, str, int]] = []
+    for number, text in enumerate(args.expected_row or (), start=1):
+        try:
+            pairs.append((*parse_audit_row_pair(text), -number))
+        except AuditRowPairError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    path = args.expected_rows_file
+    if path is None:
+        return _refuse_contradictory_pairs(pairs)
+    try:
+        lines = read_bounded_utf8_lines(
+            path,
+            _AUDIT_ROWS_FILE_MAX_BYTES,
+            too_large=f"the file is larger than {_AUDIT_ROWS_FILE_MAX_BYTES // 2**20} MiB",
+        )
+    except (OSError, UnicodeDecodeError) as exc:
+        # `UnicodeDecodeError` is a `ValueError`: uncaught it would exit 1, a broken chain's code.
+        # The encoding hint goes only on the error it explains.
+        hint = (
+            f" It must be a UTF-8 text file of SEQ:ROW_HASH lines; {_UTF16_HINT}"
+            if isinstance(exc, UnicodeDecodeError)
+            else ""
+        )
+        print(
+            f"error: cannot read --expected-rows-file {path!r}: {codec_safe_str(exc)}.{hint}",
+            file=sys.stderr,
+        )
+        return 2
+    before = len(pairs)
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            pairs.append((*parse_audit_row_pair(line), number))
+        except AuditRowPairError as exc:
+            print(
+                f"error: malformed --expected-rows-file line {number}: {exc.reason} — "
+                f"{AUDIT_ROW_PAIR_FORM}",
+                file=sys.stderr,
+            )
+            return 2
+    if len(pairs) == before:
+        # Refused, not read as "nothing to compare": a job pointed at an empty export would
+        # otherwise report a clean walk with no witness checked, which is what the flag is for.
+        print(f"error: --expected-rows-file {path!r} holds no SEQ:ROW_HASH line", file=sys.stderr)
+        return 2
+    return _refuse_contradictory_pairs(pairs)
+
+
+def _refuse_contradictory_pairs(pairs: list[tuple[int, str, int]]) -> list[tuple[int, str]] | int:
+    """``pairs``, or the exit code 2 if one seq is given two different row_hashes. No chain matches
+    both, so such a set is a bad input, such as an export mixing two engines' tees, never evidence
+    of tampering.
+
+    The refusal names the two places by position (each pair's third item) and never the seq: a
+    seq read from a file is that file's content, and a refusal quotes none (vault BACKLOG #2612).
+    """
+
+    def where(origin: int) -> str:
+        return f"--expected-row {-origin}" if origin < 0 else f"--expected-rows-file line {origin}"
+
+    first: dict[int, tuple[str, int]] = {}
+    for seq, head, origin in pairs:
+        earlier_head, earlier_origin = first.setdefault(seq, (head, origin))
+        if earlier_head != head:
+            print(
+                f"error: {where(earlier_origin)} and {where(origin)} give one seq two different "
+                "row_hash "
+                "values; no chain matches both, so the set is refused rather than reported as "
+                "tampering",
+                file=sys.stderr,
+            )
+            return 2
+    return [(seq, head) for seq, head, _ in pairs]
 
 
 def _host_gated_store_settings(
@@ -9218,6 +9374,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
     if isinstance(resolved, int):
         return resolved
     expected_anchor = resolved
+    # vault BACKLOG #2612. An argv/file error, like the anchor's, so it is refused before the open too.
+    expected_rows = _resolve_expected_rows(args)
+    if isinstance(expected_rows, int):
+        return expected_rows
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -9294,7 +9454,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         try:
             # The verdict carries the walk's own row count, which decides the empty-log exit
             # below: no second query, which could fail after a clean walk or see other rows.
-            return await store.verify_audit_chain(expected_anchor=expected_anchor)
+            # Every expected row rides this ONE walk (vault BACKLOG #2612), never a walk per row.
+            return await store.verify_audit_chain(
+                expected_anchor=expected_anchor, expected_rows=expected_rows
+            )
         except walk_errors as exc:
             if is_store_shape_error(exc):
                 # A table, column or grant gone since the open: still not a row's evidence.
@@ -9378,10 +9541,16 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # chain as plain SHA-256 changes every row hash, the head included. `audit-anchor` verifies
         # nothing, so an anchor taken after a rewrite matches it, and the cause stays named, scoped
         # to before the anchor (vault BACKLOG #3110, item 2).
+        # Matched expected rows rule a rewrite out the same way, for the rows they witness: the tee
+        # captured each pair as the row was written (vault BACKLOG #2612).
         rewrite = (
             "Or the chain was rewritten as keyless before the expected anchor was taken: it "
             "matched, which rules out a rewrite since then and no earlier one."
             if expected_anchor is not None
+            else "Or the chain was rewritten as keyless before the expected rows were captured: "
+            "they matched, which rules out a rewrite since the earliest was captured and no "
+            "earlier one."
+            if expected_rows
             else "Or the chain was rewritten as keyless, which a keyless check cannot see."
         )
         print(

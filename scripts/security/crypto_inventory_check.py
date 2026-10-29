@@ -476,6 +476,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/secret_rotation.py": frozenset(
         {"hashlib", "hmac", "messagefoundry.store.crypto", "secrets"}
     ),
+    # Vault BACKLOG #2608: the refused-body allowance records, through store.crypto's
+    # refused_body_digest, a KEYED digest of each body refused before ingress: HMAC-SHA256 under a key
+    # HKDF-SHA256 derives from the in-heap audit-chain key under its own label. The section 4 row
+    # "Refused inbound body digest" is the crypto record; docs/CONFIGURATION.md says when it is kept.
+    "messagefoundry/pipeline/refused_body.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0049 (#60): the DR BackupRunner SHA-256s the consistent store snapshot (recorded in the
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
     # fingerprint via the backup codec; the AEAD itself is delegated to store/backup_codec.py — a
@@ -830,6 +835,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # commit the reader cannot resolve from this one. No secret, no key, no message authentication,
     # nothing user- or PHI-derived: it is an identifier in a log line.
     "scripts/asvs/anchor_report.py": frozenset({"hashlib"}),
+    # Vault BACKLOG #3411 wave 3.1, a CI spike that ships nothing: SHA-256 over a synthetic constant,
+    # signed with a P-256 CNG key the run makes and deletes, to ask whether an AppContainer can use
+    # the service account's key store; and SHA-256 over a DPAPI blob, to show the container was
+    # handed the service's exact bytes. No secret, no product key, nothing user- or PHI-derived.
+    "scripts/ci/appcontainer_spike_worker.py": frozenset({"hashlib"}),
     "scripts/security/dast_target.py": frozenset({"secrets"}),
     # BACKLOG #1426: `secrets.token_hex` names a symbol that CANNOT be on the ref, for the negative
     # arm of the subject-exists screen's own control. Unpredictability is not the property being
@@ -1383,6 +1393,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/pipeline/sandbox.py": frozenset({"csprng:secrets.token_hex"}),
+    # Vault BACKLOG #2608: the keyed digest of a refused inbound body (refused_body_digest: HKDF off
+    # the audit-chain key, then HMAC-SHA256; the hash is audit_key_id); the INVENTORY row says why.
+    "messagefoundry/pipeline/refused_body.py": frozenset(
+        {
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:via messagefoundry.store.crypto",
+        }
+    ),
     "messagefoundry/pipeline/secret_rotation.py": frozenset(
         {
             # BACKLOG #3472: each non-DEK fingerprint is sealed and opened as a store-cipher cell
@@ -1810,6 +1829,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # truncated SHA-256 of the scorecard file. An identifier in a log line, nothing secret.
     "scripts/asvs/restatement_report.py": frozenset({"hash:via scripts.asvs.anchor_report"}),
     "scripts/asvs/scorecard.py": frozenset({"hash:hashlib.sha256"}),
+    # The INVENTORY row above says why: NCryptSignHash and NCryptVerifySignature over a synthetic
+    # digest, with a key the spike makes for the run, called through ctypes.
+    "scripts/ci/appcontainer_spike_worker.py": frozenset(
+        {"hash:hashlib.sha256", "sign_verify:.sign()", "sign_verify:.verify()"}
+    ),
     "scripts/security/build_cla_action_provenance.py": frozenset(
         {"hash:hashlib.sha1", "hash:hashlib.sha256"}
     ),

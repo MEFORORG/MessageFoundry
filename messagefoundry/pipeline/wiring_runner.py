@@ -158,7 +158,6 @@ from messagefoundry.pipeline.ingress_guards import (
     listener_encoding,
     peek_max_bytes,
     reingress_size_error,
-    store_safe_raw,
     streaming_over_threshold,
     strict_validate_timeout,
 )
@@ -176,10 +175,14 @@ from messagefoundry.pipeline.phase_timing import (
     delivery_phase_timing_enabled,
 )
 from messagefoundry.pipeline.reference_sync import (
+    ReferenceStatementRefused,
     database_source_dsn,
     reference_acquire_timeout,
     reference_connection_name,
+    reference_max_rows,
+    reference_statement,
 )
+from messagefoundry.pipeline.refused_body import RefusedBodyAllowance
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
     GraphShape,
@@ -1279,6 +1282,7 @@ class RegistryRunner:
         ack_after_default: AckAfter | None = None,
         stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: streaming-detach concurrency DoS guard (0=off)
         intake_gate: IntakeGate | None = None,  # BACKLOG #290 slice 2: the engine-wide intake pause
+        refused_body_allowance: RefusedBodyAllowance | None = None,  # vault BACKLOG #2608
         priority_default: Priority | None = None,
         dr_threshold: Priority | None = None,
         dr_standby: Priority | None = None,
@@ -1397,6 +1401,13 @@ class RegistryRunner:
         # IntakeBoundMonitor holds and releases it) and injected into every source this runner starts.
         # None (embedding/tests) = no pause, so every source reads exactly as before.
         self._intake_gate = intake_gate
+        # Vault BACKLOG #2608: what a refused body may store, per inbound. The Engine owns one and
+        # passes it to every runner a reload builds; None (embedding/tests) gets the shipped defaults,
+        # so the bound is on wherever a runner is built.
+        self._refused_body = refused_body_allowance or RefusedBodyAllowance()
+        # The inbounds whose source polls a shared resource (a directory, a table): the engine consumes
+        # the only copy of what it reads, so a refusal there is always stored whole. Set at bind.
+        self._refusals_kept_whole: set[str] = set()
         # DR run-profile (#61, ADR 0048). _priority_default is the global [delivery].priority a
         # connection inherits when it declares no priority= (resolution: per-connection override >
         # global default > built-in NORMAL). _dr_threshold is the THIS-RUN run-profile gate: when set
@@ -3325,18 +3336,29 @@ class RegistryRunner:
         raise KeyError(name)
 
     async def start_inbound(self, name: str, *, operator: bool = False) -> None:
-        """Start receiving on one inbound connection (no-op if already listening).
+        """Start receiving on one inbound connection (no bind if already listening; an
+        ``operator`` start of a listening inbound may still resolve its alert).
 
         Public console/API entrypoint — takes the reload lock so it can't race a concurrent
         reload()/stop() mutating _sources/_workers (review M-10). Internal callers that already hold
         the lock (start, reload) use :meth:`_start_inbound_unsafe`.
 
         On a passive DR standby only an ``operator`` start binds; an engine door such as the
-        scheduler or an alert rule does nothing (:meth:`_dr_refuses`)."""
+        scheduler or an alert rule does nothing (:meth:`_dr_refuses`). Only an ``operator`` start
+        raises ``connection_started`` (BACKLOG #1741, :meth:`_resolving_start`)."""
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
-            await self._checked_inbound_start(name)
+            await self._resolving_start(name, resolve=operator)
+
+    async def _resolving_start(self, name: str, *, resolve: bool) -> None:
+        """:meth:`_checked_inbound_start`, then, when ``resolve`` (an operator's start or restart),
+        raise ``connection_started`` (BACKLOG #1741). The caller holds the reload lock. Covers a
+        fresh bind, an inbound already listening, and a log-write refusal that undid its own bind,
+        which :meth:`_emit_inbound_started` reads as not running."""
+        await self._checked_inbound_start(name)
+        if resolve and self._running:
+            self._emit_inbound_started(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
         """:meth:`_start_inbound_unsafe` after the lane check. A refused CA records the inbound
@@ -3360,13 +3382,39 @@ class RegistryRunner:
             await self._stop_inbound_unsafe(name)
 
     async def restart_inbound(self, name: str, *, operator: bool = False) -> None:
+        """Stop then start one inbound under one reload-lock span. Only an ``operator`` restart raises
+        ``connection_started``; an alert rule's restart resolves nothing, so a rule-driven crash loop
+        keeps one open, escalating, throttled instance (BACKLOG #1741).
+
+        An engine restart whose start fails records the inbound failed and alerts through
+        :meth:`_record_failed`, as :meth:`start` does, once while the record stands. Its stop half
+        already ran, so without the record a restart queued behind an operator's resolving start
+        could leave the inbound down with no record and no open alert. Either way the error still
+        reaches the caller; an operator's restart records nothing, as before."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
             await self._stop_inbound_unsafe(name)
-            await self._checked_inbound_start(name)
+            try:
+                await self._resolving_start(name, resolve=operator)
+            except Exception as exc:
+                # A refused CA is already recorded by _checked_inbound_start; the guard keeps a
+                # rule firing on this alert from re-alerting on every restart it drives. Only an
+                # inbound start() would bind: a name this runner does not hold (another engine
+                # shard's, a typo) or a deployed=False one is refused, not a failure to record.
+                # Nor is a raise after the bind, while the listener is up, or on a stopped runner.
+                if (
+                    not operator
+                    and self._running
+                    and not self.inbound_running(name)
+                    and name in self.registry.inbound
+                    and self._deployed(name, "inbound")
+                    and ("inbound", name) not in self._failed
+                ):
+                    self._record_failed(name, exc, kind="inbound")
+                raise
 
     def _dr_refuses(self, name: str, *, operator: bool) -> bool:
         """Whether a passive DR standby refuses an engine start of inbound ``name`` (vault BACKLOG
@@ -4439,6 +4487,51 @@ class RegistryRunner:
 
         return _hold
 
+    def _emit_inbound_started(self, name: str) -> None:
+        """Raise ``connection_started`` for inbound ``name``, so a sink with alert-state resolves the
+        open ``connection_stopped`` instance under that name, such as a bind failure (BACKLOG #1741,
+        ADR 0031 section 1, ADR 0044 D2).
+
+        :meth:`AlertSink.connection_started` states the contract; these are the checks behind it.
+        Only when no known cause still holds the name down IN EITHER DIRECTION, because alerts key on
+        the bare name while every cause here keys on direction (#1813). The alert row lives in the
+        store every process shares, so a clustered node, or an engine shard that does not own the bare
+        name as an outbound lane, cannot see every cause and resolves nothing. That holds whether or
+        not this runner's registry holds an outbound of that name: one a reload dropped here still
+        drains, and can STOP, on its owning engine shard. A pooled lane a dispatcher
+        STOPPED on its own account without a hold (a leadership-loss STOP) counts as a cause too, and
+        so does an outbound namesake whose build failed as it left the DR park. A park the ENGINE or
+        the calendar made (``deployed=False``, ``auto_start=False``, a schedule park) raises no
+        ``connection_stopped`` and is not a cause. An operator-style pause still is: a #122 log-write
+        halt pauses an outbound through the same door and leaves no other record once an inbound
+        start's own probe clears the latch, so the two cannot be told apart here. A skipped resolve
+        leaves an alert open for an operator, which is the safe direction, and nothing retries it.
+        Never raises: an alert failure must not break a start."""
+        try:
+            blocked = (
+                not self.inbound_running(name)
+                or ("inbound", name) in self._stop_held
+                or name in self._log_halted
+                or self._delivery_halted
+                or self._coordinator.is_clustered()
+                # Not gated on this runner's registry holding the outbound: a namesake a reload
+                # dropped here keeps draining, and can STOP, on the engine shard that owns it.
+                or not self._owns_destination(name)
+                or self.outbound_failed(name) is not None
+                or ("outbound", name) in self._stop_held
+                or self.outbound_dr_failed(name)
+                or (
+                    name in self._outbound_paused
+                    and name not in self._gate_parked
+                    and name not in self._schedule_parked
+                )
+                or any(d.stopped(name) for d in self._dispatchers.values())
+            )
+            if not blocked:
+                self._alert_sink.connection_started(name)
+        except Exception:
+            log.exception("connection_started for %r failed; the alert stays open", name)
+
     def _release_operator_hold(self, name: str, kind: Direction) -> None:
         """The lane was re-armed (or an operator asked for it), so the scheduler owns its calendar
         again."""
@@ -4604,6 +4697,13 @@ class RegistryRunner:
         # measurement. A source consults it BEFORE it reads: a listener before its next socket read,
         # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
         source.intake_gate = self._intake_gate
+        # Vault BACKLOG #2608: a poll source's refusals are stored whole, never as a head, because the
+        # file it deletes or the row it marks was the only copy. Keyed on the transport's own declared
+        # contract, not on a connector type (CLAUDE.md section 4).
+        if getattr(source, "polls_shared_resource", False):
+            self._refusals_kept_whole.add(ic.name)
+        else:
+            self._refusals_kept_whole.discard(ic.name)
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
         # free of any pipeline/cluster import. Only POLL sources act on it — they skip a scan when it
@@ -7575,12 +7675,11 @@ class RegistryRunner:
             check_declared_type(ic, raw if text is None else text_sniff_head(text))
         except IngressGuardError as exc:
             # PHI-safe: the reason names the declared type only — never a byte of the rejected body.
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=text if text is not None else store_safe_raw(raw, ic.content_type.value),
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=exc.reason,
-                source_type=ic.spec.type.value,
                 message_type=ic.content_type.value,
             )
             return True
@@ -7610,12 +7709,11 @@ class RegistryRunner:
             try:
                 check_binary_size(raw)
             except IngressGuardError as exc:
-                await self.store.record_received(
-                    channel_id=ic.name,
-                    raw=store_safe_raw(raw, ic.content_type.value),
-                    status=MessageStatus.ERROR,
+                await self._record_refused(
+                    ic,
+                    raw,
+                    None,
                     error=exc.reason,
-                    source_type=src,
                     message_type=ic.content_type.value,
                 )
                 return None
@@ -7637,12 +7735,11 @@ class RegistryRunner:
         try:
             text = decode_body(raw, ic, encoding=encoding)
         except IngressGuardError as exc:
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=store_safe_raw(raw, ic.content_type.value),
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                None,
                 error=exc.reason,
-                source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             return None
@@ -7654,23 +7751,21 @@ class RegistryRunner:
             # (and every value derived from it) is NUL-free for the rest of this handler. HTTP owns its
             # own 202/4xx response — no HL7 ACK. An HL7 v2 body holding an MLLP frame byte inside the
             # message, not in the whitespace at either end, lands here too (ADR 0205 rule 4).
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=store_safe_raw(raw, ic.content_type.value, text=text),
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=exc.reason,
-                source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             return None
         except IngressGuardError as exc:
             # The engine ceiling on a NON-HL7 body (SEC-017); check_decoded never raises it for HL7.
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=text,
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=exc.reason,
-                source_type=src,
                 message_type=ic.content_type.value,
             )
             return None
@@ -7699,16 +7794,15 @@ class RegistryRunner:
             peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             fields = _read_ingress_fields(peek)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=text,
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=(
                     f"parse error: {safe_exc(exc)}"
                     if isinstance(exc, HL7PeekError)
                     else _peek_read_fault(ic, exc)
                 ),
-                source_type=src,
             )
             return None
         if ic.validation.strict and streaming_over:
@@ -7737,11 +7831,11 @@ class RegistryRunner:
                 # it instead of pinning intake. The message string is PHI-safe/value-free (only the
                 # numeric timeout). HTTP owns its own 202/4xx response — no HL7 ACK here.
                 timed_out = f"strict-validation timed out after {timeout}s"
-                await self._record(ic, peek, text, MessageStatus.ERROR, error=timed_out)
+                await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
                 return None
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
-                await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
+                await self._record_refused(ic, raw, text, error=persisted, peek=peek)
                 return None
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
         # failure records ERROR + returns None, which the source answers as a refusal — never
@@ -7752,12 +7846,8 @@ class RegistryRunner:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
             except (_StreamBudgetExceeded, StreamingAttachmentsUnsupported, DocRefError) as exc:
-                await self._record(
-                    ic,
-                    peek,
-                    text,
-                    MessageStatus.ERROR,
-                    error=f"streaming detach failed: {safe_exc(exc)}",
+                await self._record_refused(
+                    ic, raw, text, error=f"streaming detach failed: {safe_exc(exc)}", peek=peek
                 )
                 return None
         mid = await self.store.enqueue_ingress(
@@ -7863,12 +7953,11 @@ class RegistryRunner:
             try:
                 check_binary_size(raw)
             except IngressGuardError as exc:
-                await self.store.record_received(
-                    channel_id=ic.name,
-                    raw=store_safe_raw(raw, ic.content_type.value),
-                    status=MessageStatus.ERROR,
+                await self._record_refused(
+                    ic,
+                    raw,
+                    None,
                     error=exc.reason,
-                    source_type=src,
                     message_type=ic.content_type.value,
                 )
                 return None
@@ -7903,12 +7992,11 @@ class RegistryRunner:
             text = decode_body(raw, ic, encoding=encoding)
         except IngressGuardError as exc:
             decode_err = exc.reason
-            mid = await self.store.record_received(
-                channel_id=ic.name,
-                raw=store_safe_raw(raw, ic.content_type.value),
-                status=MessageStatus.ERROR,
+            mid = await self._record_refused(
+                ic,
+                raw,
+                None,
                 error=decode_err,
-                source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             ack = (
@@ -7940,12 +8028,11 @@ class RegistryRunner:
             # body holding an MLLP frame byte inside the message, not in the whitespace at either end,
             # is refused the same way, with its own fixed MSA-3 text (ADR 0205 rule 4).
             body_err = exc.reason
-            mid = await self.store.record_received(
-                channel_id=ic.name,
-                raw=store_safe_raw(raw, ic.content_type.value, text=text),
-                status=MessageStatus.ERROR,
+            mid = await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=body_err,
-                source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             ack = (
@@ -7968,12 +8055,11 @@ class RegistryRunner:
             # decoded text as the HL7 path's enforce_size_limits measures len(norm); check_decoded never
             # raises it for HL7. Record ERROR + return None (no HL7 ACK for non-HL7) — count-and-log,
             # never crash the connection.
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=text,
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=exc.reason,
-                source_type=src,
                 message_type=ic.content_type.value,
             )
             return None
@@ -8014,12 +8100,11 @@ class RegistryRunner:
             else:
                 # Not a contract error: a parser fault. The NAK text is fixed, never the fault's own.
                 parse_err, nak_text = _peek_read_fault(ic, exc), "peek read failed"
-            mid = await self.store.record_received(
-                channel_id=ic.name,
-                raw=text,
-                status=MessageStatus.ERROR,
+            mid = await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=parse_err,
-                source_type=src,
             )
             ack = build_ack(text, code="AR", text=nak_text, ack_mode=ack_mode) if reply else None
             if ack is not None and self._capture_ack_enabled(ic):
@@ -8059,7 +8144,7 @@ class RegistryRunner:
                 # + NAK AE instead of pinning the listener. The stored/ACK string is PHI-safe/value-free
                 # (only the numeric timeout) — unlike the validation-error path below it quotes no field.
                 timed_out = f"strict-validation timed out after {timeout}s"
-                mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=timed_out)
+                mid = await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
                 ack = (
                     build_ack(peek, code="AE", text=timed_out, ack_mode=ack_mode) if reply else None
                 )
@@ -8081,7 +8166,7 @@ class RegistryRunner:
                 # needs) but cuts the value (review #120). The scrubbed text is gated behind
                 # messages:view_summary on read, like every other stored error.
                 persisted = f"strict-validation failed: {safe_text(joined)}"
-                mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
+                mid = await self._record_refused(ic, raw, text, error=persisted, peek=peek)
                 # The AE ACK goes back to the partner that SENT this message (their own data) and is
                 # transient (never persisted), so it may carry the fuller, bounded validation text.
                 ack = (
@@ -8119,7 +8204,7 @@ class RegistryRunner:
                 DocRefError,
             ) as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
-                mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=detach_err)
+                mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
                 ack = (
                     build_ack(peek, code="AE", text="streaming detach failed", ack_mode=ack_mode)
                     if reply
@@ -8166,24 +8251,42 @@ class RegistryRunner:
             )
         return ack
 
-    async def _record(
+    async def _record_refused(
         self,
         ic: InboundConnection,
-        peek: Peek,
-        raw: str,  # already the decoded, \r-normalized text (see _handle_inbound)
-        status: MessageStatus,
+        wire: bytes,
+        text: str | None,
         *,
-        error: str | None = None,
+        error: str,
+        message_type: str | None = None,
+        peek: Peek | None = None,
     ) -> str:
+        """Record a body refused before ingress as ``ERROR``. Every refusal phase lands here, so every
+        one is counted and logged (CLAUDE.md section 2). ``wire`` is the body as received and
+        ``text`` its decoded form once the refusal came after the decode, else ``None``; a refusal
+        after the parse passes ``peek`` so the row carries the header fields an operator searches by.
+        The per-inbound refused-body allowance decides whether the whole body or its head is stored;
+        its length always is, and a digest keyed from the store's audit key whenever the store holds
+        one in heap (vault BACKLOG #2608). The caller's ACK or NAK does not depend on it."""
+        bounded = self._refused_body.bound(
+            ic.name,
+            wire,
+            text,
+            ic.content_type.value,
+            error,
+            cipher=self.store.cipher(),
+            keep_whole=ic.name in self._refusals_kept_whole,
+        )
         return await self.store.record_received(
             channel_id=ic.name,
-            raw=raw,
-            status=status,
-            error=error,
-            control_id=peek.control_id,
-            message_type=peek.message_type,
+            raw=bounded.raw,
+            status=MessageStatus.ERROR,
+            error=bounded.error,
+            control_id=peek.control_id if peek is not None else None,
+            message_type=peek.message_type if peek is not None else message_type,
             source_type=ic.spec.type.value,
-            summary=summarize(peek) or None,
+            summary=(summarize(peek) or None) if peek is not None else None,
+            metadata=bounded.metadata,
         )
 
     async def _capture_ack(
@@ -11476,6 +11579,29 @@ def build_check_registry(
         raise WiringError(f"connector build failed: {exc}") from exc
 
 
+#: The label a refused ``DatabaseRef`` statement carries out of the build check (PR 2593 review).
+#: Fixed text, so a reader can tell this refusal from a connector that failed to build.
+REFERENCE_STATEMENT_REFUSED = "reference statement refused (read-only statement test)"
+
+
+def _check_reference_statement(settings: Mapping[str, Any], name: str) -> None:
+    """Run the ``DatabaseRef`` read-only statement test (BACKLOG #2617) for the build check, and
+    raise a refusal as a :class:`WiringError` under :data:`REFERENCE_STATEMENT_REFUSED`.
+
+    Left as it was, :class:`ReferenceStatementRefused` reached :func:`build_check_registry`'s
+    catch-all and read ``connector build failed``, which no connector did. The refusal is raised
+    outside the handler, so it carries no chain; its text is the fixed refusal vocabulary and the
+    set's name, never the statement. A missing statement is a missing setting, not this refusal,
+    and keeps the catch-all's label."""
+    refusal: str | None = None
+    try:
+        reference_statement(settings, name=name)
+    except ReferenceStatementRefused as exc:
+        refusal = str(exc)
+    if refusal is not None:
+        raise WiringError(f"{REFERENCE_STATEMENT_REFUSED}: {refusal}")
+
+
 def _build_check_connectors(
     registry: Registry,
     inbound_bind_host: str,
@@ -11592,24 +11718,33 @@ def _build_check_connectors(
         DatabaseLookupExecutor(resolved_lookups, egress=egress)  # checks each server first
     # Vault BACKLOG #2354: a DATABASE reference source's DSN, built (and discarded) under this
     # posture, so weakened TLS that every sync would refuse fails check, dry-run and reload rather
-    # than only surfacing as a failed sync after start. TLS and auth only: the egress allowlist and
-    # the statement checks stay at sync. Builds no pool and opens no socket. A source whose env()
-    # values do not resolve here is left to its sync, as before, so one unprovisioned set does not
-    # refuse the whole graph.
+    # than only surfacing as a failed sync after start. The egress allowlist stays at sync; the
+    # read-only statement test runs here and again at sync (BACKLOG #2617). Builds no pool and opens
+    # no socket. A source whose env() values do not resolve here is left to its sync, as before, so
+    # one unprovisioned set does not refuse the whole graph.
     # Every source kind, and before the unresolved-env skip below: this refusal needs no value. The
     # same call Engine.start makes (vault BACKLOG #3139).
     refuse_reference_hop_flags(registry)
     for rname, rspec in registry.references.items():
         if rspec.source.kind != "database":
             continue
+        # BACKLOG #2617: a literal statement is tested before the env() skip below, so a set whose
+        # server is not provisioned yet is still tested; an env() statement is tested once resolved.
+        literal_statement = isinstance(rspec.source.settings.get("statement"), str)
+        if literal_statement:
+            _check_reference_statement(rspec.source.settings, rname)
         try:
             rsettings = resolve_env_settings(rspec.source.settings, env_values)
         except WiringError:
             continue
+        if not literal_statement:
+            _check_reference_statement(rsettings, rname)
         database_source_dsn(rsettings, connection=reference_connection_name(rname))
         # BACKLOG #3432: the sync reads acquire_timeout by this rule, so an env() value it would
-        # refuse fails check here rather than as a failed sync after start.
+        # refuse fails check here rather than as a failed sync after start. max_rows the same way
+        # (BACKLOG #2617).
         reference_acquire_timeout(rsettings)
+        reference_max_rows(rsettings)
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         resolved_fhir_lookups[fname] = _fhir_lookup_settings(fspec, env_values, egress)

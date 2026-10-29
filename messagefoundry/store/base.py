@@ -153,6 +153,8 @@ __all__ = [
     "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
     "PROVISION_SCHEMA_COMMAND",
+    "SchemaDdlLockTimeout",
+    "SchemaLockTimeout",
     "SchemaNotProvisionedError",
     "SchemaProvisionResult",
     "StoreGrantsMissingError",
@@ -2008,6 +2010,7 @@ class AuditStore(Protocol):
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict: ...
 
     async def roll_audit_key_epoch(self) -> tuple[bool, str]:
@@ -3377,6 +3380,55 @@ class StoreGrantsMissingError(RuntimeError):
     Raised at open under ``[store].schema_management = external`` so a missing row grant refuses the
     start instead of failing the first pipeline path that touches the object. ``provision-schema``
     cannot fix it: the grant is the DBA's."""
+
+
+class SchemaLockTimeout(RuntimeError):
+    """A server-DB store open did not get the schema lock within ``[store].schema_lock_timeout``
+    (BACKLOG #1726; docs/CONFIGURATION.md says why the wait has its own bound).
+
+    Raised inside the open's schema transaction, which then rolls back with nothing applied; a
+    later open retries the batch. Deliberately NOT a ``TimeoutError``, for the reason
+    :class:`StoreAcquireTimeout` gives."""
+
+    def __init__(self, backend: StoreBackend, lock: str, timeout: float) -> None:
+        self.backend = backend
+        self.lock = lock
+        self.timeout = timeout
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        return (
+            f"{self.backend.value}: the schema lock {self.lock!r} was not acquired within "
+            f"{self.timeout:.15g} s; another engine shard or cluster node may be migrating the store "
+            "schema. Start again once it finishes, or raise [store].schema_lock_timeout"
+        )
+
+
+class SchemaDdlLockTimeout(SchemaLockTimeout):
+    """The open HELD the schema lock, but one of its DDL statements did not get its own table lock
+    within ``[store].schema_lock_timeout`` (BACKLOG #1726).
+
+    The bound covers the lock wait only, never how long a build runs once it has its lock. Without
+    it, a ``CREATE INDEX`` or ``ALTER`` queued behind any open transaction on a store table waits
+    forever while holding the schema lock, and on Postgres its queued lock request also blocks every
+    later write to that table. Raised inside the schema transaction, which then rolls back with
+    nothing applied; a later open retries the batch. A subclass, so a caller that handles
+    :class:`SchemaLockTimeout` handles this too."""
+
+    def _message(self) -> str:
+        # On Postgres a stricter role or database lock_timeout is kept, so it may be what fired.
+        stricter = (
+            " (or the role's or database's own lock_timeout, if that is stricter)"
+            if self.backend is StoreBackend.POSTGRES
+            else ""
+        )
+        return (
+            f"{self.backend.value}: holding the schema lock {self.lock!r}, a DDL statement did not "
+            f"get its table lock within {self.timeout:.15g} s{stricter}; an open transaction on a "
+            "store table, from another engine shard, cluster node or session, may be blocking it. "
+            "Nothing was applied. Start again once that transaction ends, or raise "
+            "[store].schema_lock_timeout"
+        )
 
 
 @dataclass(frozen=True, slots=True)
