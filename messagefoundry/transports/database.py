@@ -1460,8 +1460,9 @@ class AutocommitNotConfirmed(RuntimeError):
     """A connection from an autocommit pool could not be put in autocommit mode (BACKLOG #2148).
 
     The borrow is refused, and the connection goes back to its pool unconfirmed, so no statement runs
-    on it until a later borrow has set the mode. A setter that raised a driver error instead has its
-    connection closed and dropped. The text names neither the DSN nor the server."""
+    on it until a later borrow has set the mode. A setter that raises a driver error raises that
+    error instead, and its connection goes back unconfirmed the same way. The text names neither
+    the DSN nor the server."""
 
 
 def _thread_settled[T](fn: Callable[[], T]) -> asyncio.Future[T]:
@@ -1544,29 +1545,6 @@ async def _return_to_pool(pool: Any, conn: Any) -> None:
         await pool.release(conn)
     except Exception as exc:  # noqa: BLE001 - no borrower is left to tell
         logger.debug("DATABASE: returning a pooled connection failed: %s", safe_exc(exc))
-
-
-async def _discard_connection(pool: Any, conn: Any) -> None:
-    """Close ``conn``, then hand it back to ``pool``, which drops a closed connection. Call it only
-    once no worker thread is inside a call on ``conn``: closing under a running call frees handles
-    that call is using (BACKLOG #2049). Never raises but a cancellation; the release is in a
-    ``finally`` so a cancellation during the close still returns the slot.
-
-    For a connection whose autocommit set RAISED. That is a driver error, often a dead link, and a
-    dead connection returned open would be handed out, and fail, on every later borrow. Closed, it
-    is dropped and the pool dials a fresh one. aioodbc may not wake a borrower already waiting for
-    a free slot when the slot it frees held a closed connection; that borrower then waits out its
-    ``acquire_timeout``, a transient failure, which is the lesser cost."""
-    try:
-        await conn.close()
-    except Exception as exc:  # noqa: BLE001 - the set's own failure is the error that matters
-        logger.warning(
-            "DATABASE: closing a pooled connection whose autocommit set failed did not succeed; "
-            "it goes back to the pool and is set again on its next borrow: %s",
-            safe_exc(exc),
-        )
-    finally:
-        await _return_to_pool(pool, conn)
 
 
 #: Connections returned after their borrower stopped waiting. The loop holds a task only weakly
@@ -1685,7 +1663,9 @@ class _AutocommitPool:
         except BaseException as exc:
             if work.done() and isinstance(exc, Exception):
                 # The thread resolved ``work`` with a driver error, so no call is running on it.
-                await _discard_connection(self._pool, conn)
+                # Returned open, not closed: a close here is itself a worker-thread call that a
+                # cancellation could abandon, and aioodbc wakes no waiter for a closed connection.
+                await _return_to_pool(self._pool, conn)
             else:
                 # The borrower left (a cancel, or the coroutine closed) while the thread may still
                 # be inside the setter. Settled when the thread resolves ``work``, never sooner,
@@ -1703,9 +1683,9 @@ class _AutocommitPool:
 
     def _settle_detached(self, conn: Any, work: asyncio.Future[bool]) -> None:
         """Settle ``conn`` once the thread has resolved a set its borrower abandoned: marked
-        confirmed and returned if it passed, logged (no borrower is left to raise to, CLAUDE.md
-        section 6) and returned unconfirmed if it was not kept, discarded if the driver raised. A
-        done callback, so it never raises. ``work`` is a :func:`_thread_settled` future, which only
+        confirmed and returned if it passed, otherwise logged (no borrower is left to raise to,
+        CLAUDE.md section 6) and returned unconfirmed, so its next borrow sets it again. A done
+        callback, so it never raises. ``work`` is a :func:`_thread_settled` future, which only
         its thread completes, so this runs only once the setter has returned (PR 2593 review)."""
         if work.cancelled():  # nothing cancels a _thread_settled future; refuse to guess if one is
             logger.warning(
@@ -1719,15 +1699,11 @@ class _AutocommitPool:
             _detach(_return_to_pool(self._pool, conn))
             return
         logger.warning(
-            "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection is "
-            "%s",
+            "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection goes "
+            "back unconfirmed and is set again on its next borrow",
             "not kept" if failure is None else safe_exc(failure),
-            "returned unconfirmed" if failure is None else "discarded",
         )
-        if failure is None:
-            _detach(_return_to_pool(self._pool, conn))
-        else:
-            _detach(_discard_connection(self._pool, conn))
+        _detach(_return_to_pool(self._pool, conn))
 
     async def release(self, conn: Any) -> None:
         await self._pool.release(conn)

@@ -203,16 +203,21 @@ class _RaisingRaw(_RawConnection):
         raise ConnectionError("08S01")
 
 
-async def test_a_setter_that_raises_discards_the_connection(driver: _Driver) -> None:
-    """A dead connection returned open would be handed out, and fail, on every later borrow
-    (PR 2593 covering review). The setter's thread has ended, so closing it here is safe."""
+async def test_a_setter_that_raises_returns_the_connection_unconfirmed(driver: _Driver) -> None:
+    """The driver's own error reaches the borrower, and the connection goes back open and
+    unconfirmed, so its next borrow sets it again before any statement runs. It is not closed: a
+    close is a worker-thread call a cancellation could abandon, and aioodbc wakes no waiter for a
+    closed connection (PR 2593 covering review, round 2). A dead link stays in the pool: a known
+    cost, written down in the report."""
     pool = await _make_pool("DSN=x", 2, autocommit=True, login_timeout=5)
     inner = driver.pools[0]
     inner.conn = _Connection(_RaisingRaw())
-    with pytest.raises(ConnectionError):
-        await _acquire(pool, 5.0)
-    assert inner.conn.closed is True
-    assert inner.released == [inner.conn]
+    for _ in range(2):
+        with pytest.raises(ConnectionError):
+            await _acquire(pool, 5.0)
+    assert inner.conn.closed is False
+    assert inner.released == [inner.conn, inner.conn]
+    assert inner.conn.executed_under == []
 
 
 async def test_a_connection_with_no_driver_handle_is_refused(driver: _Driver) -> None:

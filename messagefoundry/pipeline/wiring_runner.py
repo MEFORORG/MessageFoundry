@@ -11503,8 +11503,8 @@ def _build_check_connectors(
     for rname, rspec in registry.references.items():
         if rspec.source.kind != "database":
             continue
-        # BACKLOG #2617: DatabaseRef takes the statement as a literal, so it is tested before the
-        # env() skip below and a set whose server is not provisioned yet is still tested.
+        # BACKLOG #2617: a literal statement is tested before the env() skip below, so a set whose
+        # server is not provisioned yet is still tested; an env() statement is tested once resolved.
         literal_statement = isinstance(rspec.source.settings.get("statement"), str)
         if literal_statement:
             _check_reference_statement(rspec.source.settings, rname)
