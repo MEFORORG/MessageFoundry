@@ -8820,11 +8820,13 @@ ADMIN_TOTP_RESET_ACTION = "auth.admin_totp_reset"
 
 class _ResetTarget(NamedTuple):
     """The account ``admin-reset-totp`` checked before the key was shown, pinned for its write. The
-    write refuses a row whose id or enrolment instant differs (ADR 0171 Amendment B)."""
+    write refuses a row whose id, enrolment instant or seed differs (ADR 0171 Amendment B, BACKLOG
+    #3778). The seed is pinned by its digest, so the old seed is not held across the prompt."""
 
     user_id: str
     username: str
     enrolled_at: float | None
+    secret_digest: str
 
 
 def _admin_reset_totp(args: argparse.Namespace) -> int:
@@ -8849,10 +8851,11 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     the console device and proved with a code BEFORE the store is written. One transaction,
     :meth:`replace_totp_enrolment`, then swaps the seed, the recovery codes and the step high-water
     mark while TOTP stays on, so no reader ever sees the account with TOTP off. The write is a
-    compare-and-set on the id and the enrolment instant read before the prompt, so a removal or a
-    re-enrolment that lands while the operator types is never overwritten. A wrong code, a lost
-    console or a refusal writes nothing and the old seed still works. The proving code's step is
-    recorded, so that code is spent.
+    compare-and-set on the id, the enrolment instant and the seed read before the prompt, so a
+    removal or a re-enrolment that lands while the operator types is never overwritten, even one
+    stamped with the same instant (BACKLOG #3778). A wrong code, a lost console or a refusal writes
+    nothing and the old seed still works. The proving code's step is recorded, so that code is
+    spent.
 
     **It replaces the recovery codes too.** A leaked seed or a stolen device usually means the codes
     kept beside it are exposed as well, and a seed rotation that left them valid would revoke nothing
@@ -8895,7 +8898,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
     from messagefoundry.store.row_seal import RowSealError
-    from messagefoundry.store.store import AuditAppend
+    from messagefoundry.store.store import AuditAppend, totp_secret_digest
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
@@ -8997,7 +9000,19 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             if refusal is not None:
                 return refusal
             _refuse_an_unauditable_write(store)  # before the key is shown, not after the write
-            return _ResetTarget(user.id, user.username, user.totp_enrolled_at)
+            # The seed from the record that gave the stamp, so the pin names one enrolment even
+            # when a second one shares its stamp (BACKLOG #3778).
+            held = store.open_totp_secret(
+                user.id, None if user.row is None else user.row.totp_secret
+            )
+            if held is None:
+                return (
+                    f"the authenticator of {user.username!r} changed while it was read; nothing "
+                    "was written. Run the command again"
+                )
+            return _ResetTarget(
+                user.id, user.username, user.totp_enrolled_at, totp_secret_digest(held)
+            )
         finally:
             await store.close()
 
@@ -9101,6 +9116,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     recovery_code_hashes=code_hashes,
                     step=step,
                     expected_enrolled_at=target.enrolled_at,
+                    expected_secret_digest=target.secret_digest,
                     audit=AuditAppend(ADMIN_TOTP_RESET_ACTION, actor=actor, detail=detail),
                 )
             except BaseException as exc:  # noqa: BLE001 - read back, then refused or re-raised

@@ -202,6 +202,17 @@ a seed again. So the UPDATE also requires the pinned `totp_enrolled_at`, which e
 enrolment rewrites, and the command refuses a row whose id changed. A removal, or a newer enrolment,
 that lands during the prompt is never overwritten: the write matches nothing and the command says so.
 
+> **Correction (2026-10-29, BACKLOG #3778).** `totp_enrolled_at` is a clock reading, so a removal
+> and a re-enrolment inside one reading left a row the compare above could not tell from the one
+> step 1 read. Step 1 now also pins a SHA-256 digest of the opened seed, read from the same record
+> as the stamp, and the UPDATE requires both (`expected_secret_digest` beside
+> `expected_enrolled_at`). Every writer of a seed draws a fresh random one, and
+> `replace_totp_enrolment` refuses a replacement equal to the seed it replaces, so two enrolments
+> differ in their seed even when they share a stamp. The compare opens the cell rather than
+> comparing ciphertext, so a store-key rotation, which re-encrypts the cell, refuses nothing. A
+> cell that does not open matches nothing. No column was added, so the user row and its seal are
+> unchanged. This is the pair the service already compares across a code check (BACKLOG #3068).
+
 The other design, clearing the seed and forcing enrol-first at the next sign-in, was rejected. It
 passes through a state with no factor. `admin_reset_mfa` needs a generated credential to make that
 state safe (ADR 0197 Amendment A, N-B2). On a sole Administrator that state is the install's only way

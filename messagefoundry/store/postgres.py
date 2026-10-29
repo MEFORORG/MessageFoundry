@@ -9259,18 +9259,24 @@ class PostgresStore:
         recovery_code_hashes: list[str],
         step: int,
         expected_enrolled_at: float | None,
+        expected_secret_digest: str,
         audit: AuditAppend,
         now: float | None = None,
     ) -> int | None:
         """See the SQLite twin (ADR 0171 Amendment B). The swap, the session sweep and the audit row
         share one transaction. This leg is CI-only, so a divergence from the SQLite and SQL Server
-        bodies surfaces first in CI. The compare-and-set is ``totp_replace``'s, null-safe."""
+        bodies surfaces first in CI. The compare-and-set is ``totp_replace``'s, null-safe, on the
+        stamp and the opened seed (BACKLOG #3778)."""
         now = time.time() if now is None else now
+        aad = cell_aad("users", "totp_secret", user_id)
         change = totp_replace(
-            sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            secret=secret,
+            seal_secret=lambda plain: self._enc(plain, aad=aad),
+            open_secret=functools.partial(self.open_totp_secret, user_id),
             recovery_code_hashes=recovery_code_hashes,
             step=step,
             expected_enrolled_at=expected_enrolled_at,
+            expected_secret_digest=expected_secret_digest,
             now=now,
         )
         # `record=False` as `create_user` passes: a CLI write is not a pipeline borrow.
