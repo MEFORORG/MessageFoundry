@@ -26,7 +26,12 @@ from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, Egr
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
-from messagefoundry.transports.rest import PROXY_DEFAULT, refuse_url_credentials
+from messagefoundry.transports.rest import (
+    PROXY_DEFAULT,
+    refuse_url_credentials,
+    url_host_label,
+    url_scheme,
+)
 
 log = logging.getLogger(__name__)
 
@@ -198,7 +203,7 @@ def _check_credential_token_url_egress(
             error=WiringError,
         )
         if not _http_egress_allowed(token_url, allowed_http):
-            host = _egress_host_label(token_url)
+            host = url_host_label(token_url)
             log.warning(
                 "egress denied: %s %s host %r not in [egress].allowed_http",
                 label,
@@ -250,8 +255,22 @@ def _check_forward_proxy_egress(
             "proxy host to permit it (the proxy receives a Proxy-Authorization credential, so this "
             "list is deny-by-default even under [security].block_unlisted_outbound = false)"
         )
+    # A URL urlsplit cannot parse is said to be one, rather than reported as an allowlist miss that
+    # no entry could ever clear. Its own ValueError quotes the netloc, so it is never let out.
+    try:
+        url_scheme(
+            proxy_url, f"{label} proxy_url", use="proxy_user/proxy_password", error=WiringError
+        )
+    except WiringError:
+        # The egress-denied WARNING this arm's other refusals write; it names the connection only.
+        log.warning("egress denied: %s forward proxy URL cannot be parsed", label)
+        raise
     if not _http_egress_allowed(proxy_url, allowed_proxy):
-        host = _egress_host_label(proxy_url)
+        # The four HTTP-family allowlist arms in this module print the host through
+        # url_host_label. refuse_url_credentials, which the other three run first and this one
+        # cannot (a proxy may carry its own userinfo), still passes shapes whose hostname is a
+        # username or token head, so none of them may print it raw (BACKLOG #1793, #2686).
+        host = url_host_label(proxy_url)
         log.warning(
             "egress denied: %s forward proxy host %r not in [egress].allowed_proxy", label, host
         )
@@ -293,7 +312,7 @@ def check_fhir_lookup_allowed(
         if not _http_egress_allowed(
             url, egress.allowed_http
         ):  # same host[:port] matching as the FHIR outbound
-            host = _egress_host_label(url)
+            host = url_host_label(url)
             log.warning(
                 "connect denied: FhirLookup %r host %r not in [egress].allowed_http", name, host
             )
@@ -468,7 +487,7 @@ def check_egress_allowed(
         url = str(dest.settings.get("url", ""))
         refuse_url_credentials(url, f"outbound {dest.name!r} 'url'", error=WiringError)
         if not _http_egress_allowed(url, egress.allowed_http):
-            host = _egress_host_label(url)
+            host = url_host_label(url)
             log.warning(
                 "egress denied: outbound %r %s host %r not in [egress].allowed_http",
                 dest.name,
@@ -677,27 +696,17 @@ def _dir_egress_allowed(directory: str, allowed: list[str]) -> bool:
     return False
 
 
-def _egress_host_label(url: str) -> str:
-    """The host an egress refusal may print (BACKLOG #1793). urllib unquotes the host, so one that
-    holds an ``@`` once unquoted is userinfo written as ``%40``, and printing it prints the password.
-
-    Every egress check runs BEFORE the connector constructor, so the construction refusal in the
-    connector never speaks first. The data, token and FhirLookup arms therefore also call
-    ``refuse_url_credentials`` up front, for a refusal that names the setting. The proxy arm cannot,
-    since a proxy may carry its own userinfo, and this label is what keeps its message clean."""
-    host = urllib.parse.urlsplit(url).hostname or ""
-    return "(withheld: it holds a credential)" if "@" in urllib.parse.unquote(host) else host
-
-
 def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
     """True if ``url``'s host (and port, when an allow entry pins one) is on the allowlist — the same
     ``host`` / ``host:port`` matching as MLLP.
 
     A port ``urlsplit`` cannot read is NOT allowed, and this never raises (BACKLOG #1793). The
     ``ValueError`` from ``.port`` quotes the port text, and a password holding an unencoded ``/``,
-    ``?`` or ``#`` ends the authority early, so its head IS that text. ``redact()`` does not match it."""
-    parts = urllib.parse.urlsplit(url)
+    ``?`` or ``#`` ends the authority early, so its head IS that text. ``redact()`` does not match it.
+    A URL ``urlsplit`` cannot parse is not allowed either, since that ``ValueError`` quotes the
+    whole netloc (#2686)."""
     try:
+        parts = urllib.parse.urlsplit(url)
         port = parts.port
     except ValueError:
         return False

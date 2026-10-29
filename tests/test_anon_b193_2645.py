@@ -137,7 +137,8 @@ def _field_of(message: str, address: str) -> str:
 
 @functools.cache
 def _out(adapter: Callable[..., str]) -> str:
-    return adapter(_MESSAGE, salt=_SALT, overlay=_OVERLAY)
+    rules = (engine_rules if adapter is engine_anonymize else tee_rules).load_rules(_OVERLAY)
+    return adapter(_MESSAGE, salt=_SALT, rules=rules)
 
 
 @pytest.mark.parametrize("address", _BATCH_18_FIELDS)

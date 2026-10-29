@@ -458,6 +458,20 @@ suite("webview message receivers check origin, source and the channel token", ()
     assert.deepStrictEqual(offenders, [], "a receiver acted on a payload without a shape check");
   });
 
+  test("every mfShapeOk call names its panel with a string literal", () => {
+    // The discard warning joins the panel argument into its one fixed phrase, so that phrase holds
+    // nothing the message chose only while every caller passes a literal (BACKLOG #1123).
+    // webviewMessaging.ts holds the definition and its doc comment, and no call.
+    const calls = webviewCodeSources()
+      .filter(({ rel }) => path.basename(rel) !== "webviewMessaging.ts")
+      .flatMap(({ rel, text }) => [...text.matchAll(/\bmfShapeOk\(([^)]*)\)/g)].map((m) => ({ rel, args: m[1] })));
+    const offenders = calls
+      .filter(({ args }) => !/^\w+, '\w+', SHAPES, '[\w ]+'$/.test(args))
+      .map(({ rel, args }) => `${rel}: mfShapeOk(${args})`);
+    assert.deepStrictEqual(offenders, [], "a panel name is not a string literal, so the message could choose it");
+    assert.ok(calls.length >= 7, `expected at least the 7 shared-helper receivers; found ${calls.length}`);
+  });
+
   test("the shared rationale says what the checks are and what they rest on", () => {
     // Guards against the note decaying back into a bare marker. It must keep naming the delivery
     // measurement the checks are derived from — an opaque origin would make the origin arm vacuous,

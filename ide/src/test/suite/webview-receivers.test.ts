@@ -75,7 +75,7 @@ interface Page {
   readonly window: JsdomWindow;
   /** Every exception the page raised, loading or handling a message. */
   readonly errors: unknown[];
-  /** Every console.warn the page wrote. A discard names itself there. */
+  /** Every console.warn the page wrote. A discard reports itself there, in one fixed phrase. */
   readonly warnings: string[];
   /** Every message the page posted to the host. */
   readonly posted: Payload[];
@@ -785,9 +785,11 @@ const UNKNOWN_KINDS: unknown[] = [
   12345,
   ["PID|1||A123"],
 ];
-// The whole warning a known-kind discard writes: the page's own key, and nothing from the message.
-const STATE_WARNING = 'MessageFoundry Security Settings: discarded a malformed "state" message';
-const RULES_WARNING = 'MessageFoundry Alert Rules: discarded a malformed "rules" message';
+// The whole warning any discard writes: the page's own panel name in one fixed phrase. Nothing in it
+// is chosen by the message, not even its kind (owner decision 2026-10-29, BACKLOG #1123).
+const discardWarning = (panel: string): string => `MessageFoundry ${panel}: discarded a malformed message`;
+const STATE_WARNING = discardWarning(security.panel);
+const RULES_WARNING = discardWarning(alertRules.panel);
 
 suite("webview receivers discard a malformed payload and render a well-formed one", () => {
   teardown(closeWindows);
@@ -839,10 +841,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.strictEqual(h.mfShapeOk({ command: "notCallable" }, "command", shapes, "P"), false);
     assert.strictEqual(h.mfShapeOk({ command: "truthy" }, "command", shapes, "P"), false);
     assert.strictEqual(h.mfShapeOk({ command: "ok" }, "command", shapes, "P"), true, "control");
-    assert.deepStrictEqual(warned, [
-      'MessageFoundry P: discarded a malformed "notCallable" message',
-      'MessageFoundry P: discarded a malformed "truthy" message',
-    ]);
+    assert.deepStrictEqual(warned, [discardWarning("P"), discardWarning("P")]);
   });
 
   test("the fixtures the host builds are the shape the malformed cases assume", () => {
@@ -1317,11 +1316,12 @@ suite("webview receivers discard a malformed payload and render a well-formed on
           } else {
             assert.strictEqual(p.snapshot(), before, `${r.panel} "${type}", ${why}: the page changed`);
           }
-          // Exactly the one fixed warning, naming the page's own key: nothing from the message.
+          // Exactly the one fixed warning. The kind is well-formed and the page's own, and this exact
+          // match is what proves it is not named: it is the message's own discriminant.
           assert.deepStrictEqual(
             p.warnings,
-            [`MessageFoundry ${r.panel}: discarded a malformed "${type}" message`],
-            `${r.panel} "${type}", ${why}: the discard was not named in the console, or carried more`,
+            [discardWarning(r.panel)],
+            `${r.panel} "${type}", ${why}: the discard was not named in the console, carried more, or named the kind`,
           );
         });
       }
@@ -1336,7 +1336,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
         assert.strictEqual(p.snapshot(), before);
         assert.deepStrictEqual(
           p.warnings,
-          [`MessageFoundry ${r.panel}: discarded a malformed message of an unknown kind`],
+          [discardWarning(r.panel)],
           `${r.panel}: an unhandled type was not reported with the fixed phrase`,
         );
         assert.ok(!p.warnings.some((w) => w.includes(String(kind))), `${r.panel}: the unhandled type was echoed`);

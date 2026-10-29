@@ -1890,7 +1890,7 @@ with materially different PHI profiles, so they get their own rows; stream 4 is 
 | **19. Off-box forwarder spool** (BACKLOG #1966, ADR 0200; `messagefoundry/log_spool.py`) | the records stream 4 has not handed to the collector: while it is down or backing off, and some of those still queued at shutdown. Not all: on a full queue `enqueue_sentinel` discards records to make room for the stop sentinel, and a listener that outlives its join loses its tail. Over UDP, the default, no failed send is detected, so a down collector spools nothing; only records behind older entries or queued at shutdown are kept. While anything is spooled, new forwarded records are appended behind it, so order holds, except at least while a spool read faults or a segment has vanished: newer records are then sent live ahead of the spooled ones. Already-sent entries also stay on disk until their whole segment drains, and a sent segment whose delete failed stays until it is reclaimed, and is replayed whole by the next start | segment files `spool-<12-digit sequence>.jsonl`, one JSON object per line, `{"v": 1, "level": ..., "line": ...}`, where `line` is the text stream 4's formatter rendered (`forward_format`) | `[logging].forward_spool_dir`, or `log-spool` beside `[store].path`, with one subdirectory per process: `engine`, `shard-<id>`, or `supervisor` for the `supervise` process, whose default root sits beside its `--db` base instead (`_forward_spool_dir`, `_supervisor_forward_spool_dir` in `messagefoundry/__main__.py`). A per-directory lock refuses a second process. Only `serve` and `supervise` open one; row 18's processes never do | replayed to the collector, oldest first, when it answers again, including after a restart. `GET /status` reports loss and fault counters (`spool_dropped`, `spool_skipped`, `spool_read_errors`, `spool_read_faulted`), not how much the spool holds, and the `supervise` process has no API | §2's spool row states the directory and segment modes and the Windows ACL. No API route serves its contents and reading it writes no audit row | bounded by **size**, `[logging].forward_spool_max_bytes`, as §2's row states. The cap is per process directory, so a `supervise` deployment holds up to one cap per engine shard plus one. No age window applies: the `[retention].app_log_days` sweep reads only `.log` / `.txt` files, one level deep, under `[logging].log_dir`. A start that turns the spool off or cannot open it, for a reason other than another process holding the lock, warns about segments an earlier run left and **does not** delete them (`_warn_leftover_segments`). A directory no later start opens, at least because forwarding was turned off, an engine shard was removed, or `[store].path` or `forward_spool_dir` moved, gets no warning at all. Either way the segments rest until a later spool sends them or an operator removes them | **Can contain PHI**, on stream 1's terms. The spool sits on the far side of the forwarder's hand-off queue. `_build_queued_forwarder` installs stream 1's filter chain on the near-side `_ForwardQueueHandler`, so the spool only ever holds text the chain already processed, and keeps stream 1's residuals. It is **plaintext**, with no app-level cipher; §2 carries its at-rest row and its FDE advice |
 
 **Not in this inventory, and why.** The Windows tray's log file was scoped out here until BACKLOG
-#2351. It is row 15 now, and what this paragraph said about it lives in that row. The VS Code extension also calls `console.warn` at four sites at least, in `ide/src/testBench.ts`, `testBenchWebview.ts` and `webviewMessaging.ts`. Each writes a fixed sentence with a panel name, a message type or an error type. That output has no row, and where the editor keeps it was not checked. `GET /metrics` (Prometheus gauges/counters) and the `/ws/stats`
+#2351. It is row 15 now, and what this paragraph said about it lives in that row. The VS Code extension also calls `console.warn` at four sites at least, in `ide/src/testBench.ts`, `testBenchWebview.ts` and `webviewMessaging.ts`. The ones read for this row write fixed sentences, some with a panel name or an error type added. The webview discard warning prints one fixed phrase per panel and names nothing the message chose, not even its kind (BACKLOG #1123). That output has no row, and where the editor keeps it was not checked. `GET /metrics` (Prometheus gauges/counters) and the `/ws/stats`
 WebSocket are **live telemetry, not log records** — neither retains a per-event record. The standalone
 **`tee` MLLP relay** is a separate application shipped in this repo with its own SQLite store and its own
 logging (`relay_log` — direction/leg/control id/type/size/outcome/ack code + a sanitized 500-char detail,
@@ -2183,8 +2183,8 @@ both are described below:
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IP address, survives | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
-| A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps. A cut shape counts when at least one of its fields is one no rule maps |
-| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps. A cut shape counts when at least one of its fields is one no rule maps |
+| A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, and what a retarget of a default field leaves past its first component. A cut shape counts when at least one of its fields is one no rule maps |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, and what a retarget of a default field leaves past its first component. A cut shape counts when at least one of its fields is one no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it as `PV2 (line with no fields)` | Every line but the header. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
@@ -2402,22 +2402,30 @@ What the `date` kind does to a value:
 - An `OBX-5` result whose `OBX-2` type is `NM`, `SN` or `TM` is kept whole only when it fits the
   grammar of that type (vault BACKLOG #2961). `NM` is an optional comparator, an optional sign,
   digits and at most one decimal point. `SN` is a comparator, a number, a separator and a second
-  number, each optional. `TM` is a time of day with every part in range. A value that does not fit
-  becomes `[REDACTED]`. So `123-45-6789` or `555-555-0100` under a numeric label would no longer
-  leave whole, and neither would an eight-digit date under `TM`. **The grammar cannot tell a
-  number from an identifier written as a number.** At least these would still leave whole under
-  `NM`, and in a number part of an `SN`. An undashed nine-digit number has the shape of an SSN.
-  An undashed ten-digit number, or eleven digits after a `+`, has the shape of a phone number. An
-  eight-digit number can read as a date. And an identifier can be split across repetitions.
-  Under `TM`, at least a six-digit date whose parts are in range for a time would still leave
-  whole: `150312` reads as 15:03:12. The leak-check's shape detectors do not scan `OBX-5`,
-  because a rule maps it, so nothing refuses these. A message that declares a digit or one of
-  `+ - . : / < > =` as its component, repetition or subcomponent separator keeps no numeric
-  `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, a
-  value such as `000-12-3456` is split by the message itself across `OBX-5`, `OBX-6` and `OBX-7`.
-  The first part is a valid number, so the guard keeps it, and the leak-check refuses the cut
-  shape, as *What the leak-check refuses, and what it lets through* says. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
-  under one of them, such as a surname, would still leave whole.
+  number, each optional. `TM` is a time of day with every part in range and no offset, since the
+  `date` kind never keeps an offset either. A value that does not fit becomes `[REDACTED]`. So
+  `123-45-6789` or `555-555-0100` under a numeric label would no longer leave whole, and neither
+  would an eight-digit date, a date written `YYYY-MMDD` or a phone number written `NNNNNN-NNNN`
+  under `TM`. **The grammar cannot tell a number from an identifier written as a number.** At
+  least these would still leave whole under `NM`, and in a number part of an `SN`. An undashed
+  nine-digit number has the shape of an SSN. An undashed ten-digit number, or eleven digits after
+  a `+`, has the shape of a phone number. An eight-digit number can read as a date. And an
+  identifier can be split across repetitions. In an `SN`, a date or a phone number written as two
+  numbers and a separator, such as `^1945^-^0612`, would still leave whole too. Under `TM`, at
+  least a four-digit month and day, such as `0612`, and a six-digit date whose parts are in range
+  for a time, such as `150312`, would still leave whole. The leak-check's shape detectors do not
+  scan `OBX-5`, because a rule maps it, so nothing refuses these. A message that declares a digit
+  or one of `+ - . : / < > =` as its component, repetition or subcomponent separator keeps no
+  numeric `OBX-5` value, and one that declares a whitespace character there keeps no numeric or
+  coded `OBX-5` value. A `DT` or `TS` value takes the `date` kind there as anywhere, and that kind
+  splits on the repetition separator, so under a space it would keep at least every year-shaped
+  run of four digits. The guard does not read the field separator. Under a field separator of
+  `-`, a value such as `000-12-3456` is split by the message itself across `OBX-5`, `OBX-6` and
+  `OBX-7`. The first part is a valid number, so the guard keeps it, and the leak-check refuses the
+  cut shape, as *What the leak-check refuses, and what it lets through* says. Under the coded types
+  `ID`, `IS`, `CE` and `CWE`, at least a bare token, such as a surname, and a name split across
+  components, such as `DOE^JOHN`, would still leave whole, and so would `000-12-3456` under any
+  field separator but `-`.
 - When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
   site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
   kind filled, so the filled date stays a date. Two things follow. A site code that reads as a
@@ -2465,21 +2473,37 @@ refuses.
 **A keep on a field the default rules scrub turns that scrub off.** A keep on `PID-5` leaves the
 patient name in the output as captured, whatever the keep was added for. A default-scrubbed field
 already counts as decided, so a keep on one never clears a refusal. `load_rules` logs one WARNING
-line for each such field, but not on every load. It remembers each set of lines it has logged in
-this process, and skips a set it remembers. The line names the field and the kind of scrub it
-lost, never a value. A keep on a
+line for each such field, on every load. The anonymizer takes no overlay path, so a caller loads
+the overlay once and passes the rules to every message. The line names the field and the kind of
+scrub it lost, never a value. A keep on a
 field with no default rule logs nothing. `python -m tee anonymize-captures` also prints one
 `warning:` line that lists those fields, and `--log-level` cannot hide it.
 
 **An overlay can also point a default field at a different kind, and that can leave part of the
 field as captured.** The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn`
 rewrite the first component only, so `PID-5` pointed at `id` leaves the given name. `date` keeps
-the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check counts such a field
-as scrubbed, and its shape detectors do not scan what is left. So a clean return does not clear it. `load_rules`
-logs one WARNING line for each such field, under the same once-per-set rule as a keep. The line
-names the field, the default kind and the new kind. `python -m tee anonymize-captures` prints
-one `warning:` line that lists them. A retarget to the same kind does not warn, and neither does
-a `drop`. Nothing refuses the retarget (vault BACKLOG #3000).
+the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check scans what such a
+field has left past its first component for a dashed SSN and a punctuated phone number, as the
+table above says, and refuses either. A name, a city or a year left there passes, and so does a
+year left in the first component, so a clean return does not clear it.
+
+**`load_rules` refuses such a retarget unless the overlay lists the field under
+`retarget_acknowledged`** (vault BACKLOG #3000):
+
+```toml
+[hl7]
+retarget_acknowledged = ["PID-5"]
+
+[hl7.fields]
+"PID-5" = "id"
+```
+
+A retarget to the same kind needs no entry, because it changes nothing. Nor does one to `drop` or
+`freetext`, which write a constant in place of the field; on `OBX-5`, where `freetext` keeps some
+values, it is already the default kind. An entry that names no retarget needing it, such as a misspelt field,
+is refused too. A listed retarget loads, and `load_rules` logs one WARNING line for each, as it
+does for a keep. The line names the field, the default kind and the new kind, never a value.
+`python -m tee anonymize-captures` prints one `warning:` line that lists them.
 
 **The tee checks the salt and reads the overlay once, before it reads the store.** A salt the
 keyer refuses, an overlay it cannot read or parse, or one that breaks the schema, refuses the

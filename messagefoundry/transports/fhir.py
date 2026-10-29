@@ -130,6 +130,7 @@ from messagefoundry.transports.rest import (
     refuse_url_credentials,
     refuse_verify_off,
     revocation_attestation_from_settings,
+    url_scheme,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
@@ -810,7 +811,7 @@ class FhirDestination(DestinationConnector):
                 "FHIR destination requires a 'url' setting (the FHIR service base URL)"
             )
         _reject_config_control_chars(url, "url")
-        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        scheme = url_scheme(url, "FHIR destination 'url'")
         if scheme not in ("http", "https"):
             raise ValueError(f"FHIR destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "FHIR destination 'url'")
@@ -1701,7 +1702,7 @@ class FhirLookupExecutor:
             # #1241: the SECOND url construction site in this module. The destination screens its
             # own; screening one and not its sibling reproduces the asymmetry the item reports.
             _reject_config_control_chars(url, "url", f"lookup {cname!r}")
-            scheme = urllib.parse.urlsplit(url).scheme.lower()
+            scheme = url_scheme(url, f"FhirLookup {cname!r} 'url'")
             if scheme not in ("http", "https"):
                 raise ValueError(
                     f"FhirLookup {cname!r} 'url' must be http or https, got scheme {scheme!r}"

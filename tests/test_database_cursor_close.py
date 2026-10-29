@@ -8,7 +8,7 @@ with ``HY000 Connection is busy with results for another command`` -- attributed
 happens to land on the recycled connection, not to the one that left it dirty.
 
 **Why this is delivery semantics, not tidiness.** An ``UPDATE`` leaves a row count pending, so the
-DATABASE source's ``mark`` is the usual victim, and ``_poll_once`` treats a failed mark as
+DATABASE source's ``mark`` is the usual victim, and ``_ingest_row`` treats a failed mark as
 at-least-once: the row is left unmarked and **re-emitted as a duplicate** on the next poll. Observed
 on a real SQL Server 2022 container against ``main``:
 

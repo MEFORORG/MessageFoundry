@@ -271,13 +271,12 @@ export const SHAPE_HELPERS = `
     }
     function mfShapeOk(d, key, shapes, panel) {
       const k = d[key];
-      const known = typeof k === 'string' && Object.prototype.hasOwnProperty.call(shapes, k);
-      const check = known ? shapes[k] : null;
+      const check = typeof k === 'string' && Object.prototype.hasOwnProperty.call(shapes, k) ? shapes[k] : null;
       if (typeof check === 'function' && check(d) === true) { return true; }
-      // Named in the webview console, so a host and page that drift apart read as a discard. Only a
-      // kind this page declares is named; any other is message text, and a discard echoes none of it.
-      console.warn('MessageFoundry ' + panel + ': discarded a malformed ' +
-        (known ? '"' + k + '" message' : 'message of an unknown kind'));
+      // Said in the webview console, so a host and page that drift apart read as a discard. One fixed
+      // phrase per panel: the panel name is the page's own constant, and no part of the text depends on the
+      // message, not even its kind, so a message cannot choose what is printed (BACKLOG #1123).
+      console.warn('MessageFoundry ' + panel + ': discarded a malformed message');
       return false;
     }`;
 
