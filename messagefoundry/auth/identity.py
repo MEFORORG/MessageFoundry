@@ -13,6 +13,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 
+from messagefoundry.auth import permissions as _permissions
 from messagefoundry.auth.permissions import Permission, Role, permissions_for_roles
 
 
@@ -110,9 +111,23 @@ class Identity:
         custom-role overlay (ADR 0045): a user's effective set is *built-in-role ∪ custom-role*
         permissions. The flat ``permissions`` set is what every authorization check consults, so where
         a permission came from is invisible downstream.
+
+        **Built from whole roles (vault BACKLOG #3474).** ``extra_permissions`` must be the union of
+        whole custom roles, each one role's full set, never a part of one: the minting rule that a
+        ``messages:view_raw`` role also holds ``messages:view_summary`` is judged per role
+        (:func:`~messagefoundry.auth.permissions.raw_body_without_summary`), and an identity built
+        from whole roles therefore never holds the first without the second. A set that does is
+        refused here with ``ValueError``, because it can only come from a caller that passed part of
+        a role. ``tests/test_identity_whole_roles.py`` pins the callers. The predicate is read off its
+        module at each call, so ``tests/_role_pairing.py`` lifts this check with the other two.
         """
         role_set = frozenset(roles)
         permissions = permissions_for_roles(role_set) | frozenset(extra_permissions)
+        if _permissions.raw_body_without_summary(permissions):
+            raise ValueError(
+                "an identity holding messages:view_raw without messages:view_summary was not built "
+                "from whole roles"
+            )
         return cls(
             user_id=user_id,
             username=username,

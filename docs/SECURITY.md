@@ -1320,8 +1320,11 @@ replacement:
   each custom role's decoded set. `Identity.build` has at least three callers, two in
   `AuthService` and the embedder's system identity in `api/security.py`, and each passes whole
   roles. While that holds and no role has the shape, no merged identity has it either.
-  `Identity.build` itself does not check this and no test pins its callers, so a caller that
-  hands it a narrowed permission set would break the premise. A rule on the merged identity
+  `Identity.build` refuses, with `ValueError`, a built set holding `view_raw` without
+  `view_summary`, which whole roles cannot produce, and `tests/test_identity_whole_roles.py` pins
+  its callers to whole roles (vault BACKLOG #3474). The check reads the one consequence of the
+  premise that this rule needs; it cannot tell a narrowed set that happens to stay coherent from a
+  whole one. A rule on the merged identity
   would need a check wherever a role reaches a user, at least each role assignment and each
   directory group mapping. `raw_body_without_summary` in
   [`auth/permissions.py`](../messagefoundry/auth/permissions.py) is the one predicate, and
