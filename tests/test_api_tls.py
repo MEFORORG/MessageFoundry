@@ -787,6 +787,67 @@ def test_trusted_proxies_refuses_a_zoned_host_uvicorn_parses_and_never_matches(
     ApiSettings(trusted_proxies=[peer], tls_terminated_upstream=True)
 
 
+def test_a_zoned_hop_misses_the_zoneless_host_entry_and_becomes_the_client() -> None:
+    """BACKLOG #3764 item 1: the gap the refusal's advice leaves, pinned as the trusted_proxies row
+    of docs/CONFIGURATION.md states it. uvicorn compares a host entry's zone, so a hop an inner
+    proxy writes WITH its zone misses the zoneless host the refusal recommends and becomes the
+    client address.
+
+    The one-address network ``fe80::1/128`` loads and does match the zoned hop, on any zone. That is
+    pinned here as a measurement only: whether to advise it is an open question, since the zoned
+    network refusal names trusting an address on every interface as its reason."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    from messagefoundry.config.settings import uvicorn_trusted_hosts
+
+    hosts = _TrustedHosts(uvicorn_trusted_hosts(["10.0.0.9", "fe80::1"]))
+    assert hosts.get_trusted_client_address("203.0.113.5, fe80::1%eth0") == ("fe80::1%eth0", 0)
+    # Control: the same hop written without its zone is trusted, so the real client resolves.
+    assert hosts.get_trusted_client_address("203.0.113.5, fe80::1") == ("203.0.113.5", 0)
+
+    network = _TrustedHosts(uvicorn_trusted_hosts(["fe80::1/128"]))
+    for hop in ("fe80::1%eth0", "fe80::1%eth9", "fe80::1"):
+        assert network.get_trusted_client_address(f"203.0.113.5, {hop}") == ("203.0.113.5", 0)
+    ApiSettings(trusted_proxies=["fe80::1/128"], tls_terminated_upstream=True)
+
+
+#: The caveat both refusal paths add after their zoneless advice, which names no zone.
+_ZONED_HOP_CAVEAT_TEXT = (
+    "A hop an inner proxy writes into X-Forwarded-For with a zone will not match 'fe80::1', and "
+    "becomes the client address; the trusted_proxies row of docs/CONFIGURATION.md says"
+)
+
+
+@pytest.mark.parametrize(
+    ("entry", "advice"),
+    [
+        ("fe80::1%eth0", "List 'fe80::1' instead."),
+        ("fe80::1%eth0/128", "List 'fe80::1' instead."),
+        ("fe80::1%eth0/64", "List the proxy's own address 'fe80::1'."),  # the host-bits path
+        ("fe80::1%eth0\nFORGED LOG LINE/64", "List the proxy's own address 'fe80::1'."),
+    ],
+)
+def test_the_zoned_host_refusal_states_the_gap_its_advice_leaves(entry: str, advice: str) -> None:
+    """BACKLOG #3764 item 1: each refusal that advises a zoneless host says what that leaves open.
+    The caveat names no zone, which ipaddress takes almost unchecked; the entry itself is quoted
+    escaped, so a newline in it never reaches the message raw.
+
+    Mutation: drop ``_ZONED_HOP_CAVEAT`` from either refusal. Red: the caveat assertion."""
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=[entry], tls_terminated_upstream=True)
+    message = str(exc.value)
+    assert advice in message
+    assert _ZONED_HOP_CAVEAT_TEXT in message
+    assert "\nFORGED" not in message
+
+
+def test_a_zoneless_host_bits_refusal_carries_no_zone_caveat() -> None:
+    """The control for the host-bits arm above: a zoneless entry gets no zoned-hop caveat."""
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=["fe80::1/64"], tls_terminated_upstream=True)
+    assert "with a zone will not match" not in str(exc.value)
+
+
 #: A forwarded chain whose last hop, the proxy at 10.0.0.1, a dual-stack proxy behind it wrote in
 #: the IPv4-mapped spelling.
 _MAPPED_XFF = "203.0.113.9, ::ffff:10.0.0.1"
@@ -1172,19 +1233,11 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     # A declared TLS-terminating proxy satisfies the exposed-gate WITHOUT in-process TLS: allowed
     # without --allow-insecure-bind, and uvicorn trusts XFF only from the proxy (no ssl context).
     from messagefoundry.store.crypto import generate_key
-
-    class _Keep(logging.Handler):
-        def __init__(self) -> None:
-            super().__init__(logging.INFO)
-            self.messages: list[str] = []
-
-        def emit(self, record: logging.LogRecord) -> None:
-            self.messages.append(record.getMessage())
+    from tests.test_ambient_proxy_disclosure import _kept
 
     captured: dict[str, Any] = {}
     # On serve's own logger, not caplog: serve's configure_logging replaces the root handlers.
     serve_logger = logging.getLogger("messagefoundry.__main__")
-    kept = _Keep()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
@@ -1200,24 +1253,24 @@ def test_serve_allows_non_loopback_with_upstream_tls(
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",
     )
-    old_level = serve_logger.level
-    serve_logger.addHandler(kept)
-    serve_logger.setLevel(logging.INFO)
-    try:
+    with _kept(serve_logger) as records:
+        serve_logger.setLevel(logging.INFO)
         assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
-    finally:
-        serve_logger.removeHandler(kept)
-        serve_logger.setLevel(old_level)
     assert "refusing to serve" not in capsys.readouterr().err
     # XFF trusted only from the proxy, in both its spellings (BACKLOG #3042).
     assert captured["forwarded_allow_ips"] == ["10.0.0.7", "::ffff:10.0.0.7"]
     assert "ssl_context_factory" not in captured  # TLS is at the proxy, not in-process
-    # The startup line names the CONFIGURED list, not uvicorn's doubled one: logging the
-    # uvicorn_trusted_hosts result raised a CodeQL clear-text-logging alert on PR 2380.
-    proxy_lines = [m for m in kept.messages if "TLS-terminating proxy" in m]
+    # The startup line names the CONFIGURED list, not uvicorn's doubled one. That form is not free
+    # of CodeQL's clear-text-logging query: alert 209 is open on this configured-list argument, as
+    # an alert was raised on the doubled list on PR 2380. Each message is read here, at the end, as
+    # an operator reads it: serve's RedactionFilter, a filter on the root's handlers, rewrites the
+    # record only after this logger's own handler has taken it (BACKLOG #3764 item 15).
+    proxy_lines = [r.getMessage() for r in records if "TLS-terminating proxy" in r.getMessage()]
     assert len(proxy_lines) == 1
     assert "['10.0.0.7']" in proxy_lines[0]
     assert "::ffff:10.0.0.7" not in proxy_lines[0]
+    # BACKLOG #3764 item 7: the line says which entries gain a twin, and claims none for IPv6.
+    assert "an entry inside ::ffff:0:0/96 in its plain IPv4 one" in proxy_lines[0]
 
 
 def test_serve_forwarded_allow_ips_empty_when_no_proxy(
