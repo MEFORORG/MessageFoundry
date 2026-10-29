@@ -203,7 +203,7 @@ def _check_credential_token_url_egress(
             error=WiringError,
         )
         if not _http_egress_allowed(token_url, allowed_http):
-            host = url_host_label(token_url, screened=True)
+            host = url_host_label(token_url)
             log.warning(
                 "egress denied: %s %s host %r not in [egress].allowed_http",
                 label,
@@ -257,12 +257,19 @@ def _check_forward_proxy_egress(
         )
     # A URL urlsplit cannot parse is said to be one, rather than reported as an allowlist miss that
     # no entry could ever clear. Its own ValueError quotes the netloc, so it is never let out.
-    url_scheme(proxy_url, f"{label} proxy_url", use="proxy_user/proxy_password", error=WiringError)
+    try:
+        url_scheme(
+            proxy_url, f"{label} proxy_url", use="proxy_user/proxy_password", error=WiringError
+        )
+    except WiringError:
+        # The same audit entry every other egress refusal writes; it names the connection only.
+        log.warning("egress denied: %s forward proxy URL cannot be parsed", label)
+        raise
     if not _http_egress_allowed(proxy_url, allowed_proxy):
         # The data, token and FhirLookup arms call refuse_url_credentials first, for a refusal that
         # names the setting. This arm cannot, since a proxy may carry its own userinfo, so the label
         # is what keeps its message clean (BACKLOG #1793, #2686).
-        host = url_host_label(proxy_url, screened=False)
+        host = url_host_label(proxy_url)
         log.warning(
             "egress denied: %s forward proxy host %r not in [egress].allowed_proxy", label, host
         )
@@ -304,7 +311,7 @@ def check_fhir_lookup_allowed(
         if not _http_egress_allowed(
             url, egress.allowed_http
         ):  # same host[:port] matching as the FHIR outbound
-            host = url_host_label(url, screened=True)
+            host = url_host_label(url)
             log.warning(
                 "connect denied: FhirLookup %r host %r not in [egress].allowed_http", name, host
             )
@@ -479,7 +486,7 @@ def check_egress_allowed(
         url = str(dest.settings.get("url", ""))
         refuse_url_credentials(url, f"outbound {dest.name!r} 'url'", error=WiringError)
         if not _http_egress_allowed(url, egress.allowed_http):
-            host = url_host_label(url, screened=True)
+            host = url_host_label(url)
             log.warning(
                 "egress denied: outbound %r %s host %r not in [egress].allowed_http",
                 dest.name,

@@ -668,13 +668,57 @@ def test_the_proxy_egress_label_withholds_a_host_that_hides_its_port(
         f"http://svc:4821/{SECRET}@proxy.example.invalid:3128",  # the username, port read as 4821
     ):
         dest = _dest(ConnectorType.REST, "https://endpoint.example.invalid/x", proxy_url=proxy)
+        caplog.clear()
         with caplog.at_level(logging.DEBUG), pytest.raises(WiringError) as exc:
             check_egress_allowed(dest, egress)
         _no_secret(str(exc.value))
         assert "svc" not in str(exc.value), str(exc.value)
         assert "withheld" in str(exc.value)
-    assert "egress denied" in caplog.text  # the warning was captured, so its check means something
-    _no_secret(caplog.text)
+        assert "egress denied" in caplog.text  # captured, so the absence check means something
+        _no_secret(caplog.text)
+        assert "svc" not in caplog.text, caplog.text
+
+
+#: Shapes ``refuse_url_credentials`` PASSES whose ``hostname`` is still a username or a token head:
+#: an ``@`` with no port, and one in a query after a real path. Each maps to that head.
+_PASSING_USERINFO_HEADS = {
+    "token_head_no_port": ("https://Tok9Head/RestOfToken@endpoint.example.invalid/x", "tok9head"),
+    "query_after_port": ("https://svc:12/a?b@endpoint.example.invalid/x", "svc"),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_PASSING_USERINFO_HEADS))
+def test_no_allowlist_refusal_prints_the_head_of_a_userinfo_the_screen_passes(
+    shape: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Hold finding on engine PR 2591. A label that trusted the screen printed these heads in the
+    WiringError and the WARNING, and in the AI allowlist refusal. Every arm must withhold them."""
+    url, head = _PASSING_USERINFO_HEADS[shape]
+    refuse_url_credentials(url, "'url'")  # the premise: the construction screen lets it through
+    egress = EgressSettings(allowed_http=["other.example.invalid"])
+    ok = "https://other.example.invalid/x"
+    arms: list[tuple[str, Any]] = [
+        ("data", lambda: check_egress_allowed(_dest(ConnectorType.REST, url), egress)),
+        (
+            "token",
+            lambda: check_egress_allowed(
+                _dest(ConnectorType.REST, ok, oauth2_token_url=url), egress
+            ),
+        ),
+        ("lookup", lambda: check_fhir_lookup_allowed("FL_2686", {"url": url}, egress)),
+    ]
+    for arm, run in arms:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG), pytest.raises(WiringError) as exc:
+            run()
+        assert "withheld" in str(exc.value), (arm, str(exc.value))
+        assert head not in str(exc.value).lower(), (arm, str(exc.value))
+        assert "denied" in caplog.text, arm  # captured, so the absence check means something
+        assert head not in caplog.text.lower(), (arm, caplog.text)
+    with pytest.raises(AiBrokerError) as ai_exc:
+        AiBroker(endpoint=url, api_key="k", allowed_endpoints=["other.example.invalid"])
+    assert "withheld" in str(ai_exc.value), str(ai_exc.value)
+    assert head not in str(ai_exc.value).lower(), str(ai_exc.value)
 
 
 def test_redact_url_never_raises_on_a_url_urlsplit_cannot_parse() -> None:
@@ -682,13 +726,11 @@ def test_redact_url_never_raises_on_a_url_urlsplit_cannot_parse() -> None:
 
 
 def test_the_egress_label_keeps_an_ordinary_host_and_an_ipv6_literal() -> None:
-    """The control half. ``::1`` holds ``:``, so the IPv6 exemption is what keeps it. A screened
-    URL with an ``@`` in its query keeps its host too, so the operator can see what to list."""
+    """The control half. ``::1`` holds ``:``, so the IPv6 exemption is what keeps it."""
     egress = EgressSettings(allowed_http=["other.example.invalid"])
     for url, host in (
         ("https://endpoint.example.invalid:8443/x", "endpoint.example.invalid"),
         ("https://[::1]:8443/x", "::1"),
-        ("https://endpoint.example.invalid/x?who=a@b", "endpoint.example.invalid"),
     ):
         with pytest.raises(WiringError) as exc:
             check_egress_allowed(_dest(ConnectorType.REST, url), egress)
@@ -757,15 +799,25 @@ def test_a_constructor_refuses_an_unparseable_url_before_reading_its_scheme(
     assert exc.value.__cause__ is None
 
 
-def test_the_proxy_egress_arm_refuses_an_unparseable_proxy_without_echoing_it() -> None:
+def test_the_proxy_egress_arm_refuses_an_unparseable_proxy_without_echoing_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The proxy arm has no ``refuse_url_credentials`` in front. It says the URL cannot be parsed,
-    rather than reporting an allowlist miss that no entry could clear."""
+    rather than reporting an allowlist miss that no entry could clear, and it still writes the
+    ``egress denied`` WARNING every other egress refusal writes (hold finding on engine PR 2591)."""
     egress = EgressSettings(
         allowed_http=["endpoint.example.invalid"], allowed_proxy=["proxy.example.invalid:3128"]
     )
     proxy = _UNPARSEABLE.replace("https://", "http://").replace("endpoint.", "proxy.")
     dest = _dest(ConnectorType.REST, "https://endpoint.example.invalid/x", proxy_url=proxy)
-    with pytest.raises(WiringError, match="proxy_url is not a URL that can be parsed") as exc:
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(WiringError, match="proxy_url is not a URL that can be parsed") as exc,
+    ):
         check_egress_allowed(dest, egress)
     _no_secret(str(exc.value))
     assert exc.value.__context__ is None
+    denied = [r for r in caplog.records if r.getMessage().startswith("egress denied")]
+    assert len(denied) == 1, caplog.text
+    assert denied[0].levelno == logging.WARNING
+    _no_secret(caplog.text)

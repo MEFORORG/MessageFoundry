@@ -569,21 +569,20 @@ _URL_CREDENTIAL_USE = "basic_user/basic_password or bearer_token"
 HOST_WITHHELD = "(withheld: the URL may hold a credential)"
 
 
-def url_host_label(url: str, *, screened: bool) -> str:
+def url_host_label(url: str) -> str:
     """The host a refusal may print for ``url``, or :data:`HOST_WITHHELD` (BACKLOG #1793, #2686).
     Never raises. A host of ``""`` prints as ``""``.
 
-    ``screened`` says :func:`refuse_url_credentials` has already passed ``url``. Then only a host
-    that hides a userinfo is withheld, so an allowlist refusal for a URL with an email in its
-    query still names the host the operator must list. Unscreened, as a ``proxy_url`` always is,
-    the host is withheld wherever :func:`_redact_url` would withhold it: an ``@`` after the
-    authority may end a userinfo, and the host printed would be its username."""
+    Withheld wherever :func:`_redact_url` would withhold it, whether or not
+    :func:`refuse_url_credentials` has passed ``url``. That screen lets an ``@`` with no port, or
+    one in a query after a real path, through: ``https://TOKENHEAD/TAIL@host`` and
+    ``https://svc:12/a?b@host`` both pass it, and their ``hostname`` is the username or token
+    head. So any ``@`` after the authority withholds the host, an email in a query included."""
     try:
         p = urllib.parse.urlsplit(url)
     except ValueError:
         return HOST_WITHHELD
-    withhold = _host_hides_userinfo(p) if screened else _withholds_host(p)
-    return HOST_WITHHELD if withhold else (p.hostname or "")
+    return HOST_WITHHELD if _withholds_host(p) else (p.hostname or "")
 
 
 def refuse_url_credentials(
