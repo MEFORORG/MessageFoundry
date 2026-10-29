@@ -1069,12 +1069,16 @@ def _reload_refusal(identity: Identity) -> str | None:
 
 
 def _purge_hold_params(name: str, scope: str, requester: str) -> dict[str, Any]:
-    """What a held purge captures. The route's guard and its proof-free rejoin both read it, and a
-    repeat is recognised only when the two are identical (vault BACKLOG #2625 with #2445).
+    """What a held purge captures. The route's guard and both its rejoins read it. A repeat is
+    recognised when the two are identical (vault BACKLOG #2625 with #2445), or differ only in
+    ``requester``, by the rejoins.
 
     ``requester`` is the display name the released purge's ``connection_purge`` row is attributed
     to (vault BACKLOG #3217), the way the replay and reload holds carry theirs: the executor sees
-    only these params."""
+    only these params. The route's proof-free rejoin passes ``requester_name="any"`` and the
+    core's passes ``"renamed"``, so a renamed requester's repeat joins the hold they already have
+    (BACKLOG #3740 item 9). The default, ``"same"``, would not. The replay and reload holds do not
+    pass it, so a rename still gives those a second hold."""
     return {"name": name, "scope": scope, "requester": requester}
 
 
@@ -5424,13 +5428,16 @@ def create_app(
         operation: str,
         params: dict[str, Any],
         identity: Identity,
+        *,
+        requester_name: Literal["same", "any", "renamed"] = "same",
     ) -> str | None:
-        """The caller's open hold for this exact request, answered with no proof, or ``None``.
+        """The caller's open hold for this request, answered with no proof, or ``None``.
 
         For the two ``proof_in_route`` routes (vault BACKLOG #2625). A rejoin holds and runs nothing,
         so it spends no proof, even one the request brought. It does need a live session window,
         as the org opt-out asks of every request, so a session whose window has lapsed goes to the
-        proof instead. ``None`` sends the route on to its spend and its guard."""
+        proof instead. ``None`` sends the route on to its spend and its guard.
+        ``requester_name`` is :meth:`ApprovalGate.rejoin`'s."""
         if gate is None or not await step_up_window_live(request):
             return None
         return await gate.rejoin(
@@ -5439,6 +5446,7 @@ def create_app(
             requester=identity.username,
             requester_user_id=identity.user_id,
             client=client_ip(request),
+            requester_name=requester_name,
         )
 
     @app.post("/connections/{name}/purge", response_model=PurgeResult | PendingApprovalResponse)
@@ -5472,6 +5480,7 @@ def create_app(
                 "connection_purge",
                 _purge_hold_params(name, scope, identity.username),
                 identity,
+                requester_name="any",
             )
             if held is not None:
                 return _held_reply(response, held, "connection_purge")
@@ -5513,9 +5522,22 @@ def create_app(
         if (
             gate is not None
         ):  # dual-control: hold for a second approver when [approvals] gates purge
-            pending = await gate.guard(
+            params = _purge_hold_params(name, scope, identity.username)
+            # BACKLOG #3740 item 9: the guard matches the params text, which carries the display
+            # name, so a renamed requester's repeat is joined here first, on the immutable id.
+            # Only a renamed one: an exact repeat goes to the guard, whose serialized step never
+            # joins a request settled since. Nothing is filed here, so a hold settled before this
+            # read gets a new one from the guard, under the current name.
+            pending = await gate.rejoin(
                 "connection_purge",
-                _purge_hold_params(name, scope, identity.username),
+                params,
+                requester=identity.username,
+                requester_user_id=identity.user_id,
+                client=client_ip(request),
+                requester_name="renamed",
+            ) or await gate.guard(
+                "connection_purge",
+                params,
                 requester=identity.username,
                 requester_user_id=identity.user_id,
                 client=client_ip(request),
