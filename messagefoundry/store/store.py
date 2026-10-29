@@ -4186,9 +4186,11 @@ def read_bounded_utf8_lines(path: str | Path, max_bytes: int, *, too_large: str)
         data = fh.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise OSError(too_large)
-    # Split on newlines only: ``str.splitlines`` also breaks on form feed, NEL, U+2028 and more,
-    # so a stray one would shift every line number a refusal names.
-    lines = [line.removesuffix("\r") for line in data.decode("utf-8-sig").split("\n")]
+    # Universal newlines only (CRLF, CR, LF): ``str.splitlines`` also breaks on form feed, NEL,
+    # U+2028 and more, so a stray one shifted every line number a refusal names. A bare CR still
+    # ends a line, so an HL7 message (CR-terminated segments) mispointed at the anchor reader
+    # yields its MSH segment alone, and that is all a refusal can quote back.
+    lines = re.split(r"\r\n|\r|\n", data.decode("utf-8-sig"))
     if lines and not lines[-1]:
         lines.pop()  # the final newline ends the last line; it does not start another
     return lines

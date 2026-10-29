@@ -273,21 +273,27 @@ def test_space_either_side_of_the_colon_reads_alike() -> None:
 def test_a_refusal_names_the_line_a_text_editor_shows(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``str.splitlines`` also breaks on form feed and NEL, so a stray one in an earlier line moved
-    the line number a refusal names. Only a newline ends a line now; CRLF still reads as one."""
+    """``str.splitlines`` also breaks on form feed, NEL and U+2028, so a stray one in an earlier
+    line moved the line number a refusal names. Only CRLF, CR and LF end a line now, as in an
+    editor. The stray characters trail a valid pair, which reads as valid since the hash is
+    stripped, and the refused line comes after it."""
     db = tmp_path / "l.db"
     pairs = _seed(db, 2)
     rows = tmp_path / "rows.txt"
     good = [f"{s}:{h}" for s, h in pairs]
     rows.write_bytes(
-        (good[0] + "\r\n" + good[1] + "\r\n" + "x\x0cy\x85z\r\n" + "BADLINE\r\n").encode("utf-8")
+        (good[0] + "\r\n" + good[1] + "\x0c\x85\u2028" + "\r" + "BADLINE\n").encode("utf-8")
     )
     assert main(["audit-verify", "--db", str(db), "--expected-rows-file", str(rows)]) == 2
     err = capsys.readouterr().err
     assert "line 3" in err, err
-    assert store_mod.read_bounded_utf8_lines(rows, 1 << 20, too_large="x") == [
-        good[0],
-        good[1],
-        "x\x0cy\x85z",
-        "BADLINE",
-    ]
+    lines = store_mod.read_bounded_utf8_lines(rows, 1 << 20, too_large="x")
+    assert lines == [good[0], good[1] + "\x0c\x85\u2028", "BADLINE"]
+
+
+def test_a_bare_cr_still_ends_the_first_anchor_line(tmp_path: Path) -> None:
+    """An anchor file mispointed at an HL7 message, whose segments end in a bare CR, must yield
+    the first segment alone, so a refusal quoting it back carries no PID segment."""
+    path = tmp_path / "msg.hl7"
+    path.write_bytes(b"MSH|A|B\rPID|1||SYNTHETIC^PERSON\r")
+    assert store_mod.read_audit_anchor_file(path) == "MSH|A|B"
