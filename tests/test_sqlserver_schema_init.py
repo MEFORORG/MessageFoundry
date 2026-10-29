@@ -394,27 +394,36 @@ async def test_the_double_check_under_the_applock_is_lock_bounded_and_reset() ->
 async def test_a_lock_timeout_on_the_double_check_names_the_setting_rolls_back_and_resets() -> None:
     """A 1222 on the double-check's read becomes the store's own error naming
     ``[store].schema_lock_timeout``; the transaction rolls back, nothing is committed, and
-    LOCK_TIMEOUT is reset after the rollback."""
-    failure = RuntimeError("Lock request time out period exceeded. (1222) (SQLExecDirectW)")
-    executed: list[tuple[str, object]] = []
-    conn = _FakeConn(executed)
-    conn.cursor_obj = _PeerAppliesCursor(executed)
-    conn.cursor_obj.failure = failure
-    _record_txn_ends(conn, executed)
-    store = _make_store(conn)
-    store._settings = _settings(command_timeout=30, schema_lock_timeout=45)  # type: ignore[assignment]
+    LOCK_TIMEOUT is reset after the rollback. Control: another driver error on the same read
+    propagates unchanged, rolls back and resets the same way."""
+    lock_error = RuntimeError("Lock request time out period exceeded. (1222) (SQLExecDirectW)")
+    other_error = RuntimeError("('08S01', 'Communication link failure (10054)')")
+    for failure, expected in ((lock_error, SchemaDdlLockTimeout), (other_error, RuntimeError)):
+        executed: list[tuple[str, object]] = []
+        conn = _FakeConn(executed)
+        conn.cursor_obj = _PeerAppliesCursor(executed)
+        conn.cursor_obj.failure = failure
+        _record_txn_ends(conn, executed)
+        store = _make_store(conn)
+        store._settings = _settings(command_timeout=30, schema_lock_timeout=45)  # type: ignore[assignment]
 
-    with pytest.raises(SchemaDdlLockTimeout) as info:
-        await store._ensure_schema()
+        with pytest.raises(RuntimeError) as info:
+            await store._ensure_schema()
 
-    assert info.value.__cause__ is failure
-    assert "[store].schema_lock_timeout" in str(info.value)
-    sqls = [sql for sql, _ in executed]
-    assert conn.committed == 0
-    assert not any("CREATE TABLE" in sql for sql in sqls)
-    first_rollback = sqls.index("ROLLBACK")
-    assert sqls[first_rollback + 1 :] == ["SET LOCK_TIMEOUT -1", "ROLLBACK"]
-    assert conn._conn.timeout == 30
+        assert type(info.value) is expected
+        if expected is SchemaDdlLockTimeout:
+            assert info.value.__cause__ is failure
+            message = str(info.value)
+            assert "schema_meta marker" in message
+            assert "[store].schema_lock_timeout" in message
+        else:
+            assert info.value is failure
+        sqls = [sql for sql, _ in executed]
+        assert conn.committed == 0
+        assert not any("CREATE TABLE" in sql for sql in sqls)
+        first_rollback = sqls.index("ROLLBACK")
+        assert sqls[first_rollback + 1 :] == ["SET LOCK_TIMEOUT -1", "ROLLBACK"]
+        assert conn._conn.timeout == 30
 
 
 class _DdlFailingCursor(_FakeCursor):

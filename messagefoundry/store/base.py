@@ -3373,18 +3373,22 @@ class SchemaDdlLockTimeout(SchemaLockTimeout):
     it, a ``CREATE INDEX`` or ``ALTER`` queued behind any open transaction on a store table waits
     forever while holding the schema lock, and on Postgres its queued lock request also blocks every
     later write to that table. Raised inside the schema transaction, which then rolls back with
-    nothing applied; a later open retries the batch. A subclass, so a caller that handles
-    :class:`SchemaLockTimeout` handles this too."""
+    nothing applied; a later open retries the batch. On SQL Server the same bound also covers the
+    holder's re-read of the ``schema_meta`` marker under the lock, so this is raised when that read
+    waits it out too. A subclass, so a caller that handles :class:`SchemaLockTimeout` handles this
+    too."""
 
     def _message(self) -> str:
         # On Postgres a stricter role or database lock_timeout is kept, so it may be what fired.
-        stricter = (
-            " (or the role's or database's own lock_timeout, if that is stricter)"
-            if self.backend is StoreBackend.POSTGRES
-            else ""
-        )
+        # On SQL Server the marker re-read under the lock shares the bound.
+        if self.backend is StoreBackend.POSTGRES:
+            statement = "a DDL statement"
+            stricter = " (or the role's or database's own lock_timeout, if that is stricter)"
+        else:
+            statement = "a DDL statement, or the re-read of the schema_meta marker,"
+            stricter = ""
         return (
-            f"{self.backend.value}: holding the schema lock {self.lock!r}, a DDL statement did not "
+            f"{self.backend.value}: holding the schema lock {self.lock!r}, {statement} did not "
             f"get its table lock within {self.timeout:.15g} s{stricter}; an open transaction on a "
             "store table, from another engine shard, cluster node or session, may be blocking it. "
             "Nothing was applied. Start again once that transaction ends, or raise "

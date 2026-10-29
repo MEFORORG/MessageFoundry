@@ -4670,11 +4670,13 @@ class SqlServerStore:
                     except _ApplockTimeout as exc:
                         raise SchemaLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
                     # The HOLDER's own lock waits are bounded too (BACKLOG #1726). The cursor has
-                    # no query timeout and the session's LOCK_TIMEOUT is -1, so without this the
-                    # double-check's read of schema_meta, or a CREATE INDEX or ALTER, queued behind
-                    # any open transaction on its table waits forever while holding the schema lock,
-                    # and cancelling the open cannot interrupt the driver thread. So the bound is set
-                    # as soon as the applock is held, BEFORE the double-check. LOCK_TIMEOUT bounds
+                    # no query timeout and the session's LOCK_TIMEOUT is -1, so without this a
+                    # CREATE INDEX or ALTER queued behind any open transaction on its table waits
+                    # forever while holding the schema lock, and so does the double-check's read of
+                    # schema_meta behind a session holding Sch-M on it (or, with RCSI off, any
+                    # writer); cancelling the open cannot interrupt the driver thread. So the bound
+                    # is set as soon as the applock is held, BEFORE the double-check. It bounds lock
+                    # waits only: the double-check's other waits stay unbounded. LOCK_TIMEOUT bounds
                     # only the wait for each lock, never how long a build runs once it has it. It is
                     # SESSION-scoped and survives the commit, so it is reset before the pooled
                     # connection is released: inside the transaction before the commit, on both the
