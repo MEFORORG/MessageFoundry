@@ -204,8 +204,7 @@ def test_the_check_agrees_with_requests_own_reads(form: str) -> None:
     own reads, or gets as far as the dial and gets a ``ConnectionError``. Not every shape agrees: a
     URL with no host fails requests' host check, whose error is fixed text, and passes the check.
     Mutation: drop the Latin-1 encode from the check; red on the last unsendable row. Drop the raw
-    ``urlsplit``; red on the first. requests reads that URL with the params-splitting parser,
-    so this row is also what pins that the two raise alike. Read on requests 2.34.2; a requests that reads these URLs
+    ``urlsplit``; red on the first, the only row where that read decides. Read on requests 2.34.2; a requests that reads these URLs
     differently goes red here rather than leaving the check out of step."""
     import requests
 
@@ -315,3 +314,20 @@ def test_request_url_refuses_it_on_its_own() -> None:
         _adapter().request_url(prepared, {"https": _UNSENDABLE[0].format(port=3128)})
     assert str(caught.value) == f"Vault test hop: {_UNSENDABLE_PROXY_URL}"
     assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+def test_the_check_leaves_no_proxy_url_in_the_url_parser_cache() -> None:
+    """The check reads the raw URL with ``urlsplit`` minus its ``lru_cache``, so a refused proxy's
+    password is not kept process-wide. RED with the public, cached ``urlsplit`` in its place: the
+    refused URL is then a cache key. Skipped where the interpreter does not cache ``urlsplit``."""
+    import urllib.parse
+
+    from messagefoundry.transports.strict_requests import _proxy_url_requests_cannot_send
+
+    cache_info = getattr(urllib.parse.urlsplit, "cache_info", None)
+    if cache_info is None:
+        pytest.skip("urllib.parse.urlsplit is not cached on this interpreter")
+    proxy = _UNSENDABLE[3].format(port=3128)  # passes urlsplit, refused by the Latin-1 encode
+    urllib.parse.urlsplit.cache_clear()  # type: ignore[attr-defined]
+    assert _proxy_url_requests_cannot_send(proxy) is True
+    assert cache_info().currsize == 0, "the check put the proxy URL in urlsplit's cache"
