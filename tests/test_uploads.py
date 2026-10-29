@@ -877,7 +877,7 @@ class _RecordingLedger:
     ) -> bool:
         return True
 
-    async def release_upload_quota(self, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         self.metas_at_release.append(len(list(self.root.glob("*.meta"))))
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
@@ -1042,10 +1042,12 @@ async def test_a_cancel_in_the_reservation_release_still_removes_the_landed_file
     releasing, finish = asyncio.Event(), asyncio.Event()
 
     class _SlowReleaseLedger(_RecordingLedger):
-        async def release_upload_quota(self, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             releasing.set()
             await finish.wait()
-            await super().release_upload_quota(reservation_id)
+            await super().release_upload_quota(
+                uploader_id=uploader_id, reservation_id=reservation_id
+            )
 
     ledger = _SlowReleaseLedger(root)
     store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
@@ -1107,10 +1109,12 @@ class _GatedLedger:
             await self._pause()
         return applied
 
-    async def release_upload_quota(self, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         if self.hold == "release":
             await self._pause()
-        await self.store.release_upload_quota(reservation_id)
+        await self.store.release_upload_quota(
+            uploader_id=uploader_id, reservation_id=reservation_id
+        )
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
         await self.store.touch_upload_quota(reservation_id)
