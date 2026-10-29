@@ -134,7 +134,8 @@ DEFAULT_CLAIM_OWNER = "engine"
 
 #: How many open requests :meth:`ApprovalGate.rejoin` reads, newest first. A repeat whose request
 #: sits further back is not found there and falls through to the proof and :meth:`ApprovalGate.guard`,
-#: whose own repeat rule still joins it; only the proof-free path is lost.
+#: whose own repeat rule still joins it; only the proof-free path is lost. A renamed requester's
+#: repeat matched only through ``any_requester_name`` is not joined there, and files a second request.
 REJOIN_SCAN_LIMIT = 1000
 
 #: Faults :meth:`ApprovalGate._read` raises as they are, because they name a defect in the read
@@ -860,6 +861,7 @@ class ApprovalGate:
         requester: str,
         requester_user_id: str,
         client: str | None = None,
+        any_requester_name: bool = False,
     ) -> str | None:
         """Point a repeat at the requester's OPEN request, filing nothing (vault BACKLOG #2625).
 
@@ -878,10 +880,39 @@ class ApprovalGate:
         **The read and the audit row are two steps, not one.** A request approved, rejected or
         expired between them is still named in the 202. Nothing new runs or is held because of it.
         The read also covers only the newest :data:`REJOIN_SCAN_LIMIT` open requests; past that, the
-        repeat needs a proof, and :meth:`guard` then joins it."""
+        repeat needs a proof, and :meth:`guard` then joins it.
+
+        **``any_requester_name`` also matches a request whose params differ only in the
+        ``requester`` display name** (BACKLOG #3740 item 9). An operation whose params carry that
+        name, as the executors need, would otherwise give a renamed requester a second request for
+        the same action, because :meth:`guard` matches the params text. The match is still keyed on
+        ``requester_user_id``, so a new holder of a freed name never joins the old holder's request,
+        and only a request whose params name a requester counts. The joined request keeps the name
+        it was filed under, which is what the approver sees and what its executor records. A caller
+        that runs this before :meth:`guard` files nothing under an earlier name: a request settled
+        in between is not found, and :meth:`guard` then files one under the current name. Past the
+        scan limit a renamed repeat is not found here, and :meth:`guard` files a second request."""
         if not self.gates(operation) or not requester_user_id:
             return None
-        wanted = json.dumps(dict(params), sort_keys=True)
+        given = dict(params)
+        wanted = json.dumps(given, sort_keys=True)
+        unnamed = {k: v for k, v in given.items() if k != "requester"}
+
+        def _same(raw: Any) -> bool:
+            if str(raw) == wanted:
+                return True
+            if not any_requester_name:
+                return False
+            # Parsed silently: a row that is not a JSON object matches nothing, and the queue is
+            # where an unreadable row is reported.
+            held, refusal = json_loads_or_refusal(str(raw))
+            return (
+                refusal is None
+                and isinstance(held, dict)
+                and named_requester(held) is not None
+                and {k: v for k, v in held.items() if k != "requester"} == unnamed
+            )
+
         # Matched first and checked after, so the seal check runs on the one or two rows that match
         # rather than on the whole scan.
         matches = await self._verified_rows(
@@ -890,8 +921,8 @@ class ApprovalGate:
                 now=self._clock(), limit=REJOIN_SCAN_LIMIT
             )
             if str(r["operation"]) == operation
-            and str(r["params"]) == wanted
             and str(r["requester_user_id"] or "") == requester_user_id
+            and _same(r["params"])
         )
         if not matches:
             return None
@@ -914,58 +945,12 @@ class ApprovalGate:
             self._alert_lost_audit(held, "approval.request_repeated")
             raise
         log.info(
-            "approval %s: a repeat %s request by %s rejoined it before its step-up; nothing new is "
-            "held",
+            "approval %s: a repeat %s request by %s rejoined it; nothing new is held",
             held,
             operation,
             scrub_log_argument(requester),
         )
         return held
-
-    async def open_request_params(
-        self, operation: str, params: Mapping[str, Any], *, requester_user_id: str
-    ) -> dict[str, Any]:
-        """``params`` as the requester's own OPEN request for ``operation`` captured them, where
-        that request differs from ``params`` in nothing but the ``requester`` display name, oldest
-        first; otherwise ``params`` as given (BACKLOG #3740 item 9).
-
-        :meth:`guard` and :meth:`rejoin` match a repeat on identical params and the same
-        ``requester_user_id``. Params that carry the display name, as the executors need, would
-        then make a renamed requester's repeat a second request rather than a repeat. A caller
-        passes its params through here first, so the repeat names the request the person already
-        has. The match is still keyed on the immutable id, so a new holder of a freed name never
-        joins the old holder's request. The joined request keeps the name it was filed under, which
-        is the name the approver sees and the released row is attributed to.
-
-        Only a match that names a requester counts, so a repeat never adopts params an executor
-        would refuse. The read and the caller's guard are two steps: a request settled between them
-        leaves the caller filing a new one under the earlier name, of the same person. Reads the
-        newest :data:`REJOIN_SCAN_LIMIT` open requests, as :meth:`rejoin` does. A failed read is
-        an :class:`ApprovalError` 503, and nothing has been held."""
-        given = dict(params)
-        if not self.gates(operation) or not requester_user_id:
-            return given
-
-        def _unnamed(p: Mapping[str, Any]) -> dict[str, Any]:
-            return {k: v for k, v in p.items() if k != "requester"}
-
-        wanted = _unnamed(given)
-        # Filtered on the id first, so the seal check runs only on this requester's rows.
-        mine = await self._verified_rows(
-            r
-            for r in await self._read(
-                self._store.list_pending_approvals(now=self._clock(), limit=REJOIN_SCAN_LIMIT),
-                what="the open approval requests",
-            )
-            if str(r["operation"]) == operation
-            and str(r["requester_user_id"] or "") == requester_user_id
-        )
-        same: list[tuple[float, dict[str, Any]]] = []
-        for r in mine:
-            held = _stored_params(r.id, r.params, throttle=self._unreadable_params_reported)
-            if held is not None and named_requester(held) is not None and _unnamed(held) == wanted:
-                same.append((r.requested_at, held))
-        return min(same, key=lambda each: each[0])[1] if same else given
 
     async def list_pending(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
         """Requests awaiting a second approver: ``pending`` and unexpired. ``caller_user_id`` marks

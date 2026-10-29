@@ -23,14 +23,15 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
 
+from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app
-from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_CONFIG_RELOAD,
     STEP_UP_ACTION_CONNECTION_PURGE,
@@ -208,10 +209,6 @@ async def test_a_repeated_purge_rejoins_its_hold_without_a_new_proof(
         assert await _repeat_rows(engine) == 2
 
 
-async def _no_rejoin(*_args: object, **_kwargs: object) -> None:
-    return None
-
-
 async def test_a_renamed_requesters_repeated_purge_joins_their_one_hold(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -255,9 +252,15 @@ async def test_a_renamed_requesters_repeated_purge_joins_their_one_hold(
         new_op_hold = str(theirs.json()["approval_id"])
         assert new_op_hold != held
 
-        # The guard's own repeat rule, reached past the rejoin (a lapsed window, a race, the
-        # console), joins op2's hold too. Unfixed, it filed a second one.
-        monkeypatch.setattr(ApprovalGate, "rejoin", _no_rejoin)
+        # The same purge at another scope is a different request, rename or not.
+        top = await c.post("/connections/OB/purge?scope=top", headers=_auth(token))
+        assert _refused_for(top, action), top.text
+        assert await _pending_ids(c, admin) == sorted([held, new_op_hold])
+
+        # Past the route's proof-free rejoin (here a lapsed window; also the console, which
+        # demands a proof every time), the core still joins op2's hold. Unfixed, the guard
+        # filed a second one.
+        monkeypatch.setattr(app_module, "step_up_window_live", _never)
         token = await _reauth(c, token, action)
         guarded = await c.post("/connections/OB/purge", headers=_auth(token))
         assert guarded.status_code == 202, guarded.text
@@ -271,6 +274,19 @@ async def test_a_renamed_requesters_repeated_purge_joins_their_one_hold(
         assert row["params"] == {"name": "OB", "scope": "all", "requester": "op"}
         repeats = await engine.store.list_audit(action="approval.request_repeated")
         assert sorted(str(r["actor"]) for r in repeats) == ["op2", "op2"]
+
+        # Once that hold is settled, a repeat files a new one under the current name, never
+        # the old one, which by now names someone else.
+        rejected = await c.post(f"/approvals/{held}/reject", headers=_auth(admin))
+        assert rejected.status_code == 200, rejected.text
+        token = await _reauth(c, token, action)
+        fresh = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert fresh.status_code == 202, fresh.text
+        fresh_id = str(fresh.json()["approval_id"])
+        assert fresh_id not in (held, new_op_hold)
+        stored = await engine.store.get_pending_approval(fresh_id)
+        assert stored is not None
+        assert json.loads(str(stored["params"]))["requester"] == "op2"
 
 
 async def test_a_repeated_reload_rejoins_its_hold_without_a_new_proof(engine: Engine) -> None:

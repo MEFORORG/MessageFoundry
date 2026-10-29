@@ -328,7 +328,6 @@ _GATE_READS: dict[str, frozenset[str]] = {
     "list_pending": frozenset({"list_pending_approvals"}),
     "list_interrupted": frozenset({"list_interrupted_approvals"}),
     "rejoin": frozenset({"list_pending_approvals"}),
-    "open_request_params": frozenset({"list_pending_approvals"}),  # BACKLOG #3740 item 9
     "_reconcile": frozenset({"list_executing_approvals"}),
 }
 

@@ -2213,6 +2213,19 @@ The store makes the check and the insert one serialized step on all three backen
 requester always gets a request of their own: the release re-checks the requester's authority, so
 one person's ask must not ride on another person's standing.
 
+**A renamed requester's purge repeat joins their open purge request (BACKLOG #3740 item 9).** The
+captured parameters of all three gated operations include the requester's display name, because
+each release attributes its audit row to that name. On its own, the rule above would treat a repeat
+after a rename as a new request. For a purge, both the route and the console look first for the
+caller's open purge request, matched on the user id and on every parameter except that name. Only
+after that do they reach the store's rule. The joined request keeps the name it was filed under,
+which the approver sees and the release records. That name is a label, not an identity: it may
+since have passed to someone else, whose own requests then show the same name. The self-approval
+refusal and the requester's authority re-check still use the user id. This lookup files nothing. So a request settled before the store's step gets a new request
+under the current name. It reads the newest 1000 open requests, as the lookup below does, and past
+that a renamed requester's purge repeat files a second request. A renamed requester's replay or
+reload repeat still files a second request.
+
 **A repeat of an open purge or reload needs no new step-up proof on the JSON plane (vault BACKLOG
 #2625).** `POST /connections/{name}/purge` and `POST /config/reload` take a single-use proof bound to
 their action, listed under [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753).
