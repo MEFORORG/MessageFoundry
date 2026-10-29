@@ -24,8 +24,8 @@ THREE LAYERS, each tested here, then two sites the construction refusal does not
 5. The ``[egress]`` allowlist, which runs BEFORE connector construction, neither raises with nor
    echoes a credential.
 6. BACKLOG #2686: a constructor that reads the scheme before the credential screen refuses a URL
-   ``urlsplit`` cannot parse without echoing it, and every HTTP-family allowlist refusal withholds
-   a host that may be a userinfo head.
+   ``urlsplit`` cannot parse without echoing it, and the ``[egress]`` HTTP-family and
+   ``[ai].allowed_endpoints`` allowlist refusals withhold a host that may be a userinfo head.
 
 Synthetic values only. Nothing here opens a socket: ``http.client`` raises ``InvalidURL`` before it
 connects.

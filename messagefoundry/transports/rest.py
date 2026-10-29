@@ -529,11 +529,10 @@ def _redact_url(url: str) -> str:
     an unencoded ``/``, ``?`` or ``#`` ends the authority early, so the username is read as the host
     and the password's tail, with the real host, as the path. ``svc:12/ss@host`` and an ``@`` that is
     only an email in a query look the same to a parser, so neither names a host, as ``_peer_label``
-    does in ``config/wiring.py``. The ``@`` is read after unquoting, so ``%40`` counts. A host or
-    port that holds ``@`` once unquoted, or a host that holds ``:``, is withheld too:
-    ``svc%3APW%40host`` is a userinfo urllib unquotes, and ``hostname`` would print it whole; in
-    ``svc:PW%40proxy:3128`` the ``%40`` sits in the port field and ``hostname`` is the username.
-    An IPv6 literal, zone and all, keeps its host.
+    does in ``config/wiring.py``. The ``@`` is read after unquoting, so ``%40`` counts. A host that
+    hides a userinfo is withheld too; :func:`_host_hides_userinfo` names the shapes, the port-field
+    ``%40`` among them. A bracketed host, such as an IPv6 literal with its zone, is exempt from the
+    ``:`` test, though not from the ``@`` one.
 
     A URL ``urlsplit`` cannot parse renders as ``<redacted>`` alone: its ``ValueError`` quotes the
     whole netloc."""
