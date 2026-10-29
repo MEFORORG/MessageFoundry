@@ -5603,7 +5603,8 @@ class RegistryRunner:
             await self._teardown_unsafe(reason, budget_seconds=budget_seconds)
             if reason is TeardownReason.SHUTDOWN and self._pending_source_stops:
                 # Never orphan a task at loop close. Under DEMOTE we deliberately leave them running —
-                # settling them is start()'s job, at the next promotion.
+                # the next demotion cancels them (_stop_sources_demote); start() does not settle
+                # them.
                 await self._settle_pending_source_stops()
             if had_state:
                 log.info("wiring stopped")  # UNCHANGED string on the SHUTDOWN path
@@ -5734,11 +5735,13 @@ class RegistryRunner:
 
         This runs inside ``_reload_lock``, which ``reload()``, ``stop()``, the per-connection
         start/stop/restart and every ``/connections`` handler also take. An unbounded join would
-        therefore wedge re-promotion, engine shutdown and the connection API for as long as a wedged
+        therefore wedge engine shutdown, and the reload, re-promotion and connection API calls
+        queued behind its lock, for as long as a wedged
         File/Database ``stop()`` runs. (Database waits on its poll task with no timeout of its own;
-        once cancelled, it lets a row's hand-off and mark run for a bounded grace, then cuts and
-        joins the task. File now cancels a poll task blocked on a share call after a grace, BACKLOG
-        #1620, but still waits without a bound while that task is inside a store call.)
+        once cancelled, it lets a row's hand-off and mark run for a bounded grace, which a
+        non-leader skips, then cuts the task and bounds both the join and the pool close. File now
+        cancels a poll task blocked on a share call after a grace, BACKLOG #1620, but still waits
+        without a bound while that task is inside a store call.)
 
         On timeout we cancel and proceed: a failed rebind is isolated per connection (ADR 0031,
         operator-recoverable), whereas refusing to re-promote strands the whole graph — and

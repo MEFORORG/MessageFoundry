@@ -1223,27 +1223,53 @@ At least these, read 2026-10-26:
   until it returns. A retry can therefore overlap it. This is the case the grace exists for.
 - **File.** Bounded by its own `_STOP_GRACE_S` for a blocked share call. When cut, it never cancels
   a poll task that is inside a store call, so the task exits at its next stop check.
-- **Database.** `stop()` joins the poll task with no timeout of its own, through an `asyncio.wait`
-  that a cancel does not forward. A cancel that lands while a row is in its row step, from the
-  handler call (parse, validation and the store commit) through the mark, waits up to
-  `_ROW_STEP_GRACE_S` (2.0 s) for that step: `_stop` is set, so the task marks the row and exits at
-  its next stop check. A cancel anywhere else cuts the task at once, at least in the select, the
-  interval wait, the pool open and the undecodable-row event, where no row step has begun. Either
-  way the task is cut, if still running, and joined, and the pool closed, before the cancel is
-  re-raised, so no poll task outlives a cancelled `stop()`. A committed row is left unmarked, a
-  duplicate, only when its step outlasts that grace or a second cancel to the stop task arrives
-  during it; a second cancel coalesced with the first counts, by the same `cancelling()` baseline
-  the runner uses. That can now happen to several Database stops at once, where the serial loop
-  could do it to one, but only to a step that is hung or whose stop task was cancelled twice; a
-  prompt step is never cut.
+- **Database.** An uncancelled `stop()` joins the poll task with no timeout of its own, through an
+  `asyncio.wait` that a cancel does not forward. A cancel that lands while a row is in its row step,
+  from the handler call (parse, validation and the store commit) through the mark, waits up to
+  `_ROW_STEP_GRACE_S` for that step, but only while this node leads: `_stop` is set, so the task
+  marks the row and exits at its next stop check. A cancel anywhere else cuts the task at once, at
+  least in the select, the interval wait, the pool open and the undecodable-row event, where no row
+  step has begun. So does a second cancel to the stop task, during the grace or coalesced with the
+  first, by the same `cancelling()` baseline the runner uses.
+
+  **On a node that is not the leader the grace ends and the cut is immediate** (decided 2026-10-28
+  on the Lander's hold of PR 2560, as the strictly safer of its two options). The signal is the
+  source's own `leader_gate`, the coordinator's cached `is_leader`, which a demotion clears before
+  the teardown runs. It is read when the cancel lands and again every `_LEADER_RECHECK_S` during
+  the grace, so a demotion during the grace ends it too. The fence is on the cancel path only: an
+  uncancelled DEMOTE stop still lets its in-flight row step finish, as Inc 4 records, and the row
+  loop still checks only `_stop` between rows. A DEMOTE stop abandoned and later cancelled by
+  `_stop_sources_demote` therefore stops waiting on its row step at once. The cut ends the task's
+  awaits only: a store commit or a mark `UPDATE` already running on a driver thread still
+  completes there. A DEMOTE stop still abandoned at engine shutdown is cancelled by
+  `_settle_pending_source_stops`, the only caller of which is the SHUTDOWN `stop()`; it gets the
+  grace only if the node leads then.
+
+  **Every wait after the cancel is bounded.** The cut task is joined for at most
+  `_CUT_JOIN_TIMEOUT_S`, again through an `asyncio.wait`, so a further cancel is not forwarded into
+  the task. The pool is then closed whether or not the task has finished, waiting at most
+  `_POOL_CLOSE_TIMEOUT_S`, with the reference dropped before the wait. A cancelled Database
+  `stop()` therefore returns within the row grace plus those two bounds of the first cancel,
+  behind a driver call hung on a thread too. A task still running stays referenced, and the next
+  `stop()` joins it. Its connections are not leaked if no `stop()` follows, because the pool was closed
+  under it and closes each connection as the task releases it. A cursor close is shielded from a
+  cancel, and its connection is released only once the close has finished
+  (`_close_and_release`), so a cut neither leaves the pool waiting on a connection nobody returns
+  nor hands the next borrower a connection whose cursor close is still running. It waits for the
+  close only: a statement the cancel abandoned on a driver thread is not waited for. A pool close
+  that times out leaves the connections it had not closed yet to the driver. A close failure after
+  a cancel is logged, never raised over the cancel. An uncancelled `stop()` closes the pool with no
+  bound, as before.
+
+  A committed row is left unmarked, a duplicate, when its step outlasts the grace, when a second
+  cancel reaches it, or when the node does not lead. That can now happen to several Database stops
+  at once, where the serial loop could do it to one. A step that finishes inside the grace, on a
+  leader, with one cancel to its stop task, is not cut; no other step is protected.
 
   The runner cuts with one cancel per stop task, so to a Database stop the runner's own second
-  cancel is a first: a row step still gets up to the row grace after it. A cancelled teardown is
-  therefore bounded by the runner grace plus at most one row grace, and a runner second cancel by
-  at most one row grace. The same holds for a DEMOTE stop abandoned and later cancelled by
-  `_settle_pending_source_stops` or `_stop_sources_demote`: its row step may finish, store commit
-  and mark included, up to the row grace after that cancel, where the cancelling `gather` cut it
-  at once. That window is unfenced by this change and is left open for review.
+  cancel is a first: on a leader, a row step still gets up to the row grace after it. A cancelled
+  teardown is therefore bounded by the runner grace plus at most one Database stop's cancel bound,
+  and a runner second cancel by that bound alone.
 
   Not covered, and as before: with an atomic-claim `poll_statement` (`UPDATE ... RETURNING`, a
   status-flag claim), the select itself claims every row it returns, so a cut in the select, or the
@@ -1279,14 +1305,22 @@ the poll task with a cancelling `gather` and the cut left the row committed and 
 row step is cut after the row grace and joined, which turns red if that wait has no timeout. A
 second cancel cuts the row step at once, and so do two coalesced cancels, which turns red without
 the `cancelling()` baseline. The control, a cancelled `stop()` cuts a hung select at
-once after one row was fully handled, turns red if the row-step flag is not reset.
+once after one row was fully handled, turns red if the row-step flag is not reset. These run on
+a fake pool that, as aioodbc's does, closes only once every connection is back, so a skipped
+release hangs the close. Six more turn red on head `9a719f564`: a cancel inside a cursor close
+still releases the connection, once the close has finished; a further cancel while the cut task
+is in its cursor close returns from `stop()` without hanging the pool close; a cut task held by a
+driver call does not hold `stop()`, and its pool is closed; a pool close given a bound keeps it; a
+non-leader cuts the row step at once, with the leader case as its control; and a demotion during
+the grace ends it.
 
 ### Not changed here
 
 At least these were found in review and are left as they were, because the serial loop had them
 too: a stop that fails on every attempt keeps every later `start()` from building the graph; a
 re-raised stop failure skips `stop()`'s settle of a prior demotion's abandoned stops;
-Database, RemoteFile and Timer `stop()` still join their poll task with no bound of their own; and
+an uncancelled Database `stop()`, and RemoteFile and Timer `stop()`, still join their poll task
+with no bound of their own; and
 a stop failure in `start()`'s failed-start unwind replaces the start error, which survives only as
 `__context__`. Also as the serial loop did: when `Engine.stop()`'s own `registry_runner.stop()`
 re-raises a stop failure, nothing retries it, so the drain side is never torn down,

@@ -1149,8 +1149,9 @@ _MARKED_1 = [("UPDATE mf_inbox SET status='DONE' WHERE id=?", (1,))]
 
 
 class _StepCursor(_SrcCursor):
-    """A source cursor that can hold a mark open, or hang every select from the ``hang_from``-th
-    on, so a test can cancel stop() at a chosen point of the poll."""
+    """A source cursor that can hold a mark open, hold the cursor close that follows a mark, or hang
+    every select from the ``hang_from``-th on, so a test can cancel stop() at a chosen point of the
+    poll."""
 
     def __init__(
         self,
@@ -1158,14 +1159,18 @@ class _StepCursor(_SrcCursor):
         rows: list[tuple[Any, ...]],
         *,
         mark_gate: asyncio.Event | None = None,
+        close_gate: asyncio.Event | None = None,
         hang_from: int | None = None,
     ) -> None:
         super().__init__(columns, rows)
         self.mark_gate = mark_gate
+        self.close_gate = close_gate
         self.hang_from = hang_from
         self.selects = 0
         self.in_mark = asyncio.Event()
         self.in_select = asyncio.Event()
+        self.in_close = asyncio.Event()
+        self.marking = False
 
     async def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
         if params is None:
@@ -1173,19 +1178,54 @@ class _StepCursor(_SrcCursor):
             if self.hang_from is not None and self.selects >= self.hang_from:
                 self.in_select.set()
                 await asyncio.Event().wait()
-        elif self.mark_gate is not None:
+        else:
             self.in_mark.set()
-            await self.mark_gate.wait()
+            self.marking = True  # until the close that follows this mark
+            if self.mark_gate is not None:
+                await self.mark_gate.wait()
         await super().execute(sql, params)
+
+    async def close(self) -> None:
+        marking, self.marking = self.marking, False
+        if self.close_gate is not None and marking:
+            self.in_close.set()
+            await self.close_gate.wait()  # a driver close on an executor thread, held
+
+
+class _CountingPool(_SrcPool):
+    """Counts the connections in use and, as aioodbc's ``wait_closed`` does, closes only once every
+    one is back, so a skipped ``release`` hangs the close instead of passing unseen."""
+
+    def __init__(self, conn: _SrcConn) -> None:
+        super().__init__(conn)
+        self.in_use = 0
+        self._all_back = asyncio.Event()
+        self._all_back.set()
+
+    async def acquire(self) -> _SrcConn:
+        self.in_use += 1
+        self._all_back.clear()
+        return self._conn
+
+    async def release(self, conn: _SrcConn) -> None:
+        self.in_use -= 1
+        if self.in_use == 0:
+            self._all_back.set()
+
+    async def wait_closed(self) -> None:
+        await self._all_back.wait()
 
 
 async def _started(
-    cur: _StepCursor, handler: Callable[[bytes], Awaitable[str | None]]
+    cur: _StepCursor,
+    handler: Callable[[bytes], Awaitable[str | None]],
+    *,
+    leader_gate: Callable[[], bool] | None = None,
 ) -> tuple[DatabaseSource, asyncio.Task[None]]:
     src = _src(body_column="payload")
-    src._pool = _SrcPool(_SrcConn(cur))
+    src._pool = _CountingPool(_SrcConn(cur))
     src._poll_seconds = 0.0
-    await src.start(handler)
+    await src.start(handler, leader_gate=leader_gate)
     assert src._task is not None
     return src, src._task
 
@@ -1339,6 +1379,162 @@ async def test_control_a_cancelled_stop_cuts_a_select_at_once(
         await asyncio.wait_for(stop, 5.0)
     assert poll.cancelled()
     assert pool.closed and src._task is None
+
+
+async def test_a_cancel_in_a_cursor_close_still_releases_the_connection() -> None:
+    """BACKLOG #1620: ``_close_cursor`` catches ``Exception`` only, so a cancel that lands in the
+    close used to skip the ``pool.release`` after it, and the pool then waited for that connection
+    forever. The release now waits for the close, which the cancel does not interrupt, so the
+    connection never goes back to the pool busy. Red on head 9a719f564: the connection is still
+    counted in use after the close has finished."""
+    close_gate = asyncio.Event()
+    cur = _StepCursor(["id", "payload"], [], close_gate=close_gate)
+    src = _src(body_column="payload")
+    pool = _CountingPool(_SrcConn(cur))
+    src._pool = pool
+    mark = asyncio.create_task(src._mark({"id": 1, "payload": "AAA"}))
+    await asyncio.wait_for(cur.in_close.wait(), 5.0)
+    mark.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await mark
+    assert pool.in_use == 1  # the close is still running on its driver thread
+    close_gate.set()
+    await asyncio.wait_for(pool.wait_closed(), 5.0)
+    assert pool.in_use == 0
+
+
+async def _noop(raw: bytes) -> str | None:
+    return None
+
+
+async def _cancelled_in_a_held_mark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[DatabaseSource, asyncio.Task[None], _CountingPool, asyncio.Task[None], _StepCursor]:
+    """Start a poll whose mark never returns and whose cursor close is held on ``close_gate``, then
+    cancel stop() once, so the row grace runs out and the cut lands in the mark."""
+    monkeypatch.setattr(database_module, "_ROW_STEP_GRACE_S", 0.05)
+    monkeypatch.setattr(database_module, "_POOL_CLOSE_TIMEOUT_S", 0.05, raising=False)
+    cur = _StepCursor(
+        ["id", "payload"], [(1, "AAA")], mark_gate=asyncio.Event(), close_gate=asyncio.Event()
+    )
+    src, poll = await _started(cur, _noop)
+    pool = src._pool
+    await asyncio.wait_for(cur.in_mark.wait(), 5.0)
+    return src, poll, pool, await _cancelled_stop(src), cur
+
+
+async def test_a_further_cancel_during_the_cut_cannot_hang_the_pool_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel to stop() while the cut poll task is in its cursor close is not forwarded into the
+    task. stop() returns with the task still registered and the pool closed under it; the held
+    connection goes back once its close finishes, and the next stop() joins the task. Red on head
+    9a719f564, whose cancelling ``gather`` forwarded the cancel into the close, skipped the
+    release, and hung in ``wait_closed``."""
+    src, poll, pool, stop, cur = await _cancelled_in_a_held_mark(monkeypatch)
+    assert cur.close_gate is not None
+    await asyncio.wait_for(cur.in_close.wait(), 5.0)  # the grace ran out and the mark was cut
+    stop.cancel()
+    done, _ = await asyncio.wait({stop}, timeout=5.0)  # wait: see the next test
+    assert done and stop.cancelled()
+    assert src._task is poll and not poll.done() and pool.closed and src._pool is None
+    cur.close_gate.set()
+    await asyncio.wait_for(src.stop(), 5.0)
+    assert poll.cancelled() and pool.in_use == 0 and src._task is None
+    assert cur.marks == []
+
+
+async def test_a_cut_task_a_driver_call_holds_does_not_hold_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The join of the cut task is bounded: a cursor close held on a driver thread keeps the task
+    alive past the cut, and stop() still returns, with the pool closed so a source nobody stops
+    again leaks no connection. Red on head 9a719f564: stop() never returns. ``raising=False`` lets
+    the test run, and fail on time, against a head without the bounds."""
+    monkeypatch.setattr(database_module, "_CUT_JOIN_TIMEOUT_S", 0.05, raising=False)
+    src, poll, pool, stop, cur = await _cancelled_in_a_held_mark(monkeypatch)
+    assert cur.close_gate is not None
+    try:
+        # wait, not wait_for: on a head without the bound, wait_for's own cancel of the hung stop
+        # would hang the test instead of failing it.
+        done, _ = await asyncio.wait({stop}, timeout=5.0)
+        assert done, "a cancelled stop() did not return behind a held driver call"
+        assert stop.cancelled()
+        assert src._task is poll and not poll.done() and pool.closed
+    finally:
+        cur.close_gate.set()
+        await asyncio.wait_for(asyncio.gather(poll, return_exceptions=True), 5.0)
+    await asyncio.wait_for(pool.wait_closed(), 5.0)
+    assert pool.in_use == 0
+
+
+async def test_the_pool_close_is_bounded() -> None:
+    """aclose() given a timeout waits for the pool no longer, and drops the pool either way, so a
+    connection a hung driver call holds cannot hold a cancelled stop(). Red on head 9a719f564,
+    whose aclose() takes no bound."""
+    src = _src(body_column="payload")
+    pool = _CountingPool(_SrcConn(_SrcCursor([], [])))
+    src._pool = pool
+    await pool.acquire()  # held, never released
+    await asyncio.wait_for(src.aclose(timeout=0.05), 5.0)
+    assert pool.closed and src._pool is None
+
+
+@pytest.mark.parametrize("leader", [True, False])
+async def test_the_row_grace_is_fenced_on_leadership(
+    monkeypatch: pytest.MonkeyPatch, leader: bool
+) -> None:
+    """ADR 0157: a demoted node must not keep writing to the shared poll table, so a cancelled
+    stop() gives the row step its grace only while this node leads; a non-leader cuts at once. The
+    leader case is the control. Red on head 9a719f564 (leader=False): wait_for times out on the
+    row grace."""
+    monkeypatch.setattr(database_module, "_ROW_STEP_GRACE_S", 60.0)
+    leads = [True]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(raw: bytes) -> str | None:
+        entered.set()
+        await release.wait()  # the durable store commit, in flight
+        return None
+
+    cur = _StepCursor(["id", "payload"], [(1, "AAA")])
+    src, poll = await _started(cur, handler, leader_gate=lambda: leads[0])
+    await asyncio.wait_for(entered.wait(), 5.0)
+    leads[0] = leader  # a demotion clears the cached gate before the teardown runs
+    stop = await _cancelled_stop(src)
+    if leader:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(stop, 5.0)
+    if leader:
+        assert not poll.cancelled() and cur.marks == _MARKED_1
+    else:
+        assert poll.cancelled() and cur.marks == []
+
+
+async def test_a_demotion_during_the_row_grace_ends_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leadership is re-read during the grace, not only when the cancel lands. Mutation: read it
+    once. Red: wait_for times out on the row grace."""
+    monkeypatch.setattr(database_module, "_ROW_STEP_GRACE_S", 60.0)
+    leads = [True]
+    entered = asyncio.Event()
+
+    async def handler(raw: bytes) -> str | None:
+        entered.set()
+        await asyncio.Event().wait()
+        return None
+
+    cur = _StepCursor(["id", "payload"], [(1, "AAA")])
+    src, poll = await _started(cur, handler, leader_gate=lambda: leads[0])
+    await asyncio.wait_for(entered.wait(), 5.0)
+    stop = await _cancelled_stop(src)
+    await asyncio.sleep(0.1)  # inside the grace, still the leader
+    assert not stop.done()
+    leads[0] = False
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(stop, 5.0)
+    assert poll.cancelled() and cur.marks == []
 
 
 @pytest.mark.parametrize("missing", ["server", "database", "poll_statement"])
