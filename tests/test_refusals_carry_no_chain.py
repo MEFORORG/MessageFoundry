@@ -1023,11 +1023,19 @@ _WS_ORIGIN_REFUSALS = [
 ]
 
 
+def _assert_bare_any_case(exc: BaseException) -> None:
+    """``_assert_bare``, and no planted text in any case: urlsplit lower-cases a host, so a parser
+    error over one quotes the planted value in lower case, which ``_holders`` would not see."""
+    _assert_bare(exc)
+    for e in _chain(exc):
+        assert _PLANTED.lower() not in f"{e} {e.args!r}".lower(), type(e).__name__
+
+
 @pytest.mark.parametrize("entry", _WS_ORIGIN_REFUSALS)
 def test_a_refused_ws_origin_keeps_the_entry_off_the_chain(entry: str) -> None:
     with pytest.raises(ValueError, match="ws_allowed_origins entry 1 ") as caught:
         _check_ws_allowed_origin(entry, 1)
-    _assert_bare(caught.value)
+    _assert_bare_any_case(caught.value)
 
 
 @pytest.mark.parametrize("entry", _WS_ORIGIN_REFUSALS)
@@ -1036,12 +1044,11 @@ def test_a_refused_ws_origin_keeps_the_entry_out_of_the_validation_error(entry: 
     error's ``ctx``, so that error's chain is walked too."""
     with pytest.raises(ValidationError) as caught:
         ApiSettings.model_validate({"ws_allowed_origins": [entry]})
-    assert _PLANTED not in str(caught.value)
-    _assert_bare(caught.value)
+    _assert_bare_any_case(caught.value)
     for error in caught.value.errors():
         cause = (error.get("ctx") or {}).get("error")
         assert isinstance(cause, ValueError)
-        _assert_bare(cause)
+        _assert_bare_any_case(cause)
 
 
 def test_a_ws_origin_spelled_as_an_origin_header_still_loads() -> None:

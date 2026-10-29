@@ -152,7 +152,7 @@ def test_ws_allowed_origins_semicolon_list_is_refused_from_the_file(
     )
     with pytest.raises(ValidationError, match="comma-separated") as exc:
         load_settings(config_path=cfg, environ={})
-    assert "entry 1 (counting non-empty entries) holds a ';'" in str(exc.value)
+    assert "entry 1 (the env form skips empty fields) holds a ';'" in str(exc.value)
 
 
 def test_ws_allowed_origins_semicolon_list_is_refused_from_env(
@@ -220,15 +220,22 @@ def test_ws_allowed_origins_ipv4_hint_covers_an_out_of_range_part() -> None:
         ApiSettings.model_validate({"ws_allowed_origins": ["https://256.1.1.1"]})
 
 
-def test_ws_allowed_origins_env_position_counts_non_empty_entries(
+def test_ws_allowed_origins_position_says_the_env_form_skips_empty_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #3764 item 2: the env split drops an empty field, so the refusal says it counts
-    only non-empty entries; here the bad entry is the third field but the second entry."""
+    """BACKLOG #3764 item 2: the env split drops an empty or blank field, so the position says so;
+    here the bad entry is the fourth field but the second entry. The file form keeps an empty
+    string, which is refused at its own index."""
     monkeypatch.chdir(tmp_path)
-    env = {"MEFOR_API_WS_ALLOWED_ORIGINS": "https://ok.example.test,,https://ops.example.test:443"}
-    with pytest.raises(ValidationError, match=re.escape("entry 2 (counting non-empty entries)")):
+    env = {
+        "MEFOR_API_WS_ALLOWED_ORIGINS": "https://ok.example.test,, ,https://ops.example.test:443"
+    }
+    skips = "(the env form skips empty fields)"
+    with pytest.raises(ValidationError, match=re.escape(f"entry 2 {skips}")):
         load_settings(environ=env)
+    file_form = {"ws_allowed_origins": ["https://ok.example.test", "", "https://b.example.test"]}
+    with pytest.raises(ValidationError, match=re.escape(f"entry 2 {skips} is not a bare origin")):
+        ApiSettings.model_validate(file_form)
 
 
 def test_ws_allowed_origins_refuses_userinfo_without_quoting_it() -> None:

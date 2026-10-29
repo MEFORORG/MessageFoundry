@@ -1582,17 +1582,24 @@ def _check_ws_allowed_origin(entry: str, position: int) -> None:
     that serialization already. One that names a real origin in another spelling (case, a trailing
     ``/``, a default port, an IPv6 literal's spelling) is refused with the spelling to list, rather
     than rewritten, so what the file says is what matches. What is refused is listed in
-    docs/CONFIGURATION.md. A refusal names the entry by position and never quotes it: a pasted URL
-    can carry a credential in its userinfo, query or path, and the message reaches the log. For
+    docs/CONFIGURATION.md. A refusal names the entry by position and never quotes it whole: a
+    pasted URL can carry a credential in its userinfo, query or path, and the message reaches the
+    log. Only the other-spelling refusal quotes anything, the scheme, host and port to list. For
     the same reason no refusal is raised inside a handler: the caught parser error quotes the
     entry, and ``from exc`` or ``from None`` would keep it on the chain (BACKLOG #1796)."""
-    # Every entry before this one passed, so none was empty; the env form drops empty fields.
-    field = f"[api].ws_allowed_origins entry {position} (counting non-empty entries)"
+    field = f"[api].ws_allowed_origins entry {position} (the env form skips empty fields)"
     if "@" in entry:
         raise ValueError(f"{field} has an '@'; userinfo is refused: {_WS_ORIGIN_FORM}")
     if any(ch in ";," or ch.isspace() or not ch.isprintable() for ch in entry):
         raise ValueError(
             f"{field} holds a ';', a ',', whitespace or a control character: {_WS_ORIGIN_FORM}"
+        )
+    # Before the split: a fullwidth ':' or '@' fails urlsplit's NFKC check, and would otherwise
+    # read as a bad host or port.
+    if not entry.isascii():
+        raise ValueError(
+            f"{field} has a non-ASCII character; a non-ASCII host takes its xn-- form: "
+            f"{_WS_ORIGIN_FORM}"
         )
     split = _split_origin(entry)
     if split is None:
@@ -1600,9 +1607,6 @@ def _check_ws_allowed_origin(entry: str, position: int) -> None:
     parts, port = split
     scheme = parts.scheme  # urlsplit lowercases the scheme, and .hostname the host
     host = parts.hostname
-    if not entry.isascii():
-        where = "host; list its xn-- form" if host and not host.isascii() else "character"
-        raise ValueError(f"{field} has a non-ASCII {where}: {_WS_ORIGIN_FORM}")
     if (
         scheme not in _DEFAULT_PORTS
         or not host
