@@ -91,6 +91,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import http.client
+import inspect
 import logging
 import re
 import socket
@@ -1026,12 +1027,14 @@ _UNSENDABLE_PROXY_URL = (
 
 
 #: ``urllib.parse.urlsplit`` without its ``lru_cache`` (vault BACKLOG #3454). On CPython 3.14 the
-#: public function is cached, so calling it on a proxy URL would keep the URL, password included,
-#: in a process-wide cache, even after the check refuses it. ``__wrapped__`` is the same body with
-#: no cache; where an interpreter has no cache, the function itself is used.
-_UNCACHED_URLSPLIT: Callable[[str], object] = getattr(
-    urllib.parse.urlsplit, "__wrapped__", urllib.parse.urlsplit
-)
+#: public function is cached, so this check calling it on a proxy URL would add the URL, password
+#: included, to a process-wide cache, even for a URL it then refuses. ``inspect.unwrap`` takes off
+#: every ``functools.wraps`` layer, the cache included; where there is none, it is the function.
+#: **This keeps only this check from adding the URL.** Other readers of the same proxy value still
+#: call the cached ``urlsplit``, at least ``ambient_proxy``'s label through ``config.wiring``'s
+#: ``_split_address``, which ``serve``'s ambient-proxy warning and :func:`_disclose_ambient_proxy`
+#: both reach. So the URL can be a cache key all the same; that is not fixed here.
+_UNCACHED_URLSPLIT: Callable[[str], object] = inspect.unwrap(urllib.parse.urlsplit)
 
 
 def _proxy_url_requests_cannot_send(proxy: str) -> bool:
@@ -1066,9 +1069,10 @@ def _proxy_url_requests_cannot_send(proxy: str) -> bool:
     It does not hold for every shape: a URL with no host fails requests' own host check, whose
     error is fixed text, and passes this.
 
-    **Not cached, on purpose.** The URL holds the proxy password, and a process-wide cache keyed on
-    it would keep a refused or retired password after nothing else does. So each send pays these
-    parses again, up to three times, once per hook that checks."""
+    **Not cached here, on purpose.** The URL holds the proxy password, and a cache this check kept
+    would hold a refused or retired password. So each send pays these parses again, up to three
+    times, once per hook that checks. :data:`_UNCACHED_URLSPLIT` says which other readers still
+    put the URL in the standard library's cache."""
     try:
         _UNCACHED_URLSPLIT(proxy)
         prepended = requests.utils.prepend_scheme_if_needed(proxy, "http")

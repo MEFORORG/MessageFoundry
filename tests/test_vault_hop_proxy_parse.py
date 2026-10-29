@@ -204,8 +204,9 @@ def test_the_check_agrees_with_requests_own_reads(form: str) -> None:
     own reads, or gets as far as the dial and gets a ``ConnectionError``. Not every shape agrees: a
     URL with no host fails requests' host check, whose error is fixed text, and passes the check.
     Mutation: drop the Latin-1 encode from the check; red on the last unsendable row. Drop the raw
-    ``urlsplit``; red on the first, the only row where that read decides. Read on requests 2.34.2; a requests that reads these URLs
-    differently goes red here rather than leaving the check out of step."""
+    ``urlsplit``; red on the first, the only row where that read decides. Read on requests 2.34.2;
+    a requests that reads these URLs differently goes red here rather than leaving the check out
+    of step."""
     import requests
 
     from messagefoundry.transports.strict_requests import _proxy_url_requests_cannot_send
@@ -316,18 +317,37 @@ def test_request_url_refuses_it_on_its_own() -> None:
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
-def test_the_check_leaves_no_proxy_url_in_the_url_parser_cache() -> None:
-    """The check reads the raw URL with ``urlsplit`` minus its ``lru_cache``, so a refused proxy's
-    password is not kept process-wide. RED with the public, cached ``urlsplit`` in its place: the
-    refused URL is then a cache key. Skipped where the interpreter does not cache ``urlsplit``."""
+def test_the_checks_own_raw_read_is_not_the_cached_urlsplit() -> None:
+    """The check reads the raw URL with ``urlsplit`` minus its ``lru_cache``, so the check itself
+    adds no proxy URL to that process-wide cache. It pins the mechanism, not the whole process:
+    other readers of the same value still use the cached function (``_UNCACHED_URLSPLIT``'s
+    comment names them). RED with the public, cached ``urlsplit`` in its place. Skipped where the
+    interpreter does not cache ``urlsplit``."""
     import urllib.parse
 
-    from messagefoundry.transports.strict_requests import _proxy_url_requests_cannot_send
+    from messagefoundry.transports.strict_requests import (
+        _UNCACHED_URLSPLIT,
+        _proxy_url_requests_cannot_send,
+    )
 
-    cache_info = getattr(urllib.parse.urlsplit, "cache_info", None)
-    if cache_info is None:
+    if getattr(urllib.parse.urlsplit, "cache_info", None) is None:
         pytest.skip("urllib.parse.urlsplit is not cached on this interpreter")
-    proxy = _UNSENDABLE[3].format(port=3128)  # passes urlsplit, refused by the Latin-1 encode
-    urllib.parse.urlsplit.cache_clear()  # type: ignore[attr-defined]
-    assert _proxy_url_requests_cannot_send(proxy) is True
-    assert cache_info().currsize == 0, "the check put the proxy URL in urlsplit's cache"
+    assert _UNCACHED_URLSPLIT is not urllib.parse.urlsplit
+    assert not hasattr(_UNCACHED_URLSPLIT, "cache_info")
+    # And it is the same parser: it refuses what the cached one refuses, with the same error.
+    with pytest.raises(ValueError, match="NFKC"):
+        _UNCACHED_URLSPLIT("https://:synthetic-pw\u2100x@proxy.synthetic.test")
+    # Passes urlsplit, refused by the Latin-1 encode. A spy on the public function shows the check
+    # never hands it this URL; it counts this URL alone, so another thread's parse cannot race it.
+    proxy = _UNSENDABLE[3].format(port=3128)
+    real = urllib.parse.urlsplit
+    seen: list[object] = []
+
+    def spy(url: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append(url)
+        return real(url, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(urllib.parse, "urlsplit", spy)
+        assert _proxy_url_requests_cannot_send(proxy) is True
+    assert proxy not in seen, "the check handed the proxy URL to the cached urlsplit"
