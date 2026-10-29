@@ -988,3 +988,76 @@ async def test_a_failed_resolve_leaves_the_count_cooldown_and_suspend_in_place()
     assert sink._occurrences[key] == 3
     assert sink._last_sent[key] == newer
     assert sink._suspended[key] == until
+
+
+class _FlakyResolve:
+    """Fails the resolves named in ``fail`` (1-based call order) and lands the rest."""
+
+    def __init__(self, *fail: int) -> None:
+        self.fail = set(fail)
+        self.calls = 0
+
+    async def upsert_alert_instance(self, **_kw: object) -> None:
+        return None
+
+    async def resolve_alert_instances_for(self, **_kw: object) -> int:
+        self.calls += 1
+        if self.calls in self.fail:
+            raise OSError("store unavailable")
+        return 1
+
+
+def _primed(store: object) -> NotifierAlertSink:
+    sink = NotifierAlertSink([], realert_seconds=3600.0, store=store)  # type: ignore[arg-type]
+    sink.connection_stopped("IB", detail="router halted")
+    sink.connection_stopped("IB", detail="router halted")
+    sink.suspend("connection_stopped", "IB", until=time.time() + 3600)
+    return sink
+
+
+async def test_a_failed_resolve_hands_its_state_to_a_later_one_that_lands() -> None:
+    # Two operator starts in quick succession: the first resolve fails, the second, queued behind
+    # it, closes the row. Nothing comes back, so the next stop is a new incident that pages.
+    key = "connection_stopped:IB"
+    sink = _primed(_FlakyResolve(1))
+    sink.connection_started("IB")
+    sink.connection_started("IB")
+    await _settle(sink)
+    assert key not in sink._occurrences
+    assert key not in sink._last_sent
+    assert key not in sink._suspended
+    assert sink._pending_clears == {}
+    # Both fail: the second takes the first's state over and puts it all back.
+    sink = _primed(_FlakyResolve(1, 2))
+    sink.connection_started("IB")
+    sink.connection_started("IB")
+    await _settle(sink)
+    assert sink._occurrences[key] == 2 and key in sink._last_sent and key in sink._suspended
+    assert sink._pending_clears == {}
+
+
+async def test_an_operator_resolve_or_resume_before_a_failed_resolve_stays_in_force() -> None:
+    key = "connection_stopped:IB"
+    sink = _primed(_FlakyResolve(1))
+    sink.connection_started("IB")
+    sink.forget("connection_stopped", "IB")  # the operator resolved it by hand meanwhile
+    await _settle(sink)
+    assert key not in sink._occurrences and key not in sink._suspended
+    sink = _primed(_FlakyResolve(1))
+    sink.connection_started("IB")
+    sink.resume("connection_stopped", "IB")
+    await _settle(sink)
+    assert key not in sink._suspended
+    assert sink._occurrences[key] == 2
+
+
+async def test_a_resolve_cancelled_before_it_runs_puts_the_state_back() -> None:
+    key = "connection_stopped:IB"
+    sink = _primed(_FlakyResolve())
+    sink.connection_started("IB")
+    for task in list(sink._state_tasks):
+        task.cancel()
+    await asyncio.gather(*sink._state_tasks, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert sink._occurrences[key] == 2 and key in sink._last_sent and key in sink._suspended
+    assert sink._pending_clears == {}

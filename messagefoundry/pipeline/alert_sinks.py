@@ -780,6 +780,26 @@ class AlertRuleSet:
         return True
 
 
+@dataclass
+class _ClearedState:
+    """The in-memory alert state one ``connection_started`` cleared for a key, held until its
+    durable resolve settles (BACKLOG #1741, :meth:`NotifierAlertSink._resolve_settled`)."""
+
+    last: float | None
+    occurrences: int | None
+    suspended: float | None
+
+    def absorb(self, earlier: _ClearedState) -> None:
+        """Take over an earlier clear whose resolve failed: its count adds, and the newer cooldown
+        and suspend stand."""
+        if earlier.occurrences is not None:
+            self.occurrences = earlier.occurrences + (self.occurrences or 0)
+        if self.last is None:
+            self.last = earlier.last
+        if self.suspended is None:
+            self.suspended = earlier.suspended
+
+
 class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     """:class:`AlertSink` that fans each event out to one or more :class:`AlertTransport` on a
     background task, with a per-(event, connection) re-alert throttle. An optional :class:`AlertRuleSet`
@@ -821,6 +841,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # pick the escalation tier. In-memory + per-node (advisory, like _last_sent); reset on auto-resolve
         # + operator resolve (the durable count/escalation_tier is the cross-restart record).
         self._occurrences: dict[str, int] = {}
+        # BACKLOG #1741: the state each connection_started cleared, per key, in the order its durable
+        # resolve was scheduled, kept until that resolve lands or fails (_resolve_settled).
+        self._pending_clears: dict[str, list[_ClearedState]] = {}
         # #144 (ADR 0128): the injected async connection-control callback (action, target) → awaitable,
         # wired by the api/app.py lifespan to RegistryRunner.restart_inbound/restart_outbound. None = no
         # control wired (a control_action rule then no-ops, logged). The sink NEVER imports the runner.
@@ -1445,6 +1468,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         """Clear a windowed suspend for ``(event_type, connection)`` (``POST /alerts/{id}/resume``) so
         re-alerts resume immediately. Does NOT reset the escalation counter — the condition persists."""
         self._suspended.pop(f"{event_type}:{connection}", None)
+        for cleared in self._pending_clears.get(f"{event_type}:{connection}", ()):
+            cleared.suspended = (
+                None  # a failed resolve must not bring back what the operator lifted
+            )
 
     def forget(self, event_type: str, connection: str) -> None:
         """Drop ALL in-memory advisory state for ``(event_type, connection)`` — the suspend window AND the
@@ -1453,6 +1480,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         matching the fresh durable instance the store opens."""
         self._suspended.pop(f"{event_type}:{connection}", None)
         self._occurrences.pop(f"{event_type}:{connection}", None)
+        for cleared in self._pending_clears.get(f"{event_type}:{connection}", ()):
+            cleared.suspended = cleared.occurrences = None
 
     async def prime_suspensions(self) -> None:
         """Seed the in-memory suspend cache from durable ``alert_instance.suspended_until`` at startup, so
@@ -1490,32 +1519,46 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
         The clear is provisional until the durable resolve lands: a stop emitted before the write
         lands must already see it to page. If the write fails, or never runs, the row stays open,
-        so the cooldown, count and suspend entry go back (:meth:`_restore_unresolved`)."""
+        so the cooldown, count and suspend entry go back (:meth:`_resolve_settled`)."""
         if self._store is None:
             return
         key = f"connection_stopped:{name}"
-        last = self._last_sent.pop(key, None)
-        occurrences = self._occurrences.pop(key, None)
-        suspended = self._suspended.pop(key, None)
+        cleared = _ClearedState(
+            self._last_sent.pop(key, None),
+            self._occurrences.pop(key, None),
+            self._suspended.pop(key, None),
+        )
+        self._pending_clears.setdefault(key, []).append(cleared)
         self._record_state(
             {"type": "connection_started", "connection": name},
             "info",
-            on_failure=lambda: self._restore_unresolved(key, last, occurrences, suspended),
+            on_settled=lambda landed: self._resolve_settled(key, cleared, landed=landed),
         )
 
-    def _restore_unresolved(
-        self, key: str, last: float | None, occurrences: int | None, suspended: float | None
-    ) -> None:
-        """Put back the in-memory state :meth:`connection_started` cleared, after its durable resolve
-        failed and left the instance open (BACKLOG #1741). A stop emitted in between bumped the open
-        row too, so its occurrences add to the restored count; a cooldown or suspend set in between
-        is newer than the cleared one and stands."""
-        if occurrences is not None:
-            self._occurrences[key] = occurrences + self._occurrences.get(key, 0)
-        if last is not None:
-            self._last_sent.setdefault(key, last)
-        if suspended is not None:
-            self._suspended.setdefault(key, suspended)
+    def _resolve_settled(self, key: str, cleared: _ClearedState, *, landed: bool) -> None:
+        """Settle the in-memory state :meth:`connection_started` cleared, once its durable resolve
+        has landed or failed (BACKLOG #1741). A landed resolve closed the row, so the state stays
+        cleared. A failed one left the row open: a later start's resolve still queued behind it then
+        takes the state over and decides in its turn, or, with none queued, the state goes back. A
+        stop emitted in between bumped the open row too, so its count adds to the restored one; a
+        cooldown or suspend set in between is newer than the cleared one and stands."""
+        queue = self._pending_clears.get(key, [])
+        index = next((i for i, c in enumerate(queue) if c is cleared), None)
+        if index is None:
+            return
+        del queue[index]
+        if not landed:
+            if index < len(queue):
+                queue[index].absorb(cleared)
+            else:
+                if cleared.occurrences is not None:
+                    self._occurrences[key] = cleared.occurrences + self._occurrences.get(key, 0)
+                if cleared.last is not None:
+                    self._last_sent.setdefault(key, cleared.last)
+                if cleared.suspended is not None:
+                    self._suspended.setdefault(key, cleared.suspended)
+        if not queue:
+            self._pending_clears.pop(key, None)
 
     @staticmethod
     def _apply_escalation(
@@ -1631,13 +1674,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         severity: str,
         *,
         escalation_tier: int = 0,
-        on_failure: Callable[[], None] | None = None,
+        on_settled: Callable[[bool], None] | None = None,
     ) -> None:
         """Schedule the alert-instance upsert (or auto-resolve) off ``_emit`` — a fail-soft side observer
         (ADR 0044 D2). Synchronous + non-blocking: it only creates a background task, never awaits the
         store. A no-op when no store is wired (state tracking off). The store write never raises into the
         ``_emit`` caller — a failure is swallowed/logged in :meth:`_run_state` so it can't wedge a worker.
-        ``on_failure`` runs when the write fails or is dropped for want of a loop, never when it lands."""
+        ``on_settled`` is called once: True when the write lands, False when it fails, is cancelled, or
+        never runs (no loop, or cancelled before its first step)."""
         store = self._store
         if store is None:
             return
@@ -1673,7 +1717,17 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 escalation_tier=escalation_tier,
                 now=now,
             )
-        wrapper = self._run_state(coro, key, on_failure)
+        settle: Callable[[bool], None] | None = None
+        if on_settled is not None:
+            settled = False
+
+            def settle(landed: bool) -> None:
+                nonlocal settled
+                if not settled:
+                    settled = True
+                    on_settled(landed)
+
+        wrapper = self._run_state(coro, key, settle)
         try:
             task = asyncio.ensure_future(wrapper)
         except RuntimeError:
@@ -1682,13 +1736,17 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # Close both coroutines so neither warns "never awaited".
             wrapper.close()
             coro.close()
-            if on_failure is not None:
-                on_failure()
+            if settle is not None:
+                settle(False)
             return
         self._state_tasks.add(task)
 
         def _done(t: asyncio.Task[None]) -> None:
             self._state_tasks.discard(t)
+            if settle is not None:
+                settle(
+                    False
+                )  # a no-op once _run_state settled; covers a cancel before its first step
             # A task cancelled before its first step never reached the await; close the store
             # coroutine so it does not warn "never awaited". Closing a finished coroutine is a no-op.
             coro.close()
@@ -1699,21 +1757,25 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self,
         coro: Coroutine[Any, Any, Any],
         key: str,
-        on_failure: Callable[[], None] | None = None,
+        on_settled: Callable[[bool], None] | None = None,
     ) -> None:
         # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
         # resolve emitted behind it and leave a cleared condition open (or the reverse). Each write now
         # holds its key's FIFO lock. Tasks take their first step in the order they were created, so
         # they queue on the lock in emit order, and a waiter cancelled mid-queue keeps the rest in order.
+        landed = False
         try:
             async with hold_keyed_lock(self._state_locks, key):
                 await coro
+            landed = True
         except Exception:
             # The alert-instance write is a side observer: a store error must never wedge a delivery
             # worker or drop the notification. Log metadata only (no event body).
             log.warning("alert-instance state write failed", exc_info=True)
-            if on_failure is not None:
-                on_failure()
+        finally:
+            # A cancel, too, is settled as not landed: the row is most likely still open.
+            if on_settled is not None:
+                on_settled(landed)
 
     async def drain_state(self, timeout: float) -> None:
         """Wait up to ``timeout`` seconds for the alert-instance writes already scheduled. The engine
