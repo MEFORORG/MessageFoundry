@@ -4115,8 +4115,9 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 #: producible form is a count plus a `vault:v1:<base64>` MAC, comfortably under 200 bytes -- so anything
 #: past this is not an anchor file and the excess must never be read, let alone quoted back.
 #:
-#: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. Every refusal below interpolates the
-#: offending text with ``{text!r}``, and both callers log that refusal. A path typo'd onto
+#: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. ``str(AuditAnchorError)``
+#: interpolates the offending text with ``{text!r}``. Neither file caller prints it now (vault
+#: BACKLOG #2612), and the bound is the second half of that control. A path typo'd onto
 #: ``messagefoundry.toml``, a key file, or a captured HL7 message would otherwise put that file's whole
 #: contents into the service log at WARNING -- which is the PHI rule in CLAUDE.md section 9, breached by
 #: a control whose own purpose is to avoid manufacturing bad outcomes from its input handling.
@@ -4126,9 +4127,11 @@ AUDIT_ANCHOR_MAX_BYTES = 4096
 class AuditAnchorError(ValueError):
     """A ``COUNT:HEAD`` anchor that :func:`parse_audit_anchor` refuses, carrying TWO renderings.
 
-    ``str(exc)`` quotes the offending text back, which is what an operator running ``audit-verify``
-    needs: they typed the path, the refusal lands on their own terminal, and seeing the bad value is
-    how they fix it. ``reason`` says what was wrong and **never includes the text**.
+    ``str(exc)`` quotes the offending text back, which is what an operator running ``audit-verify
+    --expected-anchor`` needs: they typed the value, the refusal lands on their own terminal, and
+    seeing it is how they fix it. ``reason`` says what was wrong and **never includes the text**,
+    nor any value parsed from it. Every caller that read the text from a FILE prints ``reason``
+    only, ``audit-verify --expected-anchor-file`` included (vault BACKLOG #2612).
 
     THE SPLIT EXISTS BECAUSE THE TWO CONSUMERS HAVE DIFFERENT EXPOSURE, not because one is tidier. The
     engine's startup check logs to a persistent service log that NSSM captures to disk, so quoting the
@@ -4168,8 +4171,8 @@ def read_audit_anchor_file(path: str | Path) -> str:
         too_large=f"anchor file is larger than {AUDIT_ANCHOR_MAX_BYTES} bytes, so it is not an "
         "anchor (an anchor is one short COUNT:HEAD line)",
     )
-    # The first line only: a file whose SECOND line is something else is a refusal either way, and
-    # taking one line keeps whatever follows out of the refusal message that quotes this back.
+    # The first line only: a file whose SECOND line is something else is a refusal either way. Both
+    # callers print only the refusal's content-free ``reason`` for a file (vault BACKLOG #2612).
     return lines[0] if lines else ""
 
 
@@ -4187,9 +4190,10 @@ def read_bounded_utf8_lines(path: str | Path, max_bytes: int, *, too_large: str)
     if len(data) > max_bytes:
         raise OSError(too_large)
     # Universal newlines only (CRLF, CR, LF): ``str.splitlines`` also breaks on form feed, NEL,
-    # U+2028 and more, so a stray one shifted every line number a refusal names. A bare CR still
-    # ends a line, so an HL7 message (CR-terminated segments) mispointed at the anchor reader
-    # yields its MSH segment alone, and that is all a refusal can quote back.
+    # U+2028 and more, so a stray one shifted every line number a refusal names. So a line can
+    # carry those characters, and an MLLP capture's first line starts with its 0x0B frame byte.
+    # Neither caller quotes a file's line back: each refusal names a line number and a reason that
+    # quotes nothing, which is the control, not this split.
     lines = re.split(r"\r\n|\r|\n", data.decode("utf-8-sig"))
     if lines and not lines[-1]:
         lines.pop()  # the final newline ends the last line; it does not start another
@@ -4245,13 +4249,15 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
         # is short and non-secret, but "content-free" has to be a rule, not a judgement per branch.
         raise AuditAnchorError("the row count is not an integer", text) from None
     if count < 0:
-        raise AuditAnchorError(f"the row count {count} is negative", text)
+        # No value in a reason, not even the count: `--expected-anchor-file` prints the reason, and
+        # the count is that file's content (vault BACKLOG #2612).
+        raise AuditAnchorError("the row count is negative", text)
     head = head.strip()
     if not head:
         if count != 0:
             raise AuditAnchorError(
-                "an empty head is only producible from an EMPTY log, so it cannot carry a row count "
-                f"of {count}",
+                "an empty head is only producible from an EMPTY log, so it cannot carry a nonzero "
+                "row count",
                 text,
             )
         return count, head

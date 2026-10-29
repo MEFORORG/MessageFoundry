@@ -6193,7 +6193,11 @@ stays broken, or recovers and breaks again, is reported only by that first line.
 states only what it leaves a `logs:view` or `monitoring:read` reader without `users:manage`.
 `queued` on `GET /status` counts both lanes, capped at the smaller lane bound, so once either
 lane is full it is pinned there and does not move with audit rows; an uncapped depth over
-both lanes would have risen by one per row. **Not closed, as on the single queue:** below the cap,
+both lanes would have risen by one per row. The two shutdown lines in the engine log, which
+`GET /logs/tail` serves, take the same cap: the count of records moved to the spool at the drain
+deadline and the count left undelivered are capped together at that bound, as a single queue's
+never passed it. One function, `_published_counts` in `messagefoundry/logging_setup.py`, is the
+only path from the queue's depth to a log line or a status field. **Not closed, as on the single queue:** below the cap,
 `queued` rises by one per audit row waiting, the same reading a single queue of that bound gives.
 Counting the audit lane is what lets a collector that stalls while only audit lines arrive show a
 rising depth. While the general lane is draining but not full, audit lines are served ahead of it,
@@ -6432,8 +6436,9 @@ copy they came from.** A pair is only as authentic as the collector's record of 
 hop that drops lines loses witnesses. The forwarder counts some losses on `GET /status` and in
 `log_forward_failed`, at least what its queue and spool drop and, over TCP or TLS, what a failed
 send costs. At least these are counted nowhere there: a datagram lost over UDP, bytes a TCP
-collector's reset loses after a send returned, and records still queued at the shutdown drain
-deadline, which only a log line reports. `audit-verify` does not say which rows had no pair; read the tee's own limits, in
+collector's reset loses after a send returned, and, with no spool configured or with the spool
+full, records still queued at the shutdown drain deadline, which only a log line reports. With a
+spool that has room they are kept and sent after the next start, and a log line says how many. `audit-verify` does not say which rows had no pair; read the tee's own limits, in
 `messagefoundry/store/audit_tee.py`, before resting a control on an export. Every audit row carries a
 `row_hash` from the moment it is written: the column is `NOT NULL` on all three backends and the
 startup backfill that used to chain pre-feature rows was deleted with it (BACKLOG #1198), because a

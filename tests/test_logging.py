@@ -1722,6 +1722,81 @@ def test_a_full_queue_still_accepts_the_stop_sentinel(
     assert fwd._stopped
 
 
+def _shutdown_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    *,
+    audit_rows: int,
+    spooled: bool,
+) -> list[str]:
+    """Stall the collector on its first record, fill the general lane past its bound of five, write
+    ``audit_rows`` audit rows, then close; return the shutdown lines close() logged. Every queued
+    record is still there at the drain deadline, so they are all spooled or all undelivered."""
+    from messagefoundry.log_spool import LogSpool
+    from messagefoundry.store import audit_tee
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 5)
+    monkeypatch.setattr(logging_setup, "_FORWARD_DRAIN_TIMEOUT", 0.2)
+    spool = None
+    if spooled:
+        spool = LogSpool(tmp_path / f"spool-{audit_rows}", max_bytes=10_000_000)
+        spool.open()
+    gate = threading.Event()
+    fwd = _build_queued_forwarder(_CapturingHandler(gate=gate, wait=1.0), fmt="text", spool=spool)
+    fwd.handle(_lane_record("mefor.test", "first"))
+    deadline = time.monotonic() + 5.0
+    while fwd._records.qsize() and time.monotonic() < deadline:
+        time.sleep(0.01)  # until the listener holds the first record inside the stalled send
+    assert fwd._records.qsize() == 0, "the listener never took the first record"
+    for i in range(8):
+        fwd.handle(_lane_record("mefor.test", f"g{i}"))
+    for i in range(audit_rows):
+        fwd.handle(_lane_record(audit_tee.audit_logger.name, f'{{"seq": {i}}}'))
+    assert fwd._records.qsize() == 5 + audit_rows  # the control: the raw depth DOES move
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="messagefoundry.logging_setup"):
+        fwd.close()
+    gate.set()
+    where = str(spool.directory) if spool is not None else "<no spool>"
+    return [
+        r.getMessage().replace(where, "<spool>")  # each run has its own directory
+        for r in caplog.records
+        if "drain deadline" in r.getMessage() or "undelivered" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("spooled", [False, True], ids=["no-spool", "spool"])
+def test_the_shutdown_counts_do_not_move_with_audit_rows_while_the_general_lane_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    spooled: bool,
+) -> None:
+    """The engine log is served by ``GET /logs/tail``, so a reader with ``logs:view`` and without
+    ``users:manage`` must not count audit rows off it (BACKLOG #1131, #2612). With the general lane
+    full, the shutdown line that counts what was undelivered, and the one that counts what moved to
+    the spool, read the same for 0 and 40 audit rows: both are capped at the smaller lane bound,
+    as the single queue was. Uncapped, they read 5 and 45."""
+    quiet = _shutdown_lines(monkeypatch, caplog, tmp_path, audit_rows=0, spooled=spooled)
+    busy = _shutdown_lines(monkeypatch, caplog, tmp_path, audit_rows=40, spooled=spooled)
+    assert len(quiet) == 1, quiet
+    expected = "moved 5 record(s)" if spooled else "at least 5 record(s) undelivered"
+    assert expected in quiet[0], quiet
+    assert busy == quiet
+
+
+def test_published_counts_share_one_budget_and_the_loss_takes_it_first() -> None:
+    """Capped together, so two counts that sum past the cap cannot tell how far past it the lanes
+    were; and the loss first, so a record that did not reach the collector is always reported."""
+    lanes = logging_setup._ForwardLanes(5, 100)
+    assert logging_setup._published_counts(lanes, 3, 7) == (3, 2)
+    assert logging_setup._published_counts(lanes, 9, 7) == (5, 0)
+    assert logging_setup._published_counts(lanes, 2, 1) == (2, 1)  # below the cap, untouched
+    unbounded: queue.Queue[Any] = queue.Queue()
+    assert logging_setup._published_counts(unbounded, 9, 7) == (9, 7)
+
+
 def test_a_plain_bounded_queue_makes_room_for_the_stop_sentinel() -> None:
     """``enqueue_sentinel``'s discard loop, on the plain bounded queue it is kept for. The shipped
     :class:`_ForwardLanes` always takes the sentinel (BACKLOG #2612), so the test above no longer

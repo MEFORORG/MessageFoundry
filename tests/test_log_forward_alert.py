@@ -36,6 +36,7 @@ from messagefoundry.logging_setup import (
     _ForwardLanes,
     _ForwardQueueHandler,
     _ForwardQueueListener,
+    _published_counts,
     _TimeoutSysLogHandler,
     configure_logging,
     forwarder_status,
@@ -410,7 +411,7 @@ def test_queued_reads_the_same_whichever_lane_is_full(bounds: tuple[int, int]) -
                 lanes.put_nowait(
                     logging.LogRecord(name, logging.INFO, __file__, 1, "x", None, None)
                 )
-        readings.append(lanes.reported_qsize())
+        readings.append(_published_counts(lanes, lanes.qsize())[0])
         sizes.append(lanes.qsize())
     assert sizes[0] != sizes[1]  # the control: the lanes did fill to different depths
     assert readings == [min(bounds)] * 2

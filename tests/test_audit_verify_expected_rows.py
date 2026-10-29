@@ -292,8 +292,64 @@ def test_a_refusal_names_the_line_a_text_editor_shows(
 
 
 def test_a_bare_cr_still_ends_the_first_anchor_line(tmp_path: Path) -> None:
-    """An anchor file mispointed at an HL7 message, whose segments end in a bare CR, must yield
-    the first segment alone, so a refusal quoting it back carries no PID segment."""
+    """An anchor file mispointed at an HL7 message, whose segments end in a bare CR, yields the
+    first segment alone, so the line a refusal names is the first line an editor shows."""
     path = tmp_path / "msg.hl7"
     path.write_bytes(b"MSH|A|B\rPID|1||SYNTHETIC^PERSON\r")
     assert store_mod.read_audit_anchor_file(path) == "MSH|A|B"
+
+
+def test_an_anchor_file_refusal_names_the_line_and_quotes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pointed at an MLLP capture, whose first line starts with the 0x0B frame byte, the refusal
+    must name the line and a reason, never the segment (vault BACKLOG #2612). ``str.splitlines``
+    split on that byte and so quoted an empty line; the universal-newline reader keeps the segment
+    on line 1, so the refusal must not quote line 1 either."""
+    db = tmp_path / "m.db"
+    _seed(db, 1)
+    anchor = tmp_path / "capture.mllp"
+    anchor.write_bytes(b"\x0bMSH|^~\\&|SYNTHAPP|SYNTHFAC\rPID|1||SYNTHETIC^PERSON\r\x1c\r")
+    rc = main(["audit-verify", "--db", str(db), "--expected-anchor-file", str(anchor)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--expected-anchor-file line 1" in err and "no ':' separator" in err, err
+    assert "MSH" not in err and "SYNTH" not in err and "\\x0b" not in err, err
+
+
+def test_a_typed_anchor_refusal_still_quotes_the_value(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The control for the test above: the operator typed this one, so seeing it is how they fix it.
+    db = tmp_path / "n.db"
+    _seed(db, 1)
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", "TYPED-VALUE"]) == 2
+    assert "TYPED-VALUE" in capsys.readouterr().err
+
+
+def test_a_contradictory_pair_refusal_names_lines_not_the_seq(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The seq is the file's content, so the refusal names the two lines and never the seq."""
+    db = tmp_path / "o.db"
+    _seed(db, 1)
+    rows = tmp_path / "rows.txt"
+    rows.write_text(f"987654:{'a' * 64}\n\n987654:{'b' * 64}\n", encoding="utf-8")
+    rc = main(["audit-verify", "--db", str(db), "--expected-rows-file", str(rows)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "two different row_hash values" in err, err
+    assert "--expected-rows-file line 1 and --expected-rows-file line 3" in err, err
+    assert "987654" not in err, err
+
+
+def test_a_contradictory_pair_across_flags_names_both_places(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "p.db"
+    _seed(db, 1)
+    rows = tmp_path / "rows.txt"
+    rows.write_text(f"5:{'b' * 64}\n", encoding="utf-8")
+    argv = ["audit-verify", "--db", str(db), "--expected-row", f"5:{'a' * 64}"]
+    assert main([*argv, "--expected-rows-file", str(rows)]) == 2
+    assert "--expected-row 1 and --expected-rows-file line 1" in capsys.readouterr().err

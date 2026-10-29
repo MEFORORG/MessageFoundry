@@ -6715,7 +6715,12 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
     # artifact (BACKLOG #328). A copy here would be the one place a later hardening -- of the refusals,
     # the encoding handling, or the byte bound -- could reach the CLI and miss the engine.
     from messagefoundry.redaction import codec_safe_str
-    from messagefoundry.store.store import parse_audit_anchor, read_audit_anchor_file
+    from messagefoundry.store.store import (
+        AUDIT_ANCHOR_FORM,
+        AuditAnchorError,
+        parse_audit_anchor,
+        read_audit_anchor_file,
+    )
 
     raw: str | None
     if args.expected_anchor_file is not None:
@@ -6740,8 +6745,18 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         return None
     try:
         return parse_audit_anchor(raw)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except AuditAnchorError as exc:
+        if args.expected_anchor_file is None:
+            print(f"error: {exc}", file=sys.stderr)  # the operator typed it, so it is quoted
+        else:
+            # Never the file's text (vault BACKLOG #2612): a path typo'd onto a key file, a config
+            # or a captured message would put its first line on the job's output. The line number
+            # and a reason that quotes nothing are enough to find the fault in an editor.
+            print(
+                f"error: malformed --expected-anchor-file line 1: {exc.reason} — "
+                f"{AUDIT_ANCHOR_FORM}",
+                file=sys.stderr,
+            )
         return 2
 
 
@@ -6770,15 +6785,18 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
     )
 
     pairs: list[tuple[int, str]] = []
-    for text in args.expected_row or ():
+    #: Where each pair came from, by position and never by content, for the contradiction refusal.
+    origins: list[str] = []
+    for number, text in enumerate(args.expected_row or (), start=1):
         try:
             pairs.append(parse_audit_row_pair(text))
         except AuditRowPairError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        origins.append(f"--expected-row {number}")
     path = args.expected_rows_file
     if path is None:
-        return pairs
+        return _refuse_contradictory_pairs(pairs, origins)
     try:
         lines = read_bounded_utf8_lines(
             path,
@@ -6811,22 +6829,37 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
                 file=sys.stderr,
             )
             return 2
+        origins.append(f"--expected-rows-file line {number}")
     if len(pairs) == before:
         # Refused, not read as "nothing to compare": a job pointed at an empty export would
         # otherwise report a clean walk with no witness checked, which is what the flag is for.
         print(f"error: --expected-rows-file {path!r} holds no SEQ:ROW_HASH line", file=sys.stderr)
         return 2
+    return _refuse_contradictory_pairs(pairs, origins)
+
+
+def _refuse_contradictory_pairs(
+    pairs: list[tuple[int, str]], origins: list[str]
+) -> list[tuple[int, str]] | int:
+    """``pairs``, or the exit code 2 if one seq is given two different row_hashes. No chain matches
+    both, so such a set is a bad input, such as an export mixing two engines' tees, never evidence
+    of tampering.
+
+    The refusal names the two places by position (``origins``, one per pair) and never the seq:
+    a seq read from a file is that file's content, and a refusal quotes none (vault BACKLOG #2612).
+    """
+    first: dict[int, tuple[str, str]] = {}
+    for (seq, head), origin in zip(pairs, origins, strict=True):
+        earlier_head, earlier_origin = first.setdefault(seq, (head, origin))
+        if earlier_head != head:
+            print(
+                f"error: {earlier_origin} and {origin} give one seq two different row_hash "
+                "values; no chain matches both, so the set is refused rather than reported as "
+                "tampering",
+                file=sys.stderr,
+            )
+            return 2
     return pairs
-
-
-def _contradictory_pair_seq(pairs: list[tuple[int, str]]) -> int | None:
-    """A seq given two different row_hashes, or None. No chain matches both, so such a set is a bad
-    input, such as an export mixing two engines' tees, never evidence of tampering."""
-    seen: dict[int, str] = {}
-    for seq, head in pairs:
-        if seen.setdefault(seq, head) != head:
-            return seq
-    return None
 
 
 def _host_gated_store_settings(
@@ -9314,14 +9347,6 @@ def _audit_verify(args: argparse.Namespace) -> int:
     expected_rows = _resolve_expected_rows(args)
     if isinstance(expected_rows, int):
         return expected_rows
-    clash = _contradictory_pair_seq(expected_rows)
-    if clash is not None:
-        print(
-            f"error: the expected rows give seq {clash} two different row_hash values; no chain "
-            "matches both, so the set is refused rather than reported as tampering",
-            file=sys.stderr,
-        )
-        return 2
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
