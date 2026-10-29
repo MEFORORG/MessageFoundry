@@ -3336,22 +3336,63 @@ def totp_disable(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
     )
 
 
+def totp_secret_digest(secret: str) -> str:
+    """The digest an opened TOTP secret is compared by in ``replace_totp_enrolment``'s
+    compare-and-set (BACKLOG #3778), so a caller pins the enrolment without holding its seed. It IS
+    ``hash_token``, the digest the service's own enrolment check takes (BACKLOG #3068), so the two
+    cannot drift apart."""
+    # Lazy, as passkey_is_way_past imports it: a stdlib-only leaf of the auth package.
+    from messagefoundry.auth.tokens import hash_token
+
+    return hash_token(secret)
+
+
 def totp_replace(
     *,
-    sealed_secret: str | None,
+    secret: str,
+    seal_secret: Callable[[str], str | None],
+    open_secret: Callable[[str], str | None],
     recovery_code_hashes: Sequence[str],
     step: int,
     expected_enrolled_at: float | None,
+    expected_secret_digest: str,
     now: float,
 ) -> UserChange:
     """``replace_totp_enrolment``'s swap (ADR 0171 Amendment B): only where TOTP is on, with a
-    seed, still enrolled at ``expected_enrolled_at``. The session epoch is raised in the same
-    write, since the caller ends every session with it."""
+    seed, and still the enrolment the caller read. The session epoch is raised in the same write,
+    since the caller ends every session with it.
+
+    THE ENROLMENT IS KEYED ON ITS OPENED SEED, NOT ONLY ITS STAMP (BACKLOG #3778).
+    ``totp_enrolled_at`` is a clock reading, so a removal and a re-enrolment inside one reading
+    leave a row this compare could not tell from the one the caller read. Every writer of a seed
+    draws a fresh random one (the enrolment begin, ``provision-admin``, ``admin-reset-totp``), so
+    the opened seed differs between any two enrolments, and this refuses a seed equal to the one it
+    replaces, so its own write is never that exception. The compare opens the cell rather than
+    comparing it: a store-key rotation re-encrypts the cell and leaves the seed alone, so a rotation
+    refuses nothing. A cell that does not open matches nothing, which fails closed, and is logged.
+    The stamp is compared too, the pair the service compares for the same purpose."""
+    if hmac.compare_digest(totp_secret_digest(secret), expected_secret_digest):
+        raise ValueError("the replacement TOTP secret is the secret it replaces")
+    sealed_secret = seal_secret(secret)
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
         if not r.row.totp_enabled or r.row.totp_secret is None:
             return None
         if r.row.totp_enrolled_at != _opt_float(expected_enrolled_at):
+            return None
+        try:
+            held = open_secret(r.row.totp_secret)
+        except CipherError:
+            # Never the cell or the error text: the class says what failed.
+            log.warning(
+                "replace_totp_enrolment: the TOTP secret of account %s did not open; "
+                "nothing was replaced",
+                r.row.id,
+            )
+            return None
+        if held is None or not hmac.compare_digest(
+            totp_secret_digest(held), expected_secret_digest
+        ):
             return None
         return r.bump_epoch().changed(
             totp_secret=sealed_secret,
@@ -15966,6 +16007,7 @@ class MessageStore:
         recovery_code_hashes: list[str],
         step: int,
         expected_enrolled_at: float | None,
+        expected_secret_digest: str,
         audit: AuditAppend,
         now: float | None = None,
     ) -> int | None:
@@ -15976,16 +16018,23 @@ class MessageStore:
         The secret, the recovery codes and the step high-water mark change together, and TOTP stays
         on throughout, so no reader ever sees the account without a factor. ``step`` is the step of
         the code that proved the new secret, so that code is spent. The write matches only a row
-        where TOTP is on, with a seed, and still enrolled at ``expected_enrolled_at``: a removal or a
-        re-enrolment that landed after the caller read the row is never overwritten, and TOTP can
-        never be turned on for an account that did not have it. The audit row and the session sweep
-        commit or roll back with the swap, so a refused audit append leaves the old seed in place."""
+        where TOTP is on, with a seed, still enrolled at ``expected_enrolled_at`` and still holding
+        the seed whose :func:`totp_secret_digest` is ``expected_secret_digest`` (BACKLOG #3778): a
+        removal or a re-enrolment that landed after the caller read the row is never overwritten,
+        even one stamped with the same instant, and TOTP can never be turned on for an account that
+        did not have it. A ``secret`` equal to the seed it replaces raises ``ValueError``. The audit
+        row and the session sweep commit or roll back with the swap, so a refused audit append
+        leaves the old seed in place."""
         now = time.time() if now is None else now
+        aad = cell_aad("users", "totp_secret", user_id)
         change = totp_replace(
-            sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            secret=secret,
+            seal_secret=lambda plain: self._enc(plain, aad=aad),
+            open_secret=functools.partial(self.open_totp_secret, user_id),
             recovery_code_hashes=recovery_code_hashes,
             step=step,
             expected_enrolled_at=expected_enrolled_at,
+            expected_secret_digest=expected_secret_digest,
             now=now,
         )
         async with _writer_txn(self._db, self._lock):

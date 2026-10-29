@@ -30,7 +30,15 @@ from messagefoundry.auth import totp
 from messagefoundry.auth.passwords import verify_password
 from messagefoundry.auth.permissions import Role
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.store import (
+    MessageStore,
+    UserAuthzRecord,
+    UserChange,
+    new_user_record,
+    totp_replace,
+    totp_secret_digest,
+)
 from tests._admin_account import PROVISION_TOTP_SECRET, provision_admin
 from tests.test_provision_first_administrator import _PASSWORD
 
@@ -618,13 +626,20 @@ def test_totp_on_with_no_seed_is_refused_with_its_own_reason(
     assert _audit_rows(db) == []
 
 
+@pytest.mark.parametrize("same_stamp", [False, True], ids=["new-stamp", "same-stamp"])
 def test_a_re_enrolment_during_the_prompt_is_not_overwritten(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    same_stamp: bool,
 ) -> None:
     """THE COMPARE-AND-SET'S FALSE BRANCH. While the operator types, the account's TOTP is removed
     and enrolled again with another seed. Every re-check passes (TOTP is on, with a seed), so only
-    the enrolment instant pinned before the prompt can tell. The write matches nothing, the newer
-    enrolment stands, and no audit row claims a replacement."""
+    the enrolment pinned before the prompt can tell. The write matches nothing, the newer
+    enrolment stands, and no audit row claims a replacement.
+
+    ``same-stamp`` re-enrols at the very instant the pinned enrolment carries, so the stamp alone
+    cannot tell the two apart and only the pinned seed does (BACKLOG #3778)."""
     monkeypatch.chdir(tmp_path)
     db = tmp_path / "reenrol.db"
     _seed(db)
@@ -632,15 +647,18 @@ def test_a_re_enrolment_during_the_prompt_is_not_overwritten(
 
     async def re_enrol(store: MessageStore) -> None:
         user = await store.get_user_by_username(_ADMIN)
-        assert user is not None
+        assert user is not None and user.totp_enrolled_at is not None
+        stamp = user.totp_enrolled_at if same_stamp else 1.0
         await store.disable_totp(user.id)
         staged_cell = await store.set_totp_secret(user.id, secret=other_seed)
         assert (
             await store.enable_totp(
-                user.id, expected_secret_cell=staged_cell, recovery_code_hashes=[], now=1.0
+                user.id, expected_secret_cell=staged_cell, recovery_code_hashes=[], now=stamp
             )
             is True
         )
+        again = await store.get_user(user.id)
+        assert again is not None and (again.totp_enrolled_at == user.totp_enrolled_at) is same_stamp
 
     def enrol_while_re_enrolled(**_k: object) -> tuple[str, str, float]:
         _with_store(db, re_enrol)
@@ -921,3 +939,76 @@ def test_a_store_key_that_cannot_be_resolved_exits_2(
     monkeypatch.setattr(store_base, "open_store", unresolved)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
     assert "Nothing was written" in _error(capsys)
+
+
+# --- the store's compare-and-set, unit level (BACKLOG #3778) ------------------------------------
+
+
+def _enrolled_record(cell: str, *, enrolled_at: float = 5.0) -> UserAuthzRecord:
+    """An account with TOTP on whose seed cell is ``cell``, enrolled at ``enrolled_at``."""
+    return new_user_record(
+        user_id="u-cas",
+        username="cas",
+        auth_provider="local",
+        display_name=None,
+        email=None,
+        notify_email=None,
+        password_hash=None,
+        must_change_password=False,
+        password_generated=False,
+        directory_object_id=None,
+        now=1.0,
+    ).changed(totp_enabled=True, totp_secret=cell, totp_enrolled_at=enrolled_at)
+
+
+def _replace_against(opened: dict[str, str], *, held: str) -> UserChange:
+    """``totp_replace`` pinned to ``held`` at stamp 5.0, opening a cell through ``opened``. A cell
+    not in it raises the store's ``CipherError``, as one sealed under an unheld key does."""
+
+    def open_secret(cell: str) -> str | None:
+        if cell not in opened:
+            raise CipherError("probe: this cell does not open")
+        return opened[cell]
+
+    return totp_replace(
+        secret=_NEW_SECRET,
+        seal_secret=lambda plain: f"sealed:{plain}",
+        open_secret=open_secret,
+        recovery_code_hashes=["n1"],
+        step=7,
+        expected_enrolled_at=5.0,
+        expected_secret_digest=totp_secret_digest(held),
+        now=9.0,
+    )
+
+
+def test_the_compare_opens_the_cell_so_a_store_key_rotation_refuses_nothing() -> None:
+    """A rotation re-encrypts the cell and leaves the seed, so the compare must be on the opened
+    seed: the same enrolment under a new ciphertext still matches, and another seed does not."""
+    old = PROVISION_TOTP_SECRET
+    change = _replace_against(
+        {"cell-before": old, "cell-rotated": old, "other": "X" * 16}, held=old
+    )
+    for cell in ("cell-before", "cell-rotated"):
+        written = change(_enrolled_record(cell))
+        assert written is not None, cell
+        assert written.row.totp_secret == f"sealed:{_NEW_SECRET}"
+    assert change(_enrolled_record("other")) is None
+    assert change(_enrolled_record("cell-before", enrolled_at=6.0)) is None
+
+
+def test_a_cell_that_does_not_open_matches_nothing_and_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fails closed: a cell the process cannot open is never read as the pinned seed."""
+    change = _replace_against({}, held=PROVISION_TOTP_SECRET)
+    with caplog.at_level("WARNING", logger="messagefoundry.store.store"):
+        assert change(_enrolled_record("unopenable")) is None
+    assert "did not open" in caplog.text and "u-cas" in caplog.text
+    assert "unopenable" not in caplog.text  # never the cell
+
+
+def test_a_replacement_equal_to_the_pinned_seed_is_refused_before_any_write() -> None:
+    """The swap's own output always differs from the enrolment it matched."""
+    with pytest.raises(ValueError, match="the secret it replaces"):
+        _replace_against({}, held=_NEW_SECRET)
