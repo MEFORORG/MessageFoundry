@@ -3348,12 +3348,14 @@ class RegistryRunner:
 
         Every ``Exception`` is recorded and re-raised, as :meth:`start` isolates one at boot: a
         restart that fails for a type a narrower list missed would leave the feed down with no
-        status, which is the defect itself. Three are not failed starts and record nothing: a
+        status, which is the defect itself. At least these record nothing here: a
         :class:`NotDeployedError` (that inbound reads ``not_deployed``), a name the graph does not
         declare (the caller's ``KeyError``), and a raise after the bind with the listener still
-        serving, such as one from :meth:`_ensure_inbound_workers`. That one is the caller's to
-        handle, as it was before: a record there would mark a serving listener failed and page,
-        and a later start returns early on a bound source, so nothing would clear it.
+        serving, such as one from :meth:`_ensure_inbound_workers`. A record for that last one
+        would mark a serving listener failed and page, and a later start returns early on the
+        bound source, so only a restart or a reload would clear it. On the operator door it stays
+        unrecorded, as before #3859; the scheduler's :meth:`_record_window_open_failure` still
+        records it, as it did before.
 
         Once only, as :meth:`_record_window_open_failure` records: a scheduled poller retries at
         every in-window tick, and every alert could re-fire a ``restart_inbound`` control action,
@@ -3367,7 +3369,7 @@ class RegistryRunner:
         except Exception as exc:
             if (
                 name in self.registry.inbound
-                and name not in self._sources  # not serving: the start did not leave it bound
+                and not self.inbound_running(name)  # a raise after the bind leaves it serving
                 and ("inbound", name) not in self._failed
             ):
                 self._record_failed(name, exc, kind="inbound")
@@ -4407,7 +4409,7 @@ class RegistryRunner:
 
         :meth:`_checked_inbound_start` records a failed start before this runs (BACKLOG #3859), so
         this usually finds the record and only logs the retry. It still records anything that
-        method leaves unrecorded."""
+        method leaves unrecorded, including a raise after the bind."""
         if ("inbound", name) in self._failed:
             log.debug(
                 "schedule: inbound connection %r still cannot start (%s); retrying next tick",
