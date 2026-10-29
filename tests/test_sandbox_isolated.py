@@ -978,8 +978,8 @@ def test_an_unexpected_engine_fault_fails_the_dispatch_promptly(
 def test_a_cut_off_waiter_does_not_replace_the_hung_lookups_record(
     graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Dispatch B's helper is still building its refusal when B's cap fires. Its record must not
-    # replace the hung lookup's, or dispatch C would start a second call on the hung connection.
+    # Dispatch B's helper is still building its refusal when B's cap fires, and C then finds the
+    # hung lookup still recorded. Neither may start a second call on the hung connection.
     release = threading.Event()
     calls: list[str] = []
 
@@ -1062,9 +1062,18 @@ def test_a_helper_past_its_deadline_never_calls_the_runner(
             with pytest.raises(SandboxError, match="wall cap"):
                 _bodies(registry, "h_db", session)  # B: its helper is held before the runner
             release_a.set()
+            # Wait for A's own record to go, not the runner's counter: only then is the connection
+            # free, so B's helper can only be stopped by its dispatch having been abandoned.
+            key = (codec.LOOKUP_DB, "LK")
             deadline = time.monotonic() + 10
-            while state["in_flight"] and time.monotonic() < deadline:
+
+            def a_finished() -> bool:
+                record = session._stale_lookups.get(key)
+                return record is None or record.is_set()
+
+            while not a_finished() and time.monotonic() < deadline:
                 time.sleep(0.05)
+            assert a_finished()
             go.set()  # B's helper goes on, past B's deadline, and finds A finished
             time.sleep(0.5)
             release_all.set()

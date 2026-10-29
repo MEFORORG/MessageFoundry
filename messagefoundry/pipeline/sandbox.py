@@ -724,7 +724,8 @@ class SandboxSession:
         self._closed = False
         # The [egress] lists whose empty-list refusal this session has logged.
         self._lookup_refusals_logged: set[str] = set()
-        # Per (kind, connection), the completion of the lookup last started on it: see _serve_lookup.
+        # Per (kind, connection), the completion event of the runner call running on it, removed by
+        # that call when it returns: see _serve_lookup.
         self._stale_lookups: dict[tuple[str, str], threading.Event] = {}
         self._stale_lock = threading.Lock()
 
@@ -1125,30 +1126,33 @@ class SandboxSession:
         stdin = proc.stdin
         failure: list[BaseException] = []
         fault: list[BaseException] = []
-        with self._stale_lock:
-            for key in [key for key, ended in self._stale_lookups.items() if ended.is_set()]:
-                del self._stale_lookups[key]
-        done = threading.Event()
+        # Set by this thread, under _stale_lock, the moment it gives up on the helper. The helper
+        # reads it under the same lock before it registers and calls the runner, so the two threads
+        # agree on whether the dispatch is over without comparing clocks (see _serve_lookup).
+        abandoned = threading.Event()
+
+        def report(exc: BaseException) -> None:
+            fault.append(exc)
+            log.error(
+                "inbound %r: the engine failed while serving a brokered lookup for %s %r (%s)",
+                self._inbound,
+                phase,
+                name,
+                type(exc).__name__,
+            )
 
         def serve() -> None:
             try:
-                reply = self._lookup_reply(request_id, phase, name, lookup, deadline, done)
-            except Exception as exc:  # noqa: BLE001 — logged here, failed by the dispatch thread
-                fault.append(exc)
-                log.error(
-                    "inbound %r: the engine failed while serving a brokered lookup for %s %r (%s)",
-                    self._inbound,
-                    phase,
-                    name,
-                    type(exc).__name__,
-                )
+                reply = self._lookup_reply(request_id, phase, name, lookup, deadline, abandoned)
+            except Exception as exc:  # noqa: BLE001 — logged by type, failed by the dispatch thread
+                report(exc)
                 return
-            finally:
-                done.set()
             try:
                 _write_frame(stdin, reply)
             except (OSError, ValueError, SandboxError) as exc:  # ValueError: a pipe closed under it
                 failure.append(exc)
+            except Exception as exc:  # noqa: BLE001 — logged by type, failed by the dispatch thread
+                report(exc)
 
         context = contextvars.copy_context()
         helper = threading.Thread(
@@ -1160,6 +1164,8 @@ class SandboxSession:
         helper.start()
         helper.join(max(0.0, deadline - time.monotonic()))
         if helper.is_alive():
+            with self._stale_lock:
+                abandoned.set()
             return False
         if fault:
             self._kill(proc)
@@ -1179,11 +1185,11 @@ class SandboxSession:
         name: str,
         lookup: codec.LookupRequest,
         deadline: float,
-        done: threading.Event,
+        abandoned: threading.Event,
     ) -> bytes:
         """The ``lookupok``/``lookupfail`` frame answering one ``lookup``. A result that cannot cross
         is a ``lookupfail`` the worker can report."""
-        ok, result, error = self._serve_lookup(phase, lookup, deadline, done)
+        ok, result, error = self._serve_lookup(phase, lookup, deadline, abandoned)
         fn = _LOOKUP_FN[lookup.kind]
         if ok:
             try:
@@ -1202,7 +1208,11 @@ class SandboxSession:
         )
 
     def _serve_lookup(
-        self, phase: str, lookup: codec.LookupRequest, deadline: float, done: threading.Event
+        self,
+        phase: str,
+        lookup: codec.LookupRequest,
+        deadline: float,
+        abandoned: threading.Event,
     ) -> tuple[bool, object, str]:
         """Answer one brokered lookup in the parent: ``(ok, result, error)``.
 
@@ -1216,34 +1226,39 @@ class SandboxSession:
         in-process. The slice-B seam: a broker-only check of a lookup's own arguments goes between the
         refusals below and the call.
 
-        **One lookup at a time per connection.** Each lookup registers ``done``, its completion, for
-        its connection just before it calls the runner, under ``_stale_lock``. A later lookup on that
-        connection, which can only meet one the wall cap cut off since a session serves one dispatch
-        at a time, waits on that record by the rule ``docs/CONFIGURATION.md`` states (section
-        ``[sandbox]``, *``mode="isolated"``*), and is refused if it still runs then. A helper whose
-        own dispatch the cap has already ended never calls the runner, so no call starts that nobody
-        waits for and nothing records."""
+        **One runner call at a time per connection.** Under ``_stale_lock``, a lookup registers its
+        own completion event for its connection, then calls the runner, and removes the record when
+        the runner returns. A later lookup on that connection can only meet one the wall cap cut off,
+        since a session serves one dispatch at a time. It waits on that record by the rule
+        ``docs/CONFIGURATION.md`` states (section ``[sandbox]``, *``mode="isolated"``*), and is
+        refused if it still runs then. **A helper whose dispatch was abandoned never calls the
+        runner.** The dispatch thread sets ``abandoned`` under the same lock when it gives up, and the
+        helper checks it there before it registers. So every runner call is recorded, and none starts
+        that nobody waits for."""
         is_db = lookup.kind == codec.LOOKUP_DB
         available = db_lookup_available() if is_db else fhir_lookup_available()
         refusal = self._lookup_refusal(phase, lookup) if available else None
         if refusal is not None:
             return False, None, refusal
+        key = (lookup.kind, lookup.connection)
+        done = threading.Event()
         if available:
-            key = (lookup.kind, lookup.connection)
-            with self._stale_lock:
-                stale = self._stale_lookups.get(key)
-            if stale is not None:
-                margin = min(2.0, self.policy.wall_seconds / 4)
-                if not stale.wait(max(0.0, deadline - margin - time.monotonic())):
+            margin = min(2.0, self.policy.wall_seconds / 4)
+            while True:
+                with self._stale_lock:
+                    if abandoned.is_set():
+                        # The dispatch is over: its worker is being killed and nobody waits.
+                        return (
+                            False,
+                            None,
+                            f"{_LOOKUP_FN[lookup.kind]}: the call's wall cap ran out",
+                        )
+                    current = self._stale_lookups.get(key)
+                    if current is None:
+                        self._stale_lookups[key] = done
+                        break
+                if not current.wait(max(0.0, deadline - margin - time.monotonic())):
                     return False, None, self._busy_refusal(lookup)
-            with self._stale_lock:
-                if time.monotonic() >= deadline:
-                    # This dispatch is already over: the worker is being killed and nobody waits.
-                    return False, None, f"{_LOOKUP_FN[lookup.kind]}: the call's wall cap ran out"
-                current = self._stale_lookups.get(key)
-                if current is not None and not current.is_set():
-                    return False, None, self._busy_refusal(lookup)
-                self._stale_lookups[key] = done
         try:
             if is_db:
                 return True, db_lookup(lookup.connection, lookup.target, lookup.params), ""
@@ -1253,6 +1268,12 @@ class SandboxSession:
             return False, None, _bounded(str(exc))
         except Exception as exc:  # noqa: BLE001 — the worker waits on this reply; report, never raise
             return False, None, f"{_LOOKUP_FN[lookup.kind]} failed: {safe_exc(exc)}"
+        finally:
+            if available:
+                with self._stale_lock:
+                    if self._stale_lookups.get(key) is done:
+                        del self._stale_lookups[key]
+                done.set()
 
     @staticmethod
     def _busy_refusal(lookup: codec.LookupRequest) -> str:

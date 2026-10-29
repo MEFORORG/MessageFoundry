@@ -189,15 +189,15 @@ unresearched.
 **Built:** the `isolated` mode and decision (1), the parent-held broker. A Handler's
 `db_lookup`/`fhir_lookup` in the worker writes a `lookup` frame in the closed tag set, bound to the
 dispatch's `(id, phase, name)` triple and a per-dispatch sequence number (AC-6, for a per-inbound
-worker, whose lane the session already is). The parent answers it on the dispatch thread through the
-same accessor and runner the in-process path uses (AC-1, AC-2), refuses one bound to a Router or
+worker, whose lane the session already is). The parent answers it on a helper thread, in the dispatch's
+context, through the same accessor and runner the in-process path uses (AC-1, AC-2), refuses one bound to a Router or
 `accepts=` dispatch, and refuses one whose `[egress].allowed_db` or `[egress].allowed_http` is empty.
 A refused or failed lookup is the Handler's error, routed to `ERROR`/dead-letter post-ACK (AC-5, for
 the broker). `wall_seconds` bounds the whole dispatch, the brokered lookups and the writes of their
 replies included; a lookup the cap cuts off runs on to its own timeout in the parent, and its result
-is discarded. While it runs, a later lookup on the same connection waits for it and may then be
-refused, by the rule `docs/CONFIGURATION.md` states in section `[sandbox]`, so the broker waits on one lookup per connection and
-session. A database query the runner itself gave up on can still run past that.
+is discarded. While it runs, a later lookup on the same connection waits for it, by the rule
+`docs/CONFIGURATION.md` states in section `[sandbox]`. So at most one runner call runs per connection
+and session. A database query the runner itself gave up on can still run past that.
 
 **Not built:** decision (2), the OS confinement: AC-3 (Landlock and seccomp), AC-4 (the AppContainer
 token), and AC-7 (no opening or signalling the parent or a sibling). The first two open boxes above,
