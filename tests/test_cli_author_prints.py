@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import json
 from pathlib import Path
 
@@ -322,16 +323,28 @@ def test_overlapping_redirects_restore_stdout_once_the_last_one_exits(
     import sys
 
     real = sys.stdout
-    with author_output.stdout_carries_a_result():
+    with author_output.stdout_carries_a_result(), contextlib.ExitStack() as stack:
         outer = author_output.author_code_stdout()
         inner = author_output.author_code_stdout()
         outer.__enter__()
-        inner.__enter__()
+        try:
+            stack.enter_context(inner)
+            assert sys.stdout is sys.stderr
+        finally:
+            outer.__exit__(None, None, None)  # the first one out is not the last
         assert sys.stdout is sys.stderr
-        outer.__exit__(None, None, None)  # the first one out is not the last
-        assert sys.stdout is sys.stderr
-        inner.__exit__(None, None, None)
     assert sys.stdout is real
+    assert author_output._redirects == 0
+
+
+def test_a_none_stdout_is_put_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A process started with fd 1 closed has ``sys.stdout`` None, and keeps it after a redirect."""
+    import sys
+
+    monkeypatch.setattr(sys, "stdout", None)
+    with author_output.stdout_carries_a_result(), author_output.author_code_stdout():
+        assert sys.stdout is sys.stderr
+    assert sys.stdout is None
 
 
 def test_the_loader_and_the_preview_redirect_only_under_the_mark(

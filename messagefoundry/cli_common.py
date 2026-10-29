@@ -29,7 +29,6 @@ import textwrap
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from messagefoundry.author_output import stdout_carries_a_result
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import configure_stderr_logging
 
@@ -158,7 +157,11 @@ def run_cli(
     # EVERY SUBCOMMAND'S STDOUT CARRIES ITS RESULT unless the caller names it (vault BACKLOG #3474),
     # so a print() in a config module, Router or Handler the subcommand runs goes to stderr. The
     # default covers a new subcommand, and a new load inside an old one, without anyone wrapping it;
-    # `messagefoundry.author_output` says where the redirect happens.
+    # `messagefoundry.author_output` says where the redirect happens. Imported here, not at the top:
+    # `--version` and `--help` never reach dispatch, and tests/test_startup_import_budget.py holds
+    # what they load.
+    from messagefoundry.author_output import stdout_carries_a_result
+
     seam = (
         contextlib.nullcontext()
         if args.command in author_prints_keep_stdout

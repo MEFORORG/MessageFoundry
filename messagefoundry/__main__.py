@@ -4003,8 +4003,8 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # Dual control on with a narrowed or empty [approvals].operations leaves the same actions on one
     # caller's authority, so it gets the advisory too (vault BACKLOG #3474). The narrowing and its
-    # wording are `_approvals_loosenings`', the one reader of that list against its default, so the
-    # default list is never restated here. Still WARN-only: the arm's body holds no return.
+    # wording are `_approvals_loosenings`', the one reader of that list against its default, so this
+    # arm does not compare the list itself. The off case's text still names the shipped pair. Still WARN-only: the arm's body holds no return.
     # The serve-time loosenings warning above prints the same risk text; this is the exposure
     # reminder beside it, as the MFA arm's is.
     held_gap = (

@@ -87,7 +87,8 @@ def author_code_stdout() -> Iterator[None]:
         if redirected:
             with _lock:
                 _redirects -= 1
-                if _redirects == 0 and _saved_stdout is not None:
+                if _redirects == 0:
+                    # Keyed on the count alone: a stdout that was None at the swap is put back too.
                     sys.stdout, _saved_stdout = _saved_stdout, None
 
 

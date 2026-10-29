@@ -155,7 +155,30 @@ def _extra_permissions_source(call: ast.Call, function: ast.AST | None) -> str |
                 sources.add(rhs.func.attr)
             else:
                 sources.add("<unreviewed>")
+        elif _changes_in_place(node, value.id):
+            # A narrowing after the assignment (`perms -= {...}`, `perms.discard(...)`).
+            sources.add("<unreviewed>")
     return sources.pop() if len(sources) == 1 else "<unreviewed>"
+
+
+def _changes_in_place(node: ast.AST, name: str) -> bool:
+    """Whether ``node`` rebinds ``name`` by an augmented, annotated or tuple assignment, or calls a
+    method on it. At least these forms; a change through another name for the set is not seen."""
+    if isinstance(node, ast.AugAssign | ast.AnnAssign):
+        return isinstance(node.target, ast.Name) and node.target.id == name
+    if isinstance(node, ast.Assign):
+        return any(
+            isinstance(elt, ast.Name) and elt.id == name
+            for target in node.targets
+            if isinstance(target, ast.Tuple | ast.List)
+            for elt in target.elts
+        )
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == name
+    )
 
 
 def test_identity_build_callers_are_the_reviewed_ones() -> None:
@@ -225,3 +248,11 @@ def test_the_caller_pin_fires_on_a_narrowed_set() -> None:
     )
     ((call, _kind),) = _identity_calls(good)
     assert _extra_permissions_source(call, named_func(good, "f")) == _CUSTOM_UNION
+    narrowed = ast.parse(
+        "async def f(self):\n"
+        "    perms = await self._custom_permissions_for_ids(ids)\n"
+        "    perms -= {Permission.MESSAGES_VIEW_SUMMARY}\n"
+        "    return Identity.build(roles=(), extra_permissions=perms)\n"
+    )
+    ((call, _kind),) = _identity_calls(narrowed)
+    assert _extra_permissions_source(call, named_func(narrowed, "f")) == "<unreviewed>"
