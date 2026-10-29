@@ -1006,9 +1006,72 @@ def test_a_cut_off_waiter_does_not_replace_the_hung_lookups_record(
     try:
         with db_lookup_mod.activated(hung):
             for _ in range(3):  # A hangs; B and C each find the connection busy
-                with pytest.raises(SandboxError):
+                with pytest.raises(SandboxError, match="wall cap|still running"):
                     _bodies(registry, "h_db", session)
         assert len(calls) == 1
     finally:
         release.set()
+        session.close()
+
+
+def test_a_helper_past_its_deadline_never_calls_the_runner(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Dispatch B's helper starts so late that B's cap has already ended, and by then the hung lookup
+    # A has finished. It must not call the runner: nobody waits for that call and nothing records it,
+    # so the next dispatch would start another beside it.
+    release_a, release_all = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    state = {"calls": 0, "in_flight": 0, "peak": 0}
+
+    def hung(connection: str, statement: str, params: Any) -> list[dict[str, Any]]:
+        with lock:
+            state["calls"] += 1
+            first = state["calls"] == 1
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+        try:
+            (release_a if first else release_all).wait(60)
+            return [{"v": "late", "d": Decimal(0)}]
+        finally:
+            with lock:
+                state["in_flight"] -= 1
+
+    go = threading.Event()
+    go.set()
+    real = SandboxSession._lookup_refusal
+
+    def gated(self: SandboxSession, phase: str, lookup: codec.LookupRequest) -> str | None:
+        go.wait(30)  # stands in for a helper thread scheduled late, past its dispatch's cap
+        return real(self, phase, lookup)
+
+    monkeypatch.setattr(SandboxSession, "_lookup_refusal", gated)
+    registry, config_dir = graph
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.ISOLATED, wall_seconds=2.0, lookup_allowed_db=("db",)),
+        inbound="IB_I",
+        config_dir=config_dir,
+        env=None,
+        graph=None,
+    )
+    try:
+        with db_lookup_mod.activated(hung):
+            with pytest.raises(SandboxError, match="wall cap"):
+                _bodies(registry, "h_db", session)  # A: hangs, cut off
+            go.clear()
+            with pytest.raises(SandboxError, match="wall cap"):
+                _bodies(registry, "h_db", session)  # B: its helper is held before the runner
+            release_a.set()
+            deadline = time.monotonic() + 10
+            while state["in_flight"] and time.monotonic() < deadline:
+                time.sleep(0.05)
+            go.set()  # B's helper goes on, past B's deadline, and finds A finished
+            time.sleep(0.5)
+            release_all.set()
+            assert _bodies(registry, "h_db", session)[0].startswith("late|")  # C
+        assert (state["calls"], state["peak"]) == (2, 1)  # A and C; never B
+    finally:
+        release_a.set()
+        release_all.set()
+        go.set()
         session.close()

@@ -176,7 +176,7 @@ def _screen(key: str, value: str, *, half: str) -> str:
     )
 
 
-def _resolve_one(key: str, value: FhirSearchValue) -> str:
+def _resolve_one(key: str, value: FhirSearchValue | ForeignSearchValue) -> str:
     """One ``params`` value to the string that goes on the URL, before percent-encoding."""
     if isinstance(value, str):
         return _screen(key, value, half="value")

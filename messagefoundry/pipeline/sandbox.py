@@ -724,8 +724,9 @@ class SandboxSession:
         self._closed = False
         # The [egress] lists whose empty-list refusal this session has logged.
         self._lookup_refusals_logged: set[str] = set()
-        # Per (kind, connection), the completion of a lookup the wall cap cut off: see _serve_bounded.
+        # Per (kind, connection), the completion of the lookup last started on it: see _serve_lookup.
         self._stale_lookups: dict[tuple[str, str], threading.Event] = {}
+        self._stale_lock = threading.Lock()
 
     @property
     def mode(self) -> SandboxMode:
@@ -1111,9 +1112,9 @@ class SandboxSession:
         normally ends a blocked write. A broken pipe raises :class:`SandboxError` after the worker is
         killed.
 
-        **A lookup the cap cut off is remembered per connection** until its runner returns
-        (:meth:`_serve_lookup` says what a later lookup on that connection then does). The record is
-        the lookup half's completion, not the thread's: a reply write that never ends cannot keep the
+        **Each lookup records itself per connection while its runner runs** (:meth:`_serve_lookup`
+        registers it, and says what a later lookup on that connection then does). The record is the
+        lookup half's completion, not the thread's: a reply write that never ends cannot keep the
         connection marked busy.
 
         **An unexpected fault in the engine fails the dispatch at once,** with a fixed cause and the
@@ -1124,19 +1125,14 @@ class SandboxSession:
         stdin = proc.stdin
         failure: list[BaseException] = []
         fault: list[BaseException] = []
-        for key in [key for key, ended in self._stale_lookups.items() if ended.is_set()]:
-            del self._stale_lookups[key]
+        with self._stale_lock:
+            for key in [key for key, ended in self._stale_lookups.items() if ended.is_set()]:
+                del self._stale_lookups[key]
         done = threading.Event()
 
         def serve() -> None:
             try:
-                try:
-                    reply = self._lookup_reply(request_id, phase, name, lookup, deadline)
-                finally:
-                    done.set()
-                _write_frame(stdin, reply)
-            except (OSError, ValueError, SandboxError) as exc:  # ValueError: a pipe closed under it
-                failure.append(exc)
+                reply = self._lookup_reply(request_id, phase, name, lookup, deadline, done)
             except Exception as exc:  # noqa: BLE001 — logged here, failed by the dispatch thread
                 fault.append(exc)
                 log.error(
@@ -1146,6 +1142,13 @@ class SandboxSession:
                     name,
                     type(exc).__name__,
                 )
+                return
+            finally:
+                done.set()
+            try:
+                _write_frame(stdin, reply)
+            except (OSError, ValueError, SandboxError) as exc:  # ValueError: a pipe closed under it
+                failure.append(exc)
 
         context = contextvars.copy_context()
         helper = threading.Thread(
@@ -1157,13 +1160,6 @@ class SandboxSession:
         helper.start()
         helper.join(max(0.0, deadline - time.monotonic()))
         if helper.is_alive():
-            key = (lookup.kind, lookup.connection)
-            earlier = self._stale_lookups.get(key)
-            # Never replace a record whose lookup still runs: a helper the cap cut off while it was
-            # still waiting on that record has not called the runner, and replacing it would let the
-            # next dispatch start a second call beside the one that is actually hung.
-            if not done.is_set() and (earlier is None or earlier.is_set()):
-                self._stale_lookups[key] = done
             return False
         if fault:
             self._kill(proc)
@@ -1183,10 +1179,11 @@ class SandboxSession:
         name: str,
         lookup: codec.LookupRequest,
         deadline: float,
+        done: threading.Event,
     ) -> bytes:
         """The ``lookupok``/``lookupfail`` frame answering one ``lookup``. A result that cannot cross
         is a ``lookupfail`` the worker can report."""
-        ok, result, error = self._serve_lookup(phase, lookup, deadline)
+        ok, result, error = self._serve_lookup(phase, lookup, deadline, done)
         fn = _LOOKUP_FN[lookup.kind]
         if ok:
             try:
@@ -1205,7 +1202,7 @@ class SandboxSession:
         )
 
     def _serve_lookup(
-        self, phase: str, lookup: codec.LookupRequest, deadline: float
+        self, phase: str, lookup: codec.LookupRequest, deadline: float, done: threading.Event
     ) -> tuple[bool, object, str]:
         """Answer one brokered lookup in the parent: ``(ok, result, error)``.
 
@@ -1219,22 +1216,34 @@ class SandboxSession:
         in-process. The slice-B seam: a broker-only check of a lookup's own arguments goes between the
         refusals below and the call.
 
-        **One lookup at a time per connection.** While a lookup the cap cut off on this connection
-        is still waiting on its runner, a new one waits for it, for at most the rest of its own
-        dispatch's cap less a quarter of the cap (at most 2 s), and is refused if it is still waiting
-        then. The quarter is what the Handler has left to handle the refusal before the cap. So a hung
-        backend holds one broker call per connection and session, not one per message, and a
-        transient stall does not turn the backlog into instant refusals."""
+        **One lookup at a time per connection.** Each lookup registers ``done``, its completion, for
+        its connection just before it calls the runner, under ``_stale_lock``. A later lookup on that
+        connection, which can only meet one the wall cap cut off since a session serves one dispatch
+        at a time, waits on that record by the rule ``docs/CONFIGURATION.md`` states (section
+        ``[sandbox]``, *``mode="isolated"``*), and is refused if it still runs then. A helper whose
+        own dispatch the cap has already ended never calls the runner, so no call starts that nobody
+        waits for and nothing records."""
         is_db = lookup.kind == codec.LOOKUP_DB
         available = db_lookup_available() if is_db else fhir_lookup_available()
         refusal = self._lookup_refusal(phase, lookup) if available else None
         if refusal is not None:
             return False, None, refusal
-        stale = self._stale_lookups.get((lookup.kind, lookup.connection)) if available else None
-        if stale is not None:
-            margin = min(2.0, self.policy.wall_seconds / 4)
-            if not stale.wait(max(0.0, deadline - margin - time.monotonic())):
-                return False, None, self._busy_refusal(lookup)
+        if available:
+            key = (lookup.kind, lookup.connection)
+            with self._stale_lock:
+                stale = self._stale_lookups.get(key)
+            if stale is not None:
+                margin = min(2.0, self.policy.wall_seconds / 4)
+                if not stale.wait(max(0.0, deadline - margin - time.monotonic())):
+                    return False, None, self._busy_refusal(lookup)
+            with self._stale_lock:
+                if time.monotonic() >= deadline:
+                    # This dispatch is already over: the worker is being killed and nobody waits.
+                    return False, None, f"{_LOOKUP_FN[lookup.kind]}: the call's wall cap ran out"
+                current = self._stale_lookups.get(key)
+                if current is not None and not current.is_set():
+                    return False, None, self._busy_refusal(lookup)
+                self._stale_lookups[key] = done
         try:
             if is_db:
                 return True, db_lookup(lookup.connection, lookup.target, lookup.params), ""
