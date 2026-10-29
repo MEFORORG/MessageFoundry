@@ -1276,9 +1276,10 @@ async def test_a_cleared_account_with_no_last_login_is_judged_new_not_no_baselin
         await store.close()
 
 
-async def test_the_next_real_write_prunes_the_reset_marker() -> None:
-    """The marker is stamped at the epoch, so the prune after the next real write removes it and
-    leaves that write's row as the baseline (vault BACKLOG #2946)."""
+async def test_the_next_real_write_keeps_the_reset_marker() -> None:
+    """The marker is stamped at the epoch, outside the lookback, and the prune after the next real
+    write keeps it (vault BACKLOG #3849 B4): before, that prune removed it, and one racing the reset
+    could leave the record empty. The real row is the only one a lookback read returns."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, _FakeNotifier())
@@ -1291,21 +1292,53 @@ async def test_the_next_real_write_prunes_the_reset_marker() -> None:
                 stepped.identity, issued.password, token=stepped.token, client="10.1.1.1"
             )
         ).ok
-        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.1.1.1"]
+        assert set(await store.list_known_login_addresses(uid, since=0.0)) == {
+            service_module._LOGIN_ADDRESS_RESET_MARKER,
+            "10.1.1.1",
+        }
+        assert await store.list_known_login_addresses(uid, since=1.0) == ["10.1.1.1"]
+    finally:
+        await store.close()
+
+
+async def test_a_prune_that_races_the_reset_leaves_a_baseline() -> None:
+    """Vault BACKLOG #3849 B4: a sign-in recorded its address, the reset then emptied the record
+    and wrote the marker, and only then did that sign-in's prune run. The record must still hold
+    the marker, or an account with no ``last_login_at`` would fail open as ``no_baseline``. RED on
+    the code before #3849, where the prune deleted the epoch-stamped marker."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        now = time.time()
+        await store.remember_login_address(uid, "10.1.1.1", now=now)
+        issued = await service.admin_reset_password(uid, actor="boss")
+        assert issued is not None
+        await store.forget_login_addresses(
+            uid, before=now - service_module._LOGIN_ADDRESS_LOOKBACK_SECONDS
+        )
+        assert await store.list_known_login_addresses(uid, since=0.0) == [
+            service_module._LOGIN_ADDRESS_RESET_MARKER
+        ]
+        user = await store.get_user(uid)
+        assert user is not None and user.last_login_at is None
+        out = await service.login("oper", issued.password, client="10.1.1.1")
+        assert out.ok
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 1
     finally:
         await store.close()
 
 
 @pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
-@pytest.mark.parametrize("method", ["forget_login_addresses", "remember_login_address"])
 async def test_a_failed_clear_logs_and_does_not_refuse_the_reset(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     reset: str,
-    method: str,
 ) -> None:
     """A failed clear is logged at ERROR, and the reset still returns its credential and audits
-    (owner ruling 2026-10-16)."""
+    (owner ruling 2026-10-16). The clear is one transaction since vault BACKLOG #3849 B4, so a
+    failure leaves the record unchanged, never empty."""
+    method = "reset_login_addresses"
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, _FakeNotifier())
@@ -1326,11 +1359,9 @@ async def test_a_failed_clear_logs_and_does_not_refuse_the_reset(
         )
         action = "auth.password_reset" if reset == "admin_reset_password" else "auth.mfa_reset"
         assert len(await store.list_audit(action=action)) == 1
-        # The record is as the failure left it: unchanged when the delete failed, emptied with no
-        # marker when the marker write failed.
+        # The record is as it was before the reset.
         monkeypatch.undo()
-        left = await store.list_known_login_addresses(uid, since=0.0)
-        assert left == (["10.1.1.1"] if method == "forget_login_addresses" else [])
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.1.1.1"]
     finally:
         await store.close()
 
@@ -1338,7 +1369,6 @@ async def test_a_failed_clear_logs_and_does_not_refuse_the_reset(
 def test_the_store_contract_uses_the_service_reset_values() -> None:
     from tests import _login_address_store_contract as contract
 
-    assert contract._FOREVER == service_module._LOGIN_ADDRESS_FOREVER
     assert contract._RESET_MARKER == service_module._LOGIN_ADDRESS_RESET_MARKER
 
 

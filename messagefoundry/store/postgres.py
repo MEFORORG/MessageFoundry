@@ -194,6 +194,7 @@ from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
+    LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_TARGET_PREFIX,
@@ -9444,10 +9445,22 @@ class PostgresStore:
     async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
         """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
         await self._execute(
-            "DELETE FROM known_login_addresses WHERE user_id=$1 AND last_seen<$2",
+            "DELETE FROM known_login_addresses WHERE user_id=$1 AND last_seen<$2 AND address<>$3",
             user_id,
             before,
+            LOGIN_ADDRESS_RESET_MARKER,
         )
+
+    async def reset_login_addresses(self, user_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.reset_login_addresses`."""
+        async with self._timed_acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM known_login_addresses WHERE user_id=$1", user_id)
+            await conn.execute(
+                "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
+                " VALUES ($1, $2, 0, 0)",
+                user_id,
+                LOGIN_ADDRESS_RESET_MARKER,
+            )
 
     async def delete_user(self, user_id: str) -> None:
         async with self._timed_acquire() as conn, conn.transaction():

@@ -570,7 +570,10 @@ class AlertSink(Protocol):
         with ``name`` = ``user:<username>`` and ``via`` = ``directory_sign_in_negotiate``,
         ``directory_sign_in_sso`` or ``directory_sign_in_oidc``, naming the route. A directory
         reconcile pass whose role re-diff newly grants it (vault BACKLOG #3141) raises it with
-        ``name`` = ``user:<username>`` and ``via`` = ``directory_reconcile``.
+        ``name`` = ``user:<username>`` and ``via`` = ``directory_reconcile``. The offline
+        ``provision-admin`` command raises it on every Administrator it grants (vault BACKLOG #3849
+        B5) with ``name`` = ``user:<username>``, ``via`` = ``provision_admin`` and ``granted_by`` =
+        ``cli:<OS user>``, through the ``[alerts]`` notifier it builds as ``serve`` does.
         Both keys are outside the connection-name grammar for the same reason as
         :meth:`approval_approver_provenance`. ``granted_by`` is the acting administrator's username,
         or ``<directory>`` on a directory sign-in or reconcile pass, where no administrator acted.

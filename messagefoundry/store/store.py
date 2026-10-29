@@ -3569,6 +3569,14 @@ def existing_roles_only(
 #: ``tests/test_role_seal.py`` pins this list.
 ROLE_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType({"seal": "the seal itself"})
 
+#: The one row an administrator's reset, or a provision-admin takeover, leaves in an account's
+#: known sign-in address record (vault BACKLOG #2946, #3849). It holds no host, is stamped at the
+#: epoch, and is never a match; it is the baseline for an account that never stamped
+#: ``last_login_at``. Defined in the store because the store keeps it: ``forget_login_addresses``
+#: never prunes it, and ``reset_login_addresses`` writes it in the transaction that empties the
+#: record (vault BACKLOG #3849 B4).
+LOGIN_ADDRESS_RESET_MARKER: Final = "cleared by reset"
+
 #: The AD group-to-role map: its table, and the name its seal is stored under in
 #: ``authority_set_seal``. The name is inside the sealed bytes too, so a seal made for one map
 #: never verifies for the other.
@@ -16239,8 +16247,19 @@ class MessageStore:
         """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
-                "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<?",
-                (user_id, before),
+                "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<? AND address<>?",
+                (user_id, before, LOGIN_ADDRESS_RESET_MARKER),
+            )
+            await self._commit()
+
+    async def reset_login_addresses(self, user_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.reset_login_addresses`."""
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+            await self._db.execute(
+                "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
+                " VALUES (?, ?, 0, 0)",
+                (user_id, LOGIN_ADDRESS_RESET_MARKER),
             )
             await self._commit()
 

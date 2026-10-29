@@ -169,6 +169,7 @@ from messagefoundry.store.row_seal import (
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
+    LOGIN_ADDRESS_RESET_MARKER,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     AdMap,
@@ -503,15 +504,14 @@ _LOGIN_ADDRESS_KEY_MAX = 256
 # One ``login_new_ip`` notice per account and address per this many seconds, in each engine process
 # (see ``_login_new_ip_notice_due``). The audit row is not debounced.
 _LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
-# The one row an administrator's password or MFA reset leaves in the account's known-address record
-# (vault BACKLOG #2946). It is the baseline for an account that has never stamped ``last_login_at``,
-# so the next sign-in after the reset is judged NEW rather than failed open as no-baseline. It is
-# never a match: it is stamped at the epoch, outside every lookback, ``_mark_login_address_known``
-# never writes a client whose text equals it, and the next real write's prune usually removes it.
-_LOGIN_ADDRESS_RESET_MARKER = "cleared by reset"
-# Larger than any ``last_seen`` the record can hold, so a prune with it deletes every row. Finite,
-# because SQL Server's FLOAT cannot hold an infinity.
-_LOGIN_ADDRESS_FOREVER = 1e18
+# The one row an administrator's password or MFA reset, or a provision-admin takeover, leaves in the
+# account's known-address record (vault BACKLOG #2946, #3849). It is the baseline for an account that
+# has never stamped ``last_login_at``, so the next sign-in after the reset is judged NEW rather than
+# failed open as no-baseline. It is never a match: it is stamped at the epoch, outside every
+# lookback, and ``_mark_login_address_known`` never writes a client whose text equals it. The store
+# owns it since vault BACKLOG #3849 B4: its prune never removes it, so it stays until the account
+# is deleted or reset again.
+_LOGIN_ADDRESS_RESET_MARKER = LOGIN_ADDRESS_RESET_MARKER
 
 
 class _LoginAddress(Enum):
@@ -2280,6 +2280,11 @@ class ProvisionedAdministrator:
     #: enrolled no TOTP (``--no-totp``, which only a site with ``require_mfa`` off may pass). Never
     #: in ``--json`` output, never logged, never audited.
     recovery_codes: tuple[str, ...] = ()
+    #: Every enabled Administrator when the run checked, as the audit row's
+    #: ``administrators_at_check`` records them (vault BACKLOG #2711 step 1). Non-empty means this
+    #: one was added beside them, so the CLI warns when its ``administrator_granted`` alert reached
+    #: only the log (vault BACKLOG #3849 B5).
+    administrators_at_check: tuple[str, ...] = ()
 
 
 # BACKLOG #2019: the three outcomes of the notice a repair owes the account's earlier holder. They are
@@ -3919,7 +3924,8 @@ class AuthService:
         always covers an administrator.
 
         **THE REPAIR BRANCH CLEARS EVERYTHING THE EARLIER HOLDER COULD STILL USE**, first: TOTP, its
-        recovery codes, every passkey, and every session on the row. Before this, the branch revoked
+        recovery codes, every passkey, every session on the row, and since vault BACKLOG #3849 B2 the
+        account's known sign-in addresses, as a reset clears them. Before this, the branch revoked
         no session, and ``_build_identity`` re-reads roles on every request, so a live session the
         earlier holder kept became an Administrator session when the role was written -- an ADR 0183
         defect this amendment fixes because it edits this branch.
@@ -4053,6 +4059,11 @@ class AuthService:
             await self._store.disable_totp(user_id)
             await self._store.delete_all_webauthn_credentials(user_id)
             await self._store.revoke_user_sessions(user_id)
+            # Vault BACKLOG #3849 B2: the addresses the earlier holder signed in from are theirs,
+            # not the new Administrator's, so they go too, as after an administrator's reset
+            # (#2946). Otherwise a sign-in from one of them would read as known and skip the
+            # first-seen challenge. Best effort, as at a reset.
+            await self._clear_login_addresses(user_id, username=username)
         else:
             user_id = uuid4().hex
             try:
@@ -4288,6 +4299,7 @@ class AuthService:
             repaired=repaired,
             holder_notice=holder_notice,
             recovery_codes=plain_codes,
+            administrators_at_check=standing_admins,
         )
 
     async def _unexpected_grant_refusal(
@@ -12535,29 +12547,31 @@ class AuthService:
         """Empty the account's known-address record after an administrator's password or MFA reset
         (vault BACKLOG #2946, owner ruling 2026-10-16), so an address learned before the reset, by
         the holder or by whoever the reset shuts out, reads NEW at the next sign-in. Revoking every
-        session does not call this, because revoking is routine.
+        session does not call this, because revoking is routine. A ``provision-admin`` takeover
+        calls it too (vault BACKLOG #3849 B2): the addresses are the earlier holder's.
 
         It leaves one row, ``_LOGIN_ADDRESS_RESET_MARKER``, stamped at the epoch so the lookback
         read never returns it. An account that never stamped ``last_login_at`` would otherwise read
         as having no baseline, and its next sign-in would fail open as ``UNEVALUATED_NO_BASELINE``
-        rather than be judged NEW. In the usual case the prune after the next real write removes
-        it, and that write has just added a real row; ``delete_user`` and a later reset also remove
-        it. Every reset leaves it, an account that never signed in included, as the ruling asks.
+        rather than be judged NEW. The store's prune never removes it, so it stays until
+        ``delete_user`` or a later reset (vault BACKLOG #3849 B4); it is never a match. Every reset
+        leaves it, an account that never signed in included, as the ruling asks.
+
+        **The delete and the marker are one store transaction** (``reset_login_addresses``, vault
+        BACKLOG #3849 B4). Before that they were two calls, so a failure between them, or a
+        sign-in's prune racing the marker, could leave the record empty, which reads as no
+        baseline. A sign-in's prune can no longer remove the marker either.
 
         Best-effort and never raising, for the reason :meth:`_mark_login_address_known` gives: the
         reset's credential write has committed, and its reply carries the one-time credential. A
-        failure is logged at ERROR with the username, and the reset stands with the record as the
-        failure left it: unchanged, or emptied with no marker. The two calls are separate
-        transactions, so any record write still in flight for the account, from a sign-in, a
-        step-up, a factor proof or an enrolment, can land after the delete."""
+        failure is logged at ERROR with the username, and the reset stands with the record
+        unchanged. Any record write still in flight for the account, from a sign-in, a step-up, a
+        factor proof or an enrolment, can still land after the reset's transaction."""
         # The notice debounce goes too, so the first NEW sign-in after the reset is also mailed.
         for key in [k for k in self._login_new_ip_noticed if k[0] == user_id]:
             del self._login_new_ip_noticed[key]
         try:
-            await self._store.forget_login_addresses(user_id, before=_LOGIN_ADDRESS_FOREVER)
-            # Stamped at the epoch, so the lookback read never returns it and only the any-age
-            # baseline read sees it.
-            await self._store.remember_login_address(user_id, _LOGIN_ADDRESS_RESET_MARKER, now=0.0)
+            await self._store.reset_login_addresses(user_id)
         except Exception:
             _log.exception(
                 "could not clear the known sign-in addresses of %s after a reset; the reset stands, "
