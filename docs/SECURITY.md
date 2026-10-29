@@ -6256,6 +6256,35 @@ process for each relay, by the security notifier when it is built rather than at
 a failed TLS key-exchange pin is logged once per process. **The cost of the tee line:** a sink that
 stays broken, or recovers and breaks again, is reported only by that first line.
 
+**The forwarder's audit lane (vault BACKLOG #2612) leaves at least these on the channel.**
+[CONFIGURATION.md](CONFIGURATION.md) describes the lane under `[logging]`, and this paragraph
+states only what it leaves a `logs:view` or `monitoring:read` reader without `users:manage`.
+`queued` on `GET /status` counts both lanes, capped at the smaller lane bound, so once either
+lane is full it is pinned there and does not move with audit rows; an uncapped depth over
+both lanes would have risen by one per row. The two shutdown lines in the engine log, which
+`GET /logs/tail` serves, take the same cap: the count of records moved to the spool at the drain
+deadline and the count left undelivered are capped together at that bound, the undelivered count
+first, as a single queue's never passed it. Each line says "at least". At least `queued` and those
+two lines read the queue only through `_published_counts` in `messagefoundry/logging_setup.py`.
+**Not closed:** when the spool fills part way through the shutdown drain, how the capped total
+splits between the two lines depends on how many records, and how many bytes, the spool took
+before it filled, and both can move with audit rows below the cap. **The cost of the cap:** past
+the cap, neither line counts every record, so each is a floor and not a total. **Not closed, as on the single queue:** below the cap,
+`queued` rises by one per audit row waiting, the same reading a single queue of that bound gives.
+Counting the audit lane is what lets a collector that stalls while only audit lines arrive show a
+rising depth. While the general lane is draining but not full, audit lines are served ahead of it,
+so each audit row can delay one general line.
+The drop warning, which `GET /logs/tail` serves, and the `log_forward_failed` alert never say which
+lane dropped; what they carry is stated once, in CONFIGURATION.md under `[logging]`.
+**Not closed:** the drop counts on `GET /status`, in the warning and in the alert include dropped
+audit tee lines, as the single queue's did. At least these let them track audit rows. While only
+the audit lane drops, they rise by one per audit row written. `queued` then reads the cap, as it
+does while the general lane drops, so it does not tell that reader which lane is dropping. While only the general lane drops, each audit line the forwarder
+sends takes a turn that would have freed a general slot, so they rise by about one more per audit
+row sent. And the forwarder sits on the root logger, so a drop warning written while the general
+lane is full is itself dropped and counted, while one written for an audit-lane drop fits: the
+same drops give totals one apart by lane.
+
 **A notice the relay loses is audited (BACKLOG #2383).** The `auth.lock_notice` row is written
 when the notice is handed to the relay. It reads `mailed: true` only when the relay queued the
 notice: one its full queue dropped, or one it refused because it had begun to close, reads
@@ -6366,8 +6395,8 @@ onto keyless rows fails the verify, and is also reported as
 | Exit | Meaning |
 |---|---|
 | `0` | A clean walk, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. It covers at least one row, unless `--allow-empty` or an expected anchor of `0:` accepted an empty log (see exit `3`). |
-| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. A key, key-provider or database error that stops the check part way prints one too, such as a Transit outage or a row that is not UTF-8. That line names the error's class and its cause's class, never its text. It says the rest of the chain was not checked. Before vault BACKLOG #3054 these exited 1 or 2 with no `FAIL` line. An error the command does not classify still exits 1 with none. |
-| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), and an empty log in a shell that holds no key and whose settings require one. |
+| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, an expected row (`--expected-row`, `--expected-rows-file`) that is gone or whose hash differs, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. A key, key-provider or database error that stops the check part way prints one too, such as a Transit outage or a row that is not UTF-8. That line names the error's class and its cause's class, never its text. It says the rest of the chain was not checked. Before vault BACKLOG #3054 these exited 1 or 2 with no `FAIL` line. An error the command does not classify still exits 1 with none. |
+| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), a malformed expected row, two expected rows giving one `seq` different hashes, or an `--expected-rows-file` that cannot be read, is not UTF-8, is over its bound or holds no pair (vault BACKLOG #2612), and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
 | `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. It prints a `NOT CHECKED` line. This is not a pass. |
 | `5` | The chain is keyless and walked clean as plain SHA-256. This shell holds no key, and its settings require one. So the chain was not checked to their standard. It prints a `NOT CHECKED` line and a `WARNING` on stderr. This is not a pass. Before vault BACKLOG #3054 it exited 0. The paragraph on the setup where this goes wrong, below, says what a move between 4 and 5 means. |
@@ -6464,7 +6493,26 @@ while the chain is still quiesced (a maintenance window, a DB move, a backup/res
 hand-off). Anchoring and re-verifying in one breath compares a value to itself, and a held anchor
 re-checked against a **running** engine alarms on every boot, because a running engine writes audit
 rows; for continuous coverage the off-box tee is still the control ([BACKLOG #328](BACKLOG.md); the
-`[retention].audit_days` row in [`CONFIGURATION.md`](CONFIGURATION.md) is the source of record). Every audit row carries a
+`[retention].audit_days` row in [`CONFIGURATION.md`](CONFIGURATION.md) is the source of record).
+To check the store against that tee, pass the pairs it forwarded back as `messagefoundry audit-verify
+--expected-row SEQ:ROW_HASH` (repeatable), or `--expected-rows-file PATH` with one pair per line, in
+a UTF-8 file within the size bound its `--help` states (vault BACKLOG #2612). Each pair asks whether the row at `seq` is
+still in the chain with that `row_hash`. Each row hash chains in the one before it, so a pair that
+matches also vouches for every row below it, and unlike the exact anchor a pair stays valid as the
+chain grows. Once the store opens and the walk finishes, a pair whose row is gone, or whose hash
+differs, is a broken chain, exit 1; a pair set the command refuses is exit 2. The exit table above
+is the source of record for both, and still governs a store that does not open. Key the pairs on `seq`, never on the record's `row_id`,
+which can skip numbers. All the pairs are checked in one walk of the chain, which matters under
+`vault_transit`, where each row costs a Transit round trip. **The pairs witness only as well as the
+copy they came from.** A pair is only as authentic as the collector's record of it, and a forwarder
+hop that drops lines loses witnesses. The forwarder counts some losses on `GET /status` and in
+`log_forward_failed`, at least what its queue and spool drop and, over TCP or TLS, what a failed
+send costs. At least these are counted nowhere there: a datagram lost over UDP, bytes a TCP
+collector's reset loses after a send returned, and, with no spool configured or with the spool
+full, records still queued at the shutdown drain deadline, which only a log line reports. With a
+spool that has room they are kept and sent after the next start, and a log line gives a floor on
+how many, capped at the smaller lane bound. `audit-verify` does not say which rows had no pair; read the tee's own limits, in
+`messagefoundry/store/audit_tee.py`, before resting a control on an export. Every audit row carries a
 `row_hash` from the moment it is written: the column is `NOT NULL` on all three backends and the
 startup backfill that used to chain pre-feature rows was deleted with it (BACKLOG #1198), because a
 row it could repair can no longer be written. The `client` address is folded **inside** the chained
