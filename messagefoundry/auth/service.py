@@ -185,6 +185,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     TotpState,
     UserAuthzRecord,
+    UsernameAuditAppendError,
     UserRecord,
     UserRow,
     VerifiedUser,
@@ -8665,10 +8666,12 @@ class AuthService:
         is at the skip below, and only there). True for the reconciler: a row that holds neither
         the plan's old name nor its new one is skipped. False for the login, which writes.
 
-        ``audit_soft`` is passed by the reconciler alone (BACKLOG #3018), so its audit writes go
-        through :meth:`_audit_reconciler_row`. The login path leaves it off, so there a refused
-        write still fails the sign-in, as it always has. It also lets a store fault on the ``held``
-        re-read skip the rename rather than raise (BACKLOG #3070; the reason is at that read).
+        ``audit_soft`` is passed by the reconciler alone (BACKLOG #3018), so its conflict rows go
+        through :meth:`_audit_reconciler_row`, and a refused append of the rename's own row, which
+        commits with the write (step 7), rolls the rename back and is logged rather than raised.
+        The login path leaves it off, so there a refused write still fails the sign-in, as it always
+        has. It also lets a store fault on the ``held`` re-read skip the rename rather than raise
+        (BACKLOG #3070; the reason is at that read).
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -8922,12 +8925,49 @@ class AuthService:
                 holder_id = held.id if current.user is None else current.user.id
                 await _refuse(holder_id, "pre_check", before.username)
                 return
+        # BACKLOG #3018 step 7. The success row commits in the write's own transaction, and only
+        # when the write lands, as ``create_user``'s rows do. Written after the commit, a refused
+        # row left the name moved with no row, and no later refresh wrote one: it read the new name
+        # and returned at the no-op above.
+        refreshed = AuditAppend(
+            "auth.ad_username_refreshed",
+            actor=new_username,
+            detail=_json({"user_id": user_id, "source": "directory"}),
+            client=client,
+        )
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
             # row running at once only one writes.
             written = await self._store.set_user_username(
-                user_id, new_username, expected_username=before.username
+                user_id, new_username, expected_username=before.username, audits=(refreshed,)
             )
+        except UsernameAuditAppendError as exc:
+            # The rename wrote, then its row failed to append, so the store rolled both back: the
+            # row keeps its old name and nobody is told. CAUGHT BEFORE THE ARM BELOW, because the
+            # append can raise its driver's integrity class, which that arm would read as a lost
+            # race and audit as a conflict with a false lockout warning.
+            #
+            # A sign-in raises the append's own error, as a refused row always failed it. The
+            # reconciler (``audit_soft``) logs a store refusal at ERROR and goes on, as
+            # ``_audit_reconciler_row`` does for its rows: a raise here would end the pass and skip
+            # every later account's revocation (BACKLOG #3018 step 1). The row still holds the old
+            # name, so a later pass that probes the account, or its next sign-in, renames it again
+            # and writes the row and the notice then. A defect still raises.
+            cause = exc.cause
+            if (
+                not audit_soft
+                or isinstance(cause, AUDIT_WRITE_DEFECTS)
+                or not isinstance(cause, audit_write_errors())
+            ):
+                raise cause from None
+            _log.error(
+                "directory reconcile: the auth.ad_username_refreshed audit row for %s could not be "
+                "written, so its rename was rolled back and nobody was told; a later pass that "
+                "probes the account, or its next sign-in, applies it again (BACKLOG #3018)",
+                scrub_log_argument(new_username),
+                exc_info=cause,
+            )
+            return
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
             # (see this method's docstring and the measured note in `store/postgres.py`).
@@ -8975,11 +9015,12 @@ class AuthService:
             winner = await self._load_user_by_username(new_username)
             await _refuse(winner.id if winner is not None else None, "write_race", before.username)
             return
-        # AUDIT SUCCESS ONLY ON A WRITE THAT LANDED. The UPDATE can match zero rows and raise
-        # nothing, so an unconditional success audit would report a rename that did not happen. An
-        # audit trail that says a name moved when it did not is worse than a missing row: an operator
-        # reconciling "who is this account" against the directory would take the engine's word for a
-        # state neither side is in.
+        # AUDIT SUCCESS ONLY ON A WRITE THAT LANDED, which the store now enforces: it appends the
+        # row only when the UPDATE wrote (BACKLOG #3018 step 7). The UPDATE can match zero rows and
+        # raise nothing, so an unconditional success audit would report a rename that did not
+        # happen. An audit trail that says a name moved when it did not is worse than a missing row:
+        # an operator reconciling "who is this account" against the directory would take the
+        # engine's word for a state neither side is in.
         #
         # ``False`` covers three cases, and the re-read below tells them apart.
         #   - The row is gone, deleted between the pre-read and the write: ``row_gone``.
@@ -9014,12 +9055,6 @@ class AuthService:
                     scrub_log_argument(after.username),
                 )
             return
-        await write_audit(
-            "auth.ad_username_refreshed",
-            actor=new_username,
-            detail=_json({"user_id": user_id, "source": "directory"}),
-            client=client,
-        )
         # BACKLOG #2017, ASVS 6.3.7: a username change is an update to the account's authentication
         # details, so the holder is told out of band as well as audited. THIS IS THE ONE PLACE THE
         # RULE FOR WHEN IT IS SENT LIVES: only here, after the pre-read showed a different name and
@@ -9429,8 +9464,10 @@ class AuthService:
         each paging refusal's ``auth.ad_reconcile_paging_refused`` row (vault BACKLOG #3696), which
         names the account as ``actor``. Since BACKLOG #3018 they also include each account's
         ``auth.ad_session_revoked`` row and, on the reconciler's call only, a rename's
-        ``auth.ad_username_refreshed`` and ``auth.ad_username_refresh_conflict`` rows; those name
-        the account as ``actor``. **A failed write here does not end the pass.** If it raised, the
+        ``auth.ad_username_refresh_conflict`` row; those name the account as ``actor``. A rename's
+        ``auth.ad_username_refreshed`` row is not written here: it commits in the rename's own
+        transaction (BACKLOG #3018 step 7), and :meth:`_refresh_cached_username` says what a refused
+        one does. **A failed write here does not end the pass.** If it raised, the
         pass would return no plan, and the lifespan task would raise no alert for the revocations
         already applied, nor for the hold, the breaker, the referral, the probe fault, the
         configuration refusal or a paging refusal. It would also skip every account after this
@@ -9438,8 +9475,8 @@ class AuthService:
         names is logged at ERROR, naming the action and the actor, and the pass goes on. Any other
         error still raises and ends the pass. The log line is the only record of a refused row: nothing retries it.
 
-        A revocation or rename these rows record has already committed; the conflict row records a
-        rename that was refused. A revocation's notice is sent inline, so it still goes. **A
+        A revocation these rows record has already committed; the conflict row records a rename
+        that was refused. A revocation's notice is sent inline, so it still goes. **A
         revocation's alert is raised only from the returned plan.** Something later in the same pass
         can still raise and end it, such as a store read or a write that is not a soft audit write.
         Then an earlier account whose own row was refused has neither its row nor its alert, only

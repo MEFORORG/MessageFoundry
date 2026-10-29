@@ -266,6 +266,7 @@ from messagefoundry.store.store import (
     _transit_attestation_row,
     ad_map_write,
     admin_guard_counts,
+    append_rename_audits,
     approval_update,
     audit_active_key_id,
     audit_append_refusal,
@@ -8981,7 +8982,13 @@ class PostgresStore:
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def set_user_username(
-        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+        self,
+        user_id: str,
+        username: str,
+        *,
+        expected_username: str,
+        now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=$4` on the old name makes it a compare-and-set; AuthStore says
@@ -9024,6 +9031,11 @@ class PostgresStore:
         # BACKLOG #2592: the guard is now a read in the same transaction, then the sealed write
         # under the account's row lock. It still only narrows the window, as above, and the
         # unique index is still what refuses the loser.
+        #
+        # BACKLOG #3018 step 7: ``audits`` are appended only when the write landed, inside its
+        # transaction, so a failed append rolls the rename back (AuthStore says why). The append
+        # takes the audit advisory lock while the write holds the account's row lock, the order
+        # ``_execute_with_audits`` uses.
         now = time.time() if now is None else now
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             taken = await conn.fetchrow(
@@ -9040,7 +9052,11 @@ class PostgresStore:
                     else None
                 ),
             )
-        return written is not None
+            if written is None:
+                return False
+            appended = await append_rename_audits(self._append_audits(conn, audits, now=now))
+        tee_audits(audits, appended, ts=now)
+        return True
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its

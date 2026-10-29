@@ -6621,6 +6621,33 @@ def tee_audits(
         audit.tee(ts=ts, row=row)
 
 
+class UsernameAuditAppendError(Exception):
+    """``set_user_username`` wrote the new name, then failed to append its ``audits`` (BACKLOG
+    #3018 step 7). The write's transaction rolled back, so the row keeps its old name and no row
+    was appended. ``cause`` is what the append raised.
+
+    A class of its own because the append's error can share a class with the UPDATE's. Each
+    backend's append can raise its driver's integrity error, and the caller reads that class as a
+    lost race for the name, then audits a conflict and warns of a lockout nobody faces. The name
+    carries neither "Integrity" nor "UniqueViolation", so ``AuthService``'s integrity test, which
+    matches on those names, never reads this as a race. Only ``set_user_username`` raises it."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(f"the rename's audit row could not be appended ({type(cause).__name__})")
+        self.cause = cause
+
+
+async def append_rename_audits(
+    appending: Awaitable[list[AppendedAuditRow]],
+) -> list[AppendedAuditRow]:
+    """Await a rename's audit appends, raising :class:`UsernameAuditAppendError` if they fail.
+    Called inside the rename's transaction, so the raise rolls the rename back too."""
+    try:
+        return await appending
+    except Exception as exc:
+        raise UsernameAuditAppendError(exc) from exc
+
+
 type OperatorAudit[R] = Callable[[R], AuditAppend | None]
 """The audit row an operator mutation commits WITH its change, built from the change's result.
 
@@ -15734,7 +15761,13 @@ class MessageStore:
         return UserRecord.from_mapping(dict(row)) if row else None
 
     async def set_user_username(
-        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+        self,
+        user_id: str,
+        username: str,
+        *,
+        expected_username: str,
+        now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says why
@@ -15766,7 +15799,11 @@ class MessageStore:
         # BACKLOG #2592: the compare and the NOT EXISTS are now a read inside the same writer
         # transaction, then the sealed write; the lock and SQLite's file-level writer lock still
         # order it against every other writer as the comment above describes.
+        #
+        # BACKLOG #3018 step 7: ``audits`` are appended only when the write landed, before the one
+        # commit, so a failed append rolls the rename back (AuthStore says why).
         now = time.time() if now is None else now
+        appended: list[AppendedAuditRow] = []
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)
@@ -15782,8 +15819,13 @@ class MessageStore:
                         else None
                     ),
                 )
+            if written is not None:
+                appended = await append_rename_audits(self._append_audits(audits, now=now))
             await self._commit()
-            return written is not None
+        if written is None:
+            return False
+        tee_audits(audits, appended, ts=now)
+        return True
 
     async def list_users(self) -> list[UserRecord]:
         async with self._read() as db:

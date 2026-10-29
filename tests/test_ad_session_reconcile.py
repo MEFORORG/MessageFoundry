@@ -24,7 +24,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, get_args
@@ -66,6 +66,7 @@ from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AuditAppend,
     MessageStore,
     UserRecord,
     VerifiedUser,
@@ -4484,10 +4485,15 @@ async def test_two_refreshes_of_one_rename_at_once_write_audit_and_notify_once(
         set_user_username = store.set_user_username
 
         async def _count_write(
-            user_id: str, username: str, *, expected_username: str, now: float | None = None
+            user_id: str,
+            username: str,
+            *,
+            expected_username: str,
+            now: float | None = None,
+            audits: Sequence[AuditAppend] = (),
         ) -> bool:
             wrote = await set_user_username(
-                user_id, username, expected_username=expected_username, now=now
+                user_id, username, expected_username=expected_username, now=now, audits=audits
             )
             writes.append(wrote)
             return wrote
@@ -5266,42 +5272,111 @@ async def test_a_defect_in_a_revocation_audit_write_is_still_raised(
         await store.close()
 
 
-async def test_a_refused_rename_audit_row_does_not_stop_the_next_rename(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """BACKLOG #3018 steps 1 and 3, for ``_refresh_cached_username`` on the reconciler. The store
-    refuses the first rename's ``auth.ad_username_refreshed`` row. That rename has already
-    committed and its user is still told; the second rename is still applied and audited, and the
-    pass returns its plan. No later pass writes the missing row: that is the item's step 7."""
+def _refuse_first_append(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str, refusal: Exception
+) -> list[str]:
+    """Make the store's chain append refuse the first ``action`` row it sees, inside the write
+    that carries it. A rename's ``auth.ad_username_refreshed`` row commits with the rename
+    (BACKLOG #3018 step 7), so it never reaches ``record_audit``, which ``_refuse_first`` patches.
+    Returns the refused row's actor, once there is one."""
+    real_append = store._append_audit_row
+    refused: list[str] = []
+
+    async def failing(name: str, **kwargs: Any) -> Any:
+        if name == action and not refused:
+            refused.append(kwargs["actor"])
+            raise refusal
+        return await real_append(name, **kwargs)
+
+    monkeypatch.setattr(store, "_append_audit_row", failing)
+    return refused
+
+
+async def _two_renamed_accounts() -> tuple[
+    MessageStore, AuthService, _CapturingNotifier, _FakeLdap
+]:
+    """``jdoe`` and ``asmith`` signed in, then renamed in the directory to ``<name>-new``."""
     store = await MessageStore.open(":memory:")
+    names = ("jdoe", "asmith")
+    ldap = _FakeLdap({n: _principal(n) for n in names})
+    service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+    notifier = _CapturingNotifier()
+    service._security_notifier = notifier
+    await service.initialize()
+    for name in names:
+        await _signed_in_ad_user(service, store, name)
+    notifier.sent.clear()
+    ldap.present = {f"{n}-new": _principal(f"{n}-new", object_id=_object_id_for(n)) for n in names}
+    return store, service, notifier, ldap
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        sqlite3.OperationalError("synthetic: disk I/O error"),
+        # The integrity class too: the append can raise it, and the write-race arm would read it as
+        # a lost race for the name (the brief's trap 1).
+        sqlite3.IntegrityError("synthetic: UNIQUE constraint failed: audit_log.seq"),
+        CipherError("synthetic: Transit down"),
+    ],
+    ids=["driver", "integrity", "transit-mac"],
+)
+async def test_a_refused_rename_audit_row_rolls_the_rename_back_and_a_later_pass_writes_it(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, refusal: Exception
+) -> None:
+    """BACKLOG #3018 step 7: a directory rename is never applied without its audit row. The store
+    refuses the first rename's ``auth.ad_username_refreshed`` row, which commits in the rename's own
+    transaction, so that rename rolls back and its user is not told. The second rename is still
+    applied, audited and told, and the pass returns its plan (step 1). The refusal is logged at
+    ERROR, and is not read as a name conflict. A later pass then writes the rename, its row and its
+    notice. Before step 7 the name moved, the row was lost, and no later pass ever wrote it."""
+    store, service, notifier, _ldap = await _two_renamed_accounts()
     try:
-        names = ("jdoe", "asmith")
-        ldap = _FakeLdap({n: _principal(n) for n in names})
-        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
-        notifier = _CapturingNotifier()
-        service._security_notifier = notifier
-        await service.initialize()
-        for name in names:
-            await _signed_in_ad_user(service, store, name)
-        notifier.sent.clear()
-        refusal = sqlite3.OperationalError("synthetic: disk I/O error")
-        refused = _refuse_first(monkeypatch, store, "auth.ad_username_refreshed", refusal)
-        ldap.present = {
-            f"{n}-new": _principal(f"{n}-new", object_id=_object_id_for(n)) for n in names
-        }
-        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+        refused = _refuse_first_append(monkeypatch, store, "auth.ad_username_refreshed", refusal)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
             plan = await service.reconcile_directory_sessions()
-        assert len(refused) == 1, "no rename audit write was refused"
+        assert len(refused) == 1, "no rename audit row was refused"
+        [lost] = refused
+        [kept] = {"jdoe-new", "asmith-new"} - {lost}
         assert plan.aborted is None and len(plan.renames) == 2
-        for name in names:
-            assert await store.get_user_by_username(f"{name}-new") is not None, (
-                "a rename was skipped"
-            )
-        rows = await _actors(store, "auth.ad_username_refreshed")
-        assert rows == sorted({"jdoe-new", "asmith-new"} - set(refused))
-        told = sorted(e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED)
-        assert told == ["asmith-new", "jdoe-new"], "the refused rename's user was not told"
-        assert _logged_at_error(caplog, "auth.ad_username_refreshed", refused[0])
+        assert await store.get_user_by_username(lost) is None, "a rename stood without its row"
+        assert await store.get_user_by_username(kept) is not None, "the next rename was skipped"
+        assert await _actors(store, "auth.ad_username_refreshed") == [kept]
+        told = [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert told == [kept], "a rename that rolled back was told"
+        assert _logged_at_error(caplog, "auth.ad_username_refreshed", lost, "rolled back")
+        assert not await _actors(store, "auth.ad_username_refresh_conflict"), (
+            "a refused audit append was audited as a name conflict"
+        )
+        assert not any("already held by another account" in r.getMessage() for r in caplog.records)
+        assert not any("lost to another writer" in r.getMessage() for r in caplog.records)
+
+        monkeypatch.undo()
+        notifier.sent.clear()
+        await service.reconcile_directory_sessions()
+        assert await store.get_user_by_username(lost) is not None, "the later pass did not rename"
+        assert await _actors(store, "auth.ad_username_refreshed") == sorted([kept, lost])
+        told = [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert told == [lost], "the later pass did not tell the renamed account"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("defect", [NotImplementedError, RecursionError, sqlite3.ProgrammingError])
+async def test_a_defect_in_a_rename_audit_append_is_still_raised(
+    monkeypatch: pytest.MonkeyPatch, defect: type[Exception]
+) -> None:
+    """BACKLOG #3018. The reconciler passes a store refusal of the rename's row and nothing else:
+    a defect still ends the pass, as it does for the pass's own rows. The rename rolled back."""
+    store, service, _notifier, _ldap = await _two_renamed_accounts()
+    try:
+        refused = _refuse_first_append(
+            monkeypatch, store, "auth.ad_username_refreshed", defect("synthetic")
+        )
+        with pytest.raises(defect):
+            await service.reconcile_directory_sessions()
+        assert len(refused) == 1
+        assert await store.get_user_by_username(refused[0]) is None
     finally:
         await store.close()
 
@@ -5334,22 +5409,34 @@ async def test_a_refused_rename_conflict_audit_row_does_not_end_the_pass(
         await store.close()
 
 
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        sqlite3.OperationalError("synthetic: disk I/O error"),
+        sqlite3.IntegrityError("synthetic: UNIQUE constraint failed: audit_log.seq"),
+    ],
+    ids=["driver", "integrity"],
+)
 async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, refusal: Exception
 ) -> None:
     """BACKLOG #3018 leaves sign-in alone: only the reconciler passes ``audit_soft``. Called the way
-    the login path calls it, a refused ``auth.ad_username_refreshed`` write still raises."""
+    the login path calls it, a refused ``auth.ad_username_refreshed`` row still raises its own
+    error, and since step 7 the rename rolls back with it, so the name never moves without its row.
+    An integrity error from the append raises too, rather than being read as a lost race."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap({"jdoe": _principal("jdoe")})
         service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
         await service.initialize()
         await _signed_in_ad_user(service, store, "jdoe")
         jdoe = await store.get_user_by_username("jdoe")
         assert jdoe is not None
-        refusal = sqlite3.OperationalError("synthetic: disk I/O error")
-        refused = _refuse_first(monkeypatch, store, "auth.ad_username_refreshed", refusal)
-        with pytest.raises(sqlite3.OperationalError):
+        notifier.sent.clear()
+        refused = _refuse_first_append(monkeypatch, store, "auth.ad_username_refreshed", refusal)
+        with pytest.raises(type(refusal), match="synthetic"):
             await service._refresh_cached_username(
                 user_id=jdoe.id,
                 old_username="jdoe",
@@ -5358,6 +5445,11 @@ async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
                 from_plan=False,
             )
         assert refused == ["jdoe-new"]
+        after = await store.get_user(jdoe.id)
+        assert after is not None and after.username == "jdoe", "the rename stood without its row"
+        assert not await _actors(store, "auth.ad_username_refreshed")
+        assert not await _actors(store, "auth.ad_username_refresh_conflict")
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
     finally:
         await store.close()
 

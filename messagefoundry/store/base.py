@@ -2134,7 +2134,13 @@ class AuthStore(Protocol):
         ...
 
     async def set_user_username(
-        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+        self,
+        user_id: str,
+        username: str,
+        *,
+        expected_username: str,
+        now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> bool:
         """Refresh the **cached** username on a directory-backed row (BACKLOG #1532).
 
@@ -2143,6 +2149,14 @@ class AuthStore(Protocol):
         Returns ``True`` only when that row was updated. ``False`` means nothing was written: the
         row is gone, another caller changed its name first, or another row holds ``username``. The
         caller re-reads to tell those apart.
+
+        **``audits`` are appended only when the write lands, in its transaction (BACKLOG #3018
+        step 7).** So no rename commits without its row, and a write that matched nothing appends
+        none. Before this the caller wrote its row after the commit, and a failed write there left
+        a moved name with no row; the next refresh saw the new name and wrote nothing, so no row
+        ever followed. An append that fails rolls the rename back and raises
+        :class:`~messagefoundry.store.store.UsernameAuditAppendError`, whose ``cause`` is the
+        append's own error, so a caller can tell it from an integrity error the UPDATE raised.
 
         Two refreshes of one row can run at once, a sign-in and a reconciler pass. Both read the old
         name, so without the compare both would write, and both would audit and notify one rename.

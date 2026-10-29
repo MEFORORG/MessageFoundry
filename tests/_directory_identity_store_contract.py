@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from messagefoundry.store.store import AuditAppend, UsernameAuditAppendError
+
 #: A bound account's directory id, in the ONE spelling ``auth/ldap.py``'s normaliser emits
 #: (``str(uuid.UUID(...))`` -- lower-case, hyphenated, unbraced).
 BOUND_GUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
@@ -209,7 +211,8 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     an assertion here rather than a hope.
 
     Since BACKLOG #2290 the write is also a compare-and-set on the old name, and it returns whether
-    it wrote. Every step asserts that answer, and step 5 is the compare itself.
+    it wrote. Every step asserts that answer, and step 5 is the compare itself. Steps 6 and 7 are
+    the write's ``audits`` (BACKLOG #3018 step 7).
     """
     await store.create_user(
         user_id="rename-me",
@@ -313,6 +316,50 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     # set a value the row already held.
     assert stale_after.updated_at == stale_before.updated_at, "a stale write touched the row"
     assert await store.get_user_by_username("jdoe-loses") is None
+
+    # 6. THE AUDIT ROWS COMMIT WITH THE WRITE, AND ONLY WITH IT (BACKLOG #3018 step 7). A write that
+    #    lands appends its row; a collision and a stale compare append none.
+    async def refreshed() -> list[str]:
+        rows = await store.list_audit(action="auth.ad_username_refreshed", limit=100)
+        return sorted(str(r["actor"]) for r in rows)
+
+    def row(actor: str) -> AuditAppend:
+        return AuditAppend("auth.ad_username_refreshed", actor=actor, detail='{"user_id": "x"}')
+
+    assert await store.set_user_username(
+        "rename-me", "jdoe-audited", expected_username="jdoe-wins", audits=(row("jdoe-audited"),)
+    )
+    assert await refreshed() == ["jdoe-audited"], "a rename that landed lost its audit row"
+    assert not await store.set_user_username(
+        "rename-me", "taken", expected_username="jdoe-audited", audits=(row("taken"),)
+    )
+    assert not await store.set_user_username(
+        "rename-me", "jdoe-stale", expected_username="jdoe-wins", audits=(row("jdoe-stale"),)
+    )
+    assert await refreshed() == ["jdoe-audited"], "a write that matched nothing was audited"
+
+    # 7. AN APPEND THAT FAILS ROLLS THE RENAME BACK, and says it was the append. Its own class, so
+    #    the caller cannot read the append's error as the UPDATE's integrity error.
+    refusal = RuntimeError("synthetic: the audit chain refused the row")
+
+    async def refuse(*_a: object, **_kw: object) -> list[object]:
+        raise refusal
+
+    store._append_audits = refuse
+    try:
+        try:
+            await store.set_user_username(
+                "rename-me", "jdoe-lost", expected_username="jdoe-audited", audits=(row("lost"),)
+            )
+        except UsernameAuditAppendError as exc:
+            assert exc.cause is refusal
+        else:
+            raise AssertionError("a refused audit append did not raise")
+    finally:
+        del store._append_audits
+    kept = await store.get_user("rename-me")
+    assert kept is not None and kept.username == "jdoe-audited", "the rename outlived its row"
+    assert await refreshed() == ["jdoe-audited"]
 
 
 async def _assert_username_compare_is_byte_exact(store: Any) -> None:

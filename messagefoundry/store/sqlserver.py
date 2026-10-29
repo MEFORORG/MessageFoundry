@@ -55,6 +55,7 @@ from contextlib import (
     AsyncExitStack,
     asynccontextmanager,
     contextmanager,
+    nullcontext,
 )
 from dataclasses import replace
 from functools import partial
@@ -268,6 +269,7 @@ from messagefoundry.store.store import (
     _transit_attestation_row,
     ad_map_write,
     admin_guard_counts,
+    append_rename_audits,
     approval_update,
     audit_active_key_id,
     audit_append_refusal,
@@ -14216,7 +14218,13 @@ class SqlServerStore:
         )
 
     async def set_user_username(
-        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+        self,
+        user_id: str,
+        username: str,
+        *,
+        expected_username: str,
+        now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says
@@ -14254,29 +14262,43 @@ class SqlServerStore:
         #
         # BACKLOG #2592: the guard is now a read in the same transaction, then the sealed write
         # under the account's UPDLOCK. It still only narrows the window, as above.
+        #
+        # BACKLOG #3018 step 7: ``audits`` are appended only when the write landed, before the one
+        # commit, so a failed append rolls the rename back (AuthStore says why). With audits the
+        # in-process ``_audit_lock`` is taken before the connection, the order
+        # ``_execute_with_audits`` uses, and is held across the write as there.
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)
-                )
-                taken = bool(await cur.fetchall())
-                written = None
-                if not taken:
-                    written = await self._write_user(
-                        cur,
-                        user_id,
-                        lambda r: (
-                            r.changed(username=username, updated_at=float(now))
-                            if r.row.username == expected_username
-                            else None
-                        ),
+        appended: list[AppendedAuditRow] = []
+        async with self._audit_lock if audits else nullcontext():  # noqa: SIM117
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    await cur.execute(
+                        "SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)
                     )
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return written is not None
+                    taken = bool(await cur.fetchall())
+                    written = None
+                    if not taken:
+                        written = await self._write_user(
+                            cur,
+                            user_id,
+                            lambda r: (
+                                r.changed(username=username, updated_at=float(now))
+                                if r.row.username == expected_username
+                                else None
+                            ),
+                        )
+                    if written is not None:
+                        appended = await append_rename_audits(
+                            self._append_audits(cur, audits, now=now)
+                        )
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+        if written is None:
+            return False
+        tee_audits(audits, appended, ts=now)
+        return True
 
     async def set_user_federated_subject(
         self,
