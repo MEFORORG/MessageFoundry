@@ -176,6 +176,7 @@ from messagefoundry.pipeline.phase_timing import (
     delivery_phase_timing_enabled,
 )
 from messagefoundry.pipeline.reference_sync import (
+    ReferenceStatementRefused,
     database_source_dsn,
     reference_acquire_timeout,
     reference_connection_name,
@@ -11353,6 +11354,29 @@ def build_check_registry(
         raise WiringError(f"connector build failed: {exc}") from exc
 
 
+#: The label a refused ``DatabaseRef`` statement carries out of the build check (PR 2593 review).
+#: Fixed text, so a reader can tell this refusal from a connector that failed to build.
+REFERENCE_STATEMENT_REFUSED = "reference statement refused (read-only statement test)"
+
+
+def _check_reference_statement(settings: Mapping[str, Any], name: str) -> None:
+    """Run the ``DatabaseRef`` read-only statement test (BACKLOG #2617) for the build check, and
+    raise a refusal as a :class:`WiringError` under :data:`REFERENCE_STATEMENT_REFUSED`.
+
+    Left as it was, :class:`ReferenceStatementRefused` reached :func:`build_check_registry`'s
+    catch-all and read ``connector build failed``, which no connector did. The refusal is raised
+    outside the handler, so it carries no chain; its text is the fixed refusal vocabulary and the
+    set's name, never the statement. A missing statement is a missing setting, not this refusal,
+    and keeps the catch-all's label."""
+    refusal: str | None = None
+    try:
+        reference_statement(settings, name=name)
+    except ReferenceStatementRefused as exc:
+        refusal = str(exc)
+    if refusal is not None:
+        raise WiringError(f"{REFERENCE_STATEMENT_REFUSED}: {refusal}")
+
+
 def _build_check_connectors(
     registry: Registry,
     inbound_bind_host: str,
@@ -11483,13 +11507,13 @@ def _build_check_connectors(
         # env() skip below and a set whose server is not provisioned yet is still tested.
         literal_statement = isinstance(rspec.source.settings.get("statement"), str)
         if literal_statement:
-            reference_statement(rspec.source.settings, name=rname)
+            _check_reference_statement(rspec.source.settings, rname)
         try:
             rsettings = resolve_env_settings(rspec.source.settings, env_values)
         except WiringError:
             continue
         if not literal_statement:
-            reference_statement(rsettings, name=rname)
+            _check_reference_statement(rsettings, rname)
         database_source_dsn(rsettings, connection=reference_connection_name(rname))
         # BACKLOG #3432: the sync reads acquire_timeout by this rule, so an env() value it would
         # refuse fails check here rather than as a failed sync after start. max_rows the same way

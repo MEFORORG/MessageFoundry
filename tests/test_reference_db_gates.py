@@ -222,6 +222,16 @@ def test_the_build_check_refuses_the_statement(statement: str) -> None:
         _check(_raw_registry(statement=statement))
 
 
+def test_the_build_check_labels_a_refused_statement_as_what_it_is() -> None:
+    """A statement refusal is not a connector that failed to build. Red at eb180654f, where it read
+    ``connector build failed: ...``."""
+    with pytest.raises(WiringError) as info:
+        _check(_raw_registry(statement="EXEC dbo.p"))
+    text = str(info.value)
+    assert text.startswith("reference statement refused (read-only statement test): ")
+    assert "connector build failed" not in text
+
+
 def test_the_build_check_refuses_the_statement_of_an_unprovisioned_set() -> None:
     """The statement is a literal, so it is tested even where an ``env()`` server does not resolve
     and the rest of the set is left to its sync."""

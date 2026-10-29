@@ -1036,9 +1036,24 @@ def test_the_reference_sync_max_rows_reads_zero_text_as_off() -> None:
     documented opt-out, exactly as ``0``, and refuses a negative in either spelling."""
     from messagefoundry.pipeline.reference_sync import reference_max_rows
 
-    for off in (0, "0", " 0 ", 0.0):
+    for off in (0, "0", " 0 ", 0.0, "0.0", "0_0", ""):
         assert reference_max_rows({"max_rows": off}) is None, repr(off)
     assert reference_max_rows({"max_rows": " 7 "}) == 7
-    for bad in (-1, "-1"):
+    for bad in (-1, "-1", "1e-400", True, 2.5):
         with pytest.raises(ValueError, match="DATABASE reference source max_rows"):
             reference_max_rows({"max_rows": bad})
+
+
+@pytest.mark.parametrize("off", ["0", "0.0", "0_0", " 0 ", "", 0, 0.0])
+def test_a_lookup_and_a_reference_max_rows_read_zero_as_every_cap_does(off: object) -> None:
+    """``max_rows`` is a cap, so it reads "off" by :func:`cap_setting`'s rule rather than its own.
+    Red at eb180654f: ``"0.0"`` and ``""`` were refused, where every other cap reads them as off."""
+    from messagefoundry.pipeline.reference_sync import reference_max_rows
+
+    assert cap_setting(off, int, knob="k", transport="t") is None
+    assert reference_max_rows({"max_rows": off}) is None
+    executor = DatabaseLookupExecutor(
+        {"clarity": {"server": "db.local", "database": "Clarity", "max_rows": off}},
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert executor._max_rows["clarity"] is None
