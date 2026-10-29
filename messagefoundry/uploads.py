@@ -1656,18 +1656,20 @@ class UploadStore:
         left = set(self._stragglers) | set(self._heartbeats)
         if not left:
             return
-        if self._stragglers:
+        if calls := self._stragglers - self._touches:
             _log.warning(
                 "shutdown: cancelling %d upload ledger call(s) or save-time sweep(s) still "
                 "running after %gs",
-                len(self._stragglers),
+                len(calls),
                 timeout,
             )
         # Each discard is registered after the task's own callbacks, so a reserve's done callback
         # still finds it here and starts no release.
         # A task already done is not cancelled and keeps its own outcome: a reserve that finished
         # in the same pass as the wait's timeout still pays its slot back.
-        for task in left:
+        # Not the touches, which _cancel_touches has cancelled once already: a second cancel
+        # would cut short the store's unwind of the first.
+        for task in left - self._touches:
             if task.cancel():
                 self._drain_cancelled.add(task)
                 task.add_done_callback(self._drain_cancelled.discard)
@@ -1699,6 +1701,12 @@ class UploadStore:
                 "shutdown: %d cancelled upload task(s) had not finished after %gs",
                 len(stuck),
                 grace,
+            )
+        if unwinding_touches := self._running(set()) & self._touches:
+            # Not waited for, but named: on SQLite one still holds the writer lock as it unwinds.
+            _log.warning(
+                "shutdown: %d cancelled engine-shard reservation touch(es) still unwinding",
+                len(unwinding_touches),
             )
 
     def _shard_refusal(self, *, uploader: str, observed: _Observed) -> UploadQuotaError:

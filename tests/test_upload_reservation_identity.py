@@ -191,6 +191,38 @@ async def test_the_drain_cancels_what_is_left_and_starts_no_release(
     assert await ledger_db.upload_quota_in_flight("u-op") == (1, 2)
 
 
+async def test_the_drain_cancels_a_held_touch_once(tmp_path: Path) -> None:
+    """Vault BACKLOG #3740 item 14. A touch the drain cancelled may take a while to unwind, as the
+    SQLite writer guard's rollback does, and a second cancel would cut that unwind short. Red
+    with the cancel of every task left after the wait: a straggler outlasting the wait put the
+    touch in that set, so it was cancelled twice."""
+    store = _uploads(tmp_path, None)
+    cancels = 0
+
+    async def _touch() -> None:
+        nonlocal cancels
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancels += 1
+            try:
+                await asyncio.sleep(0.3)  # the store's unwind of the cancelled statement
+            except asyncio.CancelledError:
+                cancels += 1
+            raise
+
+    touch = asyncio.ensure_future(_touch())
+    store._touches.add(touch)
+    touch.add_done_callback(store._touches.discard)
+    store._hold(touch)
+    stalled = asyncio.ensure_future(asyncio.Event().wait())
+    store._hold(stalled)  # outlasts the drain's wait, so the cancel pass runs
+    await asyncio.sleep(0)  # the touch starts, so a cancel lands inside it
+    await store.drain_stragglers(0.05, grace=0.5)
+    await asyncio.gather(touch, stalled, return_exceptions=True)
+    assert cancels == 1
+
+
 async def test_the_drain_returns_at_once_with_nothing_left_running(tmp_path: Path) -> None:
     store = _uploads(tmp_path, None)
     await asyncio.wait_for(store.drain_stragglers(timeout=30.0), 1.0)
