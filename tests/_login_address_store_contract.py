@@ -12,11 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from messagefoundry.store.store import LOGIN_ADDRESS_RESET_MARKER
+from messagefoundry.store.store import LOGIN_ADDRESS_RESET_MARKER as _RESET_MARKER
 
-# The marker the store writes and keeps (vault BACKLOG #2946, #3849); tests/test_login_new_ip.py
-# pins that it is the one the auth service names.
-_RESET_MARKER = LOGIN_ADDRESS_RESET_MARKER
 # Larger than any ``last_seen``, and finite, because SQL Server's FLOAT holds no infinity.
 _FOREVER = 1e18
 
