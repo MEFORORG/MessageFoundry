@@ -66,6 +66,7 @@ from messagefoundry.store import crypto_transit, keyprovider_vault
 from messagefoundry.store.crypto import cell_aad
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.privilege import StorePrivilegeReport
+from tests._vault_hop_env import SECRETS, STORE, supply_vault_hop
 from tests.test_revocation_guard_remaining_hops import bare_crl as bare_crl  # noqa: F401  (fixture)
 
 #: Synthetic, never a real credential. The assertions check none of them reaches the output.
@@ -391,13 +392,37 @@ def test_a_kv_mount_named_like_keys_is_not_read_as_a_transit_key() -> None:
     )
 
 
-def test_a_value_error_keeps_its_own_text_and_a_subclass_does_not() -> None:
+def test_a_value_error_keeps_its_own_text_and_a_subclass_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from messagefoundry.privilege_probes import _why
 
-    assert _why(ValueError("lookup-self returned no data")) == (
-        "ValueError: lookup-self returned no data"
-    )
+    # The probe's own shape check, raised where the probe raises it: a lookup with no "data".
+    vault = _FakeVault(caps=_least_caps())
+    monkeypatch.setattr(vault.auth.token, "lookup_self", dict)
+    reading = _reading(vault)
+    assert "token lookup-self failed: ValueError: lookup-self returned no data" in reading.problems
     assert _why(json.JSONDecodeError("server body here", "doc", 0)) == "JSONDecodeError"
+
+
+def test_a_value_error_a_library_raised_keeps_only_its_type_name() -> None:
+    """Vault BACKLOG #3454: ``_why`` kept the text of every plain ``ValueError`` as the engine's
+    own, and a URL parser's quotes the whole network location it refused. RED before the change.
+    An exception never raised has no frame to read, so it keeps only its name too."""
+    import urllib.parse
+
+    from messagefoundry.privilege_probes import _why
+
+    try:
+        urllib.parse.urlsplit("https://:synthetic-pw\u2100x@proxy.synthetic.test")
+    except ValueError as exc:
+        # The premise: exactly the type the old rule trusted, quoting the password.
+        assert type(exc) is ValueError
+        assert "synthetic-pw" in str(exc)
+        assert _why(exc) == "ValueError"
+    else:
+        pytest.fail("the parser accepted the URL")
+    assert _why(ValueError("synthetic-pw")) == "ValueError"
 
 
 def test_a_missing_capability_is_noted_and_is_not_an_over_grant() -> None:
@@ -508,6 +533,7 @@ class _TransitClient:
 
 def test_the_kek_paths_are_the_ones_the_key_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     transit = _RecordingTransit()
+    supply_vault_hop(monkeypatch, STORE)  # required since BACKLOG #2851
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", _KEK)
     monkeypatch.setenv(
         "MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:" + base64.b64encode(b"k" * 32).decode()
@@ -524,6 +550,7 @@ def test_the_transit_paths_are_the_ones_the_cipher_calls(
     monkeypatch: pytest.MonkeyPatch, audit_key: str | None
 ) -> None:
     transit = _RecordingTransit()
+    supply_vault_hop(monkeypatch, STORE)  # required since BACKLOG #2851
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor-data")
     if audit_key is None:
         monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
@@ -548,6 +575,7 @@ def test_the_kv_paths_are_the_ones_the_secret_provider_reads(
             return {"data": {"data": {"value": "synthetic", "pw": "synthetic"}}}
 
     client = type("C", (), {"secrets": type("S", (), {"kv": type("K", (), {"v2": _V2()})()})()})()
+    supply_vault_hop(monkeypatch, SECRETS)  # required since BACKLOG #2851
     monkeypatch.setenv("MEFOR_SECRETS_VAULT_KV_MOUNT", "kv-mefor")
     monkeypatch.setattr(secretprovider_vault, "_build_client", lambda a, t, **_: client)
     refs = ["mefor/ad", "mefor/smtp#pw"]

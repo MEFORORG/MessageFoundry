@@ -469,9 +469,10 @@ FAMILIES: tuple[Family, ...] = (
 #:    keyword), ``CN=svc,OU=`` (a directory DN), the engine's own ``actor=`` audit field, or userinfo
 #:    inside a URL.
 #: 3. **The engine already ruled on this class at the layer that owns it.**
-#:    ``messagefoundry/redaction.py`` scrubs multi-token name runs and states its own residual outright
-#:    -- "the residual is now an adversarially-crafted *single-token* ... identifier" (:16, :69). A
-#:    username IS a single-token identifier. ``docs/PHI.md`` says the same from the other end: the
+#:    ``messagefoundry/redaction.py`` scrubs multi-token name runs, and its module docstring lists a
+#:    *single-token* identifier first among the residuals it names (BACKLOG #3464 rewrote the earlier
+#:    "adversarially-crafted" wording this note used to quote). A username IS a single-token
+#:    identifier. ``docs/PHI.md`` says the same from the other end: the
 #:    forwarded log stream "still carries usernames", and that is its stated reason for gating the
 #:    off-box hop. Scrubbing usernames here would contradict a documented position two layers deep.
 #:

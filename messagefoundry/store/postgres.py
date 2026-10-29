@@ -8764,6 +8764,7 @@ class PostgresStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``. Pass ``expected_anchor``
         from :meth:`audit_anchor` (held out-of-band) to also detect tail-truncation.
@@ -8782,6 +8783,7 @@ class PostgresStore:
             capable=self._audit_keyed_capable(),
             expected_anchor=expected_anchor,
             expected_prefix=expected_prefix,
+            expected_rows=expected_rows,
         )
 
     # --- auth: users / roles / sessions --------------------------------------

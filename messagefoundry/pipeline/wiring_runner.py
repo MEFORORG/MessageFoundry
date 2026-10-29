@@ -176,9 +176,12 @@ from messagefoundry.pipeline.phase_timing import (
     delivery_phase_timing_enabled,
 )
 from messagefoundry.pipeline.reference_sync import (
+    ReferenceStatementRefused,
     database_source_dsn,
     reference_acquire_timeout,
     reference_connection_name,
+    reference_max_rows,
+    reference_statement,
 )
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
@@ -11501,6 +11504,29 @@ def build_check_registry(
         raise WiringError(f"connector build failed: {exc}") from exc
 
 
+#: The label a refused ``DatabaseRef`` statement carries out of the build check (PR 2593 review).
+#: Fixed text, so a reader can tell this refusal from a connector that failed to build.
+REFERENCE_STATEMENT_REFUSED = "reference statement refused (read-only statement test)"
+
+
+def _check_reference_statement(settings: Mapping[str, Any], name: str) -> None:
+    """Run the ``DatabaseRef`` read-only statement test (BACKLOG #2617) for the build check, and
+    raise a refusal as a :class:`WiringError` under :data:`REFERENCE_STATEMENT_REFUSED`.
+
+    Left as it was, :class:`ReferenceStatementRefused` reached :func:`build_check_registry`'s
+    catch-all and read ``connector build failed``, which no connector did. The refusal is raised
+    outside the handler, so it carries no chain; its text is the fixed refusal vocabulary and the
+    set's name, never the statement. A missing statement is a missing setting, not this refusal,
+    and keeps the catch-all's label."""
+    refusal: str | None = None
+    try:
+        reference_statement(settings, name=name)
+    except ReferenceStatementRefused as exc:
+        refusal = str(exc)
+    if refusal is not None:
+        raise WiringError(f"{REFERENCE_STATEMENT_REFUSED}: {refusal}")
+
+
 def _build_check_connectors(
     registry: Registry,
     inbound_bind_host: str,
@@ -11617,24 +11643,33 @@ def _build_check_connectors(
         DatabaseLookupExecutor(resolved_lookups, egress=egress)  # checks each server first
     # Vault BACKLOG #2354: a DATABASE reference source's DSN, built (and discarded) under this
     # posture, so weakened TLS that every sync would refuse fails check, dry-run and reload rather
-    # than only surfacing as a failed sync after start. TLS and auth only: the egress allowlist and
-    # the statement checks stay at sync. Builds no pool and opens no socket. A source whose env()
-    # values do not resolve here is left to its sync, as before, so one unprovisioned set does not
-    # refuse the whole graph.
+    # than only surfacing as a failed sync after start. The egress allowlist stays at sync; the
+    # read-only statement test runs here and again at sync (BACKLOG #2617). Builds no pool and opens
+    # no socket. A source whose env() values do not resolve here is left to its sync, as before, so
+    # one unprovisioned set does not refuse the whole graph.
     # Every source kind, and before the unresolved-env skip below: this refusal needs no value. The
     # same call Engine.start makes (vault BACKLOG #3139).
     refuse_reference_hop_flags(registry)
     for rname, rspec in registry.references.items():
         if rspec.source.kind != "database":
             continue
+        # BACKLOG #2617: a literal statement is tested before the env() skip below, so a set whose
+        # server is not provisioned yet is still tested; an env() statement is tested once resolved.
+        literal_statement = isinstance(rspec.source.settings.get("statement"), str)
+        if literal_statement:
+            _check_reference_statement(rspec.source.settings, rname)
         try:
             rsettings = resolve_env_settings(rspec.source.settings, env_values)
         except WiringError:
             continue
+        if not literal_statement:
+            _check_reference_statement(rsettings, rname)
         database_source_dsn(rsettings, connection=reference_connection_name(rname))
         # BACKLOG #3432: the sync reads acquire_timeout by this rule, so an env() value it would
-        # refuse fails check here rather than as a failed sync after start.
+        # refuse fails check here rather than as a failed sync after start. max_rows the same way
+        # (BACKLOG #2617).
         reference_acquire_timeout(rsettings)
+        reference_max_rows(rsettings)
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         resolved_fhir_lookups[fname] = _fhir_lookup_settings(fspec, env_values, egress)

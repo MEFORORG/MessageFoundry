@@ -23,6 +23,7 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.store import keyprovider_vault
 from messagefoundry.store.keyprovider import KeyProviderError
+from tests._vault_hop_env import STORE, supply_vault_hop
 
 _AT_REST_ENV = (
     "MEFOR_STORE_ENCRYPTION_KEY",
@@ -56,6 +57,7 @@ def _select_the_vault_provider(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "vault")
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "mefor-store-kek")
     monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
+    supply_vault_hop(monkeypatch, STORE)  # required since BACKLOG #2851
     return str(tmp_path / "vault.db")
 
 

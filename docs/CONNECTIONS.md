@@ -1876,7 +1876,7 @@ in-process layers are defence in depth and neither is authority:
 | Layer | What it does | What it cannot do |
 |---|---|---|
 | Statement gate (`_require_read_only`) | refuses a statement that does not open with `SELECT`/`WITH`, or that carries a write/`EXEC`/DDL keyword outside a literal or comment, or that chains a second statement | it reads text. A write executed on a linked server through a pass-through literal is opaque to it |
-| `ApplicationIntent=ReadOnly` on the DSN | advertises read-only intent | honored only by a SQL Server Always-On **read replica**; a no-op against any other server |
+| `ApplicationIntent=ReadOnly` on the DSN | advertises read-only intent | read at least by an Always On availability group, where read-only routing sends it to a **readable secondary** and a primary set to `ALLOW_CONNECTIONS = READ_WRITE` refuses it, and by Azure SQL read scale-out, which sends it to a read-only replica; where nothing reads it, it changes nothing |
 
 Lookup pools are opened **autocommit**, so a write that got past the statement gate would commit rather
 than roll back. T-SQL has no `SET TRANSACTION READ ONLY`, so the engine cannot open a read-only
@@ -1904,9 +1904,50 @@ transform worker, not the whole result set. The driver may still spend time disc
 when the cursor closes. The error names the connection and the ceiling, never the statement or a row.
 
 A lookup that shapes one message rarely needs more than a handful of rows. If a feed needs a large
-table, a synced `Reference(...)` is the better fit. `max_rows=0` removes the ceiling. A negative
-or fractional value stops `serve` building the lookup. `messagefoundry check` refuses it in its build
+table, a synced `Reference(...)` is the better fit. `max_rows=0` removes the ceiling, and
+`max_rows` reads zero as every other cap does (`transports.base.cap_setting`), so an `env()` value
+of `"0"` or `"0.0"` removes it too. An empty or blank `env()` value is **refused**, where other caps
+read it as off: a provisioning slip must not remove a row ceiling. A negative or fractional value stops `serve`
+building the lookup. `messagefoundry check` refuses it in its build
 leg, which runs when the config has a `messagefoundry.toml`. The ceiling counts rows, not bytes.
+
+#### A `DatabaseRef` statement passes the same gate, and a row ceiling
+
+A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the lookup's controls
+(BACKLOG #2617):
+
+- **The statement gate.** The `statement` goes through the same `_require_read_only` test as a
+  `db_lookup` statement: it must open with `SELECT` or `WITH`, carry no write, `EXEC` or DDL keyword
+  outside a literal or comment, and chain no second statement. **A stored procedure is therefore
+  refused**; read the procedure's tables or a view with a `SELECT` instead. A literal statement is
+  tested when the `DatabaseRef(...)` is declared, so loading the config fails on every path (`serve`,
+  `messagefoundry check`, dry-run, reload). An `env()` statement is tested by the build check once
+  resolved. Every sync tests the statement again, as does the build check for a reference source
+  built without `DatabaseRef`. In the build check's refusal it reads
+  `reference statement refused (read-only statement test)`. A sync it refuses fails as `ReferenceStatementRefused`.
+- **Read intent.** The sync's DSN carries `ApplicationIntent=ReadOnly`, as a lookup's does. Against an
+  Always On availability-group listener with read-only routing, the sync then reads a **readable
+  secondary**, whose data can lag the primary's, so a fresh snapshot can trail the primary by the
+  replica's lag. A replica's `ALLOW_CONNECTIONS` setting can also refuse it: a primary set to
+  `READ_WRITE` refuses a read-intent connection, and every sync of that set then fails. Point the
+  `DatabaseRef` at a listener or replica that admits read-intent connections. Azure SQL read
+  scale-out also sends it to a read-only replica. The table above says where the keyword acts.
+- **The row ceiling.** `DatabaseRef(max_rows=…)`, default `100000`, bounds one sync. The driver is asked
+  for at most `max_rows + 1` rows, and a statement that returns more fails that sync as
+  `ReferenceRowCeilingExceeded`: the last-good snapshot keeps serving, the AlertSink fires, and a set
+  that never synced stays unloaded. The set is never built from a truncated result. The driver may
+  still spend time discarding the unread rows when the cursor closes, inside that set's sync.
+  `max_rows=0` removes the ceiling, read as the lookup's is: an explicit zero is off, an empty `env()` value is refused. A
+  negative or fractional value is refused when the `DatabaseRef`
+  is declared. An `env()` value is refused by the build check, which `messagefoundry check` runs in
+  its build leg when the config has a `messagefoundry.toml`, and at each sync.
+
+The sync's log line and alert carry the error's class name only, never its text, because a source
+error can hold a reference key. The two class names above are what tell those failures apart.
+
+Neither control is read-only authority, for the reasons in the table above, and the sync pool is
+autocommit. Give the `DatabaseRef` login `SELECT` on what the statement reads, and nothing else. The
+engine does not probe that login's role membership yet.
 
 #### Static credentials on every backend hop
 
