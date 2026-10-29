@@ -946,10 +946,11 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.strictEqual(save.disabled, true, "a discarded state turned Save on");
     p.deliver(STATE_OK);
     assert.strictEqual(save.disabled, false, "a well-formed state did not turn Save on");
-    // A state discarded AFTER one rendered: the form now holds values nobody can vouch for.
+    // A state discarded AFTER one rendered: the last good state is no longer one anybody can vouch
+    // for, so the form is cleared (the clearing tests below) and goes down with Save.
     p.deliver(variant(STATE_OK, (c) => delete c.state.values.require_mfa));
-    assert.strictEqual(save.disabled, true, "Save stayed on over a stale form");
-    assert.strictEqual(doc.getElementById("form").style.display, "none", "the stale form stayed up");
+    assert.strictEqual(save.disabled, true, "Save stayed on after a discard");
+    assert.strictEqual(doc.getElementById("form").style.display, "none", "the form stayed up after a discard");
     // And the next well-formed state brings all of it back.
     p.deliver(STATE_OK);
     assert.strictEqual(save.disabled, false);
@@ -1252,7 +1253,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     // A discard after that: Save is off again, and a click sends nothing more.
     p.deliver(variant(STATE_OK, (c) => delete c.state.defaults.max_session_hours));
     save.click();
-    assert.strictEqual(p.posted.length, 1, "Save posted from a stale form");
+    assert.strictEqual(p.posted.length, 1, "Save posted after a discard");
   });
 
   // A refusal CLEARS what an earlier state left, it does not only hide it (owner ruling R4,
@@ -1301,10 +1302,15 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       assert.deepStrictEqual(p.warnings, [STATE_WARNING], `${why}: the state was not discarded`);
       const shown = refusalShown(p);
       assert.ok(shown.startsWith(REFUSAL), `${why}: no refusal, got "${shown}"`);
-      assert.ok(shown.includes("Any change not yet saved was cleared"), `${why}: the refusal hides that edits went`);
+      assert.ok(shown.includes("with any change on it that was not saved"), `${why}: the refusal hides that edits went`);
       assert.deepStrictEqual(setControls(p), [], `${why}: a control still holds a value from before the refusal`);
       assert.deepStrictEqual(heldDefaults(p), [], `${why}: collectUpdates() would still compare against old defaults`);
       assert.deepStrictEqual(loosenedFields(p), [], `${why}: a loosened mark outlived the refusal`);
+      // A control the refusal replaced still fires, as a number field committed on blur would. It
+      // must not mark the cleared form through its replacement.
+      local.dispatchEvent(new p.window.Event("change"));
+      assert.deepStrictEqual(p.errors.map(String), [], `${why}: an event from a replaced control threw`);
+      assert.deepStrictEqual(loosenedFields(p), [], `${why}: a replaced control marked the cleared form`);
       assert.strictEqual(save.disabled, true, `${why}: Save is on after a refusal`);
       // The handler holds on its own, not only the attribute.
       save.disabled = false;
@@ -1318,10 +1324,9 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     // its own: same controls, same loosened marks, same Save. A REGRESSION GUARD on render(), not on
     // refuse(): it passes on the code before the refusal cleared anything, because render() sets
     // every control, mark and default. The cases above are what pin the clearing.
-    const next = variant(STATE_OK, (c) => {
-      c.state.values.production_instance = true;
-      c.state.values.delete_message_bodies_after_days = 0;
-    });
+    // production_instance stays null: an unset select and its "Derived" option both read '' as a
+    // value, so setControls() below is what tells them apart.
+    const next = variant(STATE_OK, (c) => (c.state.values.delete_message_bodies_after_days = 0));
     const p = security.load();
     const pdoc = p.window.document;
     p.deliver(variant(STATE_OK, (c) => (c.state.values.allow_unencrypted_phi = true)));
@@ -1331,6 +1336,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     const q = security.load();
     q.deliver(next);
     assert.strictEqual(formValues(p), formValues(q), "the controls differ from a page that saw only this state");
+    assert.deepStrictEqual(setControls(p), setControls(q), "a control is set on one page and unset on the other");
+    assert.ok(setControls(p).includes('in-production_instance=""'), "a null tristate was left unset, not derived");
     assert.deepStrictEqual(loosenedFields(p), loosenedFields(q), "the loosened marks differ");
     assert.deepStrictEqual(loosenedFields(q), ["field-delete_message_bodies_after_days", "field-require_mfa"]);
     pdoc.getElementById("save").click();

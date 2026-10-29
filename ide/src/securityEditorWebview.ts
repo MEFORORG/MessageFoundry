@@ -108,12 +108,12 @@ export function securityEditorScript(token: string, fields: unknown): string {
     // The refusal now showing, or '' while the form is up. See refuse().
     let refusal = '';
     // True only while the form holds a state that rendered. Save checks it as well as its disabled
-    // attribute, so a click that still reaches the button posts nothing (refuse() says why).
+    // attribute, so a click that still reaches the button posts nothing.
     let rendered = false;
 
-    // Build the grouped form with every control UNSET; values are filled in on 'state'. It is run
-    // again by refuse(), so every control, and the 'loosened' mark on its field, is made new rather
-    // than reset one property at a time, and nothing an earlier state put on an element survives.
+    // Build the grouped form with every control UNSET; values are filled in on 'state'. refuse()
+    // runs it again. Each control and its field are then new elements, not reset ones. So nothing
+    // an earlier state put on an element survives, the 'loosened' mark included.
     function buildForm() {
       const root = $('form');
       root.innerHTML = '';
@@ -161,7 +161,9 @@ export function securityEditorScript(token: string, fields: unknown): string {
     }
 
     function markLoosened(f, input) {
-      if (f.insecure === undefined) return;
+      // A control refuse() replaced can still fire, for example a number field committed on blur.
+      // It would be read through its replacement's id, and could mark the cleared form.
+      if (f.insecure === undefined || !input.isConnected) return;
       const v = currentValue(f);
       const loosened = (v === f.insecure);
       $('field-' + f.key).classList.toggle('loosened', loosened);
@@ -186,15 +188,13 @@ export function securityEditorScript(token: string, fields: unknown): string {
       $('save').disabled = false;
     }
 
-    // A state this form cannot read. Save goes off and the form is hidden, and everything an earlier
-    // state left is CLEARED, not only hidden (owner ruling R4, 2026-10-29, BACKLOG #1123): the
-    // defaults collectUpdates() compares against, every control's value including an edit nobody
-    // saved, and each field's 'loosened' mark. The form is rebuilt unset rather than re-rendered
-    // from the last good state, which is itself an earlier message. What that adds is the time
-    // between this refusal and the next state: the page holds no value, default or mark from
-    // before it, and Save has nothing to send. (render() already sets all three, so the next state
-    // would replace them either way.) textContent (through show): the problem names a switch, and
-    // no part of a message is ever parsed as markup here.
+    // A state this form cannot read. Save goes off and the form is hidden. What an earlier state left
+    // is CLEARED, not only hidden (owner ruling R4, 2026-10-29, BACKLOG #1123). That is at least:
+    // the defaults collectUpdates() compares against, every control's value, an unsaved edit
+    // included, and each field's 'loosened' mark. The form is rebuilt unset. It is not re-rendered
+    // from the last good state, which is itself an earlier message. The clear covers the time until
+    // the next state, since render() replaces all three anyway. textContent (through show): the
+    // problem names a switch, and no part of a message is ever parsed as markup here.
     function refuse(problem) {
       rendered = false;
       $('save').disabled = true;
@@ -202,7 +202,8 @@ export function securityEditorScript(token: string, fields: unknown): string {
       buildForm();
       $('form').style.display = 'none';
       refusal = 'These settings cannot be shown. The state sent to this form is malformed: ' + problem +
-        '. Any change not yet saved was cleared, and Save is off until a well-formed state arrives.';
+        '. The form was cleared, with any change on it that was not saved. Save is off until a' +
+        ' well-formed state arrives. To read the settings again, run Edit Security Settings.';
       show(refusal);
     }
 
