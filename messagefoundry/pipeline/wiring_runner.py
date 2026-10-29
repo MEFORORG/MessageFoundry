@@ -3336,18 +3336,29 @@ class RegistryRunner:
         raise KeyError(name)
 
     async def start_inbound(self, name: str, *, operator: bool = False) -> None:
-        """Start receiving on one inbound connection (no-op if already listening).
+        """Start receiving on one inbound connection (no bind if already listening; an
+        ``operator`` start of a listening inbound may still resolve its alert).
 
         Public console/API entrypoint — takes the reload lock so it can't race a concurrent
         reload()/stop() mutating _sources/_workers (review M-10). Internal callers that already hold
         the lock (start, reload) use :meth:`_start_inbound_unsafe`.
 
         On a passive DR standby only an ``operator`` start binds; an engine door such as the
-        scheduler or an alert rule does nothing (:meth:`_dr_refuses`)."""
+        scheduler or an alert rule does nothing (:meth:`_dr_refuses`). Only an ``operator`` start
+        raises ``connection_started`` (BACKLOG #1741, :meth:`_resolving_start`)."""
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
-            await self._checked_inbound_start(name)
+            await self._resolving_start(name, resolve=operator)
+
+    async def _resolving_start(self, name: str, *, resolve: bool) -> None:
+        """:meth:`_checked_inbound_start`, then, when ``resolve`` (an operator's start or restart),
+        raise ``connection_started`` (BACKLOG #1741). The caller holds the reload lock. Covers a
+        fresh bind, an inbound already listening, and a log-write refusal that undid its own bind,
+        which :meth:`_emit_inbound_started` reads as not running."""
+        await self._checked_inbound_start(name)
+        if resolve and self._running:
+            self._emit_inbound_started(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
         """:meth:`_start_inbound_unsafe` after the lane check. A refused CA records the inbound
@@ -3371,13 +3382,39 @@ class RegistryRunner:
             await self._stop_inbound_unsafe(name)
 
     async def restart_inbound(self, name: str, *, operator: bool = False) -> None:
+        """Stop then start one inbound under one reload-lock span. Only an ``operator`` restart raises
+        ``connection_started``; an alert rule's restart resolves nothing, so a rule-driven crash loop
+        keeps one open, escalating, throttled instance (BACKLOG #1741).
+
+        An engine restart whose start fails records the inbound failed and alerts through
+        :meth:`_record_failed`, as :meth:`start` does, once while the record stands. Its stop half
+        already ran, so without the record a restart queued behind an operator's resolving start
+        could leave the inbound down with no record and no open alert. Either way the error still
+        reaches the caller; an operator's restart records nothing, as before."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
             await self._stop_inbound_unsafe(name)
-            await self._checked_inbound_start(name)
+            try:
+                await self._resolving_start(name, resolve=operator)
+            except Exception as exc:
+                # A refused CA is already recorded by _checked_inbound_start; the guard keeps a
+                # rule firing on this alert from re-alerting on every restart it drives. Only an
+                # inbound start() would bind: a name this runner does not hold (another engine
+                # shard's, a typo) or a deployed=False one is refused, not a failure to record.
+                # Nor is a raise after the bind, while the listener is up, or on a stopped runner.
+                if (
+                    not operator
+                    and self._running
+                    and not self.inbound_running(name)
+                    and name in self.registry.inbound
+                    and self._deployed(name, "inbound")
+                    and ("inbound", name) not in self._failed
+                ):
+                    self._record_failed(name, exc, kind="inbound")
+                raise
 
     def _dr_refuses(self, name: str, *, operator: bool) -> bool:
         """Whether a passive DR standby refuses an engine start of inbound ``name`` (vault BACKLOG
@@ -4449,6 +4486,51 @@ class RegistryRunner:
             self._hold_for_operator(lane, kind)
 
         return _hold
+
+    def _emit_inbound_started(self, name: str) -> None:
+        """Raise ``connection_started`` for inbound ``name``, so a sink with alert-state resolves the
+        open ``connection_stopped`` instance under that name, such as a bind failure (BACKLOG #1741,
+        ADR 0031 section 1, ADR 0044 D2).
+
+        :meth:`AlertSink.connection_started` states the contract; these are the checks behind it.
+        Only when no known cause still holds the name down IN EITHER DIRECTION, because alerts key on
+        the bare name while every cause here keys on direction (#1813). The alert row lives in the
+        store every process shares, so a clustered node, or an engine shard that does not own the bare
+        name as an outbound lane, cannot see every cause and resolves nothing. That holds whether or
+        not this runner's registry holds an outbound of that name: one a reload dropped here still
+        drains, and can STOP, on its owning engine shard. A pooled lane a dispatcher
+        STOPPED on its own account without a hold (a leadership-loss STOP) counts as a cause too, and
+        so does an outbound namesake whose build failed as it left the DR park. A park the ENGINE or
+        the calendar made (``deployed=False``, ``auto_start=False``, a schedule park) raises no
+        ``connection_stopped`` and is not a cause. An operator-style pause still is: a #122 log-write
+        halt pauses an outbound through the same door and leaves no other record once an inbound
+        start's own probe clears the latch, so the two cannot be told apart here. A skipped resolve
+        leaves an alert open for an operator, which is the safe direction, and nothing retries it.
+        Never raises: an alert failure must not break a start."""
+        try:
+            blocked = (
+                not self.inbound_running(name)
+                or ("inbound", name) in self._stop_held
+                or name in self._log_halted
+                or self._delivery_halted
+                or self._coordinator.is_clustered()
+                # Not gated on this runner's registry holding the outbound: a namesake a reload
+                # dropped here keeps draining, and can STOP, on the engine shard that owns it.
+                or not self._owns_destination(name)
+                or self.outbound_failed(name) is not None
+                or ("outbound", name) in self._stop_held
+                or self.outbound_dr_failed(name)
+                or (
+                    name in self._outbound_paused
+                    and name not in self._gate_parked
+                    and name not in self._schedule_parked
+                )
+                or any(d.stopped(name) for d in self._dispatchers.values())
+            )
+            if not blocked:
+                self._alert_sink.connection_started(name)
+        except Exception:
+            log.exception("connection_started for %r failed; the alert stays open", name)
 
     def _release_operator_hold(self, name: str, kind: Direction) -> None:
         """The lane was re-armed (or an operator asked for it), so the scheduler owns its calendar

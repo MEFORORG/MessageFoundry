@@ -112,7 +112,8 @@ the *notification*** (`transports = []`) — the dashboard still shows the open 
 not to be paged about. (To-resolve, below: whether a suppressed event records an instance or is fully muted.)
 
 Auto-resolution closes the loop without a human: a `connection_restored` / `connection_started` transition
-(the inverse of the firing event) **resolves** the matching open instance. The MVP keys auto-resolution off
+(the inverse of the firing event) **resolves** the matching open instance. (`connection_started` is raised
+only by an operator's start or restart since BACKLOG #1741; see the checklist below.) The MVP keys auto-resolution off
 the existing inverse signals the engine already emits (the `connection_event` lifecycle kinds); a generic
 "hasn't re-fired in N cooldowns ⇒ stale" sweep is **deferred** (it needs a timer and a policy — out of scope
 here, like ADR 0014's deferred durable cross-node dedup).
@@ -252,9 +253,21 @@ escalation chains (still deferred, ADR 0014 §3). The cross-node durable dedup o
 - [ ] **Land-order with the store siblings.** Confirm the `alert_instance` `_SCHEMA`/`_migrate` add rebases
   cleanly onto the **pool-prewarm store refactor** (sole store-writer) **and** the **#57 roles migration** —
   coordinate the merge order so the three additive store edits don't clobber one another.
-- [ ] **Auto-resolution coverage.** Confirm which events have a clean inverse the MVP auto-resolves on
+- [x] **Auto-resolution coverage.** Confirm which events have a clean inverse the MVP auto-resolves on
   (`connection_restored`/`connection_started`) and which (`queue_buildup`/`storage_threshold`/`message_stall`)
-  rely on the deferred staleness sweep or manual resolve until it lands.
+  rely on the deferred staleness sweep or manual resolve until it lands. *Resolved 2026-10-27 (BACKLOG
+  #1741):* the runner now raises `connection_started` when an operator starts or restarts an
+  inbound, or starts one already listening, and the inbound is up with no open cause on it or on
+  an outbound of the same name. So an inbound's bind-failure `connection_stopped` resolves on an
+  operator's recovery. Every other start resolves nothing, at least an engine start, a committed
+  reload, the scheduler and every alert rule's restart, so an open stop keeps its instance, ack
+  and suspend across a service restart or a reload, and its cooldown and count across a
+  rule-driven crash loop, as before this item.
+  At least these still need a manual resolve: an outbound's start failure while it is still
+  recorded, a halt whose name has no
+  inbound, a halt no operator restarts, an inbound whose outbound namesake still has an open cause,
+  and any alert raised in a cluster or under an engine shard that does not own the bare name as an
+  outbound lane, whether or not its registry still holds an outbound of that name. `AlertSink.connection_started` states the contract, and its exclusions bind here too.
 - [ ] **Resolved-instance retention window.** Confirm the prune window for resolved instances (a
   `connection_event_retention_hours` analog) and that it rides the **existing** `RetentionRunner.run_once`
   pass + one audit row (never an open/acknowledged instance).
