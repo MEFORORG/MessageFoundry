@@ -633,6 +633,15 @@ def test_a_lookup_with_long_arguments_round_trips(kind: str) -> None:
     assert answer.connection == "C" * 5000 and answer.params == params
 
 
+def _join_lookup_helpers(*, exclude_hung: bool = False, timeout: float = 15.0) -> None:
+    """Wait for the broker's lookup helper threads to finish, so a count read next is final. With
+    ``exclude_hung``, a helper still inside a runner the test holds is left running."""
+    for thread in threading.enumerate():
+        if not thread.name.startswith("mf-sandbox-lookup-"):
+            continue
+        thread.join(3.0 if exclude_hung else timeout)
+
+
 def _worker_broker() -> Any:
     """The worker's ``_Broker``. Importing the worker installs a stderr root handler, which is right
     in its child process and wrong here, so the root logger is restored after the import, as the
@@ -1006,8 +1015,9 @@ def test_a_cut_off_waiter_does_not_replace_the_hung_lookups_record(
     try:
         with db_lookup_mod.activated(hung):
             for _ in range(3):  # A hangs; B and C each find the connection busy
-                with pytest.raises(SandboxError, match="wall cap|still running"):
+                with pytest.raises(SandboxError, match="wall cap"):
                     _bodies(registry, "h_db", session)
+            _join_lookup_helpers(exclude_hung=True)
         assert len(calls) == 1
     finally:
         release.set()
@@ -1058,24 +1068,22 @@ def test_a_helper_past_its_deadline_never_calls_the_runner(
         with db_lookup_mod.activated(hung):
             with pytest.raises(SandboxError, match="wall cap"):
                 _bodies(registry, "h_db", session)  # A: hangs, cut off
+            a_helpers = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("mf-sandbox-lookup-")
+            ]
             go.clear()
             with pytest.raises(SandboxError, match="wall cap"):
                 _bodies(registry, "h_db", session)  # B: its helper is held before the runner
             release_a.set()
-            # Wait for A's own record to go, not the runner's counter: only then is the connection
-            # free, so B's helper can only be stopped by its dispatch having been abandoned.
-            key = (codec.LOOKUP_DB, "LK")
-            deadline = time.monotonic() + 10
-
-            def a_finished() -> bool:
-                record = session._stale_lookups.get(key)
-                return record is None or record.is_set()
-
-            while not a_finished() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert a_finished()
+            # Wait for A's own helper to finish, not the runner's counter: only then is the connection
+            # free, so B's helper can only be stopped by its dispatch being over.
+            for thread in a_helpers:
+                thread.join(10)
+            assert not any(thread.is_alive() for thread in a_helpers)
             go.set()  # B's helper goes on, past B's deadline, and finds A finished
-            time.sleep(0.5)
+            _join_lookup_helpers()
             release_all.set()
             assert _bodies(registry, "h_db", session)[0].startswith("late|")  # C
         assert (state["calls"], state["peak"]) == (2, 1)  # A and C; never B

@@ -1286,8 +1286,9 @@ It differs from `subprocess` in at least these ways:
   The dry run has no lookup runner, so it fails there as in every mode.
 - **`wall_seconds` counts the lookups.** The cap bounds the whole call, including the time the engine
   spends serving its lookups, so raise it for a feed whose lookups are slow. When the cap runs out
-  during a lookup, the call fails at once and its worker is recycled; the lookup itself runs on to
-  its own timeout in the engine, and its result is discarded. Until it ends, a later lookup on the
+  during a lookup, the call fails at once and its worker is recycled. A lookup that has already
+  reached its runner runs on to its own timeout in the engine, and its result is discarded; one
+  that has not yet reached it is never started. Until it ends, a later lookup on the
   same connection from that inbound waits for it, until a quarter of its own call's cap (at most 2
   seconds) is left, and is refused if it is still waiting then, leaving that quarter for the Handler
   to handle the refusal. That bounds what the engine's broker waits on, not the
