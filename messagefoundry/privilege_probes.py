@@ -339,6 +339,7 @@ def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> Bin
             settings.auth,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
+            hop_posture=posture,  # BACKLOG #2193: the LDAPS revocation guard, as AuthService passes
         )
     except Exception as exc:  # no extra, no CA file, an unset token: reported, never raised
         return BindAccountReading(
