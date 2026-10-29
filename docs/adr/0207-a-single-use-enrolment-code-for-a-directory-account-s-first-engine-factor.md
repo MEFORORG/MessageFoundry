@@ -762,12 +762,13 @@ secret, before the floor and the directory lookup, and on an enable that
   after the gate's write-floor charge and before the service runs, and refuses over budget.
   **Section 7's "The build adds the ceremony-budget draw to `ui_webauthn_verify`" is shipped**, and
   the Consequences line "the ceremony budget on the passkey finish route" is dropped.
-  *Note (2026-10-29, BACKLOG #3690 items 5 and 6).* The route now skips the draw for a session
-  the finish will refuse for owing a factor the account holds, asking the same rule first, so a
-  password holder refused in a loop spends none of the real holder's budget. A refused code is not
-  that case: it comes from a session on an account with no factor, which is still charged, so
-  section 7's bound on code tries holds. The route's 429 sends the console ceremony routes'
-  constant `Retry-After: 30`.
+  *Note (2026-10-29, BACKLOG #3690 items 5 and 6).* The route now asks the factor-binding rule
+  first and skips the draw for a session it refuses, auditing each such request instead, so a
+  password holder refused there in a loop spends none of the real holder's budget on this route.
+  `POST /ui/mfa` and `POST /ui/reauth` still draw it for that session. A refused code is not that
+  case: it comes from a session on an account with no factor, which is still charged, so section
+  7's bound on code tries holds. The route's 429 sends the console ceremony routes' constant
+  `Retry-After: 30`.
 - **Context item 3 is closed for the binding step (BACKLOG #3014, #3061).**
   `finish_webauthn_registration` asks `_factor_binding_is_blocked` itself, before the floor, and
   again after the directory lookup, both before the challenge pop. So section 1's check 1 is

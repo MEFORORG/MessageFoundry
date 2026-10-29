@@ -13193,8 +13193,9 @@ class AuthService:
     async def _session_satisfaction(
         self, session: SessionRecord
     ) -> tuple[bool, VerifiedUser | None]:
-        """Whether a loaded, live session is MFA-satisfied, and the account read to decide it:
-        ``None`` when the stamp decided it or the account is gone. The one rule
+        """Whether a session :meth:`_load_session` returned is MFA-satisfied, and the account read
+        to decide it: ``None`` when the stamp decided it or the account is gone. It checks no
+        expiry; the callers' loads are what it relies on. The one rule
         :meth:`_mfa_satisfied_hash` and :meth:`_owes_enrolled_factor_hash` share, so the second can
         reuse the rows it read rather than read them again (BACKLOG #3690 item 7)."""
         if session.mfa_verified_at is not None:

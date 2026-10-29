@@ -763,11 +763,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # BACKLOG #3014: ui_mfa_verify's per-actor budget, charged only on a request that reaches
         # the ceremony, and after the gate's admin-write charge (that order is BACKLOG #2652's, left
         # alone). JSON, so the page's fetch can read `error`, with the ceremony routes' constant
-        # Retry-After (BACKLOG #3690 item 5). Skipped for a session the service refuses for owing a
-        # factor, which still answers it (item 6, the #1973 rule).
+        # Retry-After (BACKLOG #3690 item 5).
+        #
+        # Not drawn for a session the factor rule refuses (item 6, the #1973 rule), which the
+        # service then answers without verifying anything. The rule fails closed on a dead session,
+        # so that is skipped too, and a state change between this read and the service's own (a
+        # factor proven in another tab) can let one uncharged request finish. Skipping the draw
+        # skips _rate_limited's WARNING, so each such request is audited instead, as #1973's
+        # pending_refusal does; the service adds its own row when it ends a staged ceremony.
         client = client_ip(request)
-        blocked = await service.factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL)
-        if not blocked and not allow_reauth_attempt(service, identity):
+        if await service.factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
+            await service.audit_mfa_denied(identity, request.url.path, client=client)
+        elif not allow_reauth_attempt(service, identity):
             exc = _rate_limited(request, "passkey-enroll")
             return JSONResponse(
                 {"ok": False, "error": exc.detail},
