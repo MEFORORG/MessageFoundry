@@ -117,8 +117,9 @@ class Identity:
         ``messages:view_raw`` role also holds ``messages:view_summary`` is judged per role
         (:func:`~messagefoundry.auth.permissions.raw_body_without_summary`), and an identity built
         from whole roles therefore never holds the first without the second. A set that does is
-        refused here with ``ValueError``, because it can only come from a caller that passed part of
-        a role. ``tests/test_identity_whole_roles.py`` pins the callers. The predicate is read off its
+        refused here with ``ValueError``: some caller passed part of a role. Not every partial set
+        has that shape, so this does not catch each one; ``tests/test_identity_whole_roles.py``
+        pins the callers to whole roles for the rest. The predicate is read off its
         module at each call, so ``tests/_role_pairing.py`` lifts this check with the other two.
         """
         role_set = frozenset(roles)

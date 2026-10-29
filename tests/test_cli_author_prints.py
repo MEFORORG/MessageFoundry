@@ -2,10 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A print() in an author's config module never lands on a ``--json`` command's stdout.
 
-``validate``, ``graph`` and ``dryrun`` import config modules in the CLI's own process. A debugging
-``print()`` at the top of one used to write to stdout ahead of the JSON, so the document did not
-parse. ``dryrun`` was fixed first (vault BACKLOG #1187) and its Handler arm is pinned in
-``tests/test_cli.py``. This file pins the config-import arm for all three (vault BACKLOG #2727).
+CLI commands import config modules in the CLI's own process. A debugging ``print()`` at the top of
+one used to write to stdout ahead of the JSON, so the document did not parse. ``dryrun`` was fixed
+first (vault BACKLOG #1187) and its Handler arm is pinned in ``tests/test_cli.py``; ``validate``
+and ``graph`` followed (vault BACKLOG #2727). Since vault BACKLOG #3474 one seam covers every
+subcommand (``messagefoundry/author_output.py``), and the later tests here pin it.
 
 Two loads are covered, because a command can import the config twice. Under an explicit
 ``--project-root`` with ``--env``, the anchor helper loads the graph first to ask whether it
@@ -17,14 +18,15 @@ Synthetic data only: the marker below is not message data.
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 from pathlib import Path
 
 import pytest
 
 import messagefoundry
+from messagefoundry import author_output
 from messagefoundry.__main__ import main
+from tests._ast_sites import source_uses
 
 #: What the config module prints. Not JSON, so one copy on stdout breaks the parse.
 MARKER = "AUTHOR-PRINT-MARKER"
@@ -138,9 +140,9 @@ def test_dryrun_under_a_project_root_sends_a_config_modules_print_to_stderr(
 
 # --- One seam for every command (vault BACKLOG #3474) ---------------------------------------------
 #
-# The wraps above were added one command at a time, and the rest still let a print through: at
-# least check's later loads, connection, impact and cert inventory. `run_cli` now marks every
-# subcommand but the named few, and the loader and the dry-run preview redirect under the mark.
+# Per-command wraps left the rest uncovered: at least check's later loads, connection, impact and
+# cert inventory let a print through. `run_cli` now marks every subcommand but the named few, and
+# the loader and the dry-run preview redirect under the mark.
 
 #: What the Router prints, so the check gate's dry-run leg, which runs it, is covered too.
 ROUTER_MARKER = "ROUTER-PRINT-MARKER"
@@ -214,13 +216,12 @@ def test_connection_remove_sends_a_config_modules_print_to_stderr(
 
 def test_run_cli_marks_every_subcommand_but_the_named_ones() -> None:
     """The guard: a subcommand is covered unless its name is listed, so a new one is covered."""
-    from messagefoundry.author_output import result_on_stdout
     from messagefoundry.cli_common import Dispatch, run_cli
 
     seen: dict[str, bool] = {}
 
     def record(args: argparse.Namespace) -> int:
-        seen[args.command] = result_on_stdout()
+        seen[args.command] = author_output._result_on_stdout
         return 0
 
     def build() -> tuple[argparse.ArgumentParser, Dispatch]:
@@ -233,7 +234,7 @@ def test_run_cli_marks_every_subcommand_but_the_named_ones() -> None:
     for command in ("result", "service"):
         assert run_cli([command], build, author_prints_keep_stdout=frozenset({"service"})) == 0
     assert seen == {"result": True, "service": False}
-    assert not result_on_stdout(), "the mark outlived the command"
+    assert not author_output._result_on_stdout, "the mark outlived the command"
 
 
 def test_the_engine_cli_leaves_only_serve_and_supervise_on_stdout(
@@ -262,20 +263,12 @@ def test_only_the_seam_redirects_stdout() -> None:
     package = Path(messagefoundry.__file__).parent
     hits = []
     for path in sorted(package.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute):
-                name: str | None = node.attr
-            elif isinstance(node, ast.Name):
-                name = node.id
-            elif isinstance(node, ast.alias):
-                name = node.name
-            else:
-                name = None
-            if name == "redirect_stdout":
-                hits.append(path.relative_to(package).as_posix())
-    # Control: the walk reaches the seam's own use, so an empty list elsewhere is not vacuous.
-    assert sorted(set(hits)) == ["author_output.py"], hits
+        source = path.read_text(encoding="utf-8")
+        # The substring screen only skips the parse; the code read below decides.
+        if "redirect_stdout" in source and source_uses(source, "redirect_stdout"):
+            hits.append(path.relative_to(package).as_posix())
+    # Control: the scan reaches the seam's own use, so an empty list elsewhere is not vacuous.
+    assert hits == ["author_output.py"], hits
 
 
 def test_the_loader_and_the_preview_redirect_only_under_the_mark(

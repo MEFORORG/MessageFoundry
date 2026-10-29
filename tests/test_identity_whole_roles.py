@@ -32,6 +32,7 @@ from messagefoundry.auth.permissions import (
     permissions_for_roles,
     raw_body_without_summary,
 )
+from tests._ast_sites import named_func, parse_source
 
 _PKG = Path(messagefoundry.__file__).resolve().parent
 
@@ -83,26 +84,30 @@ def test_build_accepts_a_whole_custom_role_and_every_built_in_role() -> None:
         _build(roles=(role,))
 
 
+_Func = ast.FunctionDef | ast.AsyncFunctionDef
+
+
 def _engine_trees() -> dict[str, ast.Module]:
-    return {
-        path.relative_to(_PKG).as_posix(): ast.parse(path.read_text(encoding="utf-8"))
-        for path in sorted(_PKG.rglob("*.py"))
-    }
+    """Every engine module that names ``Identity``, parsed. The screen only skips the parse."""
+    trees = {}
+    for path in sorted(_PKG.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if "Identity" in source:
+            trees[path.relative_to(_PKG).as_posix()] = parse_source(source)
+    return trees
 
 
-def _enclosing(tree: ast.Module) -> dict[ast.AST, str]:
-    """Each node's innermost enclosing function name, or ``<module>``."""
-    owner: dict[ast.AST, str] = {}
+def _enclosing(tree: ast.Module) -> dict[ast.AST, _Func | None]:
+    """Each node's innermost enclosing function, or ``None`` at module level."""
+    owner: dict[ast.AST, _Func | None] = {}
 
-    def visit(node: ast.AST, name: str) -> None:
+    def visit(node: ast.AST, func: _Func | None) -> None:
         for child in ast.iter_child_nodes(node):
-            inner = (
-                child.name if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) else name
-            )
+            inner = child if isinstance(child, _Func) else func
             owner[child] = inner
             visit(child, inner)
 
-    visit(tree, "<module>")
+    visit(tree, None)
     return owner
 
 
@@ -151,17 +156,6 @@ def _extra_permissions_source(call: ast.Call, function: ast.AST | None) -> str |
     return sources.pop() if len(sources) == 1 else "<unreviewed>"
 
 
-def _function_named(tree: ast.Module, name: str) -> ast.AST | None:
-    return next(
-        (
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == name
-        ),
-        None,
-    )
-
-
 def test_identity_build_callers_are_the_reviewed_ones() -> None:
     callers: set[tuple[str, str]] = set()
     direct: list[str] = []
@@ -171,12 +165,12 @@ def test_identity_build_callers_are_the_reviewed_ones() -> None:
         for call, kind in _identity_calls(tree):
             if rel == "auth/identity.py":
                 continue  # Identity.build itself constructs the instance
-            name = owner.get(call, "<module>")
+            func = owner.get(call)
             if kind == "direct":
                 direct.append(f"{rel}:{call.lineno}")
                 continue
-            callers.add((rel, name))
-            source = _extra_permissions_source(call, _function_named(tree, name))
+            callers.add((rel, "<module>" if func is None else func.name))
+            source = _extra_permissions_source(call, func)
             if source not in (None, _CUSTOM_UNION):
                 unreviewed.append(f"{rel}:{call.lineno} extra_permissions from {source}")
     assert not direct, f"an Identity built directly skips Identity.build's check: {direct}"
@@ -189,9 +183,9 @@ def test_identity_build_callers_are_the_reviewed_ones() -> None:
 
 def test_the_custom_role_union_adds_whole_decoded_rows_only() -> None:
     """``_custom_permissions_for_ids`` grows its result only by a whole decoded row."""
-    tree = _engine_trees()["auth/service.py"]
-    function = _function_named(tree, _CUSTOM_UNION)
-    assert function is not None, f"{_CUSTOM_UNION} is gone: re-read the callers above"
+    source = (_PKG / "auth" / "service.py").read_text(encoding="utf-8")
+    # Exactly one, or it raises: a renamed or doubled union is not the reviewed one.
+    function = named_func(parse_source(source), _CUSTOM_UNION)
     grows = [
         node
         for node in ast.walk(function)
@@ -221,11 +215,11 @@ def test_the_caller_pin_fires_on_a_narrowed_set() -> None:
     )
     ((call, kind),) = _identity_calls(tree)
     assert kind == "build"
-    assert _extra_permissions_source(call, _function_named(tree, "f")) == "<unreviewed>"
+    assert _extra_permissions_source(call, named_func(tree, "f")) == "<unreviewed>"
     good = ast.parse(
         "async def f(self):\n"
         "    perms = await self._custom_permissions_for_ids(ids)\n"
         "    return Identity.build(roles=(), extra_permissions=perms)\n"
     )
     ((call, _kind),) = _identity_calls(good)
-    assert _extra_permissions_source(call, _function_named(good, "f")) == _CUSTOM_UNION
+    assert _extra_permissions_source(call, named_func(good, "f")) == _CUSTOM_UNION

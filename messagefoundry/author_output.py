@@ -11,10 +11,15 @@ is one seam with two halves (vault BACKLOG #3474):
   dispatch of every subcommand, except the ones its caller names, so a new subcommand is covered
   without anyone remembering to wrap it. The engine CLI names ``serve`` and ``supervise``
   (``_AUTHOR_PRINTS_KEEP_STDOUT`` in ``__main__.py``, which says why).
-* :func:`author_code_stdout` is entered where the engine runs author code: the config loader's
-  ``_loading`` block (every ``load_config`` and ``validate_config``) and the dry-run preview's
-  ``dry_run``. While the mark is set it points ``sys.stdout`` at ``sys.stderr``; otherwise it does
-  nothing.
+* :func:`author_code_stdout` is entered where the engine runs author code for a command: the
+  config loader's ``_loading`` block (every ``load_config`` and ``validate_config``) and the
+  dry-run preview's ``dry_run`` (:func:`runs_author_code`). While the mark is set it points
+  ``sys.stdout`` at ``sys.stderr``; otherwise it does nothing.
+
+**A new place that runs author code in a CLI process outside those two must enter
+:func:`author_code_stdout` too**, or go through ``load_config`` or ``dry_run``. The mark alone
+moves nothing. ``tests/test_cli_author_prints.py`` keeps every other ``redirect_stdout`` out of
+the package, so this module stays the one place the redirect is made.
 
 So stdout carries only the command's result, and stderr gets what the author printed. Nothing
 redacts that text: stderr is no safer than stdout (docs/PHI.md, stream 18).
@@ -27,17 +32,13 @@ commands, whose loads run in a worker thread beside other output, are left out.
 from __future__ import annotations
 
 import contextlib
+import functools
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
-__all__ = ["author_code_stdout", "result_on_stdout", "stdout_carries_a_result"]
+__all__ = ["author_code_stdout", "runs_author_code", "stdout_carries_a_result"]
 
 _result_on_stdout = False
-
-
-def result_on_stdout() -> bool:
-    """Whether the process is inside :func:`stdout_carries_a_result`."""
-    return _result_on_stdout
 
 
 @contextlib.contextmanager
@@ -59,3 +60,14 @@ def author_code_stdout() -> contextlib.AbstractContextManager[object]:
     if _result_on_stdout:
         return contextlib.redirect_stdout(sys.stderr)
     return contextlib.nullcontext()
+
+
+def runs_author_code[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    """Run each call of ``fn`` inside :func:`author_code_stdout`."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        with author_code_stdout():
+            return fn(*args, **kwargs)
+
+    return wrapper

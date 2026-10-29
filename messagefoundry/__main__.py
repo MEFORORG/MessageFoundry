@@ -4005,29 +4005,31 @@ def _serve(args: argparse.Namespace) -> int:
     # caller's authority, so it gets the advisory too (vault BACKLOG #3474). The narrowing and its
     # wording are `_approvals_loosenings`', the one reader of that list against its default, so the
     # default list is never restated here. Still WARN-only: the arm's body holds no return.
-    held_gap = [
-        risk
-        for switch, risk in _approvals_loosenings(settings.approvals)
-        if switch == "approvals.operations"
-    ]
-    if admin_exposed and (not settings.approvals.enabled or held_gap):
+    held_gap = next(
+        (
+            risk
+            for switch, risk in _approvals_loosenings(settings.approvals)
+            if switch == "approvals.operations"
+        ),
+        None,
+    )
+    if admin_exposed and (not settings.approvals.enabled or held_gap is not None):
         if not settings.approvals.enabled:
-            print(
-                f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
-                "[approvals].enabled off — high-value actions (dead_letter_replay, connection_purge) "
-                "each complete on a single caller's authority with no second sign-off (ASVS 2.3.5). "
-                "Enable dual-control with [approvals].enabled=true so a distinct approver "
-                "(approvals:approve) must release them before exposure.",
-                file=sys.stderr,
+            gap = (
+                "[approvals].enabled off — high-value actions (dead_letter_replay, "
+                "connection_purge) each complete on a single caller's authority with no second "
+                "sign-off (ASVS 2.3.5). Enable dual-control with [approvals].enabled=true"
             )
         else:
-            print(
-                f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
-                f"[approvals].operations narrowed: {held_gap[0]} (ASVS 2.3.5). Hold the default "
-                "operations in [approvals].operations so a distinct approver (approvals:approve) "
-                "must release them before exposure.",
-                file=sys.stderr,
+            gap = (
+                f"[approvals].operations narrowed: {held_gap} (ASVS 2.3.5). Hold the default "
+                "operations in [approvals].operations"
             )
+        print(
+            f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with {gap} so "
+            "a distinct approver (approvals:approve) must release them before exposure.",
+            file=sys.stderr,
+        )
 
     # --- startup TLS-floor probe of the declared front door (ASVS 12.1.1) ---------------------------
     # ORDER MATTERS: this sits AFTER the config-only exposure refusals (/ui exposure,
