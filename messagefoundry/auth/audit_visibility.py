@@ -24,14 +24,18 @@ This module is the one place that names the hidden rows. Every API read of the t
   (BACKLOG #2383). It is written only when a lock landed.
 * ``auth.login_locked`` -- a sign-in refused by a live lock. A live second-step lock refuses a
   later sign-in that a wrong candidate would have been refused for as a plain wrong password.
+* ``auth.directory_login_locked`` -- a directory (Kerberos or OIDC) sign-in refused by a live lock
+  (BACKLOG #3726). Its own action, so the whole row is hidden whatever its detail holds, and the
+  OIDC ``callback_floor_exempt_amr`` marker can ride it without showing the lock to a reader
+  without ``users:manage`` on these read paths. A ``users:manage`` holder reads it with its marker.
 * ``auth.admin_unlocked`` -- the whole row, not only its lock fields. Its detail records both lock
   expiries and both cycle counts; stripped of those, it would still say that an account needed
   unlocking. An administrator reads it in full, which is who acts on it.
-* The lock refusals of the other legs, which share an action with an ordinary failure and say
+* The lock refusals of the factor legs, which share an action with an ordinary failure and say
   "a lock is live" only in their detail: ``auth.mfa_failed`` and ``auth.webauthn_failed`` with
-  ``{"reason": "locked"}``, and a directory sign-in's ``auth.login_failed`` with
-  ``{"provider": "ad", "reason": "locked"}``. Only a holder of the account's session or directory
-  ticket can cause one, but it would still show another reader that a second-step lock was live.
+  ``{"reason": "locked"}``. Only a holder of the account's session can cause one, but it would
+  still show another reader that a second-step lock was live. The pre-#3726 directory text is
+  named too; :data:`DIRECTORY_LOCKED_REFUSAL_DETAIL` says why.
 
 **Considered and left visible:** ``auth.login_after_failures`` (written only on a full sign-in, so
 nobody without both factors can cause it), the per-session re-proof cap rows (``auth.reauth`` with
@@ -75,6 +79,7 @@ __all__ = [
     "ADMIN_UNLOCKED_ACTION",
     "AUDIT_WITHHELD_HEADER",
     "DIRECTORY_LOCKED_REFUSAL_DETAIL",
+    "DIRECTORY_LOGIN_LOCKED_ACTION",
     "HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE",
     "LOCKED_REFUSAL_DETAIL",
     "LOCK_EVENT_ACTIONS",
@@ -94,6 +99,9 @@ LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
 LOCK_NOTICE_UNDELIVERED_ACTION: Final = "auth.lock_notice_undelivered"
 LOGIN_LOCKED_ACTION: Final = "auth.login_locked"
 ADMIN_UNLOCKED_ACTION: Final = "auth.admin_unlocked"
+#: A directory sign-in refused by a live lock (BACKLOG #3726). It used to share
+#: ``auth.login_failed`` and be hidden by its exact detail text, so no field could be added to it.
+DIRECTORY_LOGIN_LOCKED_ACTION: Final = "auth.directory_login_locked"
 
 #: The whole-row hides.
 LOCK_EVENT_ACTIONS: Final[frozenset[str]] = frozenset(
@@ -102,6 +110,7 @@ LOCK_EVENT_ACTIONS: Final[frozenset[str]] = frozenset(
         LOCK_NOTICE_ACTION,
         LOCK_NOTICE_UNDELIVERED_ACTION,
         LOGIN_LOCKED_ACTION,
+        DIRECTORY_LOGIN_LOCKED_ACTION,
         ADMIN_UNLOCKED_ACTION,
     }
 )
@@ -109,7 +118,11 @@ LOCK_EVENT_ACTIONS: Final[frozenset[str]] = frozenset(
 #: The exact detail of a lock refusal on the TOTP/recovery and passkey legs. The writers use this
 #: constant, so the stored text and the hidden text cannot drift apart.
 LOCKED_REFUSAL_DETAIL: Final = json.dumps({"reason": "locked"}, sort_keys=True)
-#: The exact detail of a lock refusal on a directory (Kerberos or OIDC) sign-in.
+#: The exact detail a directory (Kerberos or OIDC) lock refusal stored under ``auth.login_failed``
+#: before BACKLOG #3726 gave it :data:`DIRECTORY_LOGIN_LOCKED_ACTION`. No writer stores it now.
+#: RETAINED DELIBERATELY: removing a filter was out of #3726's scope. It stays in the exclusion
+#: below, and uncounted by the sign-in burst signal, until the dead-directory-lock-filter removal,
+#: unallocated follow-up work, decides.
 DIRECTORY_LOCKED_REFUSAL_DETAIL: Final = json.dumps(
     {"provider": "ad", "reason": "locked"}, sort_keys=True
 )
