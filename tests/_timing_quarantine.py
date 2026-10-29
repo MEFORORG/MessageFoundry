@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The one reader of ``tests/timing_quarantine.txt``.
+
+``tests/conftest.py`` applies the ``timing_quarantine`` marker from it, and
+``tests/test_timing_quarantine.py`` pins it against the tree and against ci.yml. Both import this
+module, so the hook that moves tests off the engine legs and the check that pins the list cannot
+read the file differently.
+
+Each entry line is a node id, whitespace, and a one-line reason that names its row as ``#<n>``.
+A node id is ``tests/<file>.py::<function>``, or ``::<Class>::<method>``, with no parameter
+suffix: a parametrized test is quarantined whole.
+
+A MISSING OR MALFORMED FILE RAISES, for the reason the tooling partition block in
+tests/conftest.py gives: a reader that quietly marks nothing keeps the engine legs' selection
+looking right while the quarantine job selects zero tests.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+QUARANTINE = Path(__file__).resolve().parent / "timing_quarantine.txt"
+
+_LINE = re.compile(
+    r"(?P<node>tests/test_[A-Za-z0-9_]+\.py(?:::[A-Za-z_][A-Za-z0-9_]*)+)\s+(?P<reason>\S.*)"
+)
+_ROW = re.compile(r"#\d+\b")
+
+
+@dataclass(frozen=True)
+class Entry:
+    """One quarantined test."""
+
+    node_id: str
+    reason: str
+    line: int
+
+    @property
+    def path(self) -> str:
+        """The test file, as ``tests/<name>.py``."""
+        return self.node_id.split("::", 1)[0]
+
+    @property
+    def qualname(self) -> tuple[str, ...]:
+        """The parts after the file: ``(function,)`` or ``(Class, method)``."""
+        return tuple(self.node_id.split("::")[1:])
+
+
+def entries_from(text: str) -> list[Entry]:
+    """The entries in ``text``, in order, with blanks and ``#`` comments dropped.
+
+    Raises ``ValueError`` on a line that is not a node id plus a reason, on a reason that names no
+    ``#<n>`` row, and on a node id listed twice.
+    """
+    kept: list[Entry] = []
+    seen: set[str] = set()
+    for number, physical in enumerate(text.split("\n"), start=1):
+        line = physical.removesuffix("\r").strip()
+        if not line or line.startswith("#"):
+            continue
+        found = _LINE.fullmatch(line)
+        if not found:
+            raise ValueError(
+                f"{QUARANTINE.name} line {number} is {line!r}: an entry is "
+                "`tests/test_<name>.py::<test> <reason naming #<row>>`"
+            )
+        node, reason = found.group("node"), found.group("reason")
+        if not _ROW.search(reason):
+            raise ValueError(
+                f"{QUARANTINE.name} line {number}: the reason for {node} names no #<row>, so "
+                "nothing says which row owns fixing its timing dependence"
+            )
+        if node in seen:
+            raise ValueError(f"{QUARANTINE.name} line {number}: {node} is listed twice")
+        seen.add(node)
+        kept.append(Entry(node, reason, number))
+    return kept
+
+
+def entries() -> list[Entry]:
+    """``entries_from`` over the real file."""
+    return entries_from(QUARANTINE.read_text(encoding="utf-8"))
+
+
+def node_ids() -> frozenset[str]:
+    """The quarantined node ids, as the conftest hook keys on them."""
+    return frozenset(entry.node_id for entry in entries())

@@ -1104,6 +1104,13 @@ jobs:
         # what happens when the selection lives in the run body -- the obvious spelling (`--ignore`) was
         # the one that silently did nothing. One list, read in one place, asserted by
         # tests/test_tooling_partition.py, which also pins the two halves of this wiring.
+        #
+        # `and not timing_quarantine` DESELECTS the timing-dependent tests listed in
+        # tests/timing_quarantine.txt, applied by the same conftest hook. Owner ruling 2026-10-29,
+        # verbatim: "Go on fix 1: make the Step margin guard advisory in merge_group until #3515
+        # re-measures the cap, and quarantine the recurring timing tests under #4773." They still run,
+        # in the `timing-quarantine` job, which does not gate a merge. tests/test_timing_quarantine.py
+        # pins this expression.
         # BACKLOG #1260: WRAPPED SO A NATIVE CRASH IS NOT REPORTED AS A TEST FAILURE. A segfault kills
         # the interpreter, so pytest returns 139/134 with no verdict and THREE layers of naming then
         # say "tests failed" -- the check name, the step name, and `steps.tests.outcome`, which is what
@@ -1142,7 +1149,7 @@ jobs:
         # and still passed. The recovery path this disables has not saved a single run in that window.
         # `retry-native-crash.sh` cannot help here either: under `-n` a worker segfault surfaces as a
         # controller-side node-down, not as exit 139, so the wrapper never sees it.
-        run: bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40
+        run: bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40
 
       # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
       # that has not run yet -- a step `if:` with no status function carries an implicit `success()`,
@@ -2443,6 +2450,90 @@ jobs:
           path: tooling-junit.xml
           if-no-files-found: ignore
 
+  # THE TIMING QUARANTINE (BACKLOG #4773). Owner ruling 2026-10-29, verbatim: "Go on fix 1: make the
+  # Step margin guard advisory in merge_group until #3515 re-measures the cap, and quarantine the
+  # recurring timing tests under #4773." Membership, the selection rule and the exit rule are in
+  # tests/timing_quarantine.txt; tests/conftest.py applies the marker, the `test` legs deselect it with
+  # `and not timing_quarantine`, and this job is where those tests still run and report.
+  #
+  # NOT A REQUIRED CONTEXT, AND ci-gate DOES NOT `needs:` IT, ON PURPOSE. Gating a merge on these tests
+  # is exactly what the ruling took away: they failed in the merge queue on unrelated PRs with nothing
+  # wrong in the change. Requiring this job, or rolling it into ci-gate, would put that back. So a red
+  # here wedges nothing, the same as the `ide` job. tests/test_timing_quarantine.py asserts it stays
+  # out of both. Do not add it to `.github/required-contexts.txt`.
+  #
+  # The job `if:` is the `Tests (pytest)` step's own condition, so it runs wherever the engine suite
+  # would have run these tests, the merge queue included, and keeps reporting their timing there.
+  #
+  # SERIAL, NOT `-n`. The list is a handful of tests, and xdist would only add worker start-up. The
+  # per-test `--timeout` and faulthandler values are the engine matrix's own, per OS (60/90 ubuntu,
+  # 120/150 Windows), so no timeout is raised for a quarantined test.
+  timing-quarantine:
+    name: timing quarantine (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: ci/python-version
+
+      # Collection imports every module under `testpaths` before `-m` filters, so the Qt libraries are
+      # needed here for the same reason the `tooling` job records on its own copy of this step.
+      - name: Install Qt offscreen system libraries
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update && sudo timeout 180 apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3; then
+              exit 0
+            fi
+            echo "::warning::apt attempt ${attempt}/3 failed or timed out; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt-get failed 3 times. This is the UBUNTU RUNNER MIRROR, not the change under test."
+          exit 1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
+        run: |
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+
+      # pytest exits 5 when `-m timing_quarantine` selects nothing, which reds this step: a dead marker
+      # or a broken conftest hook must not read as a green run. An EMPTY LIST is the one legitimate
+      # zero, once every entry has left under its row, so it is told apart by counting the entries.
+      - name: Quarantined timing tests (pytest)
+        timeout-minutes: 20
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONFAULTHANDLER: "1"
+          FAULT_TIMEOUT: "${{ runner.os == 'Windows' && '150' || '90' }}"
+          PYTEST_TIMEOUT: "${{ runner.os == 'Windows' && '120' || '60' }}"
+        run: |
+          entries="$(grep -cvE '^[[:space:]]*(#|$)' tests/timing_quarantine.txt || true)"
+          if [ "$entries" = "0" ]; then
+            echo "::notice::tests/timing_quarantine.txt lists no tests; nothing to run."
+            exit 0
+          fi
+          pytest -q -m timing_quarantine --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=20
+
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
   # pass CI unbuilt (this job exists because an esbuild bump merged "green" without anything having
@@ -2803,19 +2894,20 @@ jobs:
           # `webconsole` name merge_group in their own step `if:` (so `code` here is belt-and-braces
           # for them), and sqlserver-store, postgres-store, load-test, load-test-sqlserver and
           # windows-service-smoke name it in their JOB `if:`, which is why `serverdb=false` here does
-          # not stop them. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME merge_group NOWHERE are
+          # not stop them. timing-quarantine names it in its JOB `if:` beside a `code` arm, so `code`
+          # is belt-and-braces for it too. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME merge_group NOWHERE are
           # decided by that output and by nothing else -- docker-smoke, ide, tooling,
           # packaging-build and postgres-store-windows, via `docker`, `ide`, `tooling`, `packaging`
           # and `serverdb` below. So `serverdb=false` DOES keep postgres-store-windows out of the
           # queue, which is intended: that leg is advisory, and in the queue it could stop nothing.
           #
           # BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING, because dropping either changes the
-          # answer. "Names merge_group nowhere" ALONE is true of EIGHT of this file's 15 jobs -- it
+          # answer. "Names merge_group nowhere" ALONE is true of EIGHT of this file's 16 jobs -- it
           # also takes in `changes` and `crypto-operations`, which have no `if:` at all, and
           # `ci-gate`, which is `always()` and reads no output of this step. None of the three is
-          # decided by anything emitted here. Scanned over all 15 job blocks rather than sampled, and
+          # decided by anything emitted here. Scanned over all 16 job blocks rather than sampled, and
           # tests/test_ci_merge_group_gate.py pins the sides of that scan BY MEMBERSHIP, not by count:
-          # the SEVEN jobs whose own job-level or step-level `if:` names merge_group, the EIGHT of
+          # the EIGHT jobs whose own job-level or step-level `if:` names merge_group, the EIGHT of
           # this paragraph, and the FIVE named above.
           # THE COUNTS IN THIS PARAGRAPH ARE NOT WHAT IS PINNED -- that module held a count until
           # 2026-09-22 and a count sits at six while a job key is renamed underneath it. It also

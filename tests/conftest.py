@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from tests import _process_guard as process_guard
+from tests import _timing_quarantine as timing_quarantine
 from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
 from tests._qt_cycles import collect_qobjects_in_cycles
@@ -906,10 +907,25 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             "`tests` was imported from another checkout, so its list would mark this one's tests"
         )
     names = frozenset(tooling_manifest.names())  # raises if absent or malformed -- see above
+    quarantined = timing_quarantine.node_ids()  # raises the same way, for the same reason
     for item in items:
         path = getattr(item, "path", None)
-        if path is not None and path.parent == _TESTS_DIR and path.name in names:
+        if path is None or path.parent != _TESTS_DIR:
+            continue
+        if path.name in names:
             item.add_marker(pytest.mark.tooling)
+        if _quarantine_key(path, item.nodeid) in quarantined:
+            item.add_marker(pytest.mark.timing_quarantine)
+
+
+def _quarantine_key(path: Path, nodeid: str) -> str:
+    """``tests/<file>.py::<test>`` for an item in tests/, parameter suffix dropped.
+
+    Built from the file name rather than taken from ``nodeid`` whole, so the key does not depend on
+    the rootdir pytest chose. Owner ruling 2026-10-29 and the list's rules: tests/timing_quarantine.txt.
+    """
+    _, _, inner = nodeid.partition("::")
+    return f"tests/{path.name}::{inner.partition('[')[0]}"
 
 
 @pytest.fixture(autouse=True)

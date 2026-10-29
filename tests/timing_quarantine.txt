@@ -1,0 +1,32 @@
+# Timing-dependent tests held OFF the engine `test` legs, under BACKLOG #4773.
+#
+# OWNER RULING 2026-10-29, verbatim: "Go on fix 1: make the Step margin guard advisory in
+# merge_group until #3515 re-measures the cap, and quarantine the recurring timing tests under
+# #4773." That ruling is this file's whole authority, and it authorises nothing wider.
+#
+# WHAT IT DOES. tests/conftest.py marks each test below `timing_quarantine`. ci.yml's engine legs
+# run `-m 'not tooling and not timing_quarantine'`, so these tests no longer gate a merge. The
+# `timing-quarantine` job runs `-m timing_quarantine` on ubuntu and windows-2025, so they still run
+# and report. That job is not a required context and is not in ci-gate's `needs:`. Each test's
+# assertions and timeouts are unchanged; only where it runs moved.
+#
+# THE SELECTION RULE. A test enters only if it failed in the engine merge queue on at least two
+# unrelated PRs in the window of 2026-10-27 16Z to 2026-10-29 15Z (200 merge_group runs, 33 failed),
+# or if #4773 names it. It enters with the row that owns its timing dependence.
+#
+# THE EXIT RULE. A test leaves this file when its timing dependence is fixed, under its own row, in
+# the same change as the fix. Do not add a test for any other reason, and do not leave one here once
+# its row closes.
+#
+# FORMAT. One entry per line: the node id (`tests/<file>.py::<test>`, no parameter suffix), then
+# whitespace, then a one-line reason that names its row as `#<n>`. tests/_timing_quarantine.py is the
+# only reader. tests/test_timing_quarantine.py checks that every node id resolves.
+tests/test_uploads.py::test_a_timed_out_stop_keeps_the_row_of_every_pair_already_removed  merge-queue timing failure on unrelated PRs; row #3943, also #3184
+tests/test_approval_repeat_request.py::test_repeats_racing_from_two_processes_file_one_request  merge-queue timing failure on unrelated PRs; row #3909
+tests/test_harness_scenarios.py::test_a_scenario_expecting_the_wrong_disposition_fails  merge-queue timing failure on unrelated PRs; row #3933
+tests/test_message_export.py::test_a_stall_past_the_idle_window_ends_the_export  named by #4773
+tests/test_message_export.py::test_a_stall_shorter_than_the_idle_window_can_end_the_export  named by #4773
+tests/test_verify_cipher_policy.py::test_the_command_runs_in_constrained_language_mode  named by #4773
+tests/test_harness_fuzz.py::test_a_seeded_campaign_holds_every_invariant  merge-queue timing failure on unrelated PRs; row #3837, also #3349
+tests/test_transform_offloop.py::test_slow_handler_does_not_stall_the_loop  named by #4773
+tests/test_intake_pause_mllp_dicom_timer.py::test_an_association_accepted_before_a_pause_finishes_normally  merge-queue timing failure on unrelated PRs; row #3147, also #3266

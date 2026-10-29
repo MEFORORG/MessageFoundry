@@ -87,6 +87,8 @@ _SELF_GATED_ON_QUEUE = {
     "load-test",
     "load-test-sqlserver",
     "windows-service-smoke",
+    # BACKLOG #4773, owner ruling 2026-10-29: the quarantined timing tests keep running in the queue.
+    "timing-quarantine",
 }
 
 #: The mirror image, and the one the arm's comment in ci.yml enumerates: jobs GATED ON AN OUTPUT of
@@ -152,12 +154,14 @@ _NAMES_MERGE_GROUP_NOWHERE = {
 #:
 #: sqlserver-store and postgres-store carry `serverdb` in their job `if:`; `test` and `webconsole`
 #: carry `code` in their STEP `if:` lines, which ci.yml's `code` row calls belt-and-braces -- so the
-#: tidy-up that empties this set is an invited edit, not a contrived one.
+#: tidy-up that empties this set is an invited edit, not a contrived one. timing-quarantine carries
+#: `code` and merge_group side by side in its JOB `if:`, copied from the `Tests (pytest)` step.
 _SELF_GATED_AND_GATED = {
     "test",
     "webconsole",
     "sqlserver-store",
     "postgres-store",
+    "timing-quarantine",
 }
 
 # The relation BETWEEN the three pins above is checked, not claimed in prose, by
@@ -408,7 +412,7 @@ def test_the_arm_decides_before_the_step_ever_runs_git(workdir: Path, tmp_path: 
 def test_the_jobs_that_run_on_a_queue_entry_regardless_are_pinned() -> None:
     """`serverdb=false` above does NOT mean the heavy legs are off in the queue.
 
-    Seven jobs name merge_group in their own `if:` and so ignore what `changes` emits. The arm's
+    Eight jobs name merge_group in their own `if:` and so ignore what `changes` emits. The arm's
     comment says this; without a check, that comment is free to go stale while reading as current --
     and a reader who believes it would size the queue's cost at a fraction of the truth.
 
