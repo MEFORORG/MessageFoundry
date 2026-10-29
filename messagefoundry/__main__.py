@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     from messagefoundry.config.static_credentials import StaticCredentialGateOutcome
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
     from messagefoundry.store.store import UserRecord
@@ -7956,40 +7957,12 @@ def _offline_security_notifier(
     alerts = settings.alerts
     if not (settings.auth.notify_security_events and alerts.email_smtp_host and alerts.email_from):
         return None
-    unauthenticated = not alerts.email_use_tls or not alerts.email_tls_verify
-    if unauthenticated and not settings.security.allow_unverified_alert_smtp_tls:
-        print(
-            "WARNING: the [alerts] SMTP hop does not authenticate the relay (email_use_tls or "
-            "email_tls_verify is false), so no security notice is sent from this command. Set "
-            "[security].allow_unverified_alert_smtp_tls=true to accept that hop deliberately.",
-            file=sys.stderr,
-        )
+    if not _offline_smtp_hop_unauthenticated_permitted(settings, what="security notice"):
         return None
-    if unauthenticated:
-        # Acknowledged, and never silent: `serve` logs the same acknowledgment as an AUDIT line.
-        print(
-            "WARNING: sending over an [alerts] SMTP hop that does not authenticate the relay, "
-            "permitted by [security].allow_unverified_alert_smtp_tls=true. The notice can be read "
-            "on that hop. No login crosses it: [alerts].email_username beside that hop is refused "
-            "when settings load.",
-            file=sys.stderr,
-        )
     try:
         # BACKLOG #3470: the relay's CA takes the trust-anchor checks `serve` gives it. A refusal
         # drops the notice, as any other failure here does; the recovery itself goes on.
-        from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
-        from messagefoundry.config.settings import SecurityEnforcement
-        from messagefoundry.controlchars import scrub_control_chars
-
-        relay_ca = smtp_hop_anchor_spec(alerts, settings.auth, settings.tls)
-        enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
-        if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
-            # The refusal's text is written for a start. This command does not stop on it.
-            print(
-                f"WARNING: {scrub_control_chars(str(refusal))}\nThis command goes on, but it "
-                "sends no security notice over that relay.",
-                file=sys.stderr,
-            )
+        if not _offline_smtp_relay_ca_accepted(settings, what="security notice"):
             return None
         return security_notifier_from_settings(
             alerts,
@@ -8003,6 +7976,155 @@ def _offline_security_notifier(
             file=sys.stderr,
         )
         return None
+
+
+def _offline_smtp_hop_unauthenticated_permitted(settings: ServiceSettings, *, what: str) -> bool:
+    """Whether an offline command may send a ``what`` over the ``[alerts]`` SMTP hop as configured.
+
+    False, with a WARNING, for a hop that does not authenticate the relay (``email_use_tls`` or
+    ``email_tls_verify`` false) unless ``[security].allow_unverified_alert_smtp_tls`` acknowledges
+    it. :func:`_offline_security_notifier` says why an offline command refuses that hop at every
+    posture. An acknowledged one is sent over, and said so, never silently."""
+    alerts = settings.alerts
+    unauthenticated = not alerts.email_use_tls or not alerts.email_tls_verify
+    if unauthenticated and not settings.security.allow_unverified_alert_smtp_tls:
+        print(
+            "WARNING: the [alerts] SMTP hop does not authenticate the relay (email_use_tls or "
+            f"email_tls_verify is false), so no {what} is sent from this command. Set "
+            "[security].allow_unverified_alert_smtp_tls=true to accept that hop deliberately.",
+            file=sys.stderr,
+        )
+        return False
+    if unauthenticated:
+        # Acknowledged, and never silent: `serve` logs the same acknowledgment as an AUDIT line.
+        print(
+            "WARNING: sending over an [alerts] SMTP hop that does not authenticate the relay, "
+            f"permitted by [security].allow_unverified_alert_smtp_tls=true. The {what} can be read "
+            "on that hop. No login crosses it: [alerts].email_username beside that hop is refused "
+            "when settings load.",
+            file=sys.stderr,
+        )
+    return True
+
+
+def _offline_smtp_relay_ca_accepted(settings: ServiceSettings, *, what: str) -> bool:
+    """Whether the ``[alerts]`` relay's CA passes the trust-anchor checks ``serve`` gives it
+    (BACKLOG #3470). False, with a WARNING, when they refuse it: the command goes on and sends no
+    ``what`` over that relay. May raise what the checks raise; the callers treat that as a channel
+    that could not be built."""
+    from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
+    from messagefoundry.config.settings import SecurityEnforcement
+    from messagefoundry.controlchars import scrub_control_chars
+
+    relay_ca = smtp_hop_anchor_spec(settings.alerts, settings.auth, settings.tls)
+    enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+    if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
+        # The refusal's text is written for a start. This command does not stop on it.
+        print(
+            f"WARNING: {scrub_control_chars(str(refusal))}\nThis command goes on, but it "
+            f"sends no {what} over that relay.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+#: ``via`` on the ``administrator_granted`` alert ``provision-admin`` raises (vault BACKLOG #3849 B5).
+PROVISION_ADMIN_GRANT_VIA = "provision_admin"
+
+
+def _offline_alert_notifier(
+    settings: ServiceSettings, posture: HopPosture | None
+) -> NotifierAlertSink | None:
+    """The ``[alerts]`` notifier ``serve`` would wire, built for an offline command (vault BACKLOG
+    #3849 B5), or ``None`` when no transport is configured, as ``serve`` then falls back to its
+    logging sink.
+
+    The email transport is dropped, and any webhook kept, when the SMTP hop is one an offline command
+    refuses (:func:`_offline_smtp_hop_unauthenticated_permitted`) or its relay CA is refused
+    (:func:`_offline_smtp_relay_ca_accepted`), as the ``serve`` lifespan drops it for a refused CA.
+    A build failure is WARNED and yields ``None``, so the caller's alert reaches the log instead:
+    the grant it reports has already been written, and a recovery command must not die on its page.
+    """
+    from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+
+    alerts = settings.alerts
+    try:
+        if alerts.email_smtp_host and not (
+            _offline_smtp_hop_unauthenticated_permitted(settings, what="alert email")
+            and _offline_smtp_relay_ca_accepted(settings, what="alert email")
+        ):
+            from messagefoundry.api.app import _alerts_without_email
+
+            alerts = _alerts_without_email(alerts)
+        return notifier_from_settings(
+            alerts,
+            secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
+            trust_anchor_policy=settings.tls.policy(),
+            posture=posture,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort channel; the grant is already written
+        print(
+            f"WARNING: the [alerts] notifier could not be built ({exc}), so this command's alert "
+            "goes to the log only.",
+            file=sys.stderr,
+        )
+        return None
+
+
+async def _raise_offline_administrator_granted(
+    settings: ServiceSettings,
+    posture: HopPosture | None,
+    store: Store,
+    *,
+    username: str,
+    granted_by: str,
+) -> bool:
+    """Raise ``administrator_granted`` for an Administrator ``provision-admin`` just granted (vault
+    BACKLOG #3849 B5), and return whether an ``[alerts]`` notifier carried it rather than the log.
+
+    Every role grant the web console makes raises this alert. Since vault BACKLOG #2711 step 1 this
+    command can add an Administrator beside directory ones that still sign in, and before this
+    nobody was paged. It is raised on every successful run, a first install included, because the
+    console pages every grant too and a "beside others" condition would be one more read that can
+    race.
+
+    The notifier is the one ``serve`` wires, with the opened store set, so the alert also lands
+    as an open alert instance the web console lists once the engine runs (ADR 0044). Started, fed
+    and drained here, because the loop ends with the command. Best effort, and it never raises:
+    the grant is written and audited, and the page is the smaller loss."""
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+
+    key = f"user:{username}"
+    notifier = _offline_alert_notifier(settings, posture)
+    if notifier is None:
+        try:
+            LoggingAlertSink().administrator_granted(
+                key, via=PROVISION_ADMIN_GRANT_VIA, granted_by=granted_by
+            )
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+            logging.getLogger(__name__).exception("the administrator_granted alert failed to emit")
+        return False
+    try:
+        notifier.set_store(store)
+        notifier.start()
+        try:
+            await notifier.prime_suspensions()
+            notifier.administrator_granted(
+                key, via=PROVISION_ADMIN_GRANT_VIA, granted_by=granted_by
+            )
+        finally:
+            await notifier.drain_state(timeout=_OFFLINE_ALERT_DRAIN_SECONDS)
+            await notifier.aclose()
+    except Exception:  # noqa: BLE001 - as `alert_administrator_granted` in the API; the caller
+        # still has recovery codes to show, so nothing here may raise past it.
+        logging.getLogger(__name__).exception("the administrator_granted alert failed to emit")
+    return True
+
+
+#: How long ``provision-admin`` waits for the alert's open-instance write before it closes the store.
+_OFFLINE_ALERT_DRAIN_SECONDS = 10.0
 
 
 class _ProvisionStore:
@@ -8425,7 +8547,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except _PasswordEntryRefused as exc:
             return _emit_error(str(exc), as_json=args.json)
 
-    async def run() -> tuple[ProvisionedAdministrator, str]:
+    actor = f"cli:{getpass.getuser()}"
+
+    async def run() -> tuple[ProvisionedAdministrator, str, bool]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         store = await open_store(
             settings.store,
@@ -8467,7 +8591,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     password=password,
                     display_name=args.display_name,
                     notify_email=email,
-                    actor=f"cli:{getpass.getuser()}",
+                    actor=actor,
                     totp_secret=totp_secret,
                     totp_code=totp_code,
                     totp_code_read_at=totp_read_at,
@@ -8475,6 +8599,16 @@ def _provision_admin(args: argparse.Namespace) -> int:
             finally:
                 if security_notifier is not None:
                     await security_notifier.aclose()
+            # Vault BACKLOG #3849 B5: the grant is written and audited, so it pages, as every
+            # console grant does. Before the store closes, so the alert's open instance lands in it.
+            # It never raises, so the recovery codes below are always shown.
+            alerted = await _raise_offline_administrator_granted(
+                settings,
+                posture,
+                store,
+                username=outcome.username,
+                granted_by=actor,
+            )
             # NO M-31 "the store must already exist" guard here, and the difference from
             # `admin-unlock` is deliberate: the ordinary sequence is install, provision, serve, so on
             # a first run the SQLite store legitimately does NOT exist and creating it is correct.
@@ -8483,7 +8617,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # The substitute is naming the target below. It is read off the OPENED store rather than
             # off `[store].path`, which is the SQLite field and would name a file that was never
             # touched on the two server backends.
-            return (outcome, store.path)
+            return (outcome, store.path, alerted)
         finally:
             store_slot.current = None
             await store.close()
@@ -8507,7 +8641,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     # No TrustAnchorError arm: the anchors are checked at the build, before the prompt (#2081).
     try:
-        outcome, store_path = run_guarded(run())
+        outcome, store_path, alerted = run_guarded(run())
     except FirstAdministratorRefused as exc:
         return _emit_error(str(exc), as_json=args.json)
     except (_KeylessProvisionRefused, KeylessAuditChainRefused, _UnauditableWrite) as exc:
@@ -8558,6 +8692,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 # True only when recovery codes were issued AND reached the console; false with
                 # --no-totp (none issued) and when the console failed before showing them.
                 "recovery_codes_shown": codes_shown,
+                # Vault BACKLOG #3849 B5: true when an [alerts] notifier took the
+                # administrator_granted alert, false when only the log did. Not a delivery receipt.
+                "administrator_granted_alerted": alerted,
             },
             compact=True,
         )
@@ -8590,6 +8727,24 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS:
         _safe_print("The account had no notification address, so there was nobody to tell.")
+    # Vault BACKLOG #3849 B5.
+    if alerted:
+        _safe_print(
+            "Raised the administrator_granted alert on the [alerts] notifier. Delivery is best "
+            "effort: a failed send shows as a WARNING above."
+        )
+    elif outcome.administrators_at_check:
+        _safe_print(
+            "WARNING: no [alerts] notifier was available, so the administrator_granted alert for "
+            "this grant went to the log only, and nobody was paged. Tell the site's other "
+            "Administrators yourself: "
+            + ", ".join(repr(name) for name in outcome.administrators_at_check)
+        )
+    else:
+        _safe_print(
+            "No [alerts] notifier was available, so the administrator_granted alert for this "
+            "grant went to the log only."
+        )
     return 0
 
 

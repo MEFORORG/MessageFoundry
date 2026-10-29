@@ -194,6 +194,7 @@ from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
+    LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_TARGET_PREFIX,
@@ -13984,9 +13985,24 @@ class SqlServerStore:
     async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
         """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
         await self._execute(
-            "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<?",
-            (user_id, before),
+            "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<? AND address<>?",
+            (user_id, before, LOGIN_ADDRESS_RESET_MARKER),
         )
+
+    async def reset_login_addresses(self, user_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.reset_login_addresses`."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+                await cur.execute(
+                    "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
+                    " VALUES (?, ?, 0, 0)",
+                    (user_id, LOGIN_ADDRESS_RESET_MARKER),
+                )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def delete_user(self, user_id: str) -> None:
         async with self._acquire() as conn, self._cursor(conn) as cur:

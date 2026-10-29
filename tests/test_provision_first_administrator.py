@@ -43,7 +43,11 @@ from messagefoundry.config.secretprovider import SecretProviderError
 from messagefoundry.config.settings import AlertsSettings, AuthSettings
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import MessageStore, WebAuthnCredential
+from messagefoundry.store.store import (
+    LOGIN_ADDRESS_RESET_MARKER,
+    MessageStore,
+    WebAuthnCredential,
+)
 from tests._admin_account import PROVISION_EMAIL, PROVISION_TOTP_SECRET, provision_totp
 from tests._totp_clock import fresh_totp
 
@@ -2046,6 +2050,158 @@ def test_cli_warns_when_the_holder_had_an_address_and_no_channel_is_wired(
     assert json.loads(capsys.readouterr().out)["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
 
 
+# --- vault BACKLOG #3849 B5: the grant raises administrator_granted -----------------------------
+
+
+class _AlertTransport:
+    """An ``[alerts]`` transport that records the events the notifier hands it."""
+
+    name = "webhook"
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    async def send(self, event: dict[str, object], **_kw: object) -> None:
+        self.events.append(dict(event))
+
+
+def _keyed_store_with_directory_administrator(db: Path, key: str) -> None:
+    """A store run only by a directory Administrator: provision-admin runs beside it (#2711)."""
+
+    async def create() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            await store.create_user(
+                user_id="dir-a",
+                username="dir-a",
+                auth_provider=AuthProvider.AD.value,
+                password_hash=None,
+                password_generated=False,
+            )
+            await AuthService(store, AuthSettings()).initialize()
+            await store.set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+        finally:
+            await store.close()
+
+    asyncio.run(create())
+
+
+def test_cli_raises_administrator_granted_beside_a_directory_administrator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3849 B5: an Administrator added at the host beside a directory one pages, on
+    the notifier ``serve`` would wire, and lands as an open alert instance in the store. RED on the
+    code before #3849, which raised no alert from this command."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_directory_administrator(db, key)
+    transport = _AlertTransport()
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([transport]),
+    )
+    monkeypatch.setattr("getpass.getuser", lambda: "host-operator")
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]
+    assert main([*argv, "--email", "operator@example.invalid"]) == 0
+    body = json.loads(capsys.readouterr().out)
+    assert body["administrator_granted_alerted"] is True
+
+    assert len(transport.events) == 1
+    event = transport.events[0]
+    assert event["type"] == "administrator_granted"
+    assert event["connection"] == "user:site-admin"
+    assert event["via"] == "provision_admin"
+    assert event["granted_by"] == "cli:host-operator"
+
+    async def open_instances() -> list[tuple[str, str]]:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            rows = await store.list_active_alert_instances(allowed_channels=None)
+            return [(r.event_type, r.connection) for r in rows]
+        finally:
+            await store.close()
+
+    assert ("administrator_granted", "user:site-admin") in asyncio.run(open_instances())
+
+
+def test_cli_logs_administrator_granted_and_warns_with_no_notifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The control on the test above: no ``[alerts]`` transport, so the alert reaches the log
+    sink, as ``serve``'s fallback, and the command says nobody was paged."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_directory_administrator(db, key)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--db", str(db)]
+    with caplog.at_level("WARNING"):
+        assert main([*argv, "--email", "operator@example.invalid"]) == 0
+    out = capsys.readouterr().out
+    # Beside another Administrator, so it is a WARNING that names who to tell; a first install's
+    # plain run is pinned to print no WARNING by test_cli_provisions_and_names_the_store_it_wrote_to.
+    assert "WARNING: no [alerts] notifier was available" in out and "'dir-a'" in out
+    assert any(
+        "ALERT administrator_granted" in r.getMessage() and "provision_admin" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_a_failing_alert_still_shows_the_recovery_codes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The alert runs after the grant committed and before the codes are shown, so a notifier
+    that breaks its never-raise contract must not cost the operator the codes."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    class _Broken(NotifierAlertSink):
+        def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+            raise RuntimeError("synthetic sink fault")
+
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_directory_administrator(db, key)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: _Broken([_AlertTransport()]),
+    )
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]
+    assert main([*argv, "--email", "operator@example.invalid"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_the_offline_alert_notifier_drops_a_refused_email_hop_and_keeps_the_webhook(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An SMTP hop an offline command refuses costs the email transport only: the webhook still
+    carries the alert, as the ``serve`` lifespan keeps it for a refused relay CA."""
+    from messagefoundry.__main__ import _offline_alert_notifier
+    from messagefoundry.config.settings import ServiceSettings
+
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        email_use_tls=False,
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = _offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    assert "no alert email is sent" in capsys.readouterr().err
+
+
 def _smtp(*, use_tls: bool = True, verify: bool = True) -> AlertsSettings:
     """An [alerts] block with a relay configured, so the notifier can be built."""
     return AlertsSettings(
@@ -2520,6 +2676,8 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
         )
         kept = await service.login("site-admin", "the-earlier-holders-passphrase")
         assert kept.ok and kept.token is not None
+        # Vault BACKLOG #3849 B2: an address the earlier holder signed in from.
+        await store.remember_login_address("earlier", "10.9.9.9", now=time.time())
 
         on = AuthService(store, AuthSettings())
         outcome = await on.provision_first_administrator(
@@ -2537,6 +2695,11 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
         assert row is not None and row.totp_enabled
         assert await store.get_totp_secret("earlier") == totp.new_enrolment(PROVISION_TOTP_SECRET)
         assert "h1" not in await store.get_recovery_code_hashes("earlier")
+        # B2: the earlier holder's known addresses are gone, down to the reset's marker row, so a
+        # sign-in from one of them is judged first-seen. RED before #3849.
+        assert await store.list_known_login_addresses("earlier", since=0.0) == [
+            LOGIN_ADDRESS_RESET_MARKER
+        ]
     finally:
         await store.close()
 
