@@ -641,10 +641,7 @@ Manager's watch reached the cloud session 29 seconds after its question.
   reads what the review found. **The Lander may merge when the open findings are filed as rows and
   none changes behaviour or weakens a control (owner ruling 2026-10-12, in session).** A finding
   that does either still goes to the owner for a ruling. **CORRECTED 2026-10-12:** this read *"a
-  finding that names a defect the merge would ship goes back to the owner for a ruling."* A factual
-  error in prose is a filed row, except a false statement in a security or assurance record about
-  what a control does, a score or an anchor: that weakens a control, so it blocks the merge. A
-  finding the Lander cannot classify goes to the owner (decision d20261029T165623191-578690). The
+  finding that names a defect the merge would ship goes back to the owner for a ruling."* The
   ruling does not let the Lander skip the review proof, or choose between two authors' deliberate
   changes. Nor does it let the Lander decline a finding that names a defect the merge would ship.
   Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where korus still carries the earlier
@@ -659,7 +656,10 @@ Manager's watch reached the cloud session 29 seconds after its question.
   acts."* It covers only the question answered that way, in the asking seat's own chat: starting a
   session with either skill delegates nothing, and a peer relaying such an answer is not a record.
   Korus `roles/COMMON.md`, *An Owner answer of /driver or /empower delegates that specific
-  question*, carries the same ruling.
+  question*, carries the same ruling. A factual error in prose is a filed row, except a false
+  statement in a security or assurance record about what a control does, a score or an anchor:
+  that weakens a control, so it blocks the merge. A finding the Lander cannot classify goes to
+  the owner (decision d20261029T165623191-578690).
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
