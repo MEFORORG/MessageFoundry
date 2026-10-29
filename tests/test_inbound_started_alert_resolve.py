@@ -260,7 +260,6 @@ async def test_neither_a_reload_nor_its_rollback_resolves_a_bind_failure(
         assert sink.started == []
         await runner.restart_inbound("SHARED", operator=True)
         assert sink.started == ["SHARED"]
-        assert runner._resolving_starts == set()
     finally:
         await runner.stop()
 
@@ -504,7 +503,6 @@ async def test_a_non_operator_restart_raises_no_start_even_after_a_start_failure
         await runner.restart_inbound("SHARED")
         assert runner.inbound_running("SHARED") and runner.inbound_failed("SHARED") is None
         assert sink.started == []
-        assert runner._resolving_starts == set()
     finally:
         await runner.stop()
 
@@ -642,7 +640,6 @@ async def test_an_operator_start_of_a_listening_inbound_resolves(store: MessageS
         await _settle(sink)
         assert runner.inbound_running("IB")
         assert await _open(store) == set()
-        assert runner._resolving_starts == set()
         # A STOP's live hold still holds back the Start of a listening inbound.
         sink.connection_stopped("IB", detail="router halted on internal error")
         runner._hold_for_operator("IB", "inbound")

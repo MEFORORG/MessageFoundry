@@ -1483,9 +1483,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def connection_started(self, name: str) -> None:
         """The inverse of ``connection_stopped`` (BACKLOG #1741; the Protocol says when it fires: only
         an operator's start or restart). No notification; auto-resolves the open instance when
-        alert-state is wired, which drops its occurrence count, tier and suspend entry. It also ends
-        the cooldown, as ``crl_reload_applied`` does, so a stop that follows is a new incident that
-        pages and dispatches its rule's control action, whatever rule restart is in flight."""
+        alert-state is wired, which drops its occurrence count, tier and suspend entry. With
+        alert-state wired it also ends the cooldown, so a stop that follows is a new incident that
+        pages and dispatches its rule's control action, whatever rule restart is in flight. Without
+        alert-state there is no instance to resolve, and the cooldown stands."""
         if self._store is not None:
             self._last_sent.pop(f"connection_stopped:{name}", None)
         self._record_state({"type": "connection_started", "connection": name}, "info")

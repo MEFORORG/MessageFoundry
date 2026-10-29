@@ -235,9 +235,11 @@ class AlertSink(Protocol):
         it: an operator's start or restart of the inbound, including a start of an inbound that is
         already listening. Every other start never does, at least the engine's own ``start()``, a
         committed reload, a reload's rollback, the scheduler and every alert rule's
-        ``restart_inbound``. A fresh process cannot see an earlier run's causes, and a rule-driven
-        loop must keep counting, so an open stop keeps its instance, ack, suspend, cooldown and
-        escalation count across them. On that door, at least these starts never raise it: an
+        ``restart_inbound``. A fresh process cannot see an earlier run's causes, so an open stop
+        keeps its durable instance, ack and suspend across a service restart and a reload; the
+        cooldown and the escalation count are per-process memory, so a service restart resets
+        them whatever this event does. A rule-driven loop must keep counting, so a rule's restart
+        also keeps the cooldown and the count. On that door, at least these starts never raise it: an
         outbound's own start; a start where the runner cannot see every cause (on a clustered node,
         or on an engine shard that does not own the outbound namesake); and a start while the
         outbound namesake is under an operator-style pause, which a log-write halt's pause looks

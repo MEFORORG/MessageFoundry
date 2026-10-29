@@ -1656,10 +1656,6 @@ class RegistryRunner:
         # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
-        # BACKLOG #1741: inbounds inside an operator's start or restart, the only starts that raise
-        # connection_started (AlertSink.connection_started says why). Held only under the reload lock,
-        # so no other door's start sees it.
-        self._resolving_starts: set[str] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
         # resolved in _start_pooled_dispatchers AFTER trying to open the sync pools + build the per-stage
@@ -3254,7 +3250,8 @@ class RegistryRunner:
         raise KeyError(name)
 
     async def start_inbound(self, name: str, *, operator: bool = False) -> None:
-        """Start receiving on one inbound connection (no-op if already listening).
+        """Start receiving on one inbound connection (no bind if already listening; an
+        ``operator`` start of a listening inbound may still resolve its alert).
 
         Public console/API entrypoint — takes the reload lock so it can't race a concurrent
         reload()/stop() mutating _sources/_workers (review M-10). Internal callers that already hold
@@ -3262,21 +3259,20 @@ class RegistryRunner:
 
         On a passive DR standby only an ``operator`` start binds; an engine door such as the
         scheduler or an alert rule does nothing (:meth:`_dr_refuses`). Only an ``operator`` start
-        raises ``connection_started`` (BACKLOG #1741, :meth:`_note_inbound_started`)."""
+        raises ``connection_started`` (BACKLOG #1741, :meth:`_resolving_start`)."""
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
             await self._resolving_start(name, resolve=operator)
 
     async def _resolving_start(self, name: str, *, resolve: bool) -> None:
-        """:meth:`_checked_inbound_start`, marking ``name`` so its start raises ``connection_started``
-        when ``resolve`` (BACKLOG #1741). The caller holds the reload lock."""
-        if resolve:
-            self._resolving_starts.add(name)
-        try:
-            await self._checked_inbound_start(name)
-        finally:
-            self._resolving_starts.discard(name)
+        """:meth:`_checked_inbound_start`, then, when ``resolve`` (an operator's start or restart),
+        raise ``connection_started`` (BACKLOG #1741). The caller holds the reload lock. Covers a
+        fresh bind, an inbound already listening, and a log-write refusal that undid its own bind,
+        which :meth:`_emit_inbound_started` reads as not running."""
+        await self._checked_inbound_start(name)
+        if resolve and self._running:
+            self._emit_inbound_started(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
         """:meth:`_start_inbound_unsafe` after the lane check. A refused CA records the inbound
@@ -4405,13 +4401,6 @@ class RegistryRunner:
 
         return _hold
 
-    def _note_inbound_started(self, name: str) -> None:
-        """An inbound is up after a start: emit ``connection_started`` only when that start is an
-        operator's start or restart (BACKLOG #1741). :meth:`AlertSink.connection_started` says why
-        every other start resolves nothing."""
-        if name in self._resolving_starts:
-            self._emit_inbound_started(name)
-
     def _emit_inbound_started(self, name: str) -> None:
         """Raise ``connection_started`` for inbound ``name``, so a sink with alert-state resolves the
         open ``connection_stopped`` instance under that name, such as a bind failure (BACKLOG #1741,
@@ -4530,10 +4519,6 @@ class RegistryRunner:
         not-deployed inbound is skipped silently there, not treated as a fault), so this raise is the
         operator/API path: deploying is a config change, not a runtime action."""
         if name in self._sources:
-            # BACKLOG #1741: an operator's Start on a listening inbound still resolves its open stop.
-            # The cause checks in _emit_inbound_started hold back a lane a STOP still halts.
-            if self._running:
-                self._note_inbound_started(name)
             return
         if not self._deployed(name, "inbound"):
             raise NotDeployedError(name)
@@ -4699,9 +4684,6 @@ class RegistryRunner:
                 await self._stop_inbound_unsafe(name)
                 return
             self._ensure_inbound_workers(name)
-            # BACKLOG #1741: last, once the listener is bound and the stages are re-armed, so neither
-            # the log-write refusal above nor a halted worker is resolved as a start.
-            self._note_inbound_started(name)
 
     async def _stop_inbound_unsafe(self, name: str) -> None:
         """stop_inbound body without the reload lock — for callers that already hold it."""
