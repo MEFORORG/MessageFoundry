@@ -3348,9 +3348,12 @@ class RegistryRunner:
 
         Every ``Exception`` is recorded and re-raised, as :meth:`start` isolates one at boot: a
         restart that fails for a type a narrower list missed would leave the feed down with no
-        status, which is the defect itself. Two are not failed starts and record nothing: a
-        :class:`NotDeployedError` (that inbound reads ``not_deployed``), and a name the graph does
-        not declare (the caller's ``KeyError``).
+        status, which is the defect itself. Three are not failed starts and record nothing: a
+        :class:`NotDeployedError` (that inbound reads ``not_deployed``), a name the graph does not
+        declare (the caller's ``KeyError``), and a raise after the bind with the listener still
+        serving, such as one from :meth:`_ensure_inbound_workers`. That one is the caller's to
+        handle, as it was before: a record there would mark a serving listener failed and page,
+        and a later start returns early on a bound source, so nothing would clear it.
 
         Once only, as :meth:`_record_window_open_failure` records: a scheduled poller retries at
         every in-window tick, and every alert could re-fire a ``restart_inbound`` control action,
@@ -3362,7 +3365,11 @@ class RegistryRunner:
         except NotDeployedError:
             raise
         except Exception as exc:
-            if name in self.registry.inbound and ("inbound", name) not in self._failed:
+            if (
+                name in self.registry.inbound
+                and name not in self._sources  # not serving: the start did not leave it bound
+                and ("inbound", name) not in self._failed
+            ):
                 self._record_failed(name, exc, kind="inbound")
             raise
 

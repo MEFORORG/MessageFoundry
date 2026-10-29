@@ -287,6 +287,32 @@ async def test_each_refused_restart_type_records_the_listener_failed_once(
         await runner.stop()
 
 
+async def test_a_raise_after_the_bind_leaves_a_serving_listener_unrecorded(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart that binds and then raises, here from ``_ensure_inbound_workers``, leaves the
+    listener serving. Recording it failed would page for a feed that is up, and a later start
+    returns early on the bound source, so the false record would stick. It records nothing, as
+    before #3859, and the raise still reaches the caller."""
+    runner, sink = _runner(_live_listener(), store)
+    await runner.start()
+    try:
+        assert runner.inbound_running("IB_LIVE")
+
+        def boom(name: str) -> None:
+            raise RuntimeError("worker spawn failed")
+
+        monkeypatch.setattr(runner, "_ensure_inbound_workers", boom)
+        with pytest.raises(RuntimeError, match="worker spawn failed"):
+            await runner.restart_inbound("IB_LIVE", operator=True)
+        assert runner.inbound_running("IB_LIVE")
+        assert runner.inbound_failed("IB_LIVE") is None
+        assert sink.stopped == []
+    finally:
+        monkeypatch.undo()
+        await runner.stop()
+
+
 async def test_a_not_deployed_or_unknown_start_is_not_recorded_failed(store: MessageStore) -> None:
     """NotDeployedError is a refused request, not a failed start: the inbound stays not_deployed,
     with no failed record and no alert. A name the graph does not declare is the caller's
