@@ -228,12 +228,15 @@ try {
     & $PythonExe @judgeArgs
     $judged = $LASTEXITCODE
     if ($null -eq $judged) { throw "the judge did not run" }
-    # A container that wrote no report says why only in its log, so the summary carries it whole.
+    # A container that wrote no report says why only in its log, so the summary carries its end. The
+    # cap keeps the summary under GitHub's 1 MiB a step, past which the answers above are dropped too.
     $containerLog = Join-Path $SharedDir "container.log"
     if ($Summary -and -not (Test-Path -LiteralPath (Join-Path $SharedDir "container.json")) -and
             (Test-Path -LiteralPath $containerLog)) {
         $fence = '```'
         $logText = [string](Get-Content -LiteralPath $containerLog -Raw) -replace $fence, "'''"
+        $logCap = 65536
+        if ($logText.Length -gt $logCap) { $logText = "[first $($logText.Length - $logCap) characters cut]`n" + $logText.Substring($logText.Length - $logCap) }
         [IO.File]::AppendAllText($Summary,
             ("The service's container wrote no report. Its output, {0}:`n`n{1}`n{2}`n{1}`n" -f $containerLog, $fence, $logText.TrimEnd()))
     }

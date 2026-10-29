@@ -57,6 +57,7 @@ import functools
 import hashlib
 import importlib.util
 import json
+import locale
 import os
 import re
 import subprocess
@@ -106,9 +107,10 @@ _KEY_OPEN_REFUSALS = frozenset({0x80090016, 0x80070002, 0x80090011, 0x80090010, 
 _SIGN_REFUSALS = frozenset({0x80090010, 0x80070005})
 #: CreateProcessW failures that are a refusal of the launch: access denied, a privilege not held.
 _LAUNCH_REFUSALS = frozenset({5, 1314})
-#: An exit code at or above this is an NTSTATUS error, which the loader gives a process that died
-#: before its own code ran. CPython's own exits are small.
-_NTSTATUS_ERROR = 0xC0000000
+#: The NTSTATUS exits the loader gives a process that died before its own code ran: a DLL or an
+#: entry point not found, a DLL whose initialisation failed, a bad image, access denied. Any other
+#: NTSTATUS exit, such as 0xC0000409 from an abort() inside CPython, is a crash, not one of these.
+_LOADER_DEATHS = frozenset({0xC0000135, 0xC0000139, 0xC0000142, 0xC000007B, 0xC0000022})
 #: CreateAppContainerProfile's HRESULT when the profile is there already.
 _PROFILE_EXISTS = 0x800700B7
 #: The digest the owner and the container sign, and the owner checks.
@@ -606,23 +608,33 @@ class _ExplicitAccessW(ctypes.Structure):
 _UOI_NAME = 2
 _SE_WINDOW_OBJECT = 7
 _DACL_SECURITY_INFORMATION = 0x00000004
+_LABEL_SECURITY_INFORMATION = 0x00000010
 _READ_CONTROL = 0x00020000
 _WRITE_DAC = 0x00040000
+_WRITE_OWNER = 0x00080000
 _GRANT_ACCESS = 1
 _TRUSTEE_IS_SID = 0
-#: What Windows itself grants ALL APPLICATION PACKAGES on the interactive window station WinSta0:
-#: enumerate desktops, read attributes, clipboard, global atoms, enumerate, read screen, read
-#: control (read on Windows 11 build 26300).
-_WINSTA_CONTAINER_RIGHTS = 0x00020327
+_SDDL_REVISION_1 = 1
+#: WinSta0 and WinSta0\Default both carry this label (read on Windows 11 build 26300). Without it
+#: an object counts as medium integrity, and a container's low token is refused every write-class
+#: right, whatever the DACL grants.
+_LOW_LABEL_SDDL = "S:(ML;;NW;;;LW)"
+#: Enumerate desktops, read attributes, global atoms, enumerate, read control. WinSta0 grants ALL
+#: APPLICATION PACKAGES these and the clipboard and read-screen rights too (0x00020327, read on
+#: Windows 11 build 26300); those two are left out, as nothing user32 needs to start.
+_WINSTA_CONTAINER_RIGHTS = 0x00020123
 #: Read and enumerate objects, create a window or a menu, write objects, read control. Narrower than
 #: what WinSta0\Default grants ALL APPLICATION PACKAGES: no hook, journal, switch, delete or DACL
-#: right, so the container cannot watch the service's desktop.
+#: right, so the container cannot hook or record input on the service's desktop.
 _DESKTOP_CONTAINER_RIGHTS = 0x000200C7
+#: The interactive window station, which grants ALL APPLICATION PACKAGES and carries the low label
+#: already, so the launcher changes nothing there.
+_INTERACTIVE_STATION = "WinSta0"
 
 
 @functools.cache
 def _window_api() -> Any:
-    """user32's window station and desktop calls, and advapi32's object-DACL calls."""
+    """user32's window station and desktop calls, and advapi32's object-security calls."""
     w = wintypes
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     adv = _win().adv
@@ -674,6 +686,20 @@ def _window_api() -> Any:
         ctypes.c_void_p,
     )
     adv.SetSecurityInfo.restype = w.DWORD
+    adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
+        w.LPCWSTR,
+        w.DWORD,
+        pointer_out,
+        ctypes.c_void_p,
+    )
+    adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = w.BOOL
+    adv.GetSecurityDescriptorSacl.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(w.BOOL),
+        pointer_out,
+        ctypes.POINTER(w.BOOL),
+    )
+    adv.GetSecurityDescriptorSacl.restype = w.BOOL
     return types.SimpleNamespace(user32=user32, adv=adv, k32=_win().k32)
 
 
@@ -688,23 +714,27 @@ def _object_name(handle: int) -> tuple[str | None, int]:
     return buf.value, 0
 
 
-def grant_window_object(
-    name: str | None, opened: int | None, close: Callable[[int], Any], rights: int, sid: int
-) -> dict[str, Any]:
-    """Add one allow ace for ``sid`` with ``rights`` to the DACL of an open window station or
-    desktop, ``opened`` (READ_CONTROL and WRITE_DAC), then close it with ``close``."""
-    record: dict[str, Any] = {"name": name, "rights": f"0x{rights:08X}"}
-    if not opened:
-        record.update(ok=False, error=f"open failed (win32 error {ctypes.get_last_error()})")
-        return record
+#: Opens a window station or desktop by name with the access given; returns 0 on failure.
+Opener = Callable[[str, int], int]
+
+
+def _grant_dacl(
+    name: str, open_object: Opener, close: Callable[[int], Any], rights: int, sid: int
+) -> tuple[bool, str]:
+    """Merge one allow ace for ``sid`` into the object's DACL."""
     api = _window_api()
-    try:
+    with contextlib.ExitStack() as stack:
+        handle = open_object(name, _READ_CONTROL | _WRITE_DAC)
+        if not handle:
+            return False, f"open for the DACL failed (win32 error {ctypes.get_last_error()})"
+        stack.callback(close, handle)
         dacl, sd = ctypes.c_void_p(), ctypes.c_void_p()
+        info = _DACL_SECURITY_INFORMATION
         rc = int(
             api.adv.GetSecurityInfo(
-                opened,
+                handle,
                 _SE_WINDOW_OBJECT,
-                _DACL_SECURITY_INFORMATION,
+                info,
                 None,
                 None,
                 ctypes.byref(dacl),
@@ -713,40 +743,66 @@ def grant_window_object(
             )
         )
         if rc != 0:
-            record.update(ok=False, error=f"GetSecurityInfo failed (win32 error {rc})")
-            return record
-        try:
-            entry = _ExplicitAccessW(
-                rights, _GRANT_ACCESS, 0, _TrusteeW(None, 0, _TRUSTEE_IS_SID, 0, sid)
+            return False, f"GetSecurityInfo failed (win32 error {rc})"
+        stack.callback(api.k32.LocalFree, sd)
+        if dacl.value is None:
+            # A NULL DACL grants everyone already. Merging into it would make a DACL holding the
+            # one new ace, which takes the object away from everyone else, the service included.
+            return True, "ok, a NULL DACL left as it was"
+        entry = _ExplicitAccessW(
+            rights, _GRANT_ACCESS, 0, _TrusteeW(None, 0, _TRUSTEE_IS_SID, 0, sid)
+        )
+        merged = ctypes.c_void_p()
+        rc = int(api.adv.SetEntriesInAclW(1, ctypes.byref(entry), dacl, ctypes.byref(merged)))
+        if rc != 0:
+            return False, f"SetEntriesInAclW failed (win32 error {rc})"
+        stack.callback(api.k32.LocalFree, merged)
+        rc = int(api.adv.SetSecurityInfo(handle, _SE_WINDOW_OBJECT, info, None, None, merged, None))
+        return (True, "ok") if rc == 0 else (False, f"SetSecurityInfo failed (win32 error {rc})")
+
+
+def _label_low(name: str, open_object: Opener, close: Callable[[int], Any]) -> tuple[bool, str]:
+    """Give the object the low mandatory label WinSta0 carries, so a container's DACL grant of a
+    write-class right is not refused by the integrity check."""
+    api = _window_api()
+    with contextlib.ExitStack() as stack:
+        handle = open_object(name, _READ_CONTROL | _WRITE_OWNER)
+        if not handle:
+            return False, f"open for the label failed (win32 error {ctypes.get_last_error()})"
+        stack.callback(close, handle)
+        sd = ctypes.c_void_p()
+        if not api.adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            _LOW_LABEL_SDDL, _SDDL_REVISION_1, ctypes.byref(sd), None
+        ):
+            return False, f"the label did not parse (win32 error {ctypes.get_last_error()})"
+        stack.callback(api.k32.LocalFree, sd)
+        present, defaulted, sacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+        if (
+            not api.adv.GetSecurityDescriptorSacl(
+                sd, ctypes.byref(present), ctypes.byref(sacl), ctypes.byref(defaulted)
             )
-            merged = ctypes.c_void_p()
-            rc = int(api.adv.SetEntriesInAclW(1, ctypes.byref(entry), dacl, ctypes.byref(merged)))
-            if rc != 0:
-                record.update(ok=False, error=f"SetEntriesInAclW failed (win32 error {rc})")
-                return record
-            try:
-                rc = int(
-                    api.adv.SetSecurityInfo(
-                        opened,
-                        _SE_WINDOW_OBJECT,
-                        _DACL_SECURITY_INFORMATION,
-                        None,
-                        None,
-                        merged,
-                        None,
-                    )
-                )
-                record.update(
-                    ok=rc == 0,
-                    error=None if rc == 0 else f"SetSecurityInfo failed (win32 error {rc})",
-                )
-            finally:
-                api.k32.LocalFree(merged)
-        finally:
-            api.k32.LocalFree(sd)
-    finally:
-        close(opened)
-    return record
+            or not present.value
+        ):
+            return False, "the label's SACL could not be read back"
+        info = _LABEL_SECURITY_INFORMATION
+        rc = int(api.adv.SetSecurityInfo(handle, _SE_WINDOW_OBJECT, info, None, None, None, sacl))
+        return (True, "ok") if rc == 0 else (False, f"SetSecurityInfo failed (win32 error {rc})")
+
+
+def grant_window_object(
+    name: str, open_object: Opener, close: Callable[[int], Any], rights: int, sid: int
+) -> dict[str, Any]:
+    """Grant ``sid`` ``rights`` on the named window station or desktop, and label it low."""
+    dacl_ok, dacl = _grant_dacl(name, open_object, close, rights, sid)
+    label_ok, label = _label_low(name, open_object, close)
+    return {
+        "name": name,
+        "rights": f"0x{rights:08X}",
+        "dacl": dacl,
+        "label": label,
+        "ok": dacl_ok and label_ok,
+        "error": None if dacl_ok and label_ok else f"DACL {dacl}; label {label}",
+    }
 
 
 def grant_window_station_and_desktop(sid: int) -> dict[str, Any]:
@@ -754,32 +810,39 @@ def grant_window_station_and_desktop(sid: int) -> dict[str, Any]:
 
     A container inherits both, and user32 fails to initialise in a process that cannot open them,
     so any DLL that pulls user32 in fails with ERROR_DLL_INIT_FAILED. WinSta0, an interactive
-    user's, grants ALL APPLICATION PACKAGES already. On the first run the control's container ran
-    and the service's died importing ``_ctypes`` with that error, which this grant is the reading
-    of: that a service's window station grants no package. The next run confirms it or not. The
-    grant names the one package SID, never the group, and is left in place: the service's window
-    station goes when its logon session does.
+    user's, grants ALL APPLICATION PACKAGES and carries a low label already. On the first hosted
+    run the control's container ran and the service's died importing ``_ctypes`` with that error,
+    which this grant is the reading of: that a service's window station has neither. The next run
+    confirms it or not.
+
+    The grant names the one package SID, never the group, and is left in place: the service's
+    window station goes when its logon session does. On WinSta0 nothing is changed, so a run from
+    an interactive session leaves that session's objects as they were.
     """
     api = _window_api()
-    out: dict[str, Any] = {}
     station, code = _object_name(api.user32.GetProcessWindowStation())
     if station is None:
-        out["window_station"] = {"ok": False, "error": f"no name (win32 error {code})"}
-    else:
-        out["window_station"] = grant_window_object(
+        failed = {"ok": False, "error": f"no window station name (win32 error {code})"}
+        return {"window_station": failed, "desktop": failed}
+    if station == _INTERACTIVE_STATION:
+        skipped = {"ok": True, "skipped": f"{station} grants ALL APPLICATION PACKAGES already"}
+        return {"window_station": skipped, "desktop": skipped}
+    out: dict[str, Any] = {
+        "window_station": grant_window_object(
             station,
-            api.user32.OpenWindowStationW(station, False, _READ_CONTROL | _WRITE_DAC),
+            lambda name, access: api.user32.OpenWindowStationW(name, False, access),
             api.user32.CloseWindowStation,
             _WINSTA_CONTAINER_RIGHTS,
             sid,
         )
+    }
     desktop, code = _object_name(api.user32.GetThreadDesktop(api.k32.GetCurrentThreadId()))
     if desktop is None:
-        out["desktop"] = {"ok": False, "error": f"no name (win32 error {code})"}
+        out["desktop"] = {"ok": False, "error": f"no desktop name (win32 error {code})"}
     else:
         out["desktop"] = grant_window_object(
             desktop,
-            api.user32.OpenDesktopW(desktop, 0, False, _READ_CONTROL | _WRITE_DAC),
+            lambda name, access: api.user32.OpenDesktopW(name, 0, False, access),
             api.user32.CloseDesktop,
             _DESKTOP_CONTAINER_RIGHTS,
             sid,
@@ -938,7 +1001,8 @@ def _launch(profile: str, shared: Path, extra: list[str]) -> dict[str, Any]:
 def _log_tail(path: Path) -> str | None:
     """The last line the container printed, for the judge's detail: a traceback ends with its cause."""
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # CPython writes redirected stderr in the ANSI code page unless UTF-8 mode is on.
+        text = path.read_text(encoding=locale.getencoding(), errors="replace")
     except OSError:
         return None
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -1148,13 +1212,35 @@ def _dpapi_refused(record: Any) -> bool:
     )
 
 
+_GRANT_KINDS = ("window_station", "desktop")
+
+
+def _grant_held(owner: dict[str, Any]) -> bool:
+    """The launcher's window station and desktop grant both went through, or were not needed."""
+    return all(_ok(_get(owner, "window_grant", kind)) for kind in _GRANT_KINDS)
+
+
 def _grant_text(owner: dict[str, Any]) -> str:
     """What the launcher's window station and desktop grant to the package came to."""
     parts = []
-    for kind in ("window_station", "desktop"):
+    for kind in _GRANT_KINDS:
         record = _get(owner, "window_grant", kind)
-        parts.append(f"{kind.replace('_', ' ')} grant {_why(record)}")
+        skipped = _get(record, "skipped")
+        why = f"skipped, {skipped}" if skipped and _ok(record) else _why(record)
+        parts.append(f"{kind.replace('_', ' ')} grant {why}")
     return ", ".join(parts)
+
+
+def _exited_on_its_own(launch: dict[str, Any]) -> bool:
+    """The container's process ended by itself with a non-zero code: started, waited on to the
+    end, never timed out or killed after a failed wait."""
+    return (
+        launch.get("started") is True
+        and launch.get("timed_out") is False
+        and "wait_status" not in launch
+        and isinstance(launch.get("exit_code"), int)
+        and launch["exit_code"] != 0
+    )
 
 
 def _held(controls: list[Control]) -> bool:
@@ -1311,6 +1397,14 @@ def judge_reports(
                 UNANSWERED,
                 "a report came back, but not from a container of this profile",
             )
+    elif not _grant_held(o):
+        # With no report, a launch whose window station or desktop grant failed may have died of
+        # that, which is the launcher's own failure and not the account's answer.
+        q1 = UNANSWERED
+        q1_detail = (
+            f"no report, and the launcher's own grant failed: {_grant_text(o)}; exit "
+            f"{launch.get('exit_text')}; last line: {launch.get('log_tail') or 'none'}"
+        )
     elif launch.get("started") is False and launch.get("win32") in _LAUNCH_REFUSALS:
         q1, q1_detail = NO, f"the service could not start the container: {launch.get('error')}"
     elif launch.get("started") is False:
@@ -1324,37 +1418,30 @@ def judge_reports(
             "no report, and the worker crashed inside the container or its crash file was not "
             f"looked for (container_fatal={o.get('container_fatal')}); read container-fatal.txt"
         )
-    elif (
-        launch.get("started") is True
-        and not launch.get("timed_out")
-        and int(launch.get("exit_code") or 0) >= _NTSTATUS_ERROR
-    ):
-        # An NTSTATUS error exit, such as a DLL that did not load: the process died before CPython
-        # could run anything. A small exit code is CPython's own, so CPython did start.
+    elif _exited_on_its_own(launch) and int(launch["exit_code"]) in _LOADER_DEATHS:
+        # The loader's own statuses: the process died before CPython could run anything. Any other
+        # NTSTATUS exit, such as the fail-fast an abort() inside CPython ends in, is a crash below.
         q1 = NO
         q1_detail = (
             f"the container started and died before CPython ran: exit {launch.get('exit_text')}; "
-            f"its output is in {CONTAINER_LOG}"
+            f"last line: {launch.get('log_tail') or 'none'}; {_grant_text(o)}"
         )
-    elif (
-        launch.get("started") is True
-        and launch.get("timed_out") is False
-        and launch.get("exit_code") not in (None, 0)
-    ):
-        # CPython ran and exited on its own, with a code of its own, before the report it writes
-        # first: it crashed loading, in this script's imports or earlier. Not the account's NO.
+    elif _exited_on_its_own(launch):
+        # The process ended by itself, before the report the script writes first: it crashed while
+        # loading, in this script's imports or earlier. Not the account's NO.
         q1 = UNANSWERED
         q1_detail = (
-            f"the container crashed before its first report: CPython exited "
-            f"{launch.get('exit_text')} on its own, not on a timeout; its last line: "
-            f"{launch.get('log_tail') or 'none'}; {_grant_text(o)}; the rig printed "
-            f"{CONTAINER_LOG} above these lines"
+            f"the container crashed before its first report: it exited {launch.get('exit_text')} "
+            f"on its own, with no timeout and no failed wait; its last line: "
+            f"{launch.get('log_tail') or 'none'}; {_grant_text(o)}; the whole of {CONTAINER_LOG} "
+            "is in the job log, and in the step summary after these lines"
         )
     elif launch.get("started") is True:
         q1 = UNANSWERED
         q1_detail = (
             f"the container started and wrote no report: exit {launch.get('exit_text')}, "
-            f"timed out={launch.get('timed_out')}; its output is in {CONTAINER_LOG}"
+            f"timed out={launch.get('timed_out')}, wait {launch.get('wait_status') or 'ok'}; its "
+            f"output is in {CONTAINER_LOG}"
         )
     else:
         q1, q1_detail = (

@@ -105,6 +105,10 @@ def _good() -> dict[str, Any]:
         "owner_absent_key": {"open": _status(BAD_KEYSET)},
         "profile": {"name": W.PROFILE, "created": True, "sid": PACKAGE},
         "launch": {"started": True, "pid": 7, "exit_code": 0, "exit_text": "0x00000000"},
+        "window_grant": {
+            "window_station": {"ok": True, "error": None, "dacl": "ok", "label": "ok"},
+            "desktop": {"ok": True, "error": None, "dacl": "ok", "label": "ok"},
+        },
         "container_fatal": False,
         "container_signature_verified": OK,
     }
@@ -275,31 +279,32 @@ def test_a_missing_report_the_instrument_explains_is_unanswered(
     assert _answers(case) == dict.fromkeys(ALL_YES, "UNANSWERED")
 
 
-def test_a_crash_before_the_first_report_is_named_with_its_last_line() -> None:
-    # The first hosted run: CPython started in the service's container and died importing _ctypes.
+@pytest.mark.parametrize(
+    ("code", "text"),
+    [
+        # The first hosted run: CPython started in the service's container, died importing _ctypes.
+        (1, "0x00000001"),
+        # 0xC0000409, the fail-fast an abort() inside CPython ends in: NTSTATUS, but not the loader.
+        (0xC0000409, "0xC0000409"),
+    ],
+)
+def test_a_crash_before_the_first_report_is_named_with_its_last_line(code: int, text: str) -> None:
     tail = "ImportError: DLL load failed while importing _ctypes: initialization routine failed."
-    case = _mutate(
-        "owner.launch",
-        {
-            "started": True,
-            "exit_code": 1,
-            "exit_text": "0x00000001",
-            "timed_out": False,
-            "log_tail": tail,
-        },
-    )
-    case["owner"]["window_grant"] = {
-        "window_station": {"ok": True, "error": None},
-        "desktop": {"ok": False, "error": "SetSecurityInfo failed (win32 error 5)"},
+    launch = {
+        "started": True,
+        "exit_code": code,
+        "exit_text": text,
+        "timed_out": False,
+        "log_tail": tail,
     }
+    case = _mutate("owner.launch", launch)
     case["container"] = None
     judged = _judge(case)
     assert {k: a.answer for k, a in judged.items()} == dict.fromkeys(ALL_YES, "UNANSWERED")
     detail = judged["Q1"].detail
-    assert "crashed before its first report" in detail and "0x00000001" in detail, detail
+    assert "crashed before its first report" in detail and text in detail, detail
     assert tail in detail and W.CONTAINER_LOG in detail, detail
-    assert "window station grant ok" in detail, detail
-    assert "desktop grant SetSecurityInfo failed (win32 error 5)" in detail, detail
+    assert "window station grant ok, desktop grant ok" in detail, detail
 
 
 @pytest.mark.parametrize(
@@ -307,6 +312,14 @@ def test_a_crash_before_the_first_report_is_named_with_its_last_line() -> None:
     [
         # A timeout is not a crash: the owner killed it.
         {"started": True, "exit_code": 1, "exit_text": "0x00000001", "timed_out": True},
+        # A failed wait: the owner killed it with exit 1, CPython's own code.
+        {
+            "started": True,
+            "exit_code": 1,
+            "exit_text": "0x00000001",
+            "timed_out": False,
+            "wait_status": "0xFFFFFFFF",
+        },
         # No timed_out key: the launcher's wait never ran, so nothing says how it ended.
         {"started": True, "exit_code": 1, "exit_text": "0x00000001"},
         # Exit 0 with no report is not a crash either.
@@ -321,13 +334,45 @@ def test_only_an_exit_of_its_own_reads_as_a_crash(launch: dict[str, Any]) -> Non
     assert "crashed" not in judged["Q1"].detail, judged["Q1"].detail
 
 
-def test_a_yes_names_the_window_grant_and_a_missing_one_reads_no_record() -> None:
-    assert "window station grant no record, desktop grant no record" in _judge(_good())["Q1"].detail
+@pytest.mark.parametrize(
+    "launch",
+    [
+        {"started": False, "error": "CreateProcessW failed (win32 error 5)", "win32": 5},
+        {"started": True, "exit_code": 0xC0000142, "exit_text": "0xC0000142", "timed_out": False},
+    ],
+)
+@pytest.mark.parametrize(
+    "grant",
+    [
+        {"ok": False, "error": "DACL SetSecurityInfo failed (win32 error 5); label ok"},
+        None,
+    ],
+)
+def test_a_no_needs_the_launchers_own_grant_to_have_held(
+    launch: dict[str, Any], grant: Any
+) -> None:
+    # Without the grant, a container that could not start or load is the launcher's failure.
+    case = _mutate("owner.launch", launch)
+    case["owner"]["window_grant"]["desktop"] = grant
+    case["container"] = None
+    judged = _judge(case)
+    assert {k: a.answer for k, a in judged.items()} == dict.fromkeys(ALL_YES, "UNANSWERED")
+    assert "the launcher's own grant failed" in judged["Q1"].detail, judged["Q1"].detail
+
+
+def test_the_grant_reads_into_the_detail_skipped_ok_or_missing() -> None:
+    assert "window station grant ok, desktop grant ok" in _judge(_good())["Q1"].detail
+    skipped = {"ok": True, "skipped": "WinSta0 grants ALL APPLICATION PACKAGES already"}
     case = _good()
-    case["owner"]["window_grant"] = {"window_station": {"ok": True}, "desktop": {"ok": True}}
+    case["owner"]["window_grant"] = {"window_station": skipped, "desktop": skipped}
     judged = _judge(case)
     assert judged["Q1"].answer == "YES"
-    assert "window station grant ok, desktop grant ok" in judged["Q1"].detail
+    assert "desktop grant skipped, WinSta0 grants" in judged["Q1"].detail, judged["Q1"].detail
+    # A report from before the grant existed still answers a container that ran.
+    del case["owner"]["window_grant"]
+    judged = _judge(case)
+    assert judged["Q1"].answer == "YES"
+    assert "window station grant no record" in judged["Q1"].detail
 
 
 def test_the_log_tail_is_the_last_line_the_container_printed(tmp_path: Path) -> None:
@@ -341,8 +386,14 @@ def test_the_log_tail_is_the_last_line_the_container_printed(tmp_path: Path) -> 
 
 def test_the_rig_puts_the_log_of_a_container_with_no_report_in_the_summary() -> None:
     rig = _RIG.read_text(encoding="utf-8")
-    assert '$containerLog = Join-Path $SharedDir "container.log"' in rig
-    assert "[IO.File]::AppendAllText($Summary," in rig
+    # The gate: a summary to write to, no report, and a log to put in it.
+    gate = (
+        'if ($Summary -and -not (Test-Path -LiteralPath (Join-Path $SharedDir "container.json"))'
+        " -and\n            (Test-Path -LiteralPath $containerLog)) {"
+    )
+    assert gate in rig
+    after = rig.split(gate, 1)[1]
+    assert after.index("$logCap = 65536") < after.index("[IO.File]::AppendAllText($Summary,")
 
 
 def test_a_profile_that_was_there_already_still_counts() -> None:
