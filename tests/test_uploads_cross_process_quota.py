@@ -370,8 +370,9 @@ def test_a_stuck_heartbeat_touch_no_longer_holds_the_heartbeat(
 ) -> None:
     """BACKLOG #3256 item 3. The heartbeat awaited its touch with no time bound, so one touch stuck
     on the store held the heartbeat, and its lifetime cap, for as long as the store stalled. The
-    wait is bounded now and the heartbeat leaves the touch running, never cancels it, and never
-    doubles it. Red before the fix: the heartbeat never reached its cap. The held touch is then
+    wait is bounded now and the heartbeat leaves the touch running and never doubles it; a
+    heartbeat that ends at its cap, as here, never cancels it. Red before the fix: the heartbeat
+    never reached its cap. The held touch is then
     capped like every other straggler (vault BACKLOG #3180), so a stalled store does not collect
     one per save."""
     monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_SECONDS", 0.02)
@@ -425,6 +426,93 @@ def test_a_stuck_heartbeat_touch_no_longer_holds_the_heartbeat(
     with caplog.at_level("WARNING", logger=uploads_mod._log.name):
         asyncio.run(_run())
     assert "did not finish within" in caplog.text
+
+
+class _SlowUnwindTouchLedger(_StuckTouchLedger):
+    """A touch whose cancelled statement takes a while to unwind, as the SQLite writer guard's
+    rollback does when it queues behind the stuck statement."""
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        try:
+            await super().touch_upload_quota(reservation_id)
+        except asyncio.CancelledError:
+            await asyncio.shield(asyncio.sleep(1.5))
+            raise
+
+
+@pytest.mark.parametrize(
+    ("live", "touch_wait", "timeout", "grace", "ledger_type"),
+    [
+        pytest.param(False, 0.01, 5.0, 0.5, _StuckTouchLedger, id="ended"),
+        pytest.param(True, 30.0, 0.01, 5.0, _StuckTouchLedger, id="live"),
+        pytest.param(False, 0.01, 5.0, 5.0, _SlowUnwindTouchLedger, id="ended-slow-unwind"),
+        pytest.param(True, 30.0, 0.01, 5.0, _SlowUnwindTouchLedger, id="live-slow-unwind"),
+    ],
+)
+def test_the_shutdown_drain_does_not_wait_for_a_heartbeat_touch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live: bool,
+    touch_wait: float,
+    timeout: float,
+    grace: float,
+    ledger_type: type[_StuckTouchLedger],
+) -> None:
+    """Vault BACKLOG #3740 item 14. A touch would only refresh a reservation whose save does not
+    outlive the shutdown, so the drain cancels one rather than waiting for it. ``ended``: the
+    heartbeat reached its cap with its touch stuck, so the touch is held, and the drain used to
+    spend its whole wait on it. ``live``: the drain cancels the heartbeat mid-touch, and its grace
+    used to wait on the touch the heartbeat then held. Red before the fix: the drain took the
+    wait or the grace it was given, 5 s, against a bound of 2 s here. The slow-unwind cases hold
+    the drain to that bound while a cancelled touch is still unwinding."""
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_SECONDS", 0.02)
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_TOUCH_WAIT_SECONDS", touch_wait)
+    if not live:
+        monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_MAX_SECONDS", 0.1)
+    ledger = ledger_type()
+
+    async def _run() -> None:
+        uploads = UploadStore(
+            tmp_path / "uploads", make_cipher(generate_key()), max_bytes=4096, store=ledger
+        )
+        entered, gate = threading.Event(), threading.Event()
+        real_encrypt = uploads._encrypt_blob
+
+        def _held(data: bytes, file_id: str) -> str:
+            entered.set()
+            gate.wait(timeout=30)
+            return real_encrypt(data, file_id)
+
+        uploads._encrypt_blob = _held  # type: ignore[method-assign]
+        save = asyncio.ensure_future(
+            uploads.save(data=b"slow\n", filename="a.txt", uploader="alice", uploader_id="u-alice")
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 30), "the save never reached its write"
+            for _ in range(250):
+                if ledger.touches and (live or not uploads._heartbeats):
+                    break
+                await asyncio.sleep(0.02)
+            # The control: a touch is stuck, held as a straggler or inside a live heartbeat.
+            assert ledger.touches == 1
+            assert bool(uploads._heartbeats) is live
+            assert bool(uploads._stragglers) is not live
+            began = time.monotonic()
+            await asyncio.wait_for(uploads.drain_stragglers(timeout, grace=grace), 2.0)
+            assert time.monotonic() - began < 1.0
+            for _ in range(150):
+                if ledger.cut_off and not uploads._stragglers:
+                    break
+                await asyncio.sleep(0.02)
+            assert ledger.cut_off == 1, "the drain did not cancel the touch"
+            assert not uploads._stragglers
+        finally:
+            gate.set()
+            await asyncio.gather(save, return_exceptions=True)
+            for held in set(uploads._stragglers):
+                held.cancel()
+
+    asyncio.run(_run())
 
 
 def test_a_lagging_clock_never_moves_the_row_backwards(tmp_path: Path) -> None:

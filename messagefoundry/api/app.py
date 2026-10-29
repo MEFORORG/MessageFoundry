@@ -428,6 +428,7 @@ from messagefoundry.pipeline import (
 )
 from messagefoundry.pipeline.alert_sinks import (
     EmailTransport,
+    NotifierAlertSink,
     configured_alert_transport_names,
     notifier_from_settings,
 )
@@ -456,7 +457,10 @@ from messagefoundry.pipeline.engine import (
     ConfigWriteAuditFailed,
 )
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
-from messagefoundry.pipeline.security_notify import security_notifier_from_settings
+from messagefoundry.pipeline.security_notify import (
+    SecurityEventNotifier,
+    security_notifier_from_settings,
+)
 from messagefoundry.pipeline.security_signals import (
     SecuritySignalThresholds,
     install_security_signals,
@@ -1174,6 +1178,11 @@ _INNER_SHARE: Final = 0.8
 #: How long a step cut at its bound gets to unwind its cancellation before the teardown stops waiting
 #: for it and moves on, leaving it to finish or fail on its own.
 _CUT_GRACE_SECONDS: Final = 0.1
+#: The part of the long-operations drain's share it spends waiting before it cancels, the rest being
+#: the grace for the rollback arms. A policy, not derived from the drain's defaults (vault BACKLOG
+#: #3740 item 17): their ratio, 0.5 s to 6 s, would leave the wait about 0.2 s under the shipped
+#: budget, and cancel a reload, DR change or ``upload.create`` row that would have finished in it.
+_OUTLIVING_WAIT_SHARE: Final = 0.25
 
 #: Steps the teardown stopped waiting for. The event loop holds only a weak reference to a task, so
 #: this keeps one alive until it ends.
@@ -1327,8 +1336,15 @@ def _app_drain_steps(
        released reload's outcome write follows the reload.
     2. Upload stragglers (vault BACKLOG #3180), with an upload store only: the quota-ledger calls a
        cancelled save left running, the releases they start, and the save-time sweeps that write
-       ``upload.prune`` rows. After the long-operations drain, so a pair removed because its
-       ``upload.create`` row failed there (vault BACKLOG #3178) is held as a straggler by then.
+       ``upload.prune`` rows. After the long-operations drain, because a pair removed when its
+       ``upload.create`` row failed there (vault BACKLOG #3178) is removed by that operation's
+       cancellation arm. The arm can still be running when the long-operations drain stops
+       waiting, as when the cancelled row's own unwind outlasts that drain's grace, so this step
+       first waits, within its own wait, for the operations still running (vault BACKLOG #3740
+       item 6). A removal those start is then held as a straggler before the drain looks. One
+       whose operation is still running when that wait ends can start after the drain returned.
+       Where the long-operations drain cancelled that operation, a WARNING named it and an ERROR
+       counted it as still rolling back.
     3. Every approval write the gate still has running (BACKLOG #2087), at least the outcome writes
        and the request writes (vault BACKLOG #3193), which would otherwise meet a closed store.
     4. Lock notices (BACKLOG #2216), which read and write the audit log and hand their mail to the
@@ -1345,12 +1361,14 @@ def _app_drain_steps(
     outliving: OutlivingOperations = app.state.outliving_operations
 
     async def _outliving(bound: float) -> None:
-        # At most a quarter of it waiting: the grace after is what lets a cancelled operation's
-        # rollback arm record 'interrupted' before the store closes. With the managed lifespan's
-        # full set of steps that grace is below the DR hook reap, and the NSSM window leaves the
-        # budget no room to hold it. CANCEL_GRACE_SECONDS (api/outlive.py) states what that costs.
-        wait = min(OUTLIVING_DRAIN_SECONDS, bound * _INNER_SHARE / 4)
-        await outliving.drain(wait, grace=min(CANCEL_GRACE_SECONDS, bound * _INNER_SHARE - wait))
+        # _OUTLIVING_WAIT_SHARE of it waiting, the rest grace: the grace after is what lets a
+        # cancelled operation's rollback arm record 'interrupted' before the store closes. With
+        # the managed lifespan's full set of steps that grace is below the DR hook reap, and the
+        # NSSM window leaves the budget no room to hold it. CANCEL_GRACE_SECONDS (api/outlive.py)
+        # states what that costs.
+        share = bound * _INNER_SHARE
+        wait = min(OUTLIVING_DRAIN_SECONDS, share * _OUTLIVING_WAIT_SHARE)
+        await outliving.drain(wait, grace=min(CANCEL_GRACE_SECONDS, share - wait))
 
     steps = [_TeardownStep("the long-operations drain", 2.0, _outliving)]
     uploads: UploadStore | None = getattr(app.state, "upload_store", None)
@@ -1359,12 +1377,15 @@ def _app_drain_steps(
         # slots that go stale: a discard removal it cancels leaves a stored file with no
         # upload.create row, and a save-time sweep it cancels loses its upload.prune rows; each
         # is logged at ERROR by file_id. So it keeps the approval drain's floor. Handed a share of
-        # its bound, so it cancels what it owns before the cut.
+        # its bound, so it cancels what it owns before the cut. It settles the long operations
+        # first, as item 2 above says.
         steps.append(
             _TeardownStep(
                 "the upload straggler drain",
                 0.5,
-                lambda b: uploads.drain_stragglers_within(b * _INNER_SHARE),
+                lambda b: uploads.drain_stragglers_within(
+                    b * _INNER_SHARE, settle=outliving.settle
+                ),
             )
         )
     gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
@@ -1402,6 +1423,100 @@ def _app_drain_steps(
                 lambda _b: app.state.summary_auditor.flush(store),
             )
         )
+    return steps
+
+
+def _managed_teardown_steps(
+    app: FastAPI,
+    engine: Engine,
+    store: Store,
+    auth: AuthService | None,
+    *,
+    background: Sequence[asyncio.Future[None]],
+    upload_retention_runner: UploadRetentionRunner | None,
+    security_notifier: SecurityEventNotifier | None,
+    remove_security_signals: Callable[[], None] | None,
+    notifier: NotifierAlertSink | None,
+) -> list[_TeardownStep]:
+    """The managed lifespan's shutdown steps, in order, each optional one left out when its part
+    was never built. A function of its own so a test can pin the order and count the bounded
+    steps against the real list (vault BACKLOG #3740 items 15 and 16)."""
+    steps: list[_TeardownStep] = []
+    if upload_retention_runner is not None:
+        # Handed part of its bound, so the runner's own wait ends, names any unaudited file and
+        # cancels the sweep before the teardown cuts it. With the managed set of steps that bound
+        # is below the runner's own default wait, which then never runs in full here.
+        steps.append(
+            _TeardownStep(
+                "the upload retention runner's stop",
+                0.5,
+                lambda b: upload_retention_runner.stop(timeout=b * _INNER_SHARE),
+            )
+        )
+    # return_exceptions absorbs both our cancellation AND any exception a task that died earlier
+    # stored (review M-33).
+    steps.append(
+        _TeardownStep(
+            "the store-reading tasks",
+            0.1,
+            lambda _b: asyncio.gather(*background, return_exceptions=True),
+            # Never cut, as before: a task left running here would meet the store that
+            # engine.stop() closes.
+            bounded=False,
+        )
+    )
+    steps += _app_drain_steps(app, store, auth, owns_auth=True)
+    # Vault BACKLOG #2945: a config write whose caller was cancelled still writes its audit row.
+    # Drained here, under the budget, rather than by the 5 s wait engine.stop() runs when no drain
+    # ran first. Draining closes the engine's gate, and engine.stop() then gives a write still
+    # running only a 1 s late wait, inside its reserve. Handed _INNER_SHARE of its bound, so its
+    # wait ends before the step is cut; the wait never cancels a write. A small floor, since the
+    # gate closes at once and most shutdowns have no write running. The embedded lifespan
+    # (create_app(engine=...)) has no such step, so its caller's engine.stop() runs the 5 s wait,
+    # outside the reserve that lifespan's budget assumes.
+    steps.append(
+        _TeardownStep(
+            "the config-write drain",
+            0.25,
+            lambda b: engine.drain_config_writes(b * _INNER_SHARE),
+        )
+    )
+    if security_notifier is not None:
+        # It drains queued user emails, and records a notice it could not send in the audit log,
+        # so it closes while the store is open, after the lock notices that hand it mail (BACKLOG
+        # #3191).
+        steps.append(
+            _TeardownStep(
+                "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
+            )
+        )
+    if remove_security_signals is not None:
+        steps.append(
+            _TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals))
+        )
+    steps.append(
+        _TeardownStep(
+            "engine.stop()",
+            _ENGINE_STOP_RESERVE_SECONDS,
+            lambda _b: engine.stop(),
+            bounded=False,
+        )
+    )
+    # B11: the harness-only instrumented executor (None in production and other tests). The engine
+    # is stopped, so no more to_thread work: a non-blocking shutdown is clean.
+    shim_executor = getattr(app.state, "connscale_executor", None)
+    if shim_executor is not None:
+        steps.append(
+            _TeardownStep(
+                "the instrumented executor's shutdown",
+                0.05,
+                _sync(partial(shim_executor.shutdown, wait=False)),
+            )
+        )
+    if notifier is not None:
+        # Last, after the engine quiesces, so a final connection_stopped or queue_buildup alert
+        # still drains.
+        steps.append(_TeardownStep("the alert notifier's close", 0.5, lambda _b: notifier.aclose()))
     return steps
 
 
@@ -12072,88 +12187,17 @@ def create_managed_app(
             for task in background:
                 task.cancel()
 
-            steps: list[_TeardownStep] = []
-            if upload_retention_runner is not None:
-                # Handed part of its bound, so the runner's own wait ends, names any unaudited
-                # file and cancels the sweep before the teardown cuts it. With the managed set of
-                # steps that bound is below the runner's own default wait, which then never runs
-                # in full here.
-                steps.append(
-                    _TeardownStep(
-                        "the upload retention runner's stop",
-                        0.5,
-                        lambda b: upload_retention_runner.stop(timeout=b * _INNER_SHARE),
-                    )
-                )
-            # return_exceptions absorbs both our cancellation AND any exception a task that died
-            # earlier stored (review M-33).
-            steps.append(
-                _TeardownStep(
-                    "the store-reading tasks",
-                    0.1,
-                    lambda _b: asyncio.gather(*background, return_exceptions=True),
-                    # Never cut, as before: a task left running here would meet the store that
-                    # engine.stop() closes.
-                    bounded=False,
-                )
+            steps = _managed_teardown_steps(
+                app,
+                engine,
+                store,
+                auth,
+                background=background,
+                upload_retention_runner=upload_retention_runner,
+                security_notifier=security_notifier,
+                remove_security_signals=remove_security_signals,
+                notifier=notifier,
             )
-            steps += _app_drain_steps(app, store, auth, owns_auth=True)
-            # Vault BACKLOG #2945: a config write whose caller was cancelled still writes its audit
-            # row. Drained here, under the budget, rather than by the 5 s wait engine.stop() runs
-            # when no drain ran first. Draining closes the engine's gate, and engine.stop() then
-            # gives a write still running only a 1 s late wait, inside its reserve. Handed
-            # _INNER_SHARE of its bound, so its wait ends before the step is cut; the wait never
-            # cancels a write. A small floor, since the gate closes at once and most shutdowns
-            # have no write running. The embedded lifespan (create_app(engine=...)) has no such
-            # step, so its caller's engine.stop() runs the 5 s wait, outside the reserve that
-            # lifespan's budget assumes.
-            steps.append(
-                _TeardownStep(
-                    "the config-write drain",
-                    0.25,
-                    lambda b: engine.drain_config_writes(b * _INNER_SHARE),
-                )
-            )
-            if security_notifier is not None:
-                # It drains queued user emails, and records a notice it could not send in the audit
-                # log, so it closes while the store is open, after the lock notices that hand it
-                # mail (BACKLOG #3191).
-                steps.append(
-                    _TeardownStep(
-                        "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
-                    )
-                )
-            if remove_security_signals is not None:
-                steps.append(
-                    _TeardownStep(
-                        "the security-signal removal", 0.05, _sync(remove_security_signals)
-                    )
-                )
-            steps.append(
-                _TeardownStep(
-                    "engine.stop()",
-                    _ENGINE_STOP_RESERVE_SECONDS,
-                    lambda _b: engine.stop(),
-                    bounded=False,
-                )
-            )
-            # B11: the harness-only instrumented executor (None in production and other tests). The
-            # engine is stopped, so no more to_thread work: a non-blocking shutdown is clean.
-            shim_executor = getattr(app.state, "connscale_executor", None)
-            if shim_executor is not None:
-                steps.append(
-                    _TeardownStep(
-                        "the instrumented executor's shutdown",
-                        0.05,
-                        _sync(partial(shim_executor.shutdown, wait=False)),
-                    )
-                )
-            if notifier is not None:
-                # Last, after the engine quiesces, so a final connection_stopped or queue_buildup
-                # alert still drains.
-                steps.append(
-                    _TeardownStep("the alert notifier's close", 0.5, lambda _b: notifier.aclose())
-                )
             await _run_teardown(steps, _SHUTDOWN_BUDGET_SECONDS)
 
     # Settings never select the open mode: only the caller's opt-in, checked at the top, does
