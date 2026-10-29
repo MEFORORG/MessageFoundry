@@ -73,6 +73,9 @@ _KEY_MATERIAL = frozenset(
         "Store server-certificate trust",
         # BACKLOG #1174: the per-process key sealing the state and reference caches.
         "Sealed read-through caches",
+        # Vault BACKLOG #2608: an HMAC key HKDF-derived from the audit-chain key, keying the digest
+        # of a refused inbound body. A derived key used for one property is what 11.1.2 scopes.
+        "Refused inbound body digest",
     }
 )
 

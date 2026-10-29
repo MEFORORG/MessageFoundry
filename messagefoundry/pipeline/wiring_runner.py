@@ -158,7 +158,6 @@ from messagefoundry.pipeline.ingress_guards import (
     listener_encoding,
     peek_max_bytes,
     reingress_size_error,
-    store_safe_raw,
     streaming_over_threshold,
     strict_validate_timeout,
 )
@@ -183,6 +182,7 @@ from messagefoundry.pipeline.reference_sync import (
     reference_max_rows,
     reference_statement,
 )
+from messagefoundry.pipeline.refused_body import RefusedBodyAllowance
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
     GraphShape,
@@ -1282,6 +1282,7 @@ class RegistryRunner:
         ack_after_default: AckAfter | None = None,
         stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: streaming-detach concurrency DoS guard (0=off)
         intake_gate: IntakeGate | None = None,  # BACKLOG #290 slice 2: the engine-wide intake pause
+        refused_body_allowance: RefusedBodyAllowance | None = None,  # vault BACKLOG #2608
         priority_default: Priority | None = None,
         dr_threshold: Priority | None = None,
         dr_standby: Priority | None = None,
@@ -1400,6 +1401,13 @@ class RegistryRunner:
         # IntakeBoundMonitor holds and releases it) and injected into every source this runner starts.
         # None (embedding/tests) = no pause, so every source reads exactly as before.
         self._intake_gate = intake_gate
+        # Vault BACKLOG #2608: what a refused body may store, per inbound. The Engine owns one and
+        # passes it to every runner a reload builds; None (embedding/tests) gets the shipped defaults,
+        # so the bound is on wherever a runner is built.
+        self._refused_body = refused_body_allowance or RefusedBodyAllowance()
+        # The inbounds whose source polls a shared resource (a directory, a table): the engine consumes
+        # the only copy of what it reads, so a refusal there is always stored whole. Set at bind.
+        self._refusals_kept_whole: set[str] = set()
         # DR run-profile (#61, ADR 0048). _priority_default is the global [delivery].priority a
         # connection inherits when it declares no priority= (resolution: per-connection override >
         # global default > built-in NORMAL). _dr_threshold is the THIS-RUN run-profile gate: when set
@@ -4607,6 +4615,13 @@ class RegistryRunner:
         # measurement. A source consults it BEFORE it reads: a listener before its next socket read,
         # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
         source.intake_gate = self._intake_gate
+        # Vault BACKLOG #2608: a poll source's refusals are stored whole, never as a head, because the
+        # file it deletes or the row it marks was the only copy. Keyed on the transport's own declared
+        # contract, not on a connector type (CLAUDE.md section 4).
+        if getattr(source, "polls_shared_resource", False):
+            self._refusals_kept_whole.add(ic.name)
+        else:
+            self._refusals_kept_whole.discard(ic.name)
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
         # free of any pipeline/cluster import. Only POLL sources act on it — they skip a scan when it
@@ -7578,12 +7593,11 @@ class RegistryRunner:
             check_declared_type(ic, raw if text is None else text_sniff_head(text))
         except IngressGuardError as exc:
             # PHI-safe: the reason names the declared type only — never a byte of the rejected body.
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=text if text is not None else store_safe_raw(raw, ic.content_type.value),
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=exc.reason,
-                source_type=ic.spec.type.value,
                 message_type=ic.content_type.value,
             )
             return True
@@ -7613,12 +7627,11 @@ class RegistryRunner:
             try:
                 check_binary_size(raw)
             except IngressGuardError as exc:
-                await self.store.record_received(
-                    channel_id=ic.name,
-                    raw=store_safe_raw(raw, ic.content_type.value),
-                    status=MessageStatus.ERROR,
+                await self._record_refused(
+                    ic,
+                    raw,
+                    None,
                     error=exc.reason,
-                    source_type=src,
                     message_type=ic.content_type.value,
                 )
                 return None
@@ -7640,12 +7653,11 @@ class RegistryRunner:
         try:
             text = decode_body(raw, ic, encoding=encoding)
         except IngressGuardError as exc:
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=store_safe_raw(raw, ic.content_type.value),
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                None,
                 error=exc.reason,
-                source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             return None
@@ -7657,23 +7669,21 @@ class RegistryRunner:
             # (and every value derived from it) is NUL-free for the rest of this handler. HTTP owns its
             # own 202/4xx response — no HL7 ACK. An HL7 v2 body holding an MLLP frame byte inside the
             # message, not in the whitespace at either end, lands here too (ADR 0205 rule 4).
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=store_safe_raw(raw, ic.content_type.value, text=text),
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=exc.reason,
-                source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             return None
         except IngressGuardError as exc:
             # The engine ceiling on a NON-HL7 body (SEC-017); check_decoded never raises it for HL7.
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=text,
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=exc.reason,
-                source_type=src,
                 message_type=ic.content_type.value,
             )
             return None
@@ -7702,16 +7712,15 @@ class RegistryRunner:
             peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             fields = _read_ingress_fields(peek)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=text,
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=(
                     f"parse error: {safe_exc(exc)}"
                     if isinstance(exc, HL7PeekError)
                     else _peek_read_fault(ic, exc)
                 ),
-                source_type=src,
             )
             return None
         if ic.validation.strict and streaming_over:
@@ -7740,11 +7749,11 @@ class RegistryRunner:
                 # it instead of pinning intake. The message string is PHI-safe/value-free (only the
                 # numeric timeout). HTTP owns its own 202/4xx response — no HL7 ACK here.
                 timed_out = f"strict-validation timed out after {timeout}s"
-                await self._record(ic, peek, text, MessageStatus.ERROR, error=timed_out)
+                await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
                 return None
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
-                await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
+                await self._record_refused(ic, raw, text, error=persisted, peek=peek)
                 return None
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
         # failure records ERROR + returns None, which the source answers as a refusal — never
@@ -7755,12 +7764,8 @@ class RegistryRunner:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
             except (_StreamBudgetExceeded, StreamingAttachmentsUnsupported, DocRefError) as exc:
-                await self._record(
-                    ic,
-                    peek,
-                    text,
-                    MessageStatus.ERROR,
-                    error=f"streaming detach failed: {safe_exc(exc)}",
+                await self._record_refused(
+                    ic, raw, text, error=f"streaming detach failed: {safe_exc(exc)}", peek=peek
                 )
                 return None
         mid = await self.store.enqueue_ingress(
@@ -7866,12 +7871,11 @@ class RegistryRunner:
             try:
                 check_binary_size(raw)
             except IngressGuardError as exc:
-                await self.store.record_received(
-                    channel_id=ic.name,
-                    raw=store_safe_raw(raw, ic.content_type.value),
-                    status=MessageStatus.ERROR,
+                await self._record_refused(
+                    ic,
+                    raw,
+                    None,
                     error=exc.reason,
-                    source_type=src,
                     message_type=ic.content_type.value,
                 )
                 return None
@@ -7906,12 +7910,11 @@ class RegistryRunner:
             text = decode_body(raw, ic, encoding=encoding)
         except IngressGuardError as exc:
             decode_err = exc.reason
-            mid = await self.store.record_received(
-                channel_id=ic.name,
-                raw=store_safe_raw(raw, ic.content_type.value),
-                status=MessageStatus.ERROR,
+            mid = await self._record_refused(
+                ic,
+                raw,
+                None,
                 error=decode_err,
-                source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             ack = (
@@ -7943,12 +7946,11 @@ class RegistryRunner:
             # body holding an MLLP frame byte inside the message, not in the whitespace at either end,
             # is refused the same way, with its own fixed MSA-3 text (ADR 0205 rule 4).
             body_err = exc.reason
-            mid = await self.store.record_received(
-                channel_id=ic.name,
-                raw=store_safe_raw(raw, ic.content_type.value, text=text),
-                status=MessageStatus.ERROR,
+            mid = await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=body_err,
-                source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             ack = (
@@ -7971,12 +7973,11 @@ class RegistryRunner:
             # decoded text as the HL7 path's enforce_size_limits measures len(norm); check_decoded never
             # raises it for HL7. Record ERROR + return None (no HL7 ACK for non-HL7) — count-and-log,
             # never crash the connection.
-            await self.store.record_received(
-                channel_id=ic.name,
-                raw=text,
-                status=MessageStatus.ERROR,
+            await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=exc.reason,
-                source_type=src,
                 message_type=ic.content_type.value,
             )
             return None
@@ -8017,12 +8018,11 @@ class RegistryRunner:
             else:
                 # Not a contract error: a parser fault. The NAK text is fixed, never the fault's own.
                 parse_err, nak_text = _peek_read_fault(ic, exc), "peek read failed"
-            mid = await self.store.record_received(
-                channel_id=ic.name,
-                raw=text,
-                status=MessageStatus.ERROR,
+            mid = await self._record_refused(
+                ic,
+                raw,
+                text,
                 error=parse_err,
-                source_type=src,
             )
             ack = build_ack(text, code="AR", text=nak_text, ack_mode=ack_mode) if reply else None
             if ack is not None and self._capture_ack_enabled(ic):
@@ -8062,7 +8062,7 @@ class RegistryRunner:
                 # + NAK AE instead of pinning the listener. The stored/ACK string is PHI-safe/value-free
                 # (only the numeric timeout) — unlike the validation-error path below it quotes no field.
                 timed_out = f"strict-validation timed out after {timeout}s"
-                mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=timed_out)
+                mid = await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
                 ack = (
                     build_ack(peek, code="AE", text=timed_out, ack_mode=ack_mode) if reply else None
                 )
@@ -8084,7 +8084,7 @@ class RegistryRunner:
                 # needs) but cuts the value (review #120). The scrubbed text is gated behind
                 # messages:view_summary on read, like every other stored error.
                 persisted = f"strict-validation failed: {safe_text(joined)}"
-                mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
+                mid = await self._record_refused(ic, raw, text, error=persisted, peek=peek)
                 # The AE ACK goes back to the partner that SENT this message (their own data) and is
                 # transient (never persisted), so it may carry the fuller, bounded validation text.
                 ack = (
@@ -8122,7 +8122,7 @@ class RegistryRunner:
                 DocRefError,
             ) as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
-                mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=detach_err)
+                mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
                 ack = (
                     build_ack(peek, code="AE", text="streaming detach failed", ack_mode=ack_mode)
                     if reply
@@ -8169,24 +8169,42 @@ class RegistryRunner:
             )
         return ack
 
-    async def _record(
+    async def _record_refused(
         self,
         ic: InboundConnection,
-        peek: Peek,
-        raw: str,  # already the decoded, \r-normalized text (see _handle_inbound)
-        status: MessageStatus,
+        wire: bytes,
+        text: str | None,
         *,
-        error: str | None = None,
+        error: str,
+        message_type: str | None = None,
+        peek: Peek | None = None,
     ) -> str:
+        """Record a body refused before ingress as ``ERROR``. Every refusal phase lands here, so every
+        one is counted and logged (CLAUDE.md section 2). ``wire`` is the body as received and
+        ``text`` its decoded form once the refusal came after the decode, else ``None``; a refusal
+        after the parse passes ``peek`` so the row carries the header fields an operator searches by.
+        The per-inbound refused-body allowance decides whether the whole body or its head is stored;
+        its length always is, and a digest keyed from the store's audit key whenever the store holds
+        one in heap (vault BACKLOG #2608). The caller's ACK or NAK does not depend on it."""
+        bounded = self._refused_body.bound(
+            ic.name,
+            wire,
+            text,
+            ic.content_type.value,
+            error,
+            cipher=self.store.cipher(),
+            keep_whole=ic.name in self._refusals_kept_whole,
+        )
         return await self.store.record_received(
             channel_id=ic.name,
-            raw=raw,
-            status=status,
-            error=error,
-            control_id=peek.control_id,
-            message_type=peek.message_type,
+            raw=bounded.raw,
+            status=MessageStatus.ERROR,
+            error=bounded.error,
+            control_id=peek.control_id if peek is not None else None,
+            message_type=peek.message_type if peek is not None else message_type,
             source_type=ic.spec.type.value,
-            summary=summarize(peek) or None,
+            summary=(summarize(peek) or None) if peek is not None else None,
+            metadata=bounded.metadata,
         )
 
     async def _capture_ack(

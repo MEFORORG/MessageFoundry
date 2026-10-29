@@ -2037,6 +2037,15 @@ class TlsSettings(_Section):
         )
 
 
+#: Vault BACKLOG #2608: the refused-body allowance defaults, here so the settings and
+#: pipeline/refused_body.py share one copy. Per inbound, per window: two whole bodies at the 16 MiB
+#: engine frame ceiling; refilled evenly over an hour; a head long enough for the MSH and the first
+#: segments of an HL7 message.
+REFUSED_BODY_ALLOWANCE_BYTES = 32 * 1024 * 1024
+REFUSED_BODY_WINDOW_SECONDS = 3600.0
+REFUSED_BODY_HEAD_BYTES = 8192
+
+
 class InboundSettings(_Section):
     """Inbound-connection defaults that are an operational, per-environment decision rather than
     something authored in the message graph."""
@@ -2092,6 +2101,24 @@ class InboundSettings(_Section):
     # in [inbound] because it governs intake; the low-disk floor that also pauses intake is
     # [retention].min_free_disk_mb, because that one number also gates `serve`.
     max_staged_depth: int = 0
+
+    # Vault BACKLOG #2608: the per-inbound refused-body allowance. A body a listener refuses before
+    # ingress (at least decode, NUL, size, declared type, parse, strict validation, streaming detach) is
+    # recorded as an ERROR row, and its length always is (with a keyed digest, never a plain hash;
+    # docs/CONFIGURATION.md says when). The WHOLE body is stored only
+    # while its inbound's rolling byte allowance covers it; past that, the first
+    # refused_body_head_bytes of it are. A body whose head is the whole of it is stored whole. This
+    # bounds the bytes a reject flood stores, never the count of refusals, and never pauses intake, so
+    # it ships on and has no off value: 0 stores only heads. A poll source's refusals are always whole. The allowance refills evenly over the
+    # window. Held per engine process; an inbound lives on one engine shard. docs/CONFIGURATION.md
+    # carries the catalog rows.
+    refused_body_allowance_bytes: int = Field(default=REFUSED_BODY_ALLOWANCE_BYTES, ge=0)
+    # The window's floor and the head's ceiling keep a typo from switching the bound off in effect:
+    # a near-zero window refills at once, and a head as large as a frame stores every body whole.
+    refused_body_window_seconds: float = Field(
+        default=REFUSED_BODY_WINDOW_SECONDS, ge=1.0, allow_inf_nan=False
+    )
+    refused_body_head_bytes: int = Field(default=REFUSED_BODY_HEAD_BYTES, ge=256, le=1024 * 1024)
 
     @field_validator("max_staged_depth")
     @classmethod
