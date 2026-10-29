@@ -834,7 +834,9 @@ def test_a_short_write_is_completed() -> None:
 # --- 7. the Lander's covering review of 415353d7 (round-472dd562) ----------------------------------
 
 
-def test_a_lookup_the_cap_cut_off_is_the_only_one_outstanding(graph: tuple[Registry, str]) -> None:
+def test_a_lookup_the_cap_cut_off_is_the_only_one_outstanding(
+    graph: tuple[Registry, str], runners: _Runners
+) -> None:
     # A hung backend: every lookup blocks until the test releases it. Each dispatch hits the cap.
     # Unbounded, each later dispatch starts another lookup beside the abandoned ones.
     release = threading.Event()
@@ -855,7 +857,12 @@ def test_a_lookup_the_cap_cut_off_is_the_only_one_outstanding(graph: tuple[Regis
 
     registry, config_dir = graph
     session = SandboxSession(
-        SandboxPolicy(mode=SandboxMode.ISOLATED, wall_seconds=2.0, lookup_allowed_db=("db",)),
+        SandboxPolicy(
+            mode=SandboxMode.ISOLATED,
+            wall_seconds=2.0,
+            lookup_allowed_db=("db",),
+            lookup_allowed_http=("fhir",),
+        ),
         inbound="IB_I",
         config_dir=config_dir,
         env=None,
@@ -870,12 +877,13 @@ def test_a_lookup_the_cap_cut_off_is_the_only_one_outstanding(graph: tuple[Regis
             with pytest.raises(SandboxError, match="still running"):
                 _bodies(registry, "h_db", session)
             assert time.monotonic() - started < 15
+            # Another connection is not held up by the stalled one.
+            with fhir_lookup_mod.activated(runners.fhir):
+                assert _bodies(registry, "h_fhir", session) == ["BUNDLE-1"]
         assert (state["calls"], state["peak"]) == (1, 1)
-        # Once the abandoned lookup ends, the session serves lookups again.
+        # Once the abandoned lookup ends, the session serves lookups on it again: the next one waits
+        # for the stale lookup's completion rather than poll the runner's own counter.
         release.set()
-        deadline = time.monotonic() + 10
-        while state["in_flight"] and time.monotonic() < deadline:
-            time.sleep(0.05)
         with db_lookup_mod.activated(hung):
             assert _bodies(registry, "h_db", session)[0].startswith("late|")
     finally:
@@ -939,7 +947,7 @@ def test_an_unexpected_engine_fault_fails_the_dispatch_promptly(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     def explode(self: Any, *args: Any) -> bytes:
-        raise RuntimeError("PID|1||900001||DOE^JANE")
+        raise RuntimeError("FAULT-SENTINEL-7f3a")
 
     monkeypatch.setattr(SandboxSession, "_lookup_reply", explode)
     registry, config_dir = graph
@@ -961,6 +969,6 @@ def test_an_unexpected_engine_fault_fails_the_dispatch_promptly(
         assert time.monotonic() - started < 10
     finally:
         session.close()
-    assert "DOE^JANE" not in str(raised.value)
-    assert not [r for r in caplog.records if "DOE^JANE" in r.getMessage()]
+    assert "FAULT-SENTINEL-7f3a" not in str(raised.value)
+    assert not [r for r in caplog.records if "FAULT-SENTINEL-7f3a" in r.getMessage()]
     assert any("RuntimeError" in r.getMessage() for r in caplog.records)

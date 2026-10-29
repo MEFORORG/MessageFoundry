@@ -1364,8 +1364,10 @@ def _enc_fhir_params(params: object, blobs: _Blobs) -> Any:
     """A ``fhir_lookup`` ``params`` mapping in its own small grammar: ``[key, is_list, items]`` per
     key, each item ``{"s": str}``, ``{"k": [system, code]}``, ``{"r": raw}``, or ``{"x": type name}``
     for a value of any other kind, which arrives as a
-    :class:`~messagefoundry.fhirsearch.ForeignSearchValue`. Nothing is screened here: the parent's
-    executor judges every value, after its own "unavailable here" and connection checks."""
+    :class:`~messagefoundry.fhirsearch.ForeignSearchValue`. Values are not screened here: the
+    parent's executor judges each one, after its own "unavailable here" and connection checks. A
+    key that is not a ``str``, and ``params`` that is not a mapping, are still refused here, in the
+    worker, before those checks."""
     if params is None:
         return None
     if not isinstance(params, Mapping):
