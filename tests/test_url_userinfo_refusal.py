@@ -666,6 +666,7 @@ def test_the_proxy_egress_label_withholds_a_host_that_hides_its_port(
     for proxy in (
         f"http://svc%3A{SECRET}%5D/tail@proxy.example.invalid:3128",
         f"http://svc:4821/{SECRET}@proxy.example.invalid:3128",  # the username, port read as 4821
+        f"http://svc:{SECRET}%40proxy.example.invalid:3128",  # the %40 lands in the port field
     ):
         dest = _dest(ConnectorType.REST, "https://endpoint.example.invalid/x", proxy_url=proxy)
         caplog.clear()
@@ -684,6 +685,10 @@ def test_the_proxy_egress_label_withholds_a_host_that_hides_its_port(
 _PASSING_USERINFO_HEADS = {
     "token_head_no_port": ("https://Tok9Head/RestOfToken@endpoint.example.invalid/x", "tok9head"),
     "query_after_port": ("https://svc:12/a?b@endpoint.example.invalid/x", "svc"),
+    "token_head_query": ("https://Tok9Head?RestOfToken@endpoint.example.invalid/x", "tok9head"),
+    "token_head_fragment": ("https://Tok9Head#RestOfToken@endpoint.example.invalid", "tok9head"),
+    # Not a credential at all, and still withheld: an email in a query looks the same to a parser.
+    "email_in_query": ("https://Tok9Head.example.invalid/x?who=a@b", "tok9head"),
 }
 
 

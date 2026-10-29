@@ -262,13 +262,14 @@ def _check_forward_proxy_egress(
             proxy_url, f"{label} proxy_url", use="proxy_user/proxy_password", error=WiringError
         )
     except WiringError:
-        # The same audit entry every other egress refusal writes; it names the connection only.
+        # The egress-denied WARNING this arm's other refusals write; it names the connection only.
         log.warning("egress denied: %s forward proxy URL cannot be parsed", label)
         raise
     if not _http_egress_allowed(proxy_url, allowed_proxy):
-        # The data, token and FhirLookup arms call refuse_url_credentials first, for a refusal that
-        # names the setting. This arm cannot, since a proxy may carry its own userinfo, so the label
-        # is what keeps its message clean (BACKLOG #1793, #2686).
+        # Every arm prints the host through url_host_label. refuse_url_credentials, which the other
+        # arms run first and this one cannot (a proxy may carry its own userinfo), still passes
+        # shapes whose hostname is a username or token head, so no arm may print it raw
+        # (BACKLOG #1793, #2686).
         host = url_host_label(proxy_url)
         log.warning(
             "egress denied: %s forward proxy host %r not in [egress].allowed_proxy", label, host

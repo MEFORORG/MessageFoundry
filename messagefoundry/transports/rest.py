@@ -549,11 +549,13 @@ def _redact_url(url: str) -> str:
 
 
 def _host_hides_userinfo(p: urllib.parse.SplitResult) -> bool:
-    """Does an unbracketed host hold ``@`` or ``:`` once unquoted? Then it is userinfo written with
-    ``%40`` or ``%3A``, and ``hostname`` is the username and some of the password. An IPv6 literal
-    holds ``:``, so a bracketed host never counts."""
-    return not p.netloc.rpartition("@")[2].startswith("[") and any(
-        c in urllib.parse.unquote(p.hostname or "") for c in "@:"
+    """Does the host or port hold ``@`` once unquoted, or an unbracketed host hold ``:``? Then it
+    is userinfo written with ``%40`` or ``%3A``, and ``hostname`` is the username and some of the
+    password. The port counts: in ``svc:PW%40proxy:3128`` the ``%40`` lands in the port field and
+    ``hostname`` is ``svc``. An IPv6 literal holds ``:``, so a bracketed host never counts for it."""
+    host_port = p.netloc.rpartition("@")[2]
+    return "@" in urllib.parse.unquote(host_port) or (
+        not host_port.startswith("[") and ":" in urllib.parse.unquote(p.hostname or "")
     )
 
 
@@ -566,7 +568,7 @@ def _withholds_host(p: urllib.parse.SplitResult) -> bool:
 _URL_CREDENTIAL_USE = "basic_user/basic_password or bearer_token"
 
 #: What :func:`url_host_label` prints in place of a host it must not print.
-HOST_WITHHELD = "(withheld: the URL may hold a credential)"
+HOST_WITHHELD = "(withheld: an '@' or encoded ':' in the URL may hide a credential)"
 
 
 def url_host_label(url: str) -> str:
