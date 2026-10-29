@@ -3315,8 +3315,15 @@ class RegistryRunner:
                 await self._resolving_start(name, resolve=operator)
             except Exception as exc:
                 # A refused CA is already recorded by _checked_inbound_start; the guard keeps a
-                # rule firing on this alert from re-alerting on every restart it drives.
-                if not operator and ("inbound", name) not in self._failed:
+                # rule firing on this alert from re-alerting on every restart it drives. Only an
+                # inbound start() would bind: a name this runner does not hold (another engine
+                # shard's, a typo) or a deployed=False one is refused, not a failure to record.
+                if (
+                    not operator
+                    and name in self.registry.inbound
+                    and self._deployed(name, "inbound")
+                    and ("inbound", name) not in self._failed
+                ):
                     self._record_failed(name, exc, kind="inbound")
                 raise
 

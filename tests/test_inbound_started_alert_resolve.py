@@ -728,6 +728,27 @@ async def test_a_queued_rule_restart_whose_start_fails_records_and_alerts(
         await runner.stop()
 
 
+async def test_a_rule_restart_of_a_name_this_runner_does_not_hold_records_nothing(
+    store: MessageStore,
+) -> None:
+    # Another engine shard's inbound, or a typo in control_target: the restart is refused as
+    # before, and records no failure and raises no alert for an inbound that never failed here.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    sink = NotifierAlertSink([], store=store)
+    runner = _runner(reg, store, sink)
+    await runner.start()
+    try:
+        with pytest.raises(KeyError):
+            await runner.restart_inbound("IB_OTHER_SHARD")
+        await _settle(sink)
+        assert runner.inbound_failed("IB_OTHER_SHARD") is None
+        assert await _open(store) == set()
+    finally:
+        await runner.stop()
+
+
 @pytest.mark.parametrize("park", ["deployed", "auto_start"])
 async def test_a_deliberately_parked_outbound_namesake_does_not_block_the_resolve(
     store: MessageStore, held_port: tuple[int, socket.socket], tmp_path: Path, park: str
