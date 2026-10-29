@@ -37,6 +37,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, auto
+from pathlib import Path
 from typing import Any, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
@@ -190,7 +191,7 @@ from messagefoundry.pipeline.sandbox import (
     graph_shape,
 )
 from messagefoundry.pipeline.saturation import SaturationDetector
-from messagefoundry.pipeline.sharding import owner_shard_of_destination
+from messagefoundry.pipeline.sharding import inbound_guard_settings, owner_shard_of_destination
 from messagefoundry.pipeline.stage_dispatcher import (
     _REPEND_RETRY_CAP_SECONDS,
     HoldResult,
@@ -230,9 +231,13 @@ from messagefoundry.transports.base import (
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
+    ProcessedArchive,
     ReplyBodyDropped,
     SyncReplyResolver,
     check_file_key,
+    guard_dir_settings,
+    guarded_destination_dirs,
+    guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
@@ -3048,6 +3053,60 @@ class RegistryRunner:
     def listening_inbounds(self) -> frozenset[str]:
         """The inbounds whose listener is bound now."""
         return frozenset(self._sources)
+
+    def processed_archives(self) -> tuple[ProcessedArchive, ...]:
+        """The bound inbounds whose source archives what it read, such as the File source's
+        ``.processed`` directory, for the retention pass's age sweep (BACKLOG #1188). Only bound
+        ones: a stopped or undeployed inbound has no source object to resolve its directories."""
+        return tuple(s for s in self._sources.values() if isinstance(s, ProcessedArchive))
+
+    def archive_guard_dirs(self) -> tuple[Path, ...] | None:
+        """The directories the ``.processed`` age sweep must never reach (BACKLOG #1188): the watch
+        and ``.error`` directories of EVERY inbound in the deployment, and the target directory of
+        every outbound, bound or not, deployed or not. Read from the configuration rather than the
+        running connections, so a stopped, failed or DR-parked one stays protected. Under
+        ``serve --shard`` this shard's ``inbound`` map holds only its own inbounds, so the inbounds
+        come from :func:`inbound_guard_settings`, the whole config's; outbounds are never
+        filtered. Only the settings a connector declares its directories from are resolved
+        (:func:`guard_dir_settings`). None when one of those cannot be resolved (a missing env()
+        value, or a connector that declares directories but not their settings): the caller then
+        deletes nothing, because a guard that silently drops a directory fails open."""
+        connections = [
+            (False, name, kind, declared, inbound_record_name(name))
+            for name, (kind, declared) in inbound_guard_settings(self.registry).items()
+        ] + [
+            (
+                True,
+                name,
+                oc.spec.type,
+                guard_dir_settings(oc.spec.type, oc.spec.settings, outbound=True),
+                name,
+            )
+            for name, oc in self.registry.outbound.items()
+        ]
+        dirs: list[Path] = []
+        for outbound, name, kind, declared, record in connections:
+            try:
+                if declared is None:
+                    raise TypeError("directories declared without the settings they come from")
+                if not declared:
+                    continue  # a fault in a connection with no directories cannot hide one
+                settings = resolve_env_settings(declared, self._env_values, connection=record)
+                dirs.extend(
+                    guarded_destination_dirs(Destination(type=kind, name=name, settings=settings))
+                    if outbound
+                    else guarded_source_dirs(Source(type=kind, name=name, settings=settings))
+                )
+            except (WiringError, ValueError, TypeError, KeyError) as exc:
+                log.warning(
+                    "%s connection %r: its directories could not be resolved for the "
+                    "[retention].processed_archive_days guard (%s)",
+                    "outbound" if outbound else "inbound",
+                    name,
+                    type(exc).__name__,
+                )
+                return None
+        return tuple(dirs)
 
     async def park_intake(self, standby: Priority, *, keep: frozenset[str] = frozenset()) -> None:
         """Make this box a passive standby for intake and unbind every inbound, in one span of the

@@ -11532,6 +11532,23 @@ def create_managed_app(
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
             registry_guard=registry_guard,
+            # BACKLOG #1188: the settings the engine is not otherwise handed, read only for the
+            # directories they name (key files, CA files, spool dirs), which the `.processed`
+            # archive sweep must never reach.
+            owned_settings=(
+                auth_settings,
+                ai_settings,
+                security_settings,
+                alerts_settings,
+                secrets_settings,
+                tls_settings,
+                cluster_settings,
+                approvals_settings,
+                integrity_settings,
+                service_settings,
+                static_credential_settings,
+                egress_settings,
+            ),
             # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
             # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
             # every real reload. Each listener's own build then enforces again and loads the bytes

@@ -5504,6 +5504,17 @@ class Registry:
     # not-deployed target (ADR 0111) and must decide that identically on every shard. Names and a
     # flag only, not the connections, for the same reason as `all_loopback_inbound`.
     all_pt_inbound: Mapping[str, bool] | None = None
+    # EVERY inbound's DIRECTORY settings in the deployment (NAME -> connector type + only the settings
+    # it reads its watch and `.error` directories from, before env() resolution; None for a connector
+    # that declares directories but not their settings), pinned beside the shard identity by
+    # pipeline.sharding (None on an unfiltered graph / single-shard config, where `inbound` IS the
+    # whole config). Read only by the `.processed` archive sweep's guard (BACKLOG #1188): a sibling
+    # shard's watch directory is a fact about the CONFIG, and an archive directory that overlaps it
+    # would otherwise age out that shard's undelivered drops. Never a whole spec: a credential setting
+    # does not travel with it, and every other reader of `inbound` keeps seeing only this shard's.
+    all_inbound_guard_settings: (
+        Mapping[str, tuple[ConnectorType, Mapping[str, Any] | None]] | None
+    ) = None
     # The directory :func:`load_config` read this graph from, or None for a graph built in code. A
     # `[sandbox].mode=subprocess` worker re-loads its Router/Handler functions from here, so after
     # an operator reload from another root the workers load the root the running graph came from,
