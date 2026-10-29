@@ -4799,9 +4799,9 @@ later. Any notice that account was due still goes. Its alert still goes too, unl
 same pass raises and ends it. Then that account has neither its row nor its alert. A later refused
 audit write does not end the pass. The `auth.ad_username_refreshed` row is different: it commits in
 the rename's own transaction (BACKLOG #3018 step 7), so a refused one rolls the rename back. The
-account's row keeps its old name, and no audit row is written. No notice goes on that pass. A
-later pass that probes the account, or its next sign-in, would apply the rename, with its row and
-its notice, unless it is refused again or the name is taken.
+account's row keeps its old name, and there is no `auth.ad_username_refreshed` row and no
+username_changed notice on that pass. The engine would apply it on a pass or sign-in that reaches
+the rename and is not refused, with its row and its notice.
 
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same

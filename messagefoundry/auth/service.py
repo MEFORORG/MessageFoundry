@@ -9005,10 +9005,9 @@ class AuthService:
             # the pass with no plan returned, so the lifespan task would raise no alert for the
             # revocations already applied, and the later renames and at least the referral,
             # configuration refusal, probe fault, paging refusal, hold and unkeyed-binding records
-            # written after the rename loop would be skipped. The row still holds the old name, so a
-            # later pass that probes the account, or its next sign-in, would apply the rename with
-            # its row and its notice, unless it is refused again or the name is taken. A defect
-            # still raises. The sort is
+            # written after the rename loop would be skipped. The row still holds the old name, so
+            # the engine would apply it on a pass or sign-in that reaches the rename and is not
+            # refused, with its row and its notice. A defect still raises. The sort is
             # ``write_audit_soft``'s, called with the same sets ``_audit_reconciler_row`` passes.
             if not audit_soft:
                 raise refused
@@ -9022,8 +9021,8 @@ class AuthService:
                 log=_log,
                 message="directory reconcile: the auth.ad_username_refreshed audit row for account "
                 "%s (%s, renaming to %s) could not be written, so its rename was rolled back and "
-                "nobody was told; a later pass that probes the account, or its next sign-in, would "
-                "apply it unless it is refused again or the name is taken (BACKLOG #3018)",
+                "nobody was told; the engine would apply it on a pass or sign-in that reaches the "
+                "rename and is not refused (BACKLOG #3018)",
                 args=lambda: (
                     user_id,
                     scrub_log_argument(before.username),
