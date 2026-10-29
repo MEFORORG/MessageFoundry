@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -286,6 +287,8 @@ def test_a_missing_report_the_instrument_explains_is_unanswered(
         (1, "0x00000001"),
         # 0xC0000409, the fail-fast an abort() inside CPython ends in: NTSTATUS, but not the loader.
         (0xC0000409, "0xC0000409"),
+        # 0xC0000142, a DLL whose start-up failed: what a process unable to attach to its desktop gets.
+        (0xC0000142, "0xC0000142"),
     ],
 )
 def test_a_crash_before_the_first_report_is_named_with_its_last_line(code: int, text: str) -> None:
@@ -338,7 +341,7 @@ def test_only_an_exit_of_its_own_reads_as_a_crash(launch: dict[str, Any]) -> Non
     "launch",
     [
         {"started": False, "error": "CreateProcessW failed (win32 error 5)", "win32": 5},
-        {"started": True, "exit_code": 0xC0000142, "exit_text": "0xC0000142", "timed_out": False},
+        {"started": True, "exit_code": 0xC0000135, "exit_text": "0xC0000135", "timed_out": False},
     ],
 )
 @pytest.mark.parametrize(
@@ -360,6 +363,108 @@ def test_a_no_needs_the_launchers_own_grant_to_have_held(
     assert "the launcher's own grant failed" in judged["Q1"].detail, judged["Q1"].detail
 
 
+def test_a_crash_file_is_named_before_a_failed_grant() -> None:
+    # The worker raised inside the container, so CPython ran: the crash file is the cause to read.
+    case = _mutate("owner.container_fatal", True)
+    case["owner"]["launch"] = {"started": True, "exit_code": 1, "timed_out": False}
+    case["owner"]["window_grant"]["desktop"] = {"ok": False, "error": "label refused"}
+    case["container"] = None
+    assert "container-fatal.txt" in _judge(case)["Q1"].detail
+
+
+@pytest.mark.parametrize(
+    ("mode", "env", "user", "refused"),
+    [
+        ("control", {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"}, None, False),
+        ("control", {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "self-hosted"}, None, True),
+        ("control", {}, None, True),
+        ("owner", {}, OWNER_SID, False),
+        (
+            "owner",
+            {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"},
+            ADMIN_SID,
+            True,
+        ),
+        ("owner", {}, None, True),
+        ("container", {}, None, False),
+        ("judge", {}, None, False),
+    ],
+)
+def test_the_modes_that_change_the_host_refuse_off_the_runner(
+    mode: str, env: dict[str, str], user: str | None, refused: bool
+) -> None:
+    refusal = W.off_runner_refusal(mode, env, lambda: {"user": user})
+    assert (refusal is not None) == refused, refusal
+    if refusal:
+        assert refusal.startswith("STOP ") and refusal.endswith("nothing ran"), refusal
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="window stations are Windows objects")
+def test_the_grant_adds_one_ace_and_the_low_label_to_a_private_desktop() -> None:
+    # A desktop made for this test and destroyed when its last handle closes: no live session's
+    # object is touched. The SID is derived from a name; no AppContainer profile is made.
+    import ctypes
+    from ctypes import wintypes
+
+    api = W._window_api()
+    api.user32.CreateDesktopW.argtypes = (
+        wintypes.LPCWSTR,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    api.user32.CreateDesktopW.restype = wintypes.HANDLE
+    name = f"MeforAcSpikeTest{os.getpid()}"
+    desktop = api.user32.CreateDesktopW(name, None, None, 0, 0x000F01FF, None)
+    if not desktop:
+        pytest.skip("CreateDesktopW refused here")
+    sid = ctypes.c_void_p()
+    try:
+        derived = W._win().userenv.DeriveAppContainerSidFromAppContainerName(
+            "mefor.acspike.test", ctypes.byref(sid)
+        )
+        assert derived == 0, hex(derived & 0xFFFFFFFF)
+        record = W.grant_window_object(
+            name,
+            lambda n, access: api.user32.OpenDesktopW(n, 0, False, access),
+            api.user32.CloseDesktop,
+            W._DESKTOP_CONTAINER_RIGHTS,
+            sid.value,
+            label=True,
+        )
+        assert record["ok"] is True and record["error"] is None, record
+        assert W._grant_held({"window_grant": {"window_station": record, "desktop": record}})
+        api.adv.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = (
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPWSTR),
+            ctypes.c_void_p,
+        )
+        sd, text = ctypes.c_void_p(), wintypes.LPWSTR()
+        info = W._DACL_SECURITY_INFORMATION | W._LABEL_SECURITY_INFORMATION
+        assert (
+            api.adv.GetSecurityInfo(desktop, 7, info, None, None, None, None, ctypes.byref(sd)) == 0
+        )
+        try:
+            assert api.adv.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd, 1, info, ctypes.byref(text), None
+            )
+            sddl = str(text.value)
+            api.k32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+        finally:
+            api.k32.LocalFree(sd)
+        package = W._sid_text(sid.value)
+        assert package in (W.sddl_trustees(sddl) or []), sddl
+        assert "S:(ML;;NW;;;LW)" in sddl, sddl
+    finally:
+        if sid.value:
+            W._win().adv.FreeSid(sid)
+        api.user32.CloseDesktop(desktop)
+
+
 def test_the_grant_reads_into_the_detail_skipped_ok_or_missing() -> None:
     assert "window station grant ok, desktop grant ok" in _judge(_good())["Q1"].detail
     skipped = {"ok": True, "skipped": "WinSta0 grants ALL APPLICATION PACKAGES already"}
@@ -377,7 +482,7 @@ def test_the_grant_reads_into_the_detail_skipped_ok_or_missing() -> None:
 
 def test_the_log_tail_is_the_last_line_the_container_printed(tmp_path: Path) -> None:
     log = tmp_path / W.CONTAINER_LOG
-    assert W._log_tail(log) is None
+    assert "not read: FileNotFoundError" in str(W._log_tail(log))
     log.write_bytes(b"Traceback (most recent call last):\r\n  File x\r\nImportError: no\r\n\r\n")
     assert W._log_tail(log) == "ImportError: no"
     log.write_bytes(b"")

@@ -59,13 +59,14 @@ import importlib.util
 import json
 import locale
 import os
+import platform
 import re
 import subprocess
 import sys
 import time
 import traceback
 import types
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,9 +109,11 @@ _SIGN_REFUSALS = frozenset({0x80090010, 0x80070005})
 #: CreateProcessW failures that are a refusal of the launch: access denied, a privilege not held.
 _LAUNCH_REFUSALS = frozenset({5, 1314})
 #: The NTSTATUS exits the loader gives a process that died before its own code ran: a DLL or an
-#: entry point not found, a DLL whose initialisation failed, a bad image, access denied. Any other
+#: entry point not found, a bad image, access denied. Any other
 #: NTSTATUS exit, such as 0xC0000409 from an abort() inside CPython, is a crash, not one of these.
-_LOADER_DEATHS = frozenset({0xC0000135, 0xC0000139, 0xC0000142, 0xC000007B, 0xC0000022})
+#: 0xC0000142, a DLL whose initialisation failed, is left out on purpose: it is also how a process
+#: dies that cannot attach to its window station or desktop, which is the launcher's own grant.
+_LOADER_DEATHS = frozenset({0xC0000135, 0xC0000139, 0xC000007B, 0xC0000022})
 #: CreateAppContainerProfile's HRESULT when the profile is there already.
 _PROFILE_EXISTS = 0x800700B7
 #: The digest the owner and the container sign, and the owner checks.
@@ -617,7 +620,8 @@ _TRUSTEE_IS_SID = 0
 _SDDL_REVISION_1 = 1
 #: WinSta0 and WinSta0\Default both carry this label (read on Windows 11 build 26300). Without it
 #: an object counts as medium integrity, and a container's low token is refused every write-class
-#: right, whatever the DACL grants.
+#: right, whatever the DACL grants. Only the desktop grant holds such a right, so only the desktop
+#: is labelled.
 _LOW_LABEL_SDDL = "S:(ML;;NW;;;LW)"
 #: Enumerate desktops, read attributes, global atoms, enumerate, read control. WinSta0 grants ALL
 #: APPLICATION PACKAGES these and the clipboard and read-screen rights too (0x00020327, read on
@@ -627,9 +631,9 @@ _WINSTA_CONTAINER_RIGHTS = 0x00020123
 #: what WinSta0\Default grants ALL APPLICATION PACKAGES: no hook, journal, switch, delete or DACL
 #: right, so the container cannot hook or record input on the service's desktop.
 _DESKTOP_CONTAINER_RIGHTS = 0x000200C7
-#: The interactive window station, which grants ALL APPLICATION PACKAGES and carries the low label
-#: already, so the launcher changes nothing there.
-_INTERACTIVE_STATION = "WinSta0"
+#: The interactive desktop, whose station and desktop grant ALL APPLICATION PACKAGES and carry the
+#: low label already (read on Windows 11 build 26300), so the launcher changes nothing there.
+_INTERACTIVE_DESKTOP = ("WinSta0", "Default")
 
 
 @functools.cache
@@ -790,18 +794,32 @@ def _label_low(name: str, open_object: Opener, close: Callable[[int], Any]) -> t
 
 
 def grant_window_object(
-    name: str, open_object: Opener, close: Callable[[int], Any], rights: int, sid: int
+    name: str,
+    open_object: Opener,
+    close: Callable[[int], Any],
+    rights: int,
+    sid: int,
+    *,
+    label: bool,
 ) -> dict[str, Any]:
-    """Grant ``sid`` ``rights`` on the named window station or desktop, and label it low."""
+    """Grant ``sid`` ``rights`` on the named window station or desktop, and label it low when
+    ``label`` is set and the DACL grant was made."""
     dacl_ok, dacl = _grant_dacl(name, open_object, close, rights, sid)
-    label_ok, label = _label_low(name, open_object, close)
+    if not label:
+        label_ok, label_text = True, "not needed: no write-class right granted"
+    elif dacl != "ok":
+        # A NULL DACL, or a failed grant: a low label on a NULL DACL would hand every low process
+        # the hook and journal rights the narrowed grant leaves out.
+        label_ok, label_text = dacl_ok, "not set, as the DACL was not changed"
+    else:
+        label_ok, label_text = _label_low(name, open_object, close)
     return {
         "name": name,
         "rights": f"0x{rights:08X}",
         "dacl": dacl,
-        "label": label,
+        "label": label_text,
         "ok": dacl_ok and label_ok,
-        "error": None if dacl_ok and label_ok else f"DACL {dacl}; label {label}",
+        "error": None if dacl_ok and label_ok else f"DACL {dacl}; label {label_text}",
     }
 
 
@@ -815,39 +833,55 @@ def grant_window_station_and_desktop(sid: int) -> dict[str, Any]:
     which this grant is the reading of: that a service's window station has neither. The next run
     confirms it or not.
 
-    The grant names the one package SID, never the group, and is left in place: the service's
-    window station goes when its logon session does. On WinSta0 nothing is changed, so a run from
-    an interactive session leaves that session's objects as they were.
+    The changes are left in place, and the service's window station goes when its logon session
+    does: an allow ace for the one package SID, never the group, on the window station and on the
+    desktop, and a low mandatory label on the desktop alone, since only there is a write-class
+    right granted. On WinSta0\\Default nothing is changed, so a run from an interactive session
+    leaves that session's objects as they were.
+
+    It never raises: a failure is recorded, and the launch goes ahead, so the judge reads it.
     """
+    try:
+        return _grant_window_station_and_desktop(sid)
+    except (OSError, AttributeError, ctypes.ArgumentError) as exc:
+        failed = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"window_station": failed, "desktop": failed}
+
+
+def _grant_window_station_and_desktop(sid: int) -> dict[str, Any]:
     api = _window_api()
     station, code = _object_name(api.user32.GetProcessWindowStation())
     if station is None:
         failed = {"ok": False, "error": f"no window station name (win32 error {code})"}
         return {"window_station": failed, "desktop": failed}
-    if station == _INTERACTIVE_STATION:
-        skipped = {"ok": True, "skipped": f"{station} grants ALL APPLICATION PACKAGES already"}
+    desktop, code = _object_name(api.user32.GetThreadDesktop(api.k32.GetCurrentThreadId()))
+    if desktop is None:
+        failed = {"ok": False, "error": f"no desktop name (win32 error {code})"}
+        return {"window_station": failed, "desktop": failed}
+    if (station, desktop) == _INTERACTIVE_DESKTOP:
+        skipped = {
+            "ok": True,
+            "skipped": f"{station}\\{desktop} grants ALL APPLICATION PACKAGES already",
+        }
         return {"window_station": skipped, "desktop": skipped}
-    out: dict[str, Any] = {
+    return {
         "window_station": grant_window_object(
             station,
             lambda name, access: api.user32.OpenWindowStationW(name, False, access),
             api.user32.CloseWindowStation,
             _WINSTA_CONTAINER_RIGHTS,
             sid,
-        )
-    }
-    desktop, code = _object_name(api.user32.GetThreadDesktop(api.k32.GetCurrentThreadId()))
-    if desktop is None:
-        out["desktop"] = {"ok": False, "error": f"no desktop name (win32 error {code})"}
-    else:
-        out["desktop"] = grant_window_object(
+            label=False,
+        ),
+        "desktop": grant_window_object(
             desktop,
             lambda name, access: api.user32.OpenDesktopW(name, 0, False, access),
             api.user32.CloseDesktop,
             _DESKTOP_CONTAINER_RIGHTS,
             sid,
-        )
-    return out
+            label=True,
+        ),
+    }
 
 
 def appcontainer_profile(name: str) -> tuple[dict[str, Any], int | None]:
@@ -999,12 +1033,14 @@ def _launch(profile: str, shared: Path, extra: list[str]) -> dict[str, Any]:
 
 
 def _log_tail(path: Path) -> str | None:
-    """The last line the container printed, for the judge's detail: a traceback ends with its cause."""
+    """The last line the container printed, for the judge's detail: a traceback ends with its cause.
+    None when it printed nothing; a log that could not be read says so, rather than read as empty."""
     try:
-        # CPython writes redirected stderr in the ANSI code page unless UTF-8 mode is on.
-        text = path.read_text(encoding=locale.getencoding(), errors="replace")
-    except OSError:
-        return None
+        # The container is this interpreter with the same flags, so it wrote redirected stderr in
+        # the encoding this process would: the ANSI code page, or UTF-8 in UTF-8 mode.
+        text = path.read_text(encoding=locale.getpreferredencoding(False), errors="replace")
+    except OSError as exc:
+        return f"({CONTAINER_LOG} not read: {type(exc).__name__}: {exc})"
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return lines[-1][:300] if lines else None
 
@@ -1397,6 +1433,14 @@ def judge_reports(
                 UNANSWERED,
                 "a report came back, but not from a container of this profile",
             )
+    elif o.get("container_fatal") is not False:
+        # The container writes its report before anything else, so a crash file with no report is
+        # this script failing inside the container, not the account refusing to run it.
+        q1 = UNANSWERED
+        q1_detail = (
+            "no report, and the worker crashed inside the container or its crash file was not "
+            f"looked for (container_fatal={o.get('container_fatal')}); read container-fatal.txt"
+        )
     elif not _grant_held(o):
         # With no report, a launch whose window station or desktop grant failed may have died of
         # that, which is the launcher's own failure and not the account's answer.
@@ -1410,14 +1454,6 @@ def judge_reports(
     elif launch.get("started") is False:
         q1 = UNANSWERED
         q1_detail = f"the launch failed, but not as a refusal: {launch.get('error')}"
-    elif o.get("container_fatal") is not False:
-        # The container writes its report before anything else, so a crash file with no report is
-        # this script failing inside the container, not the account refusing to run it.
-        q1 = UNANSWERED
-        q1_detail = (
-            "no report, and the worker crashed inside the container or its crash file was not "
-            f"looked for (container_fatal={o.get('container_fatal')}); read container-fatal.txt"
-        )
     elif _exited_on_its_own(launch) and int(launch["exit_code"]) in _LOADER_DEATHS:
         # The loader's own statuses: the process died before CPython could run anything. Any other
         # NTSTATUS exit, such as the fail-fast an abort() inside CPython ends in, is a crash below.
@@ -1434,7 +1470,8 @@ def judge_reports(
             f"the container crashed before its first report: it exited {launch.get('exit_text')} "
             f"on its own, with no timeout and no failed wait; its last line: "
             f"{launch.get('log_tail') or 'none'}; {_grant_text(o)}; the whole of {CONTAINER_LOG} "
-            "is in the job log, and in the step summary after these lines"
+            "is in the job log, and the rig adds it to the step summary when no container.json "
+            "came back"
         )
     elif launch.get("started") is True:
         q1 = UNANSWERED
@@ -1730,11 +1767,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: A virtual service account, NT SERVICE\<name>: S-1-5-80-*.
+_SERVICE_SID_PREFIX = "S-1-5-80-"
+
+
+def off_runner_refusal(
+    mode: str, env: Mapping[str, str], facts: Callable[[], dict[str, Any]]
+) -> str | None:
+    """The circuit breaker (CLAUDE.md section 5): the modes that change the host refuse elsewhere.
+
+    ``control`` changes window station and desktop security and makes an AppContainer profile, so
+    it runs only where the rig runs, on a GitHub-hosted runner, by the variables the runner sets.
+    ``owner`` runs under NSSM, which does not pass the runner's variables on, so it runs only as a
+    virtual service account, which only the rig, behind its own breaker, registers here. The
+    ``container`` and ``judge`` modes change nothing that outlives them.
+    """
+    where = f"this is {platform.node()}; nothing ran"
+    if mode == "control" and (
+        env.get("GITHUB_ACTIONS") != "true" or env.get("RUNNER_ENVIRONMENT") != "github-hosted"
+    ):
+        return f"STOP     control mode must run on a GitHub-hosted runner, but {where}"
+    if mode == "owner" and not str(facts().get("user") or "").startswith(_SERVICE_SID_PREFIX):
+        return f"STOP     owner mode must run as the rig's NT SERVICE account, but {where}"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.mode == "judge":
         return run_judge(args)
 
+    refusal = off_runner_refusal(args.mode, os.environ, read_container_facts)
+    if refusal:
+        raise SystemExit(refusal)
     folder = Path(args.shared if args.mode == "container" else args.dir)
     try:
         if args.mode == "owner":

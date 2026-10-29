@@ -29,12 +29,15 @@
 
   THE GRANTS THE CONTAINER NEEDS ARE THE RIG'S, and each is what a deploying site would have to
   make too: read on the interpreter's folder, and on the worker and the one file it loads, for
-  ALL APPLICATION PACKAGES; and modify, for the same group, on the folders a container writes. No
-  integrity label is set: a container ran at low integrity and still wrote an unlabelled folder
-  that grants the group (measured on Windows 11 build 26300, as an interactive user). The blob
-  file the third question is about gets none of these grants. One more grant is the launcher's,
-  in the worker, since only the service can name its own window station: the one package SID on
-  that window station and its desktop (grant_window_station_and_desktop says why).
+  ALL APPLICATION PACKAGES; and modify, for the same group, on the folders a container writes. The
+  rig sets no integrity label on a file or folder: a container ran at low integrity and still
+  wrote an unlabelled folder that grants the group (measured on Windows 11 build 26300, as an
+  interactive user). The blob file the third question is about gets none of these grants.
+
+  THE LAUNCHER MAKES ONE MORE CHANGE, in the worker, since only the service can name its own
+  window station: an allow ace for the one package SID on that window station and its desktop,
+  and a low integrity label on the desktop, both left in place. On WinSta0\Default, which has
+  both already, it changes nothing. grant_window_station_and_desktop says why.
 
   Runs under Windows PowerShell 5.1, as the windows-service-smoke install step runs the installer.
 #>
@@ -237,6 +240,8 @@ try {
         $logText = [string](Get-Content -LiteralPath $containerLog -Raw) -replace $fence, "'''"
         $logCap = 65536
         if ($logText.Length -gt $logCap) { $logText = "[first $($logText.Length - $logCap) characters cut]`n" + $logText.Substring($logText.Length - $logCap) }
+        # An empty log is a container that never ran or printed nothing, not an empty block.
+        if (-not $logText.Trim()) { $logText = "[container.log is empty]" }
         [IO.File]::AppendAllText($Summary,
             ("The service's container wrote no report. Its output, {0}:`n`n{1}`n{2}`n{1}`n" -f $containerLog, $fence, $logText.TrimEnd()))
     }
