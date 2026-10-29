@@ -11,10 +11,15 @@ convention binds*, and the other places point there.
 This pins the absence of the old claim, in the shapes the controls below hold, over ``docs/``,
 ``messagefoundry/``, ``tests/``, ``packaging/``, ``harness/`` and ``scripts/``. It is a lexical floor:
 a paraphrase that never says "the control" passes it. It also pins that the statement the pointers
-cite is still in section 7. A correction note may quote the old wording, with any double quotes
-inside it made single: a match wholly inside a double-quoted span that opens right after ``read`` or
-``said`` following a ``CORRECTED`` or ``Corrected`` marker, and closes just after the match, is a
-quoted retraction, not the claim (:func:`_is_quoted_retraction`).
+cite is still in section 7.
+
+**Every match is flagged, whatever marker surrounds it.** A correction note that must quote the old
+claim verbatim adds its own entry to :data:`_ALLOWED` in the same change, so a reviewer sees the
+exemption beside the quote. An entry is a path and the exact quoted text, folded the way the scan
+folds it. An entry whose text is no longer in its file, or holds no claim, fails
+:func:`test_no_allowlist_entry_is_stale`. A marker-reading exemption was tried first and failed open
+in at least seven shapes (PR 2595), which :func:`test_a_claim_is_flagged_whatever_marker_surrounds_it`
+pins.
 """
 
 from __future__ import annotations
@@ -43,51 +48,44 @@ _LINE_MARKER = re.compile(r"^\s*(?:#:?|>)?\s*", re.MULTILINE)
 #: file that :data:`_CLAIM` would match after folding is skipped. Most files fail it and skip the fold.
 _MAYBE = re.compile(r"the\W+(?:only\W+)?control", re.IGNORECASE)
 
+#: Real retractions that quote the old claim: ``(posix path from the repository root, exact quoted
+#: text as folded)``. Empty: no file in the scanned trees quotes the claim today.
+_ALLOWED: tuple[tuple[str, str], ...] = ()
+
 
 def _folded(text: str) -> str:
     return " ".join(_LINE_MARKER.sub("", text).split())
 
 
-#: How far back a correction marker may sit and still own a quoted claim: room for the marker, its
-#: date or context and a lead-in such as ``this read``, never a whole paragraph.
-_CORRECTED_REACH = 200
-#: How far past the claim its retraction quote must close: room for a tail such as ``for both``.
-_CLOSE_REACH = 40
-#: The opening of a quoted retraction, read back from where the claim starts: a ``CORRECTED`` or
-#: ``Corrected`` marker, then ``read`` or ``said`` (in any case) with a double quote opening RIGHT
-#: AFTER the verb and still open at the claim. The marker is case-sensitive, so prose saying "the
-#: corrected wording read" is not one; the letter guard before it, not its case, is what keeps
-#: ``UNCORRECTED`` out. A quote opened anywhere else, such as the one around the convention's own
-#: name in ``this said X; the "never put PHI ..." convention remains the control``, is not one.
-_QUOTED_RETRACTION = re.compile(
-    r"(?<![A-Za-z])(?:CORRECTED|Corrected)(?![a-z])"
-    rf".{{0,{_CORRECTED_REACH}}}?"
-    r"(?<![A-Za-z])(?i:read|said)(?![a-z])[\s:*_]*\"[^\"]*$"
-)
-
-
-def _is_quoted_retraction(folded: str, m: re.Match[str]) -> bool:
-    """Whether the claim ``m`` sits wholly inside a retraction's quote.
-
-    The quote must still be open at the claim's END (no double quote inside the match, which
-    ``_CLAIM``'s ``\\W{0,4}`` would otherwise accept) and must close within :data:`_CLOSE_REACH`
-    after it, so an unclosed quote cannot exempt a claim made in a later sentence. The opening is
-    searched with ``pos``, not on a slice, so a window that cuts ``UNCORRECTED`` keeps its left
-    context."""
-    if '"' in m.group(0):
-        return False
-    close = folded.find('"', m.end())
-    if close == -1 or close - m.end() > _CLOSE_REACH:
-        return False
-    lo = max(0, m.start() - _CORRECTED_REACH)
-    return _QUOTED_RETRACTION.search(folded, lo, m.start()) is not None
-
-
-def _claims(text: str) -> list[str]:
+def _claims(
+    text: str, path: str = "", allowed: tuple[tuple[str, str], ...] = _ALLOWED
+) -> list[str]:
+    """Every claim in ``text``, less those wholly inside an allowlisted quote for ``path``."""
     if not _MAYBE.search(text):
         return []
     folded = _folded(text)
-    return [m.group(0) for m in _CLAIM.finditer(folded) if not _is_quoted_retraction(folded, m)]
+    spans = [
+        (start, start + len(quote))
+        for entry_path, quote in allowed
+        if entry_path == path
+        for start in (m.start() for m in re.finditer(re.escape(quote), folded))
+    ]
+    return [
+        m.group(0)
+        for m in _CLAIM.finditer(folded)
+        if not any(lo <= m.start() and m.end() <= hi for lo, hi in spans)
+    ]
+
+
+def _stale(root: Path, allowed: tuple[tuple[str, str], ...]) -> list[tuple[str, str]]:
+    """The entries whose quote is not in their file any more, or holds no claim to exempt."""
+    stale = []
+    for path, quote in allowed:
+        target = root / path
+        folded = _folded(target.read_text(encoding="utf-8")) if target.is_file() else ""
+        if quote not in folded or not _CLAIM.search(quote):
+            stale.append((path, quote))
+    return stale
 
 
 @pytest.mark.parametrize(
@@ -104,41 +102,33 @@ def _claims(text: str) -> list[str]:
         # variants a reword could reach for
         'the "never put PHI in an exception message" convention is still the only control',
         'the "never put PHI in an exception message" convention** remains the **control**',
-        # a claim near an unrelated correction is still the claim
-        "**CORRECTED 2026-10-01:** this said the gate was per route. Neither is a completeness "
-        "claim; the convention above remains the control for both.",
-        'An UNCORRECTED fragment, read "x". The convention above remains the control for both.',
-        # the convention's own opening quote is not a retraction quote (PR 2595 review); the
-        # control is the dated CORRECTED note in test_the_scan_passes_other_prose
-        'Corrected 2026-10-01: this said the gate was per route; the "never put PHI in an exception '
-        'message" convention remains the control.',
-        # a lowercase "corrected" in prose is no marker (PR 2595 review), dated or not; same control
-        'the corrected wording read "the convention above remains the control for both".',
-        'corrected 2026-10-28: this read "the convention above remains the control for both".',
-        # the convention name's quote closed INSIDE the claim, right after the verb
-        '**CORRECTED 2026-10-28:** this said "never put PHI in an exception message" is the control',
-        # a retraction quote never closed by a double quote does not reach a later sentence
-        '**CORRECTED 2026-10-28:** this read "per route”. Neither is a completeness claim; the '
-        "convention above remains the control for both.",
     ],
 )
 def test_the_scan_finds_each_shipped_wording(shipped: str) -> None:
     assert _claims(shipped), shipped
 
 
-def test_a_window_cut_through_uncorrected_is_no_marker() -> None:
-    # Pad so the reach window opens two characters into "UNCORRECTED", at "CORRECTED".
-    head = 'UNCORRECTED 2026-10-28: this read "'
-    text = (
-        head
-        + "x" * (_CORRECTED_REACH + 1 - len(head))
-        + ' the convention above remains the control"'
-    )
-    claim = text.index("the convention above")
-    assert text[claim - _CORRECTED_REACH :].startswith("CORRECTED")
-    assert _claims(text)
-    # control: the same text with a real marker is a quoted retraction
-    assert _claims(text.replace("UNCORRECTED", "--CORRECTED")) == []
+#: The shapes the marker-reading exemption at 09c971f14 let through (PR 2595 second hold), each
+#: measured exempt there. With no marker reading, each is flagged.
+_MARKER_SHAPES = {
+    "a quote, then a later quote": '**CORRECTED 2026-10-28:** this read "per route"; it should read '
+    '"the convention above remains the control for both".',
+    "a later sentence": '**CORRECTED 2026-10-28:** this was per route. The fix said "the convention '
+    'above remains the control for both".',
+    "prose opening with Corrected": "Corrected ACK handling landed in 2026. The spec said "
+    '"the convention above remains the control for both".',
+    "NOT CORRECTED": 'NOT CORRECTED: this read "the convention above remains the control for both".',
+    "CORRECTED-by-design": 'CORRECTED-by-design: this read "the convention above remains the '
+    'control for both".',
+    "CORRECTEDLY": 'CORRECTEDLY: this read "the convention above remains the control for both".',
+    "a curly close, then a later quote": '**CORRECTED 2026-10-28:** this read "per route”. The '
+    'convention above remains the control for both; see "Who binds".',
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_MARKER_SHAPES))
+def test_a_claim_is_flagged_whatever_marker_surrounds_it(shape: str) -> None:
+    assert _claims(_MARKER_SHAPES[shape]), shape
 
 
 @pytest.mark.parametrize(
@@ -148,27 +138,40 @@ def test_a_window_cut_through_uncorrected_is_no_marker() -> None:
         "engine's own authors write.",
         "the SPDX header convention is the control here",  # another convention
         'the "never put PHI in an exception message" convention is the controller',
-        # a retraction quoting the old claim verbatim
-        '**CORRECTED 2026-10-28:** this read "the convention above remains the control for both".',
-        '*Corrected 2026-10-01 (BACKLOG #2443 step 4):* this said "the convention above remains '
-        'the control for both".',
-        # the same, quoting the convention-name arm (inner quotes single, so the outer one stays open)
-        "**CORRECTED 2026-10-28:** this said \"the 'never put PHI in an exception message' "
-        'convention remains the control".',
-        # the tree's other correction shapes: undated, a context in brackets, a capital verb,
-        # underscore emphasis, and a quoted term before the verb
-        '**CORRECTED:** this read "the convention above remains the control for both".',
-        'CORRECTED (review of a87fcb2932): this comment said "the convention above remains the '
-        'control for both".',
-        '**CORRECTED 2026-10-28:** Read "the convention above remains the control for both".',
-        '_Corrected 2026-10-01:_ this said "the convention above remains the control for both".',
-        '**CORRECTED 2026-10-28:** this _read_ "the convention above remains the control for both".',
-        '**CORRECTED 2026-10-28:** the "Who binds" note read "the convention above remains the '
-        'control for both".',
     ],
 )
 def test_the_scan_passes_other_prose(prose: str) -> None:
     assert _claims(prose) == []
+
+
+_RETRACTION = (
+    '**CORRECTED 2026-10-28:** this read "the convention above remains the control for both".'
+)
+_ENTRY = ("docs/EXAMPLE.md", 'this read "the convention above remains the control for both"')
+
+
+def test_an_allowlisted_quote_passes_only_at_its_own_path() -> None:
+    assert _claims(_RETRACTION, "docs/EXAMPLE.md", (_ENTRY,)) == []
+    assert _claims(_RETRACTION, "docs/OTHER.md", (_ENTRY,))  # the same text elsewhere
+    assert _claims(_RETRACTION, "docs/EXAMPLE.md", ())  # control: no entry, flagged
+    # a second claim in the same file, outside the quote, is still flagged
+    assert _claims(_RETRACTION + " The convention above remains the control.", _ENTRY[0], (_ENTRY,))
+
+
+def test_an_allowlist_entry_gone_from_its_file_is_stale(tmp_path: Path) -> None:
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "EXAMPLE.md").write_text(_RETRACTION + "\n", encoding="utf-8")
+    assert _stale(tmp_path, (_ENTRY,)) == []  # control: present and holding a claim
+    (docs / "EXAMPLE.md").write_text("reworded, no quote left\n", encoding="utf-8")
+    assert _stale(tmp_path, (_ENTRY,)) == [_ENTRY]
+    assert _stale(tmp_path, (("docs/GONE.md", _ENTRY[1]),)) == [("docs/GONE.md", _ENTRY[1])]
+    no_claim = ("docs/EXAMPLE.md", "reworded")
+    assert _stale(tmp_path, (no_claim,)) == [no_claim]  # present, but exempts nothing
+
+
+def test_no_allowlist_entry_is_stale() -> None:
+    assert _stale(_ROOT, _ALLOWED) == []
 
 
 def _sources() -> list[Path]:
@@ -185,14 +188,15 @@ def test_no_document_names_the_convention_as_the_control() -> None:
     sources = _sources()
     # A moved root would scan nothing and pass; the floor catches an empty or wrong one.
     assert len(sources) > 500
-    hits = {
-        path.relative_to(_ROOT).as_posix(): found
-        for path in sources
-        if (found := _claims(path.read_text(encoding="utf-8")))
-    }
+    hits = {}
+    for path in sources:
+        rel = path.relative_to(_ROOT).as_posix()
+        if found := _claims(path.read_text(encoding="utf-8"), rel):
+            hits[rel] = found
     assert not hits, (
         f"{hits} -- the exception-message convention binds only the engine's own authors, never a "
-        "remote peer; point at docs/PHI.md section 7, 'Who the exception-message convention binds'"
+        "remote peer; point at docs/PHI.md section 7, 'Who the exception-message convention binds'. "
+        "A correction that must quote the old claim verbatim adds an entry to _ALLOWED."
     )
 
 
