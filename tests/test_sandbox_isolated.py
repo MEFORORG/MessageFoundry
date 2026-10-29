@@ -642,6 +642,15 @@ def _join_lookup_helpers(*, exclude_hung: bool = False, timeout: float = 15.0) -
         thread.join(3.0 if exclude_hung else timeout)
 
 
+def _new_lookup_helpers(earlier: set[threading.Thread]) -> list[threading.Thread]:
+    """The broker's lookup helper threads started since ``earlier`` was taken."""
+    return [
+        thread
+        for thread in set(threading.enumerate()) - earlier
+        if thread.name.startswith("mf-sandbox-lookup-")
+    ]
+
+
 def _worker_broker() -> Any:
     """The worker's ``_Broker``. Importing the worker installs a stderr root handler, which is right
     in its child process and wrong here, so the root logger is restored after the import, as the
@@ -1069,23 +1078,21 @@ def test_a_helper_past_its_deadline_never_calls_the_runner(
             earlier = set(threading.enumerate())
             with pytest.raises(SandboxError, match="wall cap"):
                 _bodies(registry, "h_db", session)  # A: hangs, cut off
-            a_helpers = [
-                thread
-                for thread in set(threading.enumerate()) - earlier
-                if thread.name.startswith("mf-sandbox-lookup-")
-            ]
-            assert len(a_helpers) == 1  # the sync point below depends on finding A's helper
+            # Exactly one helper each for A and B: the sync points below depend on finding them.
+            (a_helper,) = _new_lookup_helpers(earlier)
             go.clear()
+            earlier = set(threading.enumerate())
             with pytest.raises(SandboxError, match="wall cap"):
                 _bodies(registry, "h_db", session)  # B: its helper is held before the runner
+            (b_helper,) = _new_lookup_helpers(earlier)
             release_a.set()
             # Wait for A's own helper to finish, not the runner's counter: only then is the connection
             # free, so B's helper can only be stopped by its dispatch being over.
-            for thread in a_helpers:
-                thread.join(10)
-            assert not any(thread.is_alive() for thread in a_helpers)
+            a_helper.join(10)
+            assert not a_helper.is_alive()
             go.set()  # B's helper goes on, past B's deadline, and finds A finished
-            _join_lookup_helpers()
+            b_helper.join(10)
+            assert not b_helper.is_alive()
             release_all.set()
             assert _bodies(registry, "h_db", session)[0].startswith("late|")  # C
         assert (state["calls"], state["peak"]) == (2, 1)  # A and C; never B

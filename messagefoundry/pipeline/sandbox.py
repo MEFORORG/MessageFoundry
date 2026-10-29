@@ -1231,7 +1231,8 @@ class SandboxSession:
         the runner returns. A later lookup on that connection can only meet one the wall cap cut off,
         since a session serves one dispatch at a time. It waits on that record by the rule
         ``docs/CONFIGURATION.md`` states (section ``[sandbox]``, *``mode="isolated"``*), and is
-        refused if it still runs then. Every runner call is recorded, so a connection never has two.
+        refused if it still runs then. Every runner call is recorded, so a connection never has two in
+        one session (a reload replaces the session; ``docs/CONFIGURATION.md`` states the limits).
         **A helper does not call the runner once its dispatch is over:** it checks ``abandoned`` and
         the deadline just before it registers. That is a check, not a fence. A helper that passed it
         an instant before the dispatch gave up still calls the runner, and that call is recorded and
