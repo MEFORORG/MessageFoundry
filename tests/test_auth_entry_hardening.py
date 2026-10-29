@@ -198,9 +198,9 @@ _ADDRESS_KEYED = ["allow_login_attempt", "allow_repeated_credential_audit"]
 async def test_an_address_keyed_limiter_keys_a_host_not_a_spelling(
     accessor: str, first: str | None, second: str, same: bool
 ) -> None:
-    # BACKLOG #3764 item 3. RED on the unfixed code for every same-host pair: each spelling had its
-    # own bucket, so a host that reached the engine both ways got the per-address budget twice. A
-    # missing and an empty client still share the "unknown" bucket.
+    # BACKLOG #3764 item 3. RED on the unfixed code for every pair from _ONE_HOST: each spelling had
+    # its own bucket, so a host that reached the engine both ways got the per-address budget twice.
+    # The (None, "") pair is green either way: it pins that both still share the "unknown" bucket.
     store = await MessageStore.open(":memory:")
     try:
         svc = AuthService(

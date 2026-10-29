@@ -569,8 +569,9 @@ def _client_limiter_key(client: str | None) -> str:
     is no address.
 
     It only folds the text uvicorn hands over; which forwarded address is the client stays
-    uvicorn's call (ADR 0151 D-1). It does not fold an IPv6 zone id. At least the HTTP listener's
-    intake limiter keys a peer without it."""
+    uvicorn's call (ADR 0151 D-1). A zone id is kept on an address that is neither loopback nor
+    IPv4-mapped. At least the sign-in failure-burst signal and the HTTP listener's intake limiter
+    key the raw address text without this fold."""
     return _host_key(client) if client else "unknown"
 
 
