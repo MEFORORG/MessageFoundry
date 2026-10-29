@@ -6094,6 +6094,9 @@ bucket each time and is bounded only by the **global** ceiling. The source IP is
 uvicorn runs with `forwarded_allow_ips` built from `settings.api.trusted_proxies` (defaults to `[]`
 = trust nothing; the [`trusted_proxies` row](CONFIGURATION.md) says what is added), and an off-loopback proxied bind is gated to require a declared trusted proxy — but an
 in-process per-IP limiter inherently cannot stop pure IP rotation by a **directly-reachable** attacker.
+The key is the host, not its spelling (BACKLOG #3764 item 3): an IPv4-mapped address such as
+`::ffff:203.0.113.5` draws the bucket of `203.0.113.5`, and every loopback address draws one shared
+bucket, as the new-address signals fold them. The repeated-credential audit budget keys the same way.
 The anti-guessing controls that survive rotation are the **global sign-in ceiling** plus the
 **per-account argon2 lockout (5 / 15 min)**, applied to **both** the password and the MFA
 second-factor paths, so guessing of a specific *local* account stays well-bounded **at the login

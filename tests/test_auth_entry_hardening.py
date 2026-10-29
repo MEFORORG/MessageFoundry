@@ -19,6 +19,7 @@ from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.store import MessageStore
 
 
 @pytest.fixture
@@ -161,6 +162,54 @@ async def test_login_rate_limited_per_ip(engine: Engine) -> None:
         assert (await _login(c, "nobody", "x")).status_code == 401  # 1 — invalid creds
         assert (await _login(c, "nobody", "x")).status_code == 401  # 2
         assert (await _login(c, "nobody", "x")).status_code == 429  # 3 — rate limited
+
+
+#: Two spellings of one host. The mapped pair is the one BACKLOG #3764 item 3 names; the loopback
+#: pairs make the buckets stricter than one per spelling, which is deliberate.
+_ONE_HOST = [
+    ("::ffff:203.0.113.5", "203.0.113.5"),
+    ("203.0.113.5", "::ffff:203.0.113.5"),
+    ("127.0.0.1", "::1"),
+    ("::1", "127.0.0.1"),
+    ("::ffff:127.0.0.1", "::1"),
+    ("127.0.0.2", "127.0.0.1"),
+    ("2001:DB8::1", "2001:db8::1"),
+]
+#: Two different hosts, including a mapped address beside a different plain one.
+_TWO_HOSTS = [
+    ("203.0.113.5", "203.0.113.6"),
+    ("::ffff:203.0.113.5", "203.0.113.6"),
+    ("::ffff:203.0.113.5", "::ffff:203.0.113.6"),
+    ("203.0.113.5", "::1"),
+    ("2001:db8::1", "2001:db8::2"),
+]
+
+
+#: Every limiter keyed by client address (the passkey begin leg is in test_passkey_way_past.py).
+_ADDRESS_KEYED = ["allow_login_attempt", "allow_repeated_credential_audit"]
+
+
+@pytest.mark.parametrize("accessor", _ADDRESS_KEYED)
+@pytest.mark.parametrize(
+    ("first", "second", "same"),
+    [(*p, True) for p in _ONE_HOST] + [(*p, False) for p in _TWO_HOSTS] + [(None, "", True)],
+)
+async def test_an_address_keyed_limiter_keys_a_host_not_a_spelling(
+    accessor: str, first: str | None, second: str, same: bool
+) -> None:
+    # BACKLOG #3764 item 3. RED on the unfixed code for every same-host pair: each spelling had its
+    # own bucket, so a host that reached the engine both ways got the per-address budget twice. A
+    # missing and an empty client still share the "unknown" bucket.
+    store = await MessageStore.open(":memory:")
+    try:
+        svc = AuthService(
+            store, AuthSettings(login_rate_limit_per_ip=1, login_rate_limit_global=1000)
+        )
+        allow = getattr(svc, accessor)
+        assert allow(first)
+        assert allow(second) is not same, f"{first!r} and {second!r}: same host is {same}"
+    finally:
+        await store.close()
 
 
 def test_admin_write_pacing_ships_default_on_at_the_human_timing_floor() -> None:

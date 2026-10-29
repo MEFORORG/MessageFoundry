@@ -562,6 +562,15 @@ def _host_key(address: str) -> str:
     return str(parsed)
 
 
+def _client_limiter_key(client: str | None) -> str:
+    """The key every address-keyed limiter charges for ``client``: :func:`_host_key`, so one host's
+    spellings share one bucket (BACKLOG #3764 item 3), or ``"unknown"`` when there is no address.
+
+    It only folds the text uvicorn hands over; which forwarded address is the client stays
+    uvicorn's call (ADR 0151 D-1)."""
+    return _host_key(client) if client else "unknown"
+
+
 def _bounded_address_text(address: str) -> str:
     """``address`` itself when it is at most ``_NEW_IP_TEXT_MAX`` characters, else a short prefix
     and the SHA-256 of the whole (BACKLOG #3772).
@@ -3487,7 +3496,7 @@ class AuthService:
         """Rate-limit gate for the unauthenticated auth surface (AUTH-RATE). True = proceed."""
         if self._login_limiter is None:
             return True
-        return self._login_limiter.allow(client or "unknown")
+        return self._login_limiter.allow(_client_limiter_key(client))
 
     def allow_repeated_credential_audit(self, client: str | None) -> bool:
         """Whether a repeated-credential refusal may write its ``auth.repeated_credential`` row
@@ -3496,7 +3505,7 @@ class AuthService:
         disabled."""
         if self._repeated_credential_limiter is None:
             return True
-        return self._repeated_credential_limiter.allow(client or "unknown")
+        return self._repeated_credential_limiter.allow(_client_limiter_key(client))
 
     def allow_reauth_attempt(self, actor: str) -> bool:
         """Rate-limit gate for the POST-session credential ceremonies, keyed on the acting user.
@@ -14745,7 +14754,7 @@ class AuthService:
         :meth:`webauthn_available` first."""
         charge: webauthn.LoginCharge | None = None
         if self._login_limiter is not None:
-            key = client or "unknown"
+            key = _client_limiter_key(client)
             stamp = self._login_limiter.allow_stamped(key)
             if stamp is None:
                 return None
