@@ -434,8 +434,21 @@ def test_the_digest_confirms_the_body_only_with_its_key() -> None:
     assert verify_refused_body_digest(make_cipher(new_key, [old_key]), wire, record) is True
     # A record that is not one (a null body_hmac included), or names another scheme, is "unknown".
     assert record is not None
-    for bad in (None, "x", {}, {**record, "kdf": "hkdf-sha256:other"}, {**record, "digest": "zz"}):
+    cut = record["digest"][:62]  # valid hex, one byte short: a corrupt record, not a mismatch
+    for bad in (
+        None,
+        "x",
+        {},
+        {**record, "kdf": "hkdf-sha256:other"},
+        {**record, "digest": "zz"},
+        {**record, "digest": ""},
+        {**record, "digest": cut},
+        {"bytes": len(wire), "body_hmac": None, "stored": "whole"},
+    ):
         assert verify_refused_body_digest(make_cipher(old_key), wire, bad) is None
+    # The whole refused-body record, as read back from the metadata, checks like its body_hmac.
+    whole = {"bytes": len(wire), "body_hmac": record, "stored": "whole"}
+    assert verify_refused_body_digest(make_cipher(old_key), wire, whole) is True
 
 
 def test_the_digest_is_not_the_edit_resend_audit_digest_of_the_same_bytes() -> None:
@@ -487,6 +500,26 @@ async def test_a_keyed_store_records_the_keyed_digest_of_every_refusal(tmp_path:
     assert all(r["body_hmac"] == first for r in recs)
     assert verify_refused_body_digest(make_cipher(key), body, first) is True
     assert "sha256" not in recs[0] and first["digest"] not in _plain_digests(body)
+
+
+@pytest.mark.parametrize("phase", list(_PHASES))
+async def test_every_refusal_phase_digests_the_body_as_received(tmp_path: Path, phase: str) -> None:
+    # The digest is over the received bytes in every phase, never the decoded text, the stored view
+    # or the head, so it matches the sender's copy whichever phase refused it.
+    ic, body = _PHASES[phase]()
+    key = generate_key()
+    spent = RefusedBodyAllowance(RefusedBodyPolicy(allowance_bytes=0, head_bytes=512))
+    for label, allowance in (("spent", spent), ("unspent", RefusedBodyAllowance())):
+        s = await MessageStore.open(tmp_path / f"{label}.db", cipher=make_cipher(key))
+        try:
+            runner = _runner(s, [ic], allowance)
+            await runner._handle_inbound(runner.registry.inbound[ic.name], body)
+            (row,) = await _rows(s)
+            rec = await _record(s, row["id"])
+        finally:
+            await s.close()
+        assert rec["stored"] == ("head" if label == "spent" else "whole")
+        assert verify_refused_body_digest(make_cipher(key), body, rec["body_hmac"]) is True
 
 
 async def test_a_poll_sources_refusals_are_kept_whole(store: MessageStore) -> None:

@@ -122,12 +122,12 @@ def user_metadata(metadata_json: str | None) -> str | None:
     """The public, read-only user bag from a message's decrypted metadata JSON: the ``"user"`` sub-key
     re-serialized as a JSON string, or ``None`` when there is none.
 
-    This is the only form in which the API returns the metadata column's contents — it strips the
-    engine-internal keys, such as the correlation lineage, so they never surface (the lineage would
-    otherwise leak on pass-through / re-ingressed children). The API reads the column for one other
-    purpose: edit-and-resubmit checks the engine-internal refused-body record and refuses a row stored
-    as a head (``head_only_resubmit_refusal`` in ``pipeline/refused_body.py``, vault BACKLOG #2608).
-    That refusal names the body's length and the head bound, never the digest or a byte of the body.
+    The API returns the metadata column's contents through this view — it strips the engine-internal
+    keys, such as the correlation lineage, so they never surface (the lineage would otherwise leak on
+    pass-through / re-ingressed children). It is not the API's only READ of the column: at least
+    edit-and-resubmit also reads the engine-internal refused-body record, and refuses a row stored as
+    a head (``head_only_resubmit_refusal`` in ``pipeline/refused_body.py``, vault BACKLOG #2608). That
+    refusal names the body's length and the head bound, never the digest or a byte of the body.
 
     Returns ``None`` for absent/empty/unparseable metadata or an empty user bag, so the wire field is
     ``null`` rather than ``"{}"`` when nothing was attached."""

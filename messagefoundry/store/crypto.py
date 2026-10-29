@@ -947,10 +947,13 @@ def _derive_body_digest_key(audit_key: bytes) -> bytes:
 
 def _mac_matches(mac: HMAC, digest: str) -> bool | None:
     """Whether ``mac`` matches the hex ``digest``, compared in constant time; ``None`` when
-    ``digest`` is not hex, so it could not be checked."""
+    ``digest`` is not the hex of one HMAC-SHA256 output, so a corrupt or cut record reads as
+    "could not check", never as a mismatch."""
     try:
         expected = bytes.fromhex(digest)
     except ValueError:
+        return None
+    if len(expected) != hashlib.sha256().digest_size:
         return None
     from cryptography.exceptions import InvalidSignature
 
@@ -1091,11 +1094,14 @@ def verify_refused_body_digest(cipher: Cipher, wire: bytes, record: object) -> b
     """Whether ``wire`` is the body a :func:`refused_body_digest` ``record`` was taken of (vault
     BACKLOG #2608), compared in constant time.
 
+    ``record`` may be the ``body_hmac`` dict or the whole refused-body record that holds it.
     ``True`` for a match and ``False`` for a mismatch. ``None`` when it cannot be checked, so a
     caller never reads "unknown" as "not this body": ``record`` is not such a dict (a ``null``
-    ``body_hmac`` included), it names another scheme, or its audit key is not in the cipher's
-    keyring, as after the retired key is dropped from configuration, and always on a keyless
-    cipher."""
+    ``body_hmac`` included), it names another scheme, its digest is not one HMAC-SHA256 output in
+    hex, or its audit key is not in the cipher's keyring, as after the retired key is dropped from
+    configuration, and always on a keyless cipher."""
+    if isinstance(record, dict) and "body_hmac" in record:
+        record = record["body_hmac"]
     if not isinstance(record, dict):
         return None
     if (record.get("alg"), record.get("kdf")) != (BODY_DIGEST_ALG, REFUSED_BODY_DIGEST_KDF):

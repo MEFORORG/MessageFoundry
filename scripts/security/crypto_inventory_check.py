@@ -475,9 +475,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     ),
     # Vault BACKLOG #2608: the refused-body allowance records, through store.crypto's
     # refused_body_digest, a KEYED digest of each body refused before ingress: HMAC-SHA256 under a key
-    # HKDF-SHA256 derives from the in-heap audit-chain key under its own label. Keyed because a plain
-    # hash beside a row stored as a head would confirm a guessed tail offline; none is recorded on a
-    # store with no in-heap key. The section 4 row "Refused inbound body digest".
+    # HKDF-SHA256 derives from the in-heap audit-chain key under its own label. The section 4 row
+    # "Refused inbound body digest" is the crypto record; docs/CONFIGURATION.md says when it is kept.
     "messagefoundry/pipeline/refused_body.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0049 (#60): the DR BackupRunner SHA-256s the consistent store snapshot (recorded in the
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
