@@ -1433,8 +1433,8 @@ class UploadStore:
                     current = asyncio.current_task()
                     if current is not None and current.cancelling():
                         # The shutdown drain cancelled this heartbeat, so its touch goes now, not
-                        # at the drain's next pass (vault BACKLOG #3740 item 14).
-                        touch.cancel()
+                        # at the drain's next pass, and once only (vault BACKLOG #3740 item 14).
+                        self._cancel_touches()
 
         task = asyncio.ensure_future(_beat())
         self._heartbeats.add(task)
@@ -1601,6 +1601,7 @@ class UploadStore:
         if settle is None:
             await self.drain_stragglers(wait, grace=grace)
             return
+        self._cancel_touches()  # not left running through the settle
         began = loop.time()
         try:
             await settle(wait)
