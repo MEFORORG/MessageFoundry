@@ -96,10 +96,13 @@ _ORPHAN_MIN_AGE_SECONDS = 3600.0
 # two bounds. A healthy statement takes well under a second. The bound exists so a stuck store
 # cannot hold ``_quota_lock``, and the request's cancellation, indefinitely. Past it the call is
 # logged and left running (UploadStore._leave_running). The save-time prune reuses the same bound for
-# its audit rows after a cancelled upload (UploadStore._run_to_completion, BACKLOG #2261), and a
-# cancelled save the removal of its landed pair (UploadStore._remove_cancelled_pair, vault BACKLOG
-# #3740 item 4).
+# its audit rows after a cancelled upload (UploadStore._run_to_completion, BACKLOG #2261).
 _LEDGER_CANCEL_WAIT_SECONDS = 5.0
+
+# How long a cancelled save waits, holding ``_quota_lock``, for the removal of its landed pair
+# (UploadStore._remove_cancelled_pair, vault BACKLOG #3740 item 4). A filesystem bound, apart from
+# the ledger's, so tuning one does not move the other. A healthy unlink takes milliseconds.
+_CANCELLED_REMOVAL_WAIT_SECONDS = 5.0
 
 # How often a save that holds an engine-shard reservation touches the ledger row, so a slow save
 # keeps its slot past ``store.base.UPLOAD_RESERVATION_STALE_AFTER`` (300 s) instead of having it
@@ -265,7 +268,8 @@ class UploadQuotaError(UploadError):
       commits after the release by id ran; and a reserve the shutdown drain cancels, which starts
       no release. The module logs a WARNING when it gives up on a call, but it cannot see a
       statement that commits later, so that leak has no line of its own, only the earlier
-      WARNING that the reserve was cancelled or failed. **On Postgres and SQL Server the stamp and the staleness test both read the database server's clock (BACKLOG #3256),** so an
+      WARNING that the reserve was cancelled or failed. **On Postgres and SQL Server the stamp
+      and the staleness test both read the database server's clock (BACKLOG #3256),** so an
       engine host's skew no longer moves either. A server clock that ran ahead and is stepped
       back still holds a slot it stamped meanwhile longer by the step, because that stamp was
       written ahead, and so does a failover to a replica whose clock lags the old primary's. A
@@ -280,14 +284,14 @@ class UploadQuotaError(UploadError):
       reclaimed in at least these cases: its holder lands no touch for the whole window while it is
       alive (a suspended process or VM, an event loop starved for minutes, or a store this engine
       shard cannot reach while a sibling can); its save outlives
-      ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; its touches stall on the store for the whole window; one touch never returns, since no
-      second touch starts while one runs (BACKLOG #3256); or the database server's clock steps
-      forward by a large part of the window, or a failover lands on a replica whose clock runs
-      that far ahead. A sibling then counts neither that file
-      nor its slot until the file lands. The holder's later release deletes only its own row, so
-      the undercount ends with that save. That restores the N-1 bound above while it lasts, never
-      worse than the pre-#1112 behaviour. Host clock skew is not one of these cases on the server
-      backends (the bullet above says why).
+      ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; its touches stall on the store for the whole
+      window; one touch never returns, since no second touch starts while one runs (BACKLOG
+      #3256); or the database server's clock steps forward by a large part of the window, or a
+      failover lands on a replica whose clock runs that far ahead. A sibling then counts neither
+      that file nor its slot until the file lands. The holder's later release deletes only its
+      own row, so the undercount ends with that save. That restores the N-1 bound above while it
+      lasts, never worse than the pre-#1112 behaviour. Host clock skew is not one of these cases
+      on the server backends (the bullet above says why).
 
     The ledger is checked and paid back around the write, not in the same transaction as it, because
     the body lives on the filesystem rather than in the store. The ordering above is what stands in
@@ -1495,7 +1499,7 @@ class UploadStore:
 
     async def _remove_cancelled_pair(self, file_id: str) -> None:
         """Remove the landed pair of a cancelled save, waiting for the removal for at most
-        ``_LEDGER_CANCEL_WAIT_SECONDS`` (vault BACKLOG #3740 item 4).
+        ``_CANCELLED_REMOVAL_WAIT_SECONDS`` (vault BACKLOG #3740 item 4).
 
         ``save`` calls this holding ``_quota_lock``, so no other save in this process scans the
         disk while the pair is still on it. A wait with no bound let one hung unlink hold the lock,
@@ -1503,9 +1507,14 @@ class UploadStore:
         cannot be stopped, so past the bound this returns with the removal still running and the
         caller drops the lock. Until the removal lands, the pair is on disk and billed: a save that
         scans meanwhile, in this process or on a sibling engine shard, counts it. That can refuse
-        an upload at the quota edge, but never admits one too many. A removal that fails after the
-        bound is logged at ERROR with the ``file_id``; within it, its failure is raised to the
-        caller, which logs it.
+        an upload at the quota edge, but never admits one too many. Within the bound, a failure of
+        the removal is raised to the caller, which logs it. Past it, an ERROR names the
+        ``file_id`` at once, as a stored file with no ``upload.create`` row, since the process may
+        stop before the removal answers (vault BACKLOG #3178). A removal that then runs logs at
+        INFO, and one that fails or is refused logs a second ERROR.
+
+        This bounds the cancelled-save path only. :meth:`discard`'s removal, after a failed
+        ``upload.create`` row, still waits on its unlink under the lock with no bound.
 
         The wait is on the executor's own Future, for the reason :func:`_to_thread_to_completion`
         gives. It is not held as a straggler: the shutdown drain cancels stragglers, and a job
@@ -1515,20 +1524,21 @@ class UploadStore:
         cancelling: this one holds however the ``CancelledError`` reached ``save``."""
         loop = asyncio.get_running_loop()
         removal = _submit_to_thread(self._discard_cancelled_sync, file_id)
-        deadline = loop.time() + _LEDGER_CANCEL_WAIT_SECONDS
+        deadline = loop.time() + _CANCELLED_REMOVAL_WAIT_SECONDS
         while not removal.done() and (remaining := deadline - loop.time()) > 0:
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.wait((removal,), timeout=remaining)
         if removal.done():
             removal.result()
             return
-        _log.warning(
-            "the removal of cancelled upload %s did not finish within %gs; it goes on without "
-            "the quota lock, and the file counts against its uploader's quota until it lands",
+        _log.error(
+            "upload %s was cancelled after its file landed and has no upload.create audit row; "
+            "its removal did not finish within %gs and goes on without the quota lock, so the "
+            "file may still be stored, and counts against its uploader's quota until it goes",
             file_id,
-            _LEDGER_CANCEL_WAIT_SECONDS,
+            _CANCELLED_REMOVAL_WAIT_SECONDS,
         )
-        removal.add_done_callback(functools.partial(_log_discard_unfinished, file_id=file_id))
+        removal.add_done_callback(functools.partial(_log_late_removal, file_id=file_id))
 
     async def drain_stragglers_within(self, budget: float) -> None:
         """:meth:`drain_stragglers` with both of its waits fitted inside ``budget`` seconds, the
@@ -2742,6 +2752,16 @@ def _log_discard_unfinished(done: asyncio.Future[Any], file_id: str) -> None:
             file_id,
             exc_info=exc,
         )
+
+
+def _log_late_removal(done: asyncio.Future[Any], file_id: str) -> None:
+    """Record how a cancelled save's removal ended once its bounded wait had given up (vault
+    BACKLOG #3740 item 4); the ERROR at the bound said the file may still be stored."""
+    if done.cancelled() or done.exception() is not None:
+        _log_discard_unfinished(done, file_id)
+    else:
+        # _discard_cancelled_sync logs a refused unlink at ERROR itself; this says only that it ran.
+        _log.info("upload %s: its removal ran after the quota lock was released", file_id)
 
 
 def _log_release_cancelled(done: asyncio.Future[Any], uploader_id: str) -> None:

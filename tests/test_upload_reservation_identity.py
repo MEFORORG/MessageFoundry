@@ -248,10 +248,10 @@ async def test_a_hung_removal_of_a_cancelled_pair_does_not_hold_the_quota_lock(
 ) -> None:
     """Vault BACKLOG #3740 item 4: the removal of a cancelled save's landed pair waited under
     ``_quota_lock`` with no bound, so one hung unlink queued every upload in the process. Past
-    ``_LEDGER_CANCEL_WAIT_SECONDS`` the cancelled save drops the lock with the removal still
-    running, and the next upload reserves and lands; the pair goes once the unlink returns. Red
-    before: B never reached its reserve while A's unlink hung."""
-    monkeypatch.setattr(uploads_mod, "_LEDGER_CANCEL_WAIT_SECONDS", 0.05)
+    ``_CANCELLED_REMOVAL_WAIT_SECONDS`` the cancelled save drops the lock with the removal still
+    running, names the file at ERROR, and the next upload reserves and lands; the pair goes once
+    the unlink returns. Red before: B never reached its reserve while A's unlink hung."""
+    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 0.05)
     reserved: list[str] = []
 
     class _Recording(_PassThrough):
@@ -270,7 +270,7 @@ async def test_a_hung_removal_of_a_cancelled_pair_does_not_hold_the_quota_lock(
         removed.set()
 
     monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
-    caplog.set_level(logging.WARNING, logger="messagefoundry.uploads")
+    caplog.set_level(logging.INFO, logger="messagefoundry.uploads")
     a = asyncio.create_task(
         store.save(data=_ADT.encode(), filename="a.hl7", uploader="op", uploader_id="u-op")
     )
@@ -290,13 +290,19 @@ async def test_a_hung_removal_of_a_cancelled_pair_does_not_hold_the_quota_lock(
         assert isinstance(b.result(), UploadedFileMeta)
         assert len(reserved) == 2
         assert a in done and a.cancelled()
-        assert "did not finish within" in caplog.text, caplog.text
+        assert "has no upload.create audit row; its removal did not finish" in caplog.text
         assert len(await store.list_files()) == 2, "the control: A's pair is still on disk"
     finally:
         unhang.set()
     assert await asyncio.to_thread(removed.wait, 10), "A's removal never finished"
     assert [m.filename for m in await store.list_files()] == ["b.txt"]
+    assert await _settled(store), "a ledger call was left running"
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+    for _ in range(50):  # the done callback runs one loop pass after the thread returns
+        if "its removal ran after the quota lock was released" in caplog.text:
+            break
+        await asyncio.sleep(0.02)
+    assert "its removal ran after the quota lock was released" in caplog.text, caplog.text
 
 
 async def test_the_drain_reads_its_default_waits_when_it_runs(

@@ -250,8 +250,8 @@ async def test_a_leaked_slot_is_reclaimed_while_the_uploader_stays_active(
     """Vault BACKLOG #3180, with BACKLOG #2648. Engine shard A's slot leaked, then engine shard B
     reserved and is mid-write. Engine shard C's reserve arrives once A's slot is past the window but
     B's is not. It must reclaim A's slot and still count B's. Each reservation has its own clock,
-    so B's activity no longer keeps A's leak alive. Red before #3180: one row held one clock for every slot, so B's
-    reserve kept A's leaked slot counted, and C read ``(3, 30)``."""
+    so B's activity no longer keeps A's leak alive. Red before #3180: one row held one clock for
+    every slot, so B's reserve kept A's leaked slot counted, and C read ``(3, 30)``."""
     uploader_id = f"u-3180-{uuid.uuid4().hex}"
     async with pair(tmp_path) as (shard_ab, shard_c):
 

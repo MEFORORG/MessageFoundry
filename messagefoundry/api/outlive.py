@@ -25,10 +25,10 @@ handlers in process, so they get the same protection.
 Both API lifespans call :meth:`OutlivingOperations.drain` while the store is still open: the
 managed one before ``engine.stop()``, and the one ``create_app`` gives an app built around a
 caller's engine, before the caller stops it (``_app_drain_steps`` in ``api/app.py``). What is still
-running then is cancelled, and each operation's own cancellation arm runs. A DR operation's or a
-reload's restores its state and records an ``interrupted`` outcome. An ``upload.create`` row's
-removes the stored file instead, since no row says who created it (``_record_upload_create`` in
-``api/app.py``).
+running then is cancelled, and each operation's own cancellation arm, where it has one, runs. At
+least a DR operation's or a reload's restores its state and records an ``interrupted`` outcome,
+and an ``upload.create`` row's removes the stored file instead, since no row says who created it
+(``_record_upload_create`` in ``api/app.py``). Each route's own code says what its arm does.
 """
 
 from __future__ import annotations
@@ -159,8 +159,8 @@ class OutlivingOperations:
         """Wait up to ``timeout`` for running operations, then cancel what is left.
 
         Returns the labels of the operations it had to cancel. It waits up to ``grace`` more for
-        their cancellation arms, which for a DR operation or a reload restore state and record
-        ``interrupted``, and for an ``upload.create`` row remove the stored file. An operation still
+        their cancellation arms: at least a DR operation's or a reload's restores state and records
+        ``interrupted``, and an ``upload.create`` row's removes the stored file. An operation still
         running after that is logged and left: it is not awaited past the bound, so a stuck one
         cannot hold the shutdown."""
         pending = set(self._inflight)
