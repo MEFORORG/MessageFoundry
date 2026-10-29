@@ -49,7 +49,8 @@ THE HOLD CONTRACT. A hold is recognised ONLY by this shape, which the Lander wri
   blockquote, fence or code span can wrap it: a quoted or shown marker is never line 1. That is why
   the marker goes first, and why no Markdown is parsed here.
 * The SECOND line starts with the Lander's signature: ``Lander (session`` (the form this script
-  first read), or ``Lander (<seat id>), `` with the comma, as in ``Lander (lander-1028), ``.
+  first read), or a Lander seat id then a comma, ``Lander (lander-<id>), `` as in
+  ``Lander (lander-1028), ``.
 * The author's ``authorAssociation`` is OWNER, MEMBER or COLLABORATOR, and the comment is not
   minimized. This is not a seat check (every seat posts under one GitHub login, so classification
   keys on the body, never the login): it only stops an outside account on a public repository from
@@ -65,15 +66,14 @@ written before the marker existed (``**Held, ...**`` with no marker line) is the
 Lander comment, and its PR reads as LANDER's. That is intended, and in the safe direction: the
 Lander looks again and re-posts the hold with a marker.
 
-WHY THE SIGNATURE NEEDS ITS COMMA. A Manager addressing the Lander writes ``Lander (8a04c9f3):
-...``, with a colon. A bare ``Lander (`` prefix would read that as the Lander's own: as an unmarked
-comment it would show ``no-hold`` rather than ``replied``, hiding that the author answered, and as
-the second line under a hold marker (an author mistaking the hold marker for the ack marker) it
-would read as a hold and park the PR on its author, the unsafe direction. So a seat-signed form
-counts only with the comma. An author text that does match (``Lander (x), please re-read``) as an
-unmarked comment is a non-hold Lander event at or after the hold, so it is the newest Lander event,
-or ties with the hold, and the PR still reads LANDER's; under a hold marker it is a hold, as an
-author writing ``Lander (session`` under one always was.
+WHY THE SIGNATURE IS NARROW. A Manager addressing the Lander writes ``Lander (8a04c9f3): ...`` or
+``Lander (x), please re-read``. A bare ``Lander (`` prefix would read either as the Lander's own: as
+an unmarked comment it would show ``no-hold`` rather than ``replied``, hiding that the author
+answered, and as the second line under a hold marker (an author mistaking the hold marker for the
+ack marker) it would read as a hold and park the PR on its author, the unsafe direction. So the new
+form counts only as ``lander-`` plus 1 to 40 of ``[0-9a-z-]``, then ``), ``. The ``Lander
+(session`` form reads exactly as it did before seat ids, so an author writing it under a hold
+marker still makes a hold, as it always did.
 
 THE ACK CONTRACT. An author who has read a hold and is still working on it, with nothing pushed
 yet, may say so without handing the turn back, ONLY by this shape::
@@ -88,15 +88,16 @@ carries inline thread comments this script does not read, so a review is never a
 event is never an ack. Such an ack at or after the hold is not a reply, so the PR stays AUTHOR's,
 flagged ``held`` and ``acked``. At least these still hand the turn back: a push (``new-commit``),
 any other counted comment or review after the hold (``replied``), an ack naming another SHA or
-posted as a review (a reply), and an edit to the ack or to anything else (``edited``). A plain-prose acknowledgement, with no marker, is a reply
-and the Lander's turn. The ack line says only "still my move"; anything the Lander must read or
-answer goes in a comment WITHOUT the marker, which hands the turn back.
+posted as a review (a reply), and an edit to the ack or to anything else (``edited``). A
+plain-prose acknowledgement, with no marker, is a reply and the Lander's turn. The ack line says
+only "still my move"; anything the Lander must read or answer goes in a comment WITHOUT the
+marker, which hands the turn back.
 
 AUTHOR's turn only when ALL of these hold: the newest Lander event is a marker hold (a same-second
 tie with a non-hold Lander event is no hold); the PR's ``headRefOid`` starts with the marker's SHA,
 ignoring case; no non-Lander event other than an ack (THE ACK CONTRACT) is at or after the hold's
-second (a tie is a reply); and no comment or review, Lander or not and the hold itself included,
-was edited at or after the hold's second. Otherwise LANDER's.
+second (a tie is a reply, but a tied ack is not); and no comment or review, Lander or not and
+the hold itself included, was edited at or after the hold's second. Otherwise LANDER's.
 
 WHAT COUNTS AS AN EVENT. Issue comments and submitted PR reviews. A review with an empty body is a
 non-Lander event, because an inline-only review is how an author answers a finding in its thread;
@@ -121,9 +122,10 @@ A HOLD ON A QUEUED OR ARMED PR IS THE LANDER'S. A PR in the merge queue, or with
 merges without its author moving, so a hold on it reads LANDER with ``held`` kept beside the
 ``in-queue`` or ``auto-armed`` flag: dequeuing or disarming it is the Lander's move.
 
-FLAGS. ``held`` (a hold stands: AUTHOR's turn, unless the PR is queued or armed); ``no-hold`` (no Lander event, or the newest is not a marker
-hold); ``new-commit`` (the head does not start with the marker's SHA); ``replied`` (a non-Lander
-event at or after the hold); ``edited`` (a comment or review, of any author, the hold included,
+FLAGS. ``held`` (a hold stands: AUTHOR's turn, unless the PR is queued or armed); ``no-hold`` (no
+Lander event, or the newest is not a marker hold); ``new-commit`` (the head does not start with the
+marker's SHA); ``replied`` (a non-Lander event at or after the hold, other than an ack naming the
+head); ``edited`` (a comment or review, of any author, the hold included,
 edited at or after the hold); ``acked`` (beside ``held``: an author's ack kept the turn the
 author's); ``no-new-commit`` (replied or edited, but the head still matches the marker: the Lander
 must read the reply or edit, but can bounce it fast); ``in-queue`` / ``auto-armed`` (the PR is
@@ -170,10 +172,10 @@ COMMENT_PAGE = 100
 REVIEW_PAGE = 50
 TITLE_WIDTH = 50
 
-#: How every Lander comment begins: ``Lander (session <id>)``, or ``Lander (<seat id>), `` with the
-#: comma that a Manager's ``Lander (<id>): ...`` lacks. WHY THE SIGNATURE NEEDS ITS COMMA says why.
-#: Bounded, with no nested repeat, so it cannot backtrack catastrophically.
-_LANDER_SIGNATURE = re.compile(r"Lander \((?:session|[^()\n]{1,80}\), )")
+#: How every Lander comment begins: ``Lander (session <id>)``, or ``Lander (lander-<id>), ``. A
+#: Manager's ``Lander (<id>): ...`` matches neither; WHY THE SIGNATURE IS NARROW says why. Bounded,
+#: with no nested repeat, so it cannot backtrack catastrophically.
+_LANDER_SIGNATURE = re.compile(r"Lander \((?:session|lander-[0-9a-z-]{1,40}\), )")
 #: Associations whose comments may be Lander events: accounts with standing on the repository.
 TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 #: The hold marker, matched against the whole first line. Literal with one bounded repeat, so it

@@ -332,8 +332,9 @@ def _held(
 def test_a_seat_signed_lander_comment_is_a_lander_event(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The Lander signs ``Lander (<seat id>)`` as well as ``Lander (session <id>)``. A marker hold
-    so signed is a hold, and an unmarked comment so signed is a non-hold Lander event, not a reply."""
+    """The Lander signs ``Lander (<seat id>)`` as well as ``Lander (session <id>)``. A marker
+    hold so signed is a hold, and an unmarked comment so signed is a non-hold Lander event, not a
+    reply."""
     signed = f"<!-- lander-hold head={_sha(101)} -->\n{SEAT}**Held, back to the author.**"
     assert hpt.hold_head(signed) == _sha(101)
     assert hpt.Event(NOW, SEAT + "looking now.", bot=False, trusted=True).lander
@@ -372,9 +373,34 @@ def test_an_author_text_starting_lander_paren_never_moves_toward_author(
         assert _turn(rows[n]) == ("LANDER", ["replied", "no-new-commit"]), n
     assert _turn(rows[105]) == ("LANDER", ["replied", "edited", "no-new-commit"])
     assert _turn(rows[107]) == ("LANDER", ["no-hold"])
-    # A text that does carry the comma is a non-hold Lander event: still the Lander's turn.
-    signed_ask = _held(108, _comment("Lander (x), please re-read.", "2026-10-28T13:00:00Z"))
-    assert _turn(_engine_rows(tmp_path, capsys, signed_ask)[108]) == ("LANDER", ["no-hold"])
+
+
+def test_only_a_lander_seat_id_signs_a_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``Lander (x), ...`` carries the comma but no Lander seat id, so under a hold marker it is
+    an author reply, not a hold; ``Lander (lander-1028), ...`` under one is still a hold."""
+    comma = "Lander (x), please re-read."
+    assert not hpt.Event(NOW, comma, bot=False, trusted=True).lander
+    marked = f"<!-- lander-hold head={_sha(108)} -->\n{comma}"
+    assert hpt.hold_head(marked) is None
+    for not_a_seat in ("Lander (lander-), ", "Lander (lander-X1), ", "Lander (lander-1028): "):
+        assert hpt.hold_head(f"<!-- lander-hold head=abcdef1 -->\n{not_a_seat}x") is None
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _held(108, _comment(marked, "2026-10-28T13:00:00Z")),
+        _held(109, _comment(comma, "2026-10-28T13:00:00Z")),
+        _pr(
+            110,
+            comments=[
+                _comment(_marker_body(_sha(110)).replace(SESSION, SEAT), "2026-10-28T12:00:00Z")
+            ],
+        ),
+    )
+    assert _turn(rows[108]) == ("LANDER", ["replied", "no-new-commit"])
+    assert _turn(rows[109]) == ("LANDER", ["replied", "no-new-commit"])
+    assert _turn(rows[110]) == ("AUTHOR", ["held"])
 
 
 # ---- the ack contract ----------------------------------------------------------------------------
