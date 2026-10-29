@@ -151,6 +151,16 @@ class OutlivingOperations:
         self._inflight.pop(task, None)
         _grace_ends.pop(task, None)
 
+    async def settle(self, timeout: float) -> None:
+        """Wait up to ``timeout`` for the running operations to end, and cancel none of them.
+
+        For a shutdown step after :meth:`drain`: an operation the drain cancelled and stopped
+        waiting for may still be in its cancellation arm, and the arm can start work of its own,
+        such as the removal of an upload whose creation row failed (vault BACKLOG #3740 item 6)."""
+        pending = set(self._inflight)
+        if pending and timeout > 0:
+            await asyncio.wait(pending, timeout=timeout)
+
     async def drain(
         self,
         timeout: float = DRAIN_TIMEOUT_SECONDS,

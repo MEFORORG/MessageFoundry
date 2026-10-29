@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Vault BACKLOG #3180: each upload-quota reservation has its own identity, the ledger calls a
-cancelled save leaves running are bounded, and they are drained before the store closes.
+cancelled save leaves running are bounded, and the shutdown drain waits for them, then cancels
+them, before the store closes.
 
 The ledger used to hold one row per uploader, so a release could not say which slot it paid back,
 a reserve whose outcome was unknown could not be reconciled, and one clock kept every slot alive
@@ -503,12 +504,26 @@ async def test_the_managed_teardown_hands_the_straggler_drain_a_share_of_its_ste
 
 
 @pytest.mark.parametrize(
-    ("budget", "expected"),
-    [(0.3, (0.2, 0.1)), (10.0, (2.0, 1.0)), (0.0, (0.0, 0.0))],
+    ("budget", "expected", "defaults"),
+    [
+        (0.3, (0.2, 0.1), None),
+        (10.0, (2.0, 1.0), None),
+        (0.0, (0.0, 0.0), None),
+        # Vault BACKLOG #3740 item 17: the split moves with the defaults it is derived from. Red
+        # before: two thirds was written by hand, so equal defaults still got (2/3, 1/3).
+        (1.0, (0.5, 0.5), (1.0, 1.0)),
+    ],
 )
 async def test_drain_stragglers_within_fits_both_waits_inside_the_budget(
-    tmp_path: Path, budget: float, expected: tuple[float, float]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget: float,
+    expected: tuple[float, float],
+    defaults: tuple[float, float] | None,
 ) -> None:
+    if defaults is not None:
+        monkeypatch.setattr(uploads_mod, "_STRAGGLER_DRAIN_SECONDS", defaults[0])
+        monkeypatch.setattr(uploads_mod, "_STRAGGLER_CANCEL_GRACE_SECONDS", defaults[1])
     store = _uploads(tmp_path, None)
     waits: list[tuple[float, float]] = []
 
@@ -522,10 +537,33 @@ async def test_drain_stragglers_within_fits_both_waits_inside_the_budget(
     assert timeout + grace <= budget + 1e-9
 
 
+async def test_drain_stragglers_within_settles_first_inside_its_wait(tmp_path: Path) -> None:
+    """Vault BACKLOG #3740 item 6: ``settle`` gets the wait's share, and the drain's own wait what
+    it leaves; the grace is not touched."""
+    store = _uploads(tmp_path, None)
+    settled: list[float] = []
+    waits: list[tuple[float, float]] = []
+
+    async def _settle(timeout: float) -> None:
+        settled.append(timeout)
+        await asyncio.sleep(0.1)
+
+    async def _drain(timeout: float, *, grace: float) -> None:
+        waits.append((timeout, grace))
+
+    store.drain_stragglers = _drain  # type: ignore[method-assign,assignment]
+    await store.drain_stragglers_within(0.9, settle=_settle)
+    [(timeout, grace)] = waits
+    assert settled == [pytest.approx(0.6)]
+    assert 0.0 <= timeout <= 0.5 + 0.02
+    assert grace == pytest.approx(0.3)
+
+
 async def test_the_embedded_teardown_drains_the_upload_stragglers(tmp_path: Path) -> None:
     """``create_app(engine=...)`` runs the same drains as the managed lifespan
     (``_app_drain_steps``), the upload store's included, so a caller that stops its engine after
-    the app has shut down closes no store under a running ledger call."""
+    the app has shut down closes no store under a ledger call the drain waited for or cancelled.
+    The drain is bounded, so one that outlives its grace can still meet the closed store."""
     from messagefoundry.api import create_app
     from messagefoundry.pipeline.engine import Engine
 
@@ -537,7 +575,7 @@ async def test_the_embedded_teardown_drains_the_upload_stragglers(tmp_path: Path
         calls: list[str] = []
 
         class _Uploads:
-            async def drain_stragglers_within(self, budget: float) -> None:
+            async def drain_stragglers_within(self, budget: float, **_kwargs: Any) -> None:
                 calls.append("uploads")
 
         async def _outliving(timeout: float = 0.0, *, grace: float = 0.0) -> list[str]:

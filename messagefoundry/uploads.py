@@ -116,11 +116,12 @@ _RESERVATION_HEARTBEAT_SECONDS = 100.0
 # BACKLOG #3180). A write is
 # bounded by ``max_upload_bytes`` (512 MiB at most), so an hour is far past any healthy save.
 _RESERVATION_HEARTBEAT_MAX_SECONDS = 3600.0
-# How long the heartbeat waits for one touch before it goes on without it (BACKLOG #3256). The
-# heartbeat leaves the touch running and never cancels it, so a slow touch that lands still
+# How long the heartbeat waits for one touch before it goes on without it (BACKLOG #3256). A
+# running heartbeat leaves the touch running and never cancels it, so a slow touch that lands still
 # refreshes the reservation. One still running when the heartbeat ends is held as a straggler, so
 # it is cancelled at ``_LEDGER_STRAGGLER_MAX_SECONDS`` or by the shutdown drain (vault BACKLOG
-# #3180). Well under the interval, so the wait never delays the next beat by much.
+# #3180), which does not wait for it (#3740 item 14). Well under the interval, so the wait never
+# delays the next beat by much.
 _RESERVATION_TOUCH_WAIT_SECONDS = 10.0
 
 # How long a ledger call a cancelled save left running may run before it is cancelled (vault
@@ -714,6 +715,10 @@ class UploadStore:
         # Live saves' reservation heartbeats (BACKLOG #2648), held for the same reason. Each ends
         # once its save sets the stop Event. See _start_heartbeat.
         self._heartbeats: set[asyncio.Future[None]] = set()
+        # The heartbeat touches among the stragglers. A touch only refreshes its reservation's
+        # clock, so the shutdown drain cancels one rather than waiting for it (vault BACKLOG #3740
+        # item 14).
+        self._touches: set[asyncio.Future[Any]] = set()
         # Body name -> ((mtime_ns, size), decodes as text). Checking a body means reading it whole,
         # and every save's quota scan asks, so a body that has not changed is not read twice.
         self._body_checks: dict[str, tuple[tuple[int, int], bool]] = {}
@@ -1356,16 +1361,17 @@ class UploadStore:
         that lands after the save's release finds no row and changes nothing, so ``stop`` is a
         signal, never a wait. A failed touch is logged and the next one tried.
 
-        **The wait for a touch is bounded, and the heartbeat never cancels a touch (BACKLOG
+        **The wait for a touch is bounded, and a running heartbeat never cancels a touch (BACKLOG
         #3256).** The heartbeat waits ``_RESERVATION_TOUCH_WAIT_SECONDS`` for it, then goes on, so a
         touch stuck on the store no longer holds the heartbeat or its lifetime cap, and a ``stop``
         during the wait ends it at once. The stuck touch is left to land on its own, which still
         moves the reservation's clock when it does, and no second touch starts while it runs, so a
         stalled store never collects one abandoned statement per interval. One still running when
         the heartbeat ends is held like the other stragglers, and so is capped at
-        ``_LEDGER_STRAGGLER_MAX_SECONDS`` and cancelled by the shutdown drain. The cost: a touch
-        that never returns ends the refreshing for that save, which :class:`UploadQuotaError`
-        lists."""
+        ``_LEDGER_STRAGGLER_MAX_SECONDS`` and cancelled by the shutdown drain, which does not wait
+        for it. A heartbeat that is itself cancelled, as by that drain, cancels its touch as it
+        ends (vault BACKLOG #3740 item 14). The cost: a touch that never returns ends the
+        refreshing for that save, which :class:`UploadQuotaError` lists."""
         ledger = self._ledger
         if ledger is None:
             return
@@ -1421,7 +1427,14 @@ class UploadStore:
                     # Still referenced, and _missed still logs its outcome. Capped like every other
                     # straggler, so a stalled store does not collect one per save (vault BACKLOG
                     # #3180); a touch cancelled there moves no clock, which is all it would do.
+                    self._touches.add(touch)
+                    touch.add_done_callback(self._touches.discard)
                     self._hold(touch, cap=_LEDGER_STRAGGLER_MAX_SECONDS)
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        # The shutdown drain cancelled this heartbeat, so its touch goes now, not
+                        # at the drain's next pass (vault BACKLOG #3740 item 14).
+                        touch.cancel()
 
         task = asyncio.ensure_future(_beat())
         self._heartbeats.add(task)
@@ -1557,15 +1570,49 @@ class UploadStore:
         self._discard_cancelled_sync(file_id)
         return not any(path.exists() for path in self._paths(file_id))
 
-    async def drain_stragglers_within(self, budget: float) -> None:
+    def _running(self, left: set[asyncio.Future[Any]]) -> set[asyncio.Future[Any]]:
+        """What of ``left`` and the stragglers held now has not ended, for the drain's grace."""
+        return {t for t in left | self._stragglers if not t.done()}
+
+    def _cancel_touches(self) -> None:
+        """Cancel every heartbeat touch held as a straggler, once each, since a store's unwind of
+        the cancelled statement may itself take a while (vault BACKLOG #3740 item 14)."""
+        for touch in self._touches:
+            if not (isinstance(touch, asyncio.Task) and touch.cancelling()):
+                touch.cancel()
+
+    async def drain_stragglers_within(
+        self, budget: float, *, settle: Callable[[float], Awaitable[object]] | None = None
+    ) -> None:
         """:meth:`drain_stragglers` with both of its waits fitted inside ``budget`` seconds, the
-        form a shutdown step under one teardown budget calls (BACKLOG #3191). Two thirds of it
-        waiting and the rest the grace for what it then cancels, each capped at the drain's own
-        default."""
-        wait = max(0.0, min(_STRAGGLER_DRAIN_SECONDS, budget * 2 / 3))
-        await self.drain_stragglers(
-            wait, grace=max(0.0, min(_STRAGGLER_CANCEL_GRACE_SECONDS, budget - wait))
+        form a shutdown step under one teardown budget calls (BACKLOG #3191). The budget is split
+        between the wait and the grace for what it then cancels in the ratio of the drain's own
+        defaults, and each is capped at its default (vault BACKLOG #3740 item 17).
+
+        ``settle``, when given, is awaited first with the wait's share, and the drain's own wait
+        gets what it leaves. It waits for work that may still start a straggler, so the drain does
+        not return before that straggler is held (vault BACKLOG #3740 item 6)."""
+        loop = asyncio.get_running_loop()
+        ratio = _STRAGGLER_DRAIN_SECONDS / (
+            _STRAGGLER_DRAIN_SECONDS + _STRAGGLER_CANCEL_GRACE_SECONDS
         )
+        wait = max(0.0, min(_STRAGGLER_DRAIN_SECONDS, budget * ratio))
+        grace = max(0.0, min(_STRAGGLER_CANCEL_GRACE_SECONDS, budget - wait))
+        if settle is None:
+            await self.drain_stragglers(wait, grace=grace)
+            return
+        began = loop.time()
+        try:
+            await settle(wait)
+        except asyncio.CancelledError:
+            # The step was cut: cancel what is left, and wait for none of it.
+            await self.drain_stragglers(0.0, grace=0.0)
+            raise
+        except Exception:
+            # A settle that fails still leaves the drain to run, since that is the step's point.
+            await self.drain_stragglers(max(0.0, wait - (loop.time() - began)), grace=grace)
+            raise
+        await self.drain_stragglers(max(0.0, wait - (loop.time() - began)), grace=grace)
 
     async def drain_stragglers(
         self,
@@ -1588,15 +1635,24 @@ class UploadStore:
 
         ``None`` for either wait reads its module default, ``_STRAGGLER_DRAIN_SECONDS`` or
         ``_STRAGGLER_CANCEL_GRACE_SECONDS``, when the drain runs rather than when this method was
-        defined (vault BACKLOG #3740 item 12)."""
+        defined (vault BACKLOG #3740 item 12).
+
+        A heartbeat touch is not waited for, and each pass of either wait cancels every touch
+        held then (vault BACKLOG #3740 item 14). A touch would only refresh this process's
+        reservation, whose save does not outlive the shutdown, so landing late would only put off
+        the moment a sibling engine shard may reclaim the slot."""
         if timeout is None:
             timeout = _STRAGGLER_DRAIN_SECONDS
         if grace is None:
             grace = _STRAGGLER_CANCEL_GRACE_SECONDS
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        while self._stragglers and (remaining := deadline - loop.time()) > 0:
-            await asyncio.wait(set(self._stragglers), timeout=remaining)
+        while (waited := self._stragglers - self._touches) and (
+            remaining := deadline - loop.time()
+        ) > 0:
+            self._cancel_touches()
+            await asyncio.wait(waited, timeout=remaining)
+        self._cancel_touches()
         left = set(self._stragglers) | set(self._heartbeats)
         if not left:
             return
@@ -1620,14 +1676,20 @@ class UploadStore:
         # marked like the rest, so a reserve among them starts no release; the drain does not wait
         # for it to unwind, as it does not for anything still stuck in `left`.
         # The first wait runs even when everything in `left` is done: it is also the loop pass in
-        # which a done task's own callbacks run and start that release.
+        # which a done task's own callbacks run and start that release. A touch is in no wait,
+        # since a store can take a while to unwind a cancelled statement.
         deadline = loop.time() + grace
-        await asyncio.wait(left, timeout=grace)
-        while (pending := {t for t in left | self._stragglers if not t.done()}) and (
+        if unwinding := left - self._touches:
+            await asyncio.wait(unwinding, timeout=grace)
+        else:
+            await asyncio.sleep(0)
+        while (pending := self._running(left) - self._touches) and (
             remaining := deadline - loop.time()
         ) > 0:
+            self._cancel_touches()  # one a heartbeat that ended held meanwhile
             await asyncio.wait(pending, timeout=remaining)
-        stuck = {t for t in left | self._stragglers if not t.done()}
+        self._cancel_touches()
+        stuck = self._running(left) - self._touches
         for task in stuck - left:
             if task.cancel():
                 self._drain_cancelled.add(task)
