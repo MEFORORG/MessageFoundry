@@ -1540,6 +1540,56 @@ def test_the_audit_lane_cannot_hold_general_lines_back_for_good() -> None:
     assert order[-1] is None  # every audit line went out ahead of the stop sentinel
 
 
+@pytest.mark.parametrize("burst", [None, 10**9], ids=["shipped-cap", "uncapped-control"])
+def test_general_lines_drain_while_the_audit_lane_stays_full(
+    monkeypatch: pytest.MonkeyPatch, burst: int | None
+) -> None:
+    """Finding 10 of PR 2601's review, measured as a bound: an unauthenticated client can keep the
+    audit lane full, by failing sign-ins faster than the collector takes lines. The lane is topped
+    back up to its bound after every line served, so it is never empty, and the general lines must
+    still all go out, one in every ``_FORWARD_AUDIT_BURST + 1`` lines served (BACKLOG #2612).
+
+    The control lifts the cap. Audit-first serving with no cap then sends no general line at all
+    under the same load, so the test can see starvation when it is there."""
+    from messagefoundry.store import audit_tee
+
+    cap = logging_setup._FORWARD_AUDIT_BURST  # the shipped cap sets the bound in both arms
+    if burst is not None:
+        monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_BURST", burst)
+    audit_bound, general = 50, 20
+    lanes = logging_setup._ForwardLanes(100, audit_bound)
+
+    def audit_line() -> logging.LogRecord:
+        return logging.LogRecord(
+            audit_tee.audit_logger.name, logging.INFO, __file__, 1, "{}", None, None
+        )
+
+    def top_up() -> None:
+        while True:
+            try:
+                lanes.put_nowait(audit_line())
+            except queue.Full:
+                return
+
+    for i in range(general):
+        lanes.put_nowait(
+            logging.LogRecord("mefor.test", logging.INFO, __file__, 1, f"g{i}", None, None)
+        )
+    top_up()
+    served = (cap + 1) * general
+    general_seen: list[str] = []
+    for _ in range(served):
+        item = lanes.get_nowait()
+        if item.name != audit_tee.audit_logger.name:
+            general_seen.append(item.getMessage())
+        top_up()
+        assert len(lanes.audit) == audit_bound  # saturated the whole time
+    if burst is None:
+        assert general_seen == [f"g{i}" for i in range(general)]
+    else:
+        assert general_seen == []  # the control: uncapped, the general lane starves
+
+
 def test_the_drop_report_does_not_recurse_on_the_root_logger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
