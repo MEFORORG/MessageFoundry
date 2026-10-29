@@ -4600,6 +4600,7 @@ class SqlServerStore:
             await self._verify_schema_external(expected)
             return False
         async with self._acquire() as conn:
+            locked = False  # the schema applock may be held by this connection's transaction
             lock_bounded = False
             try:
                 async with self._cursor(conn) as cur:
@@ -4654,6 +4655,8 @@ class SqlServerStore:
                     # thread waiting in it, so @LockTimeout is the only thing that ends the wait.
                     log.info("sqlserver: waiting for the schema lock to apply the DDL batch")
                     wait = self._settings.schema_lock_timeout
+                    # Raised first: a grant whose round trip then failed is still held.
+                    locked = True
                     try:
                         await self._applock(
                             cur, _SCHEMA_LOCK, timeout_ms=_schema_applock_timeout_ms(wait)
@@ -4662,9 +4665,10 @@ class SqlServerStore:
                         raise SchemaLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
                 # Double-check under the lock: the peer we queued behind may have just applied this
                 # exact batch and committed its marker, so this open has nothing to do. The read runs
-                # under command_timeout, as on main and as the probe above, so neither a lock wait
-                # on schema_meta nor a stalled link can hold the schema lock forever (BACKLOG #1726);
-                # a query timeout here surfaces as the driver's own error and rolls back below.
+                # under command_timeout, as the probe above does, so with a non-zero command_timeout
+                # neither a lock wait on schema_meta nor a stalled link holds the schema lock forever
+                # (BACKLOG #1726); a query timeout here surfaces as the driver's own error and rolls
+                # back below. command_timeout = 0 means no limit here, as everywhere it applies.
                 if raw is not None:
                     raw.timeout = self._settings.command_timeout
                 async with self._cursor(conn) as cur:
@@ -4717,8 +4721,9 @@ class SqlServerStore:
                 try:
                     await conn.rollback()  # roll back the partial DDL batch (M-6)
                 except Exception:
-                    if lock_bounded:
-                        # Neither the transaction nor the session bound is known to be gone.
+                    if locked:
+                        # Neither the transaction, which may hold the schema applock, nor the
+                        # session bound is known to be gone.
                         log.warning(
                             "sqlserver: rollback after a failed schema batch failed; discarding"
                             " the connection",

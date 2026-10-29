@@ -423,7 +423,7 @@ async def test_the_ddl_batch_alone_runs_with_no_query_timeout() -> None:
 
 
 async def test_a_failure_on_the_double_check_rolls_back_with_nothing_to_reset() -> None:
-    """A query timeout on the double-check's read surfaces as the driver's own error, as on main;
+    """A query timeout on the double-check's read surfaces as the driver's own error;
     the transaction rolls back, nothing is committed, and since no session ``LOCK_TIMEOUT`` was set
     there is none to reset. Red on 207c24c5b2: a ``SET LOCK_TIMEOUT`` preceded the read and was
     reset after the rollback."""
@@ -447,6 +447,37 @@ async def test_a_failure_on_the_double_check_rolls_back_with_nothing_to_reset() 
     assert not any("CREATE TABLE" in sql for sql in sqls)
     assert not any("LOCK_TIMEOUT" in sql for sql in sqls)
     assert sqls[-1] == "ROLLBACK"
+
+
+async def test_a_failed_rollback_after_a_failed_double_check_discards_the_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The double-check runs while this connection's transaction holds the schema applock, so if
+    its failure's rollback also fails, the connection is discarded rather than pooled with that
+    transaction possibly still open. Red on e695b3a762: only a bounded DDL batch discarded."""
+    from messagefoundry.store import sqlserver
+
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    conn.cursor_obj = _PeerAppliesCursor(executed)
+    conn.cursor_obj.failure = RuntimeError("('HYT00', 'Query timeout expired (0)')")
+    rollback_error = RuntimeError("link failure")
+
+    async def _rollback() -> None:
+        raise rollback_error
+
+    conn.rollback = _rollback  # type: ignore[method-assign]
+    store = _make_store(conn)
+    store._settings = _settings(command_timeout=30)  # type: ignore[assignment]
+    detached: list[object] = []
+    monkeypatch.setattr(sqlserver, "_detach_connection", detached.append)
+
+    with pytest.raises(RuntimeError) as info:
+        await store._ensure_schema()
+
+    assert info.value is rollback_error
+    assert detached == [conn]
+    assert not any("LOCK_TIMEOUT" in sql for sql, _ in executed)
 
 
 class _DdlFailingCursor(_FakeCursor):
