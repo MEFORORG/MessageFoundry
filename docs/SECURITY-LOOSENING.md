@@ -2146,7 +2146,14 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   list or the service's own `Environment` value, and from the machine-wide environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
-  and a secret a connection reads through `env()`, whose name only your config knows.
+  and a secret a connection reads through `env()`, whose name only your config knows. Nor are a
+  start wrapper's own exports, either way:
+  - A launcher between NSSM and the interpreter that is not a Python interpreter or the
+    `messagefoundry` launcher, such as a `cmd` or PowerShell wrapper, makes the reading
+    `service_environment_unobservable`. A secret that wrapper exports, a store key included, is
+    then neither refused nor named.
+  - A Python wrapper is walked through to the service, and only the service's own lists are read.
+    A secret it exports is not refused, and one other than a store key is not named.
 
 ---
 

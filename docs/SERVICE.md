@@ -646,13 +646,16 @@ environment.
 > Manager or Azure Key Vault via a **managed identity**, write the secret as its file in the
 > secrets directory
 > ([`MEFOR_SECRETS_DIRECTORY`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)), or
-> place the DPAPI key file. That also covers any credential with no reference field. A Vault token
-> file on Windows has its own rule about who may write it, in
-> [the secrets directory section](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory).
-> On Windows, never export a `MEFOR_*` secret into the service's environment from a start wrapper:
-> a secret there is ruled out (owner ruling 2026-10-01).
+> place the store key as the DPAPI key file. The directory covers at least the engine's own secret
+> settings other than the store key and every `MEFOR_VALUE_*` value; a variable a library reads for
+> itself, such as `PGPASSWORD`, is not read from it. A Vault token file on Windows has its own rule
+> about who may write it, in that directory's section. On Windows, never export a `MEFOR_*` secret
+> into the service's environment from a start wrapper: a secret there is ruled out (owner ruling
+> 2026-10-01), and the engine does not read a wrapper's exports as the service's, so it may neither
+> refuse nor name them.
 > [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment)
-> says what the engine reads and names of the service's environment. An AD **gMSA** has no
+> says what the engine reads of the service's environment, what it names, and what it does not
+> cover, a start wrapper included. An AD **gMSA** has no
 > secret to export: for the SQL Server store, run the service as the gMSA with
 > `[store].auth = "integrated"`, as the walkthrough linked above describes.
 
