@@ -368,7 +368,7 @@ async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
     # inbound resolves nothing, so a rule-driven crash loop behaves as it did before the inverse
     # existed: the instance stays open, its count climbs to the after_count tier, and a suspend
     # holds across cycles. Each cycle is the per_lane router STOP (hold + the worker returning + its
-    # connection_stopped), the rule's restart, and the start's connection_started.
+    # connection_stopped) and the rule's restart, whose start raises no connection_started.
     reg = Registry()
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
     reg.add_router("r", lambda m: [])
@@ -527,12 +527,28 @@ async def test_restart_inbound_with_resolve_stop_off_raises_no_start(
         await runner.restart_inbound("IB", resolve_stop=False)
         assert runner.inbound_running("IB") and sink.started == []
         assert runner._resolving_starts == set()
-        # An engine door's restart resolves nothing; an alert rule's resolving one does.
+        # An engine door's restart resolves nothing, and nor does a rule's resolving one once the
+        # inbound is no longer recorded failed: the start failure it answered is gone.
         await runner.restart_inbound("IB")
-        assert sink.started == []
         await runner.restart_inbound("IB", resolve_stop=True)
-        assert sink.started == ["IB"]
+        assert sink.started == []
         assert runner._resolving_starts == set()
+    finally:
+        await runner.stop()
+
+
+async def test_a_rules_resolving_restart_resolves_a_start_failure_still_recorded(
+    store: MessageStore, held_port: tuple[int, socket.socket]
+) -> None:
+    port, blocker = held_port
+    sink = _Recording()
+    runner = _runner(_registry(port), store, sink)
+    await runner.start()
+    try:
+        assert runner.inbound_failed("SHARED") and sink.started == []
+        blocker.close()
+        await runner.restart_inbound("SHARED", resolve_stop=True)
+        assert runner.inbound_running("SHARED") and sink.started == ["SHARED"]
     finally:
         await runner.stop()
 

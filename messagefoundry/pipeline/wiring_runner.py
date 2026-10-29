@@ -3311,16 +3311,19 @@ class RegistryRunner:
 
         Its start raises ``connection_started`` only for an ``operator`` restart or with
         ``resolve_stop=True``, which an alert rule's restart passes only when a
-        ``connection_stopped`` rule answers this same inbound's start failure. Every other rule
-        restart resolves nothing, so a rule-driven crash loop keeps one open, escalating instance
-        (BACKLOG #1741). The mark is scoped to the start made inside the lock."""
+        ``connection_stopped`` rule answers this same inbound's start failure. That flag counts only
+        while the inbound is still recorded failed when the lock is taken: a restart queued behind a
+        reload that already bound it may meet a later halt instead. Every other rule restart
+        resolves nothing, so a rule-driven crash loop keeps one open, escalating instance (BACKLOG
+        #1741). The mark is scoped to the start made inside the lock."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
+            resolve = operator or (resolve_stop and self.inbound_failed(name) is not None)
             await self._stop_inbound_unsafe(name)
-            await self._resolving_start(name, resolve=operator or resolve_stop)
+            await self._resolving_start(name, resolve=resolve)
 
     def _dr_refuses(self, name: str, *, operator: bool) -> bool:
         """Whether a passive DR standby refuses an engine start of inbound ``name`` (vault BACKLOG
