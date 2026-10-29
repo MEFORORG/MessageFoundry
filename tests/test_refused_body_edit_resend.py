@@ -91,7 +91,12 @@ async def _seed_refused(engine: Engine, *, allowance_bytes: int) -> str:
         RefusedBodyPolicy(allowance_bytes=allowance_bytes, head_bytes=_HEAD_BYTES)
     )
     bounded = allowance.bound(
-        "in1", _REFUSED, _REFUSED.decode(), ContentType.HL7V2.value, "parse error: synthetic"
+        "in1",
+        _REFUSED,
+        _REFUSED.decode(),
+        ContentType.HL7V2.value,
+        "parse error: synthetic",
+        cipher=engine.store.cipher(),
     )
     return await engine.store.record_received(
         channel_id="in1",

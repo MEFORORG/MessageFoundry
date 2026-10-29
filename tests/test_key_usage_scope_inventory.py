@@ -73,6 +73,9 @@ _KEY_MATERIAL = frozenset(
         "Store server-certificate trust",
         # BACKLOG #1174: the per-process key sealing the state and reference caches.
         "Sealed read-through caches",
+        # Vault BACKLOG #2608: an HMAC key HKDF-derived from the audit-chain key, keying the digest
+        # of a refused inbound body. A derived key used for one property is what 11.1.2 scopes.
+        "Refused inbound body digest",
     }
 )
 
@@ -103,10 +106,6 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "ASVS scorecard revision identifier": "a keyless content hash over the scorecard file, printed "
     "truncated so a --prove-absences run states which revision of the record it read; not a key, a "
     "secret, or a message authenticator, and unlike the corpus pin above nothing is gated on it",
-    "Refused inbound body fingerprint": "an unkeyed SHA-256 over a refused inbound body, whether "
-    "it is stored whole or cut to a head (vault BACKLOG #2608); not a key, a secret, or a message "
-    "authenticator, and nothing is verified against it. Its input may hold PHI: see the "
-    "messages.metadata row in docs/PHI.md",
     "Engine wheel attestation": "a keyless digest over the installed distribution, verified against "
     "a recorded value; no key is involved on either side",
     "SQL Server transport": "a TLS hop trusted via the OS certificate store and the ODBC driver; the "

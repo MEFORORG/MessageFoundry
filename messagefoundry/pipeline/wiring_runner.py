@@ -8004,14 +8004,15 @@ class RegistryRunner:
         ``text`` its decoded form once the refusal came after the decode, else ``None``; a refusal
         after the parse passes ``peek`` so the row carries the header fields an operator searches by.
         The per-inbound refused-body allowance decides whether the whole body or its head is stored;
-        its length and SHA-256 always are (vault BACKLOG #2608). The caller's ACK or NAK does not
-        depend on it."""
+        its length always is, and a digest keyed from the store's audit key whenever the store holds
+        one in heap (vault BACKLOG #2608). The caller's ACK or NAK does not depend on it."""
         bounded = self._refused_body.bound(
             ic.name,
             wire,
             text,
             ic.content_type.value,
             error,
+            cipher=self.store.cipher(),
             keep_whole=ic.name in self._refusals_kept_whole,
         )
         return await self.store.record_received(

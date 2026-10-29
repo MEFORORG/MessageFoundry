@@ -473,11 +473,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/secret_rotation.py": frozenset(
         {"hashlib", "hmac", "messagefoundry.store.crypto", "secrets"}
     ),
-    # Vault BACKLOG #2608: the refused-body allowance records the SHA-256 of each body refused before
-    # ingress, so an operator can match a row stored as a head against the sender's copy. An
-    # integrity fingerprint of message content, not a security control and not key material; it is
-    # stored ciphered in messages.metadata. The section 4 row "Refused inbound body fingerprint".
-    "messagefoundry/pipeline/refused_body.py": frozenset({"hashlib"}),
+    # Vault BACKLOG #2608: the refused-body allowance records, through store.crypto's
+    # refused_body_digest, a KEYED digest of each body refused before ingress: HMAC-SHA256 under a key
+    # HKDF-SHA256 derives from the in-heap audit-chain key under its own label. Keyed because a plain
+    # hash beside a row stored as a head would confirm a guessed tail offline; none is recorded on a
+    # store with no in-heap key. The section 4 row "Refused inbound body digest".
+    "messagefoundry/pipeline/refused_body.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0049 (#60): the DR BackupRunner SHA-256s the consistent store snapshot (recorded in the
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
     # fingerprint via the backup codec; the AEAD itself is delegated to store/backup_codec.py — a
@@ -1378,8 +1379,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/pipeline/sandbox.py": frozenset({"csprng:secrets.token_hex"}),
-    # Vault BACKLOG #2608: the fingerprint of a refused inbound body; the INVENTORY row says why.
-    "messagefoundry/pipeline/refused_body.py": frozenset({"hash:hashlib.sha256"}),
+    # Vault BACKLOG #2608: the keyed digest of a refused inbound body (refused_body_digest: HKDF off
+    # the audit-chain key, then HMAC-SHA256; the hash is audit_key_id); the INVENTORY row says why.
+    "messagefoundry/pipeline/refused_body.py": frozenset(
+        {
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:via messagefoundry.store.crypto",
+        }
+    ),
     "messagefoundry/pipeline/secret_rotation.py": frozenset(
         {
             # BACKLOG #3472: each non-DEK fingerprint is sealed and opened as a store-cipher cell

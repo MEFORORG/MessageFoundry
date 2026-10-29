@@ -145,6 +145,9 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/gcm_invocations.py": frozenset({_DEK}),
     "messagefoundry/pipeline/dr_backup.py": frozenset({_DEK}),
     "messagefoundry/pipeline/secret_rotation.py": frozenset({_DEK}),
+    # Vault BACKLOG #2608: keys the refused-body digest with an HMAC key HKDF-derived from the
+    # audit-chain key, itself derived from the DEK. Key material in the usage-scope guard too.
+    "messagefoundry/pipeline/refused_body.py": frozenset({_DEK}),
     "messagefoundry/uploads.py": frozenset({_DEK}),
     "messagefoundry/__main__.py": frozenset({_DEK, _SELF_SIGNED}),
     # Private keys the engine loads or mints.
@@ -256,8 +259,6 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/pipeline/crl_reload.py": "adds a replaced CRL file to live TLS contexts and "
     "verifies its signature against the hop's PUBLIC CA certificates; it loads no key (BACKLOG #299)",
     "messagefoundry/pipeline/sharding.py": _KEYLESS,
-    # Vault BACKLOG #2608. Classified the same way in tests/test_key_usage_scope_inventory.py.
-    "messagefoundry/pipeline/refused_body.py": _KEYLESS,
     "messagefoundry/pipeline/sandbox.py": _EPHEMERAL,
     "messagefoundry/pipeline/alert_sinks.py": _POSTURE_ONLY,
     "messagefoundry/pipeline/engine.py": _POSTURE_ONLY,

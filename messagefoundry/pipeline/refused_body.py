@@ -11,8 +11,15 @@ one. So a flood of refusals would have grown the store unmetered on a first depl
 
 What this bounds is the BYTES each refusal stores, never the count of refusals:
 
-* Every refused body's length and SHA-256 are always recorded, in the message's engine-internal
-  metadata under :data:`METADATA_KEY`, so an operator can still match it against the sender's copy.
+* Every refused body's length is always recorded, in the message's engine-internal metadata under
+  :data:`METADATA_KEY`, and so is a KEYED digest of it, ``body_hmac``
+  (:func:`~messagefoundry.store.crypto.refused_body_digest`), whenever the store holds an in-heap
+  key. A plain hash would let anyone who can read the row confirm a guessed body, or the guessed
+  tail of a head, offline. The keyed digest lets a holder of the store key confirm whether a
+  candidate copy, such as the sender's own, is the body the row refused, which a head alone cannot
+  show (:func:`~messagefoundry.store.crypto.verify_refused_body_digest`). Nothing in the API or the
+  console shows or checks it today. On a store with no in-heap key (keyless, or Vault Transit),
+  ``body_hmac`` is recorded as ``null``: no digest, never a plain hash.
 * The whole body is stored only while its inbound's rolling byte allowance covers it. Past that,
   the first ``head_bytes`` of it are stored, and the stored ``error`` says so. The API refuses to
   edit and resubmit a row stored that way (:func:`head_only_resubmit_refusal`), since its body is cut.
@@ -36,7 +43,6 @@ refill a spent allowance.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from collections.abc import Callable
@@ -55,6 +61,7 @@ from messagefoundry.parsing.binary import is_marked
 from messagefoundry.pipeline.ingress_guards import store_safe_raw
 from messagefoundry.redaction import _DEFAULT_LIMIT as _ERROR_LIMIT
 from messagefoundry.redaction import safe_text
+from messagefoundry.store.crypto import Cipher, refused_body_digest
 
 __all__ = [
     "DEFAULT_ALLOWANCE_BYTES",
@@ -97,7 +104,7 @@ class RefusedBodyPolicy:
 @dataclass(frozen=True, slots=True)
 class BoundedRefusal:
     """What to store for one refused body: the ``raw`` view, the ``error`` text, and the ``metadata``
-    JSON carrying its length and SHA-256."""
+    JSON carrying its length and its keyed digest."""
 
     raw: str
     error: str
@@ -142,24 +149,29 @@ class RefusedBodyAllowance:
         content_type: str,
         error: str,
         *,
+        cipher: Cipher,
         keep_whole: bool = False,
     ) -> BoundedRefusal:
         """Decide what to store for one refused body.
 
-        ``wire`` is the body as received, which is what the length and SHA-256 describe, so they
-        match the sender's copy. ``text`` is its decoded form when the refusal came after the
-        decode, else ``None``. The whole stored form is :func:`store_safe_raw` of the two, as it was
-        before this bound. It is built only when it will be stored, because under a flood the head
-        is the common case and building a 16 MiB view to discard it is waste.
+        ``wire`` is the body as received, which is what the length and the keyed digest describe,
+        so they match the sender's copy. ``text`` is its decoded form when the refusal came after
+        the decode, else ``None``. The whole stored form is :func:`store_safe_raw` of the two, as it
+        was before this bound. It is built only when it will be stored, because under a flood the
+        head is the common case and building a 16 MiB view to discard it is waste.
+
+        ``cipher`` is the store's live cipher, whose audit key the digest is keyed from. With no
+        in-heap key the record holds ``"body_hmac": null``. It is required, so a caller cannot leave
+        the digest out by forgetting to pass it.
 
         ``keep_whole`` stores the body whole and charges nothing. The runner passes it for an
         inbound whose source consumes the only copy (a poll source), where a head would lose the
         rest for good.
 
-        The hash runs on the event loop, as the decode before it does: about the same cost, and
+        The HMAC runs on the event loop, as the decode before it does: about the same cost, and
         no thread or await between the refusal and its row, so a cancelled listener cannot leave a
         refusal unrecorded in that gap and a full thread pool cannot hold up its NAK."""
-        digest = hashlib.sha256(wire).hexdigest()
+        digest = refused_body_digest(cipher, wire)
         head_bytes = self.policy.head_bytes
         carried, stored_bytes = _stored_form(wire, text)
         fits_in_head = (len(wire) if carried else stored_bytes) <= head_bytes
@@ -172,7 +184,7 @@ class RefusedBodyAllowance:
             error = _with_note(note, error)
         record: dict[str, object] = {
             "bytes": len(wire),
-            "sha256": digest,
+            "body_hmac": digest,
             "stored": "whole" if whole else "head",
         }
         if not whole:

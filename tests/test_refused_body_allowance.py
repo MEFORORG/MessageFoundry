@@ -7,7 +7,8 @@ bound counted it. These tests flood the refusal path and pin four properties:
 
 * the allowance holds: past it, only the head of each refused body is stored, so the bytes stored
   stay under ``allowance + count * head``;
-* every refused body's length and SHA-256 are stored, inside the allowance and past it;
+* every refused body's length is stored, inside the allowance and past it, and so is a digest of it
+  keyed from the store's audit key, never a plain hash, whenever the store holds a key in heap;
 * count-and-log holds: every refusal is still one ``ERROR`` row, and the ACK or NAK the sender gets
   is the same as with an unspent allowance;
 * it covers EVERY refusal phase, the parse failure included, because a bound that skipped one phase
@@ -43,6 +44,13 @@ from messagefoundry.pipeline.refused_body import (
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.redaction import safe_text
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.store.crypto import (
+    REFUSED_BODY_DIGEST_KDF,
+    generate_key,
+    make_cipher,
+    refused_body_digest,
+    verify_refused_body_digest,
+)
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.transports.database import DatabaseSource
 from messagefoundry.transports.file import FileSource
@@ -51,6 +59,13 @@ from messagefoundry.transports.mllp import MLLPSource
 
 _MSH = b"MSH|^~\\&|SND|FAC|RCV|FAC|20260101||ADT^A01|MSG1|P|2.5.1\r"
 _STRICT_OK = _MSH + b"EVN|A01|20260101\rPID|1||MRN123^^^H^MR||DOE^JANE\rPV1|1|I\r"
+#: A store cipher with no key: the allowance's own tests do not need a digest.
+_KEYLESS = make_cipher(None)
+
+
+def _plain_digests(body: bytes) -> set[str]:
+    """The bare SHA-256 and SHA-1 of a body: the plain hashes the record must not hold."""
+    return {hashlib.sha256(body).hexdigest(), hashlib.sha1(body).hexdigest()}
 
 
 def _parse_failure(n: int = 4000) -> bytes:
@@ -158,11 +173,12 @@ async def test_a_reject_flood_stores_heads_past_the_allowance_and_counts_every_r
         assert "refused-body allowance spent" in r["error"]
         assert r["error"].startswith("[refused-body allowance spent: ")
         assert "parse error:" in r["error"]
-    # Length and SHA-256 are stored for every refusal, whole or head.
-    digest = hashlib.sha256(body).hexdigest()
+    # The length is stored for every refusal, whole or head. This store holds no key, so the digest
+    # is recorded as absent, never as a plain hash.
     for r in rows:
         rec = await _record(store, r["id"])
-        assert rec["bytes"] == len(body) and rec["sha256"] == digest
+        assert rec["bytes"] == len(body) and rec["body_hmac"] is None
+        assert "sha256" not in rec
         assert rec["stored"] == ("whole" if r in whole else "head")
         # A head records the bound it was cut to; the edit-and-resubmit refusal names it.
         assert rec.get("head_bytes") == (None if r in whole else policy.head_bytes)
@@ -275,9 +291,9 @@ async def test_every_refusal_phase_stores_a_head_and_the_body_record_once_spent(
     # The sender's answer does not depend on the allowance.
     assert _msa(ack_spent) == _msa(ack_unspent)
     # The record describes the body as received, in both cases.
-    digest = hashlib.sha256(body).hexdigest()
     assert rec["bytes"] == whole_rec["bytes"] == len(body)
-    assert rec["sha256"] == whole_rec["sha256"] == digest
+    # These stores hold no key, so the digest is absent; the keyed case has its own test below.
+    assert rec["body_hmac"] is None and whole_rec["body_hmac"] is None
     assert (rec["stored"], whole_rec["stored"]) == ("head", "whole")
     # The head is the start of what came in, so an operator still sees it. Byte carriage is kept
     # only when the head itself needs it; a NUL-free head of a carried body stays readable.
@@ -307,7 +323,9 @@ def test_a_body_whose_head_is_the_whole_body_is_stored_whole_and_charges_nothing
     small_carried = b"\x00\x01" * 400  # 800 bytes, stored as byte carriage of about 1080 characters
     for _ in range(50):
         for wire, text in ((small_text.encode(), small_text), (small_carried, None)):
-            bounded = allowance.bound("IB_A", wire, text, ContentType.TEXT.value, "e")
+            bounded = allowance.bound(
+                "IB_A", wire, text, ContentType.TEXT.value, "e", cipher=_KEYLESS
+            )
             assert json.loads(bounded.metadata)[METADATA_KEY]["stored"] == "whole"
             assert bounded.error == "e"
     # The 100 small bodies charged nothing, so a body the allowance covers is still admitted.
@@ -322,11 +340,15 @@ def test_the_charge_is_the_utf8_the_store_writes_not_the_characters() -> None:
         RefusedBodyPolicy(allowance_bytes=2999, window_seconds=60.0, head_bytes=1000)
     )
     wire = b"\xff" * 1500
-    bounded = allowance.bound("IB_A", wire, None, ContentType.HL7V2.value, "decode error")
+    bounded = allowance.bound(
+        "IB_A", wire, None, ContentType.HL7V2.value, "decode error", cipher=_KEYLESS
+    )
     assert json.loads(bounded.metadata)[METADATA_KEY]["stored"] == "head"
     assert len(bounded.raw.encode()) <= 1000
     # The refusal above charged nothing, so a body costing 2998 still fits the 2999.
-    fits = allowance.bound("IB_A", b"\xff" * 1499, None, ContentType.HL7V2.value, "e")
+    fits = allowance.bound(
+        "IB_A", b"\xff" * 1499, None, ContentType.HL7V2.value, "e", cipher=_KEYLESS
+    )
     assert json.loads(fits.metadata)[METADATA_KEY]["stored"] == "whole"
 
 
@@ -336,7 +358,9 @@ def test_the_note_survives_the_stores_own_bound_on_the_error() -> None:
     )
     long_reason = "strict-validation failed: " + "PID.3 bad; " * 40
     wire = b"A" * 20_000_000
-    bounded = allowance.bound("IB_A", wire, None, ContentType.TEXT.value, long_reason)
+    bounded = allowance.bound(
+        "IB_A", wire, None, ContentType.TEXT.value, long_reason, cipher=_KEYLESS
+    )
     assert len(bounded.error) <= 200
     # The store runs safe_text again; the stored text must come through it unchanged.
     assert safe_text(bounded.error) == bounded.error
@@ -355,7 +379,9 @@ def test_the_note_survives_a_reason_quoting_a_segment(reason: str) -> None:
     allowance = RefusedBodyAllowance(
         RefusedBodyPolicy(allowance_bytes=0, window_seconds=60.0, head_bytes=256)
     )
-    bounded = allowance.bound("IB_A", b"A" * 5000, None, ContentType.TEXT.value, reason)
+    bounded = allowance.bound(
+        "IB_A", b"A" * 5000, None, ContentType.TEXT.value, reason, cipher=_KEYLESS
+    )
     assert safe_text(bounded.error).startswith("[refused-body allowance spent: ")
 
 
@@ -364,10 +390,73 @@ def test_keep_whole_stores_whole_and_charges_nothing() -> None:
         RefusedBodyPolicy(allowance_bytes=0, window_seconds=60.0, head_bytes=256)
     )
     wire = b"A" * 5000
-    bounded = allowance.bound("IB_A", wire, None, ContentType.TEXT.value, "e", keep_whole=True)
+    bounded = allowance.bound(
+        "IB_A", wire, None, ContentType.TEXT.value, "e", cipher=_KEYLESS, keep_whole=True
+    )
     assert bounded.raw == wire.decode() and bounded.error == "e"
     rec = json.loads(bounded.metadata)[METADATA_KEY]
-    assert rec == {"bytes": 5000, "sha256": hashlib.sha256(wire).hexdigest(), "stored": "whole"}
+    assert rec == {"bytes": 5000, "body_hmac": None, "stored": "whole"}
+
+
+# --- the keyed digest ------------------------------------------------------------------------------
+
+
+def test_the_digest_is_keyed_equal_under_one_key_and_different_under_two() -> None:
+    wire = _parse_failure(3000)
+    key = generate_key()
+    one = refused_body_digest(make_cipher(key), wire)
+    assert one is not None
+    assert one["alg"] == "hmac-sha256" and one["kdf"] == REFUSED_BODY_DIGEST_KDF
+    assert "mefor/refused-body-digest/v1" in one["kdf"]
+    # Deterministic under one key, even across two cipher instances built from it.
+    assert refused_body_digest(make_cipher(key), wire) == one
+    other = refused_body_digest(make_cipher(generate_key()), wire)
+    assert other is not None and other["digest"] != one["digest"]
+    assert other["key_id"] != one["key_id"]
+    # No plain hash: a reader without the key cannot recompute it from a guessed body.
+    assert one["digest"] not in _plain_digests(wire)
+
+
+def test_the_digest_confirms_the_body_only_with_its_key() -> None:
+    wire = _parse_failure(3000)
+    guess = wire[:-1] + b"B"  # the same head, a different last byte
+    old_key, new_key = generate_key(), generate_key()
+    record = refused_body_digest(make_cipher(old_key), wire)
+    assert verify_refused_body_digest(make_cipher(old_key), wire, record)
+    assert not verify_refused_body_digest(make_cipher(old_key), guess, record)
+    # Another key, or none, confirms nothing.
+    assert not verify_refused_body_digest(make_cipher(new_key), wire, record)
+    assert not verify_refused_body_digest(_KEYLESS, wire, record)
+    # A rotation keeps it checkable while the retired key stays configured.
+    assert verify_refused_body_digest(make_cipher(new_key, [old_key]), wire, record)
+    # A record that is not one, or names another scheme, is an answer, not a crash.
+    assert record is not None
+    for bad in (None, "x", {}, {**record, "kdf": "hkdf-sha256:other"}, {**record, "digest": "zz"}):
+        assert not verify_refused_body_digest(make_cipher(old_key), wire, bad)
+
+
+def test_a_keyless_store_records_no_digest_rather_than_a_plain_hash() -> None:
+    assert refused_body_digest(_KEYLESS, b"MSH|anything") is None
+
+
+async def test_a_keyed_store_records_the_keyed_digest_of_every_refusal(tmp_path: Path) -> None:
+    key = generate_key()
+    s = await MessageStore.open(tmp_path / "keyed.db", cipher=make_cipher(key))
+    try:
+        policy = RefusedBodyPolicy(allowance_bytes=4096, window_seconds=60.0, head_bytes=512)
+        runner = _runner(s, [_ic()], RefusedBodyAllowance(policy))
+        body = _parse_failure(3000)
+        for _ in range(3):
+            await runner._handle_inbound(runner.registry.inbound["IB_A"], body)
+        rows = await _rows(s)
+        recs = [await _record(s, r["id"]) for r in rows]
+    finally:
+        await s.close()
+    assert [r["stored"] for r in recs] == ["whole", "head", "head"]
+    first = recs[0]["body_hmac"]
+    assert all(r["body_hmac"] == first for r in recs)
+    assert verify_refused_body_digest(make_cipher(key), body, first)
+    assert "sha256" not in recs[0] and first["digest"] not in _plain_digests(body)
 
 
 async def test_a_poll_sources_refusals_are_kept_whole(store: MessageStore) -> None:
