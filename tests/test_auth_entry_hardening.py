@@ -185,7 +185,8 @@ _TWO_HOSTS = [
 ]
 
 
-#: Every limiter keyed by client address (the passkey begin leg is in test_passkey_way_past.py).
+#: The AuthService limiters keyed by client address (the passkey begin leg is tested in
+#: test_passkey_way_past.py). The HTTP listener's intake limiter is not one of them.
 _ADDRESS_KEYED = ["allow_login_attempt", "allow_repeated_credential_audit"]
 
 
@@ -205,6 +206,7 @@ async def test_an_address_keyed_limiter_keys_a_host_not_a_spelling(
         svc = AuthService(
             store, AuthSettings(login_rate_limit_per_ip=1, login_rate_limit_global=1000)
         )
+        await svc.initialize()
         allow = getattr(svc, accessor)
         assert allow(first)
         assert allow(second) is not same, f"{first!r} and {second!r}: same host is {same}"

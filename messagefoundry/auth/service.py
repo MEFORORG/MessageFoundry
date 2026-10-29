@@ -563,11 +563,14 @@ def _host_key(address: str) -> str:
 
 
 def _client_limiter_key(client: str | None) -> str:
-    """The key every address-keyed limiter charges for ``client``: :func:`_host_key`, so one host's
-    spellings share one bucket (BACKLOG #3764 item 3), or ``"unknown"`` when there is no address.
+    """The key the sign-in limiter, the passkey begin leg and the repeated-credential audit budget
+    charge for ``client``: :func:`_host_key`, so an address's IPv4-mapped and plain spellings share
+    one bucket, as every loopback address does (BACKLOG #3764 item 3), or ``"unknown"`` when there
+    is no address.
 
     It only folds the text uvicorn hands over; which forwarded address is the client stays
-    uvicorn's call (ADR 0151 D-1)."""
+    uvicorn's call (ADR 0151 D-1). It does not fold an IPv6 zone id. At least the HTTP listener's
+    intake limiter keys a peer without it."""
     return _host_key(client) if client else "unknown"
 
 
