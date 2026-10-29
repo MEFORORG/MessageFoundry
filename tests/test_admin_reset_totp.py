@@ -619,6 +619,24 @@ def test_totp_on_with_no_seed_is_refused_with_its_own_reason(
     assert _audit_rows(db) == []
 
 
+async def _re_enrol(store: MessageStore, seed: str, *, same_stamp: bool) -> None:
+    """Remove the Administrator's TOTP and enrol ``seed``, stamped with the instant the old
+    enrolment carries when ``same_stamp``, else 1.0."""
+    user = await store.get_user_by_username(_ADMIN)
+    assert user is not None and user.totp_enrolled_at is not None
+    stamp = user.totp_enrolled_at if same_stamp else 1.0
+    await store.disable_totp(user.id)
+    staged_cell = await store.set_totp_secret(user.id, secret=seed)
+    assert (
+        await store.enable_totp(
+            user.id, expected_secret_cell=staged_cell, recovery_code_hashes=[], now=stamp
+        )
+        is True
+    )
+    again = await store.get_user(user.id)
+    assert again is not None and (again.totp_enrolled_at == user.totp_enrolled_at) is same_stamp
+
+
 @pytest.mark.parametrize("same_stamp", [False, True], ids=["new-stamp", "same-stamp"])
 def test_a_re_enrolment_during_the_prompt_is_not_overwritten(
     tmp_path: Path,
@@ -626,9 +644,9 @@ def test_a_re_enrolment_during_the_prompt_is_not_overwritten(
     capsys: pytest.CaptureFixture[str],
     same_stamp: bool,
 ) -> None:
-    """THE COMPARE-AND-SET'S FALSE BRANCH. While the operator types, the account's TOTP is removed
-    and enrolled again with another seed. Every re-check passes (TOTP is on, with a seed), so only
-    the enrolment pinned before the prompt can tell. The write matches nothing, the newer
+    """THE PIN'S FALSE BRANCH. While the operator types, the account's TOTP is removed and enrolled
+    again with another seed. Every re-check passes (TOTP is on, with a seed), so only the
+    enrolment pinned before the prompt can tell. The command refuses before the write, the newer
     enrolment stands, and no audit row claims a replacement.
 
     ``same-stamp`` re-enrols at the very instant the pinned enrolment carries, so the stamp alone
@@ -638,23 +656,8 @@ def test_a_re_enrolment_during_the_prompt_is_not_overwritten(
     _seed(db)
     other_seed = base64.b32encode(b"enrolled-meanwhile!!").decode("ascii")
 
-    async def re_enrol(store: MessageStore) -> None:
-        user = await store.get_user_by_username(_ADMIN)
-        assert user is not None and user.totp_enrolled_at is not None
-        stamp = user.totp_enrolled_at if same_stamp else 1.0
-        await store.disable_totp(user.id)
-        staged_cell = await store.set_totp_secret(user.id, secret=other_seed)
-        assert (
-            await store.enable_totp(
-                user.id, expected_secret_cell=staged_cell, recovery_code_hashes=[], now=stamp
-            )
-            is True
-        )
-        again = await store.get_user(user.id)
-        assert again is not None and (again.totp_enrolled_at == user.totp_enrolled_at) is same_stamp
-
     def enrol_while_re_enrolled(**_k: object) -> tuple[str, str, float]:
-        _with_store(db, re_enrol)
+        _with_store(db, lambda store: _re_enrol(store, other_seed, same_stamp=same_stamp))
         at = time.time()
         return _NEW_SECRET, totp.totp(_NEW_SECRET, now=at), at
 
@@ -668,6 +671,39 @@ def test_a_re_enrolment_during_the_prompt_is_not_overwritten(
     assert (after["enabled"], after["secret"], after["sessions"]) == (True, other_seed, 1)
     assert _audit_rows(db) == []
     assert shown == [], "recovery codes were shown for a replacement that never landed"
+
+
+def test_a_same_stamp_re_enrolment_after_the_re_read_is_refused_by_the_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE STORE COMPARE-AND-SET'S FALSE BRANCH (BACKLOG #3778). The re-enrolment lands after the
+    command's last read and before its write, at the same instant, so every check in the command
+    passes and only the write's compare on the stored cell can refuse it."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "late.db"
+    _seed(db)
+    other_seed = base64.b32encode(b"enrolled-just-before").decode("ascii")
+    shown = _live_terminal(monkeypatch)
+    real_has_passkeys = MessageStore.has_webauthn_credentials
+    raced: list[bool] = []
+
+    async def has_passkeys_then_race(self: MessageStore, user_id: str) -> bool:
+        # Read by the command after its last pin check and before the write.
+        if not raced:
+            raced.append(True)
+            await _re_enrol(self, other_seed, same_stamp=True)
+        return await real_has_passkeys(self, user_id)
+
+    monkeypatch.setattr(MessageStore, "has_webauthn_credentials", has_passkeys_then_race)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    error = _error(capsys)
+    assert "changed in the moment before the write" in error
+    assert "delete it: its seed was never stored" in error
+    assert raced == [True]
+    after = _state(db)
+    assert (after["enabled"], after["secret"]) == (True, other_seed)
+    assert _audit_rows(db) == []
+    assert shown == []
 
 
 def test_a_refused_audit_append_rolls_the_swap_back(

@@ -3347,13 +3347,15 @@ def totp_replace(
     least every enrolment path built today. A store-key rotation re-encrypts it, so one landing
     between the caller's read and this write makes this write nothing, which fails closed. A
     caller that must hold an enrolment across a long wait pins the opened seed instead and reads
-    the cell again just before calling, as ``admin-reset-totp`` does. ``None`` matches nothing.
-    An empty secret raises, as :func:`totp_stage` refuses one."""
+    the cell again just before calling, as ``admin-reset-totp`` does. ``None`` or an empty cell
+    matches nothing. An empty secret raises, as :func:`totp_stage` refuses one."""
     if not sealed_secret:
         raise ValueError("a TOTP secret is required")
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
-        if not r.row.totp_enabled or expected_secret_cell is None:
+        # An empty cell is no seed (the store passes "" through as a blank value), so it is never
+        # matched: this replaces a seed and never creates one.
+        if not r.row.totp_enabled or not expected_secret_cell:
             return None
         if r.row.totp_secret != expected_secret_cell:
             return None
