@@ -3303,8 +3303,8 @@ class RegistryRunner:
         An engine restart whose start fails records the inbound failed and alerts through
         :meth:`_record_failed`, as :meth:`start` does, once while the record stands. Its stop half
         already ran, so without the record a restart queued behind an operator's resolving start
-        could leave the inbound down with no record and no open alert. An operator's restart
-        raises to its caller instead, as before."""
+        could leave the inbound down with no record and no open alert. Either way the error still
+        reaches the caller; an operator's restart records nothing, as before."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
@@ -3318,8 +3318,11 @@ class RegistryRunner:
                 # rule firing on this alert from re-alerting on every restart it drives. Only an
                 # inbound start() would bind: a name this runner does not hold (another engine
                 # shard's, a typo) or a deployed=False one is refused, not a failure to record.
+                # Nor is a raise after the bind, while the listener is up, or on a stopped runner.
                 if (
                     not operator
+                    and self._running
+                    and not self.inbound_running(name)
                     and name in self.registry.inbound
                     and self._deployed(name, "inbound")
                     and ("inbound", name) not in self._failed
