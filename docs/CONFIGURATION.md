@@ -1087,9 +1087,9 @@ holds its key, its reason words and its `count`. The key carries the process suf
 applies, and the alert item above says what the suffix holds. The count in the alert list is a
 different number: how many times the engine has raised that alert.
 
-`queued` is how many records sit on the general lane of the in-memory hand-off queue right now.
-It does not count audit tee lines on their own lane, or records waiting in the on-disk spool, and
-no field does. Every other count runs from the start of
+`queued` is how many records sit on the in-memory hand-off queue right now, both lanes, capped at
+the general lane's bound. It does not count records waiting in the on-disk spool, and no field
+does. Every other count runs from the start of
 the process. While the state is `not_installed`, every count reads zero, whatever was counted
 before. Each engine process has
 its own forwarder and watches its own: every engine shard, and a cluster standby too.
@@ -1106,10 +1106,11 @@ alert word themselves the same whichever lane dropped.** The warning carries at 
 combined batch, one capacity figure (the general lane's) and the combined total, as the single
 queue's did; the alert carries at least the `queue_full` reason and `lost`. Neither names a lane
 or gives a count for one lane alone. The counts themselves can still differ by lane. What these counts and `queued` tell a reader about audit rows is in
-[SECURITY.md](SECURITY.md), beside the other audit-row residuals of the log channel. No field gives the audit lane's depth. A collector
+[SECURITY.md](SECURITY.md), beside the other audit-row residuals of the log channel. No field gives the audit lane's depth alone. A collector
 whose sends fail shows as `send_failing` and the `degraded` state, and a lane that fills shows as
 the `queue_full` alert reason and a rise in `queue_dropped`. A collector that is
-only slow shows in neither until a lane fills. Both lanes share one sending thread, one connection and one on-disk
+only slow, or stops taking records without an error, shows in neither until a lane fills; until
+then only a rising `queued` shows it, whichever lane is waiting. Both lanes share one sending thread, one connection and one on-disk
 spool, so a full spool refuses audit lines as it refuses general ones.
 `GET /status` reports the process that answered.
 

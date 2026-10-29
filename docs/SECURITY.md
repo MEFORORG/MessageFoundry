@@ -6191,17 +6191,19 @@ stays broken, or recovers and breaks again, is reported only by that first line.
 **The forwarder's audit lane (vault BACKLOG #2612) leaves at least these on the channel.**
 [CONFIGURATION.md](CONFIGURATION.md) describes the lane under `[logging]`, and this paragraph
 states only what it leaves a `logs:view` or `monitoring:read` reader without `users:manage`.
-`queued` on `GET /status` counts the general lane only, so it does not move with audit rows while
-the general lane is full; a depth over both lanes would have risen by one per row. **Not closed
-either:** while the general lane is draining but not full, audit lines are served ahead of it, so
-each audit row can delay one general line and `queued` can still drift with the audit-row rate.
+`queued` on `GET /status` counts both lanes, capped at the general lane's bound, so once the
+general lane is full it is pinned there and does not move with audit rows; an uncapped depth over
+both lanes would have risen by one per row. **Not closed, as on the single queue:** below the cap,
+`queued` rises by one per audit row waiting, the same reading a single queue of that bound gives.
+Counting the audit lane is what lets a collector that stalls while only audit lines arrive show a
+rising depth. While the general lane is draining but not full, audit lines are served ahead of it,
+so each audit row can delay one general line.
 The drop warning, which `GET /logs/tail` serves, and the `log_forward_failed` alert never say which
 lane dropped; what they carry is stated once, in CONFIGURATION.md under `[logging]`.
 **Not closed:** the drop counts on `GET /status`, in the warning and in the alert include dropped
 audit tee lines, as the single queue's did. At least these let them track audit rows. While only
-the audit lane drops, they rise by one per audit row written, and a reader who sees
-`queue_dropped` rise while `queued` sits below the general lane's capacity can infer that the
-audit lane is the one dropping. While only the general lane drops, each audit line the forwarder
+the audit lane drops, they rise by one per audit row written. With the shipped bounds, which are
+equal, `queued` then reads the cap, so it no longer tells that reader which lane is dropping. While only the general lane drops, each audit line the forwarder
 sends takes a turn that would have freed a general slot, so they rise by about one more per audit
 row sent. And the forwarder sits on the root logger, so a drop warning written while the general
 lane is full is itself dropped and counted, while one written for an audit-lane drop fits: the

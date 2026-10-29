@@ -355,8 +355,9 @@ def test_a_general_drop_raises_the_same_reason_as_an_audit_drop() -> None:
 def test_queued_does_not_move_with_audit_rows_while_the_general_lane_is_full() -> None:
     """While the general lane is pinned full, general records are dropped and cannot move a depth,
     so a ``queued`` over both lanes would rise by one per audit row written, the hidden lock rows
-    included (BACKLOG #1131, #2612). ``queued`` reports the general lane only. The control is the
-    queue's own size, which does hold the audit lines."""
+    included (BACKLOG #1131, #2612). ``queued`` counts both lanes capped at the general lane's
+    bound, so it stays pinned there. The control is the queue's own size, which does hold the
+    audit lines."""
     handler, _ = _attach(_Collector(), maxsize=3, audit_maxsize=100)
     for _ in range(5):  # three fit; two are dropped, so the lane is pinned full
         handler.handle(_record(SYNTHETIC_RECORD))
@@ -374,6 +375,27 @@ def test_queued_does_not_move_with_audit_rows_while_the_general_lane_is_full() -
     health = _log_forwarder_health()
     assert after.queued == before.queued and health is not None and health.queued == before.queued
     assert handler._records.qsize() == 3 + n  # the control: the audit lane holds every line
+
+
+def test_queued_rises_while_a_stalled_collector_carries_only_audit_lines() -> None:
+    """A collector that stops taking records raises no send error, so ``queued`` is the only field
+    that shows it. With only audit lines arriving, a ``queued`` over the general lane alone read
+    zero and the forwarder looked idle; the single queue before BACKLOG #2612 showed the depth.
+    The control is the queue's own size: the lines really are waiting."""
+    handler, _ = _attach(_Collector(), maxsize=5, audit_maxsize=100)
+    for _ in range(3):
+        handler.handle(
+            logging.LogRecord(AUDIT_LOGGER_NAME, logging.INFO, __file__, 1, "{}", None, None)
+        )
+    status = forwarder_status()
+    health = _log_forwarder_health()
+    assert handler._records.qsize() == 3  # the control
+    assert status.queued == 3 and health is not None and health.queued == 3
+    for _ in range(10):  # past the general lane's bound, the reading is pinned at it
+        handler.handle(
+            logging.LogRecord(AUDIT_LOGGER_NAME, logging.INFO, __file__, 1, "{}", None, None)
+        )
+    assert handler._records.qsize() == 13 and forwarder_status().queued == 5
 
 
 def test_a_healthy_forwarder_raises_nothing() -> None:

@@ -1018,10 +1018,17 @@ class _ForwardLanes(queue.Queue[Any]):
     def _qsize(self) -> int:
         return len(self.queue) + len(self.audit)
 
-    def general_qsize(self) -> int:
-        """The general lane's depth alone: what :func:`forwarder_status` reports as ``queued``."""
+    def reported_qsize(self) -> int:
+        """What :func:`forwarder_status` reports as ``queued``: both lanes, capped at the general
+        lane's bound.
+
+        Both lanes, so a collector that stalls while only audit lines arrive still shows a rising
+        depth, as the single queue did. Capped, so that once the general lane is full the reading
+        is pinned there as the single queue's was, and an audit row written then cannot move it
+        (BACKLOG #1131). Below the cap the reading is the one a single queue of that bound would
+        give for the same records, so it says nothing the single queue did not."""
         with self.mutex:
-            return len(self.queue)
+            return min(len(self.queue) + len(self.audit), self.lane_maxsize)
 
     def _put(self, item: Any) -> None:
         audit = _is_audit_record(item)
@@ -1690,9 +1697,9 @@ class ForwarderStatus:
     send_failing: bool = False
     #: Sends that hit a network error, whether or not a spool kept the record.
     send_failures: int = 0
-    #: Records on the general lane of the in-memory hand-off queue right now. A level, not a loss.
-    #: Audit tee lines on their own lane are not in it (BACKLOG #2612), and neither are records
-    #: waiting in the on-disk spool; no field here counts either.
+    #: Records on the in-memory hand-off queue right now, both lanes, capped at the general lane's
+    #: bound (BACKLOG #2612). A level, not a loss. Records waiting in the on-disk spool are not in
+    #: it, and no field here counts them.
     queued: int = 0
     #: Records dropped because their lane of the hand-off queue was full, both lanes counted
     #: together. No field says which lane dropped (BACKLOG #2612, #1131).
@@ -1757,11 +1764,9 @@ def forwarder_status() -> ForwarderStatus:
             configured=True, start_failure=start_failure, delivery_confirmed=confirmed
         )
     spool = listener.spool
-    # The general lane only (BACKLOG #2612, #1131). While that lane is full, general records are
-    # dropped and cannot move a depth, so a depth that counted the audit lane would rise by one per
-    # audit row written, the hidden lock rows included. A full single queue before #2612 did not.
+    # Both lanes, capped at the general lane's bound (BACKLOG #2612, #1131): _ForwardLanes says why.
     records = handler._records
-    queued = records.general_qsize() if isinstance(records, _ForwardLanes) else records.qsize()
+    queued = records.reported_qsize() if isinstance(records, _ForwardLanes) else records.qsize()
     return ForwarderStatus(
         configured=True,
         installed=True,
