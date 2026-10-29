@@ -370,21 +370,20 @@ def test_open_store_hands_its_posture_to_the_cipher_build(
 
 
 @_ENTRY_POINTS
-def test_hvacs_own_vault_addr_fallback_is_the_hop_that_is_judged(
-    entry: EntryPoint, monkeypatch: pytest.MonkeyPatch, dials: list[object]
+@pytest.mark.parametrize("vault_addr", [_OFF_BOX, _ON_BOX], ids=["off-box", "on-box"])
+def test_an_unset_address_refuses_and_vault_addr_is_never_judged_or_dialled(
+    entry: EntryPoint, vault_addr: str, monkeypatch: pytest.MonkeyPatch, dials: list[object]
 ) -> None:
-    """With the ``MEFOR_*`` address unset, hvac dials ``VAULT_ADDR``. The guard reads the address
-    the client holds, so an unset variable is neither waved through nor refused as unreadable."""
-    monkeypatch.setenv("VAULT_ADDR", _OFF_BOX)
-    with pytest.raises(_FAIL_CLOSED) as caught:
+    """BACKLOG #2851: with the ``MEFOR_*`` address unset, hvac used to dial ``VAULT_ADDR``, and
+    this guard judged that address. There is no fallback now, so the provider refuses on the unset
+    variable before any client is built, whatever ``VAULT_ADDR`` holds: an off-box one is not the
+    hop the guard judges, and an on-box one is not dialled."""
+    own, _, section = _HOPS[entry]
+    monkeypatch.setenv("VAULT_ADDR", vault_addr)
+    with pytest.raises(_FAIL_CLOSED, match=f"MEFOR_{section.upper()}_VAULT_ADDR is not set") as c:
         entry(monkeypatch, None)
-    _assert_refused(caught, entry)
+    assert type(c.value) is own
     assert dials == []
-    monkeypatch.setenv("VAULT_ADDR", _ON_BOX)
-    with pytest.raises(_FAIL_CLOSED) as crossed:
-        entry(monkeypatch, None)
-    _assert_crossed(crossed, entry)
-    assert dials == [("127.0.0.1", 8200)]
 
 
 def test_a_proxy_that_appears_after_construction_is_refused_before_sending(

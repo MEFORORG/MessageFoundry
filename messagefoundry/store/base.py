@@ -2008,6 +2008,7 @@ class AuditStore(Protocol):
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict: ...
 
     async def roll_audit_key_epoch(self) -> tuple[bool, str]:

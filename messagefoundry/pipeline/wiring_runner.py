@@ -176,9 +176,12 @@ from messagefoundry.pipeline.phase_timing import (
     delivery_phase_timing_enabled,
 )
 from messagefoundry.pipeline.reference_sync import (
+    ReferenceStatementRefused,
     database_source_dsn,
     reference_acquire_timeout,
     reference_connection_name,
+    reference_max_rows,
+    reference_statement,
 )
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
@@ -923,6 +926,14 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 #: inside one stop() — a 1x bound would cancel in precisely the slow-but-healthy case it exists to
 #: settle, taking the ADR 0031 rebind-failure branch instead.
 _PENDING_STOP_SETTLE_SECONDS = 10.0
+#: How long a SHUTDOWN teardown cancelled from outside still lets its in-flight source stops run
+#: before it cuts them (BACKLOG #1620, ADR 0157 Amendment B). The grace spares a stop that ends
+#: promptly a cut and a redo, and the DICOM cut hazard (Database guards its own row step). The
+#: bound honours the caller's cancel: a hung stop is cut here and then hangs in the unbounded
+#: registry_runner.stop() that Engine.stop() runs later in its sequence, after its other stop
+#: steps, which covers the rest. It saves no shutdown time on that path; it ADDS up to its own
+#: length there.
+_CANCELLED_STOP_GRACE_SECONDS = 2.0
 
 
 class DrIntakeState(NamedTuple):
@@ -5637,14 +5648,16 @@ class RegistryRunner:
         budget_seconds: float | None = None,
     ) -> None:
         """Stop the graph. ``reason`` is keyword-only with a SHUTDOWN default, so all ~170 existing
-        ``runner.stop()`` call sites across the engine, the tests and the harness are unchanged and
-        behave identically (ADR 0157 C6)."""
+        ``runner.stop()`` call sites across the engine, the tests and the harness are unchanged (ADR
+        0157 C6). Their SHUTDOWN teardown now stops the inbounds concurrently (BACKLOG #1620);
+        :meth:`_teardown_unsafe` states what else that changed."""
         async with self._reload_lock:  # serialize against an in-flight reload (no torn-down state)
             had_state = self._running or bool(self._sources or self._workers or self._destinations)
             await self._teardown_unsafe(reason, budget_seconds=budget_seconds)
             if reason is TeardownReason.SHUTDOWN and self._pending_source_stops:
                 # Never orphan a task at loop close. Under DEMOTE we deliberately leave them running —
-                # settling them is start()'s job, at the next promotion.
+                # the next demotion cancels them (_stop_sources_demote); start() does not settle
+                # them.
                 await self._settle_pending_source_stops()
             if had_state:
                 log.info("wiring stopped")  # UNCHANGED string on the SHUTDOWN path
@@ -5694,7 +5707,8 @@ class RegistryRunner:
             log.warning(
                 "demotion: %d inbound listener(s) did not stop within %.2fs and were ABANDONED "
                 "(their listening sockets are already closed; the client drain finishes in the "
-                "background and is settled at the next promotion). The node is NOT quiescent — a "
+                "background; the next demotion cancels it, and engine shutdown settles it). The "
+                "node is NOT quiescent — a "
                 "message mid-handler still finishes its commit and its ACK, which count-and-log "
                 "requires; the successor drains the body.",
                 len(still),
@@ -5775,8 +5789,11 @@ class RegistryRunner:
 
         This runs inside ``_reload_lock``, which ``reload()``, ``stop()``, the per-connection
         start/stop/restart and every ``/connections`` handler also take. An unbounded join would
-        therefore wedge re-promotion, engine shutdown and the connection API for as long as a wedged
-        File/Database ``stop()`` runs. (Database gathers with no cancel and no timeout. File now
+        therefore wedge engine shutdown, and the reload, re-promotion and connection API calls
+        queued behind its lock, for as long as a wedged
+        File/Database ``stop()`` runs. (Database waits on its poll task with no timeout of its own;
+        once cancelled, it lets a row's hand-off and mark run for a bounded grace, which a
+        non-leader skips, then cuts the task and bounds both the join and the pool close. File now
         cancels a poll task blocked on a share call after a grace, BACKLOG #1620, but still waits
         without a bound while that task is inside a store call.)
 
@@ -5800,6 +5817,91 @@ class RegistryRunner:
                 _PENDING_STOP_SETTLE_SECONDS,
             )
 
+    async def _join_cancelled_source_stops(
+        self, names: list[str], tasks: list[asyncio.Task[None]], cancels_before: int
+    ) -> None:
+        """The SHUTDOWN source phase was cancelled from outside (ADR 0157 Amendment B).
+
+        Let the in-flight stops finish for up to :data:`_CANCELLED_STOP_GRACE_SECONDS`, then cut the
+        rest and join their cancellation. A second cancel cuts at once, whether it arrives during
+        the grace or was coalesced with the first: ``cancelling()`` is compared against
+        ``cancels_before``, read before the wait, so a cancel the task already carried from earlier
+        does not count. The caller re-raises.
+
+        A further cancel during the final ``gather`` cannot leave a cut stop TASK running: the
+        cancel is forwarded to the stops, and ``gather`` still resolves only once each has
+        finished. A connector's own thread can outlive its task, as a cut DICOM shutdown does; the
+        ADR lists that per connector.
+        """
+        current = asyncio.current_task()
+        cut: set[asyncio.Task[None]] = set()
+        try:
+            if current is not None and current.cancelling() - cancels_before > 1:
+                why = "a second cancel"
+                still = {task for task in tasks if not task.done()}
+            else:
+                why = f"the {_CANCELLED_STOP_GRACE_SECONDS:.1f}s grace"
+                try:
+                    _done, still = await asyncio.wait(tasks, timeout=_CANCELLED_STOP_GRACE_SECONDS)
+                except asyncio.CancelledError:
+                    why = "a second cancel"
+                    still = {task for task in tasks if not task.done()}
+            if still:
+                cut.update(still)
+                for task in still:
+                    task.cancel()
+                log.warning(
+                    "shutdown cancelled: cut %d inbound stop(s) still running after %s; they stay "
+                    "registered and the next stop() or start() stops them again",
+                    len(still),
+                    why,
+                )
+                await asyncio.gather(*still, return_exceptions=True)
+        finally:
+            foreign = 0
+            for name, task in zip(names, tasks, strict=True):
+                if not task.done() or (task.cancelled() and task in cut):
+                    continue
+                if task.cancelled():
+                    foreign += 1  # cancelled by another canceller, such as a loop close
+                elif (failure := task.exception()) is not None:
+                    log.warning("inbound %r: stop() failed: %s", name, safe_exc(failure))
+            if foreign:
+                log.warning(
+                    "shutdown cancelled: %d inbound stop(s) were cancelled by something other than "
+                    "this teardown (a loop close, say); they stay registered",
+                    foreign,
+                )
+            self._forget_stopped_sources(names, tasks)
+
+    @staticmethod
+    def _log_failed_source_stops(
+        names: list[str], tasks: list[asyncio.Task[None]]
+    ) -> list[BaseException]:
+        """Log each stop that failed, by inbound name, and return the failures. A stop that ended
+        cancelled is a failure, as a RuntimeError: nobody cancelled this teardown, and a bare
+        CancelledError raised from it reads as the caller's own cancel (the graph supervisor would
+        exit on it)."""
+        failed: list[BaseException] = []
+        for name, task in zip(names, tasks, strict=True):
+            failure: BaseException | None = (
+                RuntimeError(f"inbound {name!r}: stop() ended cancelled")
+                if task.cancelled()
+                else task.exception()
+            )
+            if failure is not None:
+                log.warning("inbound %r: stop() failed: %s", name, safe_exc(failure))
+                failed.append(failure)
+        return failed
+
+    def _forget_stopped_sources(self, names: list[str], tasks: list[asyncio.Task[None]]) -> None:
+        """Before a raise out of the source phase: drop each inbound whose stop() returned cleanly,
+        so only the ones that may still be live stay registered. Otherwise inbound_running() would
+        report a closed listener as up, and a per-connection start of it would be a silent no-op."""
+        for name, task in zip(names, tasks, strict=True):
+            if task.done() and not task.cancelled() and task.exception() is None:
+                self._sources.pop(name, None)
+
     async def _teardown_unsafe(
         self,
         reason: TeardownReason = TeardownReason.SHUTDOWN,
@@ -5812,7 +5914,10 @@ class RegistryRunner:
 
         ``reason`` (ADR 0157 C6) selects the SOURCE + DISPATCHER phases and the bound on the
         lookup-executor close wait (:meth:`_teardown_body` states it); every other phase, and
-        their order, is shared. Under SHUTDOWN the executed statements are today's, verbatim.
+        their order, is shared. Under SHUTDOWN the executed statements are the pre-ADR-0157 ones,
+        except at least that the source stops now run concurrently and a failed one is raised once
+        every stop has been joined (BACKLOG #1620); none is bounded or abandoned, except that a
+        teardown cancelled from outside cuts them after a grace (ADR 0157 Amendment B).
 
         **THE INVARIANT: ``self._running = False`` must execute on every path.**
         ``Engine._reconcile_graph``'s bring-up branch is ``is_leader() and not running``, so a teardown
@@ -5888,8 +5993,31 @@ class RegistryRunner:
             await self._quiesce_dispatchers_demote(budget * _DEMOTE_QUIESCE_SHARE)
             await self._stop_sources_demote(budget * (1.0 - _DEMOTE_QUIESCE_SHARE))
         else:
-            for source in self._sources.values():
-                await source.stop()
+            # BACKLOG #1620: concurrent, so N slow inbound stops cost one, not N. Deliberately NOT
+            # bounded here: every stop is joined before the dispatchers stop (the ordering below)
+            # and before start() can rebind on its failed-start and residual-state teardowns (review
+            # M-8), so this phase is only as bounded as each inbound's own stop(). A failed stop
+            # ends teardown after every stop has been joined, before anything below runs: its
+            # listener may still be live, so its drain side is kept and the next stop()/start()
+            # retries it, as the serial loop left it. An OUTER cancel gets a bounded grace rather
+            # than cutting every stop at once. ADR 0157 Amendment B states all of it, per connector.
+            names = list(self._sources)  # snapshot BEFORE the await (ADR 0157 Inc 4)
+            tasks = [
+                asyncio.create_task(self._sources[name].stop(), name=f"shutdown-stop:{name}")
+                for name in names
+            ]
+            if tasks:
+                current = asyncio.current_task()
+                cancels_before = current.cancelling() if current is not None else 0
+                try:
+                    await asyncio.wait(tasks)  # never cancels its awaitables (D6)
+                except asyncio.CancelledError:
+                    await self._join_cancelled_source_stops(names, tasks, cancels_before)
+                    raise
+            failed_stops = self._log_failed_source_stops(names, tasks)
+            if failed_stops:
+                self._forget_stopped_sources(names, tasks)
+                raise failed_stops[0]
             # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
             # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
             # _stop.set(). The shared _stop already broke their loops; d.stop() cancels each
@@ -11351,6 +11479,29 @@ def build_check_registry(
         raise WiringError(f"connector build failed: {exc}") from exc
 
 
+#: The label a refused ``DatabaseRef`` statement carries out of the build check (PR 2593 review).
+#: Fixed text, so a reader can tell this refusal from a connector that failed to build.
+REFERENCE_STATEMENT_REFUSED = "reference statement refused (read-only statement test)"
+
+
+def _check_reference_statement(settings: Mapping[str, Any], name: str) -> None:
+    """Run the ``DatabaseRef`` read-only statement test (BACKLOG #2617) for the build check, and
+    raise a refusal as a :class:`WiringError` under :data:`REFERENCE_STATEMENT_REFUSED`.
+
+    Left as it was, :class:`ReferenceStatementRefused` reached :func:`build_check_registry`'s
+    catch-all and read ``connector build failed``, which no connector did. The refusal is raised
+    outside the handler, so it carries no chain; its text is the fixed refusal vocabulary and the
+    set's name, never the statement. A missing statement is a missing setting, not this refusal,
+    and keeps the catch-all's label."""
+    refusal: str | None = None
+    try:
+        reference_statement(settings, name=name)
+    except ReferenceStatementRefused as exc:
+        refusal = str(exc)
+    if refusal is not None:
+        raise WiringError(f"{REFERENCE_STATEMENT_REFUSED}: {refusal}")
+
+
 def _build_check_connectors(
     registry: Registry,
     inbound_bind_host: str,
@@ -11467,24 +11618,33 @@ def _build_check_connectors(
         DatabaseLookupExecutor(resolved_lookups, egress=egress)  # checks each server first
     # Vault BACKLOG #2354: a DATABASE reference source's DSN, built (and discarded) under this
     # posture, so weakened TLS that every sync would refuse fails check, dry-run and reload rather
-    # than only surfacing as a failed sync after start. TLS and auth only: the egress allowlist and
-    # the statement checks stay at sync. Builds no pool and opens no socket. A source whose env()
-    # values do not resolve here is left to its sync, as before, so one unprovisioned set does not
-    # refuse the whole graph.
+    # than only surfacing as a failed sync after start. The egress allowlist stays at sync; the
+    # read-only statement test runs here and again at sync (BACKLOG #2617). Builds no pool and opens
+    # no socket. A source whose env() values do not resolve here is left to its sync, as before, so
+    # one unprovisioned set does not refuse the whole graph.
     # Every source kind, and before the unresolved-env skip below: this refusal needs no value. The
     # same call Engine.start makes (vault BACKLOG #3139).
     refuse_reference_hop_flags(registry)
     for rname, rspec in registry.references.items():
         if rspec.source.kind != "database":
             continue
+        # BACKLOG #2617: a literal statement is tested before the env() skip below, so a set whose
+        # server is not provisioned yet is still tested; an env() statement is tested once resolved.
+        literal_statement = isinstance(rspec.source.settings.get("statement"), str)
+        if literal_statement:
+            _check_reference_statement(rspec.source.settings, rname)
         try:
             rsettings = resolve_env_settings(rspec.source.settings, env_values)
         except WiringError:
             continue
+        if not literal_statement:
+            _check_reference_statement(rsettings, rname)
         database_source_dsn(rsettings, connection=reference_connection_name(rname))
         # BACKLOG #3432: the sync reads acquire_timeout by this rule, so an env() value it would
-        # refuse fails check here rather than as a failed sync after start.
+        # refuse fails check here rather than as a failed sync after start. max_rows the same way
+        # (BACKLOG #2617).
         reference_acquire_timeout(rsettings)
+        reference_max_rows(rsettings)
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         resolved_fhir_lookups[fname] = _fhir_lookup_settings(fspec, env_values, egress)

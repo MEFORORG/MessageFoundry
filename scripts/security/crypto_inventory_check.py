@@ -830,6 +830,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # commit the reader cannot resolve from this one. No secret, no key, no message authentication,
     # nothing user- or PHI-derived: it is an identifier in a log line.
     "scripts/asvs/anchor_report.py": frozenset({"hashlib"}),
+    # Vault BACKLOG #3411 wave 3.1, a CI spike that ships nothing: SHA-256 over a synthetic constant,
+    # signed with a P-256 CNG key the run makes and deletes, to ask whether an AppContainer can use
+    # the service account's key store; and SHA-256 over a DPAPI blob, to show the container was
+    # handed the service's exact bytes. No secret, no product key, nothing user- or PHI-derived.
+    "scripts/ci/appcontainer_spike_worker.py": frozenset({"hashlib"}),
     "scripts/security/dast_target.py": frozenset({"secrets"}),
     # BACKLOG #1426: `secrets.token_hex` names a symbol that CANNOT be on the ref, for the negative
     # arm of the subject-exists screen's own control. Unpredictability is not the property being
@@ -1810,6 +1815,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # truncated SHA-256 of the scorecard file. An identifier in a log line, nothing secret.
     "scripts/asvs/restatement_report.py": frozenset({"hash:via scripts.asvs.anchor_report"}),
     "scripts/asvs/scorecard.py": frozenset({"hash:hashlib.sha256"}),
+    # The INVENTORY row above says why: NCryptSignHash and NCryptVerifySignature over a synthetic
+    # digest, with a key the spike makes for the run, called through ctypes.
+    "scripts/ci/appcontainer_spike_worker.py": frozenset(
+        {"hash:hashlib.sha256", "sign_verify:.sign()", "sign_verify:.verify()"}
+    ),
     "scripts/security/build_cla_action_provenance.py": frozenset(
         {"hash:hashlib.sha1", "hash:hashlib.sha256"}
     ),

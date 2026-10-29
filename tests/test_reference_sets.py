@@ -311,12 +311,18 @@ class _RefCursor:
     def __init__(self, columns: list[str], rows: list[tuple[Any, ...]]) -> None:
         self.description = [(c,) for c in columns]
         self._rows = rows
+        self._pending: list[tuple[Any, ...]] = []
 
     async def execute(self, sql: str, params: Any = None) -> None:
-        pass
+        self._pending = list(self._rows)
 
     async def fetchall(self) -> list[tuple[Any, ...]]:
         return list(self._rows)
+
+    async def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        # The sync fetches under its max_rows ceiling (BACKLOG #2617), so it reads in batches.
+        batch, self._pending = self._pending[:size], self._pending[size:]
+        return batch
 
 
 class _RefConn:

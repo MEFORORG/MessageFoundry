@@ -118,11 +118,12 @@ def test_an_overlay_with_no_keep_on_a_default_gives_no_keep_warning(
 ) -> None:
     # A retarget and a drop are not keeps, and a drop beats a keep on one path. This test used to
     # assert no line at all, which pinned the silent retarget. The retarget of PID-5 to a kind
-    # that leaves the given name now has a warning of its own (BACKLOG #3000), pinned in
-    # tests/test_anon_overlay_retarget_warning.py.
+    # that leaves the given name is refused unless the overlay lists it, and warns when listed
+    # (BACKLOG #3000), pinned in tests/test_anon_overlay_retarget_warning.py.
     overlay = _overlay(
         tmp_path,
-        '[hl7]\nkeep = ["PID-13"]\ndrop = ["PID-13", "PID-11"]\n[hl7.fields]\n"PID-5" = "id"\n',
+        '[hl7]\nkeep = ["PID-13"]\ndrop = ["PID-13", "PID-11"]\nretarget_acknowledged = ["PID-5"]\n'
+        '[hl7.fields]\n"PID-5" = "id"\n',
     )
     with _warnings(rules) as lines:
         loaded = rules.load_rules(overlay)
