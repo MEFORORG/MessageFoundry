@@ -898,6 +898,51 @@ def test_the_margin_check_keys_on_the_STEPS_OWN_CONCLUSION_never_the_jobs() -> N
         assert "job.status" not in joined and "job.conclusion" not in joined
 
 
+#: The one spelling that makes the engine check advisory in the queue and nowhere else. Owner ruling
+#: 2026-10-29: "Go on fix 1: make the Step margin guard advisory in merge_group until #3515
+#: re-measures the cap, and quarantine the recurring timing tests under #4773."
+_MERGE_GROUP_ONLY = "${{ github.event_name == 'merge_group' }}"
+
+
+def _margin_check(job_name: str) -> dict:
+    steps = _job(job_name)["steps"]
+    return next(s for s in steps if "--since" in str(s.get("run", "")))  # type: ignore[no-any-return]
+
+
+def test_the_engine_margin_check_is_advisory_in_merge_group_and_blocking_on_pull_request() -> None:
+    """The owner ruling of 2026-10-29, pinned until #3515's re-measure reverts it.
+
+    The condition must name merge_group and nothing wider: a bare `true`, or an expression that
+    also matches pull_request, would stop the check gating before enqueue, which is the run the
+    ruling keeps blocking. So the whole expression is compared, not searched for a substring.
+
+    The run body must still speak when the advisory branch fires, or a queue miss would leave
+    nothing but a step-level red under a green job.
+
+    Falsified by setting `continue-on-error: true`, and separately by deleting the `::warning`
+    line: RED both times. Restored.
+    """
+    check = _margin_check("test")
+    condition = check.get("continue-on-error")
+    print(f"[step-margin] engine check continue-on-error: {condition!r}")
+    assert condition == _MERGE_GROUP_ONLY, (
+        f"the engine margin check must be advisory only in merge_group; it reads {condition!r}"
+    )
+    env = check.get("env") or {}
+    assert env.get("EVENT_NAME") == "${{ github.event_name }}", env
+    run = str(check.get("run", ""))
+    assert '"$EVENT_NAME" = "merge_group"' in run
+    assert "::warning" in run and "GITHUB_STEP_SUMMARY" in run
+    assert run.rstrip().endswith("exit $rc"), "the step must still exit non-zero on a miss"
+
+
+def test_the_web_console_margin_check_stays_blocking_on_every_event() -> None:
+    """The ruling names the engine suite's check only. Falsified by copying the engine step's
+    `continue-on-error` onto this one: RED. Restored."""
+    check = _margin_check("webconsole")
+    assert "continue-on-error" not in check, check.get("continue-on-error")
+
+
 def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_suite() -> None:
     """BACKLOG #344 proposal 5. Two steps on one `timeout-minutes` is why the nesting invariant could
     not hold for the second one on any leg: reaching it has already spent setup plus `Tests`, so its

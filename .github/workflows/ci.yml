@@ -1163,12 +1163,27 @@ jobs:
       # A skipped step (docs-only PR) reports NO OBSERVATION in words rather than a healthy-looking
       # ratio, and the script runs its own red/green control pair on every invocation and prints both
       # into the job summary -- a gate that has never been red is a claim, not a control.
+      #
+      # ADVISORY IN THE MERGE QUEUE ONLY, BLOCKING EVERYWHERE ELSE. Owner ruling 2026-10-29, verbatim:
+      # "Go on fix 1: make the Step margin guard advisory in merge_group until #3515 re-measures the
+      # cap, and quarantine the recurring timing tests under #4773." Over the engine merge_group runs
+      # of 2026-10-27 16Z to 10-29 15Z, 14 of the 34 failed jobs were this step with every test
+      # passed. A pull_request run still gates before the entry is enqueued, so the margin is still
+      # enforced once per change; the queue entry only re-runs the same tree on a busier runner.
+      # `continue-on-error` keeps the job, and so the required `test` context, green; the step's own
+      # outcome stays `failure`, and the run body below adds a warning annotation and a summary line,
+      # so the miss stays visible. `ci-gate` does not need `test` at all: each `test` leg is its own
+      # required context, judged by its job conclusion. REVERT THIS (drop `continue-on-error` and the
+      # merge_group branch below) when #3515's re-measure of the cap lands.
+      # tests/test_ci_step_margin.py pins the condition.
       - name: Step margin -- engine suite
         if: always()
+        continue-on-error: ${{ github.event_name == 'merge_group' }}
         env:
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
           STEP_CAP: ${{ matrix.step_timeout }}
           LEG: ${{ matrix.os }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           rc=0
           # `|| rc=$?` OUTSIDE the command, so a non-zero exit is captured rather than swallowed by
@@ -1176,6 +1191,13 @@ jobs:
           python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
             --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
             --since before-tests --until now || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$EVENT_NAME" = "merge_group" ]; then
+            msg="Step margin -- engine suite exited $rc on $LEG. ADVISORY in merge_group under the owner ruling of 2026-10-29 until #3515 re-measures the cap; it still blocks on pull_request."
+            echo "::warning title=Step margin advisory (merge_group)::$msg"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '\n**WARNING:** %s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
           exit $rc
 
       # BACKLOG #1211: the connscale readings are written on EVERY run, pass or fail, because an
