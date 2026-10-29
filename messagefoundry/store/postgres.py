@@ -52,6 +52,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import socket
 import ssl
@@ -98,12 +99,14 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
     Row,
+    SchemaDdlLockTimeout,
     SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
     StoreGrantsMissingError,
     StoreNotFoundError,
     acquire_pooled,
+    driver_sqlstate,
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
@@ -428,6 +431,9 @@ def _audit_write_probe(table: str, privilege: str) -> str:
 _SCHEMA_LOCK = "mefor_schema_init"
 _FINALIZE_LOCK_PREFIX = "mefor_finalize:"
 _OUTBOUND_LANE_LOCK_PREFIX = "mefor_outlane:"
+
+#: SQLSTATE lock_not_available: a statement waited out lock_timeout (BACKLOG #1726).
+_LOCK_NOT_AVAILABLE: Final = "55P03"
 
 # H1 epoch-fence guard templates (ADR 0157 C1/C2). Templates rather than literals because the guard
 # lands at a different `$N` at every site; `{h}` is bound once and referenced twice, already the house
@@ -1990,21 +1996,39 @@ class PostgresStore:
                         raise
                     lock = self._lock_key(_SCHEMA_LOCK)
                     raise SchemaLockTimeout(self.backend, lock, wait) from exc
-                # Double-check under the lock: the peer this open queued behind may have just applied
-                # this exact batch and committed its marker — then there is nothing to do.
-                if await self._schema_marker_current(conn, expected):
-                    log.debug("postgres: schema applied by a peer (%s…) — skipped", expected[:12])
-                    return False
-                for statement in _SCHEMA:
-                    await conn.execute(statement)
-                await self._migrate_lease_columns(conn)
-                await conn.execute(
-                    "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, $1, $2)"
-                    " ON CONFLICT (id) DO UPDATE"
-                    " SET schema_hash = EXCLUDED.schema_hash, applied_at = EXCLUDED.applied_at",
-                    expected,
-                    time.time(),
-                )
+                # The HOLDER's own lock waits are bounded too (BACKLOG #1726). The builds run with
+                # statement_timeout 0, so without this a CREATE INDEX or ALTER queued behind any open
+                # transaction on its table waits forever while holding the schema lock, and its
+                # queued SHARE-lock request also blocks every later write to that table. lock_timeout
+                # bounds only each lock wait, never how long a build runs once it has its lock. Set
+                # AFTER the advisory lock so that wait keeps its own client-side bound; SET LOCAL
+                # reverts at commit or rollback. The value is a validated number, not text.
+                await conn.execute(f"SET LOCAL lock_timeout = {math.ceil(wait * 1000)}")
+                try:
+                    # Double-check under the lock: the peer this open queued behind may have just
+                    # applied this exact batch and committed its marker — then there is nothing to do.
+                    if await self._schema_marker_current(conn, expected):
+                        log.debug(
+                            "postgres: schema applied by a peer (%s…) — skipped", expected[:12]
+                        )
+                        return False
+                    for statement in _SCHEMA:
+                        await conn.execute(statement)
+                    await self._migrate_lease_columns(conn)
+                    await conn.execute(
+                        "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, $1, $2)"
+                        " ON CONFLICT (id) DO UPDATE"
+                        " SET schema_hash = EXCLUDED.schema_hash, applied_at = EXCLUDED.applied_at",
+                        expected,
+                        time.time(),
+                    )
+                except Exception as exc:
+                    # 55P03 is lock_not_available (asyncpg's LockNotAvailableError), read off the
+                    # error rather than by importing the lazy driver.
+                    if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
+                        lock = self._lock_key(_SCHEMA_LOCK)
+                        raise SchemaDdlLockTimeout(self.backend, lock, wait) from exc
+                    raise
         log.info("postgres: schema DDL batch applied (%s…)", expected[:12])
         return True
 

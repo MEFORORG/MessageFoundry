@@ -152,6 +152,7 @@ __all__ = [
     "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
     "PROVISION_SCHEMA_COMMAND",
+    "SchemaDdlLockTimeout",
     "SchemaLockTimeout",
     "SchemaNotProvisionedError",
     "SchemaProvisionResult",
@@ -3354,10 +3355,33 @@ class SchemaLockTimeout(RuntimeError):
         self.backend = backend
         self.lock = lock
         self.timeout = timeout
-        super().__init__(
-            f"{backend.value}: the schema lock {lock!r} was not acquired within {timeout:g} s; "
-            "another engine shard or cluster node may be migrating the store schema. Start again "
-            "once it finishes, or raise [store].schema_lock_timeout"
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        return (
+            f"{self.backend.value}: the schema lock {self.lock!r} was not acquired within "
+            f"{self.timeout:g} s; another engine shard or cluster node may be migrating the store "
+            "schema. Start again once it finishes, or raise [store].schema_lock_timeout"
+        )
+
+
+class SchemaDdlLockTimeout(SchemaLockTimeout):
+    """The open HELD the schema lock, but one of its DDL statements did not get its own table lock
+    within ``[store].schema_lock_timeout`` (BACKLOG #1726).
+
+    The bound covers the lock wait only, never how long a build runs once it has its lock. Without
+    it, a ``CREATE INDEX`` or ``ALTER`` queued behind any open transaction on a store table waits
+    forever while holding the schema lock, and on Postgres its queued lock request also blocks every
+    later write to that table. Raised inside the schema transaction, which then rolls back with
+    nothing applied; a later open retries the batch. A subclass, so a caller that handles
+    :class:`SchemaLockTimeout` handles this too."""
+
+    def _message(self) -> str:
+        return (
+            f"{self.backend.value}: holding the schema lock {self.lock!r}, a DDL statement did not "
+            f"get its table lock within {self.timeout:g} s; an open transaction on a store table, "
+            "from another engine shard, cluster node or session, may be blocking it. Nothing was "
+            "applied. Start again once that transaction ends, or raise [store].schema_lock_timeout"
         )
 
 

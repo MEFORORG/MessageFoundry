@@ -496,9 +496,15 @@ async def test_postgres_received_index_build_is_exempt_from_the_client_timeout(
     assert fifo == [math.inf]
 
 
-def _pg_schema_store(conn: _RecordingPgConn, *, schema_lock_timeout: float | None = None) -> Any:
+def _pg_schema_store(
+    conn: _RecordingPgConn,
+    *,
+    schema_lock_timeout: float | None = None,
+    peer_applied: bool = True,
+) -> Any:
     """A PostgresStore whose _ensure_schema runs against ``conn``: the marker reads stale before
-    the schema lock and current once it is held, as if a peer engine shard committed the batch."""
+    the schema lock and, with ``peer_applied``, current once it is held, as if a peer engine shard
+    committed the batch. Without it the open runs the batch itself."""
     from types import SimpleNamespace
 
     from messagefoundry.config.settings import SchemaManagement, StoreSettings
@@ -519,7 +525,7 @@ def _pg_schema_store(conn: _RecordingPgConn, *, schema_lock_timeout: float | Non
     async def _acquire(*, record: bool = True) -> AsyncIterator[Any]:
         yield conn
 
-    reads = iter([False, True])
+    reads = iter([False, peer_applied])
 
     async def _marker_current(_conn: Any, _expected: str) -> bool:
         return next(reads)
@@ -651,3 +657,86 @@ async def test_an_existing_store_gains_the_index_on_its_next_open(tmp_path: Path
         assert len(rows) == 11
     finally:
         await s.close()
+
+
+async def test_postgres_holder_bounds_its_ddl_lock_waits_after_the_advisory_lock() -> None:
+    """BACKLOG #1726: the open holding the schema lock bounds each DDL statement's own lock wait by
+    ``[store].schema_lock_timeout`` with ``SET LOCAL lock_timeout`` (ms), issued after the advisory
+    lock (whose wait keeps its client-side bound) and before the first DDL statement. Red on
+    00bcb661e6: the builds ran with statement_timeout 0 and no lock_timeout, so a build queued behind
+    an open transaction on its table waited forever while holding the schema lock."""
+    from messagefoundry.store import postgres
+
+    conn = _RecordingPgConn()
+    store = _pg_schema_store(conn, schema_lock_timeout=45, peer_applied=False)
+
+    assert await store._ensure_schema() is True
+    sqls = [sql for sql, _ in conn.executed]
+    [lock] = [i for i, sql in enumerate(sqls) if "pg_advisory_xact_lock" in sql]
+    bound = sqls.index("SET LOCAL lock_timeout = 45000")
+    first_ddl = sqls.index(postgres._SCHEMA[0])
+    assert lock < bound < first_ddl < sqls.index("COMMIT")
+    # The builds _migrate_lease_columns runs come after it too.
+    assert bound < sqls.index(postgres._RECEIVED_INDEX_DDL)
+    assert sqls.count("SET LOCAL lock_timeout = 45000") == 1
+
+
+async def test_postgres_fractional_schema_lock_timeout_rounds_the_ddl_bound_up() -> None:
+    conn = _RecordingPgConn()
+    store = _pg_schema_store(conn, schema_lock_timeout=0.0001)
+
+    await store._ensure_schema()
+
+    assert "SET LOCAL lock_timeout = 1" in [sql for sql, _ in conn.executed]  # never 0 = no limit
+
+
+class _PgLockNotAvailable(Exception):
+    """What asyncpg raises when a statement waits out lock_timeout: LockNotAvailableError carries
+    SQLSTATE 55P03 on ``sqlstate``."""
+
+    sqlstate = "55P03"
+
+
+class _DdlFailingConn(_RecordingPgConn):
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
+        await super().execute(sql, *args, timeout=timeout)
+        if sql.lstrip().upper().startswith("CREATE"):
+            raise self._exc
+        return ""
+
+
+async def test_postgres_ddl_lock_wait_expiry_names_the_setting() -> None:
+    """A DDL statement that waits out the bound (asyncpg LockNotAvailableError, 55P03) becomes the
+    store's own error naming the lock and ``[store].schema_lock_timeout``; the transaction rolls
+    back with nothing committed. Control: any other database error propagates unchanged."""
+    from messagefoundry.store.base import SchemaDdlLockTimeout, SchemaLockTimeout
+
+    failure = _PgLockNotAvailable("canceling statement due to lock timeout")
+    conn = _DdlFailingConn(failure)
+    store = _pg_schema_store(conn, schema_lock_timeout=45, peer_applied=False)
+
+    with pytest.raises(SchemaDdlLockTimeout) as info:
+        await store._ensure_schema()
+
+    assert isinstance(info.value, SchemaLockTimeout)  # a SchemaLockTimeout handler catches it
+    assert info.value.__cause__ is failure
+    message = str(info.value)
+    assert "'public:mefor_schema_init'" in message
+    assert "DDL statement" in message
+    assert "45 s" in message
+    assert "[store].schema_lock_timeout" in message
+    assert "engine shard" in message
+    assert "COMMIT" not in [sql for sql, _ in conn.executed]
+
+    class _OtherError(Exception):
+        sqlstate = "42P07"
+
+    other = _OtherError("duplicate_table")
+    store = _pg_schema_store(_DdlFailingConn(other), peer_applied=False)
+    with pytest.raises(_OtherError) as raw:
+        await store._ensure_schema()
+    assert raw.value is other
