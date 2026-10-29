@@ -924,14 +924,14 @@ def _name_owned_by(owner: str, universe: tuple[str, ...]) -> str:
     raise AssertionError("no name hashes to the owner")  # pragma: no cover
 
 
-async def test_a_dropped_outbound_namesake_owned_by_another_shard_keeps_its_stop_open(
+async def test_a_dropped_outbound_namesake_owned_by_another_engine_shard_keeps_its_stop_open(
     store: MessageStore,
 ) -> None:
     # A reload dropped the outbound of this name from this engine shard's registry, but its queued
     # rows still drain on the engine shard that owns the lane, whose STOP raised connection_stopped
-    # into the shared store. This shard cannot see that cause, so an operator start of the inbound
+    # into the shared store. This engine shard cannot see that cause, so an operator start of the inbound
     # of the same name must not resolve it. On an earlier cut the ownership check ran only for an
-    # outbound in this registry, so the start resolved the other shard's stop.
+    # outbound in this registry, so the start resolved the other engine shard's stop.
     universe = ("a", "b")
     name = _name_owned_by("b", universe)
     reg = Registry()
@@ -943,7 +943,9 @@ async def test_a_dropped_outbound_namesake_owned_by_another_shard_keeps_its_stop
     await runner.start()
     try:
         assert name not in runner.registry.outbound and not runner._owns_destination(name)
-        sink.connection_stopped(name, detail="outbound halted on internal error")  # shard b's
+        sink.connection_stopped(
+            name, detail="outbound halted on internal error"
+        )  # engine shard b's
         await _settle(sink)
         await runner.start_inbound(name, operator=True)
         assert runner.inbound_running(name)
@@ -1061,3 +1063,24 @@ async def test_a_resolve_cancelled_before_it_runs_puts_the_state_back() -> None:
     await asyncio.sleep(0)
     assert sink._occurrences[key] == 2 and key in sink._last_sent and key in sink._suspended
     assert sink._pending_clears == {}
+
+
+async def test_a_landed_resolve_settles_earlier_clears_and_drops_an_in_flight_suspend() -> None:
+    # The first start's resolve is cancelled before it runs, but only after the second start's
+    # resolve has landed and closed the row: nothing comes back. A suspend set while the landed
+    # resolve was in flight muted the row it closed, so it goes with it.
+    key = "connection_stopped:IB"
+    sink = _primed(_FlakyResolve())
+    sink.connection_started("IB")
+    first = next(iter(sink._state_tasks))
+    sink.connection_started("IB")
+    cleared = sink._pending_clears[key][0]
+    sink.suspend("connection_stopped", "IB", until=time.time() + 3600)
+    sink._resolve_settled(key, sink._pending_clears[key][1], landed=True)
+    sink._resolve_settled(key, cleared, landed=False)  # the late cancel of the first
+    assert key not in sink._occurrences and key not in sink._last_sent
+    assert key not in sink._suspended
+    assert sink._pending_clears == {}
+    first.cancel()
+    await asyncio.gather(*sink._state_tasks, return_exceptions=True)
+    assert sink._pending_clears == {} and key not in sink._occurrences

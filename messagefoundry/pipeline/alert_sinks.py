@@ -1469,9 +1469,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         re-alerts resume immediately. Does NOT reset the escalation counter — the condition persists."""
         self._suspended.pop(f"{event_type}:{connection}", None)
         for cleared in self._pending_clears.get(f"{event_type}:{connection}", ()):
-            cleared.suspended = (
-                None  # a failed resolve must not bring back what the operator lifted
-            )
+            # A failed resolve must not bring back what the operator lifted.
+            cleared.suspended = None
 
     def forget(self, event_type: str, connection: str) -> None:
         """Drop ALL in-memory advisory state for ``(event_type, connection)`` — the suspend window AND the
@@ -1529,25 +1528,35 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             self._suspended.pop(key, None),
         )
         self._pending_clears.setdefault(key, []).append(cleared)
-        self._record_state(
-            {"type": "connection_started", "connection": name},
-            "info",
-            on_settled=lambda landed: self._resolve_settled(key, cleared, landed=landed),
-        )
+        try:
+            self._record_state(
+                {"type": "connection_started", "connection": name},
+                "info",
+                on_settled=lambda landed: self._resolve_settled(key, cleared, landed=landed),
+            )
+        except Exception:
+            # Nothing was scheduled, so the row stays open (a no-op if the write settled already).
+            self._resolve_settled(key, cleared, landed=False)
+            raise
 
     def _resolve_settled(self, key: str, cleared: _ClearedState, *, landed: bool) -> None:
         """Settle the in-memory state :meth:`connection_started` cleared, once its durable resolve
         has landed or failed (BACKLOG #1741). A landed resolve closed the row, so the state stays
-        cleared. A failed one left the row open: a later start's resolve still queued behind it then
-        takes the state over and decides in its turn, or, with none queued, the state goes back. A
-        stop emitted in between bumped the open row too, so its count adds to the restored one; a
-        cooldown or suspend set in between is newer than the cleared one and stands."""
+        cleared, every earlier clear still waiting is settled with it, and a suspend set while it was
+        in flight muted the row it closed and goes too. A failed one left the row open: a later
+        start's resolve still queued behind it then takes the state over and decides in its turn, or,
+        with none queued, the state goes back. A stop emitted in between bumped the open row too, so
+        its count adds to the restored one; a cooldown or suspend set in between is newer than the
+        cleared one and stands."""
         queue = self._pending_clears.get(key, [])
         index = next((i for i, c in enumerate(queue) if c is cleared), None)
         if index is None:
             return
-        del queue[index]
-        if not landed:
+        if landed:
+            del queue[: index + 1]
+            self._suspended.pop(key, None)
+        else:
+            del queue[index]
             if index < len(queue):
                 queue[index].absorb(cleared)
             else:
@@ -1725,7 +1734,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 nonlocal settled
                 if not settled:
                     settled = True
-                    on_settled(landed)
+                    try:
+                        on_settled(landed)
+                    except Exception:
+                        log.exception("alert-instance settle callback failed")
 
         wrapper = self._run_state(coro, key, settle)
         try:
@@ -1744,9 +1756,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         def _done(t: asyncio.Task[None]) -> None:
             self._state_tasks.discard(t)
             if settle is not None:
-                settle(
-                    False
-                )  # a no-op once _run_state settled; covers a cancel before its first step
+                # A no-op once _run_state settled; this covers a cancel before its first step.
+                settle(False)
             # A task cancelled before its first step never reached the await; close the store
             # coroutine so it does not warn "never awaited". Closing a finished coroutine is a no-op.
             coro.close()
