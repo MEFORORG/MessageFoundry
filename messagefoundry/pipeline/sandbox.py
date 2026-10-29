@@ -1127,7 +1127,7 @@ class SandboxSession:
         failure: list[BaseException] = []
         fault: list[BaseException] = []
         # Set by this thread the moment it gives up on the helper. The helper checks it, with the
-        # deadline, before it registers and calls the runner, and before it writes its reply.
+        # deadline, before it registers and calls the runner, and checks it alone before it writes.
         abandoned = threading.Event()
 
         def report(exc: BaseException) -> None:
@@ -1241,9 +1241,9 @@ class SandboxSession:
         refusal = self._lookup_refusal(phase, lookup) if available else None
         if refusal is not None:
             return False, None, refusal
+        key = (lookup.kind, lookup.connection)
+        done = threading.Event()
         if available:
-            key = (lookup.kind, lookup.connection)
-            done = threading.Event()
             margin = min(2.0, self.policy.wall_seconds / 4)
             while True:
                 with self._running_lock:

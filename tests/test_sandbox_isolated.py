@@ -1015,7 +1015,7 @@ def test_a_cut_off_waiter_does_not_replace_the_hung_lookups_record(
     try:
         with db_lookup_mod.activated(hung):
             for _ in range(3):  # A hangs; B and C each find the connection busy
-                with pytest.raises(SandboxError, match="wall cap"):
+                with pytest.raises(SandboxError, match="exceeded the 4.0s wall cap"):
                     _bodies(registry, "h_db", session)
             _join_lookup_helpers(exclude_hung=True)
         assert len(calls) == 1
@@ -1028,8 +1028,8 @@ def test_a_helper_past_its_deadline_never_calls_the_runner(
     graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Dispatch B's helper starts so late that B's cap has already ended, and by then the hung lookup
-    # A has finished. It must not call the runner: nobody waits for that call and nothing records it,
-    # so the next dispatch would start another beside it.
+    # A has finished. It must not call the runner: nobody waits for that call. The guard is the call
+    # count; peak alone would miss it, since such a call is recorded and C would wait for it.
     release_a, release_all = threading.Event(), threading.Event()
     lock = threading.Lock()
     state = {"calls": 0, "in_flight": 0, "peak": 0}
@@ -1066,11 +1066,12 @@ def test_a_helper_past_its_deadline_never_calls_the_runner(
     )
     try:
         with db_lookup_mod.activated(hung):
+            earlier = set(threading.enumerate())
             with pytest.raises(SandboxError, match="wall cap"):
                 _bodies(registry, "h_db", session)  # A: hangs, cut off
             a_helpers = [
                 thread
-                for thread in threading.enumerate()
+                for thread in set(threading.enumerate()) - earlier
                 if thread.name.startswith("mf-sandbox-lookup-")
             ]
             go.clear()

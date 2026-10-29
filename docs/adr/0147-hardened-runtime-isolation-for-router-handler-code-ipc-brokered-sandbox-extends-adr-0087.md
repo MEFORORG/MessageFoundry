@@ -194,11 +194,9 @@ the dispatch's context, through the same accessor and runner the in-process path
 It refuses one bound to a Router or `accepts=` dispatch, and one whose `[egress].allowed_db` or
 `[egress].allowed_http` is empty. A refused or failed lookup is the Handler's error, routed to
 `ERROR`/dead-letter post-ACK (AC-5, for the broker). `wall_seconds` bounds the whole dispatch, the
-brokered lookups and the writes of their replies included. A lookup that already reached its runner
-when the cap ran out runs on to its own timeout in the parent, and its result is discarded; one that
-had not is never started. While it runs, a later lookup on the same connection waits for it, by the
-rule `docs/CONFIGURATION.md` states in section `[sandbox]`. So at most one runner call runs per
-connection and session. A database query the runner itself gave up on can still run past that.
+brokered lookups and the writes of their replies included. What happens to a lookup the cap cuts
+off, and to a later lookup on the same connection, is stated once, in `docs/CONFIGURATION.md`
+section `[sandbox]`. At most one runner call runs per connection and session.
 
 **Not built:** decision (2), the OS confinement: AC-3 (Landlock and seccomp), AC-4 (the AppContainer
 token), and AC-7 (no opening or signalling the parent or a sibling). The first two open boxes above,
