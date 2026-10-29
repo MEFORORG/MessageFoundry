@@ -1115,8 +1115,8 @@ class LogForwarderInfo(BaseModel):
     start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
     send_failing: bool = False  # the last send, or a deferred start's connect, hit a network error
     lost: int = 0  # the five loss counts below, added up; a floor
-    queued: int = 0  # on the hand-off queue now: a level, not a loss, and not the spool
-    queue_dropped: int = 0  # dropped because the hand-off queue was full
+    queued: int = 0  # on the hand-off queue now, both lanes, capped at the smaller lane bound
+    queue_dropped: int = 0  # dropped because their lane of the hand-off queue was full
     unsent: int = 0  # a network error cost them, with no spool to keep them
     undeliverable: int = 0  # dropped for a send error that was not a network error
     spool_dropped: int = 0  # the on-disk spool was full or refused the write

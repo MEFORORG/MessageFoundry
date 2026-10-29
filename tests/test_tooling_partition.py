@@ -178,6 +178,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # subject.
         "test_packaged_tree_denylist.py",
         "test_release_pipeline.py",
+        # Reads messagefoundry/** (redaction.py and logging_setup.py among them), docs/** and the
+        # other trees off disk, and fails when a comment or docstring names the exception-message
+        # convention as THE control for a redaction residual again (BACKLOG #3464). That arrives as
+        # an ENGINE diff, which does not trip the tooling path gate.
+        "test_redaction_convention_claim.py",
         # Parses messagefoundry/store/{store.py,postgres.py,sqlserver.py} off disk without importing
         # them. What it guards is the erased-body predicate going missing from a replay statement,
         # which arrives as an ENGINE diff and does not trip the tooling path gate (BACKLOG #1560).

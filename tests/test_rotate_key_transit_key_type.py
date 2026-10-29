@@ -23,6 +23,7 @@ from messagefoundry.__main__ import main
 from messagefoundry.store import crypto_transit
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
+from tests._vault_hop_env import STORE, supply_vault_hop
 
 _AT_REST_ENV = (
     "MEFOR_STORE_ENCRYPTION_KEY",
@@ -75,6 +76,7 @@ def test_rotate_key_on_a_refused_transit_key_type_exits_2_without_a_traceback(
         crypto_transit, "_build_client", lambda addr, token, **_: _FakeClient(transit)
     )
     monkeypatch.setenv("MEFOR_STORE_CIPHER_PROVIDER", "vault_transit")
+    supply_vault_hop(monkeypatch, STORE)  # required since BACKLOG #2851
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor-store")
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)  # gets the command past its first check
 
