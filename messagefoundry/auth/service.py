@@ -8944,12 +8944,10 @@ class AuthService:
             )
         except UsernameAuditAppendError as exc:
             # The rename wrote, then its row failed to append, so the store rolled both back: the
-            # row keeps its old name and nobody is told. CAUGHT BEFORE THE ARM BELOW, because the
-            # append can raise its driver's integrity class, which that arm would read as a lost
-            # race. After the rollback its re-read finds no holder of the new name, so it would
-            # audit a ``write_race`` conflict that never happened and log that the write "lost to
-            # another writer". Handled after this block, so the append's own error is raised or
-            # logged with its own chain, not this wrapper's.
+            # row keeps its old name and nobody is told. CAUGHT BEFORE THE ARM BELOW, which would
+            # misread the append's error; ``UsernameAuditAppendError`` says how. Handled after
+            # this block, so the append's own error is raised or logged with its own chain, not
+            # this wrapper's.
             refused = exc.cause
             written = False
         except Exception as exc:
@@ -9005,9 +9003,9 @@ class AuthService:
             # ``_audit_reconciler_row`` does for its rows (BACKLOG #3018 step 1). The pass applies
             # every revocation before its renames, so a raise here skips none of them. It would end
             # the pass with no plan returned, so the lifespan task would raise no alert for the
-            # revocations already applied, and the later renames and every record written after
-            # the rename loop (referral, configuration refusal, probe fault, paging refusal, hold,
-            # unkeyed-binding report) would be skipped. The row still holds the old name, so a
+            # revocations already applied, and the later renames and at least the referral,
+            # configuration refusal, probe fault, paging refusal, hold and unkeyed-binding records
+            # written after the rename loop would be skipped. The row still holds the old name, so a
             # later pass that probes the account, or its next sign-in, renames it again and writes
             # the row and the notice then. A defect still raises. The sort is
             # ``write_audit_soft``'s, called with the same sets ``_audit_reconciler_row`` passes.

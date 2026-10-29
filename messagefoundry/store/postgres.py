@@ -9065,12 +9065,11 @@ class PostgresStore:
                     lost = exc
                     raise
         except Exception as exc:
-            # An append that failed because the connection dropped leaves a rollback that fails
-            # too, and the pool's release after it can fail as well; whichever fails last replaces
-            # the append's error. The server ends the transaction with the session, so the rename
-            # did not commit, and the caller is owed the append's error: read as a plain store
-            # fault, it would end a reconciler pass. Recorded at the append, never read off the
-            # exception chain, so it holds however many errors follow it.
+            # After a failed append, a failure in the rollback or the release after it replaces the
+            # append's error. No COMMIT was sent, so the rename did not commit, and the caller is
+            # owed the append's error: read as a plain store fault, it would end a reconciler pass.
+            # Recorded at the append, never read off the exception chain, so it holds however many
+            # errors follow it.
             if lost is None or exc is lost:
                 raise
             log.warning(

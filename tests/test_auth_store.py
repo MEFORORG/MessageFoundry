@@ -441,31 +441,32 @@ async def test_the_username_refresh_contract_on_sqlite() -> None:
         await store.close()
 
 
-class _ConnectionClosed(Exception):
-    """Stands in for asyncpg's error when a rollback runs on a connection that is gone."""
+class _RollbackFailed(Exception):
+    """Stands in for a driver error raised by the rollback after a failed append."""
 
 
 class _ReleaseFailed(Exception):
-    """Stands in for asyncpg's pool release re-raising a failed reset on that connection."""
+    """Stands in for a driver error raised by the pool release after that rollback."""
 
 
-@pytest.mark.parametrize("release_fails", [False, True], ids=["rollback", "rollback-then-release"])
+@pytest.mark.parametrize(
+    "release_fails", [False, True], ids=["rollback-fails", "rollback-and-release-fail"]
+)
 async def test_a_failed_rollback_on_postgres_still_reports_the_rename_audit_append(
     release_fails: bool,
 ) -> None:
-    """BACKLOG #3018 step 7. On PostgreSQL an append that fails because the connection dropped is
-    followed by a rollback that fails too, and that error replaces the append's. With
-    ``release_fails`` the pool's release then fails as well, so the append's error sits two levels
-    down the chain. The store raises the append's ``UsernameAuditAppendError`` either way, so the
-    reconciler reads a refused row and goes on, rather than a store fault that ends its pass. Driven
-    against the real method with its I/O seams replaced, because the live leg cannot drop a
-    connection on cue."""
+    """BACKLOG #3018 step 7. On PostgreSQL, after a failed append, a failure in the rollback or
+    the release after it replaces the append's error. With ``release_fails`` both fail, so the
+    append's error sits two levels down the chain. The store raises the append's
+    ``UsernameAuditAppendError`` either way, so the reconciler reads a refused row and goes on,
+    rather than a store fault that ends its pass. Driven against the real method with its I/O
+    seams replaced, because the live leg cannot make a rollback or a release fail on cue."""
     from contextlib import asynccontextmanager
 
     from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.store import UsernameAuditAppendError
 
-    dropped = ConnectionResetError("synthetic: the server closed the connection")
+    append_error = ConnectionResetError("synthetic: the audit append failed")
 
     class _Transaction:
         async def __aenter__(self) -> None:
@@ -473,7 +474,7 @@ async def test_a_failed_rollback_on_postgres_still_reports_the_rename_audit_appe
 
         async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
             if exc is not None:
-                raise _ConnectionClosed("synthetic: cannot roll back, the connection is closed")
+                raise _RollbackFailed("synthetic: the rollback failed")
 
     class _Conn:
         async def fetchrow(self, *_a: object) -> None:
@@ -488,13 +489,13 @@ async def test_a_failed_rollback_on_postgres_still_reports_the_rename_audit_appe
             yield _Conn()
         finally:
             if release_fails:
-                raise _ReleaseFailed("synthetic: the reset on release failed")
+                raise _ReleaseFailed("synthetic: the release failed")
 
     async def _write_user(*_a: object) -> object:
         return object()  # the write landed
 
     async def _append_audits(*_a: object, **_kw: object) -> list[object]:
-        raise dropped
+        raise append_error
 
     store: Any = PostgresStore.__new__(PostgresStore)
     store._timed_acquire = _acquire
@@ -504,7 +505,7 @@ async def test_a_failed_rollback_on_postgres_still_reports_the_rename_audit_appe
         await store.set_user_username(
             "u1", "jdoe-new", expected_username="jdoe", audits=(AuditAppend("x", actor="a"),)
         )
-    assert refused.value.cause is dropped
+    assert refused.value.cause is append_error
 
 
 async def test_the_username_comparison_is_byte_exact_on_sqlite() -> None:
