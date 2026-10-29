@@ -595,6 +595,8 @@ the first table. The rule places at least these modules:
 - `pipeline/wiring_runner.py`, first. It hands each received body to `pipeline/ingress_guards.py`,
   and an HL7 body to `parsing/peek.py`.
 - `pipeline/dryrun.py`, first. It reads fixture files itself, and hands bodies to `parsing/`.
+- `pipeline/refused_body.py`, first. It hands a refused body to `pipeline/ingress_guards.py` and
+  `parsing/`.
 - `store/store.py`, `store/postgres.py` and `store/sqlserver.py`, first. Each hands a stored
   message body to `parsing/binary.py`.
 - `transports/loopback.py` and `transports/passthrough.py`, second. They hand their bodies to the
@@ -628,7 +630,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Input | Where it comes from | Modules |
 |---|---|---|
 | Inbound connectors | Whatever a sender or a polled source delivers. `transports/http_listener.py` reads the HTTP request line and headers itself. | `transports/file.py`, `transports/http_listener.py`, `transports/remotefile.py`, `transports/tcp.py`, `transports/x12.py`, `transports/database.py` |
-| The intake path | Every received body. `pipeline/wiring_runner.py` is the shared ingress code. It hands each body to the decode and size guards, and an HL7 body to the peek, then to the parsers below. The live router and transform workers call the routing and transform core in `pipeline/dryrun.py` (`route_only`, `transform_one`), which hands each body to the parser for its content type. | `pipeline/wiring_runner.py`, `pipeline/dryrun.py` |
+| The intake path | Every received body. `pipeline/wiring_runner.py` is the shared ingress code. It hands each body to the decode and size guards, and an HL7 body to the peek, then to the parsers below. The live router and transform workers call the routing and transform core in `pipeline/dryrun.py` (`route_only`, `transform_one`), which hands each body to the parser for its content type. `pipeline/refused_body.py` decides what is stored of a body the listener refused, and cuts it to a head through `pipeline/ingress_guards.py` and `parsing/` (vault BACKLOG #2608). The scan's match there is different: JSON the engine wrote itself, in the message's metadata. | `pipeline/wiring_runner.py`, `pipeline/dryrun.py`, `pipeline/refused_body.py` |
 | Dry-run fixtures | The sample and batch files a dry run reads, such as the `--messages` files of `messagefoundry dryrun`. A fixture may be captured traffic. `read_fixture` reads each file, and `split_messages` hands a batch file to `parsing/split.py` to split. The scan's match in this module is different: a JSON decode of a value it encoded a moment before. | `pipeline/dryrun.py` |
 | A stored message body, when retention strips its documents | The body a sender delivered, decrypted from the store. Each backend's retention pass hands it to `parsing/binary.py`, in the hand-read table below, to strip its embedded documents. The scan's matches here are different: JSON the engine wrote itself. | `store/store.py`, `store/postgres.py`, `store/sqlserver.py` |
 | HL7 v2 | An inbound connection. Strict validation is opt-in. The tolerant parser is hand-written, so it is in the hand-read table below. | `parsing/message.py`, `parsing/validate.py` |
@@ -658,7 +660,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/refused_body.py`, `pipeline/security_signals.py` |
+| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py`, `api/protocol_floor_selftest.py` |
 | It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
