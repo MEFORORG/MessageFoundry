@@ -1534,24 +1534,56 @@ _WS_ORIGIN_FORM = (
     "MEFOR_API_WS_ALLOWED_ORIGINS, comma-separated (BACKLOG #3764)"
 )
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+# A registered name as a browser serializes it into Origin: ASCII, lower case, and no character the
+# WHATWG host parser forbids, decodes or rewrites (at least '%', '\', '<', '>', '^', '|').
+_WS_ORIGIN_HOST = re.compile(r"[a-z0-9._-]+")
+_WS_ORIGIN_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+
+
+def _whatwg_ipv6(address: ipaddress.IPv6Address) -> str:
+    """Serialize an IPv6 address as the WHATWG URL standard does, which is how a browser writes it
+    into ``Origin``: eight hex pieces, the first longest run of two or more zero pieces as ``::``.
+    ``IPv6Address.compressed`` differs on an IPv4-mapped address, which it writes dotted."""
+    pieces = [int.from_bytes(address.packed[i : i + 2], "big") for i in range(0, 16, 2)]
+    length, start = 1, -1  # a run must beat length 1 to compress
+    run: int | None = None
+    for i, piece in enumerate([*pieces, 1]):  # the sentinel closes a trailing run
+        if piece == 0:
+            run = i if run is None else run
+        elif run is not None:
+            if i - run > length:
+                length, start = i - run, run
+            run = None
+    if start < 0:
+        return ":".join(f"{p:x}" for p in pieces)
+    head = ":".join(f"{p:x}" for p in pieces[:start])
+    tail = ":".join(f"{p:x}" for p in pieces[start + length :])
+    return f"{head}::{tail}"
 
 
 def _ws_allowed_origin(entry: str) -> str:
-    """Return one ``[api].ws_allowed_origins`` entry in the form a browser sends as ``Origin``, or
-    raise ``ValueError``.
+    """Return one ``[api].ws_allowed_origins`` entry normalized to the form a browser sends as
+    ``Origin``, or raise ``ValueError``.
 
     The handshake check is an exact string match against the browser's serialized ``Origin``, so an
-    entry in any other form loads and matches nothing: a ``;``-joined list loads as one origin, and
-    so does any text at all. Refused: a separator or whitespace inside an entry, a scheme other than
-    http/https, userinfo, a path, query or fragment, a bad port, an IPv6 zone and a non-ASCII host
-    (a browser sends the ``xn--`` form). There is no wildcard: ``*`` and ``null`` are refused, the
-    second because every sandboxed or ``file:`` page sends it. Normalized, as the browser
-    serializes: case, a trailing ``/``, a default port and an IPv6 literal's spelling."""
+    entry in another form loads and matches nothing: a ``;``-joined list loads as one origin, and so
+    does any text at all. Refused, at least: userinfo (named, never quoted, since it can carry a
+    credential), a separator, whitespace or a control character, a scheme other than http/https, a
+    path, query or fragment, a bad port, an IPv6 zone, a non-ASCII host (a browser sends the
+    ``xn--`` form), a host character the browser would forbid, decode or rewrite, and an IPv4
+    address in any spelling but four decimal parts. There is no wildcard: ``*`` and ``null`` are
+    refused, the second because every sandboxed or ``file:`` page sends it. Normalized: case, a
+    trailing ``/``, a default port and an IPv6 literal's spelling."""
+    if "@" in entry:
+        raise ValueError(
+            "[api].ws_allowed_origins has an entry with userinfo ('@'), not quoted here because "
+            f"it can carry a credential: {_WS_ORIGIN_FORM}"
+        )
     field = f"[api].ws_allowed_origins entry {entry!r}"
-    if any(ch in ";," or ch.isspace() for ch in entry):
-        raise ValueError(f"{field} holds a ';', a ',' or whitespace: {_WS_ORIGIN_FORM}")
-    if not entry.isascii():
-        raise ValueError(f"{field} has a non-ASCII host; list its xn-- form: {_WS_ORIGIN_FORM}")
+    if any(ch in ";," or ch.isspace() or not ch.isprintable() for ch in entry):
+        raise ValueError(
+            f"{field} holds a ';', a ',', whitespace or a control character: {_WS_ORIGIN_FORM}"
+        )
     try:
         # urlsplit refuses a bad bracketed host, and .port a bad or out-of-range port.
         parts = urlsplit(entry)
@@ -1560,10 +1592,12 @@ def _ws_allowed_origin(entry: str) -> str:
         raise ValueError(f"{field} is not a bare origin ({exc}): {_WS_ORIGIN_FORM}") from exc
     scheme = parts.scheme  # urlsplit lowercases the scheme, and .hostname the host
     host = parts.hostname
+    if not entry.isascii():
+        where = "host; list its xn-- form" if host and not host.isascii() else "character"
+        raise ValueError(f"{field} has a non-ASCII {where}: {_WS_ORIGIN_FORM}")
     if (
         scheme not in _DEFAULT_PORTS
         or not host
-        or "@" in parts.netloc
         or parts.path not in ("", "/")
         # urlsplit drops an empty "?" or "#", so read the raw text for them.
         or "?" in entry
@@ -1577,7 +1611,26 @@ def _ws_allowed_origin(entry: str) -> str:
             raise ValueError(f"{field} has a bad IPv6 literal: {_WS_ORIGIN_FORM}") from exc
         if literal.scope_id is not None:
             raise ValueError(f"{field} has an IPv6 zone, which no browser sends: {_WS_ORIGIN_FORM}")
-        host = f"[{literal.compressed}]"
+        host = f"[{_whatwg_ipv6(literal)}]"
+    elif not _WS_ORIGIN_HOST.fullmatch(host):
+        raise ValueError(
+            f"{field} has a host character no browser Origin carries: {_WS_ORIGIN_FORM}"
+        )
+    else:
+        # A browser reads a host whose last label is numeric as IPv4 and rewrites it to four
+        # decimal parts (127.1, 0x7f.0.0.1, 010.0.0.1 and 127.0.0.1. all become another string).
+        labels = host.split(".")
+        last = labels[-2] if len(labels) > 1 and not labels[-1] else labels[-1]
+        if _WS_ORIGIN_NUMERIC_LABEL.fullmatch(last):
+            try:
+                canonical = str(ipaddress.IPv4Address(host))
+            except ValueError:
+                canonical = None
+            if canonical != host:
+                raise ValueError(
+                    f"{field} is an IPv4 address in a form a browser rewrites; write it as four "
+                    f"decimal parts with no leading zeros: {_WS_ORIGIN_FORM}"
+                )
     suffix = "" if port is None or port == _DEFAULT_PORTS[scheme] else f":{port}"
     return f"{scheme}://{host}{suffix}"
 

@@ -9,10 +9,14 @@ import os
 import re
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from starlette.websockets import WebSocket
 
+from messagefoundry.api.security import _ws_origin_allowed
 from messagefoundry.config.settings import (
     _DEFAULT_FILE,
     ApiSettings,
@@ -179,14 +183,24 @@ def test_ws_allowed_origins_semicolon_list_is_refused_from_env(
         "https://a.example.test/console",
         "https://a.example.test?",
         "https://a.example.test#top",
-        "https://user@a.example.test",
         "https://a.example.test:99999",
         "https://a.example.test:port",
+        "https://a.example.test:\u0664\u0664\u0663",
         "https://[fd00::7",
         "https://[v1.x]",
         "https://[fe80::1%25eth0]",
-        "https://bücher.example.test",
+        "https://b\u00fccher.example.test",
+        "https://a.example.test/\u00fc",
         "https://a.example.test,https://b.example.test",
+        "\x01https://a.example.test",
+        # A host a browser forbids, decodes or rewrites, so its Origin is another string.
+        "https://%41.example.test",
+        "https://a.example.test\\",
+        "https://a<b.example.test",
+        "https://127.1",
+        "https://0x7f.0.0.1",
+        "https://010.0.0.1",
+        "https://127.0.0.1.",
     ],
 )
 def test_ws_allowed_origins_refuses_a_non_origin(entry: str) -> None:
@@ -196,6 +210,16 @@ def test_ws_allowed_origins_refuses_a_non_origin(entry: str) -> None:
     with pytest.raises(ValidationError, match=r"scheme://host\[:port\]") as exc:
         ApiSettings.model_validate({"ws_allowed_origins": ["https://ok.example.test", entry]})
     assert f"entry {entry!r}" in str(exc.value)
+
+
+def test_ws_allowed_origins_refuses_userinfo_without_quoting_it() -> None:
+    """BACKLOG #3764 item 2: userinfo is refused, and the refusal never echoes the entry, since a
+    load error reaches stderr and the service log and the userinfo can carry a password."""
+    secret = "SENTINEL-not-a-real-password"
+    entry = f"https://svc:{secret}@ops.example.test"
+    with pytest.raises(ValidationError, match="userinfo") as exc:
+        ApiSettings.model_validate({"ws_allowed_origins": [entry]})
+    assert secret not in str(exc.value)
 
 
 @pytest.mark.parametrize(
@@ -212,12 +236,46 @@ def test_ws_allowed_origins_refuses_a_non_origin(entry: str) -> None:
         ("http://ops.example.test:80", "http://ops.example.test"),
         ("https://ops.example.test:", "https://ops.example.test"),
         ("https://[FD00:0:0::7]", "https://[fd00::7]"),
+        # A browser writes an IPv4-mapped address in hex; IPv6Address.compressed writes it dotted.
+        ("https://[::ffff:127.0.0.1]", "https://[::ffff:7f00:1]"),
+        ("https://[1:0:0:2:0:0:0:3]", "https://[1:0:0:2::3]"),
     ],
 )
 def test_ws_allowed_origins_loads_a_bare_origin(entry: str, loaded: str) -> None:
     """BACKLOG #3764 item 2: a bare origin loads, in the form a browser sends as ``Origin``."""
     s = ApiSettings.model_validate({"ws_allowed_origins": [entry]})
     assert s.ws_allowed_origins == [loaded]
+
+
+async def _never_receive() -> Any:
+    raise AssertionError("the origin check never reads the socket")
+
+
+async def _never_send(message: Any) -> None:
+    raise AssertionError("the origin check never writes the socket")
+
+
+@pytest.mark.parametrize(
+    ("entry", "browser_origin"),
+    [
+        # The Origin a browser sends at each, per the WHATWG URL serializer.
+        ("HTTPS://Ops.Example.TEST:443/", "https://ops.example.test"),
+        ("https://[::ffff:127.0.0.1]:8443", "https://[::ffff:7f00:1]:8443"),
+    ],
+)
+def test_ws_allowed_origins_loaded_entry_admits_its_browser(
+    entry: str, browser_origin: str
+) -> None:
+    """BACKLOG #3764 item 2: the loaded entry is admitted by the handshake's own check, fed the
+    Origin a browser sends there; before, each loaded as written and matched nothing."""
+    allowed = tuple(ApiSettings.model_validate({"ws_allowed_origins": [entry]}).ws_allowed_origins)
+    scope = {
+        "type": "websocket",
+        "headers": [(b"origin", browser_origin.encode())],
+        "app": SimpleNamespace(state=SimpleNamespace(ws_allowed_origins=allowed)),
+    }
+    websocket = WebSocket(scope, receive=_never_receive, send=_never_send)
+    assert _ws_origin_allowed(websocket) is True
 
 
 def test_sandbox_mode_is_settable_by_env(tmp_path: Path) -> None:
