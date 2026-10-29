@@ -2447,24 +2447,30 @@ unwrapped and unencrypted, so the file holds the bare token. The file is held to
 - **POSIX.** The file is mode `0600` owned by the engine's account, so the agent writes it as
   that account, with the sink's `mode` set to `0600`: a group bit, as in the agent's default sink
   mode, is refused.
-- **Windows, a default install: not offered.** The engine runs as its virtual account,
-  `NT SERVICE\<ServiceName>`, and stays on it: do not move the engine off it for this route.
-  Do not give a second account, the agent's included, write rights in this directory, and do
-  not run the agent as LocalSystem. Supply the token through `MEFOR_STORE_VAULT_TOKEN` or
-  `MEFOR_SECRETS_VAULT_TOKEN` in the service's environment, the route that already exists. A
-  token there does not renew itself: give it a lifetime longer than the engine runs between
-  restarts, and put a new one in the service's environment and restart the service before it
-  expires.
+- **Windows, the engine on its virtual account `NT SERVICE\<ServiceName>` (a default install):
+  not offered.** Do not add write rights in this directory for any other account, the agent's
+  included, and do not run the agent as an account that can already write here, at least
+  LocalSystem and any member of Administrators. Supply `MEFOR_STORE_VAULT_TOKEN` or
+  `MEFOR_SECRETS_VAULT_TOKEN` by a route that already exists, with no agent writing it: the
+  service's environment, or a file an administrator writes into this directory by hand. A token
+  in the service's environment is readable by local users and is named at every start as
+  [`service_environment_secret`](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment),
+  so the file is the protected one. Neither renews itself: replace the token, and restart the
+  service, before it expires. To change the environment, mind that
+  [`nssm set AppEnvironmentExtra` replaces the whole list](SERVICE.md#start--stop--status).
 - **Windows, a dedicated account the site already chose.** A site that already runs the engine
   under a dedicated account, chosen for other reasons, may run the agent as that same account,
   which then needs the right to create and delete files in this directory, since the agent may
   write a temporary file and rename it over the sink. This route is not a reason to leave the
   virtual account ([SERVICE.md](SERVICE.md#restrict-the-service-token) says what leaving it
-  costs). Never use a built-in account other services share, such as NetworkService.
+  costs).
+- **Windows, any other account: not offered.** That covers LocalSystem (`-AllowLocalSystem`),
+  another virtual account, and a built-in account other services share, such as NetworkService,
+  where a right in this directory would reach every service that runs as it.
 - **A shared account is a shared trust.** Where the agent and the engine share an account, code
   running as the engine can replace any setting the directory supplies and can read the agent's
-  own auto-auth material. That material cannot sit in this directory, which refuses a file named
-  for no setting.
+  own auto-auth material. Keep that material out of this directory: a file whose name starts
+  with `.` is skipped there, not refused.
 
 Where the sink route is used:
 
