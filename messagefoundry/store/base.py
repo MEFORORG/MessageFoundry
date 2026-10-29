@@ -152,6 +152,7 @@ __all__ = [
     "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
     "PROVISION_SCHEMA_COMMAND",
+    "SchemaLockTimeout",
     "SchemaNotProvisionedError",
     "SchemaProvisionResult",
     "StoreGrantsMissingError",
@@ -3339,6 +3340,28 @@ class StoreGrantsMissingError(RuntimeError):
     Raised at open under ``[store].schema_management = external`` so a missing row grant refuses the
     start instead of failing the first pipeline path that touches the object. ``provision-schema``
     cannot fix it: the grant is the DBA's."""
+
+
+class SchemaLockTimeout(RuntimeError):
+    """A server-DB store open did not get the schema lock within ``[store].schema_lock_timeout``
+    (BACKLOG #1726).
+
+    The lock serializes the open-time DDL batch across engine shards and cluster nodes, and the
+    holder's batch is exempt from ``[store].command_timeout``, so a large first-upgrade index build
+    can hold it for a long time. The wait is bounded anyway, so a store open, and a service stop
+    behind it, can never hang forever. On expiry this open's transaction rolls back with nothing
+    applied, and a later open retries the batch, which is idempotent. Deliberately NOT a
+    ``TimeoutError``, for the reason :class:`StoreAcquireTimeout` gives."""
+
+    def __init__(self, backend: StoreBackend, lock: str, timeout: float) -> None:
+        self.backend = backend
+        self.lock = lock
+        self.timeout = timeout
+        super().__init__(
+            f"{backend.value}: the schema lock {lock!r} was not acquired within {timeout:g} s; "
+            "another engine shard or cluster node may be migrating the store schema. Start again "
+            "once it finishes, or raise [store].schema_lock_timeout"
+        )
 
 
 @dataclass(frozen=True, slots=True)

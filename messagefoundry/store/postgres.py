@@ -98,6 +98,7 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
     Row,
+    SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
     StoreGrantsMissingError,
@@ -1967,18 +1968,24 @@ class PostgresStore:
                 # per-statement with timeout=inf on the long builds in _migrate_lease_columns. SET LOCAL
                 # scopes to this txn and auto-reverts at commit.
                 await conn.execute("SET LOCAL statement_timeout = 0")
-                # The wait is unbounded too (BACKLOG #1726), on both server backends. A peer holding
-                # this lock runs the same batch with its builds exempt from command_timeout, so
-                # bounding the wait by command_timeout would fail this open at startup while the
-                # peer's upgrade is still healthy. The lock is transaction-scoped: it is released
-                # when the holder commits or rolls back, or once the server sees the holder's
-                # session end, which for a crashed host can take as long as TCP keepalive allows.
-                # A role- or database-configured lock_timeout (or transaction_timeout) still
-                # bounds it; this lifts only command_timeout and statement_timeout.
+                # The wait is bounded by [store].schema_lock_timeout, not command_timeout (BACKLOG
+                # #1726), on both server backends. A peer engine shard or cluster node holding this
+                # lock runs the same batch with its builds exempt from command_timeout, so bounding
+                # the wait by command_timeout would fail this open at startup while the peer's
+                # upgrade is still healthy. It stays bounded (ADR 0060 prefers a bounded wait that
+                # fails transiently and recoverably): on expiry asyncpg cancels the wait, the
+                # transaction rolls back with nothing applied, and the next open retries the
+                # idempotent batch. The lock is transaction-scoped: it is released when the holder
+                # commits or rolls back, or once the server sees the holder's session end, which
+                # for a crashed host can take as long as TCP keepalive allows. A role- or
+                # database-configured lock_timeout (or transaction_timeout) can still end it sooner.
                 log.info("postgres: waiting for the schema lock to apply the DDL batch")
-                await self._advisory_lock(
-                    conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK, timeout=float("inf")
-                )
+                wait = self._settings.schema_lock_timeout
+                try:
+                    await self._advisory_lock(conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK, timeout=wait)
+                except TimeoutError as exc:
+                    lock = self._lock_key(_SCHEMA_LOCK)
+                    raise SchemaLockTimeout(self.backend, lock, wait) from exc
                 # Double-check under the lock: the peer this open queued behind may have just applied
                 # this exact batch and committed its marker — then there is nothing to do.
                 if await self._schema_marker_current(conn, expected):

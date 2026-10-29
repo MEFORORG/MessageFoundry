@@ -20,8 +20,12 @@ import types
 
 import pytest
 
-from messagefoundry.config.settings import SchemaManagement
-from messagefoundry.store.base import PROVISION_SCHEMA_COMMAND, SchemaNotProvisionedError
+from messagefoundry.config.settings import SchemaManagement, StoreSettings
+from messagefoundry.store.base import (
+    PROVISION_SCHEMA_COMMAND,
+    SchemaLockTimeout,
+    SchemaNotProvisionedError,
+)
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import _SCHEMA_LOCK, SqlServerStore, _schema_hash
 
@@ -52,7 +56,10 @@ class _FakeCursor:
             return (_schema_hash(),) if self._marker_current else (None,)
         if "sys.databases" in self._last_sql:
             return self.options_row
-        return (0,)  # sp_getapplock return code >= 0 (lock granted)
+        return (self.applock_rc,)  # sp_getapplock return code; >= 0 is lock granted
+
+    #: What sp_getapplock returns; a test sets a negative code to fake a refusal.
+    applock_rc: int = 0
 
     async def fetchall(self) -> list[object]:
         return []
@@ -99,12 +106,16 @@ class _FakePool:
 
 
 def _settings(
-    *, command_timeout: int, mode: SchemaManagement = SchemaManagement.AUTO
+    *,
+    command_timeout: int,
+    mode: SchemaManagement = SchemaManagement.AUTO,
+    schema_lock_timeout: float = StoreSettings().schema_lock_timeout,
 ) -> types.SimpleNamespace:
     """The settings slice _ensure_schema reads. AUTO by default: these contracts are the engine
     running its OWN DDL; the #305 external-mode cases pass ``mode`` explicitly."""
     return types.SimpleNamespace(
         command_timeout=command_timeout,
+        schema_lock_timeout=schema_lock_timeout,
         acquire_timeout=30.0,
         database="MessageFoundry",
         resolved_schema_management=lambda: mode,
@@ -198,10 +209,11 @@ async def test_ensure_schema_exempts_statement_timeout_for_the_ddl_batch() -> No
     assert conn._conn.timeout == 0  # the DDL-batch statement-timeout exemption was applied
 
 
-async def test_schema_applock_waits_unbounded_for_a_peer_migration() -> None:
-    """BACKLOG #1726: the schema applock waits without limit, not ``command_timeout*1000``;
-    ``SqlServerStore._ensure_schema`` says why. Red before the fix: the timeout parameter is 30000,
-    and the batch ran on the probe's cursor, made while the connection timeout was still 30."""
+async def test_schema_applock_waits_the_schema_lock_timeout_for_a_peer_migration() -> None:
+    """BACKLOG #1726: the schema applock waits ``[store].schema_lock_timeout`` (default 600 s), not
+    ``command_timeout*1000``; ``SqlServerStore._ensure_schema`` says why. Red before the fix: the
+    timeout parameter was 30000 (and then -1, unbounded), and the batch ran on the probe's cursor,
+    made while the connection timeout was still 30."""
     executed: list[tuple[str, object]] = []
     conn = _FakeConn(executed)
     store = _make_store(conn)
@@ -210,16 +222,62 @@ async def test_schema_applock_waits_unbounded_for_a_peer_migration() -> None:
     await store._ensure_schema()
 
     lock_i = _applock_index(executed)
-    assert executed[lock_i][1] == (_SCHEMA_LOCK, -1)  # -1: sp_getapplock waits without limit
+    assert StoreSettings().schema_lock_timeout == 600.0
+    assert executed[lock_i][1] == (_SCHEMA_LOCK, 600_000)
     # The cursor the applock and the DDL run on was made after the timeout was lifted.
     made_before_lock = [timeout for n, timeout in conn.cursors_made if n <= lock_i]
     assert made_before_lock[-1] == 0
     assert conn.cursors_made[0][1] == 30  # control: the probe's cursor kept command_timeout
 
 
+async def test_a_custom_schema_lock_timeout_reaches_the_applock() -> None:
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    store = _make_store(conn)
+    store._settings = _settings(command_timeout=30, schema_lock_timeout=12.5)  # type: ignore[assignment]
+
+    await store._ensure_schema()
+
+    assert executed[_applock_index(executed)][1] == (_SCHEMA_LOCK, 12_500)
+
+
+async def test_schema_applock_expiry_names_the_lock_and_the_setting() -> None:
+    """``sp_getapplock`` returning -1 (its @LockTimeout elapsed) raises the store's own error naming
+    the lock and ``[store].schema_lock_timeout``, and rolls the open's transaction back with no DDL
+    run. Control: another negative code (-3, deadlock victim) stays the generic refusal."""
+    for rc, expected in ((-1, SchemaLockTimeout), (-3, RuntimeError)):
+        executed: list[tuple[str, object]] = []
+        conn = _FakeConn(executed)
+        conn.cursor_obj.applock_rc = rc
+        store = _make_store(conn)
+        store._settings = _settings(command_timeout=30, schema_lock_timeout=45)  # type: ignore[assignment]
+
+        with pytest.raises(RuntimeError) as info:
+            await store._ensure_schema()
+
+        assert type(info.value) is expected
+        if expected is SchemaLockTimeout:
+            message = str(info.value)
+            assert repr(_SCHEMA_LOCK) in message
+            assert "45 s" in message
+            assert "[store].schema_lock_timeout" in message
+            assert "engine shard" in message
+        assert conn.rolledback == 1
+        lock_i = _applock_index(executed)
+        assert len(executed) == lock_i + 1  # nothing ran after the refused lock
+
+
+def test_schema_applock_timeout_ms_rounds_up_and_clamps() -> None:
+    from messagefoundry.store.sqlserver import _schema_applock_timeout_ms
+
+    assert _schema_applock_timeout_ms(600.0) == 600_000
+    assert _schema_applock_timeout_ms(0.0001) == 1  # never 0, which would mean "do not wait"
+    assert _schema_applock_timeout_ms(1e12) == 2**31 - 1  # the T-SQL int ceiling
+
+
 async def test_other_applocks_keep_the_command_timeout_bound() -> None:
-    """Only the schema lock is unbounded: a call that passes no override still sends
-    ``command_timeout*1000``."""
+    """Only the schema lock takes ``schema_lock_timeout``: a call that passes no override still
+    sends ``command_timeout*1000``."""
     executed: list[tuple[str, object]] = []
     conn = _FakeConn(executed)
     store = _make_store(conn)

@@ -496,43 +496,113 @@ async def test_postgres_received_index_build_is_exempt_from_the_client_timeout(
     assert fifo == [math.inf]
 
 
-async def test_postgres_schema_lock_wait_is_exempt_from_the_client_timeout() -> None:
-    """A peer engine shard waiting on the schema lock waits as long as the build it queued behind;
-    ``PostgresStore._ensure_schema`` says why. Red before the fix: the lock call passed no timeout,
-    so asyncpg applied ``command_timeout`` to the wait."""
+def _pg_schema_store(conn: _RecordingPgConn, *, schema_lock_timeout: float | None = None) -> Any:
+    """A PostgresStore whose _ensure_schema runs against ``conn``: the marker reads stale before
+    the schema lock and current once it is held, as if a peer engine shard committed the batch."""
     from types import SimpleNamespace
 
-    from messagefoundry.config.settings import SchemaManagement
+    from messagefoundry.config.settings import SchemaManagement, StoreSettings
     from messagefoundry.store import postgres
 
-    conn = _RecordingPgConn()
     store = postgres.PostgresStore.__new__(postgres.PostgresStore)
     store._settings = SimpleNamespace(  # type: ignore[assignment]
-        db_schema=None, resolved_schema_management=lambda: SchemaManagement.AUTO
+        db_schema=None,
+        resolved_schema_management=lambda: SchemaManagement.AUTO,
+        schema_lock_timeout=(
+            StoreSettings().schema_lock_timeout
+            if schema_lock_timeout is None
+            else schema_lock_timeout
+        ),
     )
 
     @contextlib.asynccontextmanager
     async def _acquire(*, record: bool = True) -> AsyncIterator[Any]:
         yield conn
 
-    reads = iter([False, True])  # stale before the lock; the peer committed it once we hold it
+    reads = iter([False, True])
 
     async def _marker_current(_conn: Any, _expected: str) -> bool:
         return next(reads)
 
     store._timed_acquire = _acquire  # type: ignore[method-assign]
     store._schema_marker_current = _marker_current  # type: ignore[method-assign,assignment]
+    return store
+
+
+async def test_postgres_schema_lock_wait_takes_the_schema_lock_timeout() -> None:
+    """A peer engine shard waiting on the schema lock waits ``[store].schema_lock_timeout`` (default
+    600 s), not ``command_timeout``; ``PostgresStore._ensure_schema`` says why. Red before the fix:
+    the lock call passed no timeout, so asyncpg applied ``command_timeout`` to the wait (and then
+    ``inf``, unbounded)."""
+    from messagefoundry.config.settings import StoreSettings
+
+    conn = _RecordingPgConn()
+    store = _pg_schema_store(conn)
 
     assert await store._ensure_schema() is False  # the peer applied the batch
     sqls = [sql for sql, _ in conn.executed]
     [lock] = [i for i, sql in enumerate(sqls) if "pg_advisory_xact_lock" in sql]
-    assert conn.executed[lock][1] == math.inf
+    assert StoreSettings().schema_lock_timeout == 600.0
+    assert conn.executed[lock][1] == 600.0
     # The server-side statement_timeout is lifted first, in the same transaction.
     assert sqls.index("BEGIN") < sqls.index("SET LOCAL statement_timeout = 0") < lock
     assert lock < sqls.index("COMMIT")
     # Control: a lock with no override keeps the pool's command_timeout (no timeout passed).
     await store._advisory_lock(conn, 1, "finalize:m1")
     assert conn.executed[-1] == ("SELECT pg_advisory_xact_lock($1, hashtext($2))", None)
+
+
+async def test_postgres_custom_schema_lock_timeout_reaches_the_lock_wait() -> None:
+    conn = _RecordingPgConn()
+    store = _pg_schema_store(conn, schema_lock_timeout=12.5)
+
+    await store._ensure_schema()
+
+    assert [t for sql, t in conn.executed if "pg_advisory_xact_lock" in sql] == [12.5]
+
+
+class _TimingOutLockConn(_RecordingPgConn):
+    """asyncpg raises ``TimeoutError`` when a statement's client timeout elapses."""
+
+    async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
+        await super().execute(sql, *args, timeout=timeout)
+        if "pg_advisory_xact_lock" in sql:
+            raise TimeoutError
+        return ""
+
+
+async def test_postgres_schema_lock_expiry_names_the_lock_and_the_setting() -> None:
+    """On expiry the open raises the store's own error naming the lock and
+    ``[store].schema_lock_timeout``, not a bare ``TimeoutError``, and its transaction runs no DDL."""
+    from messagefoundry.store.base import SchemaLockTimeout
+
+    conn = _TimingOutLockConn()
+    store = _pg_schema_store(conn, schema_lock_timeout=45)
+
+    with pytest.raises(SchemaLockTimeout) as info:
+        await store._ensure_schema()
+
+    message = str(info.value)
+    assert "'public:mefor_schema_init'" in message
+    assert "45 s" in message
+    assert "[store].schema_lock_timeout" in message
+    assert "engine shard" in message
+    assert isinstance(info.value.__cause__, TimeoutError)
+    assert not isinstance(info.value, TimeoutError)
+    sqls = [sql for sql, _ in conn.executed]
+    assert "pg_advisory_xact_lock" in sqls[-1]  # nothing ran after the refused lock
+    assert "COMMIT" not in sqls
+
+
+@pytest.mark.parametrize("value", [0, -1, math.inf, math.nan])
+def test_schema_lock_timeout_refuses_an_unbounded_or_empty_wait(value: float) -> None:
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreSettings
+
+    with pytest.raises(ValidationError, match="schema_lock_timeout must be > 0 and finite"):
+        StoreSettings(schema_lock_timeout=value)
+    assert StoreSettings(schema_lock_timeout=30).schema_lock_timeout == 30.0  # control
 
 
 # --- upgrade ---------------------------------------------------------------------------------------

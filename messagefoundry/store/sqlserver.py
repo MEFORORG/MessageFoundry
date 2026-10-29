@@ -35,6 +35,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import queue
 import threading
 import time
@@ -82,6 +83,7 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
+    SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
     StoreNotFoundError,
@@ -1008,29 +1010,44 @@ def _upload_quota_lock(uploader_id: str) -> str:
     return f"mefor:upload_quota:{uploader_id}"
 
 
-#: ``@LockTimeout`` value that makes ``sp_getapplock`` wait without limit.
-_APPLOCK_WAIT_FOREVER: Final[int] = -1
-
-
 def _applock_timeout_ms(command_timeout: int) -> int:
     """``@LockTimeout`` (ms) for :data:`_SQL_APPLOCK`: ``command_timeout*1000`` when set, else ``-1``
     (wait forever; nothing else bounds it, since a 0 command timeout sets no pyodbc query timeout
-    either, and the schema lock passes ``-1`` on a cursor made with none). ``0`` -> ``-1`` is why the
-    SYNC handoff pool
-    REFUSES to build when ``command_timeout==0`` (ADR 0071 invariant: a fused hop must never wait
-    unboundedly on the applock)."""
-    return int(command_timeout * 1000) if command_timeout else _APPLOCK_WAIT_FOREVER
+    either). ``0`` -> ``-1`` is why the SYNC handoff pool REFUSES to build when
+    ``command_timeout==0`` (ADR 0071 invariant: a fused hop must never wait unboundedly on the
+    applock). The schema lock does not use this: it passes ``[store].schema_lock_timeout`` instead
+    (BACKLOG #1726)."""
+    return int(command_timeout * 1000) if command_timeout else -1
 
 
 def _applock_params(resource: str, timeout_ms: int) -> tuple[Any, ...]:
     return (resource, timeout_ms)
 
 
+#: Largest ``@LockTimeout`` ``sp_getapplock`` takes: the parameter is a T-SQL ``int`` (ms).
+_APPLOCK_MAX_TIMEOUT_MS: Final[int] = 2**31 - 1
+
+
+def _schema_applock_timeout_ms(schema_lock_timeout: float) -> int:
+    """``@LockTimeout`` (ms) for the schema lock, from ``[store].schema_lock_timeout`` (BACKLOG
+    #1726). Rounded up so a sub-millisecond setting still waits, rather than becoming ``0`` (no
+    wait), and clamped to the T-SQL ``int`` range rather than overflowing it."""
+    return min(max(math.ceil(schema_lock_timeout * 1000), 1), _APPLOCK_MAX_TIMEOUT_MS)
+
+
+class _ApplockTimeout(RuntimeError):
+    """``sp_getapplock`` returned ``-1``: its ``@LockTimeout`` elapsed before the lock was granted.
+    A ``RuntimeError`` like every other refusal :func:`_applock_result` raises, so existing callers
+    are unchanged; the schema open alone tells it apart, to name its own setting."""
+
+
 def _applock_result(row: Any, resource: str) -> None:
     """Raise on a negative ``sp_getapplock`` return code (timeout/cancel/deadlock/bad-param) rather than
     proceeding unserialized — a swallowed timeout would fork the audit chain or double-finalize."""
     rc = int(row[0]) if row and row[0] is not None else -999
-    if rc < 0:  # -1 timeout, -2 cancelled, -3 deadlock victim, -999 bad param
+    if rc == -1:
+        raise _ApplockTimeout(f"sp_getapplock({resource!r}) failed: rc={rc}")
+    if rc < 0:  # -2 cancelled, -3 deadlock victim, -999 bad param
         raise RuntimeError(f"sp_getapplock({resource!r}) failed: rc={rc}")
 
 
@@ -4634,10 +4651,19 @@ class SqlServerStore:
                     # open transaction for `@LockOwner='Transaction'` to attach to. (An earlier comment
                     # here read "this first statement opens the txn" — it predated the probe and was
                     # stale, not a contradiction of the applock rule record_audit now follows.)
-                    # The wait is unbounded; PostgresStore._ensure_schema says why. SQL Server has
-                    # no lock_timeout that bounds sp_getapplock, so here nothing else bounds it.
+                    # The wait is bounded by [store].schema_lock_timeout, not command_timeout;
+                    # PostgresStore._ensure_schema says why. Here the bound matters more: this
+                    # cursor carries no pyodbc query timeout, SQL Server has no lock_timeout that
+                    # reaches sp_getapplock, and cancelling the open cannot interrupt the driver
+                    # thread waiting in it, so @LockTimeout is the only thing that ends the wait.
                     log.info("sqlserver: waiting for the schema lock to apply the DDL batch")
-                    await self._applock(cur, _SCHEMA_LOCK, timeout_ms=_APPLOCK_WAIT_FOREVER)
+                    wait = self._settings.schema_lock_timeout
+                    try:
+                        await self._applock(
+                            cur, _SCHEMA_LOCK, timeout_ms=_schema_applock_timeout_ms(wait)
+                        )
+                    except _ApplockTimeout as exc:
+                        raise SchemaLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
                     # Double-check under the lock: the peer we queued behind may have just applied
                     # this exact batch and committed its marker — then this open has nothing to do.
                     if await self._schema_marker_current(cur, expected):

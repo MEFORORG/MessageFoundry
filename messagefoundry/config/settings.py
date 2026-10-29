@@ -40,6 +40,7 @@ import difflib
 import functools
 import ipaddress
 import logging
+import math
 import os
 import re
 import string
@@ -996,6 +997,15 @@ class StoreSettings(_Section):
     # #2283) and for a fixed multiple of it on SQL Server, longer but still bounded (BACKLOG #3023);
     # docs/CONNECTIONS.md has both, and says what else this knob does not reach.
     acquire_timeout: float = 30.0
+    # Upper bound (seconds) on a server-DB store open's wait for the schema lock that serializes the
+    # open-time DDL batch across engine shards and cluster nodes (BACKLOG #1726). The holder's batch
+    # is exempt from command_timeout, so a large first-upgrade index build can hold the lock far past
+    # it; this bound sits above such a build rather than at command_timeout. It is still a bound:
+    # on SQL Server nothing else limits sp_getapplock on the DDL cursor, and a stop cannot interrupt
+    # the driver thread waiting in it. On expiry the open fails with SchemaLockTimeout, its
+    # transaction rolls back with nothing applied, and the next start retries the idempotent batch.
+    # Must be > 0. No-op on SQLite.
+    schema_lock_timeout: float = 600.0
     # POSTGRES ONLY, refused on the other backends (see _db_schema_backend). 'db_schema' avoids
     # shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA.
     db_schema: str | None = None
@@ -1097,6 +1107,17 @@ class StoreSettings(_Section):
         # this setting exists to remove, so there is deliberately no way to configure it back.
         if value <= 0:
             raise ValueError("acquire_timeout must be > 0 (the pool wait is always bounded)")
+        return value
+
+    @field_validator("schema_lock_timeout")
+    @classmethod
+    def _positive_schema_lock_timeout(cls, value: float) -> float:
+        # No "0 disables" value, as with acquire_timeout: an unbounded schema-lock wait could hang a
+        # store open, and the service stop behind it, forever (BACKLOG #1726).
+        if not 0 < value < math.inf:
+            raise ValueError(
+                "schema_lock_timeout must be > 0 and finite (the wait is always bounded)"
+            )
         return value
 
     @field_validator("warm_pool_target")
