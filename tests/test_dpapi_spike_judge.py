@@ -30,6 +30,9 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 _WORKER = _REPO / "scripts" / "ci" / "dpapi_spike_worker.py"
 _RIG = _REPO / "scripts" / "ci" / "dpapi_spike.ps1"
+# The AppContainer spike (wave 3.1) lifts the installer the same way, so its lift is checked here too.
+_AC_RIG = _REPO / "scripts" / "ci" / "appcontainer_spike.ps1"
+_LIFTING_RIGS = pytest.mark.parametrize("rig", [_RIG, _AC_RIG], ids=["dpapi", "appcontainer"])
 _INSTALLER = _REPO / "scripts" / "service" / "install-service.ps1"
 OWNER_SID = "S-1-5-80-1111111111-2222222222-3333333333-4444444444-555555555"
 OTHER_SID = "S-1-5-21-1000000001-1000000002-1000000003-1001"
@@ -394,44 +397,49 @@ foreach ($v in $values) {
 """
 
 
-def _run_pwsh(tmp_path: Path, name: str, script: str, *args: str) -> dict[str, Any]:
-    """Run a check script under pwsh against the rig and the installer; its last line is JSON."""
+def _run_pwsh(
+    tmp_path: Path, name: str, script: str, *args: str, rig: Path = _RIG
+) -> dict[str, Any]:
+    """Run a check script under pwsh against a rig and the installer; its last line is JSON."""
     if shutil.which("pwsh") is None:
         pytest.skip("SKIP (nothing run): pwsh not on PATH")
     path = tmp_path / name
     path.write_text(script, encoding="utf-8")
     argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(path)]
-    argv += ["-RigPath", str(_RIG), "-InstallerPath", str(_INSTALLER), *args]
+    argv += ["-RigPath", str(rig), "-InstallerPath", str(_INSTALLER), *args]
     done = subprocess.run(argv, capture_output=True, text=True, timeout=120, check=False)
     assert done.returncode == 0, done.stderr
     result: dict[str, Any] = json.loads(done.stdout.strip().splitlines()[-1])
     return result
 
 
-def _lift_gaps(tmp_path: Path, drop: str = "") -> dict[str, Any]:
-    result = _run_pwsh(tmp_path, "lift_check.ps1", _LIFT_CHECK, "-Drop", drop)
+def _lift_gaps(tmp_path: Path, rig: Path, drop: str = "") -> dict[str, Any]:
+    result = _run_pwsh(tmp_path, "lift_check.ps1", _LIFT_CHECK, "-Drop", drop, rig=rig)
     result["gaps"] = list(result["gaps"] or [])
     return result
 
 
-def test_every_installer_helper_the_rig_lifts_is_lifted_with_it(tmp_path: Path) -> None:
+@_LIFTING_RIGS
+def test_every_installer_helper_the_rig_lifts_is_lifted_with_it(tmp_path: Path, rig: Path) -> None:
     # The rig lifts install-service.ps1's definitions by name, and runs only when its own files
     # change. A new helper call inside a lifted function would otherwise break the spike silently,
     # at its next run, with "not recognized".
-    result = _lift_gaps(tmp_path)
+    result = _lift_gaps(tmp_path, rig)
     assert result["lifted"] >= 18, "CONTROL FAILED: the rig's $lifted list was not read"
     assert result["gaps"] == []
 
 
-def test_the_lift_check_reports_a_value_left_out(tmp_path: Path) -> None:
+@_LIFTING_RIGS
+def test_the_lift_check_reports_a_value_left_out(tmp_path: Path, rig: Path) -> None:
     # The control arm for the variable branch: Resolve-Nssm reads $NssmExeSha256.
-    gaps = _lift_gaps(tmp_path, drop="NssmExeSha256")["gaps"]
+    gaps = _lift_gaps(tmp_path, rig, drop="NssmExeSha256")["gaps"]
     assert any("reads top-level $NssmExeSha256" in gap for gap in gaps), gaps
 
 
-def test_the_lift_check_reports_a_helper_left_out(tmp_path: Path) -> None:
+@_LIFTING_RIGS
+def test_the_lift_check_reports_a_helper_left_out(tmp_path: Path, rig: Path) -> None:
     # The control arm: Resolve-Nssm calls Get-FilePinProblem, so dropping it must be named.
-    gaps = _lift_gaps(tmp_path, drop="Get-FilePinProblem")["gaps"]
+    gaps = _lift_gaps(tmp_path, rig, drop="Get-FilePinProblem")["gaps"]
     assert any("calls Get-FilePinProblem" in gap for gap in gaps), gaps
 
 
