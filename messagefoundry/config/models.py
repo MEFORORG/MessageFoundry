@@ -409,6 +409,8 @@ class Source(BaseModel):
     # attests that a VERIFYING hop's certificates are checked for revocation elsewhere. Authored as a
     # top-level inbound key (inbound() / connections.toml) and filled by the runner's _source_config;
     # `tls_revocation_attested_reason` is mandatory with it and rides into the audit line.
+    # BACKLOG #2193: the same pair is the FTPS poller's attestation. That inbound dials out and
+    # verifies a SERVER, and RemoteFileSource runs the outbound RevocationHopGuard on it.
     tls_revocation_attested: bool = False
     tls_revocation_attested_reason: str | None = None
     # Vault BACKLOG #2370: the instance [tls] client trust-anchor policy, for the one inbound that

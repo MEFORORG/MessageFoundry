@@ -330,6 +330,7 @@ async def _lock_second_step(store: MessageStore, user_id: str) -> None:
         lockout_seconds=900.0,
         max_lockout_seconds=86_400.0,
         totp_usable=_opened_totp_state,
+        passkey_escalates=None,
     )
 
 

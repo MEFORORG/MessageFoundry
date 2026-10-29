@@ -626,6 +626,14 @@ SITES: dict[str, Site] = {
         "The module stem from an export's inbound name is folded through the guard (BACKLOG #1130).",
         "messagefoundry/corepoint_import.py::_sanitize",
     ),
+    "messagefoundry/engine_secrets.py::SecretsDirectory._read_file": Site(
+        1,
+        GUARDED,
+        "A name from the secrets directory's own listing that the open accepted: one of the fixed "
+        "setting names, or the value prefix then ASCII letters, digits and underscores. No separator "
+        "can reach the join (vault BACKLOG #2595).",
+        "messagefoundry/engine_secrets.py::open_secrets_directory",
+    ),
     "messagefoundry/generators/_core.py::write_corpus": Site(
         2,
         OPERATOR,
@@ -761,6 +769,15 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/transports/file.py::FileSource.__init__": Site(
         2, OPERATOR, "The operator's processed and error subdirectory settings."
+    ),
+    "messagefoundry/transports/file.py::FileSource.guarded_dirs": Site(
+        1, OPERATOR, "The operator's error subdirectory setting, as `__init__` joins it."
+    ),
+    "messagefoundry/transports/file.py::_prune_entries": Site(
+        1,
+        REVIEWED,
+        "A bare name from listing the archive directory the sweep opened through no link, joined "
+        "into that held directory; the Windows delete then opens it as itself, refusing a link.",
     ),
     "messagefoundry/transports/file.py::_archive": Site(
         1,

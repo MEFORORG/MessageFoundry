@@ -154,8 +154,8 @@ def crl_reload_refused_detail(
     ]
     if start_refuses:
         # "At least": the time is when one cause of a refusal ends, not a promise that a start
-        # loads the file then. A proven bad signature, or a private copy a start cannot make,
-        # still refuses after it (vault BACKLOG #3506); the remedy that follows says when.
+        # loads the file then. A private copy a start cannot make, for one, still refuses after
+        # it (vault BACKLOG #3506).
         parts.append(
             "A start refuses this file too at least until its CRL takes effect, so do not restart "
             "before then."
@@ -229,7 +229,9 @@ class AlertSink(Protocol):
         (auto-resolved on the next clean head via ADR-0044 durable state when wired). Distinct from
         :meth:`connection_stopped` (the ``stop``-policy terminal) so an operator can route a "still
         retrying, look at the dependency" signal apart from a halted lane. ``name`` is the stage-lane
-        label; ``detail`` is a PHI-free reason (stage + streak). Emitted by the ``StageDispatcher``."""
+        label; ``detail`` is a PHI-free reason (stage + streak). Emitted by the ``StageDispatcher``.
+        Under ``retry_forever`` it also fires for a serializer HOLDING its lane while the re-pend of
+        its claimed rows keeps failing (BACKLOG #1611), which the ADR 0070 streak cannot reach."""
         ...
 
     def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:
@@ -606,24 +608,29 @@ class AlertSink(Protocol):
         #3010, the ``auth.ad_reconcile_misconfigured`` row), which leaves those accounts unjudged the
         same way; or one account's group search was refused for the engine's own bound
         (``group_search_deadline`` or ``group_search_cap``, vault BACKLOG #3696), raised once as
-        the account enters that state, which leaves it unjudged too. The type's name predates every
-        case but the first. Read ``reason`` before naming the cause.
+        the account enters that state, which leaves it unjudged too; or the directory has stayed
+        unreachable for ``[auth].ad_reconcile_outage_passes`` passes running
+        (``directory_unavailable``, BACKLOG #3709, the ``auth.ad_reconcile_skipped`` row whose
+        ``passes`` the page names), raised once per run. The type's name predates every case but the first. Read
+        ``reason`` before naming the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
         ``"directory-reconciler-referral"`` for a referral, ``"directory-reconciler-probe-fault"``
         for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
-        and ``"directory-reconciler-paging:<username>"`` for a paging refusal, so each is its own
-        instance and throttle. ``reason`` is one of those six closed-set slugs. ``probed`` is, for
+        ``"directory-reconciler-paging:<username>"`` for a paging refusal, and
+        ``"directory-reconciler-outage"`` for a lasting outage, so each is its own instance and
+        throttle. ``reason`` is one of those seven closed-set slugs. ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal
         carries that same count of candidates the pass took up, asked or not, which counts any
         id-less row: a paging refusal concerns one account, and its count is still the pass's. For
-        a referral, a configuration refusal and a probe fault it is how many probes the pass sent to
-        the directory, which leaves out an id-less row (BACKLOG #3170). ``detail`` is the
-        operator-facing explanation the auth service latches, or for a paging refusal a fixed
-        sentence naming its cause. No PHI. Emitted by the API-lifespan reconciler task, never from
-        ``auth/``. A whole-directory outage is NOT this event: it is audited as
-        ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine. A pass where
-        every probe fails and none is referred, refused or faults is such an outage."""
+        a referral, a configuration refusal, a probe fault and a lasting outage it is how many
+        probes the pass sent to the directory, which leaves out an id-less row (BACKLOG #3170).
+        ``detail`` is the operator-facing explanation the auth service latches, or for a paging
+        refusal or a lasting outage a fixed sentence. No PHI. Emitted by the API-lifespan
+        reconciler task, never from ``auth/``. A single whole-directory outage pass is NOT this
+        event: it is audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the
+        accounts are fine. A pass where every probe fails and none is referred, refused or faults
+        is such an outage."""
         ...
 
     def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
@@ -645,7 +652,9 @@ class AlertSink(Protocol):
         (``AuthService._mark_reconcile_clears`` states the test). Emits **no** notification; when
         alert-state is wired (ADR 0044) it auto-resolves the open ``ad_reconcile_aborted`` instance
         for the same ``name``: ``"directory-reconciler"`` for the breaker's instance, and
-        ``"directory-reconciler-referral"`` for the referral's. Raised on every such pass, except where
+        ``"directory-reconciler-referral"`` for the referral's, and ``"directory-reconciler-outage"``
+        for a lasting outage's, on a pass that reached the directory after a run that paged
+        (``AuthService._note_directory_outage``, BACKLOG #3709). Raised on every such pass, except where
         ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
         ``[cluster]`` node or in an engine that runs more than one engine shard
         (``api/app.py::_without_clears`` says why), and while the open instance is one an earlier
@@ -1189,8 +1198,8 @@ class LoggingAlertSink:
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
             # The count is the candidates the pass took up for the breaker and a paging refusal, or
-            # the probes the pass asked for a referral, a configuration refusal and a probe fault
-            # (BACKLOG #3170); see AlertSink.ad_reconcile_aborted.
+            # the probes the pass asked for a referral, a configuration refusal, a probe fault and a
+            # lasting outage (BACKLOG #3170, #3709); see AlertSink.ad_reconcile_aborted.
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked or unjudged, in a pass counting "
             "%d principal(s) "
             "(%s): %s",
@@ -1211,7 +1220,8 @@ class LoggingAlertSink:
 
     def ad_reconcile_breaker_cleared(self, name: str) -> None:
         # The inverse (auto-resolve) event, raised on every clear pass; no page, so DEBUG.
-        # The referral's source label raises it too, once no referral stands (BACKLOG #2538).
+        # The referral's source label raises it too, once no referral stands (BACKLOG #2538), and
+        # the outage's, on a reach after a run that paged (BACKLOG #3709).
         log.debug("ALERT ad_reconcile_breaker_cleared: %r found its condition clear", name)
 
     def ad_reconcile_hold_released(self, name: str) -> None:

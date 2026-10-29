@@ -180,7 +180,7 @@ def test_a_sqlserver_pin_with_a_private_key_is_refused_at_load(tmp_path: Path, l
 
 @pytest.mark.parametrize("label", _KEY_SHAPES)
 def test_an_sslca_file_with_a_private_key_is_refused(tmp_path: Path, label: str) -> None:
-    """Red with the private-key check removed from ``_refuse_one_encrypted_ca_file``."""
+    """Red with the private-key check removed from ``_refuse_encrypted_driver_ca``."""
     ca = _write(tmp_path, _with_key(label))
     with pytest.raises(ValueError, match=re.escape(f"the CA file {PRIVATE_KEY_SCOPE}")) as refused:
         _build(sslca=ca)

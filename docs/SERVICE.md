@@ -617,6 +617,20 @@ environment.
   not refused. What the engine reads, what it names and what it does not cover are in
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment).
 
+- **The other secrets: a secrets directory (any platform).** At least the engine's own secret
+  settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
+  value can each come from a file instead of the service's NSSM list. A variable an operator names
+  as a `[secrets].provider = "env"` reference, and one a library reads for itself, are not read
+  from it. Point `MEFOR_SECRETS_DIRECTORY` at a directory only
+  SYSTEM, Administrators and the service account can reach, with one file per setting, named as
+  its variable. A path in the NSSM list is not a secret. The engine refuses a directory or file a
+  broad group can read or change. The files are plain, protected by their access list alone, and
+  nothing creates the directory yet, so you create it. Which settings it supplies, and the rules,
+  are stated once, in
+  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). This is the
+  first part of the protected channel vault BACKLOG #2595 asks for, not the whole of it: a secret
+  left in the NSSM list is still named, not refused.
+
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:
 >

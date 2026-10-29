@@ -34,9 +34,10 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from messagefoundry.config.settings import RetentionSettings, StoreBackend
@@ -44,7 +45,14 @@ from messagefoundry.config.wiring import Registry
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store import Store, StripResult
+from messagefoundry.transports.base import (
+    ArchiveGuard,
+    ProcessedArchive,
+    archive_dir_key,
+    build_archive_guard,
+)
 
 __all__ = [
     "DiskFloorReading",
@@ -269,6 +277,10 @@ class RetentionPass:
     # declares. Metadata only: a count, never a key or a value. 0 when the window is unset, when no
     # registry is wired, or when the registry declares no reference sets (the positive-signal skip).
     reference_snapshots_purged: int = 0
+    # Archived copies DELETEd from running File inbounds' `.processed` directories this pass, past
+    # `processed_archive_days` (owner ruling A2 of 2026-10-08, BACKLOG #1188). A count only, never a
+    # file or connection name. 0 when the window is unset or no File inbound is bound.
+    processed_archives_deleted: int = 0
     # This pass hit the `max_pass_seconds` between-phase duration cap (#121, ADR 0137) and SKIPPED its
     # remaining phases — the skipped tail (incl. any due WAL-checkpoint/VACUUM) re-runs next interval with
     # its last-run marker unadvanced. Always False when the cap is off (`max_pass_seconds<=0`, the
@@ -311,6 +323,7 @@ class RetentionPass:
             or self.app_logs_compressed > 0
             or self.search_presets_purged > 0
             or self.reference_snapshots_purged > 0
+            or self.processed_archives_deleted > 0
             or self.vacuumed
             or self.over_limit
             or self.capped
@@ -333,8 +346,25 @@ class RetentionRunner:
         coordinator: ClusterCoordinator | None = None,
         registry_source: Callable[[], Registry | None] | None = None,
         log_dir: str | None = None,
+        archive_source: Callable[[], Sequence[ProcessedArchive]] | None = None,
+        guard_source: Callable[[], Iterable[Path] | None] | None = None,
+        engine_dirs: Iterable[Path] = (),
+        engine_trees: Iterable[Path] = (),
     ) -> None:
         self._store = store
+        # The engine's own directories (store, keys, TLS pair, config) and trees (backup destination,
+        # log directory), which no archive sweep may reach either (BACKLOG #1188): an archive that is
+        # or holds one is refused, and so is one inside a tree.
+        self._engine_dirs = tuple(engine_dirs)
+        self._engine_trees = tuple(engine_trees)
+        # The bound inbounds whose `.processed` archive the `processed_archive_days` sweep ages out
+        # (BACKLOG #1188), read from the LIVE graph each pass like the registry. None (embedding,
+        # tests) = nothing to sweep.
+        self._archive_source = archive_source
+        # Every inbound's watch and `.error` directories across all engine shards, and every File
+        # outbound's target directory, bound or not, which no archive sweep may reach. Returning None
+        # means one could not be resolved, so the sweep deletes nothing.
+        self._guard_source = guard_source
         self._settings = settings
         # The SQLite store file the low-disk floor measures (BACKLOG #290); None when the floor
         # cannot apply to this store. See sqlite_store_file for the rule.
@@ -385,6 +415,7 @@ class RetentionRunner:
             or s.connection_event_retention_hours
             or s.search_preset_days
             or s.reference_snapshot_days
+            or s.processed_archive_days
             or s.max_db_mb
             or s.audit_log_warn_rows
             or self._wal_truncate_applies()
@@ -418,7 +449,8 @@ class RetentionRunner:
         log.info(
             "retention enabled: messages_days=%d dead_letter_days=%d max_db_mb=%d "
             "min_free_disk_mb=%d audit_log_warn_rows=%d wal_checkpoint_seconds=%g vacuum_at=%r "
-            "app_log_days=%d app_log_compress_days=%d max_pass_seconds=%g (every %gs)",
+            "app_log_days=%d app_log_compress_days=%d processed_archive_days=%d "
+            "max_pass_seconds=%g (every %gs)",
             self._settings.messages_days,
             self._settings.dead_letter_days,
             self._settings.max_db_mb,
@@ -428,6 +460,7 @@ class RetentionRunner:
             self._settings.vacuum_at,
             self._settings.app_log_days,
             self._settings.app_log_compress_days,
+            self._settings.processed_archive_days,
             self._settings.max_pass_seconds,
             self._settings.purge_interval_seconds,
         )
@@ -703,6 +736,16 @@ class RetentionRunner:
                 self._compress_app_logs, now, _deadline_hit
             )
 
+        # The File source's `.processed` archive (owner ruling A2 of 2026-10-08, BACKLOG #1188): a
+        # clear-text copy of every inbound payload, aged out on ARCHIVE time at the body window. Each
+        # source does its own blocking I/O off the loop and under its own credential, re-reading the
+        # deadline per file, so a large directory releases the pass like the compressor does.
+        processed_archives_deleted = 0
+        if not _deadline_hit() and s.processed_archive_days > 0:
+            processed_archives_deleted = await self._prune_processed_archives(
+                now - s.processed_archive_days * _SECONDS_PER_DAY, _deadline_hit
+            )
+
         # Maintenance phases (WAL-checkpoint, then daily VACUUM). Their cadence markers advance ONLY when
         # the phase actually runs, so a phase SKIPPED by the cap stays due for the next pass (#121). A
         # running VACUUM is non-interruptible: the deadline is checked only BEFORE it is dispatched.
@@ -761,6 +804,7 @@ class RetentionRunner:
             app_log_bytes_reclaimed=app_log_bytes_reclaimed,
             search_presets_purged=search_presets_purged,
             reference_snapshots_purged=reference_snapshots_purged,
+            processed_archives_deleted=processed_archives_deleted,
             capped=capped,
             below_disk_floor=below_disk_floor,
             wal_left_untruncated=wal_left_untruncated,
@@ -769,6 +813,92 @@ class RetentionRunner:
         if result.did_work:
             await self._audit(result)
         return result
+
+    async def _prune_processed_archives(
+        self, older_than: float, deadline_hit: Callable[[], bool]
+    ) -> int:
+        """Run each bound archive's sweep, and return how many files went in all (BACKLOG #1188).
+
+        Every archive is handed the watch and ``.error`` directories of every inbound in the
+        deployment, on every engine shard, and every File outbound's target directory, bound or not,
+        so one whose archive directory overlaps any connection's drops, quarantine or deliveries
+        deletes nothing. When a connection's directories cannot be read from its configuration the
+        whole sweep is skipped: the guard is only as good as its list. A guarded directory whose
+        identity cannot be read is read again by each archive under its own identity, and an archive
+        that still cannot read it is not swept (:class:`ArchiveGuard`), nor is one whose opened
+        directory has no readable identity. A directory two connections share is swept once. A
+        fault in one connection is logged and the others still run, because a sweep must never stop the pass: a pass that
+        raised here would lose the audit row for what it had already purged."""
+        # Everything up to the sweep itself is contained: a fault here, a connector's declared
+        # directories raising say, must not escape the pass and lose its audit row.
+        try:
+            archives = list(self._archive_source()) if self._archive_source is not None else []
+            if not any(a.archiving for a in archives):
+                return 0
+            guarded: list[Path] = [p for a in archives for p in (a.directory, a.error_dir)]
+            if self._guard_source is not None:
+                extra = self._guard_source()
+                if extra is None:
+                    log.warning(
+                        "the [retention].processed_archive_days sweep deleted nothing this pass: a "
+                        "connection's directories could not be resolved from its configuration, so "
+                        "the sweep cannot tell what it must not reach"
+                    )
+                    return 0
+                guarded.extend(extra)
+            guarded.extend(self._engine_dirs)
+            guarded.extend(self._engine_trees)
+            protected, keys = await asyncio.to_thread(
+                _archive_keys, guarded, [a.processed_dir for a in archives], self._engine_trees
+            )
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            log.warning(
+                "the [retention].processed_archive_days sweep deleted nothing this pass: the "
+                "directories it must not reach could not be listed (%s)",
+                safe_exc(exc),
+            )
+            return 0
+        # Set when this task is cancelled, so a sweep already running on a worker thread stops at its
+        # next file instead of deleting on after the engine has stopped.
+        cancelled = threading.Event()
+
+        def stop_hit() -> bool:
+            return cancelled.is_set() or deadline_hit()
+
+        swept: set[str] = set()
+        deleted = 0
+        for archive, key in zip(archives, keys, strict=True):
+            if stop_hit():
+                break
+            # Only a source that archives is swept, and only it claims the directory, so a leave
+            # source sharing a directory with a move source does not shadow it.
+            if not archive.archiving or key in swept:
+                continue
+            try:
+                outcome = await archive.prune_processed_archive(
+                    older_than, protected=protected, deadline_hit=stop_hit
+                )
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            except OSError as exc:
+                # A file fault is the sweep's own to absorb; this catches what escapes it, the
+                # alternate credential failing say, which the protocol raises as an OSError.
+                # safe_exc, because an OSError renders its path and below the archive directory a
+                # path is a partner's file name.
+                log.warning(
+                    "the [retention].processed_archive_days sweep failed for the archive directory "
+                    "%s (%s); nothing more was deleted there this pass",
+                    archive.processed_dir.name,
+                    safe_exc(exc),
+                )
+                continue
+            # Only a sweep that ran claims the directory: one refused (an unreadable guarded
+            # directory under its identity, say) or failed leaves it to a sibling that shares it.
+            if outcome is not None:
+                swept.add(key)
+                deleted += outcome
+        return deleted
 
     # --- per-connection retention overrides (#34, ADR 0027) ------------------
 
@@ -1268,6 +1398,10 @@ class RetentionRunner:
                 # narrow which patient cohort was dropped; the count is what an assessor needs.
                 "reference_snapshot_days": self._settings.reference_snapshot_days,
                 "reference_snapshots_purged": result.reference_snapshots_purged,
+                # `.processed` archive copies deleted (BACKLOG #1188) + the window. The COUNT only:
+                # never a file name, which can carry an identifier, nor a connection name.
+                "processed_archive_days": self._settings.processed_archive_days,
+                "processed_archives_deleted": result.processed_archives_deleted,
                 # Between-phase duration cap (#121, ADR 0137): the configured ceiling + whether THIS pass
                 # hit it and skipped its remaining phases. Timing metadata only — no PHI.
                 "max_pass_seconds": self._settings.max_pass_seconds,
@@ -1302,3 +1436,27 @@ class RetentionRunner:
     def _day_key(now: float) -> str:
         lt = time.localtime(now)
         return f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
+
+
+def _archive_keys(
+    guarded: Iterable[Path], archives: Sequence[Path], trees: Iterable[Path] = ()
+) -> tuple[ArchiveGuard, list[str]]:
+    """Build the guard over the protected directories once per pass, and each archive directory's
+    key for sweeping a shared directory once (BACKLOG #1188). Blocking: run off the loop.
+
+    The once-only key is resolved but NOT case-folded: two directories that differ only in case on a
+    case-sensitive volume are two archives, and folding would leave the second unswept."""
+    keys = []
+    for path in archives:
+        try:
+            keys.append(os.path.normcase(os.path.realpath(path)))
+        except (OSError, ValueError):
+            keys.append(os.path.normcase(os.path.abspath(path)))
+    tree_keys = set()
+    for tree in trees:
+        try:
+            tree_keys.add(archive_dir_key(tree))
+        except (OSError, ValueError):
+            tree_keys.add(os.path.normcase(os.path.abspath(tree)).casefold())
+    guard = build_archive_guard(guarded)
+    return replace(guard, trees=frozenset(tree_keys)), keys

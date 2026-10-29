@@ -6,7 +6,8 @@ The code-first graph references environment-specific values via ``env("key")`` (
 :mod:`messagefoundry.config.wiring`); this module gathers those values for the running instance's
 environment. Non-secret values live in a flat TOML table ``<dir>/<env>.toml`` (versioned in the
 repo, diffable, reviewable); secrets are supplied as ``MEFOR_VALUE_<KEY>`` environment variables
-(never the file), and **env overrides the file**.
+or as files of that name in the secrets directory (never the file), and **env overrides the file**,
+and the secrets directory overrides both.
 
 This module only *gathers* the values; a referenced key that ends up undefined is surfaced **loud**
 later, when the engine builds the connector (:func:`messagefoundry.config.wiring.resolve_env_settings`)
@@ -35,6 +36,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from messagefoundry.config.snapshot import ConfigSnapshot
 
+from messagefoundry.engine_secrets import VALUE_PREFIX, open_secrets_directory
+
 __all__ = [
     "VALUE_ENV_PREFIX",
     "EnvironmentValuesReader",
@@ -48,7 +51,7 @@ __all__ = [
 ]
 
 #: Env-var prefix for environment values (esp. secrets): MEFOR_VALUE_EPIC_HOST -> key "epic_host".
-VALUE_ENV_PREFIX = "MEFOR_VALUE_"
+VALUE_ENV_PREFIX = VALUE_PREFIX
 
 _log = logging.getLogger(__name__)
 
@@ -193,7 +196,8 @@ def load_environment_values(
     """Resolve this instance's environment values.
 
     Reads ``<base_dir>/<dir_name>/<environment>.toml`` (a flat key→scalar table) if present, then
-    overlays ``MEFOR_VALUE_<KEY>`` env vars (env wins). A missing file is **not** an error here —
+    overlays ``MEFOR_VALUE_<KEY>`` env vars (env wins), then a ``MEFOR_VALUE_<KEY>`` file in the secrets
+    directory (the directory wins; :mod:`messagefoundry.engine_secrets`). A missing file is **not** an error here —
     referenced-but-undefined keys fail loud when a connector is built, not at gather time.
     """
     path = values_file_path(base_dir, dir_name, environment)
@@ -233,5 +237,12 @@ def environment_values_from_bytes(
             key = name[len(VALUE_ENV_PREFIX) :].lower()
             if key:
                 values[key] = value  # env (incl. secrets) overrides the file
+
+    # The secrets directory overrides both (vault BACKLOG #2595, ADR 0214): a file named
+    # MEFOR_VALUE_<KEY> there supplies that value. Unset, nothing is read; unusable, it refuses.
+    directory = open_secrets_directory(environ)
+    if directory is not None:
+        for name, value in directory.read_values().items():
+            values[name[len(VALUE_ENV_PREFIX) :].lower()] = value
 
     return values

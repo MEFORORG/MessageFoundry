@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import ssl
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,6 +46,7 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
     build_smtp_tls_context,
     context_checks_revocation,
+    relax_verify_expiry,
 )
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.transports import dicom as dicom_module
@@ -61,6 +63,11 @@ from messagefoundry.transports.rest import (
     opener_tls_context,
 )
 from tests.test_direct_transport import _mint_ca, _mint_leaf, _write_key, _write_pem
+from tests.test_hop_refusal_revocation import (
+    _crl_coverage_ca,
+    _crl_coverage_server,
+    _handshake,
+)
 from tests.test_revocation_audit_names_connection import _build_check, _shipped
 
 ENFORCING = HopPosture(enforcing=True)
@@ -519,12 +526,15 @@ def _ftps(
     *,
     protocol: str = "ftps",
     tls_verify: bool = True,
+    allow_expired: bool = False,
     attested: bool = False,
     policy: TrustAnchorPolicy | None = None,
 ) -> Destination:
     settings: dict[str, object] = {"host": host, "remote_dir": "/in", "protocol": protocol}
     if not tls_verify:
         settings["tls_verify"] = False
+    if allow_expired:
+        settings["tls_allow_expired"] = True
     return _dest("OB_FTPS", ConnectorType.REMOTEFILE, settings, attested=attested, policy=policy)
 
 
@@ -556,26 +566,6 @@ def test_a_configured_crl_does_not_admit_an_ftps_upload_whose_context_lacks_it(
     )
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
         RemoteFileDestination(_ftps(REMOTE, policy=_crl_policy(bare_crl)))
-
-
-def test_an_inbound_ftps_poll_loads_the_instance_crl(bare_crl: str) -> None:
-    """Vault BACKLOG #2370: the poller now gets the ``[tls]`` policy, CRL included. It is still not
-    gated, so the control is that it builds without a CRL and checks none."""
-    settings = {"host": REMOTE, "remote_dir": "/in", "protocol": "ftps"}
-    with active_hop_posture(ENFORCING):
-        polled = RemoteFileSource(
-            Source(
-                type=ConnectorType.REMOTEFILE,
-                name="IB_FTPS",
-                settings=dict(settings),
-                trust_anchor_policy=_crl_policy(bare_crl),
-            )
-        )
-        control = RemoteFileSource(
-            Source(type=ConnectorType.REMOTEFILE, name="IB_FTPS", settings=dict(settings))
-        )
-    assert context_checks_revocation(polled._client.tls_context) is True
-    assert context_checks_revocation(control._client.tls_context) is False
 
 
 def test_an_ftps_upload_crosses_on_its_attestation_and_is_audited() -> None:
@@ -638,6 +628,234 @@ def test_an_anonymous_plain_ftp_upload_is_the_cleartext_refusal_not_this_one() -
         RemoteFileDestination(_ftps(REMOTE, protocol="ftp"))
     assert "cleartext anonymous FTP" in str(exc.value)
     assert "revocation" not in str(exc.value)
+
+
+# --- FTPS poll, the inbound source (transports/remotefile.py) --------------------------------------
+#
+# The one inbound that dials out and verifies a server. It sends the FTP login and reads message
+# files, so it is a credential and PHI hop like the upload. Vault BACKLOG #2370 handed it the
+# [tls] policy, so a CRL can reach its context; #2193 slice (a) gives it the upload's guard.
+
+
+def _poll(
+    host: str,
+    *,
+    protocol: str = "ftps",
+    tls_verify: bool = True,
+    allow_expired: bool = False,
+    attested: bool = False,
+    policy: TrustAnchorPolicy | None = None,
+) -> Source:
+    settings: dict[str, object] = {"host": host, "remote_dir": "/in", "protocol": protocol}
+    if not tls_verify:
+        settings["tls_verify"] = False
+    if allow_expired:
+        settings["tls_allow_expired"] = True
+    return Source(
+        type=ConnectorType.REMOTEFILE,
+        name="IB_FTPS",
+        settings=settings,
+        tls_revocation_attested=attested,
+        tls_revocation_attested_reason=REASON if attested else None,
+        trust_anchor_policy=policy or TrustAnchorPolicy(),
+    )
+
+
+def test_an_ftps_poll_is_refused_when_it_checks_no_revocation() -> None:
+    # THE CONTROL. Before #2193 slice (a) this constructed: the poll took no guard at all.
+    with (
+        active_hop_posture(ENFORCING),
+        pytest.raises(InsecureHopRefused, match="revocation") as exc,
+    ):
+        RemoteFileSource(_poll(REMOTE))
+    assert "connection 'inbound:IB_FTPS';" in str(exc.value)
+    assert "REMOTEFILE ftps source" in str(exc.value)
+
+
+def test_an_ftps_poll_is_admitted_when_a_crl_reaches_its_own_context(bare_crl: str) -> None:
+    with active_hop_posture(ENFORCING):
+        polled = RemoteFileSource(_poll(REMOTE, policy=_crl_policy(bare_crl)))
+    assert context_checks_revocation(polled._client.tls_context) is True
+
+
+def test_a_configured_crl_does_not_admit_an_ftps_poll_whose_context_lacks_it(
+    bare_crl: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard reads the client's context, never the setting, as the upload's does."""
+    monkeypatch.setattr(
+        remotefile_module,
+        "_ftps_ssl_context",
+        _without_the_policy(remotefile_module._ftps_ssl_context),
+    )
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
+        RemoteFileSource(_poll(REMOTE, policy=_crl_policy(bare_crl)))
+
+
+def test_a_crl_does_not_admit_an_ftps_hop_that_ignores_certificate_expiry(bare_crl: str) -> None:
+    """``tls_allow_expired`` sets ``X509_V_FLAG_NO_CHECK_TIME``, which OpenSSL applies to the CRL's
+    validity window too, so a CRL past ``nextUpdate`` would still be accepted at the handshake. A
+    CRL on that context is not a check that may relax the refusal, as on REST (vault BACKLOG
+    #2188). Both directions share the guard, so both are read here."""
+    with active_hop_posture(ENFORCING):
+        with pytest.raises(InsecureHopRefused, match="revocation") as exc:
+            RemoteFileSource(_poll(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
+        # The refusal offers only levers that can cross it: not the CRL it already has.
+        assert "tls_allow_expired" in str(exc.value)
+        assert "Configure [tls].crl_file" not in str(exc.value)
+        assert remotefile_module._EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
+        with pytest.raises(InsecureHopRefused, match="revocation") as exc:
+            RemoteFileDestination(_ftps(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
+        assert remotefile_module._EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
+        assert "Configure [tls].crl_file" not in str(exc.value)
+        # The control: the same hop without the relaxation is admitted by that CRL.
+        RemoteFileSource(_poll(REMOTE, policy=_crl_policy(bare_crl)))
+        # And the attestation still crosses it.
+        RemoteFileSource(_poll(REMOTE, allow_expired=True, attested=True))
+
+
+def test_a_crl_still_refuses_a_listed_leaf_on_a_context_that_skips_validity_checks(
+    tmp_path: Path,
+) -> None:
+    """What the expiry-relaxed refusal says a CRL still does, as a measurement. ``tls_allow_expired``
+    adds ``X509_V_FLAG_NO_CHECK_TIME``, and a leaf the CRL lists is still refused under it, with a
+    fresh CRL and with one past ``nextUpdate`` that the same flag lets through. Synthetic PKI."""
+    host = "revoked-leaf.test"
+    ca_key, ca = _crl_coverage_ca("mefor-2193-revoked-leaf-ca")
+    server = _crl_coverage_server(ca_key, ca, host, tmp_path)
+    leaf = x509.load_pem_x509_certificate((tmp_path / f"{host}.crt").read_bytes())
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+    pem = serialization.Encoding.PEM
+
+    def client(*, next_update: datetime.datetime, relaxed: bool) -> ssl.SSLContext:
+        crl = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(ca.subject)
+            .last_update(now - 30 * day)
+            .next_update(next_update)
+            .add_revoked_certificate(
+                x509.RevokedCertificateBuilder()
+                .serial_number(leaf.serial_number)
+                .revocation_date(now - 2 * day)
+                .build()
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+        bundle = tmp_path / f"ca_and_crl_{int(next_update.timestamp())}_{relaxed}.pem"
+        bundle.write_bytes(ca.public_bytes(pem) + crl.public_bytes(pem))
+        ctx = ssl.create_default_context(cafile=str(bundle))
+        assert ctx.cert_store_stats()["crl"] == 1
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+        if relaxed:
+            relax_verify_expiry(ctx, host=host)
+        return ctx
+
+    fresh, lapsed = now + 30 * day, now - day
+    # The control: without the relaxation the lapsed CRL refuses first, so the listing is untested.
+    assert _handshake(client(next_update=lapsed, relaxed=False), server, host) == "CRL has expired"
+    assert (
+        _handshake(client(next_update=fresh, relaxed=True), server, host) == "certificate revoked"
+    )
+    assert (
+        _handshake(client(next_update=lapsed, relaxed=True), server, host) == "certificate revoked"
+    )
+
+
+@pytest.mark.parametrize("shape", ["missing", "not a crl"])
+def test_an_ftps_poll_whose_configured_crl_cannot_be_read_is_refused(
+    shape: str, tmp_path: Path
+) -> None:
+    """Fail closed: a CRL the operator set but the engine cannot load refuses the poll, under any
+    posture, rather than building a context that checks nothing and connecting unguarded."""
+    crl = tmp_path / "crl.pem"
+    if shape == "not a crl":
+        crl.write_text("this is not a PEM CRL\n", encoding="utf-8")
+    for posture in (ENFORCING, NOT_ENFORCING):
+        with active_hop_posture(posture), pytest.raises(ValueError, match=r"\[tls\]\.crl_file"):
+            RemoteFileSource(_poll(REMOTE, policy=_crl_policy(str(crl))))
+
+
+def test_an_ftps_poll_crosses_on_its_attestation_and_is_audited() -> None:
+    with active_hop_posture(ENFORCING), _guard_log() as log:
+        RemoteFileSource(_poll(REMOTE, attested=True))
+    shipped = _shipped(log.audit)
+    assert "connection 'inbound:IB_FTPS';" in shipped and REASON in shipped, log.state()
+    assert "REMOTEFILE ftps source" in shipped
+
+
+def test_an_ftps_poll_refused_for_another_reason_logs_no_crossing() -> None:
+    """The guard runs last in the constructor, so a poll refused by another check has logged no
+    attested crossing for a hop that never built. The control is the same poll, valid, which does
+    log its crossing in the same capture."""
+    bad = _poll(REMOTE, attested=True)
+    bad.settings["after_read"] = "archive"
+    with active_hop_posture(ENFORCING), _guard_log() as log:
+        with pytest.raises(ValueError, match="after_read"):
+            RemoteFileSource(bad)
+        assert not log.audit, log.state()
+        RemoteFileSource(_poll(REMOTE, attested=True))
+    assert "connection 'inbound:IB_FTPS';" in log.audit, log.state()
+
+
+def test_an_ftps_poll_on_loopback_still_crosses() -> None:
+    with active_hop_posture(ENFORCING):
+        polled = RemoteFileSource(_poll(LOOPBACK))
+    assert context_checks_revocation(polled._client.tls_context) is False
+
+
+def test_an_ftps_poll_warns_but_builds_when_not_enforcing() -> None:
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
+        RemoteFileSource(_poll(REMOTE))
+    assert log.has("revocation") and log.has("REMOTEFILE ftps source"), log.state()
+
+
+def test_an_ftps_poll_built_outside_the_gate_is_unchanged() -> None:
+    RemoteFileSource(_poll(REMOTE))
+
+
+def test_an_ftps_poll_that_verifies_nothing_is_the_verify_off_refusal_not_this_one() -> None:
+    with active_hop_posture(ENFORCING), pytest.raises(ValueError, match="tls_verify=false") as exc:
+        RemoteFileSource(_poll(REMOTE, tls_verify=False))
+    assert "revocation" not in str(exc.value)
+
+
+def test_an_anonymous_plain_ftp_poll_is_the_cleartext_refusal_not_this_one() -> None:
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused) as exc:
+        RemoteFileSource(_poll(REMOTE, protocol="ftp"))
+    assert "cleartext anonymous FTP" in str(exc.value)
+    assert "revocation" not in str(exc.value)
+
+
+def _poll_config(tmp_path: Path, *, declared: bool) -> Path:
+    attest = f', tls_revocation_attested=True, tls_revocation_attested_reason="{REASON}"'
+    (tmp_path / "poll.py").write_text(
+        "from messagefoundry import Ftp, inbound, router\n"
+        "@router('r')\n"
+        "def r(msg):\n"
+        "    return []\n"
+        "inbound('IB_FTPS', Ftp(host='ftp.example.org', tls=True, remote_dir='/out'), "
+        f"router='r'{attest if declared else ''})\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_the_check_gate_refuses_an_undeclared_ftps_poll_and_admits_a_declared_one(
+    tmp_path: Path,
+) -> None:
+    """End to end through the gate ``messagefoundry check``, dry-run and reload reach, with the
+    Source the runner really builds: the typed inbound declaration is what reaches the poll."""
+    undeclared = tmp_path / "undeclared"
+    undeclared.mkdir()
+    registry = load_config(_poll_config(undeclared, declared=False), allow_empty=True)
+    with pytest.raises(WiringError, match="revocation"):
+        _build_check(registry)
+    declared = tmp_path / "declared"
+    declared.mkdir()
+    registry = load_config(_poll_config(declared, declared=True), allow_empty=True)
+    with _guard_log() as log:
+        _build_check(registry)
+    assert "connection 'inbound:IB_FTPS';" in log.audit and REASON in log.audit, log.state()
 
 
 # --- DIRECT: the SMTP authentication leg (transports/direct.py) ------------------------------------
