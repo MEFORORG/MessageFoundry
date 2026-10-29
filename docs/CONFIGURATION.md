@@ -1088,7 +1088,7 @@ applies, and the alert item above says what the suffix holds. The count in the a
 different number: how many times the engine has raised that alert.
 
 `queued` is how many records sit on the in-memory hand-off queue right now, both lanes, capped at
-the general lane's bound. It does not count records waiting in the on-disk spool, and no field
+the smaller lane bound. It does not count records waiting in the on-disk spool, and no field
 does. Every other count runs from the start of
 the process. While the state is `not_installed`, every count reads zero, whatever was counted
 before. Each engine process has

@@ -1019,16 +1019,17 @@ class _ForwardLanes(queue.Queue[Any]):
         return len(self.queue) + len(self.audit)
 
     def reported_qsize(self) -> int:
-        """What :func:`forwarder_status` reports as ``queued``: both lanes, capped at the general
-        lane's bound.
+        """What :func:`forwarder_status` reports as ``queued``: both lanes, capped at the smaller
+        lane bound.
 
         Both lanes, so a collector that stalls while only audit lines arrive still shows a rising
-        depth, as the single queue did. Capped, so that once the general lane is full the reading
-        is pinned there as the single queue's was, and an audit row written then cannot move it
-        (BACKLOG #1131). Below the cap the reading is the one a single queue of that bound would
-        give for the same records, so it says nothing the single queue did not."""
+        depth, as the single queue did. Capped at the smaller bound, so that once EITHER lane is
+        full the reading is pinned at the cap: an audit row written while the general lane is full
+        cannot move it, and a drop from either lane reads the same, whatever the two bounds are
+        (BACKLOG #1131). Below the cap the reading is the one a single queue would give for the
+        same records, so it says nothing the single queue did not."""
         with self.mutex:
-            return min(self._qsize(), self.lane_maxsize)
+            return min(self._qsize(), self.lane_maxsize, self.audit_maxsize)
 
     def _put(self, item: Any) -> None:
         audit = _is_audit_record(item)
@@ -1697,7 +1698,7 @@ class ForwarderStatus:
     send_failing: bool = False
     #: Sends that hit a network error, whether or not a spool kept the record.
     send_failures: int = 0
-    #: Records on the in-memory hand-off queue right now, both lanes, capped at the general lane's
+    #: Records on the in-memory hand-off queue right now, both lanes, capped at the smaller lane
     #: bound (BACKLOG #2612). A level, not a loss. Records waiting in the on-disk spool are not in
     #: it, and no field here counts them.
     queued: int = 0
@@ -1764,7 +1765,7 @@ def forwarder_status() -> ForwarderStatus:
             configured=True, start_failure=start_failure, delivery_confirmed=confirmed
         )
     spool = listener.spool
-    # Both lanes, capped at the general lane's bound (BACKLOG #2612, #1131): _ForwardLanes says why.
+    # Both lanes, capped at the smaller lane bound (BACKLOG #2612, #1131): _ForwardLanes says why.
     records = handler._records
     queued = records.reported_qsize() if isinstance(records, _ForwardLanes) else records.qsize()
     return ForwarderStatus(

@@ -11,6 +11,7 @@ alert, and the status model. No test opens a socket or resolves a name.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import queue
 import socket
@@ -392,6 +393,27 @@ def test_queued_rises_while_a_stalled_collector_carries_only_audit_lines() -> No
     for _ in range(10):  # past the general lane's bound, the reading is pinned at it
         handler.handle(_audit_record())
     assert handler._records.qsize() == 13 and forwarder_status().queued == 5
+
+
+@pytest.mark.parametrize("bounds", [(5, 2), (2, 5)], ids=["audit-smaller", "general-smaller"])
+def test_queued_reads_the_same_whichever_lane_is_full(bounds: tuple[int, int]) -> None:
+    """``queued`` must not tell a reader without ``users:manage`` which lane is dropping, or a
+    full audit lane says audit rows are being written (BACKLOG #1131, #2612). It is capped at the
+    smaller bound, so a full lane of either kind reads the cap whatever the two bounds are. The
+    control is the queue's own size, which differs between the two arms."""
+    general_bound, audit_bound = bounds
+    readings, sizes = [], []
+    for name in (AUDIT_LOGGER_NAME, "mefor.test"):
+        lanes = _ForwardLanes(general_bound, audit_bound)
+        for _ in range(max(bounds) + 2):
+            with contextlib.suppress(queue.Full):
+                lanes.put_nowait(
+                    logging.LogRecord(name, logging.INFO, __file__, 1, "x", None, None)
+                )
+        readings.append(lanes.reported_qsize())
+        sizes.append(lanes.qsize())
+    assert sizes[0] != sizes[1]  # the control: the lanes did fill to different depths
+    assert readings == [min(bounds)] * 2
 
 
 def test_a_healthy_forwarder_raises_nothing() -> None:

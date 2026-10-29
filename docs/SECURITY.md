@@ -6191,8 +6191,8 @@ stays broken, or recovers and breaks again, is reported only by that first line.
 **The forwarder's audit lane (vault BACKLOG #2612) leaves at least these on the channel.**
 [CONFIGURATION.md](CONFIGURATION.md) describes the lane under `[logging]`, and this paragraph
 states only what it leaves a `logs:view` or `monitoring:read` reader without `users:manage`.
-`queued` on `GET /status` counts both lanes, capped at the general lane's bound, so once the
-general lane is full it is pinned there and does not move with audit rows; an uncapped depth over
+`queued` on `GET /status` counts both lanes, capped at the smaller lane bound, so once either
+lane is full it is pinned there and does not move with audit rows; an uncapped depth over
 both lanes would have risen by one per row. **Not closed, as on the single queue:** below the cap,
 `queued` rises by one per audit row waiting, the same reading a single queue of that bound gives.
 Counting the audit lane is what lets a collector that stalls while only audit lines arrive show a
@@ -6202,8 +6202,8 @@ The drop warning, which `GET /logs/tail` serves, and the `log_forward_failed` al
 lane dropped; what they carry is stated once, in CONFIGURATION.md under `[logging]`.
 **Not closed:** the drop counts on `GET /status`, in the warning and in the alert include dropped
 audit tee lines, as the single queue's did. At least these let them track audit rows. While only
-the audit lane drops, they rise by one per audit row written. With the shipped bounds, which are
-equal, `queued` then reads the cap, so it no longer tells that reader which lane is dropping. While only the general lane drops, each audit line the forwarder
+the audit lane drops, they rise by one per audit row written. `queued` then reads the cap, as it
+does while the general lane drops, so it does not tell that reader which lane is dropping. While only the general lane drops, each audit line the forwarder
 sends takes a turn that would have freed a general slot, so they rise by about one more per audit
 row sent. And the forwarder sits on the root logger, so a drop warning written while the general
 lane is full is itself dropped and counted, while one written for an audit-lane drop fits: the
@@ -6429,7 +6429,9 @@ is the source of record for both, and still governs a store that does not open. 
 which can skip numbers. All the pairs are checked in one walk of the chain, which matters under
 `vault_transit`, where each row costs a Transit round trip. **The pairs witness only as well as the
 copy they came from.** A pair is only as authentic as the collector's record of it, and a forwarder
-hop that drops lines loses witnesses with nothing reporting it; read the tee's own limits, in
+hop that drops lines loses witnesses. The forwarder counts what its queue and spool drop and, over
+TCP or TLS, what a failed send costs (`GET /status`, `log_forward_failed`), but a datagram lost over
+UDP is counted nowhere, and `audit-verify` does not say which rows had no pair; read the tee's own limits, in
 `messagefoundry/store/audit_tee.py`, before resting a control on an export. Every audit row carries a
 `row_hash` from the moment it is written: the column is `NOT NULL` on all three backends and the
 startup backfill that used to chain pre-feature rows was deleted with it (BACKLOG #1198), because a
