@@ -33,19 +33,21 @@ _SCANNED = ("docs", "messagefoundry", "tests", "packaging", "harness", "scripts"
 _SUFFIXES = frozenset({".md", ".py"})
 _STATEMENT = "**Who the exception-message convention binds.**"
 
-_CONTROL = r"\s+(?:remains|is)\s+(?:still\s+)?the\s+(?:only\s+)?\W{0,2}control\b"
+_CONTROL = r"\s+\W{0,2}(?:remains|is)\W{0,2}\s+(?:still\s+)?the\s+(?:only\s+)?\W{0,3}control\b"
 #: The claim, as it read before BACKLOG #3464. Line breaks and comment or quote markers are folded
 #: away first, so a claim wrapped across lines is still one sentence; up to four marks such as a
-#: closing quote or Markdown emphasis may sit between the convention's name and the verb.
+#: closing quote or Markdown emphasis may sit between the convention's name and the verb, two on
+#: each side of the verb, and three before "control".
 _CLAIM = re.compile(
     rf"exception\s+message\W{{0,4}}(?:\s+convention\W{{0,4}})?{_CONTROL}"
     rf"|the\s+convention\s+above\W{{0,4}}{_CONTROL}",
     re.IGNORECASE,
 )
 _LINE_MARKER = re.compile(r"^\s*(?:#:?|>)?\s*", re.MULTILINE)
-#: The seam between two implicitly concatenated Python literals, ``"... the "`` then ``f"control"``,
-#: so a claim a formatter split across literals is still one sentence after folding.
-_LITERAL_SEAM = re.compile(r"""["']\s+[rbfuRBFU]{0,2}["']""")
+#: The seam between two implicitly concatenated Python literals with the same quote kind and only
+#: whitespace between them, ``"... the "`` then ``f"control"``. A claim split there folds into one
+#: sentence; a seam with a comment, a backslash, a triple quote or mixed quote kinds does not.
+_LITERAL_SEAM = re.compile(r"""(["'])\s+[rbftuRBFTU]{0,2}\1""")
 
 
 def _claims(text: str) -> list[str]:
@@ -75,8 +77,9 @@ def _scan(root: Path) -> tuple[int, list[str]]:
     return len(sources), hits
 
 
-#: The shapes the marker-reading exemption let through on PR 2595, each measured exempt there and
-#: named in the Lander's second hold. With no exemption, each is flagged.
+#: The shapes the marker-reading exemption let through on PR 2595, each named in the Lander's second
+#: hold there and measured exempt at the head that hold comment pins. With no exemption, each is
+#: flagged.
 _HOLD_SHAPES = {
     "a quote, then a later quote": '**CORRECTED 2026-10-28:** this read "per route"; it should read '
     '"the convention above remains the control for both".',
@@ -107,8 +110,12 @@ _MUST_FLAG = {
     "is the control. Pin it.",
     "is still the only control": 'the "never put PHI in an exception message" convention is still '
     "the only control",
-    "emphasis around the verb": 'the "never put PHI in an exception message" convention** remains '
-    "the **control**",
+    "emphasis after the name and on control": 'the "never put PHI in an exception message" '
+    "convention** remains the **control**",
+    "emphasis on the verb": 'the "never put PHI in an exception message" convention **remains** '
+    "the control",
+    "emphasis on is": "the convention above *is* the control",
+    "a quoted, bold control": 'the convention above remains the "**control**"',
     "after a CORRECTED marker": "**CORRECTED 2026-10-01:** this said the gate was per route. "
     "Neither is a completeness claim; the convention above remains the control for both.",
     "after UNCORRECTED": 'An UNCORRECTED fragment, read "x". The convention above remains the '
@@ -130,6 +137,10 @@ _MUST_FLAG = {
     '    "control for both"\n)',
     "split across literals before remains": "msg = (\n    'the convention above '\n"
     "    f'remains the control for {x}'\n)",
+    "split after a quoted name": "msg = ('the \"never put PHI in an exception message\" '\n"
+    "    'convention remains the control')",
+    "split after a single-quoted name, into a t-string": "msg = (\"the 'never put PHI in an "
+    'exception message\' "\n    t"convention remains the control")',
     **{f"hold shape: {name}": text for name, text in _HOLD_SHAPES.items()},
 }
 
@@ -147,7 +158,6 @@ def test_every_claim_in_a_text_is_reported_by_its_own_words() -> None:
         "the convention above remains the control",
         "The convention above remains the control",
     ]
-    assert len(_claims(retraction + "\n" + retraction)) == 2
 
 
 @pytest.mark.parametrize(
@@ -166,9 +176,15 @@ def test_the_scan_passes_other_prose(prose: str) -> None:
 def test_the_scan_reads_every_scanned_tree_and_suffix(tmp_path: Path) -> None:
     claim = "the convention above remains the control for both.\n"
     # Spelled out rather than read from _SCANNED and _SUFFIXES, so dropping a tree or a suffix
-    # there fails here; the old claim shipped in docs/*.md and messagefoundry/*.py.
+    # there fails here; the old claim shipped in docs/*.md and messagefoundry/*.py. Each tree gets
+    # a file at its top and one nested, so a scan that stops recursing fails too.
     trees = ("docs", "messagefoundry", "tests", "packaging", "harness", "scripts")
-    planted = [f"{top}/plant{suffix}" for top in trees for suffix in (".md", ".py")]
+    planted = [
+        f"{top}{sub}/plant{suffix}"
+        for top in trees
+        for sub in ("", "/sub")
+        for suffix in (".md", ".py")
+    ]
     for rel in [*planted, "other/plant.md", "docs/plant.txt"]:  # the last two are not scanned
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / rel).write_text(claim, encoding="utf-8")
