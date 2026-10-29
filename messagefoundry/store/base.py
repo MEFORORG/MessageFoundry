@@ -3360,7 +3360,7 @@ class SchemaLockTimeout(RuntimeError):
     def _message(self) -> str:
         return (
             f"{self.backend.value}: the schema lock {self.lock!r} was not acquired within "
-            f"{self.timeout:g} s; another engine shard or cluster node may be migrating the store "
+            f"{self.timeout:.15g} s; another engine shard or cluster node may be migrating the store "
             "schema. Start again once it finishes, or raise [store].schema_lock_timeout"
         )
 
@@ -3379,7 +3379,7 @@ class SchemaDdlLockTimeout(SchemaLockTimeout):
     def _message(self) -> str:
         return (
             f"{self.backend.value}: holding the schema lock {self.lock!r}, a DDL statement did not "
-            f"get its table lock within {self.timeout:g} s; an open transaction on a store table, "
+            f"get its table lock within {self.timeout:.15g} s; an open transaction on a store table, "
             "from another engine shard, cluster node or session, may be blocking it. Nothing was "
             "applied. Start again once that transaction ends, or raise [store].schema_lock_timeout"
         )

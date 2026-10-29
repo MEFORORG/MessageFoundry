@@ -435,6 +435,16 @@ _OUTBOUND_LANE_LOCK_PREFIX = "mefor_outlane:"
 #: SQLSTATE lock_not_available: a statement waited out lock_timeout (BACKLOG #1726).
 _LOCK_NOT_AVAILABLE: Final = "55P03"
 
+#: Sets the schema transaction's lock_timeout to $1 ms, unless the session already has a stricter
+#: one (BACKLOG #1726). 0 means no limit, so it never counts as stricter. pg_settings reports
+#: lock_timeout in ms.
+_DDL_LOCK_TIMEOUT_SQL: Final = (
+    "SELECT pg_catalog.set_config('lock_timeout',"
+    " CASE WHEN s.setting::bigint > 0 AND s.setting::bigint < $1::bigint"
+    " THEN s.setting ELSE $1::bigint::text END, true)"
+    " FROM pg_catalog.pg_settings s WHERE s.name = 'lock_timeout'"
+)
+
 # H1 epoch-fence guard templates (ADR 0157 C1/C2). Templates rather than literals because the guard
 # lands at a different `$N` at every site; `{h}` is bound once and referenced twice, already the house
 # idiom (see the twice-referenced `$5` at claim_next_fifo). `leader_lease.leader_epoch` is BIGINT, so
@@ -1996,14 +2006,21 @@ class PostgresStore:
                         raise
                     lock = self._lock_key(_SCHEMA_LOCK)
                     raise SchemaLockTimeout(self.backend, lock, wait) from exc
+                except Exception as exc:
+                    # A role- or database-configured lock_timeout ended the wait first.
+                    if driver_sqlstate(exc) != _LOCK_NOT_AVAILABLE:
+                        raise
+                    lock = self._lock_key(_SCHEMA_LOCK)
+                    raise SchemaLockTimeout(self.backend, lock, wait) from exc
                 # The HOLDER's own lock waits are bounded too (BACKLOG #1726). The builds run with
                 # statement_timeout 0, so without this a CREATE INDEX or ALTER queued behind any open
                 # transaction on its table waits forever while holding the schema lock, and its
                 # queued SHARE-lock request also blocks every later write to that table. lock_timeout
                 # bounds only each lock wait, never how long a build runs once it has its lock. Set
-                # AFTER the advisory lock so that wait keeps its own client-side bound; SET LOCAL
-                # reverts at commit or rollback. The value is a validated number, not text.
-                await conn.execute(f"SET LOCAL lock_timeout = {math.ceil(wait * 1000)}")
+                # AFTER the advisory lock so that wait keeps its own client-side bound. It only
+                # tightens: a stricter role- or database-configured lock_timeout is kept. Local to
+                # this transaction, so it reverts at commit or rollback.
+                await conn.execute(_DDL_LOCK_TIMEOUT_SQL, math.ceil(wait * 1000))
                 try:
                     # Double-check under the lock: the peer this open queued behind may have just
                     # applied this exact batch and committed its marker — then there is nothing to do.

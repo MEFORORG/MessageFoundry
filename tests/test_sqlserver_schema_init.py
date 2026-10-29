@@ -324,9 +324,9 @@ async def test_the_schema_holder_bounds_its_ddl_lock_waits_and_resets_the_bound(
     bound = sqls.index("SET LOCK_TIMEOUT 45000")
     first_create = next(i for i, sql in enumerate(sqls) if "CREATE TABLE" in sql)
     assert lock_i < bound < first_create
-    commit = sqls.index("COMMIT")
-    assert sqls[commit + 1 :] == ["SET LOCK_TIMEOUT -1"]  # reset after the commit, then nothing
-    assert conn.committed == 1  # the SET opens no transaction, so it needs no commit of its own
+    # Reset inside the transaction, as its last statement, so the one commit covers it.
+    assert sqls[-2:] == ["SET LOCK_TIMEOUT -1", "COMMIT"]
+    assert conn.committed == 1
 
 
 async def test_the_ddl_lock_bound_is_reset_when_a_peer_already_applied_the_batch() -> None:
@@ -345,7 +345,8 @@ async def test_the_ddl_lock_bound_is_reset_when_a_peer_already_applied_the_batch
 
     sqls = [sql for sql, _ in executed]
     assert "SET LOCK_TIMEOUT 45000" in sqls
-    assert sqls[-1] == "SET LOCK_TIMEOUT -1"
+    assert sqls[-1] == "SET LOCK_TIMEOUT -1"  # before the commit that releases the applock
+    assert conn.committed == 1
     assert not any("CREATE TABLE" in sql for sql in sqls)
 
 
@@ -396,31 +397,46 @@ async def test_a_ddl_lock_timeout_names_the_setting_rolls_back_and_resets() -> N
         else:
             assert info.value is failure
         sqls = [sql for sql, _ in executed]
-        assert conn.committed == 0 and conn.rolledback == 1
-        assert sqls[sqls.index("ROLLBACK") + 1 :] == ["SET LOCK_TIMEOUT -1"]
+        assert conn.committed == 0
+        first_rollback = sqls.index("ROLLBACK")
+        # Reset after the batch's rollback, under command_timeout again, then a second rollback.
+        assert sqls[first_rollback + 1 :] == ["SET LOCK_TIMEOUT -1", "ROLLBACK"]
+        assert conn._conn.timeout == 30
 
 
 async def test_a_failed_lock_timeout_reset_does_not_mask_the_outcome(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A reset that fails after a failed batch is logged, the batch's own error still raises, and
+    the connection is discarded rather than pooled with a LOCK_TIMEOUT nobody else expects."""
+    from messagefoundry.store import sqlserver
+
     executed: list[tuple[str, object]] = []
 
-    class _ResetFailingCursor(_FakeCursor):
+    class _ResetFailingCursor(_DdlFailingCursor):
         async def execute(self, sql: str, params: object = None) -> None:
-            await super().execute(sql, params)
             if sql == "SET LOCK_TIMEOUT -1":
+                executed.append((sql, params))
                 raise RuntimeError("connection gone")
+            await super().execute(sql, params)
 
     conn = _FakeConn(executed)
     conn.cursor_obj = _ResetFailingCursor(executed)
+    conn.cursor_obj.failure = RuntimeError("Lock request time out period exceeded. (1222)")
     store = _make_store(conn)
     store._settings = _settings(command_timeout=30)  # type: ignore[assignment]
+    detached: list[object] = []
+    monkeypatch.setattr(sqlserver, "_detach_connection", detached.append)
 
-    with caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"):
-        assert await store._ensure_schema() is True
+    with (
+        caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"),
+        pytest.raises(SchemaDdlLockTimeout),
+    ):
+        await store._ensure_schema()
 
     assert executed[-1][0] == "SET LOCK_TIMEOUT -1"
     assert "could not reset LOCK_TIMEOUT" in caplog.text
+    assert detached == [conn]
 
 
 async def test_the_schema_applock_runs_before_the_ddl_lock_bound() -> None:

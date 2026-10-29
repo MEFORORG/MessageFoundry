@@ -457,19 +457,23 @@ class _RecordingPgConn:
 
     def __init__(self) -> None:
         self.executed: list[tuple[str, object]] = []
+        self.args: list[tuple[object, ...]] = []  # each execute's bind arguments, in step
 
     async def fetch(self, sql: str, *args: object) -> list[Any]:
         return []
 
     async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
         self.executed.append((sql, timeout))
+        self.args.append(args)
         return ""
 
     @contextlib.asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
         self.executed.append(("BEGIN", None))
+        self.args.append(())
         yield
         self.executed.append(("COMMIT", None))
+        self.args.append(())
 
 
 async def test_postgres_received_index_build_is_exempt_from_the_client_timeout(
@@ -673,21 +677,29 @@ async def test_postgres_holder_bounds_its_ddl_lock_waits_after_the_advisory_lock
     assert await store._ensure_schema() is True
     sqls = [sql for sql, _ in conn.executed]
     [lock] = [i for i, sql in enumerate(sqls) if "pg_advisory_xact_lock" in sql]
-    bound = sqls.index("SET LOCAL lock_timeout = 45000")
+    [bound] = [i for i, sql in enumerate(sqls) if sql == postgres._DDL_LOCK_TIMEOUT_SQL]
+    assert conn.args[bound] == (45_000,)
     first_ddl = sqls.index(postgres._SCHEMA[0])
     assert lock < bound < first_ddl < sqls.index("COMMIT")
     # The builds _migrate_lease_columns runs come after it too.
     assert bound < sqls.index(postgres._RECEIVED_INDEX_DDL)
-    assert sqls.count("SET LOCAL lock_timeout = 45000") == 1
+    # Transaction-local, and it keeps a stricter session setting rather than raising it.
+    ddl_bound = postgres._DDL_LOCK_TIMEOUT_SQL
+    assert "set_config('lock_timeout'," in ddl_bound and ddl_bound.count(", true)") == 1
+    assert "s.setting::bigint > 0 AND s.setting::bigint < $1::bigint" in ddl_bound
 
 
 async def test_postgres_fractional_schema_lock_timeout_rounds_the_ddl_bound_up() -> None:
+    from messagefoundry.store import postgres
+
     conn = _RecordingPgConn()
     store = _pg_schema_store(conn, schema_lock_timeout=0.0001)
 
     await store._ensure_schema()
 
-    assert "SET LOCAL lock_timeout = 1" in [sql for sql, _ in conn.executed]  # never 0 = no limit
+    sqls = [sql for sql, _ in conn.executed]
+    [bound] = [i for i, sql in enumerate(sqls) if sql == postgres._DDL_LOCK_TIMEOUT_SQL]
+    assert conn.args[bound] == (1,)  # never 0, which would mean no limit
 
 
 class _PgLockNotAvailable(Exception):
@@ -740,3 +752,34 @@ async def test_postgres_ddl_lock_wait_expiry_names_the_setting() -> None:
     with pytest.raises(_OtherError) as raw:
         await store._ensure_schema()
     assert raw.value is other
+
+
+async def test_postgres_server_lock_timeout_on_the_advisory_wait_names_the_setting() -> None:
+    """A role- or database-configured lock_timeout that ends the advisory wait (55P03) is reported
+    as the schema lock wait, not as a raw driver error; other driver errors there propagate."""
+    from messagefoundry.store.base import SchemaDdlLockTimeout, SchemaLockTimeout
+
+    class _LockConn(_RecordingPgConn):
+        def __init__(self, exc: Exception) -> None:
+            super().__init__()
+            self._exc = exc
+
+        async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
+            await super().execute(sql, *args, timeout=timeout)
+            if "pg_advisory_xact_lock" in sql:
+                raise self._exc
+            return ""
+
+    failure = _PgLockNotAvailable("canceling statement due to lock timeout")
+    with pytest.raises(SchemaLockTimeout) as info:
+        await _pg_schema_store(_LockConn(failure), schema_lock_timeout=45)._ensure_schema()
+    assert type(info.value) is SchemaLockTimeout
+    assert not isinstance(info.value, SchemaDdlLockTimeout)
+    assert info.value.__cause__ is failure
+
+    class _OtherError(Exception):
+        sqlstate = "57P01"
+
+    other = _OtherError("admin shutdown")
+    with pytest.raises(_OtherError):
+        await _pg_schema_store(_LockConn(other))._ensure_schema()

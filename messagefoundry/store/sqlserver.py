@@ -581,6 +581,9 @@ def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
 # diagnostic message embeds "(1222)"); match on the code without pinning to a specific SQLSTATE.
 _LOCK_TIMEOUT_NATIVE_ERROR = 1222
 
+#: Puts a session's LOCK_TIMEOUT back to the default, wait forever (BACKLOG #1726).
+_LOCK_TIMEOUT_RESET: Final = "SET LOCK_TIMEOUT -1"
+
 
 def _is_lock_timeout(exc: BaseException) -> bool:
     """True iff ``exc`` is a SQL Server lock-request timeout (native error 1222).
@@ -4671,9 +4674,9 @@ class SqlServerStore:
                     # CREATE INDEX or ALTER queued behind any open transaction on its table waits
                     # forever while holding the schema lock. LOCK_TIMEOUT bounds only the wait for
                     # each lock, never how long a build runs once it has it. It is SESSION-scoped
-                    # and survives the commit, so the finally below resets it before the pooled
-                    # connection is released. Set AFTER the applock, which takes its own
-                    # @LockTimeout.
+                    # and survives the commit, so it is reset before the pooled connection is
+                    # released: inside the transaction before each commit, or after the rollback
+                    # below. Set AFTER the applock, which takes its own @LockTimeout.
                     await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
                     lock_bounded = True
                     try:
@@ -4681,6 +4684,7 @@ class SqlServerStore:
                         # applied this exact batch and committed its marker — then this open has
                         # nothing to do.
                         if await self._schema_marker_current(cur, expected):
+                            await cur.execute(_LOCK_TIMEOUT_RESET)
                             await self._commit(conn)  # releases the txn-scoped applock
                             log.debug(
                                 "sqlserver: schema applied by a peer (%s…) — skipped",
@@ -4694,6 +4698,7 @@ class SqlServerStore:
                             "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, ?, ?)",
                             (expected, time.time()),
                         )
+                        await cur.execute(_LOCK_TIMEOUT_RESET)
                     except Exception as exc:
                         if _is_lock_timeout(exc):
                             raise SchemaDdlLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
@@ -4702,31 +4707,37 @@ class SqlServerStore:
                     log.info("sqlserver: schema DDL batch applied (%s…)", expected[:12])
                     return True
             except Exception:
+                # A cancellation here, or during the rollback, skips the reset below: _acquire
+                # quarantines that connection rather than pooling it, and the cancelled statement
+                # may still be running on its executor thread.
                 await conn.rollback()  # roll back the partial DDL batch (M-6)
-                raise
-            except asyncio.CancelledError:
-                # _acquire quarantines this connection rather than pooling it, and the cancelled
-                # statement may still be running on its executor thread, so it is not touched here.
-                lock_bounded = False
-                raise
-            finally:
                 if lock_bounded:
                     await self._reset_schema_lock_timeout(conn)
+                raise
 
     async def _reset_schema_lock_timeout(self, conn: Any) -> None:
-        """Put the session's LOCK_TIMEOUT back to -1 after the schema batch (BACKLOG #1726), once the
-        batch has committed or rolled back. A ``SET`` does not open an implicit transaction, so it
-        needs no commit. A cancelled open skips it: :meth:`_acquire` quarantines that connection
-        rather than pooling it. A failed reset is logged, not raised, so
-        it cannot mask the batch's own outcome; the connection then keeps a bounded wait, never an
-        unbounded one."""
+        """After a failed schema batch has rolled back, put the session's LOCK_TIMEOUT back to -1
+        (BACKLOG #1726), so the pooled connection keeps the default. A ``SET`` is not undone by a
+        rollback, so the reset runs alone and is followed by a second rollback, which ends any
+        implicit transaction it opened. It runs under ``command_timeout`` again: the batch lifted
+        the connection's query timeout, and this round trip must not be the one unbounded wait. A
+        failed reset is logged, not raised, so it cannot mask the batch's own error, and the
+        connection is discarded rather than pooled with a LOCK_TIMEOUT nobody else expects."""
+        raw = getattr(conn, "_conn", None)
+        if raw is not None:
+            raw.timeout = self._settings.command_timeout
         try:
             async with self._cursor(conn) as cur:
-                await cur.execute("SET LOCK_TIMEOUT -1")
+                await cur.execute(_LOCK_TIMEOUT_RESET)
+            await conn.rollback()
         except Exception:  # noqa: BLE001 - a reset failure must not mask the real outcome
             log.warning(
-                "sqlserver: could not reset LOCK_TIMEOUT after the schema batch", exc_info=True
+                "sqlserver: could not reset LOCK_TIMEOUT after a failed schema batch; discarding"
+                " the connection",
+                exc_info=True,
             )
+            # Its future is deliberately not awaited, as in _rollback_or_discard.
+            _detach_connection(conn)
 
     async def _verify_schema_external(self, expected: str) -> None:
         """External mode's whole open-time schema step (#305): reads only, no DDL, no applock.
