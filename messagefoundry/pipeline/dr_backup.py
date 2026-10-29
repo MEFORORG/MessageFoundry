@@ -83,7 +83,9 @@ from messagefoundry.store.base import (
 from messagefoundry.store.cipher_cells import (
     CipherWalkInterrupted,
     connect_readonly,
+    keyed_store_mismatch,
     read_cipher_cells,
+    store_tables,
 )
 from messagefoundry.store.crypto import (
     StoreKeylessError,
@@ -2593,31 +2595,47 @@ def _decrypt_check(
     names the table, the column and the cell's ``locator``, never a key column that can itself be PHI.
 
     The walk is :func:`~messagefoundry.store.cipher_cells.read_cipher_cells`, which ``cipher-audit``
-    shares; this pass stops at the first value that does not open.
+    shares, and so is its verdict precedence: a keyed snapshot read with no key
+    (:func:`~messagefoundry.store.cipher_cells.keyed_store_mismatch`), then a sealed text value no
+    key opened, then a failure. Under a key no keyless reading can come, so this pass stops at the
+    first value that does not open. With no key it reads on past a BLOB, which fails under any
+    cipher, so a sealed value later in the walk still decides KEY_MISMATCH, as ``cipher-audit``
+    decides it, whichever row comes first.
     """
     import sqlite3
 
     cipher = build_store_cipher(settings, posture=posture)
     cells = 0
+    first_blob: str | None = None
     # The store's own read-only URI builder, not `f"file:{snap}"`: a path can hold `#` or `?`, and
     # an unquoted `#` cut the path short, so the old open read a different, empty file and passed.
     conn = connect_readonly(snap, busy_timeout=_SNAPSHOT_BUSY_TIMEOUT)
     try:
+        mismatch = keyed_store_mismatch(conn, cipher, store_tables(conn), source="snapshot")
+        if mismatch is not None:
+            return "KEY_MISMATCH", mismatch, cells
         for reading in read_cipher_cells(conn, cipher):
             if reading.kind == "keyless":
-                # The #241 F2 keyless-open trap: the snapshot holds sealed cells and these settings
-                # resolved no key for them. Nothing could have opened them, so the keyring is
+                # The #241 F2 keyless-open trap: the snapshot holds sealed text and these settings
+                # resolved no key for it. Nothing could have opened it, so the keyring is
                 # unambiguously the cause. Keylessness is the CIPHER's, never a plaintext's: a
-                # decrypted value may itself begin with the marker.
+                # decrypted value may itself begin with the marker. A BLOB never comes here.
                 return "KEY_MISMATCH", reading.failure(source="snapshot"), cells
+            if reading.kind == "blob":
+                # FAIL under any cipher, and never the keyring's: no key makes a BLOB readable.
+                if cipher.encrypts:
+                    return "FAIL", reading.failure(source="snapshot"), cells
+                first_blob = first_blob or reading.failure(source="snapshot")
             if reading.kind == "failed":
-                # FAIL, not KEY_MISMATCH: CipherError cannot separate a corrupted ciphertext from a
-                # key that was never supplied, and the keyring here is not empty (the keyless case
-                # is the branch above). Reporting the softer verdict on a bit-flipped PHI cell is
-                # the reading that must not be talked down.
+                # Only under a key: a keyless walk never decrypts. FAIL, not KEY_MISMATCH:
+                # CipherError cannot separate a corrupted ciphertext from a key that was never
+                # supplied, so the softer verdict on a bit-flipped PHI cell is the reading that
+                # must not be talked down.
                 return "FAIL", reading.failure(source="snapshot"), cells
             if reading.kind == "opened":
                 cells += 1
+        if first_blob is not None:
+            return "FAIL", first_blob, cells
     except sqlite3.Error as exc:
         return "FAIL", _sqlite_error_reason(exc), cells
     except CipherWalkInterrupted as exc:  # nothing else writes a snapshot, but never PASS a part

@@ -695,6 +695,134 @@ def test_a_keyless_walk_fails_a_blob_rather_than_blame_the_key(tmp_path: Path) -
     assert status == "FAIL" and "messages.raw" in message and "BLOB" in message, message
 
 
+def _keyless_store(db: Path) -> None:
+    """A store written with no key: one message, no ``keyed_surface`` row."""
+
+    async def write() -> None:
+        store = await _open(db, StoreSettings(path=str(db)))
+        try:
+            await store.enqueue_message(channel_id="IB_SYNTH", raw=_RAW, deliveries=[("OB", "X")])
+        finally:
+            await store.close()
+
+    asyncio.run(write())
+
+
+def _plant(db: Path, sql: str, params: tuple[object, ...]) -> None:
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_BLOB_ROWS = {
+    "state": ("INSERT INTO state (namespace, key, value, set_at) VALUES ('ns', 'k', ?, 0)",),
+    "reference": ("INSERT INTO reference (name, version, key, value) VALUES ('r', '1', 'k', ?)",),
+}
+
+
+@pytest.mark.usefixtures("sqlite_like_build")
+@pytest.mark.parametrize("table", sorted(_BLOB_ROWS))
+def test_cipher_audit_with_no_key_fails_a_json_cell_blob(
+    tmp_path: Path,
+    table: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A BLOB in ``state.value`` or ``reference.value`` of a keyless store: the store's reader hands
+    it back as bytes and its JSON decode raises, so the store does not start. cipher-audit with no
+    key must not call that store clean."""
+    db = tmp_path / "msg.db"
+    _keyless_store(db)
+    _plant(db, _BLOB_ROWS[table][0], (b"not json",))
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    rc, payload = _audit(db, monkeypatch, capsys)
+    assert rc != 0 and payload["status"] == "FAIL", payload
+    assert "holds a BLOB" in _cells(payload)[f"{table}.value"]["first_failure"]
+
+
+def _verdicts(
+    db: Path,
+    settings: StoreSettings,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> tuple[str, str]:
+    """(restore-verify's decrypt pass, cipher-audit) statuses for one file under one shell."""
+    status, _message, _cells = dr_backup._decrypt_check(db, settings)
+    if settings.encryption_key is None:
+        monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    else:
+        _keyed(monkeypatch, settings)
+    _rc, payload = _audit(db, monkeypatch, capsys)
+    return status, str(payload["status"])
+
+
+@pytest.mark.usefixtures("sqlite_like_build")
+@pytest.mark.parametrize("keyed_record", [False, True], ids=["unrecorded", "keyed-surface"])
+@pytest.mark.parametrize("order", ["blob-first", "sealed-first", "blob-only"])
+def test_restore_verify_and_cipher_audit_agree_whatever_the_row_order(
+    tmp_path: Path,
+    order: str,
+    keyed_record: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One BLOB, with one sealed text value in either walk order (``messages.raw`` is walked before
+    ``message_events.detail``) or none, read with no key, on a store with and without its keyed
+    record. Both commands give one verdict: a store recorded as keyed, or a sealed value no key
+    opened, is a key mismatch wherever the BLOB sits; a BLOB alone in an unrecorded store fails."""
+    db = tmp_path / "msg.db"
+    _keyless_store(db)
+    sealed, blob = f"{MARKER_PREFIX}v4:aesgcm:k:00:AAAA", b"MSH|^~\\&|BLOB-PLAINTEXT"
+    if order == "blob-only":
+        _plant(db, "UPDATE messages SET raw = ?", (blob,))
+    else:
+        first, second = (blob, sealed) if order == "blob-first" else (sealed, blob)
+        _plant(db, "UPDATE messages SET raw = ?", (first,))
+        _plant(db, "UPDATE message_events SET detail = ?", (second,))
+    if keyed_record:
+        _plant(
+            db,
+            "INSERT INTO keyed_surface (surface_table, surface_column, keyed_at) VALUES (?, ?, 0)",
+            ("messages", "raw"),
+        )
+    restore, audit = _verdicts(db, StoreSettings(path=str(db)), monkeypatch, capsys)
+    expected = "FAIL" if order == "blob-only" and not keyed_record else "KEY_MISMATCH"
+    assert restore == audit == expected, (restore, audit)
+
+
+@pytest.mark.usefixtures("sqlite_like_build")
+@pytest.mark.parametrize("with_key", [False, True], ids=["no-key", "key"])
+def test_a_keyed_snapshot_holding_only_unmarked_blobs_fails_both(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    with_key: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every sealed value purged to ``''`` and one plaintext BLOB left, in a store a keyed open
+    recorded. Neither command may PASS it, with the key or without, and they agree."""
+    db, settings = _copy(_template, tmp_path)
+    conn = sqlite3.connect(db)
+    try:
+        for cell in SQLITE_CIPHER_CELLS:
+            conn.execute(
+                f"UPDATE {cell.table} SET {cell.column} = '' WHERE {cell.column} LIKE ?",
+                (f"{MARKER_PREFIX}%",),
+            )
+        rowid = conn.execute("SELECT rowid FROM messages ORDER BY rowid LIMIT 1").fetchone()[0]
+        conn.execute("UPDATE messages SET raw = ? WHERE rowid = ?", (b"BLOB-PLAINTEXT", rowid))
+        conn.commit()
+    finally:
+        conn.close()
+    shell = settings if with_key else settings.model_copy(update={"encryption_key": None})
+    restore, audit = _verdicts(db, shell, monkeypatch, capsys)
+    assert restore == audit, (restore, audit)
+    assert restore == ("FAIL" if with_key else "KEY_MISMATCH"), restore
+
+
 @pytest.mark.usefixtures("sqlite_like_build")
 def test_a_marker_in_another_case_fails_even_under_the_opt_out(
     tmp_path: Path,

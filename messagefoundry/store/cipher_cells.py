@@ -49,6 +49,7 @@ __all__ = [
     "audit_cipher_cells",
     "cell_present",
     "connect_readonly",
+    "keyed_store_mismatch",
     "read_cipher_cells",
     "store_tables",
 ]
@@ -175,7 +176,7 @@ SQLITE_CIPHER_CELLS: tuple[CipherCell, ...] = (
 DEFAULT_CHUNK_ROWS = 500
 
 #: What :func:`read_cipher_cells` found at one value; see :class:`CellReading`.
-ReadingKind = Literal["opened", "failed", "keyless", "unmarked", "legacy"]
+ReadingKind = Literal["opened", "failed", "blob", "keyless", "unmarked", "legacy"]
 
 
 class CipherWalkInterrupted(RuntimeError):
@@ -190,8 +191,10 @@ class CellReading:
     """What :func:`read_cipher_cells` found at one value of one cell.
 
     ``kind`` is ``"opened"`` when the value decrypted and authenticated, ``"failed"`` when it did
-    not or its reader would refuse it (``error`` says why), and ``"keyless"`` when it is sealed and
-    the cipher holds no key, so nothing could have opened it. Two kinds are reported only when the
+    not or its reader would refuse it (``error`` says why), ``"blob"`` for a BLOB, which is a
+    failure under any cipher and never a key question (see :func:`_sealed_test`), and
+    ``"keyless"`` when it is sealed text and the cipher holds no key, so nothing could have opened
+    it. Two kinds are reported only when the
     walk is asked for unmarked values: ``"unmarked"``, a non-blank text value with no marker on a
     surface the store has sealed, which it refuses at read, and ``"legacy"``, the same on a surface
     no keyed open has sealed yet, which the next keyed open seals. ``values`` are the cell's
@@ -211,14 +214,19 @@ class CellReading:
         return self.cell.locate(*self.values)
 
     def failure(self, *, source: str = "store") -> str:
-        """The PHI-free line a failed or keyless value is reported with: table, column and locator,
-        and for a failure the redacted cipher error, never the value. ``source`` names what was
-        read in the keyless line: the live store, or a restore-verify's snapshot."""
+        """The PHI-free line a failed, BLOB or keyless value is reported with: table, column and
+        locator, and for a failure the redacted cipher error, never the value. ``source`` names
+        what was read in the keyless line: the live store, or a restore-verify's snapshot."""
         name = f"{self.cell.table}.{self.cell.column}"
         if self.kind == "keyless":
             return (
                 f"{name} is encrypted at rest but the store settings resolved no key "
                 f"to open it (keyless open of an encrypted {source})"
+            )
+        if self.kind == "blob":
+            return (
+                f"{name} {self.where} holds a BLOB where the store writes only text: a planted or "
+                "damaged row, which no key makes readable"
             )
         reason = safe_exc(self.error) if self.error is not None else self.kind
         if self.foreign_key:
@@ -275,10 +283,12 @@ def _sealed_test(column: str) -> tuple[str, tuple[object, ...]]:
     Windows one does not) makes it skip every BLOB, and ``SQLITE_CASE_SENSITIVE_LIKE`` or ``PRAGMA
     case_sensitive_like`` makes it skip ``MFENC:``. A value it skipped would never be read at all.
 
-    Every BLOB is called sealed, by its type, ``x''`` included. At least the store's own writer,
-    ``_enc``, binds text, so a BLOB in a cipher-covered column is not a value the store's reader can
-    open, and :func:`_open` fails it without a decrypt, under any cipher: the walk fails closed on
-    a BLOB on every build."""
+    Every BLOB is called sealed, by its type, ``x''`` included, and the walk reports it as a
+    ``"blob"`` reading under any cipher, without a decrypt: it fails closed on a BLOB on every
+    build. At least the store's own writer, ``_enc``, binds text, so a BLOB is a planted or damaged
+    row. Under a key the reader cannot open one; with no key it hands one back as bytes, and at
+    least the ``state`` and ``reference`` readers then raise. Either way no key is the remedy, so a
+    BLOB is never reported as a key mismatch."""
     sql = f"(typeof({column}) = 'blob' OR lower(substr({column}, 1, ?)) = ?)"
     return sql, (len(MARKER_PREFIX), MARKER_PREFIX.lower())
 
@@ -359,10 +369,12 @@ def read_cipher_cells(
                 where, key, stored = tuple(row[:width]), row[width:-1], row[-1]
                 if not sealed:
                     readings.append(CellReading(spec, unsealed_kind, where))
-                elif keyless and isinstance(stored, str):
+                elif not isinstance(stored, str):
+                    # Only a BLOB is sealed and not text; see `_sealed_test` for why it fails.
+                    readings.append(CellReading(spec, "blob", where))
+                elif keyless:
                     # The sealed test ignores case; the marker does not. A keyless store's plaintext
-                    # that only resembles it is not a sealed cell. A BLOB goes on to `_open`, which
-                    # fails it under any cipher: no key would open it, so the keyring is not blamed.
+                    # that only resembles it is not a sealed cell.
                     if cipher.is_encrypted(stored):
                         readings.append(CellReading(spec, "keyless", where))
                 else:
@@ -406,22 +418,14 @@ def _is_outage(error: CipherError) -> bool:
 def _open(
     spec: CipherCell,
     cipher: Cipher,
-    stored: object,
+    stored: str,
     key: list[object],
     where: tuple[object, ...],
 ) -> CellReading:
-    """Open one value :func:`_sealed_test` called sealed, and run its cell's check; the plaintext
-    goes no further. A value the store's reader could not take as a sealed cell fails here without
-    a decrypt: a BLOB, marked or not, or a marker in another case, which the cipher would otherwise
-    hand to its unmarked-value rule and, under ``allow_unmarked_ciphertext``, return with no tag
-    checked."""
-    if not isinstance(stored, str):
-        return CellReading(
-            spec,
-            "failed",
-            where,
-            CipherError("the value is stored as a BLOB, not text, which the store cannot open"),
-        )
+    """Open one text value :func:`_sealed_test` called sealed, under a key, and run its cell's
+    check; the plaintext goes no further. A marker in another case fails here without a decrypt:
+    the cipher would otherwise hand it to its unmarked-value rule and, under
+    ``allow_unmarked_ciphertext``, return it with no tag checked."""
     if not stored.startswith(MARKER_PREFIX):
         return CellReading(
             spec,
@@ -489,6 +493,27 @@ class CipherAudit:
         return [t.name for t in self.tallies if not t.present]
 
 
+def keyed_store_mismatch(
+    conn: sqlite3.Connection, cipher: Cipher, tables: set[str], *, source: str = "store"
+) -> str | None:
+    """The key-mismatch line for a store a keyed open has recorded (its ``keyed_surface`` rows),
+    read under a keyless cipher; ``None`` otherwise. Checked before any value is read, by both the
+    restore-verify and ``cipher-audit``, so they agree on such a store whatever its rows hold:
+    every sealed value may be purged to ``''``, or only BLOBs left, and a walk alone would then
+    find no key question."""
+    if cipher.encrypts or "keyed_surface" not in tables:
+        return None
+    keyed = conn.execute(
+        "SELECT surface_table, surface_column FROM keyed_surface ORDER BY 1, 2 LIMIT 1"
+    ).fetchone()
+    if keyed is None:
+        return None
+    return (
+        f"{keyed[0]}.{keyed[1]} is recorded as keyed in this {source}, but the store settings "
+        f"resolved no key to read it (keyless open of a keyed {source})"
+    )
+
+
 def audit_cipher_cells(
     conn: sqlite3.Connection,
     cipher: Cipher,
@@ -499,27 +524,20 @@ def audit_cipher_cells(
     """Walk every value in ``cells`` to the end and tally it, unlike the restore-verify, which
     stops at its first failure. Counts unmarked values in a keyed store.
 
-    Two things stop the walk. A sealed value under a keyless cipher is recorded as the key
-    mismatch, since every other sealed value would say the same. A decrypt that failed because the
-    key service was unreachable (:func:`_is_outage`) is raised: every later value would wait out
-    its own timeout and then read as damaged, which an outage is not."""
+    The verdict precedence is :func:`keyed_store_mismatch`'s, then a keyless reading's, then a
+    failure's, so it does not depend on which value the walk meets first. Two things stop the
+    walk: a sealed text value under a keyless cipher, recorded as the key mismatch, since every
+    other one would say the same; and a decrypt that failed because the key service was
+    unreachable (:func:`_is_outage`), which is raised: every later value would wait out its own
+    timeout and then read as damaged, which an outage is not."""
     wanted = tuple(cells)
     tables = store_tables(conn)
     audit = CipherAudit(
         [CellTally(c.table, c.column, present=cell_present(conn, c, tables)) for c in wanted]
     )
-    if not cipher.encrypts and "keyed_surface" in tables:
-        # A store a keyed open has recorded, read with no key. It may hold no sealed value just
-        # now (purged to ''), and then the walk below would find nothing to object to.
-        keyed = conn.execute(
-            "SELECT surface_table, surface_column FROM keyed_surface ORDER BY 1, 2 LIMIT 1"
-        ).fetchone()
-        if keyed is not None:
-            audit.key_mismatch = (
-                f"{keyed[0]}.{keyed[1]} is recorded as keyed in this store, but the store "
-                "settings resolved no key to read it (keyless open of a keyed store)"
-            )
-            return audit
+    audit.key_mismatch = keyed_store_mismatch(conn, cipher, tables)
+    if audit.key_mismatch is not None:
+        return audit
     tally = {(t.table, t.column): t for t in audit.tallies}
     for reading in read_cipher_cells(
         conn, cipher, cells=wanted, chunk_rows=chunk_rows, unmarked=True
@@ -530,7 +548,7 @@ def audit_cipher_cells(
             break
         if reading.kind == "opened":
             found.opened += 1
-        elif reading.kind == "failed":
+        elif reading.kind in ("failed", "blob"):
             if reading.error is not None and _is_outage(reading.error):
                 raise reading.error
             found.failed += 1
