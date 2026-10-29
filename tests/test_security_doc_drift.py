@@ -1740,6 +1740,14 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "absence of a retired release-note sentence in CHANGELOG.md and presence of the #3081 "
         "entry (BACKLOG #3822); the code is pinned by AST in the re-bind role-test test"
     ),
+    ("test_security_doc_drift.py", "test_the_changelog_states_the_directory_grant_limits"): (
+        "presence of the no-alert cases in SECURITY.md's *A directory grant* bullet and in the "
+        "changelog entry completing the 0.5.2 notes (vault BACKLOG #3141). Of the code behind the "
+        "cases, at least the breaker case is pinned by calling it in "
+        "tests/test_directory_last_admin_alert.py and the recheck-0 case in "
+        "tests/test_ad_session_reconcile.py; no code test pins that a sign-in failing after the "
+        "role write raises nothing, and the no-live-session case was not traced"
+    ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
     ),
@@ -3947,3 +3955,52 @@ def test_the_changelog_records_the_re_bind_role_test() -> None:
         "**403** on `POST /me/reauth`",
     ):
         assert fact in entry, f"the #3081 changelog entry no longer says: {fact}"
+
+
+def _bullet(lines: list[str], marker: str) -> list[str]:
+    """Each top-level bullet in ``lines`` that opens with ``marker``, as one whitespace-normalised
+    string. The bullet ends at its first line that is not indented or that opens a sub-bullet, and
+    is cut at its first ``**CORRECTED`` note, which quotes retired wording and must not satisfy a
+    check. A blank line ends it too, so a second paragraph reads as a dropped case: loud, not
+    silent."""
+    found = []
+    for i, line in enumerate(lines):
+        if not line.startswith(marker):
+            continue
+        body = [line]
+        for rest in lines[i + 1 :]:
+            if not rest[:1].isspace() or rest.lstrip().startswith("- "):
+                break
+            body.append(rest)
+        found.append(" ".join(" ".join(body).split("**CORRECTED", 1)[0].split()))
+    return found
+
+
+def test_the_changelog_states_the_directory_grant_limits() -> None:
+    """vault BACKLOG #3141: the 0.5.2 notes named only some of the directory grants of
+    Administrator that raise no ``administrator_granted`` alert, and none named the
+    ``ad_session_recheck_seconds = 0`` case. RED when the *A directory grant* bullet of SECURITY.md
+    or the changelog entry that completes those notes drops a case below, or stops saying "at
+    least these cases", or when that entry is not held exactly once across ``changelog.d/`` and
+    ``CHANGELOG.md``. The entry moves from its fragment into ``CHANGELOG.md`` at release, so both
+    are read, as ``changelog_fragments.py`` reads them, byte order mark allowed. The phrases are
+    kept short enough to survive a rewording of SECURITY.md, since the entry freezes at release. A
+    text check only: a case added to SECURITY.md is not caught here, and the behaviour behind the
+    cases is pinned elsewhere, if at all (see ``_REVIEWED_TEXT_CHECKS``)."""
+    cases = (
+        "at least these cases raise none",
+        "fails with a server error after the role write",
+        "mass-revoke breaker aborts writes no roles",
+        "holds no live session",
+        "`[auth].ad_session_recheck_seconds` is 0",
+    )
+    security = _bullet(_doc_text().splitlines(), "- **A directory grant.**")
+    assert len(security) == 1, f"SECURITY.md holds the directory-grant bullet {len(security)} times"
+    entries: list[str] = []
+    for path in [*(_ROOT / "changelog.d").glob("*.md"), _ROOT / "CHANGELOG.md"]:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        entries += _bullet(lines, "- **The 0.5.2 notes listed only some of the directory grants")
+    assert len(entries) == 1, f"the #3141 grant-limits changelog entry is held {len(entries)} times"
+    for case in cases:
+        assert case in security[0], f"SECURITY.md, A directory grant, no longer says: {case}"
+        assert case in entries[0], f"the #3141 grant-limits changelog entry no longer says: {case}"
