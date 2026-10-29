@@ -86,7 +86,6 @@ from messagefoundry.config.tls_policy import (
     HOP_ATTESTATION_LEVER,
     MIRRORED_CONNECTION_SETTING,
     HopPosture,
-    InsecureHopRefused,
     TrustAnchorPolicy,
     active_hop_posture,
     current_hop_posture,
@@ -234,7 +233,6 @@ from messagefoundry.transports.base import (
     IntakeRateLimiter,
     ProcessedArchive,
     ReplyBodyDropped,
-    SourceStartupError,
     SyncReplyResolver,
     check_file_key,
     guard_dir_settings,
@@ -3341,29 +3339,31 @@ class RegistryRunner:
             await self._checked_inbound_start(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
-        """:meth:`_start_inbound_unsafe` after the lane check. A refused start records the inbound
+        """:meth:`_start_inbound_unsafe` after the lane check. A failed start records the inbound
         failed before it re-raises, so a listener an operator or an alert rule starts or restarts
-        reads ``failed``, with an alert, not ``stopped`` with none: a refused CA (vault BACKLOG
-        #2371), or a start gate, hop guard, startup validation or bind (BACKLOG #3859). A restart
-        has already unbound the listener when its start is refused. A refused plain start is
-        recorded too, as :meth:`start` records one at boot.
+        reads ``failed``, with an alert, not ``stopped`` with none. A restart has already unbound
+        the listener when its start fails (BACKLOG #3859). Among the causes are at least a refused
+        CA (vault BACKLOG #2371), a start gate, a bind race, a hop guard, a CRL or key check in the
+        connector's constructor, and a startup validation.
+
+        Every ``Exception`` is recorded and re-raised, as :meth:`start` isolates one at boot: a
+        restart that fails for a type a narrower list missed would leave the feed down with no
+        status, which is the defect itself. Two are not failed starts and record nothing: a
+        :class:`NotDeployedError` (that inbound reads ``not_deployed``), and a name the graph does
+        not declare (the caller's ``KeyError``).
 
         Once only, as :meth:`_record_window_open_failure` records: a scheduled poller retries at
         every in-window tick, and every alert could re-fire a ``restart_inbound`` control action,
-        so a page per refusal would be an alert-restart loop. A start that binds clears the record, so the
-        next refusal pages again. :class:`NotDeployedError` is not recorded: that inbound reads
-        ``not_deployed``, not failed."""
+        so a page per refusal would be an alert-restart loop. A start that binds clears the record,
+        and so does a reload that leaves the listener down by design, so the next refusal pages
+        again."""
         try:
             await self._check_inbound_lane_anchor(name)
             await self._start_inbound_unsafe(name)
-        except (
-            TrustAnchorError,
-            WiringError,  # a start gate, and PortConflictError from a bind race
-            InsecureHopRefused,  # a hop guard the connector's own constructor runs
-            SourceStartupError,  # validate_startup, such as a missing poll directory
-            OSError,  # a bind or startup failure that is not a port conflict
-        ) as exc:
-            if ("inbound", name) not in self._failed:
+        except NotDeployedError:
+            raise
+        except Exception as exc:
+            if name in self.registry.inbound and ("inbound", name) not in self._failed:
                 self._record_failed(name, exc, kind="inbound")
             raise
 
@@ -4399,8 +4399,9 @@ class RegistryRunner:
         whose message varies. A reload clears the record (see :meth:`reload`), so the next window
         open alerts afresh.
 
-        :meth:`_checked_inbound_start` records the refusals it names before this runs (BACKLOG
-        #3859), so for those this only logs the retry; it records what that method does not name."""
+        :meth:`_checked_inbound_start` records a failed start before this runs (BACKLOG #3859), so
+        this usually only logs the retry. It still records what that method leaves, such as a
+        :class:`NotDeployedError`."""
         if ("inbound", name) in self._failed:
             log.debug(
                 "schedule: inbound connection %r still cannot start (%s); retrying next tick",
@@ -7405,7 +7406,16 @@ class RegistryRunner:
                     # an operator action) while a never-started one stays down. Its router/transform
                     # workers are still re-armed below, so any backlog drains (the AC-3 rule).
                     skip = self._listener_skip(ic, old_inbound_names, binding_now=True, now=now)
-                    if skip is _ListenerSkip.NOT_DEPLOYED or skip is _ListenerSkip.NOT_STARTED:
+                    if skip is _ListenerSkip.NOT_STARTED:
+                        # A refused operator start or restart left a failed record (BACKLOG #3859).
+                        # The reload is the recovery its alert names, and with no bind here to clear
+                        # it, the record would read failed after the fix, and its once-only guard
+                        # would swallow the alert for the next refusal. A refused CA's record is
+                        # kept: _keeps_anchor_failure owns it (vault BACKLOG #2371).
+                        if ("inbound", ic.name) not in self._anchor_refused:
+                            self._failed.pop(("inbound", ic.name), None)
+                        continue
+                    if skip is _ListenerSkip.NOT_DEPLOYED:
                         continue
                     # DR run-profile (#61, ADR 0048): a reload re-evaluates the whole graph against the
                     # threshold (the profile is a per-run decision read at start/reload), so a

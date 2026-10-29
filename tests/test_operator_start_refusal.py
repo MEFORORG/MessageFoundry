@@ -261,13 +261,17 @@ async def test_a_gate_refused_restart_of_a_running_listener_reads_failed_and_ale
         pytest.param(InsecureHopRefused("revocation hop refused"), id="hop-guard"),
         pytest.param(SourceStartupError("directory missing"), id="startup-validation"),
         pytest.param(OSError(errno.ENETDOWN, "network is down"), id="os-error"),
+        # A constructor's own refusal, such as a CRL past nextUpdate or a key-wrap check, is a
+        # ValueError, and none of the named types above. A narrower catch left it unrecorded.
+        pytest.param(ValueError("CRL is past its nextUpdate"), id="constructor-value-error"),
+        pytest.param(RuntimeError("connector failed to start"), id="runtime-error"),
     ],
 )
 async def test_each_refused_restart_type_records_the_listener_failed_once(
     store: MessageStore, gate: _Gate, refusal: Exception
 ) -> None:
-    """Each other refusal type the start path raises records the restarted listener failed with
-    one alert, and a second refused restart adds none."""
+    """Each other type a failed start raises records the restarted listener failed with one
+    alert, and a second refused restart adds none."""
     runner, sink = _runner(_live_listener(), store)
     await runner.start()
     try:
@@ -283,9 +287,10 @@ async def test_each_refused_restart_type_records_the_listener_failed_once(
         await runner.stop()
 
 
-async def test_a_not_deployed_start_is_not_recorded_failed(store: MessageStore) -> None:
+async def test_a_not_deployed_or_unknown_start_is_not_recorded_failed(store: MessageStore) -> None:
     """NotDeployedError is a refused request, not a failed start: the inbound stays not_deployed,
-    with no failed record and no alert."""
+    with no failed record and no alert. A name the graph does not declare is the caller's
+    KeyError, and it records nothing either."""
     reg = Registry()
     reg.add_inbound(
         InboundConnection(
@@ -299,6 +304,9 @@ async def test_a_not_deployed_start_is_not_recorded_failed(store: MessageStore) 
         with pytest.raises(NotDeployedError):
             await runner.start_inbound("IB_OFF", operator=True)
         assert runner.inbound_failed("IB_OFF") is None
+        with pytest.raises(KeyError):
+            await runner.restart_inbound("IB_NOPE", operator=True)
+        assert runner.inbound_failed("IB_NOPE") is None
         assert sink.stopped == []
     finally:
         await runner.stop()
@@ -307,9 +315,10 @@ async def test_a_not_deployed_start_is_not_recorded_failed(store: MessageStore) 
 async def test_a_gate_refused_window_open_alerts_once_over_three_ticks(
     store: MessageStore, gate: _Gate
 ) -> None:
-    """The scheduler path already recorded a refused window open once, through
-    ``_record_window_open_failure``. With the start path recording first, the two must not page
-    twice: three in-window ticks give one ``connection_stopped``."""
+    """A regression guard, green before the fix too: the scheduler path already recorded a
+    refused window open once, through ``_record_window_open_failure``. With the start path now
+    recording first, the two must not page twice: three in-window ticks give one
+    ``connection_stopped``."""
     schedule = Schedule(
         windows=[
             ActiveWindow(
@@ -329,5 +338,39 @@ async def test_a_gate_refused_window_open_alerts_once_over_three_ticks(
             await runner._reconcile_schedule("IB_LIVE", "inbound", schedule)
         assert runner.inbound_failed("IB_LIVE") is not None
         assert [name for name, _ in sink.stopped] == ["IB_LIVE"], sink.stopped
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_clears_the_record_a_refused_start_left_on_a_start_disabled_listener(
+    store: MessageStore, gate: _Gate
+) -> None:
+    """A reload does not bind an ``auto_start = false`` listener, so no bind clears the record a
+    refused operator start left. The reload drops it, as it drops a DR-parked or out-of-window
+    one: the listener reads stopped, and the next refusal pages again rather than being swallowed
+    by the once-only guard."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "IB_LIVE", ConnectionSpec(ConnectorType.MLLP, {"port": 0}), router="r", auto_start=False
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    runner, sink = _runner(reg, store)
+    await runner.start()
+    try:
+        gate.refusal = WiringError(_TLS_REFUSAL)
+        with pytest.raises(WiringError):
+            await runner.start_inbound("IB_LIVE", operator=True)
+        assert runner.inbound_failed("IB_LIVE") is not None
+        assert len(sink.stopped) == 1
+        gate.refusal = None
+        await runner.reload(reg)
+        assert runner.inbound_failed("IB_LIVE") is None
+        assert not runner.inbound_running("IB_LIVE")
+        gate.refusal = WiringError(_TLS_REFUSAL)
+        with pytest.raises(WiringError):
+            await runner.start_inbound("IB_LIVE", operator=True)
+        assert len(sink.stopped) == 2, sink.stopped
     finally:
         await runner.stop()
