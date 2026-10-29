@@ -1528,6 +1528,60 @@ def _split_address_list(v: object) -> object:
     return v
 
 
+_WS_ORIGIN_FORM = (
+    "list each origin as scheme://host[:port] with no path, query or fragment, as separate TOML "
+    'list items (ws_allowed_origins = ["https://a.example", "https://b.example"]) or, in '
+    "MEFOR_API_WS_ALLOWED_ORIGINS, comma-separated (BACKLOG #3764)"
+)
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _ws_allowed_origin(entry: str) -> str:
+    """Return one ``[api].ws_allowed_origins`` entry in the form a browser sends as ``Origin``, or
+    raise ``ValueError``.
+
+    The handshake check is an exact string match against the browser's serialized ``Origin``, so an
+    entry in any other form loads and matches nothing: a ``;``-joined list loads as one origin, and
+    so does any text at all. Refused: a separator or whitespace inside an entry, a scheme other than
+    http/https, userinfo, a path, query or fragment, a bad port, an IPv6 zone and a non-ASCII host
+    (a browser sends the ``xn--`` form). There is no wildcard: ``*`` and ``null`` are refused, the
+    second because every sandboxed or ``file:`` page sends it. Normalized, as the browser
+    serializes: case, a trailing ``/``, a default port and an IPv6 literal's spelling."""
+    field = f"[api].ws_allowed_origins entry {entry!r}"
+    if any(ch in ";," or ch.isspace() for ch in entry):
+        raise ValueError(f"{field} holds a ';', a ',' or whitespace: {_WS_ORIGIN_FORM}")
+    if not entry.isascii():
+        raise ValueError(f"{field} has a non-ASCII host; list its xn-- form: {_WS_ORIGIN_FORM}")
+    try:
+        # urlsplit refuses a bad bracketed host, and .port a bad or out-of-range port.
+        parts = urlsplit(entry)
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"{field} is not a bare origin ({exc}): {_WS_ORIGIN_FORM}") from exc
+    scheme = parts.scheme  # urlsplit lowercases the scheme, and .hostname the host
+    host = parts.hostname
+    if (
+        scheme not in _DEFAULT_PORTS
+        or not host
+        or "@" in parts.netloc
+        or parts.path not in ("", "/")
+        # urlsplit drops an empty "?" or "#", so read the raw text for them.
+        or "?" in entry
+        or "#" in entry
+    ):
+        raise ValueError(f"{field} is not a bare origin: {_WS_ORIGIN_FORM}")
+    if parts.netloc.startswith("["):
+        try:
+            literal = ipaddress.IPv6Address(host)
+        except ValueError as exc:  # urlsplit passes an IPvFuture literal such as [v1.x]
+            raise ValueError(f"{field} has a bad IPv6 literal: {_WS_ORIGIN_FORM}") from exc
+        if literal.scope_id is not None:
+            raise ValueError(f"{field} has an IPv6 zone, which no browser sends: {_WS_ORIGIN_FORM}")
+        host = f"[{literal.compressed}]"
+    suffix = "" if port is None or port == _DEFAULT_PORTS[scheme] else f":{port}"
+    return f"{scheme}://{host}{suffix}"
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -1803,6 +1857,13 @@ class ApiSettings(_Section):
         for entry in v:
             _parse_trusted_proxy(entry)
         return v
+
+    @field_validator("ws_allowed_origins", mode="after")
+    @classmethod
+    def _check_ws_allowed_origins(cls, v: list[str]) -> list[str]:
+        # An entry that is not an origin loads and matches no browser, so the operator's intended
+        # console is refused with nothing naming why (BACKLOG #3764).
+        return [_ws_allowed_origin(entry) for entry in v]
 
     @field_validator("tls_client_cert_identities", mode="before")
     @classmethod

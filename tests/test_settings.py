@@ -138,6 +138,88 @@ def test_trusted_proxies_and_ws_origins_from_env_keep_their_colons(
     assert s.api.ws_allowed_origins == ["https://ops.example.test:8443", "https://b.example.test"]
 
 
+def test_ws_allowed_origins_semicolon_list_is_refused_from_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3764 item 2: an old ``;``-joined value loaded as ONE origin, which no browser's
+    ``Origin`` equals, so the console it meant to allow was refused with nothing naming why. It now
+    refuses at load, naming the comma-separated form. Red before: it loaded as one entry."""
+    monkeypatch.chdir(tmp_path)
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[api]\nws_allowed_origins = ["https://a.example.test;https://b.example.test"]\n',
+    )
+    with pytest.raises(ValidationError, match="comma-separated") as exc:
+        load_settings(config_path=cfg, environ={})
+    assert "'https://a.example.test;https://b.example.test'" in str(exc.value)
+    assert "holds a ';'" in str(exc.value)
+
+
+def test_ws_allowed_origins_semicolon_list_is_refused_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3764 item 2: the env form is split on commas first, so a ``;`` survives into one
+    entry and meets the same refusal."""
+    monkeypatch.chdir(tmp_path)
+    env = {"MEFOR_API_WS_ALLOWED_ORIGINS": "https://a.example.test;https://b.example.test"}
+    with pytest.raises(ValidationError, match="comma-separated"):
+        load_settings(environ=env)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "not an origin",
+        "*",
+        "null",
+        "",
+        "a.example.test",
+        "ws://a.example.test",
+        "file:///etc",
+        "https://a.example.test/console",
+        "https://a.example.test?",
+        "https://a.example.test#top",
+        "https://user@a.example.test",
+        "https://a.example.test:99999",
+        "https://a.example.test:port",
+        "https://[fd00::7",
+        "https://[v1.x]",
+        "https://[fe80::1%25eth0]",
+        "https://bücher.example.test",
+        "https://a.example.test,https://b.example.test",
+    ],
+)
+def test_ws_allowed_origins_refuses_a_non_origin(entry: str) -> None:
+    """BACKLOG #3764 item 2: an entry a browser's ``Origin`` cannot equal loaded and matched
+    nothing. Each is refused, naming the entry and the accepted form; a list carries no wildcard,
+    so ``*`` and ``null`` are refused too (``null`` is what every sandboxed page sends)."""
+    with pytest.raises(ValidationError, match=r"scheme://host\[:port\]") as exc:
+        ApiSettings.model_validate({"ws_allowed_origins": ["https://ok.example.test", entry]})
+    assert f"entry {entry!r}" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("entry", "loaded"),
+    [
+        ("https://ops.example.test", "https://ops.example.test"),
+        ("https://ops.example.test:8443", "https://ops.example.test:8443"),
+        ("http://127.0.0.1:8765", "http://127.0.0.1:8765"),
+        ("https://[fd00::7]:8443", "https://[fd00::7]:8443"),
+        # Normalized to the browser's serialization, which the handshake matches exactly.
+        ("HTTPS://Ops.Example.TEST", "https://ops.example.test"),
+        ("https://ops.example.test/", "https://ops.example.test"),
+        ("https://ops.example.test:443", "https://ops.example.test"),
+        ("http://ops.example.test:80", "http://ops.example.test"),
+        ("https://ops.example.test:", "https://ops.example.test"),
+        ("https://[FD00:0:0::7]", "https://[fd00::7]"),
+    ],
+)
+def test_ws_allowed_origins_loads_a_bare_origin(entry: str, loaded: str) -> None:
+    """BACKLOG #3764 item 2: a bare origin loads, in the form a browser sends as ``Origin``."""
+    s = ApiSettings.model_validate({"ws_allowed_origins": [entry]})
+    assert s.ws_allowed_origins == [loaded]
+
+
 def test_sandbox_mode_is_settable_by_env(tmp_path: Path) -> None:
     """BACKLOG #1365: ``[sandbox]`` was missing from ``_SECTIONS``, so ``MEFOR_SANDBOX_MODE`` parsed to
     a section that did not exist and was DROPPED. The identical key in the config FILE worked, so an
