@@ -508,6 +508,29 @@ async def test_AC_A7_the_begin_leg_charges_the_sign_in_limiter_first() -> None:
         await store.close()
 
 
+@pytest.mark.parametrize(
+    ("first", "other"), [("::ffff:192.0.2.40", "192.0.2.40"), ("192.0.2.40", "::ffff:192.0.2.40")]
+)
+async def test_the_begin_leg_charges_the_bucket_of_the_host_not_of_its_spelling(
+    first: str, other: str
+) -> None:
+    """BACKLOG #3764 item 3: a begin leg from either spelling charges the one bucket of the address,
+    and its staged hit still renews under that key. RED on the unfixed code: the begin leg keyed
+    each spelling apart, so the other spelling got a second budget."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store, login_rate_limit_enabled=True, login_rate_limit_per_ip=1)
+        begun = service.begin_passkey_sign_in(rp_id=RP, client=first)
+        assert begun is not None
+        assert service.begin_passkey_sign_in(rp_id=RP, client=other) is None
+        assert not service.allow_login_attempt(other), "the spellings drew two buckets"
+        taken = service.take_passkey_challenge(begun[0])
+        assert taken is not None and taken.paid, "the folded charge did not renew"
+        assert not service.allow_login_attempt(first), "the renewal freed the bucket"
+    finally:
+        await store.close()
+
+
 async def test_AC_A6_a_passkey_owner_signs_in_with_password_and_assertion_under_a_live_lock() -> (
     None
 ):

@@ -228,9 +228,11 @@ class RedactionFilter(logging.Filter):
 
     *Residual:* ``redact`` now also applies a conservative free-text heuristic — date/DOB runs and
     multi-token name runs (e.g. ``DOE JANE``) are scrubbed even without HL7 delimiters — so this flows
-    through to both the stdout handler and the off-box forwarder by construction. The remaining residual
-    is an adversarially-crafted *single-token* or non-name-shaped identifier, for which the "never put
-    PHI in an exception message" convention remains the control (see :mod:`messagefoundry.redaction`).
+    through to both the stdout handler and the off-box forwarder by construction. Residuals remain, at
+    least a *single-token* or non-name-shaped identifier and the shapes docs/PHI.md section 7 lists.
+    The "never put PHI in an exception message" convention binds only the engine's own authors, Router
+    and Handler authors included, in text they write themselves, and never a remote peer, a library or the runtime (docs/PHI.md
+    section 7, *Who the exception-message convention binds*).
     A message escaped before it reaches this filter is another residual: the audit tee's
     ``json.dumps`` escapes the C0 controls first, and a name or date beside one can pass. See
     :func:`~messagefoundry.store.audit_tee.emit_audit_tee`.
