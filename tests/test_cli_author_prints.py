@@ -16,11 +16,14 @@ Synthetic data only: the marker below is not message data.
 
 from __future__ import annotations
 
+import argparse
+import ast
 import json
 from pathlib import Path
 
 import pytest
 
+import messagefoundry
 from messagefoundry.__main__ import main
 
 #: What the config module prints. Not JSON, so one copy on stdout breaks the parse.
@@ -131,3 +134,168 @@ def test_dryrun_under_a_project_root_sends_a_config_modules_print_to_stderr(
     assert rc == 0
     results = _stdout_json(capsys, anchor)
     assert isinstance(results, list) and len(results) == 1
+
+
+# --- One seam for every command (vault BACKLOG #3474) ---------------------------------------------
+#
+# The wraps above were added one command at a time, and the rest still let a print through: at
+# least check's later loads, connection, impact and cert inventory. `run_cli` now marks every
+# subcommand but the named few, and the loader and the dry-run preview redirect under the mark.
+
+#: What the Router prints, so the check gate's dry-run leg, which runs it, is covered too.
+ROUTER_MARKER = "ROUTER-PRINT-MARKER"
+
+ROUTER_PRINTING_CONFIG = PRINTING_CONFIG.replace(
+    '    return ["h"]', f'    print("{ROUTER_MARKER}")\n    return ["h"]'
+)
+
+
+def _no_print_on_stdout(capsys: pytest.CaptureFixture[str], *markers: str) -> object:
+    """Stdout parsed as one JSON document, after checking each marker reached stderr and not stdout."""
+    captured = capsys.readouterr()
+    for marker in markers:
+        # Control: the print ran, so its absence from stdout is not vacuous.
+        assert marker in captured.err, captured.err
+        assert marker not in captured.out
+    return json.loads(captured.out)
+
+
+def test_check_sends_every_loads_print_and_the_routers_to_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``check`` loads the config once per leg, then runs the Router over each fixture."""
+    assert ROUTER_PRINTING_CONFIG != PRINTING_CONFIG, "the fixture swap did not apply"
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path, ROUTER_PRINTING_CONFIG)
+    messages = tmp_path / "messages"
+    messages.mkdir()
+    (messages / "a.hl7").write_bytes(ADT_A01.encode("utf-8"))
+    main(["check", "--config", cfg, "--messages", str(messages), "--no-lint", "--json"])
+    captured = capsys.readouterr()
+    # More than one load printed, so the later legs' loads are covered, not only the first.
+    assert captured.err.count(MARKER) > 1, captured.err
+    assert ROUTER_MARKER in captured.err
+    assert MARKER not in captured.out and ROUTER_MARKER not in captured.out
+    report = json.loads(captured.out)
+    dryrun = [c for c in report["checks"] if c["name"] == "dryrun"]
+    assert dryrun and not dryrun[0]["skipped"], report
+
+
+def test_impact_sends_a_config_modules_print_to_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _config(tmp_path, PRINTING_CONFIG)
+    assert main(["impact", "--config", cfg, "router", "r", "--json"]) == 0
+    assert isinstance(_no_print_on_stdout(capsys, MARKER), dict)
+
+
+def test_cert_inventory_sends_a_config_modules_print_to_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _config(tmp_path, PRINTING_CONFIG)
+    assert main(["cert", "inventory", "--config", cfg, "--json"]) == 0
+    _no_print_on_stdout(capsys, MARKER)
+
+
+def test_connection_remove_sends_a_config_modules_print_to_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The edit validates the candidate graph by loading it before it writes."""
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path, PRINTING_CONFIG)
+    Path(cfg, "connections.toml").write_text(
+        '[[outbound]]\nname = "OB_TEST"\ntransport = "file"\n'
+        '  [outbound.settings]\n  directory = "out"\n',
+        encoding="utf-8",
+    )
+    assert main(["connection", "remove", "--config", cfg, "--name", "OB_TEST", "--json"]) == 0
+    _no_print_on_stdout(capsys, MARKER)
+
+
+def test_run_cli_marks_every_subcommand_but_the_named_ones() -> None:
+    """The guard: a subcommand is covered unless its name is listed, so a new one is covered."""
+    from messagefoundry.author_output import result_on_stdout
+    from messagefoundry.cli_common import Dispatch, run_cli
+
+    seen: dict[str, bool] = {}
+
+    def record(args: argparse.Namespace) -> int:
+        seen[args.command] = result_on_stdout()
+        return 0
+
+    def build() -> tuple[argparse.ArgumentParser, Dispatch]:
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command", required=True)
+        sub.add_parser("result")
+        sub.add_parser("service")
+        return parser, {"result": record, "service": record}
+
+    for command in ("result", "service"):
+        assert run_cli([command], build, author_prints_keep_stdout=frozenset({"service"})) == 0
+    assert seen == {"result": True, "service": False}
+    assert not result_on_stdout(), "the mark outlived the command"
+
+
+def test_the_engine_cli_leaves_only_serve_and_supervise_on_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adding a name takes a subcommand out of the default; that is a decision, so it fails here."""
+    import messagefoundry.__main__ as cli
+
+    assert frozenset({"serve", "supervise"}) == cli._AUTHOR_PRINTS_KEEP_STDOUT
+    passed: dict[str, object] = {}
+
+    def fake_run_cli(*_args: object, **kwargs: object) -> int:
+        passed.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "run_cli", fake_run_cli)
+    assert cli.main(["validate"]) == 0
+    assert passed["author_prints_keep_stdout"] is cli._AUTHOR_PRINTS_KEEP_STDOUT
+
+
+def test_only_the_seam_redirects_stdout() -> None:
+    """One seam: no other engine module points ``sys.stdout`` elsewhere for a block of its own.
+
+    A command that wraps its own load again would pass every other test here, and leave the next
+    command's author to remember the wrap. This keeps the redirect in one place."""
+    package = Path(messagefoundry.__file__).parent
+    hits = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                name: str | None = node.attr
+            elif isinstance(node, ast.Name):
+                name = node.id
+            elif isinstance(node, ast.alias):
+                name = node.name
+            else:
+                name = None
+            if name == "redirect_stdout":
+                hits.append(path.relative_to(package).as_posix())
+    # Control: the walk reaches the seam's own use, so an empty list elsewhere is not vacuous.
+    assert sorted(set(hits)) == ["author_output.py"], hits
+
+
+def test_the_loader_and_the_preview_redirect_only_under_the_mark(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` loads with the mark unset, so its prints stay where they were."""
+    from messagefoundry.author_output import stdout_carries_a_result
+    from messagefoundry.config.wiring import load_config, validate_config
+    from messagefoundry.pipeline.dryrun import dry_run
+
+    cfg = _config(tmp_path, ROUTER_PRINTING_CONFIG)
+    reg = load_config(cfg)
+    validate_config(cfg)
+    dry_run(reg, ADT_A01)
+    unmarked = capsys.readouterr()
+    assert unmarked.out.count(MARKER) == 2 and ROUTER_MARKER in unmarked.out, unmarked.out
+    with stdout_carries_a_result():
+        reg = load_config(cfg)
+        validate_config(cfg)
+        dry_run(reg, ADT_A01)
+    marked = capsys.readouterr()
+    assert marked.err.count(MARKER) == 2 and ROUTER_MARKER in marked.err, marked.err
+    assert MARKER not in marked.out and ROUTER_MARKER not in marked.out

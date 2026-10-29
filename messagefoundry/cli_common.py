@@ -20,6 +20,7 @@ before it calls :func:`run_cli`. The engine's ODBC pooling switch is the example
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import re
@@ -28,6 +29,7 @@ import textwrap
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from messagefoundry.author_output import stdout_carries_a_result
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import configure_stderr_logging
 
@@ -42,6 +44,7 @@ def run_cli(
     build_parser: Callable[[], tuple[argparse.ArgumentParser, Dispatch]],
     *,
     configures_own_logging: frozenset[str] = frozenset(),
+    author_prints_keep_stdout: frozenset[str] = frozenset(),
     floor_code: Callable[[argparse.Namespace], str | None] | None = None,
 ) -> int:
     """Run one command line: harden, install the hooks, parse, dispatch, and return the exit code.
@@ -51,6 +54,8 @@ def run_cli(
     in ``args.command``, as ``add_subparsers(dest="command", required=True)`` does, because the
     dispatch and the log-sink choice both key on it. ``configures_own_logging`` names the
     subcommands that install their own redacting root handler, so this shell gives them none.
+    ``author_prints_keep_stdout`` names the subcommands whose stdout is not a result, so this shell
+    does not send an author's ``print()`` to stderr for them (:mod:`messagefoundry.author_output`).
     ``floor_code`` names the ``"code"`` the JSON error floor adds for a subcommand that promises one
     on every failure, or None for no code; the command, not this shared shell, knows which do.
     """
@@ -150,8 +155,18 @@ def run_cli(
     # `Exception`, not `BaseException`: Ctrl-C and `SystemExit` keep their own meaning. A command that
     # printed part of its JSON before raising still leaves two documents on stdout; this catch cannot
     # take back what was already written.
+    # EVERY SUBCOMMAND'S STDOUT CARRIES ITS RESULT unless the caller names it (vault BACKLOG #3474),
+    # so a print() in a config module, Router or Handler the subcommand runs goes to stderr. The
+    # default covers a new subcommand, and a new load inside an old one, without anyone wrapping it;
+    # `messagefoundry.author_output` says where the redirect happens.
+    seam = (
+        contextlib.nullcontext()
+        if args.command in author_prints_keep_stdout
+        else stdout_carries_a_result()
+    )
     try:
-        return dispatch[args.command](args)
+        with seam:
+            return dispatch[args.command](args)
     except Exception as exc:
         from messagefoundry.last_resort import report_uncaught
 

@@ -55,6 +55,7 @@ from pathlib import Path
 from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, TypeIs
 
+from messagefoundry.author_output import author_code_stdout
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
     CodeSet,
@@ -8179,7 +8180,10 @@ def _loading(snapshot: ConfigSnapshot, registry: Registry) -> Iterator[_HelperIm
     imported. A load that raises inside this block gets back, in ``sys.modules``, whatever each of
     its names held before, so a live graph loaded earlier from the same files keeps its modules. (A
     failure after the block -- graph validation, the connections.toml merge -- leaves this load's
-    entries, as it leaves its config modules'.)"""
+    entries, as it leaves its config modules'.)
+
+    Under a CLI command whose stdout carries its result, a ``print()`` the modules run goes to
+    stderr: :func:`~messagefoundry.author_output.author_code_stdout` (vault BACKLOG #3474)."""
     global _active
     helpers = _HelperImporter(snapshot)
     with _load_lock:
@@ -8187,7 +8191,7 @@ def _loading(snapshot: ConfigSnapshot, registry: Registry) -> Iterator[_HelperIm
         # Code sets are published BEFORE the modules run so a top-level capture resolves; the registry
         # already holds them (loaded in load_config/validate_config), and activated() restores cleanly.
         try:
-            with _code_sets_activated(registry.code_sets):
+            with _code_sets_activated(registry.code_sets), author_code_stdout():
                 yield helpers
         except BaseException:
             helpers.discard()
