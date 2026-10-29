@@ -8070,7 +8070,11 @@ def _offline_alert_notifier(
         )
 
     alerts = settings.alerts
-    emails = "email" in configured_alert_transport_names(alerts)
+    names = configured_alert_transport_names(alerts)
+    if not names:
+        # As `serve` with no transport: the logging sink. Nothing is resolved for it.
+        return None
+    emails = "email" in names
     try:
         if emails and not (
             _offline_smtp_hop_unauthenticated_permitted(settings, what="alert email")
@@ -8079,19 +8083,22 @@ def _offline_alert_notifier(
             alerts, emails = alerts_without_email(alerts), False
         return build(alerts)
     except Exception as exc:  # noqa: BLE001 - best-effort channel; the grant is already written
-        if emails:
+        # The class only, as `_build_provision_auth_service` names a secret failure: the text of
+        # a provider's error can carry its address or a reference.
+        failure = type(exc).__name__
+        if emails and len(names) > 1:
             print(
-                f"WARNING: the [alerts] notifier could not be built with email ({exc}), so this "
-                "command sends no alert email; it tries the other transports.",
+                f"WARNING: the [alerts] notifier could not be built ({failure}); this command "
+                "tries again without the email transport.",
                 file=sys.stderr,
             )
             try:
                 return build(alerts_without_email(alerts))
             except Exception as retry:  # noqa: BLE001 - as above
-                exc = retry
+                failure = type(retry).__name__
         print(
-            f"WARNING: the [alerts] notifier could not be built ({exc}), so this command's alert "
-            "goes to the log only.",
+            f"WARNING: the [alerts] notifier could not be built ({failure}), so this command's "
+            "alert goes to the log only.",
             file=sys.stderr,
         )
         return None
@@ -8100,7 +8107,7 @@ def _offline_alert_notifier(
 async def _raise_offline_administrator_granted(
     settings: ServiceSettings,
     posture: HopPosture | None,
-    store: Store,
+    store: Store | None,
     *,
     username: str,
     granted_by: str,
@@ -8114,16 +8121,17 @@ async def _raise_offline_administrator_granted(
     console pages every grant too and a "beside others" condition would be one more read that can
     race.
 
-    The notifier is the one ``serve`` wires, with the opened store set, so the alert also lands
-    as an open alert instance the web console lists once the engine runs (ADR 0044). Started, fed
-    and drained here, because the loop ends with the command, within
-    :data:`_OFFLINE_ALERT_WAIT_SECONDS` in all. No suspend window is primed: a muted key would page
-    anyway, the safe direction for one alert.
+    The notifier is the one ``serve`` wires. With ``store`` set it also records the alert as an
+    open alert instance the web console lists once the engine runs (ADR 0044), best effort. Started,
+    fed and drained here, because the loop ends with the command, within
+    :data:`_OFFLINE_ALERT_WAIT_SECONDS`. No suspend window is primed: a muted key would page anyway,
+    the safe direction for one alert. The caller runs this AFTER the recovery codes are shown, so
+    a slow relay or an interrupt here never costs them.
 
-    True only when the notifier took the alert. A notifier that could not be built, or that raised
-    on the alert, leaves it to the logging sink, and the caller then says nobody was paged. Best
-    effort, and it never raises: the grant is written and audited, and the page is the smaller
-    loss."""
+    True only when the notifier took the alert and closed in time. A notifier that could not be
+    built, raised on the alert, or did not finish in time leaves it to the logging sink as well,
+    and the caller then says nobody may have been paged. Best effort, and it never raises: the
+    grant is written and audited, and the page is the smaller loss."""
     import asyncio
 
     from messagefoundry.pipeline.alerts import LoggingAlertSink, administrator_granted_alert
@@ -8141,17 +8149,19 @@ async def _raise_offline_administrator_granted(
                 )
                 taken = True
             finally:
+                # The sends first, then the state write, inside one bound.
                 async with asyncio.timeout(_OFFLINE_ALERT_WAIT_SECONDS):
-                    await notifier.drain_state(timeout=_OFFLINE_ALERT_WAIT_SECONDS)
                     await notifier.aclose()
+                    await notifier.drain_state(timeout=_OFFLINE_ALERT_WAIT_SECONDS)
         except TimeoutError:
+            taken = False
             log.warning(
                 "the [alerts] notifier did not finish within %.0f s, so the administrator_granted "
                 "alert may not have been sent, or recorded as an open alert",
                 _OFFLINE_ALERT_WAIT_SECONDS,
             )
-        except Exception:  # noqa: BLE001 - the caller still has recovery codes to show, so
-            # nothing here may raise past it.
+        except Exception:  # noqa: BLE001 - never raise past the caller's own output
+            taken = False
             log.exception("the [alerts] notifier failed on the administrator_granted alert")
     if not taken:
         # Builds the key and swallows a sink fault, as the reconciler's raise does.
@@ -8583,7 +8593,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     actor = f"cli:{getpass.getuser()}"
 
-    async def run() -> tuple[ProvisionedAdministrator, str, bool]:
+    async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         store = await open_store(
             settings.store,
@@ -8634,16 +8644,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
             finally:
                 if security_notifier is not None:
                     await security_notifier.aclose()
-            # Vault BACKLOG #3849 B5: the grant is written and audited, so it pages, as every
-            # console grant does. Before the store closes, so the alert's open instance lands in it.
-            # It never raises, so the recovery codes below are always shown.
-            alerted = await _raise_offline_administrator_granted(
-                settings,
-                posture,
-                store,
-                username=outcome.username,
-                granted_by=actor,
-            )
             # NO M-31 "the store must already exist" guard here, and the difference from
             # `admin-unlock` is deliberate: the ordinary sequence is install, provision, serve, so on
             # a first run the SQLite store legitimately does NOT exist and creating it is correct.
@@ -8652,7 +8652,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # The substitute is naming the target below. It is read off the OPENED store rather than
             # off `[store].path`, which is the SQLite field and would name a file that was never
             # touched on the two server backends.
-            return (outcome, store.path, alerted)
+            return (outcome, store.path)
         finally:
             store_slot.current = None
             await store.close()
@@ -8676,7 +8676,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     # No TrustAnchorError arm: the anchors are checked at the build, before the prompt (#2081).
     try:
-        outcome, store_path, alerted = run_guarded(run())
+        outcome, store_path = run_guarded(run())
     except FirstAdministratorRefused as exc:
         return _emit_error(str(exc), as_json=args.json)
     except (_KeylessProvisionRefused, KeylessAuditChainRefused, _UnauditableWrite) as exc:
@@ -8710,6 +8710,36 @@ def _provision_admin(args: argparse.Namespace) -> int:
         "a lost authenticator is replaced by another Administrator, or at the host by "
         "`admin-reset-totp`, so create a second Administrator soon.",
     )
+
+    async def alert() -> bool:
+        # Vault BACKLOG #3849 B5: the grant is written and audited, so it pages, as every console
+        # grant does. AFTER the codes are shown, so a slow relay or an interrupt here never costs
+        # them. The store is opened again, as `serve` opens it, only so the alert's open instance
+        # lands in it; a store that does not open costs that record, not the page.
+        reopened: Store | None = None
+        try:
+            reopened = await open_store(
+                settings.store,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        except Exception:  # noqa: BLE001 - the page goes on without the open-instance record
+            logging.getLogger(__name__).warning(
+                "could not reopen the store for the administrator_granted open alert", exc_info=True
+            )
+        try:
+            return await _raise_offline_administrator_granted(
+                settings, posture, reopened, username=outcome.username, granted_by=actor
+            )
+        finally:
+            if reopened is not None:
+                await reopened.close()
+
+    try:
+        alerted = run_guarded(alert())
+    except Exception:  # noqa: BLE001 - the account and its codes are done; report, do not fail
+        logging.getLogger(__name__).exception("the administrator_granted alert step failed")
+        alerted = False
     if args.json:
         _print_json(
             {
@@ -8770,15 +8800,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
     elif outcome.administrators_at_check:
         _safe_print(
-            "WARNING: no [alerts] notifier was available, so the administrator_granted alert for "
-            "this grant went to the log only, and nobody was paged. Tell the site's other "
-            "Administrators yourself: "
+            "WARNING: no [alerts] notifier took the administrator_granted alert for this grant "
+            "(none is configured, or a WARNING or ERROR above says why), so it went to the log and "
+            "nobody may have been paged. Tell the site's other Administrators yourself: "
             + ", ".join(repr(name) for name in outcome.administrators_at_check)
         )
     else:
         _safe_print(
-            "No [alerts] notifier was available, so the administrator_granted alert for this "
-            "grant went to the log only."
+            "No [alerts] notifier took the administrator_granted alert for this grant, so it went "
+            "to the log."
         )
     return 0
 
