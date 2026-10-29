@@ -9,14 +9,11 @@ import os
 import re
 import tomllib
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from starlette.websockets import WebSocket
 
-from messagefoundry.api.security import _ws_origin_allowed
 from messagefoundry.config.settings import (
     _DEFAULT_FILE,
     ApiSettings,
@@ -145,8 +142,8 @@ def test_trusted_proxies_and_ws_origins_from_env_keep_their_colons(
 def test_ws_allowed_origins_semicolon_list_is_refused_from_the_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #3764 item 2: an old ``;``-joined value loaded as ONE origin, which no browser's
-    ``Origin`` equals, so the console it meant to allow was refused with nothing naming why. It now
+    """BACKLOG #3764 item 2: an old ``;``-joined value loaded as ONE origin, which no ``Origin``
+    header equals, so a client it meant to allow was refused with nothing naming why. It now
     refuses at load, naming the comma-separated form. Red before: it loaded as one entry."""
     monkeypatch.chdir(tmp_path)
     cfg = _write(
@@ -155,8 +152,7 @@ def test_ws_allowed_origins_semicolon_list_is_refused_from_the_file(
     )
     with pytest.raises(ValidationError, match="comma-separated") as exc:
         load_settings(config_path=cfg, environ={})
-    assert "'https://a.example.test;https://b.example.test'" in str(exc.value)
-    assert "holds a ';'" in str(exc.value)
+    assert "entry 1 holds a ';'" in str(exc.value)
 
 
 def test_ws_allowed_origins_semicolon_list_is_refused_from_env(
@@ -201,15 +197,20 @@ def test_ws_allowed_origins_semicolon_list_is_refused_from_env(
         "https://0x7f.0.0.1",
         "https://010.0.0.1",
         "https://127.0.0.1.",
+        "https://a.example.test:0",
+        "https://a.example.test/?access_token=SENTINEL-not-a-real-token",
     ],
 )
 def test_ws_allowed_origins_refuses_a_non_origin(entry: str) -> None:
-    """BACKLOG #3764 item 2: an entry a browser's ``Origin`` cannot equal loaded and matched
-    nothing. Each is refused, naming the entry and the accepted form; a list carries no wildcard,
-    so ``*`` and ``null`` are refused too (``null`` is what every sandboxed page sends)."""
+    """BACKLOG #3764 item 2: an entry no ``Origin`` header can equal loaded and matched nothing.
+    Each is refused by position with the accepted form, and never quoted, since a pasted URL can
+    carry a credential and the message reaches the log. A list carries no wildcard, so ``*`` and
+    ``null`` are refused too (``null`` is what every sandboxed page sends)."""
     with pytest.raises(ValidationError, match=r"scheme://host\[:port\]") as exc:
         ApiSettings.model_validate({"ws_allowed_origins": ["https://ok.example.test", entry]})
-    assert f"entry {entry!r}" in str(exc.value)
+    assert "[api].ws_allowed_origins entry 2 " in str(exc.value)
+    if entry:
+        assert repr(entry) not in str(exc.value)
 
 
 def test_ws_allowed_origins_refuses_userinfo_without_quoting_it() -> None:
@@ -223,13 +224,25 @@ def test_ws_allowed_origins_refuses_userinfo_without_quoting_it() -> None:
 
 
 @pytest.mark.parametrize(
-    ("entry", "loaded"),
+    "entry",
     [
-        ("https://ops.example.test", "https://ops.example.test"),
-        ("https://ops.example.test:8443", "https://ops.example.test:8443"),
-        ("http://127.0.0.1:8765", "http://127.0.0.1:8765"),
-        ("https://[fd00::7]:8443", "https://[fd00::7]:8443"),
-        # Normalized to the browser's serialization, which the handshake matches exactly.
+        "https://ops.example.test",
+        "https://ops.example.test:8443",
+        "http://127.0.0.1:8765",
+        "https://[fd00::7]:8443",
+        "https://[::ffff:7f00:1]",
+    ],
+)
+def test_ws_allowed_origins_loads_an_origin_as_written(entry: str) -> None:
+    """BACKLOG #3764 item 2: an entry spelled as an ``Origin`` header carries it loads unchanged,
+    the env form included."""
+    assert ApiSettings.model_validate({"ws_allowed_origins": [entry]}).ws_allowed_origins == [entry]
+    assert ApiSettings.model_validate({"ws_allowed_origins": entry}).ws_allowed_origins == [entry]
+
+
+@pytest.mark.parametrize(
+    ("entry", "canonical"),
+    [
         ("HTTPS://Ops.Example.TEST", "https://ops.example.test"),
         ("https://ops.example.test/", "https://ops.example.test"),
         ("https://ops.example.test:443", "https://ops.example.test"),
@@ -241,41 +254,44 @@ def test_ws_allowed_origins_refuses_userinfo_without_quoting_it() -> None:
         ("https://[1:0:0:2:0:0:0:3]", "https://[1:0:0:2::3]"),
     ],
 )
-def test_ws_allowed_origins_loads_a_bare_origin(entry: str, loaded: str) -> None:
-    """BACKLOG #3764 item 2: a bare origin loads, in the form a browser sends as ``Origin``."""
-    s = ApiSettings.model_validate({"ws_allowed_origins": [entry]})
-    assert s.ws_allowed_origins == [loaded]
-
-
-async def _never_receive() -> Any:
-    raise AssertionError("the origin check never reads the socket")
-
-
-async def _never_send(message: Any) -> None:
-    raise AssertionError("the origin check never writes the socket")
-
-
-@pytest.mark.parametrize(
-    ("entry", "browser_origin"),
-    [
-        # The Origin a browser sends at each, per the WHATWG URL serializer.
-        ("HTTPS://Ops.Example.TEST:443/", "https://ops.example.test"),
-        ("https://[::ffff:127.0.0.1]:8443", "https://[::ffff:7f00:1]:8443"),
-    ],
-)
-def test_ws_allowed_origins_loaded_entry_admits_its_browser(
-    entry: str, browser_origin: str
+def test_ws_allowed_origins_refuses_another_spelling_naming_the_origin(
+    entry: str, canonical: str
 ) -> None:
-    """BACKLOG #3764 item 2: the loaded entry is admitted by the handshake's own check, fed the
-    Origin a browser sends there; before, each loaded as written and matched nothing."""
-    allowed = tuple(ApiSettings.model_validate({"ws_allowed_origins": [entry]}).ws_allowed_origins)
+    """BACKLOG #3764 item 2: a real origin in another spelling loaded as written and matched no
+    handshake, since the check is exact. It is refused with the spelling to list, rather than
+    rewritten, so what the file says is what matches."""
+    with pytest.raises(ValidationError, match=re.escape(f"list {canonical!r}")):
+        ApiSettings.model_validate({"ws_allowed_origins": [entry]})
+
+
+def test_ws_allowed_origins_listed_origin_passes_the_handshake_origin_check() -> None:
+    """BACKLOG #3764 item 2: the spelling a refusal names is the one the handshake's own Origin
+    check admits, fed the header a browser sends at ``https://[::ffff:127.0.0.1]:8443`` (the
+    WHATWG serializer writes the mapped address in hex). This is the Origin check alone: on the
+    header path a browser still needs a bearer token, which it cannot send."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocket
+
+    from messagefoundry.api.security import _ws_origin_allowed
+
+    with pytest.raises(ValidationError, match=r"list '(https://\[::ffff:7f00:1\]:8443)'") as exc:
+        ApiSettings.model_validate({"ws_allowed_origins": ["https://[::ffff:127.0.0.1]:8443"]})
+    named = re.search(r"list '([^']+)'", str(exc.value))
+    assert named is not None
+    allowed = tuple(
+        ApiSettings.model_validate({"ws_allowed_origins": [named[1]]}).ws_allowed_origins
+    )
+
+    async def _never(*_args: Any) -> Any:
+        raise AssertionError("the origin check never touches the socket")
+
     scope = {
         "type": "websocket",
-        "headers": [(b"origin", browser_origin.encode())],
+        "headers": [(b"origin", b"https://[::ffff:7f00:1]:8443")],
         "app": SimpleNamespace(state=SimpleNamespace(ws_allowed_origins=allowed)),
     }
-    websocket = WebSocket(scope, receive=_never_receive, send=_never_send)
-    assert _ws_origin_allowed(websocket) is True
+    assert _ws_origin_allowed(WebSocket(scope, receive=_never, send=_never)) is True
 
 
 def test_sandbox_mode_is_settable_by_env(tmp_path: Path) -> None:

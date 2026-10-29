@@ -1529,9 +1529,11 @@ def _split_address_list(v: object) -> object:
 
 
 _WS_ORIGIN_FORM = (
-    "list each origin as scheme://host[:port] with no path, query or fragment, as separate TOML "
-    'list items (ws_allowed_origins = ["https://a.example", "https://b.example"]) or, in '
-    "MEFOR_API_WS_ALLOWED_ORIGINS, comma-separated (BACKLOG #3764)"
+    "list each origin exactly as a browser sends it in Origin, scheme://host[:port] with no "
+    "path, query, fragment or wildcard, as separate TOML list items "
+    '(ws_allowed_origins = ["https://a.example", "https://b.example"]) or, in '
+    "MEFOR_API_WS_ALLOWED_ORIGINS, comma-separated; docs/CONFIGURATION.md has the rules "
+    "(BACKLOG #3764)"
 )
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 # A registered name as a browser serializes it into Origin: ASCII, lower case, and no character the
@@ -1541,45 +1543,31 @@ _WS_ORIGIN_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
 
 
 def _whatwg_ipv6(address: ipaddress.IPv6Address) -> str:
-    """Serialize an IPv6 address as the WHATWG URL standard does, which is how a browser writes it
-    into ``Origin``: eight hex pieces, the first longest run of two or more zero pieces as ``::``.
-    ``IPv6Address.compressed`` differs on an IPv4-mapped address, which it writes dotted."""
-    pieces = [int.from_bytes(address.packed[i : i + 2], "big") for i in range(0, 16, 2)]
-    length, start = 1, -1  # a run must beat length 1 to compress
-    run: int | None = None
-    for i, piece in enumerate([*pieces, 1]):  # the sentinel closes a trailing run
-        if piece == 0:
-            run = i if run is None else run
-        elif run is not None:
-            if i - run > length:
-                length, start = i - run, run
-            run = None
-    if start < 0:
-        return ":".join(f"{p:x}" for p in pieces)
-    head = ":".join(f"{p:x}" for p in pieces[:start])
-    tail = ":".join(f"{p:x}" for p in pieces[start + length :])
-    return f"{head}::{tail}"
+    """Serialize an IPv6 address as a browser writes it into ``Origin`` (the WHATWG URL standard).
+    ``IPv6Address.compressed`` already does, except on an IPv4-mapped address, which it writes
+    dotted where the standard writes two hex pieces."""
+    mapped = address.ipv4_mapped
+    if mapped is None:
+        return address.compressed
+    n = int(mapped)
+    return f"::ffff:{n >> 16:x}:{n & 0xFFFF:x}"
 
 
-def _ws_allowed_origin(entry: str) -> str:
-    """Return one ``[api].ws_allowed_origins`` entry normalized to the form a browser sends as
-    ``Origin``, or raise ``ValueError``.
+def _check_ws_allowed_origin(entry: str, position: int) -> None:
+    """Raise ``ValueError`` unless one ``[api].ws_allowed_origins`` entry, the ``position``-th
+    (from 1), is an origin spelled as an ``Origin`` header carries it.
 
-    The handshake check is an exact string match against the browser's serialized ``Origin``, so an
-    entry in another form loads and matches nothing: a ``;``-joined list loads as one origin, and so
-    does any text at all. Refused, at least: userinfo (named, never quoted, since it can carry a
-    credential), a separator, whitespace or a control character, a scheme other than http/https, a
-    path, query or fragment, a bad port, an IPv6 zone, a non-ASCII host (a browser sends the
-    ``xn--`` form), a host character the browser would forbid, decode or rewrite, and an IPv4
-    address in any spelling but four decimal parts. There is no wildcard: ``*`` and ``null`` are
-    refused, the second because every sandboxed or ``file:`` page sends it. Normalized: case, a
-    trailing ``/``, a default port and an IPv6 literal's spelling."""
+    The handshake check is an exact string match against the ``Origin`` header, and a browser
+    always sends its own serialization, so an entry in another form loads and matches nothing: a
+    ``;``-joined list loads as one origin, and so does any text at all. An entry must therefore be
+    that serialization already. One that names a real origin in another spelling (case, a trailing
+    ``/``, a default port, an IPv6 literal's spelling) is refused with the spelling to list, rather
+    than rewritten, so what the file says is what matches. What is refused is listed in
+    docs/CONFIGURATION.md. A refusal names the entry by position and never quotes it: a pasted URL
+    can carry a credential in its userinfo, query or path, and the message reaches the log."""
+    field = f"[api].ws_allowed_origins entry {position}"
     if "@" in entry:
-        raise ValueError(
-            "[api].ws_allowed_origins has an entry with userinfo ('@'), not quoted here because "
-            f"it can carry a credential: {_WS_ORIGIN_FORM}"
-        )
-    field = f"[api].ws_allowed_origins entry {entry!r}"
+        raise ValueError(f"{field} has an '@'; userinfo is refused: {_WS_ORIGIN_FORM}")
     if any(ch in ";," or ch.isspace() or not ch.isprintable() for ch in entry):
         raise ValueError(
             f"{field} holds a ';', a ',', whitespace or a control character: {_WS_ORIGIN_FORM}"
@@ -1589,7 +1577,7 @@ def _ws_allowed_origin(entry: str) -> str:
         parts = urlsplit(entry)
         port = parts.port
     except ValueError as exc:
-        raise ValueError(f"{field} is not a bare origin ({exc}): {_WS_ORIGIN_FORM}") from exc
+        raise ValueError(f"{field} has a bad host or port: {_WS_ORIGIN_FORM}") from exc
     scheme = parts.scheme  # urlsplit lowercases the scheme, and .hostname the host
     host = parts.hostname
     if not entry.isascii():
@@ -1604,6 +1592,8 @@ def _ws_allowed_origin(entry: str) -> str:
         or "#" in entry
     ):
         raise ValueError(f"{field} is not a bare origin: {_WS_ORIGIN_FORM}")
+    if port == 0:
+        raise ValueError(f"{field} has port 0, which a browser blocks: {_WS_ORIGIN_FORM}")
     if parts.netloc.startswith("["):
         try:
             literal = ipaddress.IPv6Address(host)
@@ -1621,18 +1611,19 @@ def _ws_allowed_origin(entry: str) -> str:
         # decimal parts (127.1, 0x7f.0.0.1, 010.0.0.1 and 127.0.0.1. all become another string).
         labels = host.split(".")
         last = labels[-2] if len(labels) > 1 and not labels[-1] else labels[-1]
-        if _WS_ORIGIN_NUMERIC_LABEL.fullmatch(last):
-            try:
-                canonical = str(ipaddress.IPv4Address(host))
-            except ValueError:
-                canonical = None
-            if canonical != host:
-                raise ValueError(
-                    f"{field} is an IPv4 address in a form a browser rewrites; write it as four "
-                    f"decimal parts with no leading zeros: {_WS_ORIGIN_FORM}"
-                )
+        if _WS_ORIGIN_NUMERIC_LABEL.fullmatch(last) and not is_canonical_ipv4(host):
+            raise ValueError(
+                f"{field} is an IPv4 address in a form a browser rewrites; write it as four "
+                f"decimal parts with no leading zeros: {_WS_ORIGIN_FORM}"
+            )
     suffix = "" if port is None or port == _DEFAULT_PORTS[scheme] else f":{port}"
-    return f"{scheme}://{host}{suffix}"
+    canonical = f"{scheme}://{host}{suffix}"
+    if canonical != entry:
+        # Quoting the canonical form is safe: it is built from the scheme, host and port alone.
+        raise ValueError(
+            f"{field} is not spelled as a browser sends it in Origin; list {canonical!r}: "
+            f"{_WS_ORIGIN_FORM}"
+        )
 
 
 class ApiSettings(_Section):
@@ -1914,9 +1905,11 @@ class ApiSettings(_Section):
     @field_validator("ws_allowed_origins", mode="after")
     @classmethod
     def _check_ws_allowed_origins(cls, v: list[str]) -> list[str]:
-        # An entry that is not an origin loads and matches no browser, so the operator's intended
-        # console is refused with nothing naming why (BACKLOG #3764).
-        return [_ws_allowed_origin(entry) for entry in v]
+        # An entry not spelled as an Origin header loads and matches no handshake, so a client the
+        # operator meant to allow is refused with nothing naming why (BACKLOG #3764).
+        for position, entry in enumerate(v, 1):
+            _check_ws_allowed_origin(entry, position)
+        return v
 
     @field_validator("tls_client_cert_identities", mode="before")
     @classmethod
