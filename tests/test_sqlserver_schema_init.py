@@ -329,7 +329,7 @@ async def test_the_schema_holder_bounds_its_ddl_lock_waits_and_resets_the_bound(
     assert conn.committed == 1
 
 
-async def test_the_ddl_lock_bound_is_reset_when_a_peer_already_applied_the_batch() -> None:
+async def test_an_open_a_peer_already_served_sets_no_ddl_lock_bound() -> None:
     executed: list[tuple[str, object]] = []
     conn = _FakeConn(executed)
     store = _make_store(conn)
@@ -344,8 +344,8 @@ async def test_the_ddl_lock_bound_is_reset_when_a_peer_already_applied_the_batch
     assert await store._ensure_schema() is False
 
     sqls = [sql for sql, _ in executed]
-    assert "SET LOCK_TIMEOUT 45000" in sqls
-    assert sqls[-1] == "SET LOCK_TIMEOUT -1"  # before the commit that releases the applock
+    # The bound is set only once the double-check under the lock finds DDL to run.
+    assert not any("LOCK_TIMEOUT" in sql for sql in sqls)
     assert conn.committed == 1
     assert not any("CREATE TABLE" in sql for sql in sqls)
 
@@ -437,6 +437,36 @@ async def test_a_failed_lock_timeout_reset_does_not_mask_the_outcome(
     assert executed[-1][0] == "SET LOCK_TIMEOUT -1"
     assert "could not reset LOCK_TIMEOUT" in caplog.text
     assert detached == [conn]
+
+
+async def test_a_failed_rollback_after_a_bounded_batch_discards_the_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the batch's rollback itself fails, neither the transaction nor the session bound is known
+    to be gone, so the connection is discarded rather than pooled; the rollback's error raises."""
+    from messagefoundry.store import sqlserver
+
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    conn.cursor_obj = _DdlFailingCursor(executed)
+    conn.cursor_obj.failure = RuntimeError("Lock request time out period exceeded. (1222)")
+    rollback_error = RuntimeError("link failure")
+
+    async def _rollback() -> None:
+        raise rollback_error
+
+    conn.rollback = _rollback  # type: ignore[method-assign]
+    store = _make_store(conn)
+    store._settings = _settings(command_timeout=30)  # type: ignore[assignment]
+    detached: list[object] = []
+    monkeypatch.setattr(sqlserver, "_detach_connection", detached.append)
+
+    with pytest.raises(RuntimeError) as info:
+        await store._ensure_schema()
+
+    assert info.value is rollback_error
+    assert detached == [conn]
+    assert "CREATE TABLE" in executed[-1][0]  # no reset on a connection being discarded
 
 
 async def test_the_schema_applock_runs_before_the_ddl_lock_bound() -> None:

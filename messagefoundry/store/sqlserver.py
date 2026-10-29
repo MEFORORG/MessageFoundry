@@ -4669,28 +4669,27 @@ class SqlServerStore:
                         )
                     except _ApplockTimeout as exc:
                         raise SchemaLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
+                    # Double-check under the lock: the peer we queued behind may have just applied
+                    # this exact batch and committed its marker — then this open has nothing to do.
+                    if await self._schema_marker_current(cur, expected):
+                        await self._commit(conn)  # releases the txn-scoped applock
+                        log.debug(
+                            "sqlserver: schema applied by a peer (%s…) — skipped", expected[:12]
+                        )
+                        return False
                     # The HOLDER's own lock waits are bounded too (BACKLOG #1726). The cursor has
                     # no query timeout and the session's LOCK_TIMEOUT is -1, so without this a
                     # CREATE INDEX or ALTER queued behind any open transaction on its table waits
                     # forever while holding the schema lock. LOCK_TIMEOUT bounds only the wait for
                     # each lock, never how long a build runs once it has it. It is SESSION-scoped
                     # and survives the commit, so it is reset before the pooled connection is
-                    # released: inside the transaction before each commit, or after the rollback
-                    # below. Set AFTER the applock, which takes its own @LockTimeout.
-                    await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
+                    # released: inside the transaction before the commit, or after the rollback
+                    # below. Set AFTER the applock, which takes its own @LockTimeout. The flag is
+                    # raised first: a SET the server applied but whose round trip then failed must
+                    # still be reset.
                     lock_bounded = True
                     try:
-                        # Double-check under the lock: the peer we queued behind may have just
-                        # applied this exact batch and committed its marker — then this open has
-                        # nothing to do.
-                        if await self._schema_marker_current(cur, expected):
-                            await cur.execute(_LOCK_TIMEOUT_RESET)
-                            await self._commit(conn)  # releases the txn-scoped applock
-                            log.debug(
-                                "sqlserver: schema applied by a peer (%s…) — skipped",
-                                expected[:12],
-                            )
-                            return False
+                        await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
                         for statement in _SCHEMA:
                             await cur.execute(statement)
                         await cur.execute("DELETE FROM schema_meta WHERE id=1")
@@ -4710,7 +4709,18 @@ class SqlServerStore:
                 # A cancellation here, or during the rollback, skips the reset below: _acquire
                 # quarantines that connection rather than pooling it, and the cancelled statement
                 # may still be running on its executor thread.
-                await conn.rollback()  # roll back the partial DDL batch (M-6)
+                try:
+                    await conn.rollback()  # roll back the partial DDL batch (M-6)
+                except Exception:
+                    if lock_bounded:
+                        # Neither the transaction nor the session bound is known to be gone.
+                        log.warning(
+                            "sqlserver: rollback after a failed schema batch failed; discarding"
+                            " the connection",
+                            exc_info=True,
+                        )
+                        _detach_connection(conn)
+                    raise
                 if lock_bounded:
                     await self._reset_schema_lock_timeout(conn)
                 raise
@@ -4719,21 +4729,23 @@ class SqlServerStore:
         """After a failed schema batch has rolled back, put the session's LOCK_TIMEOUT back to -1
         (BACKLOG #1726), so the pooled connection keeps the default. A ``SET`` is not undone by a
         rollback, so the reset runs alone and is followed by a second rollback, which ends any
-        implicit transaction it opened. It runs under ``command_timeout`` again: the batch lifted
-        the connection's query timeout, and this round trip must not be the one unbounded wait. A
+        implicit transaction it opened. It runs under ``command_timeout`` again, like any other
+        statement on a borrowed connection: the batch had lifted the connection's query timeout. A
         failed reset is logged, not raised, so it cannot mask the batch's own error, and the
         connection is discarded rather than pooled with a LOCK_TIMEOUT nobody else expects."""
         raw = getattr(conn, "_conn", None)
         if raw is not None:
             raw.timeout = self._settings.command_timeout
+        step = "reset LOCK_TIMEOUT"
         try:
             async with self._cursor(conn) as cur:
                 await cur.execute(_LOCK_TIMEOUT_RESET)
+            step = "roll back after the LOCK_TIMEOUT reset"
             await conn.rollback()
         except Exception:  # noqa: BLE001 - a reset failure must not mask the real outcome
             log.warning(
-                "sqlserver: could not reset LOCK_TIMEOUT after a failed schema batch; discarding"
-                " the connection",
+                "sqlserver: could not %s after a failed schema batch; discarding the connection",
+                step,
                 exc_info=True,
             )
             # Its future is deliberately not awaited, as in _rollback_or_discard.

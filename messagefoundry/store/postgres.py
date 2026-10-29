@@ -1997,6 +1997,7 @@ class PostgresStore:
                 # database-configured lock_timeout (or transaction_timeout) can still end it sooner.
                 log.info("postgres: waiting for the schema lock to apply the DDL batch")
                 wait = self._settings.schema_lock_timeout
+                lock = self._lock_key(_SCHEMA_LOCK)
                 try:
                     await self._advisory_lock(conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK, timeout=wait)
                 except TimeoutError as exc:
@@ -2004,14 +2005,12 @@ class PostgresStore:
                     # TimeoutError) is a network fault, not a lock wait, so it propagates as is.
                     if exc.errno is not None:
                         raise
-                    lock = self._lock_key(_SCHEMA_LOCK)
                     raise SchemaLockTimeout(self.backend, lock, wait) from exc
-                except Exception as exc:
-                    # A role- or database-configured lock_timeout ended the wait first.
-                    if driver_sqlstate(exc) != _LOCK_NOT_AVAILABLE:
-                        raise
-                    lock = self._lock_key(_SCHEMA_LOCK)
-                    raise SchemaLockTimeout(self.backend, lock, wait) from exc
+                # Double-check under the lock: the peer this open queued behind may have just
+                # applied this exact batch and committed its marker — then there is nothing to do.
+                if await self._schema_marker_current(conn, expected):
+                    log.debug("postgres: schema applied by a peer (%s…) — skipped", expected[:12])
+                    return False
                 # The HOLDER's own lock waits are bounded too (BACKLOG #1726). The builds run with
                 # statement_timeout 0, so without this a CREATE INDEX or ALTER queued behind any open
                 # transaction on its table waits forever while holding the schema lock, and its
@@ -2022,13 +2021,6 @@ class PostgresStore:
                 # this transaction, so it reverts at commit or rollback.
                 await conn.execute(_DDL_LOCK_TIMEOUT_SQL, math.ceil(wait * 1000))
                 try:
-                    # Double-check under the lock: the peer this open queued behind may have just
-                    # applied this exact batch and committed its marker — then there is nothing to do.
-                    if await self._schema_marker_current(conn, expected):
-                        log.debug(
-                            "postgres: schema applied by a peer (%s…) — skipped", expected[:12]
-                        )
-                        return False
                     for statement in _SCHEMA:
                         await conn.execute(statement)
                     await self._migrate_lease_columns(conn)
@@ -2043,7 +2035,6 @@ class PostgresStore:
                     # 55P03 is lock_not_available (asyncpg's LockNotAvailableError), read off the
                     # error rather than by importing the lazy driver.
                     if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
-                        lock = self._lock_key(_SCHEMA_LOCK)
                         raise SchemaDdlLockTimeout(self.backend, lock, wait) from exc
                     raise
         log.info("postgres: schema DDL batch applied (%s…)", expected[:12])

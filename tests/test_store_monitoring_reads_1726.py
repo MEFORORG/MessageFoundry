@@ -693,13 +693,22 @@ async def test_postgres_fractional_schema_lock_timeout_rounds_the_ddl_bound_up()
     from messagefoundry.store import postgres
 
     conn = _RecordingPgConn()
-    store = _pg_schema_store(conn, schema_lock_timeout=0.0001)
+    store = _pg_schema_store(conn, schema_lock_timeout=0.0001, peer_applied=False)
 
     await store._ensure_schema()
 
     sqls = [sql for sql, _ in conn.executed]
     [bound] = [i for i, sql in enumerate(sqls) if sql == postgres._DDL_LOCK_TIMEOUT_SQL]
     assert conn.args[bound] == (1,)  # never 0, which would mean no limit
+
+
+async def test_postgres_open_a_peer_already_served_sets_no_ddl_bound() -> None:
+    """The bound is set only once the double-check under the lock finds DDL to run."""
+    from messagefoundry.store import postgres
+
+    conn = _RecordingPgConn()
+    assert await _pg_schema_store(conn)._ensure_schema() is False
+    assert postgres._DDL_LOCK_TIMEOUT_SQL not in [sql for sql, _ in conn.executed]
 
 
 class _PgLockNotAvailable(Exception):
@@ -740,6 +749,7 @@ async def test_postgres_ddl_lock_wait_expiry_names_the_setting() -> None:
     assert "'public:mefor_schema_init'" in message
     assert "DDL statement" in message
     assert "45 s" in message
+    assert "own lock_timeout, if that is stricter" in message  # the kept server bound may fire
     assert "[store].schema_lock_timeout" in message
     assert "engine shard" in message
     assert "COMMIT" not in [sql for sql, _ in conn.executed]
@@ -754,32 +764,19 @@ async def test_postgres_ddl_lock_wait_expiry_names_the_setting() -> None:
     assert raw.value is other
 
 
-async def test_postgres_server_lock_timeout_on_the_advisory_wait_names_the_setting() -> None:
-    """A role- or database-configured lock_timeout that ends the advisory wait (55P03) is reported
-    as the schema lock wait, not as a raw driver error; other driver errors there propagate."""
-    from messagefoundry.store.base import SchemaDdlLockTimeout, SchemaLockTimeout
+async def test_postgres_server_lock_timeout_on_the_advisory_wait_is_not_renamed() -> None:
+    """A role- or database-configured lock_timeout that ends the advisory wait (55P03) propagates
+    as the driver error: SchemaLockTimeout would name schema_lock_timeout, a bound that did not
+    fire and that raising cannot help."""
+    from messagefoundry.store.base import SchemaLockTimeout
 
     class _LockConn(_RecordingPgConn):
-        def __init__(self, exc: Exception) -> None:
-            super().__init__()
-            self._exc = exc
-
         async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
             await super().execute(sql, *args, timeout=timeout)
             if "pg_advisory_xact_lock" in sql:
-                raise self._exc
+                raise _PgLockNotAvailable("canceling statement due to lock timeout")
             return ""
 
-    failure = _PgLockNotAvailable("canceling statement due to lock timeout")
-    with pytest.raises(SchemaLockTimeout) as info:
-        await _pg_schema_store(_LockConn(failure), schema_lock_timeout=45)._ensure_schema()
-    assert type(info.value) is SchemaLockTimeout
-    assert not isinstance(info.value, SchemaDdlLockTimeout)
-    assert info.value.__cause__ is failure
-
-    class _OtherError(Exception):
-        sqlstate = "57P01"
-
-    other = _OtherError("admin shutdown")
-    with pytest.raises(_OtherError):
-        await _pg_schema_store(_LockConn(other))._ensure_schema()
+    with pytest.raises(_PgLockNotAvailable) as info:
+        await _pg_schema_store(_LockConn(), schema_lock_timeout=45)._ensure_schema()
+    assert not isinstance(info.value, SchemaLockTimeout)

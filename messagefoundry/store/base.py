@@ -3377,11 +3377,18 @@ class SchemaDdlLockTimeout(SchemaLockTimeout):
     :class:`SchemaLockTimeout` handles this too."""
 
     def _message(self) -> str:
+        # On Postgres a stricter role or database lock_timeout is kept, so it may be what fired.
+        stricter = (
+            " (or the role's or database's own lock_timeout, if that is stricter)"
+            if self.backend is StoreBackend.POSTGRES
+            else ""
+        )
         return (
             f"{self.backend.value}: holding the schema lock {self.lock!r}, a DDL statement did not "
-            f"get its table lock within {self.timeout:.15g} s; an open transaction on a store table, "
-            "from another engine shard, cluster node or session, may be blocking it. Nothing was "
-            "applied. Start again once that transaction ends, or raise [store].schema_lock_timeout"
+            f"get its table lock within {self.timeout:.15g} s{stricter}; an open transaction on a "
+            "store table, from another engine shard, cluster node or session, may be blocking it. "
+            "Nothing was applied. Start again once that transaction ends, or raise "
+            "[store].schema_lock_timeout"
         )
 
 
