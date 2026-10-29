@@ -312,11 +312,13 @@ from messagefoundry.auth.trust_anchors import (
     AnchorStoreUnavailable,
     TrustAnchorError,
     anchor_refusal,
+    explicit_cause,
     make_lane_anchor_check,
     make_registry_anchor_preflight,
     make_settings_anchor_preflight,
     run_anchor_preflight,
     smtp_hop_anchor_spec,
+    trust_anchor_cause,
 )
 from messagefoundry.auth.webauthn import configured_rp_id
 from messagefoundry.config.ai_policy import (
@@ -2296,6 +2298,23 @@ async def _answer_refused_reload(
     raise HTTPException(status, answer) from exc
 
 
+def _refused_by_trust_anchor(exc: WiringError) -> bool:
+    """Whether a refused reload's ``WiringError`` is a trust-anchor check's refusal: its explicit
+    cause, under any further ``WiringError`` wrappers, is a :class:`TrustAnchorError`. That is
+    the shape the settings preflight and ``refused_connection_anchor`` raise.
+
+    A refusal under any other cause is not one. A typo in a literal ``tls_ca_pin`` is the
+    factory's ``ValueError``, whose own cause is ``parse_anchor_pin``'s refusal, and that is a
+    config to fix: ``invalid_config``, as the reload has always audited it (vault BACKLOG
+    #3498). A cycle ends the walk."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while isinstance(cur, WiringError) and id(cur) not in seen:
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return isinstance(cur, TrustAnchorError)
+
+
 async def _audit_refused_reload(
     engine: Engine,
     exc: Exception,
@@ -2414,7 +2433,7 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
-    elif isinstance(exc, WiringError) and isinstance(exc.__cause__, AnchorStoreUnavailable):
+    elif isinstance(exc, WiringError) and explicit_cause(exc, AnchorStoreUnavailable) is not None:
         # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
         # known to be wrong with the anchor or the config, so neither of the reasons below fits.
         # warn, as every refusal here: a convergence reload's retry logs at DEBUG (vault #3109).
@@ -2426,7 +2445,7 @@ async def _audit_refused_reload(
         status = 503
         answer = "the engine could not reach its store to check a trust anchor; see the engine log"
     elif isinstance(exc, WiringError):
-        anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+        anchor_refused = _refused_by_trust_anchor(exc)
         warn(
             "config reload %s: %s",
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
@@ -3564,22 +3583,6 @@ async def _audit_alert_rules_withheld(
 _ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
 
 
-def _caused_by_trust_anchor(exc: BaseException) -> bool:
-    """Whether ``exc`` wraps a :class:`TrustAnchorError` through its explicit ``__cause__`` chain.
-
-    Only ``raise ... from``, the way ``build_test_connector`` wraps a build failure. An implicit
-    ``__context__`` is not followed: an unrelated error raised while handling an anchor refusal
-    would then be hidden as one."""
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, TrustAnchorError):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__
-    return False
-
-
 async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
@@ -3629,7 +3632,7 @@ async def _run_connection_test(
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
         # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
         # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
-        if _caused_by_trust_anchor(exc):
+        if trust_anchor_cause(exc) is not None:
             # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
             # full text goes to the operator log, as the reload route's does; the caller and the
             # audit row get a fixed line (BACKLOG #1142).

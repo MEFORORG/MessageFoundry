@@ -23,7 +23,9 @@ from __future__ import annotations
 import asyncio
 import datetime
 import gc
+import itertools
 import logging
+import os
 import re
 import shutil
 import ssl
@@ -33,6 +35,7 @@ import time
 import weakref
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -46,6 +49,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from messagefoundry.config import loaded_crls
 from messagefoundry.config import tls_policy as tls_policy_module
 from messagefoundry.config.loaded_crls import (
+    HeldCrl,
     ReloadRefusal,
     crl_fingerprint,
     held_crl_copies,
@@ -480,7 +484,7 @@ def test_a_bad_replacement_is_refused_and_the_old_copy_kept(
     assert reload_refusal(pki.crl, crl_fingerprint(pki.crl.read_bytes())) == outcome.refusal
     # Logged once per file version, though every pass retries it.
     assert again is not None and again.refusal == outcome.refusal
-    assert sum("refused to apply" in r.getMessage() for r in caplog.records) == 1
+    assert _refusals_logged(caplog) == 1
 
 
 def test_a_refusal_clears_once_the_file_is_fixed(pki: _Pki) -> None:
@@ -1054,7 +1058,7 @@ def test_a_staging_failure_is_logged_once_though_each_temp_path_differs(
 
     assert first is not None and first.refusal is not None and not first.refusal.sticky
     assert second is not None and second.refusal == first.refusal
-    assert sum("refused to apply" in r.getMessage() for r in caplog.records) == 1
+    assert _refusals_logged(caplog) == 1
     assert _accepts(hop, pki.server())
 
 
@@ -1173,11 +1177,7 @@ def test_one_context_failing_does_not_stop_the_rest_or_stick(
 ) -> None:
     failing, other = pki.outbound_hop(), pki.outbound_hop()
     pki.crl.write_bytes(_fresher(pki))
-
-    def boom(binary_form: bool = False) -> list[bytes]:
-        raise RuntimeError("a defect in one context")
-
-    failing.get_ca_certs = boom  # type: ignore[method-assign, assignment]
+    _break_ca_list(failing)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
         outcome = _reload(pki)
 
@@ -1664,6 +1664,15 @@ def _refusals_logged(caplog: pytest.LogCaptureFixture) -> int:
     return sum("refused to apply" in r.getMessage() for r in caplog.records)
 
 
+def _break_ca_list(ctx: ssl.SSLContext) -> None:
+    """Make ``ctx``'s CA list raise, as a defect in one context would."""
+
+    def boom(binary_form: bool = False) -> list[bytes]:
+        raise RuntimeError("a defect in one context")
+
+    ctx.get_ca_certs = boom  # type: ignore[method-assign, assignment]
+
+
 def _assert_refused_for_good(
     pki: _Pki, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1804,11 +1813,7 @@ def test_a_retried_refusal_keeps_its_label_once_another_holder_takes_the_file(
     # The root alone cannot verify the intermediate's CRL, which the reload retries every pass.
     refused = _holder(pki, pki.ca_file if held_back_by == NO_ISSUER else both, "refused")
     if held_back_by == RETRY:
-
-        def boom(binary_form: bool = False) -> list[bytes]:
-            raise RuntimeError("a defect in one context")
-
-        refused.get_ca_certs = boom  # type: ignore[method-assign, assignment]
+        _break_ca_list(refused)
     pki.crl.write_bytes(_fresher(pki))
 
     with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
@@ -1849,6 +1854,23 @@ def test_a_retried_refusal_keeps_its_label_while_a_short_lived_holder_comes_and_
     assert after is not None and after.refusal == first.refusal
     assert _refusals_logged(caplog) == 1
     assert refused.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_the_label_takes_one_spelling_whatever_order_the_holders_come_in() -> None:
+    """Stale holders spell one file differently. The label names it the same way whichever the
+    registry met first, and takes an absolute spelling over a relative one (vault BACKLOG #3498).
+    The holders are stand-ins: the label reads only their spelling and setting. Red under: the
+    label taking the first holder's spelling."""
+    absolute = os.path.abspath(os.path.join("crls", "partner.crl"))
+    spellings = [absolute.upper(), "./crls/partner.crl", absolute]
+    holders = [SimpleNamespace(configured_path=p, setting="[tls].crl_file") for p in spellings]
+    labels = set()
+    for order in itertools.permutations(holders):
+        crl_reload._LABELS.clear()
+        stale = [(cast(ssl.SSLContext, None), cast(HeldCrl, h)) for h in order]
+        labels.add(crl_reload._label("key", (1, 2), stale, "fallback", refused=False))
+    (label,) = labels
+    assert label.startswith("[tls].crl_file") and "./crls" not in label and "fallback" not in label
 
 
 def test_bytes_put_back_after_a_change_are_named_by_the_hops_that_hold_the_file_now(
