@@ -45,6 +45,7 @@ from messagefoundry.config.settings import (
     is_ldaps_address,
     split_kerberos_spn,
 )
+from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.redaction import safe_name
 
 if TYPE_CHECKING:
@@ -57,6 +58,86 @@ _MATCHING_RULE_IN_CHAIN = "1.2.840.113556.1.4.1941"  # AD nested-group ("member 
 #: Operator-recognisable label for this hop in a TLS suite-assertion error (BACKLOG #1317). Pinned to
 #: this file by ``test_every_covered_file_still_names_its_connector_label``.
 _LDAPS_CONNECTOR = "LDAPS bind to AD"
+
+#: The LDAPS bind's OWN way across its revocation refusal (BACKLOG #2193). The connection-shaped
+#: default names ``[tls].crl_file`` and a connection's attestation, and neither reaches this hop:
+#: its context resolves no ``[tls]`` anchor, and it is not a connection. No attestation is offered,
+#: because none is built for this hop (see :func:`_refuse_ad_revocation`).
+_AD_WAYS_ACROSS = (
+    "Set [auth].ad_tls_crl_file to a PEM file holding a CRL from the CA that issues the domain "
+    "controller's certificate, so the engine checks revocation on every LDAPS bind. Put only CRLs "
+    "in it: a certificate not already in the hop's trust store refuses start."
+)
+
+
+def _ldap3_dial_host(address: str) -> str | None:
+    """The host ldap3 2.9.1's ``Server`` dials for the ``ldaps://`` address ``address``, or
+    ``None`` where its host rule refuses the address.
+
+    The host rule of ``ldap3.core.server.Server.__init__``, restated for an ``ldaps://`` URL and
+    pinned against the real class by ``tests/test_ldaps_revocation_guard.py``. Restated, not called:
+    building a throwaway ``Server`` here would be one more ldap3 construction site for the timeout
+    and referral censuses to cover, and tests replace ``ldap3.Server`` with doubles that hold no
+    host. Only the host is read: a port ldap3 would refuse leaves the host it names, and no bind
+    to it can happen, since every bind builds the real ``Server``."""
+    rest = address.strip()[len("ldaps://") :]
+    if rest.count(":") == 1:
+        return rest.partition(":")[0]
+    if rest.startswith("["):
+        hostname, sep, _ = rest[1:].partition("]")
+        return hostname if sep else None
+    return None if rest.count(":") > 1 else rest
+
+
+def _refuse_ad_revocation(
+    settings: AuthSettings, tls: NarrowedTls, posture: HopPosture | None
+) -> None:
+    """Apply the ADR 0173 revocation-hop guard to the LDAPS AD bind (BACKLOG #2193).
+
+    Every bind carries a password, the service account's and then a user's, over a context that
+    verifies the domain controller. Stdlib ssl checks no OCSP or CRL, so a revoked but unexpired
+    certificate would be accepted with no refusal and no record.
+
+    Called with the finished ``tls`` and handed a context its factory built, the recipe every bind's
+    ``wrap_socket`` runs, so an ``[auth].ad_tls_crl_file`` that really loaded relaxes the refusal and
+    the guard never reads the setting. ``posture`` is PASSED: ``AuthService`` is built in the API
+    lifespan, outside every ``active_hop_posture`` scope, as the OIDC legs' guard says. ``None``
+    reads the ambient posture, as ``RevocationHopGuard.capture`` does for every hop, and where
+    ``AuthService`` is built none is stamped, so there the guard is the shipped no-op.
+
+    ``attested=False``: the owner ruling of 2026-10-27 gave this hop the guard and a CRL setting,
+    and no attestation, as the OIDC legs have none.
+
+    **The host is the one ldap3 dials** (:func:`_ldap3_dial_host`), never what ``urlsplit`` reads.
+    The two disagree on at least userinfo: ``ldaps://dc.corp@127.0.0.1`` is loopback to
+    ``urlsplit`` and ``dc.corp@127.0.0.1`` to ldap3, so a URL reader would let a hop it misread
+    cross as on the box. The Vault guard reads its address with the parser that dials for the same
+    reason. An address that names no host, or one ldap3's host rule refuses, is refused here,
+    whatever the posture, since a bind to it could not be classified as on the box or off it.
+
+    A Kerberos sign-in adds no hop here. The SPNEGO acceptor reads a ticket the browser sent and
+    builds no TLS context, and every bind in this module is an ldap3 SIMPLE bind over this one
+    context, so the lookups a Kerberos or OIDC sign-in makes ride the hop this guards."""
+    host = _ldap3_dial_host(str(settings.ad_server))
+    if not host:
+        raise LdapError(
+            "ad_server names no host ldap3 can dial, so the LDAPS bind cannot be judged on or off "
+            "this box; name the domain controller in ad_server, an IPv6 address in brackets"
+        )
+    RevocationHopGuard.capture(
+        host=host,
+        cell="[auth] LDAPS bind to AD (verified TLS, no revocation check)",
+        description=(
+            "carries the AD service-account and user passwords over verified LDAPS but performs "
+            "no certificate revocation checking"
+        ),
+        attested=False,
+        context=tls.handshake_context(),
+        posture=posture,
+        ways_across=_AD_WAYS_ACROSS,
+        connection=None,  # the directory bind, not a connection
+    ).enforce_construction()
+
 
 #: The directory attribute carrying the account's immutable identity (BACKLOG #1471). ``objectGUID``
 #: is minted once per account object and survives a rename, a move between organizational units and a
@@ -1559,6 +1640,7 @@ class LdapAuthenticator:
         *,
         secret_provider: SecretProvider | None = None,
         enforcing: bool = True,
+        hop_posture: HopPosture | None = None,
     ) -> None:
         if not settings.ad_server or not settings.ad_user_search_base:
             raise LdapError("AD is enabled but ad_server / ad_user_search_base are not configured")
@@ -1588,20 +1670,6 @@ class LdapAuthenticator:
                 "ad_tls_verify on (the default). For a directory whose certificate comes from a "
                 "private or self-signed CA, pin that CA with ad_tls_ca_cert_file."
             )
-        # Resolve the effective service-account bind password ONCE at construction (ADR 0019 §5): from a
-        # [secrets].provider when ad_bind_password_secret is set, else the env-sourced ad_bind_password
-        # (byte-identical when no reference/provider). A configured-but-unresolvable reference fails closed
-        # here (SecretProviderError propagates) — a blank bind is never used. Held on the instance so a
-        # Vault-backed secret is fetched once, not on every authenticate().
-        self._bind_password = resolve_connector_secret(
-            secret_provider,
-            ref=settings.ad_bind_password_secret,
-            literal=settings.ad_bind_password,
-            label="[auth].ad_bind_password",
-        )
-        if not settings.ad_bind_dn or not self._bind_password:
-            raise LdapError("AD is enabled but the service-account bind is not configured")
-        self._s = settings
         # BACKLOG #2034 (ASVS 6.7.1): check [auth].ad_tls_ca_cert_file ONCE, here, and keep the bytes
         # the pin, ACL and path check read. Every bind hands ldap3 those bytes as ca_certs_data, so a
         # file swapped after this check is never trusted. ldap3 used to get the path, and read the
@@ -1628,7 +1696,26 @@ class LdapAuthenticator:
             validate=ssl.CERT_REQUIRED,  # ad_tls_verify=false is refused above
             ca_certs_data=self._ca_certs_data,
             connector=_LDAPS_CONNECTOR,
+            crl_file=settings.ad_tls_crl_file,  # BACKLOG #2193: the hop's own CRL knob
         )
+        # BACKLOG #2193 (ADR 0173): the revocation-hop guard, on a context the finished Tls built.
+        # This block runs before the bind secret is resolved, like the two refusals above, so a
+        # build the guard or the anchor check refuses never fetches the password.
+        _refuse_ad_revocation(settings, self._tls, hop_posture)
+        # Resolve the effective service-account bind password ONCE at construction (ADR 0019 §5): from a
+        # [secrets].provider when ad_bind_password_secret is set, else the env-sourced ad_bind_password
+        # (byte-identical when no reference/provider). A configured-but-unresolvable reference fails closed
+        # here (SecretProviderError propagates) — a blank bind is never used. Held on the instance so a
+        # Vault-backed secret is fetched once, not on every authenticate().
+        self._bind_password = resolve_connector_secret(
+            secret_provider,
+            ref=settings.ad_bind_password_secret,
+            literal=settings.ad_bind_password,
+            label="[auth].ad_bind_password",
+        )
+        if not settings.ad_bind_dn or not self._bind_password:
+            raise LdapError("AD is enabled but the service-account bind is not configured")
+        self._s = settings
 
     def _server(self) -> Any:
         import ldap3

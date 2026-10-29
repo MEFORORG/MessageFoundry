@@ -3389,6 +3389,14 @@ class AuthSettings(_Section):
     # independent of [security].enforcement (a substituted AD anchor permits an LDAPS MITM). Dormant
     # when None. Block-scoped (direct-read by the preflight, not desugared).
     ad_tls_ca_cert_pin: str | None = None
+    # BACKLOG #2193: optional PEM file of CRLs checked against the domain controller's certificate on
+    # every LDAPS bind. The LDAPS context resolves no [tls] trust anchor, so [tls].crl_file never
+    # reaches it: this is the hop's own knob, as oidc_tls_crl_file is the IdP's. Each bind builds a
+    # fresh context and loads this file again, so a replaced CRL reaches the next bind. Same
+    # fail-closed refusals as every other CRL: absent or blank at load, unloadable or past
+    # nextUpdate at start and at every bind. With it unset, an off-box LDAPS bind on an enforcing
+    # instance is refused when serve builds the auth service.
+    ad_tls_crl_file: str | None = None
     # A plain ldap:// bind is refused at every posture (vault BACKLOG #3533 item 1). The opt-in that once
     # released it at [security].enforcement = warn, ad_allow_insecure_ldap, is a REMOVED key
     # (_REMOVED_KEYS), so a config that still sets it is refused by name rather than ignored.
@@ -3869,10 +3877,10 @@ class AuthSettings(_Section):
     def _refuse_a_blank_ca_cert_pin(cls, v: str | None, info: ValidationInfo) -> str | None:
         return refuse_a_blank_anchor_pin(v, f"[auth].{info.field_name}")
 
-    @field_validator("oidc_tls_crl_file")
+    @field_validator("ad_tls_crl_file", "oidc_tls_crl_file")
     @classmethod
-    def _oidc_tls_crl_file_exists(cls, v: str | None) -> str | None:
-        return _refuse_a_missing_crl_file(v, "[auth].oidc_tls_crl_file")
+    def _auth_crl_file_exists(cls, v: str | None, info: ValidationInfo) -> str | None:
+        return _refuse_a_missing_crl_file(v, f"[auth].{info.field_name}")
 
     @field_validator("kerberos_spn")
     @classmethod

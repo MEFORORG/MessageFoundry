@@ -11211,10 +11211,13 @@ def create_managed_app(
         # lifespan builds — the alerts webhook sink (notifier_from_settings) and the AD bind
         # (AuthService → LdapAuthenticator). Neither is built inside an active_hop_posture scope, so
         # current_hop_posture() is None there. The webhook sink's weakened-TLS escape would ship
-        # UNCLAMPED without an explicit posture, and the plain ldap:// bind refusal reads it too
-        # (vault BACKLOG #2354); threading this makes both apply on first deployment. The LDAPS
-        # ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only for an embedding that passes no [ai] (serve always passes it); since
-        # vault BACKLOG #2354 a None posture fails closed, so there the escape is NOT honoured. Reuses
+        # UNCLAMPED without an explicit posture, and the LDAPS revocation guard reads it (BACKLOG
+        # #2193), as the OIDC legs' guard does. CORRECTED 2026-10-28: this said the plain ldap://
+        # bind refusal reads it; that refusal holds at every posture since vault BACKLOG #3533. The
+        # LDAPS ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only
+        # for an embedding that passes no [ai] (serve always passes it). There the webhook escape
+        # fails closed (vault BACKLOG #2354), but the two revocation guards are the unstamped
+        # no-op, as for any hop built outside a posture. Reuses
         # the same hop_posture_from_ai derivation the store hop and the runner use.
         _hop_posture = (
             hop_posture_from_ai(
@@ -11789,9 +11792,10 @@ def create_managed_app(
                     # central run_anchor_preflight above) rather than refusing at enforce-only. Central
                     # preflight already ran before any listener bound; this keeps the seam consistent.
                     enforcing=trust_anchors_enforcing,
-                    # Thread the derived instance posture to the AD bind, which is built out of the
-                    # connector-construction gate: its plain ldap:// refusal reads it (vault BACKLOG
-                    # #2354). Its ad_tls_verify=false escape, which #329 clamped here, is gone (#3230).
+                    # Thread the derived instance posture to the hops this service builds out of the
+                    # connector-construction gate: the OIDC legs' revocation guard (BACKLOG #1887)
+                    # and the LDAPS AD bind's (BACKLOG #2193). CORRECTED 2026-10-28: this said the
+                    # plain ldap:// refusal read it; that refusal holds at every posture (#3533).
                     hop_posture=_hop_posture,
                     # BACKLOG #2592: an authority row that fails its integrity seal is denied and
                     # raises integrity_drift on the same sink the cipher refusal uses.
