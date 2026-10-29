@@ -3917,7 +3917,8 @@ class AuthService:
 
         **THE REPAIR BRANCH CLEARS EVERYTHING THE EARLIER HOLDER COULD STILL USE**, first: TOTP, its
         recovery codes, every passkey, every session on the row, and since vault BACKLOG #3849 B2 the
-        account's known sign-in addresses, as a reset clears them. Before this, the branch revoked
+        account's known sign-in addresses, as a reset clears them, once the role is granted. Before
+        this, the branch revoked
         no session, and ``_build_identity`` re-reads roles on every request, so a live session the
         earlier holder kept became an Administrator session when the role was written -- an ADR 0183
         defect this amendment fixes because it edits this branch.
@@ -4051,11 +4052,6 @@ class AuthService:
             await self._store.disable_totp(user_id)
             await self._store.delete_all_webauthn_credentials(user_id)
             await self._store.revoke_user_sessions(user_id)
-            # Vault BACKLOG #3849 B2: the addresses the earlier holder signed in from are theirs,
-            # not the new Administrator's, so they go too, as after an administrator's reset
-            # (#2946). Otherwise a sign-in from one of them would read as known and skip the
-            # first-seen challenge. Best effort, as at a reset.
-            await self._clear_login_addresses(user_id, username=username)
         else:
             user_id = uuid4().hex
             try:
@@ -4262,6 +4258,14 @@ class AuthService:
             # the first revoke never saw, and roles are re-read on every request. Revoking once more
             # here ends it before it can act as an Administrator.
             await self._store.revoke_user_sessions(user_id)
+            # Vault BACKLOG #3849 B2: the addresses the earlier holder signed in from are theirs,
+            # not the new Administrator's, so they go too, as after an administrator's reset
+            # (#2946). Otherwise a sign-in from one of them would read as known and skip the
+            # first-seen challenge. HERE, after the grant, and not with the first clear: a sign-in
+            # the earlier holder finished before ``set_password`` can still record its address,
+            # and a run refused before the grant takes nothing over, so it must not reset the
+            # holder's record. Best effort, as at a reset.
+            await self._clear_login_addresses(user_id, username=username)
         await self._audit(
             "auth.first_administrator_provisioned",
             actor=actor,
@@ -12567,9 +12571,9 @@ class AuthService:
             await self._store.reset_login_addresses(user_id)
         except Exception:
             _log.exception(
-                "could not clear the known sign-in addresses of %s after a reset; the reset stands, "
-                "and the next sign-in may read an address seen before it as known, or find no "
-                "baseline",
+                "could not clear the known sign-in addresses of %s after a reset or takeover; it "
+                "stands, the record is unchanged, and the next sign-in may read an address seen "
+                "before it as known",
                 username,
             )
 

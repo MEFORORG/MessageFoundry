@@ -408,7 +408,8 @@ it did neither. A session the earlier holder kept then became an Administrator s
 was written, because every request re-reads the account's roles.
 
 The repair also empties the account's known sign-in addresses, as an administrator's reset does
-(vault BACKLOG #3849). The earlier holder's addresses then read as new at the next sign-in, so a
+(vault BACKLOG #3849). It does so once the role is written, beside the second session revoke, so a
+run refused before the grant leaves the record alone. The earlier holder's addresses then read as new at the next sign-in, so a
 sign-in from one of them faces the first-seen challenge rather than passing as known.
 
 #### Keep a local Administrator
@@ -428,7 +429,9 @@ enabled Administrator the run found. Every run that grants the role also raises 
 `granted_by` set to `cli:<OS user>` (vault BACKLOG #3849). The command builds the `[alerts]`
 notifier as `serve` does, so the alert also shows as an open alert in the web console once the
 engine runs. With no `[alerts]` transport configured, or one this shell cannot build, the alert
-goes to the command's log output only, and the command prints a WARNING saying so.
+goes to the command's log output only. The command then says so: as a WARNING naming the other
+enabled Administrators when there are any, as a plain note on a first install, and under `--json`
+as `administrator_granted_alerted` set to false.
 **CORRECTED 2026-10-29:** this read "No alert goes to them, so read that row."
 
 A local Administrator that is locked out, or must change its password, still blocks the command,

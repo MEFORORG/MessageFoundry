@@ -13854,9 +13854,16 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+                # A MERGE under HOLDLOCK, as remember_login_address's: a concurrent reset of the
+                # account may have committed its marker meanwhile, and that is the record this
+                # one writes, so a match is left as it is rather than a key collision.
                 await cur.execute(
-                    "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
-                    " VALUES (?, ?, 0, 0)",
+                    "MERGE known_login_addresses WITH (HOLDLOCK) AS t"
+                    " USING (SELECT ? AS user_id, ? AS address) AS s"
+                    " ON t.user_id = s.user_id AND t.address = s.address"
+                    " WHEN NOT MATCHED THEN"
+                    " INSERT (user_id, address, first_seen, last_seen)"
+                    " VALUES (s.user_id, s.address, 0, 0);",
                     (user_id, LOGIN_ADDRESS_RESET_MARKER),
                 )
                 await self._commit(conn)

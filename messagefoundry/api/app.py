@@ -428,12 +428,9 @@ from messagefoundry.pipeline import (
 )
 from messagefoundry.pipeline.alert_sinks import (
     EmailTransport,
+    alerts_without_email,
     notifier_from_settings,
 )
-
-# Vault BACKLOG #3849: moved to pipeline/alert_sinks.py for provision-admin; the lifespan and its
-# tests keep the old name.
-from messagefoundry.pipeline.alert_sinks import alerts_without_email as _alerts_without_email
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
@@ -11217,7 +11214,7 @@ def create_managed_app(
         notifier_alerts = alerts_settings
         if smtp_anchor_refusal is not None and alerts_settings is not None:
             # Keep the webhook: drop only the email transport, which would load the refused CA.
-            notifier_alerts = _alerts_without_email(alerts_settings)
+            notifier_alerts = alerts_without_email(alerts_settings)
             _log.warning(
                 "alert email is off: the CA it reads was refused. The start check below refuses "
                 "the start. Until then a rule that sent only by email uses the other transports, "

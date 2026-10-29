@@ -16268,7 +16268,7 @@ class MessageStore:
             await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
             await self._db.execute(
                 "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
-                " VALUES (?, ?, 0, 0)",
+                " VALUES (?, ?, 0, 0) ON CONFLICT(user_id, address) DO NOTHING",
                 (user_id, LOGIN_ADDRESS_RESET_MARKER),
             )
             await self._commit()
