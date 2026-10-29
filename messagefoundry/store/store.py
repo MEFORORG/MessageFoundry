@@ -4275,8 +4275,7 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
     if set(head) <= _AUDIT_ANCHOR_HEX:
         if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
             return (
-                f"{noun} is {len(head)} hex characters, not a full "
-                f"{AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest",
+                f"{noun} is hex but not a full {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest",
                 head,
             )
         return None, head.lower()

@@ -6743,6 +6743,13 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         raw = args.expected_anchor
     if raw is None:
         return None
+    if args.expected_anchor_file is not None and not raw.strip():
+        # Said as such, not as a malformed line 1 of a file that has none.
+        print(
+            f"error: --expected-anchor-file {args.expected_anchor_file!r} holds no COUNT:HEAD line",
+            file=sys.stderr,
+        )
+        return 2
     try:
         return parse_audit_anchor(raw)
     except AuditAnchorError as exc:
@@ -6784,19 +6791,17 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
         read_bounded_utf8_lines,
     )
 
-    pairs: list[tuple[int, str]] = []
-    #: Where each pair came from, by position and never by content, for the contradiction refusal.
-    origins: list[str] = []
+    #: Each pair with where it came from, by position and never by content, for the refusal below.
+    pairs: list[tuple[int, str, str]] = []
     for number, text in enumerate(args.expected_row or (), start=1):
         try:
-            pairs.append(parse_audit_row_pair(text))
+            pairs.append((*parse_audit_row_pair(text), f"--expected-row {number}"))
         except AuditRowPairError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        origins.append(f"--expected-row {number}")
     path = args.expected_rows_file
     if path is None:
-        return _refuse_contradictory_pairs(pairs, origins)
+        return _refuse_contradictory_pairs(pairs)
     try:
         lines = read_bounded_utf8_lines(
             path,
@@ -6821,7 +6826,7 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
         if not line.strip():
             continue
         try:
-            pairs.append(parse_audit_row_pair(line))
+            pairs.append((*parse_audit_row_pair(line), f"--expected-rows-file line {number}"))
         except AuditRowPairError as exc:
             print(
                 f"error: malformed --expected-rows-file line {number}: {exc.reason} — "
@@ -6829,27 +6834,24 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
                 file=sys.stderr,
             )
             return 2
-        origins.append(f"--expected-rows-file line {number}")
     if len(pairs) == before:
         # Refused, not read as "nothing to compare": a job pointed at an empty export would
         # otherwise report a clean walk with no witness checked, which is what the flag is for.
         print(f"error: --expected-rows-file {path!r} holds no SEQ:ROW_HASH line", file=sys.stderr)
         return 2
-    return _refuse_contradictory_pairs(pairs, origins)
+    return _refuse_contradictory_pairs(pairs)
 
 
-def _refuse_contradictory_pairs(
-    pairs: list[tuple[int, str]], origins: list[str]
-) -> list[tuple[int, str]] | int:
+def _refuse_contradictory_pairs(pairs: list[tuple[int, str, str]]) -> list[tuple[int, str]] | int:
     """``pairs``, or the exit code 2 if one seq is given two different row_hashes. No chain matches
     both, so such a set is a bad input, such as an export mixing two engines' tees, never evidence
     of tampering.
 
-    The refusal names the two places by position (``origins``, one per pair) and never the seq:
-    a seq read from a file is that file's content, and a refusal quotes none (vault BACKLOG #2612).
+    The refusal names the two places by position (each pair's third item) and never the seq: a
+    seq read from a file is that file's content, and a refusal quotes none (vault BACKLOG #2612).
     """
     first: dict[int, tuple[str, str]] = {}
-    for (seq, head), origin in zip(pairs, origins, strict=True):
+    for seq, head, origin in pairs:
         earlier_head, earlier_origin = first.setdefault(seq, (head, origin))
         if earlier_head != head:
             print(
@@ -6859,7 +6861,7 @@ def _refuse_contradictory_pairs(
                 file=sys.stderr,
             )
             return 2
-    return pairs
+    return [(seq, head) for seq, head, _ in pairs]
 
 
 def _host_gated_store_settings(

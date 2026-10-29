@@ -980,9 +980,10 @@ def _is_audit_record(item: object) -> bool:
     return isinstance(item, logging.LogRecord) and item.name == AUDIT_LOGGER_NAME
 
 
-def _depth_cap(records: queue.Queue[Any]) -> int:
+def _depth_cap(records: queue.Queue[Any]) -> int | None:
     """The most any depth or count the forwarder publishes from its queue may read (BACKLOG #2612,
-    #1131). ``0`` means no cap: an unbounded plain queue, which only a test builds.
+    #1131). ``None`` means no cap: an unbounded plain queue, which only a test builds. A lane bound
+    of 0 is a cap of 0, not "no cap".
 
     For :class:`_ForwardLanes` it is the smaller lane bound. Once EITHER lane is full every
     published reading is pinned at it, so an audit row written while the general lane is full
@@ -992,7 +993,7 @@ def _depth_cap(records: queue.Queue[Any]) -> int:
     queue's own bound, which that queue's depth never passes anyway."""
     if isinstance(records, _ForwardLanes):
         return min(records.lane_maxsize, records.audit_maxsize)
-    return records.maxsize
+    return records.maxsize if records.maxsize > 0 else None
 
 
 def _published_counts(records: queue.Queue[Any], *counts: int) -> tuple[int, ...]:
@@ -1003,9 +1004,11 @@ def _published_counts(records: queue.Queue[Any], *counts: int) -> tuple[int, ...
     bounded queue the records still queued at the drain deadline, spooled and lost alike, never
     passed its bound, so on the two lanes neither the parts nor their sum may pass the cap.
     Capping each part alone would let two parts that sum past the cap tell how far past it the
-    lanes were, which is the audit-row signal the cap is there to hide (BACKLOG #1131)."""
+    lanes were, which is the audit-row signal the cap is there to hide (BACKLOG #1131). The order
+    matters too: close() passes the spooled count first, because a spool that fills part way
+    takes a fixed number of records and leaves the rest, audit rows included, to the loss."""
     budget = _depth_cap(records)
-    if budget <= 0:
+    if budget is None:
         return counts
     published = []
     for count in counts:
@@ -1546,33 +1549,32 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         self._stopped = True
         self._accepting = False
         drained = self._listener.stop_within(_FORWARD_DRAIN_TIMEOUT)
-        spool = self._listener.spool
+        # The spool, only once the listener thread has ENDED: it owns the spool, so its counts are
+        # final and closing it is safe only then. A thread that outlived its join keeps the lock
+        # until the process exits, which is when the OS releases it anyway.
+        spool = self._listener.spool if drained else None
         # Both counts rise by one per audit row while the general lane is full, and this log is
-        # served by GET /logs/tail, so they are published capped together (BACKLOG #2612, #1131).
-        # The loss takes the budget first, so a record that did not reach the collector is never
-        # hidden behind one the spool kept. The spool count is final only once the thread has
-        # ended. The undelivered count is a floor, and the message says so.
-        undelivered, kept = _published_counts(
+        # served by GET /logs/tail, so they are published capped together, spooled first
+        # (BACKLOG #2612, #1131): _published_counts says why. Both are floors, and say so.
+        kept, undelivered = _published_counts(
             self._records,
+            self._listener.spooled_at_stop if spool is not None else 0,
             self._listener.undelivered(),
-            self._listener.spooled_at_stop if spool is not None and drained else 0,
         )
         for target in self.targets:
             target.close()
-        if spool is not None and drained:
-            # Only once the listener thread has ENDED: it owns the spool, and closing it under a
-            # thread still appending would race. A thread that outlived its join keeps the lock
-            # until the process exits, which is when the OS releases it anyway.
+        if spool is not None:
             spool.close()
-        undeleted = spool.undeleted_segments if spool is not None and drained else 0
+        undeleted = spool.undeleted_segments if spool is not None else 0
         # These two lines are logged while this handler may still be on a logger, so they come
         # straight back to enqueue(); the flag tells it they are not dropped records.
         self._reporting.active = True
         try:
-            if spool is not None and drained and kept:
-                # Only once the thread has ended, so the count is final. Not a loss, so INFO.
+            if spool is not None and kept:
+                # Not a loss, so INFO.
                 _log.info(
-                    "off-box log forwarding moved %d record(s) still queued at the drain deadline "
+                    "off-box log forwarding moved at least %d record(s) still queued at the drain "
+                    "deadline "
                     "to the on-disk spool at %s; they are sent after the next start.",
                     kept,
                     spool.directory,

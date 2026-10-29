@@ -1781,7 +1781,7 @@ def test_the_shutdown_counts_do_not_move_with_audit_rows_while_the_general_lane_
     quiet = _shutdown_lines(monkeypatch, caplog, tmp_path, audit_rows=0, spooled=spooled)
     busy = _shutdown_lines(monkeypatch, caplog, tmp_path, audit_rows=40, spooled=spooled)
     assert len(quiet) == 1, quiet
-    expected = "moved 5 record(s)" if spooled else "at least 5 record(s) undelivered"
+    expected = "moved at least 5 record(s)" if spooled else "at least 5 record(s) undelivered"
     assert expected in quiet[0], quiet
     assert busy == quiet
 
@@ -1795,6 +1795,17 @@ def test_published_counts_share_one_budget_and_the_loss_takes_it_first() -> None
     assert logging_setup._published_counts(lanes, 2, 1) == (2, 1)  # below the cap, untouched
     unbounded: queue.Queue[Any] = queue.Queue()
     assert logging_setup._published_counts(unbounded, 9, 7) == (9, 7)
+    # A lane bound of 0 is a cap of 0, never "no cap".
+    assert logging_setup._published_counts(logging_setup._ForwardLanes(0, 100), 9, 7) == (0, 0)
+
+
+def test_a_spool_that_fills_part_way_publishes_counts_audit_rows_cannot_move() -> None:
+    """Spooled first: a spool with room for a fixed number takes them and the loss gets the rest,
+    audit rows included, so with the loss first both published counts tracked the audit rows
+    below the cap. The raw counts here are a spool of 6 and a loss of 2 plus the audit rows."""
+    lanes = logging_setup._ForwardLanes(8, 100)
+    readings = {logging_setup._published_counts(lanes, 6, 2 + n) for n in (0, 3, 40)}
+    assert readings == {(6, 2)}
 
 
 def test_a_plain_bounded_queue_makes_room_for_the_stop_sentinel() -> None:
