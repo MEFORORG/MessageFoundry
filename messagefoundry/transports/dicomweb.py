@@ -87,6 +87,7 @@ from messagefoundry.transports.rest import (
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
     refuse_verify_off,
+    url_scheme,
 )
 
 __all__ = ["DicomWebDestination"]
@@ -205,7 +206,7 @@ class DicomWebDestination(DestinationConnector):
                 "DICOMweb destination requires a 'url' setting (the DICOMweb service base URL)"
             )
         _reject_url_control_chars(url, "url")
-        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        scheme = url_scheme(url, "DICOMweb destination 'url'")
         if scheme not in ("http", "https"):
             raise ValueError(
                 f"DICOMweb destination 'url' must be http or https, got scheme {scheme!r}"

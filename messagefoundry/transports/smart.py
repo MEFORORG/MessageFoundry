@@ -86,6 +86,7 @@ from messagefoundry.transports.rest import (
     refuse_url_credentials,
     # Re-exported: it moved to rest.py beside its cleartext twin (vault BACKLOG #3139).
     revocation_attestation_from_settings,
+    url_scheme,
 )
 from messagefoundry.transports.signing import (
     CLIENT_ASSERTION_TYPE,
@@ -280,7 +281,9 @@ class _TokenEndpointProvider(abc.ABC):
         """Validate the token URL and refuse a cleartext hop; return its lower-cased scheme."""
         if not token_url:
             raise self._ERROR(self._MISSING_URL)
-        scheme = urllib.parse.urlsplit(token_url).scheme.lower()
+        scheme = url_scheme(
+            token_url, self._URL_SETTING, use=self._CREDENTIAL_SETTINGS, error=self._ERROR
+        )
         if scheme not in ("http", "https"):
             raise self._ERROR(f"{self._URL_SETTING} must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(
