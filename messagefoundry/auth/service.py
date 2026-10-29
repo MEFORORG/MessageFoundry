@@ -9006,8 +9006,9 @@ class AuthService:
             # revocations already applied, and the later renames and at least the referral,
             # configuration refusal, probe fault, paging refusal, hold and unkeyed-binding records
             # written after the rename loop would be skipped. The row still holds the old name, so a
-            # later pass that probes the account, or its next sign-in, renames it again and writes
-            # the row and the notice then. A defect still raises. The sort is
+            # later pass that probes the account, or its next sign-in, would apply the rename with
+            # its row and its notice, unless it is refused again or the name is taken. A defect
+            # still raises. The sort is
             # ``write_audit_soft``'s, called with the same sets ``_audit_reconciler_row`` passes.
             if not audit_soft:
                 raise refused
@@ -9020,10 +9021,14 @@ class AuthService:
                 _refused,
                 log=_log,
                 message="directory reconcile: the auth.ad_username_refreshed audit row for account "
-                "%s (renaming to %s) could not be written, so its rename was rolled back and nobody "
-                "was told; a later pass that probes the account, or its next sign-in, applies it "
-                "again (BACKLOG #3018)",
-                args=lambda: (user_id, scrub_log_argument(new_username)),
+                "%s (%s, renaming to %s) could not be written, so its rename was rolled back and "
+                "nobody was told; a later pass that probes the account, or its next sign-in, would "
+                "apply it unless it is refused again or the name is taken (BACKLOG #3018)",
+                args=lambda: (
+                    user_id,
+                    scrub_log_argument(before.username),
+                    scrub_log_argument(new_username),
+                ),
                 errors=audit_write_errors(),
                 defects=AUDIT_WRITE_DEFECTS,
             )
