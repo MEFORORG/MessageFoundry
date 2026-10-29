@@ -2536,6 +2536,11 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
             AuthService._unverified_session_owes_factor,
             fake,  # type: ignore[arg-type]
         )
+        # The rule _mfa_satisfied_hash and _owes_enrolled_factor_hash share (BACKLOG #3690 item 7).
+        fake._session_satisfaction = functools.partial(
+            AuthService._session_satisfaction,
+            fake,  # type: ignore[arg-type]
+        )
         return bool(asyncio.run(AuthService._mfa_satisfied_hash(fake, "h")))  # type: ignore[arg-type]
 
     scopes = ("administrators", "every_local_account")

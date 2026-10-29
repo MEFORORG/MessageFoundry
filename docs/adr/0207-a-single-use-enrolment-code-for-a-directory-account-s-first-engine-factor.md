@@ -156,6 +156,10 @@ step checks two things itself:
    this itself because the passkey finish route's gate does not (Context item 3). Without it, a
    passkey challenge staged while the account had no factor could finish after the real holder
    enrolled, with no code asked.
+   *Note (2026-10-29, BACKLOG #3690 item 3).* This check is shipped on the passkey path, for every
+   account type: `finish_webauthn_registration` asks it twice, and the store asks it a third time
+   inside the credential insert's own transaction (BACKLOG #3014, #3061, #3690 item 1). The build
+   adds no factor check of its own; Amendment A, A2, says what it adds.
 2. **Otherwise, a valid enrolment code** for this account.
 
 The rule reads the account and what the session proved. It never reads `SessionMechanism`, and it
@@ -567,6 +571,8 @@ ADR 0197 Amendment A's wave 1. It changes a security control, so it gets its own
   That gap reaches a directory account under the shipped posture (Context item 3), and section 1
   closes it there by the step's own check. A local account meets it only outside the shipped
   posture, and that case is not decided here.
+  *Closed since this was drafted (BACKLOG #3014): the finish's own check reaches a local account
+  too, so this bullet no longer names open work; see Amendment A, A2.*
 - Vault BACKLOG #2738 item 7: a bind clears no factor, so a factor enrolled first-come on Kerberos
   proof before or during a bind survives the bind. It has the same root, but closing it is a
   separate decision. With zero deployments, no such factor exists today.
@@ -756,11 +762,20 @@ secret, before the floor and the directory lookup, and on an enable that
   after the gate's write-floor charge and before the service runs, and refuses over budget.
   **Section 7's "The build adds the ceremony-budget draw to `ui_webauthn_verify`" is shipped**, and
   the Consequences line "the ceremony budget on the passkey finish route" is dropped.
+  *Note (2026-10-29, BACKLOG #3690 items 5 and 6).* The route now skips the draw for a session
+  the finish will refuse for owing a factor the account holds, asking the same rule first, so a
+  password holder refused in a loop spends none of the real holder's budget. A refused code is not
+  that case: it comes from a session on an account with no factor, which is still charged, so
+  section 7's bound on code tries holds. The route's 429 sends the console ceremony routes'
+  constant `Retry-After: 30`.
 - **Context item 3 is closed for the binding step (BACKLOG #3014, #3061).**
   `finish_webauthn_registration` asks `_factor_binding_is_blocked` itself, before the floor, and
   again after the directory lookup, both before the challenge pop. So section 1's check 1 is
   already made on the passkey path. On the TOTP path, `confirm_mfa_enrollment` asks it once after
   the lookup and refuses only a passkey; a TOTP enabled meanwhile is left to the compare-and-set.
+  *Note (2026-10-29, BACKLOG #3690 items 1 and 3).* The passkey path has a third ask since engine
+  PR 2617: `add_webauthn_credential(for_session=...)` asks the same rule inside the insert's own
+  transaction, so a factor bound after the second ask is refused at the write too.
   The build adds no factor check of its own. It adds the `auth.enrolment_code_refused` row with
   `factor_present` beside the `auth.mfa_denied` row those refusals already write, for an unstamped
   directory session only. The Consequences line "both checks in both binding steps" now means the
@@ -824,6 +839,10 @@ against the row the lookup returned, so it adds no read), and in
 which another process on the same store, an engine shard included, can write. (The attestation
 verify itself runs on the event loop and yields to nothing.) The code is spent by then, and the
 second passkey binds on a code the holder did show.
+*Note (2026-10-29, BACKLOG #3690 items 1 and 3).* Narrowed since this was written: step 11's
+credential write is itself conditional (engine PR 2617), so a factor bound in that window is
+refused at the write and the second passkey does not bind, provided the build keeps the
+conditional write. What the residual still costs is the code, which step 10 spent.
 
 **The label check before the spend is new.** Today the method checks only the label's length before
 the pop. A clash with another of the account's labels shows only when `add_webauthn_credential`
