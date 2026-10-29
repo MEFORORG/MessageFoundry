@@ -68,8 +68,10 @@ class _PassThrough:
     async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
         return await self.store.reserve_upload_quota(*args, **kwargs)
 
-    async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
-        await self.store.release_upload_quota(uploader_id, reservation_id)
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
+        await self.store.release_upload_quota(
+            uploader_id=uploader_id, reservation_id=reservation_id
+        )
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
         await self.store.touch_upload_quota(reservation_id)
@@ -112,7 +114,7 @@ async def test_a_late_release_is_cancelled_at_its_cap_rather_than_absorbed(
         async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
             raise ConnectionError("store unreachable")
 
-        async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             await asyncio.Event().wait()
 
         async def touch_upload_quota(self, reservation_id: str) -> None:
@@ -293,9 +295,11 @@ async def test_a_retry_right_after_a_failed_reserve_is_not_refused_for_its_own_o
                 raise ConnectionError("lost after the commit")
             return applied
 
-        async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             await asyncio.sleep(0.05)  # a release slower than the retry's reserve
-            await self.store.release_upload_quota(uploader_id, reservation_id)
+            await self.store.release_upload_quota(
+                uploader_id=uploader_id, reservation_id=reservation_id
+            )
 
     store = _uploads(tmp_path, _FirstReserveCommitsThenFails(ledger_db), max_files=1)
     with pytest.raises(ConnectionError):
@@ -352,9 +356,11 @@ async def test_a_straggler_that_ends_after_the_drain_returned_starts_no_release(
                 raise
             return applied
 
-        async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             released.append(reservation_id)
-            await self.store.release_upload_quota(uploader_id, reservation_id)
+            await self.store.release_upload_quota(
+                uploader_id=uploader_id, reservation_id=reservation_id
+            )
 
     store = _uploads(tmp_path, _ReserveOutlivesItsCancel(ledger_db))
     save = asyncio.create_task(
@@ -501,10 +507,12 @@ async def test_a_reserve_already_done_when_the_drain_cancels_still_pays_its_slot
     released: list[str] = []
 
     class _Recording(_PassThrough):
-        async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             await asyncio.sleep(0.05)  # slower than one loop pass, so only a wait covers it
             released.append(reservation_id)
-            await self.store.release_upload_quota(uploader_id, reservation_id)
+            await self.store.release_upload_quota(
+                uploader_id=uploader_id, reservation_id=reservation_id
+            )
 
     store = _uploads(tmp_path, _Recording(ledger_db))
     reserve: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
@@ -522,7 +530,7 @@ async def test_a_release_still_running_at_the_grace_is_cancelled(
     so nothing the drain saw outlives it."""
 
     class _Stalls(_PassThrough):
-        async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             await asyncio.Event().wait()
 
     store = _uploads(tmp_path, _Stalls(ledger_db))

@@ -1543,7 +1543,7 @@ class QueueStore(StoreLifecycle, Protocol):
         worse."""
         ...
 
-    async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         """Pay back ``uploader_id``'s reservation ``reservation_id`` by deleting its row (vault
         BACKLOG #3180).
 

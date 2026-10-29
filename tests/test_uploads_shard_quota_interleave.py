@@ -158,14 +158,16 @@ async def _assert_in_flight_contract(store: Any, uploader_id: str) -> None:
         uploader_id, large, size_bytes=20, max_files=5, max_total_bytes=100
     )
     assert await store.upload_quota_in_flight(uploader_id) == (2, 30)
-    await store.release_upload_quota(f"{uploader_id}-other", small)
+    await store.release_upload_quota(uploader_id=f"{uploader_id}-other", reservation_id=small)
     assert await store.upload_quota_in_flight(uploader_id) == (2, 30)
-    await store.release_upload_quota(uploader_id, small)
+    await store.release_upload_quota(uploader_id=uploader_id, reservation_id=small)
     assert await store.upload_quota_in_flight(uploader_id) == (1, 20)
-    await store.release_upload_quota(uploader_id, small)
-    await store.release_upload_quota(uploader_id, f"{uploader_id}-never-reserved")
+    await store.release_upload_quota(uploader_id=uploader_id, reservation_id=small)
+    await store.release_upload_quota(
+        uploader_id=uploader_id, reservation_id=f"{uploader_id}-never-reserved"
+    )
     assert await store.upload_quota_in_flight(uploader_id) == (1, 20)
-    await store.release_upload_quota(uploader_id, large)
+    await store.release_upload_quota(uploader_id=uploader_id, reservation_id=large)
     assert await store.upload_quota_in_flight(uploader_id) == (0, 0)
 
 
@@ -197,8 +199,10 @@ async def _assert_budget_edges(store: Any, uploader_id: str) -> None:
     assert not await _reserve("over_files", 0, total=1000)  # 2 + 1 > 2, with bytes to spare
     assert await store.upload_quota_in_flight(uploader_id) == (2, 30)
     for name in ("a", "b"):
-        await store.release_upload_quota(uploader_id, f"{uploader_id}-{name}")
-    await store.release_upload_quota(other, f"{other}-x")
+        await store.release_upload_quota(
+            uploader_id=uploader_id, reservation_id=f"{uploader_id}-{name}"
+        )
+    await store.release_upload_quota(uploader_id=other, reservation_id=f"{other}-x")
     assert await store.upload_quota_in_flight(uploader_id) == (0, 0)
     assert await store.upload_quota_in_flight(other) == (0, 0)
 
@@ -321,7 +325,9 @@ async def test_a_leaked_slot_is_reclaimed_while_the_uploader_stays_active(
         assert await shard_c.upload_quota_in_flight(uploader_id) == (2, 20)
         # Release what is left, so a server-backend run leaves nothing in flight behind it.
         for name in ("b", "c"):
-            await shard_c.release_upload_quota(uploader_id, f"{uploader_id}-{name}")
+            await shard_c.release_upload_quota(
+                uploader_id=uploader_id, reservation_id=f"{uploader_id}-{name}"
+            )
         assert await shard_c.upload_quota_in_flight(uploader_id) == (0, 0)
 
 
@@ -388,5 +394,7 @@ async def test_the_server_backends_stamp_since_with_the_database_clock(
         await asyncio.sleep(0.05)  # past A's stamp on the server's own clock
         assert await _reserve(shard_b, "b", stale_after=0.0)
         assert await shard_b.upload_quota_in_flight(uploader_id) == (1, 10)
-        await shard_b.release_upload_quota(uploader_id, f"{uploader_id}-b")
+        await shard_b.release_upload_quota(
+            uploader_id=uploader_id, reservation_id=f"{uploader_id}-b"
+        )
         assert await shard_b.upload_quota_in_flight(uploader_id) == (0, 0)

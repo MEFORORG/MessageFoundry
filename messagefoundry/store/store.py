@@ -15535,7 +15535,7 @@ class MessageStore:
             await self._commit()
         return applied
 
-    async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         """See :meth:`messagefoundry.store.base.Store.release_upload_quota`."""
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(

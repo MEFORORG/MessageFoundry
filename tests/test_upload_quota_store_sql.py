@@ -10,6 +10,7 @@ run only where `MEFOR_TEST_POSTGRES` / `MEFOR_TEST_SQLSERVER` are set.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,6 +24,12 @@ from messagefoundry.store.store import MessageStore
 def _insert(statements: list[str]) -> str:
     (insert,) = [s for s in statements if s.lstrip().upper().startswith("INSERT INTO UPLOAD_RES")]
     return insert
+
+
+def _pg_log(log: list[tuple[str, tuple[Any, ...]]], sql: str, params: tuple[Any, ...]) -> None:
+    # asyncpg binds $1..$N; the highest index must be the number of values passed.
+    assert max(map(int, re.findall(r"\$(\d+)", sql)), default=0) == len(params), (sql, params)
+    log.append((sql, params))
 
 
 def _reads_of_the_ledger(sql: str) -> int:
@@ -59,6 +66,8 @@ class _MssqlCursor:
         self.log = log
 
     async def execute(self, sql: str, params: Any = ()) -> None:
+        # One bound value per placeholder, so a dropped or extra parameter fails offline too.
+        assert sql.count("?") == len(params), (sql, params)
         self.log.append(("sql", (sql, tuple(params))))
 
     async def fetchall(self) -> list[Any]:
@@ -101,7 +110,7 @@ def _mssql(log: list[tuple[str, Any]]) -> SqlServerStore:
 
 async def test_the_sqlserver_release_takes_the_named_uploaders_lock_without_reading_it() -> None:
     log: list[tuple[str, Any]] = []
-    await _mssql(log).release_upload_quota("u-a", "r-1")
+    await _mssql(log).release_upload_quota(uploader_id="u-a", reservation_id="r-1")
     statements = [entry for kind, entry in log if kind == "sql"]
     # No read of the row by its reservation id, under any hint: the caller named the uploader.
     assert not any("READCOMMITTEDLOCK" in sql.upper() for sql, _ in statements), statements
@@ -140,11 +149,11 @@ class _PgConn:
         yield None
 
     async def execute(self, sql: str, *params: Any) -> str:
-        self.log.append((sql, params))
+        _pg_log(self.log, sql, params)
         return "DELETE 0"
 
     async def fetchval(self, sql: str, *params: Any) -> Any:
-        self.log.append((sql, params))
+        _pg_log(self.log, sql, params)
         return 1
 
 
@@ -160,7 +169,7 @@ def _pg(log: list[tuple[str, tuple[Any, ...]]]) -> PostgresStore:
         return None
 
     async def _execute(sql: str, *params: Any) -> int:
-        log.append((sql, params))
+        _pg_log(log, sql, params)
         return 0
 
     vars(store).update(
@@ -180,7 +189,7 @@ async def test_the_postgres_reserve_reads_its_budget_in_one_aggregate() -> None:
 
 async def test_the_postgres_release_matches_the_uploader() -> None:
     log: list[tuple[str, tuple[Any, ...]]] = []
-    await _pg(log).release_upload_quota("u-a", "r-1")
+    await _pg(log).release_upload_quota(uploader_id="u-a", reservation_id="r-1")
     ((sql, params),) = log
     assert sql.upper().startswith("DELETE FROM UPLOAD_RESERVATION") and "UPLOADER_ID" in sql.upper()
     assert params == ("r-1", "u-a")

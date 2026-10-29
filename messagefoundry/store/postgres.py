@@ -8703,7 +8703,7 @@ class PostgresStore:
             )
         return applied is not None
 
-    async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         """See :meth:`messagefoundry.store.base.Store.release_upload_quota`."""
         await self._execute(
             "DELETE FROM upload_reservation WHERE reservation_id = $1 AND uploader_id = $2",

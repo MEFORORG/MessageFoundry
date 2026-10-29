@@ -350,7 +350,7 @@ class _StuckTouchLedger:
     ) -> bool:
         return True
 
-    async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         return None
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
@@ -449,7 +449,7 @@ def test_a_lagging_clock_never_moves_the_row_backwards(tmp_path: Path) -> None:
             assert await store.reserve_upload_quota(
                 "u-alice", "other", size_bytes=10, max_files=5, max_total_bytes=100
             )
-            await store.release_upload_quota("u-alice", "other")
+            await store.release_upload_quota(uploader_id="u-alice", reservation_id="other")
             await store.touch_upload_quota("ahead")
             cur = await store._db.execute(
                 "SELECT since FROM upload_reservation WHERE reservation_id = ?", ("ahead",)
