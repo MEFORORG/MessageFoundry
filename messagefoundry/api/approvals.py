@@ -922,6 +922,51 @@ class ApprovalGate:
         )
         return held
 
+    async def open_request_params(
+        self, operation: str, params: Mapping[str, Any], *, requester_user_id: str
+    ) -> dict[str, Any]:
+        """``params`` as the requester's own OPEN request for ``operation`` captured them, where
+        that request differs from ``params`` in nothing but the ``requester`` display name, oldest
+        first; otherwise ``params`` as given (BACKLOG #3740 item 9).
+
+        :meth:`guard` and :meth:`rejoin` match a repeat on identical params and the same
+        ``requester_user_id``. Params that carry the display name, as the executors need, would
+        then make a renamed requester's repeat a second request rather than a repeat. A caller
+        passes its params through here first, so the repeat names the request the person already
+        has. The match is still keyed on the immutable id, so a new holder of a freed name never
+        joins the old holder's request. The joined request keeps the name it was filed under, which
+        is the name the approver sees and the released row is attributed to.
+
+        Only a match that names a requester counts, so a repeat never adopts params an executor
+        would refuse. The read and the caller's guard are two steps: a request settled between them
+        leaves the caller filing a new one under the earlier name, of the same person. Reads the
+        newest :data:`REJOIN_SCAN_LIMIT` open requests, as :meth:`rejoin` does. A failed read is
+        an :class:`ApprovalError` 503, and nothing has been held."""
+        given = dict(params)
+        if not self.gates(operation) or not requester_user_id:
+            return given
+
+        def _unnamed(p: Mapping[str, Any]) -> dict[str, Any]:
+            return {k: v for k, v in p.items() if k != "requester"}
+
+        wanted = _unnamed(given)
+        # Filtered on the id first, so the seal check runs only on this requester's rows.
+        mine = await self._verified_rows(
+            r
+            for r in await self._read(
+                self._store.list_pending_approvals(now=self._clock(), limit=REJOIN_SCAN_LIMIT),
+                what="the open approval requests",
+            )
+            if str(r["operation"]) == operation
+            and str(r["requester_user_id"] or "") == requester_user_id
+        )
+        same: list[tuple[float, dict[str, Any]]] = []
+        for r in mine:
+            held = _stored_params(r.id, r.params, throttle=self._unreadable_params_reported)
+            if held is not None and named_requester(held) is not None and _unnamed(held) == wanted:
+                same.append((r.requested_at, held))
+        return min(same, key=lambda each: each[0])[1] if same else given
+
     async def list_pending(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
         """Requests awaiting a second approver: ``pending`` and unexpired. ``caller_user_id`` marks
         the caller's own requests (``caller_is_requester``). A request that fails its integrity

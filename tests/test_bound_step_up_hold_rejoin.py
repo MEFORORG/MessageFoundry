@@ -30,6 +30,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_CONFIG_RELOAD,
     STEP_UP_ACTION_CONNECTION_PURGE,
@@ -205,6 +206,71 @@ async def test_a_repeated_purge_rejoins_its_hold_without_a_new_proof(
         doomed = await c.post("/connections/OB/purge", headers=_auth(token))
         assert doomed.status_code == 409, doomed.text
         assert await _repeat_rows(engine) == 2
+
+
+async def _no_rejoin(*_args: object, **_kwargs: object) -> None:
+    return None
+
+
+async def test_a_renamed_requesters_repeated_purge_joins_their_one_hold(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3740 item 9: the purge's params carry the display name, so a requester renamed
+    since filing used to file a second hold for the same purge. The repeat is keyed on the
+    immutable id, by the proof-free rejoin and by the guard alike, and the approver still sees the
+    name the hold was filed under."""
+    await _quiesced_outbound(engine, tmp_path)
+    service = await _service(engine)
+    await _add(service, "op", ["operator"])
+    await _add(service, "admin", ["administrator"])
+    action = STEP_UP_ACTION_CONNECTION_PURGE
+    async with _client(engine, service) as c:
+        admin = await _login(c, "admin")
+        token = await _reauth(c, await _login(c, "op"), action)
+        first = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert first.status_code == 202, first.text
+        held = str(first.json()["approval_id"])
+
+        # The directory renames op; the same session now resolves to the new name.
+        op = await engine.store.get_user_by_username("op")
+        assert op is not None
+        assert await engine.store.set_user_username(op.id, "op2", expected_username="op")
+        me = await c.get("/auth/me", headers=_auth(token))
+        assert me.status_code == 200 and me.json()["username"] == "op2", me.text
+
+        # The proof-free rejoin finds op2's hold. Unfixed, this was a step-up 403.
+        again = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert again.status_code == 202, again.text
+        assert again.json()["approval_id"] == held
+        assert await _pending_ids(c, admin) == [held]
+
+        # A new holder of the freed name is someone else, so their purge is their own hold.
+        await _add(service, "op", ["operator"])
+        theirs_token = await _login(c, "op")
+        theirs = await c.post("/connections/OB/purge", headers=_auth(theirs_token))
+        assert _refused_for(theirs, action), theirs.text
+        theirs_token = await _reauth(c, theirs_token, action)
+        theirs = await c.post("/connections/OB/purge", headers=_auth(theirs_token))
+        assert theirs.status_code == 202, theirs.text
+        new_op_hold = str(theirs.json()["approval_id"])
+        assert new_op_hold != held
+
+        # The guard's own repeat rule, reached past the rejoin (a lapsed window, a race, the
+        # console), joins op2's hold too. Unfixed, it filed a second one.
+        monkeypatch.setattr(ApprovalGate, "rejoin", _no_rejoin)
+        token = await _reauth(c, token, action)
+        guarded = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert guarded.status_code == 202, guarded.text
+        assert guarded.json()["approval_id"] == held
+        assert await _pending_ids(c, admin) == sorted([held, new_op_hold])
+
+        # What the approver sees still names the requester as filed.
+        listed = (await c.get("/approvals", headers=_auth(admin))).json()["approvals"]
+        row = next(a for a in listed if a["id"] == held)
+        assert row["requester"] == "op"
+        assert row["params"] == {"name": "OB", "scope": "all", "requester": "op"}
+        repeats = await engine.store.list_audit(action="approval.request_repeated")
+        assert sorted(str(r["actor"]) for r in repeats) == ["op2", "op2"]
 
 
 async def test_a_repeated_reload_rejoins_its_hold_without_a_new_proof(engine: Engine) -> None:
