@@ -275,9 +275,6 @@ class _TokenEndpointProvider(abc.ABC):
         self,
         token_url: str,
         *,
-        attested: bool,
-        cleartext_accepted: bool,
-        cleartext_reason: str | None,
         connection: str | None,
     ) -> str:
         """Validate the token URL and refuse a cleartext hop; return its lower-cased scheme."""
@@ -289,29 +286,24 @@ class _TokenEndpointProvider(abc.ABC):
         refuse_url_credentials(
             token_url, self._URL_SETTING, use=self._CREDENTIAL_SETTINGS, error=self._ERROR
         )
-        # The token POST carries a credential, so this hop goes through the ONE posture-keyed
-        # authority the REST/SOAP/FHIR delivery cells consume (#200, ADR 0092). A production-PHI
-        # hop is refused whatever the process environment says, while a non-prod, non-PHI,
-        # per-hop-attested, declared (ADR 0153) or loopback hop decides as the delivery cells do.
-        # The posture is the one the construction gate stamped, fail-closing to production-PHI
-        # when unstamped. InsecureHopRefused is re-raised as the provider's own error to keep each seam's contract;
-        # both are ValueError subclasses, so the loader surfaces either identically. The message
-        # never carries the credential.
+        # The token POST carries a credential, so an off-box cleartext hop is refused with no
+        # escape, as the delivery cells' credentials are (vault BACKLOG #3533 item 4): neither
+        # tls_hop_attested nor cleartext_accepted lifts it, only a loopback host. InsecureHopRefused
+        # is re-raised as the provider's own error to keep each seam's contract; both are ValueError
+        # subclasses, so the loader surfaces either identically. The message never carries the
+        # credential.
         try:
             refuse_cleartext_credential_hop(
                 scheme,
                 token_url,
                 credential=f"{self._LABEL} {self._CREDENTIAL_NAME}",
-                attested=attested,
-                cleartext_accepted=cleartext_accepted,
-                cleartext_reason=cleartext_reason,
                 connection=connection,
             )
         except InsecureHopRefused as exc:
             raise self._ERROR(
                 f"{hop_name_prefix(connection)}{self._LABEL} token endpoint over cleartext http "
                 "would expose the "
-                f"{self._CREDENTIAL_NAME}; refused by the instance security posture ({CREDENTIAL_HOP_WAYS_ACROSS})"
+                f"{self._CREDENTIAL_NAME}; refused ({CREDENTIAL_HOP_WAYS_ACROSS})"
             ) from exc
         return scheme
 
@@ -484,15 +476,14 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
         private_key_password: str | None = None,
         expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
         timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
-        attested: bool = False,
-        # #1498 (ADR 0173 §4.3): the per-connection `tls_revocation_attested`, DISTINCT from `attested`
-        # above (which attests a cleartext/verify-off hop is secure by other means, #200). Read from the
-        # resolved settings by `token_provider_from_settings`, where the runner's `_dest_config` mirrors
-        # the connection's top-level declaration and its mandatory reason (ADR 0173).
+        # #1498 (ADR 0173 §4.3): the per-connection `tls_revocation_attested`. Read from the resolved
+        # settings by `token_provider_from_settings`, where the runner's `_dest_config` mirrors the
+        # connection's top-level declaration and its mandatory reason (ADR 0173). No cleartext
+        # declaration is taken: none lets the token request cross cleartext http off-box (vault
+        # BACKLOG #3533 item 4).
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
-        cleartext_accepted: bool = False,
-        cleartext_reason: str | None = None,
+        # The connection the refusals and the revocation record name.
         connection: str | None = None,
         # ADR 0173: the connection named by the revocation guard's audit line and refusal. Today both
         # readers take it from the one `connection_name` mirror, so it equals `connection`; it stays a
@@ -516,9 +507,6 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
     ) -> None:
         scheme = self._check_token_url(
             token_url,
-            attested=attested,
-            cleartext_accepted=cleartext_accepted,
-            cleartext_reason=cleartext_reason,
             connection=connection,
         )
         if not client_id:
@@ -678,10 +666,9 @@ def token_provider_from_settings(
     none. ``None`` (a direct test construction) resolves to the OS trust store, byte-identical."""
     if not smart_auth_configured(s):
         return None
-    # ADR 0153: the same per-connection declaration the delivery hop carries, mirrored into these
-    # resolved settings by the runner's _dest_config (with the connection name, so the acceptance audit
-    # record names the declaration). Read exactly as the OAuth2 sibling does.
-    attested, accepted, revocation = hop_declarations_from_settings(s, SmartAuthError)
+    # Read strictly for the flag check (vault BACKLOG #2232) and the connection name the runner's
+    # _dest_config mirrors into these resolved settings. Read exactly as the OAuth2 sibling does.
+    _, (_, _, connection), revocation = hop_declarations_from_settings(s, SmartAuthError)
     token_url = str(s.get("smart_token_url") or "")
     return SmartBackendTokenProvider(
         token_url=token_url,
@@ -704,16 +691,11 @@ def token_provider_from_settings(
             knob="smart_timeout_seconds",
             transport="SMART",
         ),
-        # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
-        # __init__ (read from settings exactly as _dest_config / the OAuth2 provider do).
-        attested=attested,
         # #1498 (ADR 0173 §4.3): the revocation attestation `_dest_config` mirrors from the connection's
-        # top-level declaration. A DIFFERENT claim from `attested` above, so it gets its own key.
+        # top-level declaration.
         revocation_attested=revocation[0],
         revocation_attested_reason=revocation[1],
-        cleartext_accepted=accepted[0],
-        cleartext_reason=accepted[1],
-        connection=accepted[2],
+        connection=connection,
         revocation_connection=revocation[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
         ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)

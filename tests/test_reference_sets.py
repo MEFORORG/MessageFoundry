@@ -825,7 +825,7 @@ async def test_reload_refuses_adding_a_reference_set_on_unsupporting_backend(
 
         monkeypatch.setattr(
             "messagefoundry.pipeline.engine.load_config",
-            lambda _path: _ref_graph(csv),
+            lambda _path, **_kw: _ref_graph(csv),
             raising=True,
         )
         with pytest.raises(WiringError) as exc:

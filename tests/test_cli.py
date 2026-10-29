@@ -3414,6 +3414,7 @@ def _seed_both_locks(db: Path) -> None:
                             # The first cycle is set well in the past so it has lapsed by the second.
                             now=now - 5_000.0 if cycle == 0 and cycles > 1 else now,
                             totp_usable=_opened_totp_state,
+                            passkey_escalates=None,
                         )
         finally:
             await s.close()
@@ -3935,7 +3936,8 @@ def _phi_logging_probe(seen: dict[str, object]) -> Callable[[argparse.Namespace]
     return probe
 
 
-def _assert_redacted_on_stderr(capsys: pytest.CaptureFixture[str], command: str) -> None:
+def _assert_redacted_on_stderr(capsys: pytest.CaptureFixture[str], command: str) -> str:
+    """Assert the probe's record reached stderr redacted and stdout stayed empty; return stderr."""
     captured = capsys.readouterr()
     err = captured.err
     # The control: the record DID reach stderr. Without it an absent line would pass as redacted.
@@ -3951,6 +3953,7 @@ def _assert_redacted_on_stderr(capsys: pytest.CaptureFixture[str], command: str)
     assert "[redacted]" in err
     # stdout is the data channel; a diagnostic must never land there.
     assert captured.out == "", f"`{command}` wrote a log record to stdout: {captured.out!r}"
+    return err
 
 
 def test_backup_warning_is_redacted_through_the_real_argument_parser(
@@ -4009,8 +4012,8 @@ def test_the_logging_exemption_covers_only_subcommands_that_configure_their_own(
     cannot be used as a way to skip the chain.
 
     What this does NOT prove is that the call comes before the subcommand's first log record. It
-    does not for ``serve``, whose pre-configure window is the residual named at
-    ``_CONFIGURES_OWN_LOGGING``."""
+    does not for ``serve``, whose pre-configure window ``_CONFIGURES_OWN_LOGGING`` describes. The
+    ``serve`` startup-sink tests below cover that window (BACKLOG #3768)."""
     assert cli_module._CONFIGURES_OWN_LOGGING == _SELF_CONFIGURING
     # Both controls read THIS test: it calls `_calls`, and it names configure_logging only in its
     # docstring and a message string, which must not count as a call.
@@ -4040,26 +4043,99 @@ def test_main_really_consults_the_exemption(command: str, monkeypatch: pytest.Mo
     assert seen["handlers"] == [], f"main() installed a sink for exempt `{command}`"
 
 
-def test_a_real_cli_process_starts_with_no_root_handler_and_redacts(tmp_path: Path) -> None:
-    """The fix rests on one premise: a real ``python -m messagefoundry`` process reaches main() with
-    NO root handler, so main() installs its sink. Every in-process test above creates that shape by
-    hand. This runs a child, not ``--json`` (which has its own path, #1489), so the premise is
-    measured. If an import ever started adding a root handler, main() would skip its sink and the
-    in-process tests would stay green."""
+# --- BACKLOG #3768: `serve` filters the window before configure_logging -------------------------
+#
+# `serve` is exempt from main()'s sink and installs its handlers only after its settings, key and
+# egress gates, so in that window a record no handler takes goes to `logging.lastResort`. These
+# tests log in that window and read stderr. It is entered for real: `suppress_crash_dumps` is the
+# first call `_serve` makes after its imports, and a `--service-config` naming a directory refuses
+# the start before configure_logging runs. `lastResort` is process-wide, so each test puts back the
+# one it found.
+
+
+def _warn_in_serve_window(monkeypatch: pytest.MonkeyPatch, seen: dict[str, object]) -> None:
+    """Make ``_serve``'s ``suppress_crash_dumps`` call log the synthetic segment at WARNING with a
+    traceback carrying it, log it again on a logger that does not propagate, and log one INFO
+    record on a logger whose own level lets INFO through."""
+    import messagefoundry.crashdump as crashdump
+
+    monkeypatch.setattr(logging, "lastResort", logging.lastResort)
+    warn = _phi_logging_probe(seen)
+
+    def probe() -> None:
+        warn(argparse.Namespace())
+        quiet = logging.getLogger("messagefoundry.test_serve_window_quiet")
+        chatty = logging.getLogger("messagefoundry.test_serve_window_info")
+        quiet.propagate = False
+        chatty.setLevel(logging.INFO)
+        try:
+            quiet.warning("probe-quiet %s", _SYNTHETIC_PID)
+            chatty.info("probe-info-line")
+        finally:
+            quiet.propagate = True
+            chatty.setLevel(logging.NOTSET)
+
+    monkeypatch.setattr(crashdump, "suppress_crash_dumps", probe)
+
+
+def test_serve_redacts_a_warning_logged_before_its_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A WARNING in ``serve``'s pre-configure window reaches stderr redacted, through the filtered
+    ``lastResort``, from a logger that does not propagate too, and once each. The INFO record a
+    lowered logger lets through is still not printed: lastResort's level is kept."""
+    from messagefoundry.logging_setup import _FilteredLastResort
+
+    seen: dict[str, object] = {}
+    _warn_in_serve_window(monkeypatch, seen)
+    with _handlerless_root():
+        assert main(["serve", "--service-config", str(tmp_path)]) == 2
+    err = _assert_redacted_on_stderr(capsys, "serve")
+    assert err.count("probe: could not persist") == 1, err
+    assert err.count("probe-quiet") == 1, err
+    assert "probe-info-line" not in err, "the window printed below WARNING, as lastResort did not"
+    assert "error: " in err  # the refusal: the run entered the window and left it before logging
+    assert seen["handlers"] == []  # no root handler was added, so a handler's record is not doubled
+    assert isinstance(logging.lastResort, _FilteredLastResort)
+
+
+def test_serve_window_without_the_filtered_last_resort_leaks_the_same_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the test above, through the same instrument. With the install taken out,
+    the same records go to the stdlib's ``logging.lastResort`` and the synthetic segment reaches
+    stderr whole, so the absence the test above asserts is the filter's doing and not a record
+    that never arrived. The INFO record is absent here too: the level is the stdlib's."""
+    from messagefoundry.logging_setup import _FilteredLastResort
+
+    seen: dict[str, object] = {}
+    _warn_in_serve_window(monkeypatch, seen)
+    monkeypatch.setattr(cli_module, "install_filtered_last_resort", lambda: None)
+    assert not isinstance(logging.lastResort, _FilteredLastResort)  # nothing earlier leaked one
+    with _handlerless_root():
+        assert main(["serve", "--service-config", str(tmp_path)]) == 2
+    err = capsys.readouterr().err
+    assert seen["handlers"] == []
+    assert "probe: could not persist" in err and "probe-quiet" in err, err
+    assert all(fragment in err for fragment in _PID_FRAGMENTS), err
+    assert "probe-info-line" not in err
+    assert "error: " in err  # the refusal, so the run left the window the same way
+
+
+def _run_warning_driver(
+    tmp_path: Path, name: str, body: str, *, returncode: int, handlers_line: str
+) -> None:
+    """Run ``body`` in a child after ``import logging`` and the CLI module, then assert it reached
+    main() with no root handler, printed ``handlers_line``, and logged the probe once, redacted.
+    ``body`` prints ``handlers_line`` itself, at the moment it means to measure."""
     import subprocess
     import sys
 
-    driver = tmp_path / "warn_in_a_subcommand.py"
+    driver = tmp_path / name
     driver.write_text(
         "import logging\n"
         "import messagefoundry.__main__ as m\n"
-        "def _probe(args):\n"
-        "    print('handlers-at-dispatch', len(logging.getLogger().handlers))\n"
-        f"    logging.getLogger('messagefoundry.store').warning('probe: %s', {_SYNTHETIC_PID!r})\n"
-        "    return 0\n"
-        "print('handlers-before-main', len(logging.getLogger().handlers))\n"
-        "m._DISPATCH['hl7schema'] = _probe\n"
-        "raise SystemExit(m.main(['hl7schema']))\n",
+        "print('handlers-before-main', len(logging.getLogger().handlers), flush=True)\n" + body,
         encoding="utf-8",
     )
     proc = subprocess.run(
@@ -4069,12 +4145,57 @@ def test_a_real_cli_process_starts_with_no_root_handler_and_redacts(tmp_path: Pa
         text=True,
         timeout=60,
     )
-    assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stderr}"
+    assert proc.returncode == returncode, f"rc={proc.returncode}\n{proc.stderr}"
     assert "handlers-before-main 0" in proc.stdout, proc.stdout
-    assert "handlers-at-dispatch 1" in proc.stdout, proc.stdout
-    assert "probe: PID|" in proc.stderr, f"the WARNING never reached stderr: {proc.stderr!r}"
+    assert handlers_line in proc.stdout, proc.stdout
+    assert proc.stderr.count("probe: PID|") == 1, f"the WARNING did not print once: {proc.stderr!r}"
     for fragment in _PID_FRAGMENTS:
         assert fragment not in proc.stderr + proc.stdout, proc.stderr
+
+
+#: The child's probe line: one WARNING carrying the synthetic segment, at four spaces of indent.
+_CHILD_PROBE = (
+    f"    logging.getLogger('messagefoundry.store').warning('probe: %s', {_SYNTHETIC_PID!r})\n"
+)
+
+
+def test_a_real_serve_process_redacts_a_warning_before_its_handlers(tmp_path: Path) -> None:
+    """The premise the in-process ``serve`` tests stand on, measured in a child: a real process
+    reaches ``_serve`` with no root handler, so ``install_filtered_last_resort`` acts and the
+    WARNING reaches stderr redacted. The child exits 2 on the directory ``--service-config``."""
+    _run_warning_driver(
+        tmp_path,
+        "warn_in_the_serve_window.py",
+        "import messagefoundry.crashdump as crashdump\n"
+        "def _probe():\n"
+        "    resort = type(logging.lastResort).__name__\n"
+        "    print('window', len(logging.getLogger().handlers), resort, flush=True)\n"
+        + _CHILD_PROBE
+        + "crashdump.suppress_crash_dumps = _probe\n"
+        f"raise SystemExit(m.main(['serve', '--service-config', {str(tmp_path)!r}]))\n",
+        returncode=2,
+        handlers_line="window 0 _FilteredLastResort",
+    )
+
+
+def test_a_real_cli_process_starts_with_no_root_handler_and_redacts(tmp_path: Path) -> None:
+    """The fix rests on one premise: a real ``python -m messagefoundry`` process reaches main() with
+    NO root handler, so main() installs its sink. Every in-process test above creates that shape by
+    hand. This runs a child, not ``--json`` (which has its own path, #1489), so the premise is
+    measured. If an import ever started adding a root handler, main() would skip its sink and the
+    in-process tests would stay green."""
+    _run_warning_driver(
+        tmp_path,
+        "warn_in_a_subcommand.py",
+        "def _probe(args):\n"
+        "    print('handlers-at-dispatch', len(logging.getLogger().handlers), flush=True)\n"
+        + _CHILD_PROBE
+        + "    return 0\n"
+        "m._DISPATCH['hl7schema'] = _probe\n"
+        "raise SystemExit(m.main(['hl7schema']))\n",
+        returncode=0,
+        handlers_line="handlers-at-dispatch 1",
+    )
 
 
 def test_a_host_that_already_configured_logging_is_left_alone(

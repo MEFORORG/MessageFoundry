@@ -256,7 +256,8 @@ def _rate_limited(request: Request, label: str) -> HTTPException:
     """Log a throttled (HTTP 429) attempt so password-spraying is no longer silent (ASVS 16.3.3),
     then return the exception to raise. We log (the rotating general log) rather than write an
     audit_log row per rejection so a sustained flood can't amplify into unbounded DB growth — the
-    per-account ``auth.login_failed``/``auth.login_locked`` events already provide the audit trail."""
+    per-account ``auth.login_failed``/``auth.login_locked``/``auth.directory_login_locked`` events
+    already provide the audit trail."""
     _log.warning("rate-limited %s attempt from client=%s", label, client_ip(request))
     return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too many attempts; please retry later")
 
@@ -270,6 +271,12 @@ async def _service(request: Request) -> AuthService:
     if auth is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AUTH_NOT_CONFIGURED)
     return auth
+
+
+async def _arrival() -> float:
+    """The wall-clock moment a route's dependencies began to be solved, for ``POST /auth/logout``
+    (BACKLOG #3715). Wall clock, because the store stamps a lineage link with ``time.time()``."""
+    return time.time()
 
 
 def _current_user(identity: Identity) -> CurrentUser:
@@ -701,11 +708,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post("/auth/logout", response_model=SimpleMessage)
     async def logout(
         request: Request,
+        arrived: float = Depends(_arrival),
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
     ) -> SimpleMessage:
+        # BACKLOG #3715: the gate proved the token live after ``arrived``, which is declared first
+        # so FastAPI solves it before the gate. See AuthService.logout for the bound.
         await service.logout(
-            bearer_token(request), actor=identity.username, client=client_ip(request)
+            bearer_token(request),
+            actor=identity.username,
+            client=client_ip(request),
+            proven_at=arrived,
         )
         return SimpleMessage(detail="logged out")
 
@@ -2221,8 +2234,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         The caller is resolved again from ``token`` before each page is sent (BACKLOG #1154). A
         failed standing stops the stream. So does a caller who may now read fewer rows than the
-        export started with. A stop records ``audit.export.stopped`` and raises :class:`ExportStopped`, which does not
-        reach the client as a failed download; see that class. The JSON route
+        export started with. A stop records ``audit.export.stopped`` and raises
+        :class:`ExportStopped`, which reaches the client as a failed download (BACKLOG #3907); see that class. The JSON route
         reads ``token`` from the bearer, and the console's ``/ui/audit/export`` passes its cookie
         session."""
         # A direct caller that passed no token hands on the Depends marker. Refuse it here, before

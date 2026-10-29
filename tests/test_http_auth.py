@@ -15,6 +15,7 @@ import http.client
 import json
 import time
 import urllib.request
+from typing import Any
 
 import pytest
 
@@ -315,33 +316,32 @@ def test_oauth2_cleartext_token_endpoint_refused_on_prod_phi_even_with_escape(
     assert "s3cr3t" not in str(ei.value)  # never echo the secret in the refusal
 
 
-def test_oauth2_cleartext_token_endpoint_allowed_when_accepted(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "declared",
+    [
+        {"cleartext_accepted": True, "cleartext_reason": "legacy IdP has no TLS listener"},
+        {"tls_hop_attested": True},
+    ],
+    ids=["accepted", "attested"],
+)
+def test_oauth2_cleartext_token_endpoint_refused_whatever_the_declaration(
+    declared: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ADR 0153: the token-endpoint hop takes the same per-connection declaration as its delivery hop.
-
-    It replaces the escape this test used to rely on (decision 5 unhooked that). Threading the pair here
-    is deliberate even though a credential is worse on the wire than a body: without it, an operator
-    whose legacy peer needs OAuth2 over a cleartext segment would have to write a FALSE
-    `tls_hop_attested`, which is the exact defect ADR 0153 exists to remove."""
+    """Vault BACKLOG #3533 item 4 (owner ruling 2026-10-26): the client secret never crosses
+    cleartext http off-box, whatever declaration the runner mirrors into the settings. ADR 0153
+    build note 3 once let the declarations carry it; its dated amendment records why that went."""
     monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
-    with active_hop_posture(_PROD_PHI):
-        p = _oauth_provider(
-            token_url="http://auth.example.com/token",
-            cleartext_accepted=True,
-            cleartext_reason="legacy IdP has no TLS listener",
-        )
-    assert isinstance(p, OAuth2ClientCredentialsProvider)
-
-
-def test_oauth2_cleartext_token_endpoint_allowed_when_attested(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A per-hop attestation crosses even a prod-PHI cleartext hop (no escape needed) — stays as-is.
-    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
-    with active_hop_posture(_PROD_PHI):
-        p = _oauth_provider(token_url="http://auth.example.com/token", attested=True)
-    assert isinstance(p, OAuth2ClientCredentialsProvider)
+    settings = {
+        "oauth2_token_url": "http://auth.example.com/token",
+        "oauth2_client_id": "cid",
+        "oauth2_client_secret": "s3cr3t",
+        "connection_name": "OB_OAUTH",
+        **declared,
+    }
+    with active_hop_posture(_PROD_PHI), pytest.raises(HttpAuthError, match="refused") as ei:
+        bearer_provider_from_settings(settings)
+    assert "use https" in str(ei.value)
+    assert "OB_OAUTH" in str(ei.value)
 
 
 def test_digest_cleartext_refused_on_prod_phi_even_with_escape(
@@ -357,36 +357,32 @@ def test_digest_cleartext_refused_on_prod_phi_even_with_escape(
     assert "cleartext" in str(ei.value)
 
 
-def test_digest_cleartext_allowed_when_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
-    # ADR 0153: the declaration (mirrored into the resolved settings by _dest_config) replaces the
-    # escape this test used to rely on. WARN + audit, not a silent crossing.
+@pytest.mark.parametrize(
+    "declared",
+    [
+        {"cleartext_accepted": True, "cleartext_reason": "legacy device has no TLS listener"},
+        {"tls_hop_attested": True},
+    ],
+    ids=["accepted", "attested"],
+)
+def test_digest_cleartext_refused_whatever_the_declaration(
+    declared: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3533 item 4: the digest response never crosses cleartext http off-box."""
     monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
-    with active_hop_posture(_PROD_PHI):
-        h = digest_handler_from_settings(
-            {
-                "http_auth": "digest",
-                "http_auth_user": "u",
-                "http_auth_password": "p",
-                "cleartext_accepted": True,
-                "cleartext_reason": "legacy device has no TLS listener",
-            },
+    with active_hop_posture(_PROD_PHI), pytest.raises(HttpAuthError, match="refused"):
+        digest_handler_from_settings(
+            {"http_auth": "digest", "http_auth_user": "u", "http_auth_password": "p", **declared},
             url="http://api.example.com/x",
         )
-    assert h is not None  # WARN, not REFUSE — the challenge-answering handler is still built
 
 
-def test_digest_cleartext_allowed_when_attested(monkeypatch: pytest.MonkeyPatch) -> None:
-    # tls_hop_attested (read from settings, as _dest_config threads it) crosses even a prod-PHI hop.
+def test_control_digest_cleartext_to_loopback_still_builds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
     with active_hop_posture(_PROD_PHI):
         h = digest_handler_from_settings(
-            {
-                "http_auth": "digest",
-                "http_auth_user": "u",
-                "http_auth_password": "p",
-                "tls_hop_attested": True,
-            },
-            url="http://api.example.com/x",
+            {"http_auth": "digest", "http_auth_user": "u", "http_auth_password": "p"},
+            url="http://127.0.0.1:8080/x",
         )
     assert h is not None
 

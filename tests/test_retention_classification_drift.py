@@ -191,8 +191,9 @@ def test_the_floor_is_seven_not_six_and_is_enforced() -> None:
     Mutation: set MIN to 6 — reds, because the real length is checked against it AND against the
     documented reason for the value.
     """
-    assert MIN_PHI_RETENTION_WINDOWS == 10, (
-        "the floor changed. It is 10 (9 until BACKLOG #1966 added [logging].forward_spool_max_bytes) — and 9 was CORRECTED BY THIS TEST rather than counted: "
+    assert MIN_PHI_RETENTION_WINDOWS == 11, (
+        "the floor changed. It is 11 (10 until BACKLOG #1188 added [retention].processed_archive_days, "
+        "9 until BACKLOG #1966 added [logging].forward_spool_max_bytes) — and 9 was CORRECTED BY THIS TEST rather than counted: "
         "it was first written as 7, and the two-way equality above immediately reported "
         "[backup].retention_keep and [retention].connection_event_retention_hours as "
         "documented-but-absent. If the classification genuinely grew or shrank, update this assertion "
@@ -220,6 +221,8 @@ def test_the_auto_bound_and_warn_only_split_matches_the_owner_ruling() -> None:
         "[security].delete_message_bodies_after_days",
         "[retention].dead_letter_days",
         "[retention].reference_snapshot_days",
+        # Owner ruling A2 of 2026-10-08 (BACKLOG #1188): the fourth window.
+        "[retention].processed_archive_days",
     }, f"auto-bound set drifted from the owner ruling: {sorted(auto)}"
     assert "[retention].state_max_age_days" in warn, (
         "state_max_age_days must NOT auto-bound — purge_state deletes by `set_at`, which a read never "

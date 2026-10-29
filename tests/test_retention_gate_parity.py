@@ -34,6 +34,7 @@ _ACK = "[security].allow_keeping_phi_indefinitely"
 _BODY = "[security].delete_message_bodies_after_days"
 _DEAD = "[retention].dead_letter_days"
 _REFERENCE = "[retention].reference_snapshot_days"
+_PROCESSED = "[retention].processed_archive_days"
 _STATE_CAVEAT = (
     "a window on it deletes transform state by write time, so a Handler's correlation "
     "entry could vanish while still in use; until state has a non-write-time eviction key, "
@@ -95,12 +96,13 @@ def test_serve_auto_bound_notice_is_unchanged(
     rc, captured = _run_secure_serve(tmp_path, monkeypatch, _EGRESS + _SECURE_ALERTS)
     assert rc == 0
     assert _gate_lines(capsys.readouterr().err) == [
-        _auto_bound_notice(f"{_BODY}, {_DEAD}, {_REFERENCE}", "prod")
+        _auto_bound_notice(f"{_BODY}, {_DEAD}, {_REFERENCE}, {_PROCESSED}", "prod")
     ]
     retention = captured["retention_settings"]
     assert retention.messages_days == 30  # type: ignore[attr-defined]
     assert retention.dead_letter_days == 30  # type: ignore[attr-defined]
     assert retention.reference_snapshot_days == 30  # type: ignore[attr-defined]
+    assert retention.processed_archive_days == 30  # type: ignore[attr-defined]
 
 
 def test_serve_body_window_refusal_is_unchanged(
@@ -116,7 +118,7 @@ def test_serve_body_window_refusal_is_unchanged(
     assert rc == 2
     # The notice for the one unset window comes first, then the refusal for the explicit 0.
     assert _gate_lines(capsys.readouterr().err) == [
-        _auto_bound_notice(_REFERENCE, "prod"),
+        _auto_bound_notice(f"{_REFERENCE}, {_PROCESSED}", "prod"),
         f"error: a data-retention window is explicitly disabled for {_BODY} on a production PHI "
         "instance ('prod'); refusing to start — PHI message bodies would be retained indefinitely "
         "(unbounded PHI at rest, ASVS 14.2.4/14.2.7). Set the window(s) to a positive number of "
@@ -133,7 +135,7 @@ def test_serve_body_window_warning_is_unchanged(
         'security.enforcement = "warn"\n'
         + _EGRESS
         + "security.delete_message_bodies_after_days = 0\n"
-        + "[retention]\ndead_letter_days = 30\nreference_snapshot_days = 30\n"
+        + "[retention]\ndead_letter_days = 30\nreference_snapshot_days = 30\nprocessed_archive_days = 30\n"
         + _SECURE_ALERTS,
         env="staging",
     )
@@ -159,7 +161,7 @@ def test_serve_acknowledged_body_windows_are_unchanged(
     assert rc == 0
     # The acknowledgement turns the auto-bound off, so every unset window stays 0.
     assert captured["retention_settings"].messages_days == 0  # type: ignore[attr-defined]
-    windows = f"{_BODY}, {_DEAD}, {_REFERENCE}"
+    windows = f"{_BODY}, {_DEAD}, {_REFERENCE}, {_PROCESSED}"
     streams = capsys.readouterr()
     assert _gate_lines(streams.err) == [
         f"warning: {_ACK}=true — a production PHI instance ('prod') retains PHI message bodies "
@@ -179,7 +181,7 @@ def test_serve_warn_only_tier_refusal_is_unchanged(
     rc, _ = _run_secure_serve(tmp_path, monkeypatch, _EGRESS + _SECURE_ALERTS)
     assert rc == 2
     assert _gate_lines(capsys.readouterr().err) == [
-        _auto_bound_notice(f"{_BODY}, {_DEAD}, {_REFERENCE}", "prod"),
+        _auto_bound_notice(f"{_BODY}, {_DEAD}, {_REFERENCE}, {_PROCESSED}", "prod"),
         "error: these classified PHI tiers have no retention window on a PHI instance ('prod') "
         "and would accumulate without bound; refusing to start, because each needs a window or "
         f"its own audited acknowledgement (ASVS 14.2.7): {_WARN_ONLY_TIERS}.",
@@ -198,7 +200,7 @@ def test_serve_warn_only_tier_warning_is_unchanged(
     )
     assert rc == 0
     assert _gate_lines(capsys.readouterr().err) == [
-        _auto_bound_notice(f"{_BODY}, {_DEAD}, {_REFERENCE}", "staging"),
+        _auto_bound_notice(f"{_BODY}, {_DEAD}, {_REFERENCE}, {_PROCESSED}", "staging"),
         "warning: these classified PHI tiers have no retention window on a PHI instance "
         "('staging') and will accumulate without bound. They are deliberately NOT defaulted "
         "(owner ruling 2026-07-30); under enforcement=enforce this refuses to start: "
@@ -223,7 +225,7 @@ def test_serve_acknowledged_warn_only_tiers_are_unchanged(
     assert rc == 0
     streams = capsys.readouterr()
     assert _gate_lines(streams.err) == [
-        _auto_bound_notice(f"{_BODY}, {_DEAD}, {_REFERENCE}", "prod")
+        _auto_bound_notice(f"{_BODY}, {_DEAD}, {_REFERENCE}, {_PROCESSED}", "prod")
     ]
     assert _audit_lines(streams.out) == [
         "AUDIT: starting a production PHI instance (environment 'prod') with "
@@ -312,7 +314,7 @@ def test_check_says_so_when_nothing_reads_as_unbounded(tmp_path: Path) -> None:
     toml = tmp_path / "messagefoundry.toml"
     toml.write_text(
         'ai.environment = "prod"\nsecurity.delete_message_bodies_after_days = 30\n'
-        "[retention]\ndead_letter_days = 30\nreference_snapshot_days = 30\n",
+        "[retention]\ndead_letter_days = 30\nreference_snapshot_days = 30\nprocessed_archive_days = 30\n",
         encoding="utf-8",
     )
     leg = _retention_leg(toml)
@@ -366,7 +368,7 @@ def test_a_line_that_prints_no_environment_carries_no_placeholder_note(tmp_path:
     toml = tmp_path / "messagefoundry.toml"
     toml.write_text(
         "security.delete_message_bodies_after_days = 30\n"
-        "[retention]\ndead_letter_days = 30\nreference_snapshot_days = 30\n",
+        "[retention]\ndead_letter_days = 30\nreference_snapshot_days = 30\nprocessed_archive_days = 30\n",
         encoding="utf-8",
     )
     assert _retention_leg(toml).detail == _SILENT
@@ -453,7 +455,8 @@ def test_the_notice_names_the_bound_the_window_took(monkeypatch: pytest.MonkeyPa
     assert settings.retention.dead_letter_days == 7 and settings.retention.messages_days == 14
     notice = outcome.lines[0].text
     assert (
-        f"{_BODY} (14 days), {_DEAD} (7 days), {_REFERENCE} (14 days) defaulted ON for a PHI "
+        f"{_BODY} (14 days), {_DEAD} (7 days), {_REFERENCE} (14 days), {_PROCESSED} (14 days) "
+        "defaulted ON for a PHI "
         "instance ('dev')" in notice
     )
     assert "30 days" not in notice
@@ -467,4 +470,7 @@ def test_the_notice_names_the_bound_the_window_took(monkeypatch: pytest.MonkeyPa
     again = retention_classification.evaluate_retention_gate(
         _dev_settings(), enforcing=False, production=False, env_name="dev"
     )
-    assert f"{_BODY}, {_DEAD}, {_REFERENCE} defaulted ON (14 days) for" in again.lines[0].text
+    assert (
+        f"{_BODY}, {_DEAD}, {_REFERENCE}, {_PROCESSED} defaulted ON (14 days) for"
+        in again.lines[0].text
+    )

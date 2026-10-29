@@ -490,6 +490,10 @@ async def test_a_failing_re_pend_in_the_same_arm_backs_off_too(
     """Under a busy timeout the handoff and the re-pend fail on the same passes, so throttling only
     the first would leave a traceback per pass beside it."""
     caplog.set_level(logging.INFO, logger=_RUNNER_LOGGER)
+    # The held re-pend sleeps its backoff in base-interval steps, reading the #122 halt after each
+    # (#1611). At this file's 1 ms base a doubling backoff is hundreds of steps, each rounded up to
+    # the OS timer's tick (about 15 ms on Windows), so cap it to keep ten failures inside the wait.
+    monkeypatch.setattr(wiring_runner, "_REPEND_RETRY_CAP_SECONDS", 0.004)
     store = _RepeatFaultNoRependStore()
     runner = _runner(store)
 
@@ -652,7 +656,8 @@ async def test_a_failed_batch_pass_records_its_re_pend_once(
     finally:
         await _stop(runner, task)
 
-    # One re-pend per failed pass, naming every row the pass held.
+    # Every re-pend write, the pass's first and each retry while it holds the lane (#1611), is ONE
+    # write naming every row the pass held, never head and extras apart.
     assert all(ids == ["head", "extra-1", "extra-2"] for ids in store.reschedules)
     repends = [
         r

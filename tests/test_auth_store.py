@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -167,8 +168,27 @@ async def test_lockout_counter_contract() -> None:
     The same body runs against live PostgreSQL and SQL Server, so the one security policy the three
     SQL bodies implement is asserted once rather than worded three times."""
     store = await _store()
+
+    def corrupt(cell: str | bytes) -> Callable[[str], Awaitable[None]]:
+        async def write(user_id: str) -> None:
+            await store._db.execute(
+                "UPDATE webauthn_credentials SET transports=CAST(? AS TEXT) WHERE user_id=?",
+                (cell, user_id),
+            )
+            await store._db.commit()
+
+        return write
+
     try:
-        await _assert_lockout_contract(store)
+        await _assert_lockout_contract(
+            store,
+            corrupt_passkeys={
+                # Not UTF-8: sqlite3 raises OperationalError while FETCHING the row, before any
+                # parse runs.
+                "fetch": corrupt(bytes([0xFF])),
+                "parse": corrupt("not json"),
+            },
+        )
     finally:
         await store.close()
 

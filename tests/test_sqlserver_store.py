@@ -13,7 +13,7 @@ import asyncio
 import base64
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
@@ -37,7 +37,7 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
-from messagefoundry.store.store import load_audit_chain
+from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -694,12 +694,10 @@ async def test_stats_and_metrics(store) -> None:
     # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
     # this guards every run.
     assert db.disk_free_bytes is None
-    # Non-empty is the engine-side fact a reader of the null above depends on: this backend names
-    # itself through `journal_mode` (the recovery model), and the "" fallback here means the
-    # sys.databases read came back empty, so the row says nothing about which store answered.
-    # Deliberately asserts only that, not WHICH model — the set of recovery models a console might
-    # recognise is that console's policy, and restating it in the engine suite would let the two
-    # drift apart while both stayed green.
+    assert db.disk_free_status is DiskFreeStatus.NOT_APPLICABLE  # stated, not inferred
+    # journal_mode is the recovery model, for display only: since disk_free_status states the
+    # not_applicable fact, no reader infers the backend from it. Non-empty means the sys.databases
+    # read answered.
     assert db.journal_mode
     ok, _ = await store.integrity_check()
     assert ok is True
@@ -879,6 +877,14 @@ async def test_webauthn_store_contract(store) -> None:
     await _assert_webauthn_store_contract(store)
 
 
+async def test_webauthn_conditional_bind_contract(store) -> None:
+    """BACKLOG #3014, #3690 item 1 on the real SQL Server backend: the conditional passkey insert,
+    checked with the account row held under UPDLOCK, ROWLOCK."""
+    from tests._webauthn_store_contract import _assert_webauthn_conditional_bind_contract
+
+    await _assert_webauthn_conditional_bind_contract(store)
+
+
 async def test_totp_store_contract(store) -> None:
     """WP-14 TOTP store contract on the real SQL Server backend — the backfill that finally
     executes the UPDLOCK row-lock paths (consume_totp_step / consume_recovery_code_hash)."""
@@ -896,7 +902,30 @@ async def test_lockout_store_contract(store) -> None:
     backend needs does not exist."""
     from tests._lockout_store_contract import _assert_lockout_contract
 
-    await _assert_lockout_contract(store)
+    def corrupt(statement: str, param: object) -> Callable[[str], Awaitable[None]]:
+        async def write(user_id: str) -> None:
+            async with store._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(statement, (param, user_id))
+                await cur.close()
+                await conn.commit()
+
+        return write
+
+    await _assert_lockout_contract(
+        store,
+        corrupt_passkeys={
+            # A lone UTF-16 surrogate: the driver's decode of the NVARCHAR cell raises
+            # UnicodeDecodeError while fetching, before any parse runs. A driver that decodes it
+            # anyway hands the parse a value that is not JSON, which keeps the fixed length too.
+            "fetch": corrupt(
+                "UPDATE webauthn_credentials SET transports=NCHAR(?) WHERE user_id=?", 55296
+            ),
+            "parse": corrupt(
+                "UPDATE webauthn_credentials SET transports=? WHERE user_id=?", "not json"
+            ),
+        },
+    )
 
 
 async def test_login_address_store_contract(store) -> None:
@@ -6385,28 +6414,128 @@ def _presented_certificate_pem(host: str, port: int) -> str:
     return ssl.DER_cert_to_PEM_cert(der)
 
 
+def _odbc_pairs(dsn: str) -> list[tuple[str, str]]:
+    """Split an ODBC connection string into ``(keyword, raw value)`` pairs, in order.
+
+    Keys are read as keys, never as substrings: ``"ServerCertificate" in dsn`` is also true of
+    ``TrustServerCertificate=no;``, which every verified string carries (vault BACKLOG #3714). A
+    brace-quoted value is read whole, with ``}}`` as an escaped brace, so a ``;`` or ``=`` inside
+    one, as a password may hold, starts no keyword."""
+    pairs: list[tuple[str, str]] = []
+    i = 0
+    while i < len(dsn):
+        eq = dsn.index("=", i)
+        j = eq + 1
+        if dsn.startswith("{", j):
+            j += 1
+            while True:
+                close = dsn.index("}", j)
+                if dsn.startswith("}}", close):
+                    j = close + 2
+                    continue
+                j = close + 1
+                break
+        end = dsn.find(";", j)
+        if end == -1:
+            end = len(dsn)
+        pairs.append((dsn[i:eq], dsn[eq + 1 : end]))
+        i = end + 1
+    return pairs
+
+
+def _odbc_value(dsn: str, keyword: str) -> str | None:
+    """The value ``keyword`` takes in ``dsn``, or ``None``. ODBC keywords are case-insensitive and
+    the last one wins, as the driver reads them."""
+    values = [v for k, v in _odbc_pairs(dsn) if k.strip().lower() == keyword.lower()]
+    return values[-1] if values else None
+
+
+def _odbc_with(dsn: str, keyword: str, value: str) -> str:
+    """``dsn`` with every ``keyword`` set to ``value`` and nothing else changed. A substring
+    ``replace`` would also rewrite matching text inside a brace-quoted value."""
+    pairs = _odbc_pairs(dsn)
+    assert any(k.strip().lower() == keyword.lower() for k, _ in pairs), (
+        f"no {keyword} in the string"
+    )
+    return "".join(f"{k}={value if k.strip().lower() == keyword.lower() else v};" for k, v in pairs)
+
+
+def test_odbc_keyword_reader_tells_server_certificate_from_trust_server_certificate() -> None:
+    """The pin test's string checks, on the builder's own strings, with no server. It needs none,
+    so it runs on both SQL Server legs ahead of the strict step that depends on it (vault BACKLOG
+    #3714). The password holds the text a substring check would trip on."""
+    from messagefoundry.config.settings import StoreBackend, StoreSettings
+    from messagefoundry.store.sqlserver import connection_string
+
+    base = StoreSettings(
+        backend=StoreBackend.SQLSERVER,
+        server="localhost",
+        port=14330,
+        database="master",
+        username="sa",
+        password="p}w;Encrypt=yes;ServerCertificate={x}",
+    )
+
+    def dsn(pin: str | None) -> str:
+        # model_copy, as the pin test does: the builder reads no file, so none need exist.
+        return connection_string(
+            base.model_copy(update={"trust_server_certificate": False, "ssl_root_cert": pin})
+        )
+
+    unpinned, pinned = dsn(None), dsn("/tmp/presented.pem")
+    # CONTROL: the substring guard this replaced misreads the unpinned string as pinned.
+    assert "ServerCertificate" in unpinned
+    assert _odbc_value(unpinned, "ServerCertificate") is None
+    assert _odbc_value(unpinned, "TrustServerCertificate") == "no"
+    assert _odbc_value(unpinned, "Encrypt") == "yes"
+    assert _odbc_value(pinned, "ServerCertificate") == "{/tmp/presented.pem}"
+    assert _odbc_value(pinned, "Encrypt") == "strict"
+    # The password is one value, read whole, and a rewrite leaves it as it was.
+    assert _odbc_value(unpinned, "PWD") == "{p}}w;Encrypt=yes;ServerCertificate={x}}}"
+    assert "".join(f"{k}={v};" for k, v in _odbc_pairs(unpinned)) == unpinned
+    chain = _odbc_with(unpinned, "Encrypt", "strict")
+    assert _odbc_value(chain, "Encrypt") == "strict"
+    assert _odbc_value(chain, "PWD") == _odbc_value(unpinned, "PWD")
+    assert chain == unpinned.replace("Encrypt=yes;TrustServer", "Encrypt=strict;TrustServer")
+
+
 @pytest.mark.skipif(
     os.getenv("MEFOR_TEST_SQLSERVER_STRICT") != "1",
     reason="set MEFOR_TEST_SQLSERVER_STRICT=1 only where the SQL Server is configured for TDS 8.0 "
-    "strict encryption; the default CI containers are not, so the TLS-first read is cut",
+    "strict encryption; the CI service containers are not, so the TLS-first read is cut. The 2025 "
+    "sqlserver-store leg starts a strict-configured container for this test (vault BACKLOG #3714)",
 )
 async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_path: Any) -> None:
     """The store's pinned string, ``ServerCertificate`` with ``Encrypt=strict``, connects with the
     certificate the server presents and is refused with any other. Vault BACKLOG #3009 measured on
     Windows that Driver 18.7 enforced the pin with strict and not with ``Encrypt=yes``, and that
-    measurement is the evidence the store change rests on. This would be the Linux driver's reading,
+    measurement is the evidence the store change rests on. This is the Linux driver's reading,
     toward closing step 1 of #2223, on a server configured for strict encryption.
 
     POSITIVE CONTROL: the right pin connects through the same builder, so the wrong pin's refusal is
     the pin's doing and not a strict handshake this server cannot make. The two strings differ only
     in the pinned file.
 
+    TWO ARMS (vault BACKLOG #3714 item 6). CI runs this test twice on the 2025 leg. The UNTRUSTED arm
+    runs first, with the server's certificate outside the runner's trust store. The TRUSTED arm sets
+    ``MEFOR_TEST_SQLSERVER_PIN_TRUSTED=1`` after CI adds that certificate to the OpenSSL store. In the
+    untrusted arm a driver that skipped the pin would still refuse the wrong pin through the chain,
+    so only the trusted arm can tell a pin refusal from a chain refusal: there the chain passes, and
+    ``strict_wrong`` must still be refused. ``strict_chain`` is strict with no pin, which is a chain
+    check alone. Each arm asserts it: CONNECTED in the trusted arm, because an arm whose chain does
+    not pass proves nothing about the pin, and REFUSED in the untrusted arm, so that arm is not the
+    trusted condition under the wrong name. A refusal is not asserted to be a certificate mismatch;
+    its driver message is in the warning line.
+
     MEASUREMENT, not asserted: the same two pins beside ``Encrypt=yes``, the string the store sent
-    before #2223. The CI container's certificate is self-signed and not in the runner's trust store,
-    so ``yes_right`` is the control for ``yes_wrong``: if ``yes_right`` is REFUSED, the chain check
-    refused both and ``yes_wrong`` says nothing about the pin. The test is skipped in CI unless
+    before #2223. On a server that does not force strict encryption, ``yes_right`` is the control
+    for ``yes_wrong`` in the untrusted arm: if ``yes_right`` is REFUSED, the chain check refused
+    both and ``yes_wrong`` says nothing about the pin. The CI server forces strict encryption, so
+    there every ``Encrypt=yes`` login is refused before the certificate matters, in both arms, and
+    both readings say nothing about the pin. The test is skipped unless
     ``MEFOR_TEST_SQLSERVER_STRICT=1`` is set on a strict-configured server; where it runs, its
-    ``BACKLOG-2223-PIN`` warning line carries each outcome, and a refusal carries the driver's message."""
+    ``BACKLOG-2223-PIN`` warning line names the arm and carries each outcome, and a refusal carries
+    the driver's message."""
     import warnings
 
     import aioodbc
@@ -6426,7 +6555,7 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
     wrong.write_bytes(make_self_signed("mf-test-not-the-server", [], 30)[0])
 
     def pinned_dsn(pin: Any) -> str:
-        # CI trusts the container's self-signed certificate through the escape; the pin replaces that.
+        # Verification on, so the pin rides the secure posture and goes out with Encrypt=strict.
         return connection_string(
             base.model_copy(update={"trust_server_certificate": False, "ssl_root_cert": str(pin)})
         )
@@ -6447,18 +6576,44 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
         assert row is not None and row[0] == 1
         return "CONNECTED"
 
+    trusted = os.getenv("MEFOR_TEST_SQLSERVER_PIN_TRUSTED") == "1"
     right_dsn, wrong_dsn = pinned_dsn(right), pinned_dsn(wrong)
-    assert "Encrypt=strict;" in right_dsn and "Encrypt=strict;" in wrong_dsn
+    # Keys, not substrings: "ServerCertificate" is also inside "TrustServerCertificate=no;", which
+    # every verified string carries (vault BACKLOG #3714; run 40524945884 failed on exactly that).
+    for dsn in (right_dsn, wrong_dsn):
+        assert _odbc_value(dsn, "Encrypt") == "strict"
+        assert _odbc_value(dsn, "ServerCertificate") is not None
+    # No pin and verification on: the builder sends Encrypt=yes, so strict here is the chain alone.
+    unpinned_dsn = connection_string(
+        base.model_copy(update={"trust_server_certificate": False, "ssl_root_cert": None})
+    )
+    assert _odbc_value(unpinned_dsn, "Encrypt") == "yes"
+    assert _odbc_value(unpinned_dsn, "ServerCertificate") is None
     results = {
         "strict_right": await outcome(right_dsn),
         "strict_wrong": await outcome(wrong_dsn),
-        "yes_right": await outcome(right_dsn.replace("Encrypt=strict;", "Encrypt=yes;")),
-        "yes_wrong": await outcome(wrong_dsn.replace("Encrypt=strict;", "Encrypt=yes;")),
+        "strict_chain": await outcome(_odbc_with(unpinned_dsn, "Encrypt", "strict")),
+        "yes_right": await outcome(_odbc_with(right_dsn, "Encrypt", "yes")),
+        "yes_wrong": await outcome(_odbc_with(wrong_dsn, "Encrypt", "yes")),
     }
+    arm = "trusted" if trusted else "untrusted"
     warnings.warn(
-        "BACKLOG-2223-PIN " + " ".join(f"{k}={v}" for k, v in results.items()), stacklevel=1
+        f"BACKLOG-2223-PIN arm={arm} " + " ".join(f"{k}={v}" for k, v in results.items()),
+        stacklevel=1,
     )
+    # The right pin first: if it fails, the server or the login is at fault, and the chain
+    # assertions below would name the wrong cause.
     assert results["strict_right"] == "CONNECTED", "the right pin was refused: the control failed"
+    if trusted:
+        assert results["strict_chain"] == "CONNECTED", (
+            "the trusted arm's strict login with no pin was refused, so this arm cannot tell a pin "
+            f"refusal from a chain refusal (driver: {results['strict_chain']})"
+        )
+    else:
+        assert results["strict_chain"].startswith("REFUSED"), (
+            "the untrusted arm's strict login with no pin connected, so the certificate is already "
+            "trusted through the chain and this arm measured the trusted condition"
+        )
     assert results["strict_wrong"].startswith("REFUSED"), "a pin of another certificate connected"
 
 

@@ -46,14 +46,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import errno
 import json
 import logging
 import os
 import re
-import stat
 import weakref
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from functools import partial
@@ -64,6 +62,7 @@ from messagefoundry.auth.trust_anchors import (
     PRIVATE_KEY_SCOPE,
     has_encryption_header_bytes,
     has_private_key_label_bytes,
+    read_if_regular,
 )
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import (
@@ -89,7 +88,8 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
-from messagefoundry.keywrap import refuse_weak_key_file
+from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
+from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
@@ -128,13 +128,6 @@ _PARAM_RE = re.compile(r"(?<![:\w]):(\w+)")
 # deadlock (40001); plus the ODBC connect/operation timeouts.
 _TRANSIENT_PREFIXES = ("08", "40")
 _TRANSIENT_STATES = frozenset({"HYT00", "HYT01"})
-
-
-def _odbc_brace(value: str) -> str:
-    """ODBC-quote a value in braces, doubling any internal ``}`` — neutralizes ``; { } =`` inside it so
-    an attacker-influenced value (e.g. a password) can't inject extra connection keywords (mirrors the
-    store's ``connection_string`` hardening)."""
-    return "{" + value.replace("}", "}}") + "}"
 
 
 def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
@@ -200,12 +193,11 @@ def _build_dsn(
 ) -> str:
     """Build the ODBC connection string for SQL Server from the connection settings.
 
-    Free-text values are brace-quoted (injection guard) and the ``Encrypt``/``TrustServerCertificate``
-    flags are emitted **last** (ODBC is last-wins, so nothing earlier can downgrade TLS). A weakened
-    TLS posture is **refused** via the shared posture-keyed authority (:func:`_weakened_tls_permitted`,
-    #200) — a STRICT verify-off cell that stays refused for staging AND prod PHI, with the global escape
-    clamped so it can never relax a production hop; ``attested`` (the per-connection ``tls_hop_attested``)
-    is the surgical, audited per-hop opt-in.
+    Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (BACKLOG #3714). It sends no
+    ``ServerCertificate`` pin. A weakened TLS posture is **refused** via the shared posture-keyed
+    authority (:func:`_weakened_tls_permitted`, #200) — a STRICT verify-off cell that stays refused
+    for staging AND prod PHI, with the global escape clamped so it can never relax a production hop;
+    ``attested`` (the per-connection ``tls_hop_attested``) is the surgical, audited per-hop opt-in.
 
     ``read_only`` (the db_lookup pool and, since BACKLOG #2617, the ``DatabaseRef`` sync set it;
     destination/source omit it, keeping their DSN byte-identical) appends ``ApplicationIntent=ReadOnly``
@@ -248,26 +240,24 @@ def _build_dsn(
             "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
         )
     parts = [
-        f"DRIVER={_odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
+        f"DRIVER={odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
         f"SERVER={server},{int(s.get('port', 1433))}",
-        f"DATABASE={_odbc_brace(str(s['database']))}",
+        f"DATABASE={odbc_brace(str(s['database']))}",
         # No login-timeout keyword here, on purpose: see :func:`_login_timeout` (BACKLOG #2089).
-        f"APP={_odbc_brace(str(s.get('app_name', 'messagefoundry')))}",
+        f"APP={odbc_brace(str(s.get('app_name', 'messagefoundry')))}",
     ]
     if auth == "sql":
-        parts.append(f"UID={_odbc_brace(str(s.get('username') or ''))}")
-        parts.append(f"PWD={_odbc_brace(str(s.get('password') or ''))}")
+        parts.append(f"UID={odbc_brace(str(s.get('username') or ''))}")
+        parts.append(f"PWD={odbc_brace(str(s.get('password') or ''))}")
     elif auth == "integrated":
         parts.append("Trusted_Connection=yes")
     else:  # entra
         parts.append("Authentication=ActiveDirectoryDefault")
     if read_only:
-        # Advertise read-only intent for the db_lookup pool (ADR 0010). Emitted before the TLS flags so
-        # the last-wins Encrypt/TrustServerCertificate posture is unchanged.
+        # Advertise read-only intent for the db_lookup pool (ADR 0010). Not a TLS keyword, so it goes
+        # in the head, before the TLS tail (messagefoundry.odbc_dsn).
         parts.append("ApplicationIntent=ReadOnly")
-    parts.append(f"Encrypt={'yes' if encrypt else 'no'}")
-    parts.append(f"TrustServerCertificate={'yes' if trust else 'no'}")
-    return ";".join(parts) + ";"
+    return odbc_connection_string(parts, encrypt=encrypt, trust_server_certificate=trust)
 
 
 # A valid ODBC connection-string keyword: a letter then letters/digits/spaces/underscores. Rejecting the
@@ -472,6 +462,33 @@ def _odbc_keyword_name(key: str) -> str:
     return " ".join(key.split()).lower()
 
 
+def generic_odbc_param(settings: Mapping[str, Any], keyword: str) -> object | None:
+    """The value a generic-dialect connection's ``odbc_params`` gives ``keyword``, a name in the
+    form :func:`_odbc_keyword_name` gives, or ``None`` (vault BACKLOG #3090, step 7).
+
+    ``None`` too for the SQL Server preset, which sends no ``odbc_params``, and for a table that is
+    not a mapping, which the build refuses. The keyword is matched in any case and spacing, as the
+    build matches it, and the build refuses a keyword given twice, so the first match is the copy
+    the driver reads."""
+    if str(settings.get("dialect", "sqlserver")).lower() != "generic":
+        return None
+    params = settings.get("odbc_params")
+    return _odbc_param(params, keyword) if isinstance(params, Mapping) else None
+
+
+def _odbc_param(params: Mapping[str, Any], keyword: str) -> object | None:
+    """The value ``params`` gives ``keyword``, matched as the build matches it, or ``None``."""
+    return next((v for k, v in params.items() if _odbc_keyword_name(str(k)) == keyword), None)
+
+
+def generic_odbc_tls_off(settings: Mapping[str, Any]) -> bool:
+    """Whether a generic-dialect connection's ``sslmode`` turns TLS off, so its driver reads no CA:
+    libpq's ``disable`` or MySQL's ``DISABLED``, as :func:`_no_tls_label` spells them, in any case.
+    ``allow`` and ``prefer`` may still go to TLS, so they do not count (vault BACKLOG #3090)."""
+    mode = generic_odbc_param(settings, "sslmode")
+    return mode is not None and _no_tls_label(mode) in ("disable", "disabled")
+
+
 def _odbc_credential_keyword(
     value: object, setting: str, allowed: frozenset[str], *, connection: str | None
 ) -> str:
@@ -515,7 +532,26 @@ def _odbc_literal(value: object, *, what: str, connection: str | None, refused: 
             f"{hop_name_prefix(connection)}DATABASE {what} must hold only printable ASCII characters"
             + (f", and none of {listed}" if refused else "")
         )
-    return _odbc_brace(text)
+    return odbc_brace(text)
+
+
+def _is_remote_spelling(value: object) -> bool:
+    """Whether the trimmed ``value`` starts with two separators, or with the device prefix, and so
+    can name another host. The spelling only; :func:`_refuse_remote_path` says what it misses."""
+    text = str(value).strip()
+    return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
+
+
+def driver_file_spellings(value: object) -> tuple[str, ...]:
+    """The spellings of a driver file keyword's value the engine checks: as sent, then trimmed,
+    since a driver may trim it. Empty for a value that can name another host, which the build
+    refuses (:func:`_refuse_remote_path`), so no check opens a remote path first (vault BACKLOG
+    #3090). Any value, a ``Path`` too, is read as its ``str()``: the text the build sends and the
+    remote screen reads, so the engine checks the file the driver is told to load."""
+    if not value or _is_remote_spelling(value):
+        return ()
+    raw = str(value)
+    return tuple(p for p in dict.fromkeys((raw, raw.strip())) if p)
 
 
 def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> None:
@@ -525,8 +561,7 @@ def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> 
     the driver (or, for ``sslkey``, the engine's own wrap check) would open a connection to it. This
     reads the spelling only. It does not resolve the path, so a mapped drive or a link that leads
     to another host is not caught here."""
-    text = str(value).strip()
-    if len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?":
+    if _is_remote_spelling(value):
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' must be a plain "
             "local path: a drive letter, or one leading separator"
@@ -547,24 +582,75 @@ def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None 
     builder has already refused a keyword given twice, so the copy read here is the copy the driver
     reads. This binds only a driver that reads ``sslkey`` itself. psqlODBC takes a client key only
     through ``pqopt``, which the builder refuses, so there libpq finds the key on its own (at least
-    ``PGSSLKEY``, a service file, or its default path) and no key is checked (BACKLOG #2423)."""
-    key_path = named.get("sslkey")
-    if not key_path:
-        return
-    refuse_weak_key_file(
-        str(key_path),
-        setting=f"{hop_name_prefix(connection)}DATABASE odbc_params sslkey",
-        unlock_setting="odbc_params sslpassword",
-        passphrase_given=bool(named.get("sslpassword")),
-    )
+    ``PGSSLKEY``, a service file, or its default path) and no key is checked (BACKLOG #2423).
+
+    The file is read at each spelling :func:`driver_file_spellings` gives (vault BACKLOG #3090), so
+    a padded value is checked as a driver may trim it, and a pipe named here is never read: it is
+    refused, as anything that is not a regular file is, on its stat, or on its descriptor if it
+    was swapped in after that stat (:func:`~messagefoundry.auth.trust_anchors.read_if_regular`)."""
+    _refuse_weak_driver_wrap(named, "sslkey", "key file", connection, leave_irregular=False)
 
 
-#: How much of an ``sslca`` file :func:`_refuse_encrypted_driver_ca` reads. A CA bundle is tens or
-#: hundreds of KiB; the system bundles a site might name are well under this.
-_MAX_DRIVER_CA_FILE_BYTES = 16 * 2**20
+def _refuse_weak_driver_cert(named: Mapping[str, Any], *, connection: str | None = None) -> None:
+    """Check the key wrap of a driver's client certificate file before the driver loads it (vault
+    BACKLOG #3090, step 5).
+
+    ``sslcert`` names the client certificate a driver loads with its own TLS library, and with no
+    ``sslkey`` a PEM there may carry the private key too. A certificate-chain load is the one that
+    can prompt for a passphrase, so the file takes :func:`_refuse_weak_driver_key`'s wrap check. A
+    plain certificate, PEM or DER, holds no key and passes. The private-key-label refusal a CA file
+    takes (BACKLOG #3745) does not apply: a client certificate file may hold its own key.
+
+    With ``sslkey`` set, the key comes from that file, which its own check reads, so ``sslcert`` is
+    not read here. That is the rule
+    :func:`~messagefoundry.keywrap.refuse_weak_cert_chain_key` follows. It runs when the
+    connection is built, not at each connect. docs/CONNECTIONS.md, under the generic dialect, says
+    what it does not cover."""
+    if not str(named.get("sslkey") or "").strip():
+        _refuse_weak_driver_wrap(named, "sslcert", "certificate file", connection)
+
+
+def _refuse_weak_driver_wrap(
+    named: Mapping[str, Any],
+    keyword: str,
+    what: str,
+    connection: str | None,
+    *,
+    leave_irregular: bool = True,
+) -> None:
+    """Refuse a weak or unlockable key wrap in the ``keyword`` file, with ``sslpassword`` as its
+    passphrase, through :func:`~messagefoundry.keywrap.refuse_weak_key_wrap`. A file the check
+    cannot read is refused as :class:`~messagefoundry.keywrap.KeyWrapRefused`, as
+    :func:`~messagefoundry.keywrap.refuse_weak_key_file` refuses it. ``leave_irregular`` is
+    :func:`_read_driver_file`'s."""
+    for setting, data in _driver_file_spellings(
+        named,
+        keyword,
+        connection,
+        what,
+        "its wrap",
+        error=KeyWrapRefused,
+        leave_irregular=leave_irregular,
+    ):
+        refuse_weak_key_wrap(
+            data,
+            setting=setting,
+            unlock_setting="odbc_params sslpassword",
+            passphrase_given=bool(named.get("sslpassword")),
+        )
+
+
+#: How much of an ``sslca``, ``sslcert`` or ``sslkey`` file :func:`_read_driver_file` reads: 1 MiB,
+#: the cap :mod:`messagefoundry.keywrap` puts on a key file (vault BACKLOG #3090, step 8). A CA
+#: bundle is tens or hundreds of KiB, and a client certificate with its key a few KiB. The read
+#: runs on the event loop when the connection is built, so the cap bounds that stall too.
+_MAX_DRIVER_CA_FILE_BYTES = 1 << 20
 #: ``ERROR_INVALID_NAME``: Windows' answer for a path it cannot spell, such as one with a leading
 #: space before the drive letter.
 _WINDOWS_INVALID_NAME = 123
+#: ``ERROR_BAD_NETPATH`` and ``ERROR_BAD_NET_NAME``: a share Windows could not reach, which
+#: CPython raises as ``FileNotFoundError`` though a file may be there.
+_WINDOWS_UNREACHABLE = frozenset({53, 67})
 
 
 def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | None = None) -> None:
@@ -581,74 +667,165 @@ def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | N
     private-key label is refused too, through
     :func:`~messagefoundry.auth.trust_anchors.has_private_key_label_bytes` (BACKLOG #3745).
 
-    Like :func:`~messagefoundry.keywrap.refuse_weak_key_file`, a path that does not exist is left to
-    the driver, which reports it. So is anything that is not a regular file: a directory, which
-    this keyword should not name (a CA directory is ``sslcapath``) and which is loaded as before,
-    and a device or pipe, which the engine does not open because reading one could itself wait.
-    Any other read failure is refused, because a file this check cannot read is one it cannot
-    clear. The value is checked as sent and trimmed, since :func:`_refuse_remote_path` judges the
-    trimmed spelling and a driver may trim it.
+    :func:`_driver_file_spellings` says which paths are left to the driver, and which spellings
+    are read. A share Windows reports as not found because it could not reach it is refused,
+    unless ``sslmode`` turns TLS off (:func:`generic_odbc_tls_off`): then the driver reads no CA,
+    so it never meets that file.
 
-    **It runs when the connection is built, not at each connect.** A file replaced afterwards
-    reaches the driver unchecked."""
-    ca_path = named.get("sslca")
-    if not ca_path:
-        return
-    setting = f"{hop_name_prefix(connection)}DATABASE odbc_params sslca"
-    raw = str(ca_path)
-    for path in dict.fromkeys((raw, raw.strip())):
-        _refuse_one_encrypted_ca_file(path, setting)
+    **It runs when the connection is built, not at each connect.** What checks the file after
+    that, and what does not, is ``auth.trust_anchors`` module item 12."""
+    for setting, data in _driver_file_spellings(
+        named,
+        "sslca",
+        connection,
+        "CA file",
+        "it for an encryption header or a private key",
+        leave_unreachable=generic_odbc_tls_off({"dialect": "generic", "odbc_params": named}),
+    ):
+        if has_encryption_header_bytes(data):
+            raise ValueError(
+                f"{setting}: the CA file {ENCRYPTION_HEADER_SCOPE}. The driver loads it with its "
+                "own TLS library, which can wait for a password on an encrypted block; refusing "
+                "to hand it over (BACKLOG #3090)"
+            )
+        if has_private_key_label_bytes(data):
+            raise ValueError(
+                f"{setting}: the CA file {PRIVATE_KEY_SCOPE}. A CA file is public trust material, "
+                "so a private key does not belong in it; refusing to hand it over (BACKLOG #3745)"
+            )
 
 
-def _refuse_one_encrypted_ca_file(path: str, setting: str) -> None:
-    """One spelling of :func:`_refuse_encrypted_driver_ca`'s check.
+def _driver_file_spellings(
+    named: Mapping[str, Any],
+    keyword: str,
+    connection: str | None,
+    what: str,
+    checked_for: str,
+    *,
+    error: type[ValueError] = ValueError,
+    leave_irregular: bool = True,
+    leave_unreachable: bool = False,
+) -> Iterator[tuple[str, bytes]]:
+    """``(setting, bytes)`` for each spelling of the ``keyword`` file
+    (:func:`driver_file_spellings`) that :func:`_read_driver_file` reads, for the caller to check.
+    Nothing when the keyword is unset, and nothing more once a spelling is left to the driver as
+    an unreached share: another spelling of it would wait out the same network timeout."""
+    setting = f"{hop_name_prefix(connection)}DATABASE odbc_params {keyword}"
+    for path in driver_file_spellings(named.get(keyword)):
+        try:
+            data = _read_driver_file(
+                path,
+                setting,
+                what,
+                checked_for,
+                error=error,
+                leave_irregular=leave_irregular,
+                leave_unreachable=leave_unreachable,
+            )
+        except _UnreachedShare:
+            return
+        if data is not None:
+            yield setting, data
 
-    The file is opened once and judged by its own descriptor, so nothing can swap a pipe in
-    between a check and the open. ``O_NONBLOCK``, where the platform has it, keeps that open from
-    waiting on a pipe with no writer."""
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+
+class _UnreachedShare(Exception):
+    """:func:`_read_driver_file` could not reach the share a spelling names, and its caller said
+    the driver will not read the file, so no spelling of it is read."""
+
+
+def _read_driver_file(
+    path: str,
+    setting: str,
+    what: str,
+    checked_for: str,
+    *,
+    error: type[ValueError] = ValueError,
+    leave_irregular: bool = True,
+    leave_unreachable: bool = False,
+) -> bytes | None:
+    """The bytes of one spelling of a file a driver loads, for the engine to check first, or
+    ``None`` when the file is left to the driver. ``what`` and ``checked_for`` word a refusal, and
+    ``error`` is its type.
+
+    Like :func:`~messagefoundry.keywrap.refuse_weak_key_file`, a path that does not exist is left
+    to the driver, which reports it. With ``leave_irregular``, so is anything that is not a regular
+    file: a directory, which is loaded as before, and a device or pipe, which the engine does not
+    read because reading one could itself wait. Without it, as for ``sslkey``, those are refused
+    unread, as ``refuse_weak_key_file`` refused a directory. Any other read failure is refused,
+    because a file the check cannot read is one it cannot clear, and so is a file past
+    :data:`_MAX_DRIVER_CA_FILE_BYTES`. That includes a share Windows could not reach
+    (:func:`_names_no_file`), unless ``leave_unreachable`` says the driver will not read the file
+    either: then :class:`_UnreachedShare` is raised.
+
+    The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says
+    how a device or pipe is judged without being read, or waited on."""
     try:
-        with os.fdopen(os.open(path, flags), "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                logger.debug("%s: not a regular file, so no encryption-header check", setting)
-                return
-            data = handle.read(_MAX_DRIVER_CA_FILE_BYTES + 1)
-    except (FileNotFoundError, NotADirectoryError, ValueError):
-        # No such file, a path through a file, or a NUL in the path: the driver cannot load it
-        # either.
-        logger.debug("%s: no CA file at this spelling, so no encryption-header check", setting)
-        return
+        data = read_if_regular(path, _MAX_DRIVER_CA_FILE_BYTES + 1)
+    except ValueError:
+        # A path os.stat cannot take, such as one holding a NUL: the driver cannot load it either.
+        logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
+        return None
     except OSError as exc:
-        # Opening a directory fails, as IsADirectoryError on POSIX and PermissionError on Windows.
-        # A directory is loaded as before.
-        if os.path.isdir(path):
-            logger.debug("%s: not a regular file, so no encryption-header check", setting)
-            return
-        if exc.errno == errno.EINVAL or getattr(exc, "winerror", None) == _WINDOWS_INVALID_NAME:
-            # A name the platform cannot spell, such as a padded Windows path: no such file.
-            logger.debug("%s: no CA file at this spelling, so no encryption-header check", setting)
-            return
-        raise ValueError(
-            f"{setting}: the CA file could not be read to check it for an encryption header or "
-            "a private key: "
+        # read_if_regular returns None for a directory it stats. One swapped in after that stat
+        # can fail the open instead, as PermissionError on Windows, so the path is looked at
+        # again after that failure alone: on a share Windows could not reach, a second look would
+        # wait out the same network timeout again, on the event loop. A path through a file names
+        # no file either. POSIX reports it as NotADirectoryError, which keywrap refused, so sslkey
+        # still does; Windows reports it as a missing name, left to the driver.
+        if isinstance(exc, NotADirectoryError) or (
+            isinstance(exc, (PermissionError, IsADirectoryError)) and os.path.isdir(path)
+        ):
+            _irregular(setting, what, checked_for, error, leave_irregular)
+            return None
+        if _names_no_file(exc):
+            logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
+            return None
+        if leave_unreachable and getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
+            logger.debug(
+                "%s: the share was not reached, and the driver reads no such file", setting
+            )
+            raise _UnreachedShare from exc
+        raise error(
+            f"{setting}: the {what} could not be read to check {checked_for}: "
             f"{exc.strerror or type(exc).__name__}"
         ) from exc
+    if data is None:  # a directory, device or pipe: judged by its stat, never read
+        _irregular(setting, what, checked_for, error, leave_irregular)
+        return None
     if len(data) > _MAX_DRIVER_CA_FILE_BYTES:
-        raise ValueError(
-            f"{setting}: the CA file is larger than the {_MAX_DRIVER_CA_FILE_BYTES // 2**20} MiB "
-            "the engine reads to check it for an encryption header"
+        raise error(
+            f"{setting}: the {what} is larger than the {_MAX_DRIVER_CA_FILE_BYTES // 2**20} MiB "
+            f"the engine reads to check {checked_for}"
         )
-    if has_encryption_header_bytes(data):
-        raise ValueError(
-            f"{setting}: the CA file {ENCRYPTION_HEADER_SCOPE}. The driver loads it with its own "
-            "TLS library, which can wait for a password on an encrypted block; refusing to hand "
-            "it over (BACKLOG #3090)"
+    return data
+
+
+def _names_no_file(exc: OSError) -> bool:
+    """Whether a failure to read one spelling of a driver file says no file is there, so the
+    driver cannot load it either, rather than that a file is there the engine cannot check.
+
+    A missing name counts, unless Windows reports it for a share it could not reach (53 and 67,
+    as :mod:`messagefoundry.config.key_file_access` reads them): the driver may reach that file
+    at a later connect. So does Windows' ``ERROR_INVALID_NAME``, a padded path for one, and only
+    by that Win32 code: CPython maps every Win32 error it has no errno for to EINVAL, so testing
+    errno would leave a real read failure unchecked. On POSIX an EINVAL is refused too, even from
+    a filesystem that rejects a padded spelling with it, because errno cannot tell that from a
+    failed read; that refuses the build rather than check the trimmed spelling."""
+    winerror = getattr(exc, "winerror", None)
+    if isinstance(exc, FileNotFoundError):
+        return winerror not in _WINDOWS_UNREACHABLE
+    return winerror == _WINDOWS_INVALID_NAME
+
+
+def _irregular(
+    setting: str, what: str, checked_for: str, error: type[ValueError], leave: bool
+) -> None:
+    """:func:`_read_driver_file`'s answer for a path that names no regular file."""
+    if not leave:
+        raise error(
+            f"{setting}: the {what} could not be read to check {checked_for}: not a regular file"
         )
-    if has_private_key_label_bytes(data):
-        raise ValueError(
-            f"{setting}: the CA file {PRIVATE_KEY_SCOPE}. A CA file is public trust material, so "
-            "a private key does not belong in it; refusing to hand it over (BACKLOG #3745)"
-        )
+    logger.debug("%s: not a regular file, so the engine does not check it", setting)
 
 
 def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
@@ -754,6 +931,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     _refuse_weak_driver_key(named, connection=connection)
+    _refuse_weak_driver_cert(named, connection=connection)
     _refuse_encrypted_driver_ca(named, connection=connection)
     _warn_generic_tls_unenforced(params, connection=connection)
     return ";".join(parts) + ";"
@@ -861,7 +1039,7 @@ def _generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, 
         host, _, port_text = host.partition(":")
     # A usable port in `server` wins; otherwise the PORT keyword; otherwise unknown. 0 is the "neither
     # said" value, so `or` reads correctly here — a port is never legitimately 0.
-    keyword = next((str(v) for k, v in params.items() if _odbc_keyword_name(str(k)) == "port"), "")
+    keyword = str(_odbc_param(params, "port") or "")
     return host.strip(), _port_or_zero(port_text) or _port_or_zero(keyword)
 
 
