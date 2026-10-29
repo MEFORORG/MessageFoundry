@@ -42,6 +42,7 @@ from messagefoundry.auth.trust_anchors import ad_anchor_spec, verified_anchor_ca
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
     AuthSettings,
+    check_kerberos_realm,
     is_ldaps_address,
     split_kerberos_spn,
 )
@@ -190,6 +191,25 @@ class KerberosTokenRefused(Exception):
     def __init__(self, error_type: str) -> None:
         super().__init__(f"SPNEGO token refused: {error_type}")
         self.error_type = error_type
+
+
+#: Every ``reason`` a :class:`KerberosPrincipalRefused` carries. docs/SECURITY.md lists this set,
+#: and tests/test_kerberos_realm.py pins the two together.
+KERBEROS_PRINCIPAL_REFUSALS: frozenset[str] = frozenset(
+    {"realm_mismatch", "no_realm", "domain_backslash_form", "not_a_bare_account_name"}
+)
+
+
+class KerberosPrincipalRefused(Exception):
+    """The acceptor took the token, but its client principal may not sign in (BACKLOG #2610).
+
+    ``reason`` is one of :data:`KERBEROS_PRINCIPAL_REFUSALS`, so the caller can audit why without
+    storing any of the principal's text.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Kerberos client principal refused: {reason}")
+        self.reason = reason
 
 
 class LdapReferralError(LdapError):
@@ -1916,8 +1936,9 @@ class LdapAuthenticator:
             # match, or more than one, still proves nothing, so it is refused as before.
             #
             # THE CHOSEN ENTRY MUST BE THE ONLY MATCH HOLDING THE NAME AS ITS sAMAccountName. The
-            # Kerberos caller passes the ticket's name with its realm already dropped, so the ticket
-            # proves only that its holder has this sAMAccountName in SOME realm the acceptor trusts.
+            # Kerberos caller passes the ticket's name with its realm checked against
+            # [auth].kerberos_realm and then dropped (BACKLOG #2610), so the ticket proves only that
+            # its holder has this sAMAccountName in that realm, while the search base may span more.
             # - An entry that matched only through its UPN is not that holder. Choosing it would let
             #   a renamed account that kept its old UPN be signed in by whoever was later given the
             #   old name.
@@ -2423,17 +2444,20 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     Experimental — **not a supported v0.1 feature**: off by default (``kerberos_enabled=False``),
     production hardening (CI coverage, keytab/SPN preflight) targeted for 0.2. Single-leg only: no
     NTLM fallback, no mutual-auth response token, no multi-leg challenge handshake. The server must
-    have a usable keytab/credential for ``kerberos_spn`` in its environment; the realm suffix
-    (``user@REALM``) is stripped to yield the account name.
+    have a usable keytab/credential for ``kerberos_spn`` in its environment. The principal must be
+    ``user@REALM`` with ``REALM`` equal to ``kerberos_realm``; :func:`_account_in_realm` says what
+    else it refuses (BACKLOG #2610).
 
     ``None`` unless :func:`_kerberos_context_complete` says the context finished (BACKLOG #2610
     review point c), so no provider can hand back a principal from a half-done exchange. That is
     defence in depth: no such provider is known.
 
-    Raises :class:`KerberosTokenRefused` when the acceptor refuses the token, and
-    :class:`LdapError` when the acceptor cannot be built from settings or cannot read the principal
-    of a token its step accepted.
+    Raises :class:`KerberosTokenRefused` when the acceptor refuses the token,
+    :class:`KerberosPrincipalRefused` when it accepts a token whose principal may not sign in, and
+    :class:`LdapError` when the acceptor or the realm cannot be read from settings, or the principal
+    of a token its step accepted cannot be read.
     """
+    realm = _configured_kerberos_realm(settings)
     server = _kerberos_acceptor(settings)
     refused: str | None = None
     try:
@@ -2468,7 +2492,49 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
         raise LdapError(f"Kerberos principal read failed: {unreadable}")
     if not principal:
         return None
-    return str(principal).split("@", 1)[0]
+    return _account_in_realm(str(principal), realm)
+
+
+def _configured_kerberos_realm(settings: AuthSettings) -> str:
+    """``[auth].kerberos_realm``, checked again here for settings built without validation.
+
+    Raises :class:`LdapError`, a configuration fault, rather than letting a missing realm accept
+    every realm. The settings validator refuses both cases at load first.
+    """
+    if not settings.kerberos_realm:
+        raise LdapError("kerberos_realm is not set; Windows SSO accepts no ticket without it")
+    try:
+        return check_kerberos_realm(settings.kerberos_realm)
+    except ValueError as exc:
+        raise LdapError(str(exc)) from exc
+
+
+def _account_in_realm(principal: str, realm: str) -> str:
+    """The account name of ``principal``, whose realm must be ``realm`` (BACKLOG #2610).
+
+    The realm is the text after the LAST ``@`` and must equal ``realm`` up to ASCII case; a
+    non-ASCII realm is refused before the compare, because lowering folds some non-ASCII letters
+    into ASCII ones. Each refusal raises :class:`KerberosPrincipalRefused` with its own reason, and
+    logs that reason at WARNING, never the principal's text:
+
+    - no ``@`` at all, with ``DOMAIN\\user`` named apart. Windows SSPI may report that form, and
+      which form it gives is UNVERIFIED against a real domain, so it is refused rather than mapped
+      from a NetBIOS name the engine cannot check;
+    - another realm, or an empty one;
+    - an account part that is empty or holds ``@``, ``/`` or ``\\``: an escaped enterprise principal
+      or a service principal, not a bare account name.
+    """
+    account, at, presented = principal.rpartition("@")
+    if not at:
+        reason = "domain_backslash_form" if "\\" in principal else "no_realm"
+    elif not (presented.isascii() and presented.lower() == realm.lower()):
+        reason = "realm_mismatch"
+    elif not account or any(ch in account for ch in "@/\\"):
+        reason = "not_a_bare_account_name"
+    else:
+        return account
+    logger.warning("Kerberos sign-in refused the ticket's client principal: %s", reason)
+    raise KerberosPrincipalRefused(reason)
 
 
 def _kerberos_capable() -> bool:
@@ -2500,7 +2566,8 @@ def kerberos_acceptor_preflight(settings: AuthSettings) -> None:
 
     Raises :class:`LdapError` when browser SSO cannot actually work on this host — either no
     Kerberos-capable provider exists (the pure-Python NTLM fallback, e.g. a Linux install without
-    the gssapi/krb5 libraries) or the acceptor can't be built (missing keytab/SPN credential) — so
+    the gssapi/krb5 libraries), ``kerberos_realm`` is unset or malformed on settings built without
+    validation, or the acceptor can't be built (missing keytab/SPN credential) — so
     browser SSO degrades legibly at startup (providers ``kerberos=false``, the login-page link
     hidden, ``GET /ui/sso`` → ``e=sso_unavailable``) instead of advertising a dead link or failing
     per-request. Boot-once by design — a transient failure sticks until restart (recorded ADR 0068
@@ -2510,4 +2577,5 @@ def kerberos_acceptor_preflight(settings: AuthSettings) -> None:
             "no Kerberos-capable SPNEGO provider on this host — SSPI (Windows) or the GSSAPI/krb5 "
             "libraries (Linux) are required; the pure-Python NTLM fallback cannot validate a ticket"
         )
+    _configured_kerberos_realm(settings)
     _kerberos_acceptor(settings)
