@@ -1552,7 +1552,8 @@ async def _return_to_pool(pool: Any, conn: Any) -> None:
     try:
         await pool.release(conn)
     except Exception as exc:  # noqa: BLE001 - no borrower is left to tell
-        logger.debug("DATABASE: returning a pooled connection failed: %s", safe_exc(exc))
+        # WARNING, not DEBUG: a failed return leaks a pool slot, and main logged it so (PR 2560).
+        logger.warning("DATABASE: returning a pooled connection failed: %s", _safe_db_error(exc))
 
 
 #: Connections returned after their borrower stopped waiting. The loop holds a task only weakly
@@ -1834,6 +1835,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
             return
     else:
         work = asyncio.ensure_future(_close_cursor(cur))
+        # The loop holds a task only weakly; keep this one alive until its done-callback has run.
+        _DETACHED_SETTLES.add(work)
+        work.add_done_callback(_DETACHED_SETTLES.discard)
     try:
         await asyncio.shield(work)
     except BaseException:

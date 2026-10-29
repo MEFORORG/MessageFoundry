@@ -530,3 +530,19 @@ def test_a_thread_call_that_ends_after_the_loop_closed_is_logged(
             time.sleep(0.01)
     assert "after the event loop closed" in caplog.text
     assert "must not be logged" not in caplog.text
+
+
+async def test_a_failed_pool_return_is_logged_at_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A connection whose return to the pool fails leaks a pool slot, so the failure is a WARNING,
+    as main logged it before the PR 2593 merge resolution (Lander review round-a3856bb8). Red when
+    it logs at DEBUG."""
+
+    class _FailingPool:
+        async def release(self, conn: object) -> None:
+            raise RuntimeError("pool refused")
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await database._return_to_pool(_FailingPool(), object())
+    assert "returning a pooled connection failed" in caplog.text
