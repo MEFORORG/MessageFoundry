@@ -3242,8 +3242,8 @@ class AuthSettings(_Section):
     # **explicitly opted out** there, ``serve`` **refuses to start** under ``[security].enforcement =
     # "enforce"`` unless ``[security].allow_single_factor_admin_when_exposed`` lowers that to an
     # audited warning, and **warns** under ``warn``, whatever the environment (see __main__._serve),
-    # so MFA can't be silently
-    # skipped at exposure. Scope: since ASVS 6.3.3 it gates **every authorized route** for an in-scope
+    # so MFA can't be silently skipped at exposure.
+    # Scope: since ASVS 6.3.3 it gates **every authorized route** for an in-scope
     # session, not merely step-up operations — an MFA-pending session is refused with 403 +
     # ``X-MFA-Required: 1`` (api/security.py:require) and, in the browser, confined to /ui/mfa.
     require_mfa: bool = True

@@ -4005,13 +4005,19 @@ def _serve(args: argparse.Namespace) -> int:
     # caller's authority, so it gets the advisory too (vault BACKLOG #3474). The narrowing and its
     # wording are `_approvals_loosenings`', the one reader of that list against its default, so the
     # default list is never restated here. Still WARN-only: the arm's body holds no return.
-    held_gap = next(
-        (
-            risk
-            for switch, risk in _approvals_loosenings(settings.approvals)
-            if switch == "approvals.operations"
-        ),
-        None,
+    # The serve-time loosenings warning above prints the same risk text; this is the exposure
+    # reminder beside it, as the MFA arm's is.
+    held_gap = (
+        next(
+            (
+                risk
+                for switch, risk in _approvals_loosenings(settings.approvals)
+                if switch == "approvals.operations"
+            ),
+            None,
+        )
+        if admin_exposed
+        else None
     )
     if admin_exposed and (not settings.approvals.enabled or held_gap is not None):
         if not settings.approvals.enabled:

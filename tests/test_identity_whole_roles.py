@@ -72,7 +72,9 @@ def test_build_refuses_view_raw_without_view_summary() -> None:
 def test_build_accepts_a_whole_custom_role_and_every_built_in_role() -> None:
     whole = {Permission.MESSAGES_VIEW_RAW, Permission.MESSAGES_VIEW_SUMMARY}
     assert Permission.MESSAGES_VIEW_RAW in _build(roles=(), extra_permissions=whole).permissions
-    # A built-in role's summary pairs with a custom role's raw read: both are whole roles.
+    # The check reads the built set, not each role: view_raw alone passes beside a built-in role
+    # that supplies view_summary. No mintable custom role is view_raw alone; this pins what the
+    # check reads, and the caller pin below is what keeps such a part from reaching it.
     summary_roles = [
         r for r in Role if Permission.MESSAGES_VIEW_SUMMARY in permissions_for_roles({r})
     ]

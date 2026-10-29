@@ -18,6 +18,7 @@ Synthetic data only: the marker below is not message data.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 from pathlib import Path
 
@@ -26,7 +27,7 @@ import pytest
 import messagefoundry
 from messagefoundry import author_output
 from messagefoundry.__main__ import main
-from tests._ast_sites import source_uses
+from tests._ast_sites import code_names, parse_source
 
 #: What the config module prints. Not JSON, so one copy on stdout breaks the parse.
 MARKER = "AUTHOR-PRINT-MARKER"
@@ -172,15 +173,16 @@ def test_check_sends_every_loads_print_and_the_routers_to_stderr(
     messages = tmp_path / "messages"
     messages.mkdir()
     (messages / "a.hl7").write_bytes(ADT_A01.encode("utf-8"))
-    main(["check", "--config", cfg, "--messages", str(messages), "--no-lint", "--json"])
+    rc = main(["check", "--config", cfg, "--messages", str(messages), "--no-lint", "--json"])
     captured = capsys.readouterr()
     # More than one load printed, so the later legs' loads are covered, not only the first.
     assert captured.err.count(MARKER) > 1, captured.err
     assert ROUTER_MARKER in captured.err
     assert MARKER not in captured.out and ROUTER_MARKER not in captured.out
     report = json.loads(captured.out)
+    assert rc == (0 if report["ok"] else 1), report
     dryrun = [c for c in report["checks"] if c["name"] == "dryrun"]
-    assert dryrun and not dryrun[0]["skipped"], report
+    assert dryrun and dryrun[0]["ok"] and not dryrun[0]["skipped"], report
 
 
 def test_impact_sends_a_config_modules_print_to_stderr(
@@ -221,7 +223,7 @@ def test_run_cli_marks_every_subcommand_but_the_named_ones() -> None:
     seen: dict[str, bool] = {}
 
     def record(args: argparse.Namespace) -> int:
-        seen[args.command] = author_output._result_on_stdout
+        seen[args.command] = author_output._marks > 0
         return 0
 
     def build() -> tuple[argparse.ArgumentParser, Dispatch]:
@@ -234,7 +236,7 @@ def test_run_cli_marks_every_subcommand_but_the_named_ones() -> None:
     for command in ("result", "service"):
         assert run_cli([command], build, author_prints_keep_stdout=frozenset({"service"})) == 0
     assert seen == {"result": True, "service": False}
-    assert not author_output._result_on_stdout, "the mark outlived the command"
+    assert author_output._marks == 0, "the mark outlived the command"
 
 
 def test_the_engine_cli_leaves_only_serve_and_supervise_on_stdout(
@@ -255,6 +257,31 @@ def test_the_engine_cli_leaves_only_serve_and_supervise_on_stdout(
     assert passed["author_prints_keep_stdout"] is cli._AUTHOR_PRINTS_KEEP_STDOUT
 
 
+def _rebinds_stdout(source: str) -> bool:
+    """Whether CODE in ``source`` calls ``redirect_stdout`` or assigns to ``sys.stdout``.
+
+    At least these two forms. A ``setattr(sys, "stdout", ...)`` or a rebinding through another
+    name for ``sys`` is not seen."""
+    tree = parse_source(source)
+    if "redirect_stdout" in code_names(tree):
+        return True
+    return any(
+        isinstance(target, ast.Attribute)
+        and target.attr == "stdout"
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "sys"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign | ast.AugAssign | ast.AnnAssign)
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        for target in (target.elts if isinstance(target, ast.Tuple) else [target])
+    )
+
+
+#: The modules allowed to point ``sys.stdout`` elsewhere. The sandbox worker's stdout is its IPC
+#: channel, so it points ``sys.stdout`` at stderr for its whole life (ADR 0176); it runs no CLI.
+_STDOUT_REBINDERS = ["author_output.py", "pipeline/_sandbox_worker.py"]
+
+
 def test_only_the_seam_redirects_stdout() -> None:
     """One seam: no other engine module points ``sys.stdout`` elsewhere for a block of its own.
 
@@ -265,10 +292,46 @@ def test_only_the_seam_redirects_stdout() -> None:
     for path in sorted(package.rglob("*.py")):
         source = path.read_text(encoding="utf-8")
         # The substring screen only skips the parse; the code read below decides.
-        if "redirect_stdout" in source and source_uses(source, "redirect_stdout"):
+        if "stdout" in source and _rebinds_stdout(source):
             hits.append(path.relative_to(package).as_posix())
-    # Control: the scan reaches the seam's own use, so an empty list elsewhere is not vacuous.
-    assert hits == ["author_output.py"], hits
+    # Control: the scan reaches the seam's own rebind, so an empty list elsewhere is not vacuous.
+    assert hits == _STDOUT_REBINDERS, hits
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import contextlib, sys\nwith contextlib.redirect_stdout(sys.stderr):\n    pass\n", True),
+        ("from contextlib import redirect_stdout\nredirect_stdout(x)\n", True),
+        ("import sys\nsys.stdout = sys.stderr\n", True),
+        ("import sys\nsys.stdout, old = sys.stderr, sys.stdout\n", True),
+        (
+            '"""sys.stdout = sys.stderr, redirect_stdout"""\nimport sys\nsys.stdout.write("x")\n',
+            False,
+        ),
+    ],
+)
+def test_the_stdout_rebind_scan_fires(source: str, expected: bool) -> None:
+    assert _rebinds_stdout(source) is expected
+
+
+def test_overlapping_redirects_restore_stdout_once_the_last_one_exits(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two redirects that overlap, as two threads' may, leave the real stdout behind them."""
+    import sys
+
+    real = sys.stdout
+    with author_output.stdout_carries_a_result():
+        outer = author_output.author_code_stdout()
+        inner = author_output.author_code_stdout()
+        outer.__enter__()
+        inner.__enter__()
+        assert sys.stdout is sys.stderr
+        outer.__exit__(None, None, None)  # the first one out is not the last
+        assert sys.stdout is sys.stderr
+        inner.__exit__(None, None, None)
+    assert sys.stdout is real
 
 
 def test_the_loader_and_the_preview_redirect_only_under_the_mark(
