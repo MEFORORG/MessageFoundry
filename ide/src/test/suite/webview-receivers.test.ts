@@ -75,7 +75,7 @@ interface Page {
   readonly window: JsdomWindow;
   /** Every exception the page raised, loading or handling a message. */
   readonly errors: unknown[];
-  /** Every console.warn the page wrote. A discard names itself there. */
+  /** Every console.warn the page wrote. A discard reports itself there, in one fixed phrase. */
   readonly warnings: string[];
   /** Every message the page posted to the host. */
   readonly posted: Payload[];

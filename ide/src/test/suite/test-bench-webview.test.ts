@@ -68,7 +68,7 @@ interface Bench {
   readonly errors: unknown[];
   /** Every message the page posted to the host, JSON-copied out of the page's realm. */
   readonly posted: Payload[];
-  /** Every console.warn the page wrote. A shape discard names itself there. */
+  /** Every console.warn the page wrote. A shape discard reports itself there, in one fixed phrase. */
   readonly warnings: string[];
   /** Deliver a stamped, same-origin message exactly as the host path would. */
   deliver(data: Record<string, unknown>): void;
@@ -374,6 +374,7 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
       b.deliver(p);
       assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw instead of discarding`);
       assert.strictEqual(b.detail.innerHTML, SENTINEL, `${why}: detail was re-rendered`);
+      assert.deepStrictEqual(b.warnings, [DISCARD_WARNING], `${why}: not the one fixed warning`);
     }
   });
 
@@ -550,8 +551,9 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
   });
   for (const type of declaredTypes) {
     test(`a known type with malformed fields is discarded, and its warning does not name the type: ${type}`, () => {
-      const b = assertDiscarded({ type }, type);
-      assert.ok(!b.warnings.some((w) => w.includes(type)), `${type}: the type was named in the warning`);
+      // assertDiscarded matches the warning exactly against the fixed phrase, which is what proves the
+      // type is not named. A substring check would add nothing, and would misfire on a type such as "Test".
+      assertDiscarded({ type }, type);
     });
   }
 });
@@ -696,6 +698,8 @@ suite("Test Bench webview — a collection run reveals values one case at a time
     b.deliver({ ...caseDetail(0), index: 7 });
     assert.strictEqual(b.detail.innerHTML, before, "an unasked or stale reply rendered");
     assertShows(b, null, "unasked or stale replies");
+    // No warning: the stale-reply check dropped them, not the shape check.
+    assert.deepStrictEqual(b.warnings, [], "a stale reply was refused by the shape check");
     // Well-formed, so the shape check passes it and the stale-reply check behind it drops it silently.
     assertDiscarded(caseDetail(0), "no run on screen", []);
   });
