@@ -18,6 +18,7 @@ re-proof a directory account makes at the directory. All directory data is synth
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -102,13 +103,14 @@ def _spy_ceremony_budget(service: AuthService, monkeypatch: pytest.MonkeyPatch) 
 
 
 async def test_the_route_refuses_a_finish_after_the_account_gained_a_factor(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """RED when: the route stops reaching the service's factor refusal, answers it as anything but
     a 400 the page's fetch can read, stores a passkey, stamps the session, charges the per-actor
-    ceremony budget for a request the factor rule refuses (BACKLOG #3690 items 4, 6), or leaves such
-    a request unaudited.
+    ceremony budget for a request the factor rule refuses (BACKLOG #3690 items 4, 6), or logs no
+    WARNING for such a request.
     """
+    caplog.set_level(logging.WARNING, logger="messagefoundry_webconsole.routes.account")
     service = await _service(engine)
     identity, token = await _sign_in(service)
     body = await _staged_body(service, identity, token)
@@ -131,14 +133,15 @@ async def test_the_route_refuses_a_finish_after_the_account_gained_a_factor(
     assert calls == [], f"a session the finish refuses was charged: {calls}"
     assert await service.store.list_webauthn_credentials(identity.user_id) == []
     assert await service.mfa_satisfied(token) is False
-    # Each uncharged request leaves a row, as #1973's refusals do, since none reaches the 429's
-    # WARNING line; the service adds one when it ends the ceremony.
+    # Each uncharged request logs its own WARNING, since none reaches the 429's; the audit log gets
+    # only the service's row for the refusal that ended the ceremony, so a flood cannot grow it.
+    warned = [r for r in caplog.records if "factor-refused passkey-enroll" in r.getMessage()]
+    assert [r.levelname for r in warned] == ["WARNING"] * 3
     paths = [
         json.loads(r["detail"])["path"]
         for r in await service.store.list_audit(action="auth.mfa_denied")
     ]
-    assert paths.count(_VERIFY) == 3
-    assert paths.count("finish_webauthn_registration") == 1
+    assert paths == ["finish_webauthn_registration"]
 
 
 async def test_the_route_still_charges_a_finish_it_lets_through(
@@ -163,7 +166,7 @@ async def test_the_routes_429_sends_the_ceremony_retry_after(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED when: the passkey finish's 429 sends no ``Retry-After``, or one other than the constant
-    the other console ceremony 429s on the same budget send (BACKLOG #3690 item 5), or the 429
+    ``POST /ui/mfa``, ``/ui/reauth`` and ``/ui/reauth/webauthn`` send (BACKLOG #3690 item 5), or the 429
     ends the ceremony: the same response must still finish once the budget allows it."""
     service = await _service(engine)
     identity, token = await _sign_in(service)

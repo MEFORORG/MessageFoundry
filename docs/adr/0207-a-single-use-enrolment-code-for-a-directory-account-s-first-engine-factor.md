@@ -763,9 +763,10 @@ secret, before the floor and the directory lookup, and on an enable that
   **Section 7's "The build adds the ceremony-budget draw to `ui_webauthn_verify`" is shipped**, and
   the Consequences line "the ceremony budget on the passkey finish route" is dropped.
   *Note (2026-10-29, BACKLOG #3690 items 5 and 6).* The route now asks the factor-binding rule
-  first and skips the draw for a session it refuses, auditing each such request instead, so a
+  first and skips the draw for a session it refuses, logging each such request instead, so a
   password holder refused there in a loop spends none of the real holder's budget on this route.
-  `POST /ui/mfa` and `POST /ui/reauth` still draw it for that session. A refused code is not that
+  At least `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn` still draw it for that
+  session. A refused code is not that
   case: it comes from a session on an account with no factor, which is still charged, so section
   7's bound on code tries holds. The route's 429 sends the console ceremony routes' constant
   `Retry-After: 30`.
@@ -804,6 +805,9 @@ bullet says.
   `allow_reauth_attempt` refuses and the write floor is not exhausted. Pinned today by
   `test_webauthn_verify_draws_on_the_ceremony_budget` in
   `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py`, not the file AC-14 names.
+  *Note (2026-10-29, BACKLOG #3690 item 6).* Except for a session the factor-binding rule refuses:
+  the route does not draw the budget for it, and the service answers it. A refused code comes from
+  a session that rule does not refuse, so AC-14 still holds for every code try.
 
 ### A3. The order of the checks in the binding steps
 

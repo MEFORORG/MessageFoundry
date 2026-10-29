@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import time
 from collections import OrderedDict
 
@@ -57,6 +58,8 @@ from .._auth import (
 from .._service import _service
 from ._common import _form_pairs, _rate_limited
 from .core import _CEREMONY_RETRY_AFTER, _refusal_error
+
+_log = logging.getLogger(__name__)
 
 # --- L4b: self-service account (change password + TOTP MFA lifecycle) -------
 # Self-scoped actions: any authenticated session acts on ITS OWN credential, so the registry
@@ -769,11 +772,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # service then answers without verifying anything. The rule fails closed on a dead session,
         # so that is skipped too, and a state change between this read and the service's own (a
         # factor proven in another tab) can let one uncharged request finish. Skipping the draw
-        # skips _rate_limited's WARNING, so each such request is audited instead, as #1973's
-        # pending_refusal does; the service adds its own row when it ends a staged ceremony.
+        # skips _rate_limited's WARNING, so each such request writes one of its own: a log line,
+        # not an audit row, for _rate_limited's reason (a flood must not grow the audit log). The
+        # service still audits the refusal that ends a staged ceremony.
         client = client_ip(request)
         if await service.factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
-            await service.audit_mfa_denied(identity, request.url.path, client=client)
+            _log.warning("factor-refused passkey-enroll attempt from client=%s", client)
         elif not allow_reauth_attempt(service, identity):
             exc = _rate_limited(request, "passkey-enroll")
             return JSONResponse(
