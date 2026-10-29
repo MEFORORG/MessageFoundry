@@ -2414,6 +2414,10 @@ counts as credentials. The check reads the proxy variables in either case, `ALL_
 Windows system proxy. It refuses at the same two points and in the same form as the rule above.
 Its text names no part of the proxy URL, and `[security].enforcement` does not relax it. Use an
 `https://` proxy, or one that takes no credentials in its URL.
+**A proxy URL requests cannot read or send is refused too** (vault BACKLOG #3454), whatever its
+scheme. That includes, at least, a URL with a user name and a password where either one is not
+Latin-1 text, which is how requests sends them. requests' own error for such a URL can carry the URL or its credentials, so the
+refusal is fixed text instead, at the same two points and in the same form.
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
