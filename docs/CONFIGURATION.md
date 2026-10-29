@@ -1287,7 +1287,8 @@ It differs from `subprocess` in at least these ways:
 - **`wall_seconds` counts the lookups.** The cap bounds the whole call, including the time the engine
   spends serving its lookups, so raise it for a feed whose lookups are slow. When the cap runs out
   during a lookup, the call fails at once and its worker is recycled; the lookup itself runs on to
-  its own timeout in the engine, and its result is discarded.
+  its own timeout in the engine, and its result is discarded. Until it ends, every other lookup on
+  that inbound is refused at once, so a hung backend holds at most one lookup per inbound.
 - **It needs a config directory.** A graph built in code with none cannot start a worker. Under
   `subprocess` such a graph quietly runs in-process; under `isolated` the runner refuses to be built
   instead, because in-process its lookups would not go through the broker.

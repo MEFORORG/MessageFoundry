@@ -227,7 +227,9 @@ _ALLOWED: tuple[_Allowed, ...] = (
     _Allowed(
         "messagefoundry/pipeline/_sandbox_worker.py::_Broker._ask::SandboxError::error",
         _SAFE + "the lookup error quotes the codec refusal, which names a slot, a type or a size "
-        "and never a value; the cause is dropped so the Handler sees the mode=off error type alone",
+        "and never a value; the cause is dropped so the Handler sees the mode=off error type alone. "
+        "Two sites: describing the arguments, and framing them",
+        count=2,
     ),
     _Allowed(
         "messagefoundry/pipeline/_sandbox_worker.py::_Broker._ask::(OSError, SandboxError)::error",

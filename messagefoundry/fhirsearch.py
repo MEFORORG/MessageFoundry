@@ -88,6 +88,7 @@ __all__ = [
     "FhirSearchParams",
     "FhirSearchValue",
     "FhirToken",
+    "ForeignSearchValue",
     "resolve_search_pairs",
 ]
 
@@ -137,6 +138,19 @@ class FhirRaw:
     value: str
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class ForeignSearchValue:
+    """A search value of a kind :func:`fhir_lookup` does not take, carried by its type NAME only.
+
+    Not a kind an author writes. The ``mode=isolated`` sandbox (ADR 0147) sends a Handler's
+    ``params`` to the engine, and a value of any other type cannot cross the pipe, so it crosses as
+    this. :func:`resolve_search_pairs` refuses it with the words it gives the original value, in the
+    engine and after the engine's own checks, so the Handler sees what ``mode=off`` shows it."""
+
+    type_name: str
+
+
 #: One search value: data (``str``), a token whose halves are declared (``FhirToken``), or author
 #: syntax (``FhirRaw``).
 FhirSearchValue = str | FhirToken | FhirRaw
@@ -173,10 +187,11 @@ def _resolve_one(key: str, value: FhirSearchValue) -> str:
         return f"{value.system}|{_screen(key, value.code, half='code half of the FhirToken')}"
     if isinstance(value, FhirRaw):
         return value.value
+    got = value.type_name if isinstance(value, ForeignSearchValue) else type(value).__name__
     raise ValueError(
         f"FHIR search parameter {key!r}: a search value must be a str (data), a "
         f"FhirToken(system, code), or a FhirRaw(...) author-syntax value -- got "
-        f"{type(value).__name__}. A number is not a kind here: wrap it, str(value). "
+        f"{got}. A number is not a kind here: wrap it, str(value). "
         f"(The value is withheld: it may carry PHI.)"
     )
 

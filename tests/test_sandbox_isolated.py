@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -124,6 +125,17 @@ class _LazyParams(Mapping):
 def h_db_nested(msg):
     rows = db_lookup("LK", "SELECT outer", _LazyParams())
     return Send("OB_I", rows[0]["v"])
+
+
+@handler("h_fhir_badkind")
+def h_fhir_badkind(msg):
+    from messagefoundry.config.fhir_lookup import FhirLookupError
+
+    try:
+        fhir_lookup("FH", "Patient", {"_count": 10, "x": ["ok", 2.5]})
+    except FhirLookupError as exc:
+        return Send("OB_I", str(exc))
+    return Send("OB_I", "not refused")
 
 
 @handler("h_fhir")
@@ -817,3 +829,138 @@ def test_a_short_write_is_completed() -> None:
     out = Trickle()
     _write_frame(out, b"0123456789")
     assert bytes(out.data) == (10).to_bytes(4, "big") + b"0123456789"
+
+
+# --- 7. the Lander's covering review of 415353d7 (round-472dd562) ----------------------------------
+
+
+def test_a_lookup_the_cap_cut_off_is_the_only_one_outstanding(graph: tuple[Registry, str]) -> None:
+    # A hung backend: every lookup blocks until the test releases it. Each dispatch hits the cap.
+    # Unbounded, each later dispatch starts another lookup beside the abandoned ones.
+    release = threading.Event()
+    lock = threading.Lock()
+    state = {"calls": 0, "in_flight": 0, "peak": 0}
+
+    def hung(connection: str, statement: str, params: Any) -> list[dict[str, Any]]:
+        with lock:
+            state["calls"] += 1
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+        try:
+            release.wait(60)
+            return [{"v": "late", "d": Decimal(0)}]
+        finally:
+            with lock:
+                state["in_flight"] -= 1
+
+    registry, config_dir = graph
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.ISOLATED, wall_seconds=2.0, lookup_allowed_db=("db",)),
+        inbound="IB_I",
+        config_dir=config_dir,
+        env=None,
+        graph=None,
+    )
+    try:
+        with db_lookup_mod.activated(hung):
+            with pytest.raises(SandboxError, match="wall cap"):
+                _bodies(registry, "h_db", session)
+            # The next dispatch is refused its lookup at once rather than start a second one.
+            started = time.monotonic()
+            with pytest.raises(SandboxError, match="still running"):
+                _bodies(registry, "h_db", session)
+            assert time.monotonic() - started < 15
+        assert (state["calls"], state["peak"]) == (1, 1)
+        # Once the abandoned lookup ends, the session serves lookups again.
+        release.set()
+        deadline = time.monotonic() + 10
+        while state["in_flight"] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        with db_lookup_mod.activated(hung):
+            assert _bodies(registry, "h_db", session)[0].startswith("late|")
+    finally:
+        release.set()
+        session.close()
+
+
+def test_a_codec_refusal_while_framing_is_the_lookups_own_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    from types import SimpleNamespace
+
+    from messagefoundry.config.db_lookup import DbLookupError
+
+    # Framing refuses here: one long param is one segment, over a cap of none.
+    monkeypatch.setattr(codec, "_MAX_BLOBS", 0)
+    broker = _worker_broker()(io.BytesIO(), io.BytesIO())
+    req = SimpleNamespace(request_id="a", phase="transform", name="h")
+    broker.begin(req)
+    db, _ = broker.runners(req)
+    with pytest.raises(DbLookupError, match="cannot cross the sandbox"):
+        db("LK", "SELECT 1", {"k": "x" * 5000})
+    assert not broker.broken
+
+
+def _executor_like(connection: str, query: str, params: Any) -> dict[str, Any]:
+    """The FHIR executor's screening, as mode=off meets it (transports/fhir.py ``read``)."""
+    from messagefoundry.config.fhir_lookup import FhirLookupError
+    from messagefoundry.fhirsearch import resolve_search_pairs
+
+    try:
+        resolve_search_pairs(params or {})
+    except ValueError as exc:
+        raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from exc
+    return {"resourceType": "Bundle", "id": "B"}
+
+
+def test_a_wrong_kind_search_value_fails_as_at_mode_off(graph: tuple[Registry, str]) -> None:
+    registry, config_dir = graph
+    session = _session(config_dir, SandboxMode.ISOLATED)
+    try:
+        with fhir_lookup_mod.activated(_executor_like):
+            off = _bodies(registry, "h_fhir_badkind", None)
+            isolated = _bodies(registry, "h_fhir_badkind", session)
+        # No runner: the "unavailable here" error, in both modes, before any value is judged.
+        off_bare = _bodies(registry, "h_fhir_badkind", None)
+        isolated_bare = _bodies(registry, "h_fhir_badkind", session)
+    finally:
+        session.close()
+    assert "got int" in off[0]
+    assert isolated == off
+    assert "unavailable here" in off_bare[0]
+    assert isolated_bare == off_bare
+
+
+def test_an_unexpected_engine_fault_fails_the_dispatch_promptly(
+    graph: tuple[Registry, str],
+    runners: _Runners,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def explode(self: Any, *args: Any) -> bytes:
+        raise RuntimeError("PID|1||900001||DOE^JANE")
+
+    monkeypatch.setattr(SandboxSession, "_lookup_reply", explode)
+    registry, config_dir = graph
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.ISOLATED, wall_seconds=20.0, lookup_allowed_db=("db",)),
+        inbound="IB_I",
+        config_dir=config_dir,
+        env=None,
+        graph=None,
+    )
+    try:
+        _bodies(registry, "h_parent", session)  # warm the worker
+        started = time.monotonic()
+        with (
+            caplog.at_level("DEBUG"),
+            pytest.raises(SandboxError, match="failed while serving") as raised,
+        ):
+            _bodies(registry, "h_db", session)
+        assert time.monotonic() - started < 10
+    finally:
+        session.close()
+    assert "DOE^JANE" not in str(raised.value)
+    assert not [r for r in caplog.records if "DOE^JANE" in r.getMessage()]
+    assert any("RuntimeError" in r.getMessage() for r in caplog.records)

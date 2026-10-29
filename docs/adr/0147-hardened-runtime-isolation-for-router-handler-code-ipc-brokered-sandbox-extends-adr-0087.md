@@ -195,7 +195,8 @@ same accessor and runner the in-process path uses (AC-1, AC-2), refuses one boun
 A refused or failed lookup is the Handler's error, routed to `ERROR`/dead-letter post-ACK (AC-5, for
 the broker). `wall_seconds` bounds the whole dispatch, the brokered lookups and the writes of their
 replies included; a lookup the cap cuts off runs on to its own timeout in the parent, and its result
-is discarded.
+is discarded. While it runs, the session refuses every other lookup, so at most one is outstanding
+per inbound.
 
 **Not built:** decision (2), the OS confinement: AC-3 (Landlock and seccomp), AC-4 (the AppContainer
 token), and AC-7 (no opening or signalling the parent or a sibling). The first two open boxes above,

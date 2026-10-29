@@ -72,7 +72,7 @@ from messagefoundry.config.wiring import (
     handler_item_fault,
     handler_result_items,
 )
-from messagefoundry.fhirsearch import FhirRaw, FhirToken
+from messagefoundry.fhirsearch import FhirRaw, FhirToken, ForeignSearchValue
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.redaction import safe_exc
 
@@ -1362,9 +1362,10 @@ class LookupRequest:
 
 def _enc_fhir_params(params: object, blobs: _Blobs) -> Any:
     """A ``fhir_lookup`` ``params`` mapping in its own small grammar: ``[key, is_list, items]`` per
-    key, each item ``{"s": str}``, ``{"k": [system, code]}`` or ``{"r": raw}``. Only the three kinds
-    :mod:`messagefoundry.fhirsearch` takes cross. The worker runs fhirsearch's own check before it
-    gets here, so a refusal below is a backstop; the parent's executor screens the content."""
+    key, each item ``{"s": str}``, ``{"k": [system, code]}``, ``{"r": raw}``, or ``{"x": type name}``
+    for a value of any other kind, which arrives as a
+    :class:`~messagefoundry.fhirsearch.ForeignSearchValue`. Nothing is screened here: the parent's
+    executor judges every value, after its own "unavailable here" and connection checks."""
     if params is None:
         return None
     if not isinstance(params, Mapping):
@@ -1385,9 +1386,9 @@ def _enc_fhir_params(params: object, blobs: _Blobs) -> Any:
             elif isinstance(one, FhirRaw):
                 items.append({"r": blobs.ref(one.value)})
             else:
-                raise SandboxCodecError(
-                    f"FHIR search parameter {key!r}: a {type(one).__name__} is not a search value"
-                )
+                # Any other kind crosses by its type name alone, never its value, so the engine's
+                # executor refuses it with the words it uses at mode=off, after its own checks.
+                items.append({"x": blobs.ref(type(one).__name__)})
         out.append([key, is_list, items])
     return out
 
@@ -1418,6 +1419,8 @@ def _dec_fhir_params(node: Any, reader: _Reader) -> dict[str, Any] | None:
                 items.append(FhirToken(reader.text(pair[0]), reader.text(pair[1])))
             elif tag == "r":
                 items.append(FhirRaw(reader.text(arg)))
+            elif tag == "x":
+                items.append(ForeignSearchValue(reader.text(arg)))
             else:
                 raise SandboxCodecError(f"unknown fhir_lookup param tag {tag!r}")
         if not is_list and len(items) != 1:

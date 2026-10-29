@@ -292,13 +292,19 @@ class _Broker:
                 raise error(f"{fn}: an earlier lookup in this dispatch broke the sandbox pipe")
             if self._req is not req:
                 raise error(f"{fn}: called outside the Handler dispatch it was published for")
-            frame = codec.encode_prepared_lookup(
-                prepared,
-                request_id=req.request_id,
-                phase=req.phase,
-                name=req.name,
-                seq=self._seq + 1,
-            )
+            try:
+                frame = codec.encode_prepared_lookup(
+                    prepared,
+                    request_id=req.request_id,
+                    phase=req.phase,
+                    name=req.name,
+                    seq=self._seq + 1,
+                )
+            except SandboxError as exc:
+                # A frame the codec refuses (over a header or segment cap) fails as a bad argument
+                # does, as the lookup's own error, as at mode=off: the Handler can catch it, and
+                # nothing was written, so the pipe stays in step.
+                raise error(f"{fn}: its arguments cannot cross the sandbox: {exc}") from None
             if len(frame) > MAX_FRAME:
                 raise error(
                     f"{fn}: its arguments are too large for the sandbox ({len(frame)} bytes)"
