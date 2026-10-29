@@ -642,7 +642,7 @@ class UploadQuotaLedger(Protocol):
         max_total_bytes: int,
     ) -> bool: ...
 
-    async def release_upload_quota(self, reservation_id: str) -> None: ...
+    async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None: ...
 
     async def touch_upload_quota(self, reservation_id: str) -> None: ...
 
@@ -2657,7 +2657,7 @@ async def _release_reservation(
     in this module's words whether or not anyone still waits, and the task never ends in an error
     of its own; a release failure must not fail an upload that landed."""
     try:
-        await ledger.release_upload_quota(reservation)
+        await ledger.release_upload_quota(uploader_id, reservation)
     except Exception:  # noqa: BLE001 — logged; the slot is reclaimed once it goes stale
         _log.warning(
             "could not release the engine-shard upload reservation for %s; it will be "

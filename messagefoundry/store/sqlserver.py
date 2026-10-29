@@ -12484,15 +12484,7 @@ class SqlServerStore:
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
-                    # This read OPENS the transaction the applock attaches to, as in record_audit:
-                    # the autocommit=False pool begins one only on a statement that touches a
-                    # table, and `@LockOwner='Transaction'` needs one open. Value discarded.
-                    await cur.execute(
-                        "SELECT TOP (1) reservation_id FROM upload_reservation WHERE uploader_id = ?",
-                        (uploader_id,),
-                    )
-                    await cur.fetchall()
-                    await self._applock(cur, _upload_quota_lock(uploader_id))
+                    await self._open_under_upload_quota_applock(cur, uploader_id)
                     await cur.execute(
                         "DELETE FROM upload_reservation WHERE uploader_id = ?"
                         f" AND since <= {_MSSQL_EPOCH_NOW} - ?",
@@ -12503,17 +12495,15 @@ class SqlServerStore:
                         " (reservation_id, uploader_id, size_bytes, since)"
                         " OUTPUT inserted.reservation_id"
                         f" SELECT ?, ?, ?, {_MSSQL_EPOCH_NOW}"
-                        " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = ?)"
-                        " + 1 <= ?"
-                        " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
-                        " WHERE uploader_id = ?) + ? <= ?",
+                        " FROM (SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+                        " FROM upload_reservation WHERE uploader_id = ?) AS held"
+                        " WHERE held.n + 1 <= ? AND held.b + ? <= ?",
                         (
                             reservation_id,
                             uploader_id,
                             int(size_bytes),
                             uploader_id,
                             int(max_files),
-                            uploader_id,
                             int(size_bytes),
                             int(max_total_bytes),
                         ),
@@ -12526,7 +12516,7 @@ class SqlServerStore:
                 raise
         return row is not None
 
-    async def release_upload_quota(self, reservation_id: str) -> None:
+    async def release_upload_quota(self, uploader_id: str, reservation_id: str) -> None:
         """See :meth:`messagefoundry.store.base.Store.release_upload_quota`.
 
         **It takes the uploader's applock before it deletes, as the reserve does (vault BACKLOG
@@ -12536,31 +12526,37 @@ class SqlServerStore:
         sweeps its own stale row could therefore deadlock it. Under the applock the two cannot
         hold row locks at once, because each holds no row lock when it asks for the applock.
 
-        For the release that rests on how the uploader is read. ``READCOMMITTEDLOCK`` waits out a
-        reserve still committing this row rather than reading past it under RCSI, and its shared
-        lock is released when the read ends, before the applock is requested. A hint that holds
-        it longer, such as ``HOLDLOCK``, would break the argument. Nothing to release commits the
-        empty transaction and returns."""
+        The caller names the uploader, so the applock is taken with no read of the row, whether or
+        not the row exists (vault BACKLOG #3740 item 10). A reserve of this uploader that holds
+        the applock is waited out through the applock itself. The delete matches the uploader too,
+        so a row of another uploader, whose lock this release does not hold, is left alone."""
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
+                    await self._open_under_upload_quota_applock(cur, uploader_id)
                     await cur.execute(
-                        "SELECT uploader_id FROM upload_reservation WITH (READCOMMITTEDLOCK)"
-                        " WHERE reservation_id = ?",
-                        (reservation_id,),
+                        "DELETE FROM upload_reservation WHERE reservation_id = ? AND uploader_id = ?",
+                        (reservation_id, uploader_id),
                     )
-                    row = await cur.fetchone()
-                    if row is not None:
-                        await self._applock(cur, _upload_quota_lock(str(row[0])))
-                        await cur.execute(
-                            "DELETE FROM upload_reservation WHERE reservation_id = ?",
-                            (reservation_id,),
-                        )
                     await self._commit(conn)
             except Exception:
                 # The transaction may hold the applock; after the cursor closes, as the reserve.
                 await self._rollback_or_discard(conn)
                 raise
+
+    async def _open_under_upload_quota_applock(self, cur: Any, uploader_id: str) -> None:
+        """Open a transaction on ``cur`` and take ``uploader_id``'s upload-quota applock in it, for
+        the reserve and the release alike. The opener reads the uploader's index, as
+        :meth:`_open_under_audit_applock` reads ``audit_log``, because the applock needs a
+        transaction and a SELECT with no FROM begins none. Its value is discarded. Under RCSI it
+        takes no row lock, so the caller holds none when it asks for the applock, which is the
+        release's lock-order argument."""
+        await cur.execute(
+            "SELECT TOP (1) reservation_id FROM upload_reservation WHERE uploader_id = ?",
+            (uploader_id,),
+        )
+        await cur.fetchall()
+        await self._applock(cur, _upload_quota_lock(uploader_id))
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
         """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`. "Now" is the database
