@@ -2423,8 +2423,9 @@ What the `date` kind does to a value:
   `-`, a value such as `000-12-3456` is split by the message itself across `OBX-5`, `OBX-6` and
   `OBX-7`. The first part is a valid number, so the guard keeps it, and the leak-check refuses the
   cut shape, as *What the leak-check refuses, and what it lets through* says. Under the coded types
-  `ID`, `IS`, `CE` and `CWE`, at least a bare token, such as a surname or `000-12-3456`, and a name
-  split across components, such as `DOE^JOHN`, would still leave whole.
+  `ID`, `IS`, `CE` and `CWE`, at least a bare token, such as a surname, and a name split across
+  components, such as `DOE^JOHN`, would still leave whole, and so would `000-12-3456` under any
+  field separator but `-`.
 - When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
   site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
   kind filled, so the filled date stays a date. Two things follow. A site code that reads as a

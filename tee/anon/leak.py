@@ -18,8 +18,10 @@ Returns **reasons only** (never the matched text), and the token denylist is the
 *backstop*, not the primary control: it catches known *tokens*, not structural PHI (ADR 0030 §5). The
 structural PHI-shape detectors + unmapped-field coverage report below (BACKLOG #331) close that gap —
 they are held byte-for-byte identical with the engine copy so the two agree on every input. The
-dashed SSN and punctuated phone detectors also scan what a retarget of a default field left past
-its first component (:func:`retarget_residue_hits`, BACKLOG #3493).
+dashed SSN and punctuated phone detectors also refuse such a shape that the message's own field
+separator cut across fields, when at least one of them is unmapped (BACKLOG #3465), and scan what
+a retarget of a default field left past its first component (:func:`retarget_residue_hits`,
+BACKLOG #3493).
 """
 
 from __future__ import annotations
