@@ -4257,7 +4257,10 @@ ledger, so it has no public page.
   shutdown drain can still cancel a delete between its unlink and its row. (vault `BACKLOG #3178`)
 - **Each upload-quota reservation now has its own identity.** The engine-shard ledger holds one row
   per upload in flight, named by the upload's `file_id`, in a new `upload_reservation` table that
-  replaces `upload_quota` on all three store backends, and the old table is dropped at open. A
+  replaces `upload_quota` on all three store backends. The schema DDL drops the old table: at
+  open on SQLite and under `[store].schema_management = "auto"`, and when a DBA runs
+  `messagefoundry store provision-schema` under the `external` default on SQL Server and
+  PostgreSQL. A
   leaked slot is reclaimed once its own window passes, however active the uploader stays; a
   release pays back only its own slot; and a reserve whose outcome is unknown is released by its
   id before the upload fails, so a retry in the same process is not refused for its own orphan

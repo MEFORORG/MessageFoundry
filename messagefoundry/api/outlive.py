@@ -22,9 +22,13 @@ than an exemption from the deadline: an exempt route would hold its worker for a
 which is the thing the deadline exists to stop. The web console's ``/ui`` routes call the same
 handlers in process, so they get the same protection.
 
-The managed lifespan calls :meth:`OutlivingOperations.drain` before ``engine.stop()``. What is still
-running then is cancelled, and each operation's own cancellation arm restores its state and records
-an ``interrupted`` outcome while the store is still open.
+Both API lifespans call :meth:`OutlivingOperations.drain` while the store is still open: the
+managed one before ``engine.stop()``, and the one ``create_app`` gives an app built around a
+caller's engine, before the caller stops it (``_app_drain_steps`` in ``api/app.py``). What is still
+running then is cancelled, and each operation's own cancellation arm runs. A DR operation's or a
+reload's restores its state and records an ``interrupted`` outcome. An ``upload.create`` row's
+removes the stored file instead, since no row says who created it (``_record_upload_create`` in
+``api/app.py``).
 """
 
 from __future__ import annotations
@@ -50,8 +54,9 @@ log = logging.getLogger(__name__)
 
 #: How long :meth:`OutlivingOperations.drain` lets a running operation finish at shutdown before it
 #: cancels it. It shares NSSM's 15 s graceful-stop window with the other shutdown steps, so it is
-#: short; an operation it cancels records ``interrupted``. The API lifespans pass at most this, and
-#: less when their shutdown budget is short (``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py``).
+#: short; a DR operation or a reload it cancels records ``interrupted``. The API lifespans pass at
+#: most this, and less when their shutdown budget is short (``_SHUTDOWN_BUDGET_SECONDS`` in
+#: ``api/app.py``).
 DRAIN_TIMEOUT_SECONDS = 0.5
 
 #: How long the drain then waits for the cancelled operations' rollback arms to finish, so their
@@ -130,7 +135,7 @@ class OutlivingOperations:
             return await _outlive_caller(task)
         except asyncio.CancelledError:
             # A task that was itself cancelled raised this through task.result(); its own
-            # cancellation arm already recorded the outcome, and there is nothing left to read.
+            # cancellation arm has already run, and there is nothing left to read.
             if not task.cancelled():
                 if not task.done():
                     log.warning(
@@ -154,7 +159,8 @@ class OutlivingOperations:
         """Wait up to ``timeout`` for running operations, then cancel what is left.
 
         Returns the labels of the operations it had to cancel. It waits up to ``grace`` more for
-        their cancellation arms, which restore state and record ``interrupted``. An operation still
+        their cancellation arms, which for a DR operation or a reload restore state and record
+        ``interrupted``, and for an ``upload.create`` row remove the stored file. An operation still
         running after that is logged and left: it is not awaited past the bound, so a stuck one
         cannot hold the shutdown."""
         pending = set(self._inflight)

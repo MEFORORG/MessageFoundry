@@ -1518,7 +1518,7 @@ class QueueStore(StoreLifecycle, Protocol):
         scaling axis and nothing partitions ``uploads_dir`` per shard, so N shards over one directory
         hold N independent locks and each can overshoot the budget by one file. Every shard sits on
         the ONE unified store (ADR 0063 — and ``require_unified_store`` makes a server DB mandatory
-        past one shard), so these rows are authoritative for all of them.
+        past one engine shard), so these rows are authoritative for all of them.
 
         **What is counted here, and what is not.** The files already ON DISK are counted by the
         caller's sidecar scan, which is uncached and therefore already fleet-visible. The gap this

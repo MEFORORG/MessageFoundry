@@ -3866,10 +3866,12 @@ def create_app(
     # says what it does not cover; a route reached through ``include_router`` is one. The engine
     # includes no router; refuse_undeclared_route refuses a route whose gate only an include adds.
     app.router.route_class = AuthenticatedBeforeBodyRoute
-    # DR activate, DR release and config reload outlive a caller the request deadline cancels, and
-    # the managed lifespan drains what is still running before engine.stop() (vault BACKLOG #2751,
-    # #2752, #2753). One per app; the handlers below close over it, so /ui gets it too, and so does
-    # the approval gate's released reload.
+    # DR activate, DR release, config reload, an upload's upload.create row and an upload delete
+    # outlive a caller the request deadline cancels (vault BACKLOG #2751, #2752, #2753, #3178). Both
+    # lifespans drain what is still running while the store is open: the managed one before
+    # engine.stop(), and the one this function gives an app built around a caller's engine, before
+    # the caller stops it (_app_drain_steps). One per app; the handlers below close over it, so /ui
+    # gets it too, and so does the approval gate's released reload.
     outliving = OutlivingOperations()
     app.state.outliving_operations = outliving
     if engine is not None:
@@ -8135,6 +8137,14 @@ def create_app(
             raise HTTPException(409, str(exc)) from None
         # Vault BACKLOG #3178: the creation row outlives the request, so a deadline that fires now
         # still leaves the stored file with its row. A row that cannot be written removes the file.
+        #
+        # Kept by design (vault BACKLOG #3740 item 3, the owner's delegated ruling of 2026-10-29):
+        # a deadline here answers 503 for an upload that was stored, so a client that retries
+        # stores the same content a second time. Each copy keeps its own upload.create row, is
+        # owned by its uploader and counts against that uploader's quota, so a duplicate is
+        # attributed and bounded. Discarding the file on a deadline instead would cancel its row
+        # partway, and a removal that is refused or cut short would then leave a stored file with
+        # no row, which is the gap #3178 closed.
         await outliving.run(
             _record_upload_create(
                 engine.store, us, meta, actor=identity.username, client=client_ip(request)

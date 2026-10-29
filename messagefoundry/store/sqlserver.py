@@ -2226,9 +2226,9 @@ _SCHEMA: list[str] = [
         audit_hash NVARCHAR(64) NOT NULL)""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
     # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. One of the two
-    # backends a real sharded deployment runs (`require_unified_store` makes a server DB mandatory
-    # past one shard). No PHI (two ids, a size and a timestamp). BIN2 collation matches the other
-    # id-keyed tables.
+    # backends a real engine-sharded deployment runs (`require_unified_store` makes a server DB
+    # mandatory past one engine shard). No PHI (two ids, a size and a timestamp). BIN2 collation
+    # matches the other id-keyed tables.
     # The table this one replaced held one row per uploader (vault BACKLOG #3180). Nothing reads
     # it. In _SCHEMA, so the drop moves _schema_hash() and a provisioning run carries it too.
     """IF OBJECT_ID('upload_quota','U') IS NOT NULL DROP TABLE upload_quota""",
