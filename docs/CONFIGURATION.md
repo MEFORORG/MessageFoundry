@@ -2433,8 +2433,8 @@ secret. Each file in that directory holds one setting and is named exactly as it
   engine reads no `VAULT_TOKEN` at all (BACKLOG #2851).
 
 On Windows, create the directory with inheritance off, granting SYSTEM and Administrators full
-control and the service account read, and nothing else; a Vault Agent site also gives that account
-write, as below. On POSIX, make it mode `0700` and each file
+control and the service account read, and nothing else, except as the Vault Agent route below
+says. On POSIX, make it mode `0700` and each file
 `0600`, owned by the engine's account.
 
 **A Vault Agent token comes through this directory** (BACKLOG #2851). The Vault clients never read
@@ -2444,17 +2444,18 @@ this directory, and leaves the sink unwrapped and unencrypted, so the file holds
 The file is held to the rules above. On POSIX that is mode `0600` owned by the engine's account,
 so the agent writes it as that account, with the sink's `mode` set to `0600`: a group bit, as in
 the agent's default sink mode, is refused. On Windows too, the agent runs as the engine's own
-service account, so the access list stays SYSTEM, Administrators and that account. That account
-then needs the right to create and delete files in the directory, since the agent may write a
-temporary file and rename it over the sink. That right reaches every file in the
-directory, as the POSIX owner's does: code running as the engine can then replace any setting
-the directory supplies, and can read the agent's own auto-auth material. The agent can run as
-the engine's account only where that account is a gMSA, a local user or LocalSystem
-(`-ServiceAccount` or `-AllowLocalSystem`, each of which sets the service's SID type to `none`;
-see [SERVICE.md](SERVICE.md#restrict-the-service-token)). The default install's virtual
-account, `NT SERVICE\<ServiceName>`, belongs to the engine's service alone, so no agent can run
-as it, and this route is not available on that install. Grant no account outside that list,
-and no broad group, anything.
+service account, which then needs the right to create and delete files in the directory, since
+the agent may write a temporary file and rename it over the sink. That works only when a second
+service can log on as the engine's account, and the default install's cannot: its virtual
+account, `NT SERVICE\<ServiceName>`, belongs to the engine's service alone, so this route is not
+available on a default install, and granting that account the right there gains nothing.
+Moving the engine off that account, with `-ServiceAccount` naming another account or with
+`-AllowLocalSystem`, drops its restricted service token
+([SERVICE.md](SERVICE.md#restrict-the-service-token)). Never use a built-in account other
+services share, such as NetworkService: the right would reach every service that runs as it.
+On either system the agent and the engine share an account, so code running as the engine can
+replace any setting the directory supplies and can read the agent's own auto-auth material.
+Keep that material outside this directory, where a file named for no setting is refused.
 
 - **When a replaced token is used.** The engine reads the file each time it builds a Vault client.
   For the `vault` key provider that is at least every store open and every DR backup pass, and for
