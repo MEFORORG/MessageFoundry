@@ -5298,8 +5298,8 @@ async def _two_renamed_accounts(
     "refusal",
     [
         sqlite3.OperationalError("synthetic: disk I/O error"),
-        # The integrity class too: the append can raise it, and the write-race arm would read it as
-        # a lost race for the name, auditing a false write_race conflict (BACKLOG #3018 step 7).
+        # The integrity class too: the append can raise it, and the store's wrapping is what keeps
+        # it from the write-race arm (UsernameAuditAppendError, BACKLOG #3018 step 7).
         sqlite3.IntegrityError("synthetic: UNIQUE constraint failed: audit_log.seq"),
         CipherError("synthetic: Transit down"),
     ],

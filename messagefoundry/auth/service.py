@@ -8944,10 +8944,10 @@ class AuthService:
             )
         except UsernameAuditAppendError as exc:
             # The rename wrote, then its row failed to append, so the store rolled both back: the
-            # row keeps its old name and nobody is told. CAUGHT BEFORE THE ARM BELOW, which would
-            # misread the append's error; ``UsernameAuditAppendError`` says how. Handled after
-            # this block, so the append's own error is raised or logged with its own chain, not
-            # this wrapper's.
+            # row keeps its old name and nobody is told. Caught here, so the reconciler can log a
+            # refused row and go on; the store's wrapping is what keeps the append's error from the
+            # integrity arm below (``UsernameAuditAppendError``). Handled after this block, so the
+            # append's own error is raised or logged with its own chain, not this wrapper's.
             refused = exc.cause
             written = False
         except Exception as exc:
