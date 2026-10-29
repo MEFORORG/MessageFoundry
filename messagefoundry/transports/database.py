@@ -254,9 +254,8 @@ def _build_dsn(
     else:  # entra
         parts.append("Authentication=ActiveDirectoryDefault")
     if read_only:
-        # Advertise read-only intent for the db_lookup pool (ADR 0010) and the DatabaseRef sync
-        # (BACKLOG #2617). Not a TLS keyword, so it goes
-        # in the head, before the TLS tail (messagefoundry.odbc_dsn).
+        # Advertise read-only intent; the docstring says who asks for it. Not a TLS keyword, so it
+        # goes in the head, before the TLS tail (messagefoundry.odbc_dsn).
         parts.append("ApplicationIntent=ReadOnly")
     return odbc_connection_string(parts, encrypt=encrypt, trust_server_certificate=trust)
 

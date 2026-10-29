@@ -265,8 +265,8 @@ def test_the_reference_dsn_advertises_read_only_intent() -> None:
     """Red before the fix: the sync's DSN carried no ApplicationIntent."""
     dsn = database_source_dsn(dict(_BASE))
     assert "ApplicationIntent=ReadOnly" in dsn
-    # In the head, before the TLS tail, as messagefoundry.odbc_dsn builds every string. The position
-    # is not the TLS guard; that module says what is.
+    # A head part, as odbc_connection_string requires of every keyword but the TLS ones. The
+    # position is not the TLS guard; messagefoundry.odbc_dsn says what is.
     assert dsn.index("ApplicationIntent") < dsn.index("Encrypt=")
 
 
