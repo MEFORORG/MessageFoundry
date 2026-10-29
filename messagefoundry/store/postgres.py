@@ -1967,7 +1967,13 @@ class PostgresStore:
                 # per-statement with timeout=inf on the long builds in _migrate_lease_columns. SET LOCAL
                 # scopes to this txn and auto-reverts at commit.
                 await conn.execute("SET LOCAL statement_timeout = 0")
-                await self._advisory_lock(conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK)
+                # The wait is unbounded too (BACKLOG #1726). A peer holding this lock is running the
+                # same batch with its builds exempt from command_timeout, so bounding the wait by
+                # command_timeout would fail this open at startup while the peer's upgrade is still
+                # healthy. The lock is transaction-scoped, so a peer that dies releases it.
+                await self._advisory_lock(
+                    conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK, timeout=float("inf")
+                )
                 # Double-check under the lock: the peer this open queued behind may have just applied
                 # this exact batch and committed its marker — then there is nothing to do.
                 if await self._schema_marker_current(conn, expected):
@@ -2545,12 +2551,18 @@ class PostgresStore:
         database-scoped, not schema-scoped)."""
         return f"{self._settings.db_schema or 'public'}:{key}"
 
-    async def _advisory_lock(self, conn: Any, classid: int, key: str) -> None:
+    async def _advisory_lock(
+        self, conn: Any, classid: int, key: str, *, timeout: float | None = None
+    ) -> None:
         """Take a transaction-scoped advisory lock in the ``classid`` family (auto-released at commit).
         Uses the two-key form so each family has its own 32-bit hashtext namespace (no cross-family
-        collisions)."""
+        collisions). ``timeout`` overrides asyncpg's client-side ``command_timeout`` for the wait;
+        ``None``, asyncpg's own default, keeps it."""
         await conn.execute(
-            "SELECT pg_advisory_xact_lock($1, hashtext($2))", classid, self._lock_key(key)
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            classid,
+            self._lock_key(key),
+            timeout=timeout,
         )
 
     async def _lock_outbound_lanes(self, conn: Any, destinations: Iterable[str]) -> None:

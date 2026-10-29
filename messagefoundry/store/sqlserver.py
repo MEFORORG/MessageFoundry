@@ -1008,12 +1008,16 @@ def _upload_quota_lock(uploader_id: str) -> str:
     return f"mefor:upload_quota:{uploader_id}"
 
 
+#: ``@LockTimeout`` value that makes ``sp_getapplock`` wait without limit.
+_APPLOCK_WAIT_FOREVER: Final[int] = -1
+
+
 def _applock_timeout_ms(command_timeout: int) -> int:
     """``@LockTimeout`` (ms) for :data:`_SQL_APPLOCK`: ``command_timeout*1000`` when set, else ``-1``
     (wait forever, the pyodbc query timeout backstops). ``0`` -> ``-1`` is why the SYNC handoff pool
     REFUSES to build when ``command_timeout==0`` (ADR 0071 invariant: a fused hop must never wait
     unboundedly on the applock)."""
-    return int(command_timeout * 1000) if command_timeout else -1
+    return int(command_timeout * 1000) if command_timeout else _APPLOCK_WAIT_FOREVER
 
 
 def _applock_params(resource: str, timeout_ms: int) -> tuple[Any, ...]:
@@ -4600,9 +4604,7 @@ class SqlServerStore:
                 # can exceed command_timeout (30s default); being killed mid-CREATE would roll back this
                 # batch and re-fail on every restart — a startup crash-loop. raw.timeout=0 = no client
                 # statement timeout for this connection; _acquire re-applies command_timeout on the next
-                # borrow, so no restore is needed. (sp_getapplock below keeps its own server-side
-                # @LockTimeout from command_timeout, so a peer's in-progress migration still bounds the
-                # lock wait rather than hanging.)
+                # borrow, so no restore is needed.
                 raw = getattr(conn, "_conn", None)
                 if raw is not None:
                     raw.timeout = 0
@@ -4618,7 +4620,11 @@ class SqlServerStore:
                 # `@LockOwner='Transaction'` to attach to. (An earlier comment here read "this first
                 # statement opens the txn" — it predated the probe and was stale, not a contradiction
                 # of the applock rule record_audit now follows.)
-                await self._applock(cur, _SCHEMA_LOCK)
+                # The wait is unbounded (BACKLOG #1726). The peer holding this lock
+                # runs the same batch with no statement timeout, so a wait bounded by command_timeout
+                # would fail this open at startup while the peer's upgrade is still healthy. The
+                # applock is transaction-scoped, so a peer that dies releases it.
+                await self._applock(cur, _SCHEMA_LOCK, timeout_ms=_APPLOCK_WAIT_FOREVER)
                 # Double-check under the lock: the peer we queued behind may have just applied this
                 # exact batch and committed its marker — then this open has nothing to do.
                 if await self._schema_marker_current(cur, expected):
@@ -5511,15 +5517,17 @@ class SqlServerStore:
             (key, outbox_id, message_id, destination_name, seq, now, key),
         )
 
-    async def _applock(self, cur: Any, resource: str) -> None:
+    async def _applock(self, cur: Any, resource: str, *, timeout_ms: int | None = None) -> None:
         """Take a transaction-scoped exclusive ``sp_getapplock`` — the T-SQL analog of PG's advisory
         lock. A NAMED lock in its own space: it never locks ``queue``/``messages`` rows, so it cannot
         invert the producers' queue->messages lock order (no AB/BA deadlock), and it is re-entrant per
         (resource, transaction). ``@LockOwner='Transaction'`` auto-releases it at the caller's commit/
         rollback, so the caller MUST be in an open (autocommit=False) transaction. Raises on a negative
         return code (timeout/deadlock/error) rather than proceeding unserialized — a swallowed timeout
-        would fork the audit chain or double-finalize a message."""
-        timeout_ms = _applock_timeout_ms(self._settings.command_timeout)
+        would fork the audit chain or double-finalize a message. ``timeout_ms`` overrides the
+        ``command_timeout``-derived ``@LockTimeout``."""
+        if timeout_ms is None:
+            timeout_ms = _applock_timeout_ms(self._settings.command_timeout)
         await cur.execute(_SQL_APPLOCK, _applock_params(resource, timeout_ms))
         row = await cur.fetchone()
         _applock_result(row, resource)

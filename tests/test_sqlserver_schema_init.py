@@ -194,6 +194,20 @@ async def test_ensure_schema_exempts_statement_timeout_for_the_ddl_batch() -> No
     assert conn._conn.timeout == 0  # the DDL-batch statement-timeout exemption was applied
 
 
+async def test_schema_applock_waits_unbounded_for_a_peer_migration() -> None:
+    """BACKLOG #1726: the schema applock waits without limit, not ``command_timeout*1000``;
+    ``SqlServerStore._ensure_schema`` says why. Red before the fix: the timeout parameter is 30000."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    store = _make_store(conn)
+    store._settings = _settings(command_timeout=30)  # type: ignore[assignment]
+
+    await store._ensure_schema()
+
+    params_lock = executed[_applock_index(executed)][1]
+    assert params_lock == (_SCHEMA_LOCK, -1)  # -1: sp_getapplock waits without limit
+
+
 async def test_marker_current_skips_batch_applock_and_timeout_exemption() -> None:
     """ADR 0064: a marker-current DB skips the whole batch — no applock, no DDL, no statement-timeout
     override (the co-start convoy path never engages) — with the probe's read txn still committed."""

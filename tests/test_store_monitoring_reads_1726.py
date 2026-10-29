@@ -465,6 +465,10 @@ class _RecordingPgConn:
         self.executed.append((sql, timeout))
         return ""
 
+    @contextlib.asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        yield
+
 
 async def test_postgres_received_index_build_is_exempt_from_the_client_timeout(
     monkeypatch: pytest.MonkeyPatch,
@@ -488,6 +492,41 @@ async def test_postgres_received_index_build_is_exempt_from_the_client_timeout(
     # Control: the FIFO rebuild this mirrors is seen the same way, so the recorder reads kwargs.
     fifo = [t for sql, t in conn.executed if "ix_queue_fifo_in_seq" in sql]
     assert fifo == [math.inf]
+
+
+async def test_postgres_schema_lock_wait_is_exempt_from_the_client_timeout() -> None:
+    """A peer engine shard waiting on the schema lock waits as long as the build it queued behind;
+    ``PostgresStore._ensure_schema`` says why. Red before the fix: the lock call passed no timeout,
+    so asyncpg applied ``command_timeout`` to the wait."""
+    from types import SimpleNamespace
+
+    from messagefoundry.config.settings import SchemaManagement
+    from messagefoundry.store import postgres
+
+    conn = _RecordingPgConn()
+    store = postgres.PostgresStore.__new__(postgres.PostgresStore)
+    store._settings = SimpleNamespace(  # type: ignore[assignment]
+        db_schema=None, resolved_schema_management=lambda: SchemaManagement.AUTO
+    )
+
+    @contextlib.asynccontextmanager
+    async def _acquire(*, record: bool = True) -> AsyncIterator[Any]:
+        yield conn
+
+    reads = iter([False, True])  # stale before the lock; the peer committed it once we hold it
+
+    async def _marker_current(_conn: Any, _expected: str) -> bool:
+        return next(reads)
+
+    store._timed_acquire = _acquire  # type: ignore[method-assign]
+    store._schema_marker_current = _marker_current  # type: ignore[method-assign,assignment]
+
+    assert await store._ensure_schema() is False  # the peer applied the batch
+    sqls = [sql for sql, _ in conn.executed]
+    [lock] = [i for i, sql in enumerate(sqls) if "pg_advisory_xact_lock" in sql]
+    assert conn.executed[lock][1] == math.inf
+    # The server-side statement_timeout is lifted first, in the same transaction.
+    assert sqls.index("SET LOCAL statement_timeout = 0") < lock
 
 
 # --- upgrade ---------------------------------------------------------------------------------------
