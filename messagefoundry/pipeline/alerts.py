@@ -29,7 +29,6 @@ __all__ = [
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
     "REMINDER_SECONDS",
-    "START_FAILURE_DETAIL",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
@@ -55,10 +54,6 @@ INTAKE_DISK_REASON = "disk_floor"
 #: cooldown, ``[alerts].realert_seconds``, which an operator can raise; a cooldown longer than this
 #: throttles some reminders, by that operator's choice.
 REMINDER_SECONDS = 300.0
-
-#: How a ``connection_stopped`` detail for a start failure begins (ADR 0031). The runner writes it,
-#: and the notifier reads it to tell a start failure from a halt (BACKLOG #1741).
-START_FAILURE_DETAIL = "failed to start:"
 
 
 def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str) -> str:
@@ -229,22 +224,20 @@ class AlertSink(Protocol):
         ...
 
     def connection_started(self, name: str) -> None:
-        """An inbound connection genuinely came up: its listener bound and its internal stages are
-        re-armed, with no open cause left on it or on an outbound of the same name (BACKLOG #1741).
+        """An operator started an inbound connection and it is up: its listener is bound, with no
+        open cause left on it or on an outbound of the same name (BACKLOG #1741).
         The **inverse** of :meth:`connection_stopped`, as :meth:`connection_restored` is of
         :meth:`connection_error`. Emits **no** notification; it exists so durable alert-state (ADR
         0044) can **auto-resolve** the open ``connection_stopped`` instance for ``name``, such as an
         inbound's bind failure. Auto-resolve-only, never a rule-targetable alert type. The default
         :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is always a
-        bare inbound name, so it never resolves a prefixed stand-in instance. Only two doors raise
-        it: an operator's start or restart of the inbound, and the ``restart_inbound`` a
-        ``connection_stopped`` rule dispatches for its own inbound's start failure (a failed restart
-        raises no new alert, so it is no loop). Every other start never does, at least the engine's
-        own ``start()``, a committed reload, a reload's rollback, the scheduler and every other
-        alert rule restart, a rule's restart after its own inbound's halt and two rules restarting
-        each other's inbound among them. A fresh process cannot see an earlier run's causes, and a
-        rule-driven loop must keep counting, so an open stop keeps its instance, ack, suspend and
-        escalation count across them. On those two doors, at least these starts never raise it: an
+        bare inbound name, so it never resolves a prefixed stand-in instance. Only one door raises
+        it: an operator's start or restart of the inbound, including a start of an inbound that is
+        already listening. Every other start never does, at least the engine's own ``start()``, a
+        committed reload, a reload's rollback, the scheduler and every alert rule's
+        ``restart_inbound``. A fresh process cannot see an earlier run's causes, and a rule-driven
+        loop must keep counting, so an open stop keeps its instance, ack, suspend, cooldown and
+        escalation count across them. On that door, at least these starts never raise it: an
         outbound's own start; a start where the runner cannot see every cause (on a clustered node,
         or on an engine shard that does not own the outbound namesake); and a start while the
         outbound namesake is under an operator-style pause, which a log-write halt's pause looks

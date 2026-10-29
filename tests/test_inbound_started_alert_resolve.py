@@ -17,10 +17,12 @@ import socket
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from messagefoundry.api.app import _alert_control_action
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
@@ -38,7 +40,7 @@ from messagefoundry.config.wiring import (
     env,
 )
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
-from messagefoundry.pipeline.alerts import START_FAILURE_DETAIL, LoggingAlertSink
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 
@@ -385,12 +387,10 @@ async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
     runner = _runner(reg, store, sink, claim_mode="per_lane")
     restarts: list[str] = []
 
-    async def _control(
-        action: str, target: str, *, default_target: bool, resolve_stop: bool = False
-    ) -> None:
-        assert action == "restart_inbound" and not resolve_stop
+    async def _control(action: str, target: str, *, default_target: bool) -> None:
+        assert action == "restart_inbound"
         restarts.append(target)
-        await runner.restart_inbound(target, resolve_stop=resolve_stop)
+        await runner.restart_inbound(target)
 
     async def _cycle() -> int:
         await asyncio.sleep(0.01)
@@ -439,11 +439,9 @@ async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
     assert [e["severity"] for e in pages.events] == ["warning", "warning", "critical", "critical"]
 
 
-async def test_only_the_rules_restart_after_its_own_start_failure_resolves() -> None:
-    # The sink-level contract: only the restart_inbound a connection_stopped of the same inbound
-    # dispatched for that inbound's start failure carries resolve_stop=True. A restart after a halt,
-    # or one another alert type drove, does not. The sink itself resolves every connection_started
-    # it sees; whether a start raises one is the runner's (RegistryRunner.restart_inbound).
+async def test_a_connection_started_always_resolves_and_drops_the_count() -> None:
+    # The sink resolves every connection_started it sees; whether a start raises one is the
+    # runner's (only an operator's start or restart, AlertSink.connection_started).
     resolved: list[tuple[object, object]] = []
 
     class _Resolve:
@@ -454,31 +452,9 @@ async def test_only_the_rules_restart_after_its_own_start_failure_resolves() -> 
             resolved.append((kw["event_type"], kw["connection"]))
             return 0
 
-    rules = [
-        AlertRule(event_type=t, connection="IB", control_action="restart_inbound")
-        for t in ("connection_stopped", "queue_buildup")
-    ]
-    sink = NotifierAlertSink([], rules=rules, store=_Resolve())  # type: ignore[arg-type]
-    flags: list[bool] = []
-
-    async def _control(
-        action: str, target: str, *, default_target: bool, resolve_stop: bool = False
-    ) -> None:
-        flags.append(resolve_stop)
-
-    sink.set_control_callback(_control)
+    sink = NotifierAlertSink([], store=_Resolve())  # type: ignore[arg-type]
     sink.connection_stopped("IB", detail="router halted")
-    sink.queue_buildup("IB", depth=10, oldest_age_seconds=1.0)
-    await _settle(sink, sink._control_tasks)
-    assert flags == [False, False]
-    # A start failure is no crash loop: the restart that recovers it resolves. A fresh sink, so
-    # the cooldown on the first connection_stopped does not swallow this one.
-    other = NotifierAlertSink([], rules=rules)
-    other.set_control_callback(_control)
-    other.connection_stopped("IB", detail=f"{START_FAILURE_DETAIL} port in use")
-    await _settle(other, other._control_tasks)
-    assert flags == [False, False, True]
-
+    assert sink._occurrences["connection_stopped:IB"] == 1
     # A connection_started reaching the sink always resolves, dropping the count (ADR 0133 D1).
     sink.connection_started("IB")
     assert "connection_stopped:IB" not in sink._occurrences
@@ -513,33 +489,11 @@ async def test_a_bare_inbound_start_never_resolves_a_prefixed_stand_in() -> None
     )
 
 
-async def test_restart_inbound_with_resolve_stop_off_raises_no_start(
-    store: MessageStore,
-) -> None:
-    reg = Registry()
-    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
-    reg.add_router("r", lambda m: [])
-    sink = _Recording()
-    runner = _runner(reg, store, sink)
-    await runner.start()
-    try:
-        sink.started.clear()
-        await runner.restart_inbound("IB", resolve_stop=False)
-        assert runner.inbound_running("IB") and sink.started == []
-        assert runner._resolving_starts == set()
-        # An engine door's restart resolves nothing, and nor does a rule's resolving one once the
-        # inbound is no longer recorded failed: the start failure it answered is gone.
-        await runner.restart_inbound("IB")
-        await runner.restart_inbound("IB", resolve_stop=True)
-        assert sink.started == []
-        assert runner._resolving_starts == set()
-    finally:
-        await runner.stop()
-
-
-async def test_a_rules_resolving_restart_resolves_a_start_failure_still_recorded(
+async def test_a_non_operator_restart_raises_no_start_even_after_a_start_failure(
     store: MessageStore, held_port: tuple[int, socket.socket]
 ) -> None:
+    # An alert rule's restart, or any other engine door's, resolves nothing, even when it is the
+    # restart that recovers the inbound's recorded start failure (BACKLOG #1741).
     port, blocker = held_port
     sink = _Recording()
     runner = _runner(_registry(port), store, sink)
@@ -547,50 +501,164 @@ async def test_a_rules_resolving_restart_resolves_a_start_failure_still_recorded
     try:
         assert runner.inbound_failed("SHARED") and sink.started == []
         blocker.close()
-        await runner.restart_inbound("SHARED", resolve_stop=True)
-        assert runner.inbound_running("SHARED") and sink.started == ["SHARED"]
+        await runner.restart_inbound("SHARED")
+        assert runner.inbound_running("SHARED") and runner.inbound_failed("SHARED") is None
+        assert sink.started == []
+        assert runner._resolving_starts == set()
     finally:
         await runner.stop()
 
 
-@pytest.mark.parametrize(("control_target", "resolves"), [("IB", True), ("OTHER", False)])
-async def test_a_rule_naming_its_own_inbound_resolves_its_start_failure_too(
-    control_target: str, resolves: bool
+def _engine_control(runner: RegistryRunner) -> Any:
+    """The control callback ``create_managed_app`` wires, over a bare runner."""
+    engine = SimpleNamespace(registry_runner=runner)
+
+    async def _control(action: str, target: str, **kw: Any) -> None:
+        await _alert_control_action(engine, action, target, **kw)  # type: ignore[arg-type]
+
+    return _control
+
+
+@pytest.mark.parametrize("cooldown", [0.001, 3600.0])
+async def test_a_rule_restart_after_a_start_failure_keeps_the_instance_open_and_counting(
+    store: MessageStore, cooldown: float
 ) -> None:
-    # A rule that names its own inbound as control_target answers that inbound's start failure as
-    # the default target does; one that names another connection resolves nothing, so two rules
-    # restarting each other's inbound keep counting.
+    # A start failure a connection_stopped rule answers with restart_inbound: the restart brings
+    # the inbound up and resolves nothing, so a flapping bind keeps ONE open instance whose count
+    # climbs to its after_count tier, and inside the cooldown a recurrence stays throttled on that
+    # same instance, as on main. On f3dbb7bedb the restart resolved, so the count reset to 1 every
+    # cycle and a throttled recurrence opened a fresh instance that was never paged.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
     rule = AlertRule(
         event_type="connection_stopped",
         connection="IB",
+        severity=AlertSeverity.WARNING,
+        cooldown_seconds=cooldown,
         control_action="restart_inbound",
-        control_target=control_target,
+        escalate=[EscalationTier(after_count=3, severity=AlertSeverity.CRITICAL)],
     )
-    sink = NotifierAlertSink([], rules=[rule])
-    calls: list[tuple[str, bool]] = []
+    pages = _RecordingTransport()
+    sink = NotifierAlertSink([pages], rules=[rule], store=store)
+    runner = _runner(reg, store, sink)
+    sink.set_control_callback(_engine_control(runner))
+    sink.start()
+    await runner.start()
+    try:
+        ids: set[int] = set()
+        counts: list[int] = []
+        tiers: list[int] = []
+        for _ in range(4):
+            await asyncio.sleep(0.01)  # outlasts the short cooldown
+            # The bind failure start() records: the inbound is recorded failed, then alerted.
+            runner._record_failed("IB", OSError("port in use"), kind="inbound")
+            await _settle(sink, sink._control_tasks)
+            await _settle(sink)
+            (inst,) = await store.list_active_alert_instances(allowed_channels=None)
+            ids.add(inst.id)
+            counts.append(int(inst.count))
+            tiers.append(int(inst.escalation_tier))
+        assert runner.inbound_running("IB")
+        # The durable instance reaches its tier whether or not the cooldown throttles the pages.
+        assert len(ids) == 1 and counts == [1, 2, 3, 4] and tiers == [0, 0, 1, 1]
+        if cooldown < 1:
+            assert runner.inbound_failed("IB") is None  # each restart recovered the start failure
+    finally:
+        try:
+            await runner.stop()
+        finally:
+            await sink.aclose()
+    expected = ["warning", "warning", "critical", "critical"] if cooldown < 1 else ["warning"]
+    assert [e["severity"] for e in pages.events] == expected
 
-    async def _control(
-        action: str, target: str, *, default_target: bool, resolve_stop: bool = False
-    ) -> None:
-        assert default_target is False
-        calls.append((target, resolve_stop))
+
+async def test_an_operator_restart_during_a_rule_restart_ends_the_cooldown(
+    store: MessageStore,
+) -> None:
+    # A rule's restart is in flight when an operator restarts the inbound. The operator's resolve
+    # fully resets the instance, cooldown included, so the next stop is a new incident that pages.
+    # On f3dbb7bedb the in-flight rule restart kept the cooldown, so that stop was never paged.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    rule = AlertRule(
+        event_type="connection_stopped",
+        connection="IB",
+        cooldown_seconds=3600.0,
+        control_action="restart_inbound",
+    )
+    pages = _RecordingTransport()
+    sink = NotifierAlertSink([pages], rules=[rule], store=store)
+    runner = _runner(reg, store, sink)
+    gate = asyncio.Event()
+    inner = _engine_control(runner)
+
+    async def _control(action: str, target: str, **kw: Any) -> None:
+        await gate.wait()  # the rule's restart is in flight until the gate opens
+        await inner(action, target, **kw)
 
     sink.set_control_callback(_control)
-    sink.connection_stopped("IB", detail=f"{START_FAILURE_DETAIL} port in use")
-    await _settle(sink, sink._control_tasks)
-    assert calls == [(control_target, resolves)]
+    sink.start()
+    await runner.start()
+    try:
+        sink.connection_stopped("IB", detail="router halted on internal error")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert sink._control_tasks  # in flight
+        await runner.restart_inbound("IB", operator=True)
+        await _settle(sink)
+        assert await _open(store) == set()
+        sink.connection_stopped("IB", detail="router halted on internal error")  # a new incident
+        gate.set()
+        await _settle(sink, sink._control_tasks)
+        await _settle(sink)
+        assert await _open(store) == {("connection_stopped", "IB")}
+    finally:
+        try:
+            await runner.stop()
+        finally:
+            await sink.aclose()
+    assert len(pages.events) == 2
+
+
+async def test_an_operator_start_of_a_listening_inbound_resolves(store: MessageStore) -> None:
+    # An open connection_stopped whose cause is gone while the inbound is still listening: the
+    # operator's Start finds it up and resolves it. An engine door's start of it does not. On
+    # f3dbb7bedb the Start returned before the emit, so nothing could clear the instance there.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    sink = NotifierAlertSink([], store=store)
+    runner = _runner(reg, store, sink)
+    await runner.start()
+    try:
+        sink.connection_stopped("IB", detail="router halted on internal error")
+        await _settle(sink)
+        await runner.start_inbound("IB")
+        await _settle(sink)
+        assert await _open(store) == {("connection_stopped", "IB")}
+        await runner.start_inbound("IB", operator=True)
+        await _settle(sink)
+        assert runner.inbound_running("IB")
+        assert await _open(store) == set()
+        assert runner._resolving_starts == set()
+        # A STOP's live hold still holds back the Start of a listening inbound.
+        sink.connection_stopped("IB", detail="router halted on internal error")
+        runner._hold_for_operator("IB", "inbound")
+        await runner.start_inbound("IB", operator=True)
+        await _settle(sink)
+        assert await _open(store) == {("connection_stopped", "IB")}
+    finally:
+        await runner.stop()
 
 
 async def test_an_operator_start_while_the_rules_restart_waits_resolves(
     store: MessageStore,
 ) -> None:
-    # The rule's restart is queued behind the reload lock while another door, holding it, brings
-    # the inbound up. An operator's start is a genuine recovery, so the alert resolves; only the
-    # start the restart itself makes is skipped. An engine door's start would resolve nothing.
-    from types import SimpleNamespace
-
-    from messagefoundry.api.app import _alert_control_action
-
+    # The rule's restart is queued behind the reload lock while an operator's start, holding it,
+    # brings the inbound up. That start resolves the alert; the restart's own start resolves
+    # nothing. An engine door's start would resolve nothing.
     reg = Registry()
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
     reg.add_router("r", lambda m: [])
@@ -599,12 +667,7 @@ async def test_an_operator_start_while_the_rules_restart_waits_resolves(
     )
     sink = NotifierAlertSink([], rules=[rule], store=store)
     runner = _runner(reg, store, sink)
-    engine = SimpleNamespace(registry_runner=runner)
-
-    async def _control(action: str, target: str, **kw: Any) -> None:
-        await _alert_control_action(engine, action, target, **kw)  # type: ignore[arg-type]
-
-    sink.set_control_callback(_control)
+    sink.set_control_callback(_engine_control(runner))
     await runner.start()
     try:
         await _settle(sink)
@@ -673,9 +736,7 @@ async def test_a_stop_after_an_auto_resolve_pages_and_acts_inside_the_cooldown(
     sink = NotifierAlertSink([pages], realert_seconds=3600.0, rules=[rule], store=store)
     restarts: list[str] = []
 
-    async def _control(
-        action: str, target: str, *, default_target: bool, resolve_stop: bool = False
-    ) -> None:
+    async def _control(action: str, target: str, *, default_target: bool) -> None:
         restarts.append(target)
 
     sink.set_control_callback(_control)
@@ -698,11 +759,13 @@ async def test_a_stop_after_an_auto_resolve_pages_and_acts_inside_the_cooldown(
 async def test_rules_restarting_each_others_inbound_keep_the_cooldown(
     store: MessageStore,
 ) -> None:
-    # Two connection_stopped rules that restart each other's inbound. Neither restart resolves, so
-    # the runner raises no connection_started for it; this pins the sink's second guard, for a
-    # connection_started that arrives while such a restart is in flight, as an operator's start
-    # can. It must not end a cooldown, or the pair would page and restart at the halt cadence (ADR
-    # 0128 section 4).
+    # Two connection_stopped rules that restart each other's inbound. No rule restart raises
+    # connection_started, so neither ends a cooldown, and the pair stays at one page and one
+    # restart per cooldown (ADR 0128 section 4).
+    reg = Registry()
+    for name in ("IB_A", "IB_B"):
+        reg.add_inbound(build_inbound_connection(name, MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
     rules = [
         AlertRule(
             event_type="connection_stopped",
@@ -714,25 +777,32 @@ async def test_rules_restarting_each_others_inbound_keep_the_cooldown(
     ]
     pages = _RecordingTransport()
     sink = NotifierAlertSink([pages], realert_seconds=3600.0, rules=rules, store=store)
+    runner = _runner(reg, store, sink)
+    inner = _engine_control(runner)
     restarts: list[str] = []
 
-    async def _control(
-        action: str, target: str, *, default_target: bool, resolve_stop: bool = False
-    ) -> None:
-        assert not resolve_stop
+    async def _control(action: str, target: str, **kw: Any) -> None:
         restarts.append(target)
-        sink.connection_started(target)
+        await inner(action, target, **kw)
 
     sink.set_control_callback(_control)
     sink.start()
+    await runner.start()
     try:
         for name in ("IB_A", "IB_B", "IB_A", "IB_B"):
             sink.connection_stopped(name, detail="router halted on internal error")
             await _settle(sink, sink._control_tasks)
         await _settle(sink)
-        assert sink._control_starts == {}
+        assert runner.inbound_running("IB_A") and runner.inbound_running("IB_B")
+        assert await _open(store) == {
+            ("connection_stopped", "IB_A"),
+            ("connection_stopped", "IB_B"),
+        }
     finally:
-        await sink.aclose()
+        try:
+            await runner.stop()
+        finally:
+            await sink.aclose()
     assert restarts == ["IB_B", "IB_A"]
     assert [e["connection"] for e in pages.events] == ["IB_A", "IB_B"]
 

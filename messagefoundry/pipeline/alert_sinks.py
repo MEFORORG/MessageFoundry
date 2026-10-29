@@ -56,7 +56,6 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
-    START_FAILURE_DETAIL,
     config_changed_detail,
     crl_expiry_detail,
     crl_reload_refused_detail,
@@ -92,15 +91,9 @@ class ControlCallback(Protocol):
     ``default_target`` is True when the rule set no ``control_target``, so ``target`` is the event's
     own bare name. The event does not say which namespace that name came from, and inbound and
     outbound names are separate namespaces, so the callback must not aim it at the other side
-    (BACKLOG #2528).
+    (BACKLOG #2528)."""
 
-    ``resolve_stop`` is True only when a ``connection_stopped`` rule restarts its own inbound to
-    answer that inbound's start failure (``_RESOLVING_ACTION``), so that restart's start may resolve
-    the alert (BACKLOG #1741). The callback passes it to the runner's ``restart_inbound``."""
-
-    def __call__(
-        self, action: str, target: str, *, default_target: bool, resolve_stop: bool = False
-    ) -> Awaitable[None]: ...
+    def __call__(self, action: str, target: str, *, default_target: bool) -> Awaitable[None]: ...
 
 
 # Bound the in-memory backlog so a wedged transport (unreachable webhook) can't grow without limit;
@@ -136,9 +129,8 @@ class _AlertStateStore(Protocol):
 #: Auto-resolution map (ADR 0044 D2): an inverse lifecycle event type resolves the matching open
 #: instance(s) of the failure event type it cancels. ``connection_restored`` cancels the
 #: ``connection_error`` raised on ``connection_lost``; ``connection_started``, which the runner emits
-#: only on the doors ``AlertSink.connection_started`` names (BACKLOG #1741), clears a
-#: ``connection_stopped``. Keyed by the
-#: inverse event's ``type`` → the failure event ``type`` it resolves.
+#: only for an operator's start or restart (``AlertSink.connection_started``, BACKLOG #1741), clears a
+#: ``connection_stopped``. Keyed by the inverse event's ``type`` → the failure event ``type`` it resolves.
 _AUTO_RESOLVE: dict[str, str] = {
     "connection_restored": "connection_error",
     "connection_started": "connection_stopped",
@@ -160,17 +152,6 @@ _AUTO_RESOLVE: dict[str, str] = {
     # on the same process.
     "crl_reload_applied": "crl_reload_refused",
 }
-
-#: BACKLOG #1741: the one control action whose start may resolve, and only when a
-#: ``connection_stopped`` rule aims it at its own inbound to answer that inbound's start failure
-#: (``START_FAILURE_DETAIL``): a failed restart raises no new alert, so it is no loop. The sink then
-#: passes ``resolve_stop=True`` to the control callback. Every other rule's restart, a self-restart
-#: after a halt and a restart driven by another alert or another inbound among them, resolves
-#: nothing, so the instance stays open, its #81 occurrence count, its tier and any suspend entry
-#: carry on, and a rule-driven crash loop, two rules restarting each other's inbound included, still
-#: reaches its ``after_count`` tier; ADR 0133 D1's reset-on-auto-resolve stays true. An operator's
-#: start still resolves. An engine door's start never does (``AlertSink.connection_started``).
-_RESOLVING_ACTION = "restart_inbound"
 
 _T = TypeVar("_T")
 
@@ -845,9 +826,6 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # control wired (a control_action rule then no-ops, logged). The sink NEVER imports the runner.
         self._control_cb: ControlCallback | None = None
         self._control_tasks: set[asyncio.Task[None]] = set()
-        # BACKLOG #1741: inbound name -> restart_inbound control actions in flight for it. The runner
-        # raises connection_started inside that restart, and such a start must not end a cooldown.
-        self._control_starts: dict[str, int] = {}
 
     # --- AlertSink emit methods (sync, non-blocking) -------------------------
 
@@ -1503,13 +1481,12 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._record_state({"type": "connection_restored", "connection": name}, "info")
 
     def connection_started(self, name: str) -> None:
-        """The inverse of ``connection_stopped`` (BACKLOG #1741; the Protocol says when it fires). No
-        notification; auto-resolves the open instance when alert-state is wired. That resolve also
-        ends the cooldown, as ``crl_reload_applied`` does, so a stop that follows inside it is a new
-        incident that pages and dispatches its rule's control action. A start an alert control action
-        is making for ``name`` keeps the cooldown, so rules restarting each other's inbound, or any
-        rule-driven loop, stay at one page and one restart per cooldown (ADR 0128 section 4)."""
-        if self._store is not None and name not in self._control_starts:
+        """The inverse of ``connection_stopped`` (BACKLOG #1741; the Protocol says when it fires: only
+        an operator's start or restart). No notification; auto-resolves the open instance when
+        alert-state is wired, which drops its occurrence count, tier and suspend entry. It also ends
+        the cooldown, as ``crl_reload_applied`` does, so a stop that follows is a new incident that
+        pages and dispatches its rule's control action, whatever rule restart is in flight."""
+        if self._store is not None:
             self._last_sent.pop(f"connection_stopped:{name}", None)
         self._record_state({"type": "connection_started", "connection": name}, "info")
 
@@ -1587,23 +1564,12 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     decision.control_action,
                     event["type"],
                 )
-            else:
-                target = decision.control_target
-                # BACKLOG #1741: only a connection_stopped rule restarting its own inbound, by
-                # default or by naming it, after that inbound's start failure resolves the alert
-                # (_RESOLVING_ACTION says why).
-                resolves = (
-                    event["type"] == "connection_stopped"
-                    and decision.control_action == _RESOLVING_ACTION
-                    and target in (None, subject)
-                    and str(event.get("detail", "")).startswith(START_FAILURE_DETAIL)
-                )
+            elif decision.control_target is not None:
                 self._dispatch_control(
-                    decision.control_action,
-                    subject if target is None else target,
-                    default_target=target is None,
-                    resolve_stop=resolves,
+                    decision.control_action, decision.control_target, default_target=False
                 )
+            else:
+                self._dispatch_control(decision.control_action, subject, default_target=True)
         # #143 (ADR 0044 amendment): the windowed suspend gate — NOTIFICATION-only. The durable instance
         # was already recorded above (AC-3: a suspended alert stays open/counted/visible), and any #144
         # control action already dispatched; a still-active suspend window only mutes the transport enqueue.
@@ -1718,19 +1684,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 
-    def _dispatch_control(
-        self,
-        action: str,
-        target: str,
-        *,
-        default_target: bool,
-        resolve_stop: bool = False,
-    ) -> None:
+    def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> None:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget
         task, exactly like the ADR 0044 state observer). Synchronous + non-blocking: it only creates the
         task, never awaits the runner, so a slow/hung restart can never stall the worker that emitted the
-        alert. A no-op when no callback is wired (logged once at emit). ``resolve_stop`` is passed
-        through to the callback (:class:`ControlCallback`, BACKLOG #1741)."""
+        alert. A no-op when no callback is wired (logged once at emit)."""
         cb = self._control_cb
         if cb is None:
             log.warning(
@@ -1741,9 +1699,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             return
         try:
             task = asyncio.ensure_future(
-                self._run_control(
-                    cb, action, target, default_target=default_target, resolve_stop=resolve_stop
-                )
+                self._run_control(cb, action, target, default_target=default_target)
             )
         except RuntimeError:
             # No running loop (e.g. a control emit on a non-async test path) — best-effort, drop it rather
@@ -1752,32 +1708,16 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._control_tasks.add(task)
         task.add_done_callback(self._control_tasks.discard)
 
+    @staticmethod
     async def _run_control(
-        self,
-        cb: ControlCallback,
-        action: str,
-        target: str,
-        *,
-        default_target: bool,
-        resolve_stop: bool,
+        cb: ControlCallback, action: str, target: str, *, default_target: bool
     ) -> None:
-        # Any rule's restart_inbound, not only a self-restart (BACKLOG #1741, see connection_started).
-        marked = action == "restart_inbound"
-        if marked:
-            self._control_starts[target] = self._control_starts.get(target, 0) + 1
         try:
-            await cb(action, target, default_target=default_target, resolve_stop=resolve_stop)
+            await cb(action, target, default_target=default_target)
         except Exception:
             # NEVER-RAISE (ADR 0128 §3): a rejected/hung restart (unknown / not-deployed / shard-not-owner
             # connection) must never break alerting or delivery. Swallow + log metadata only (no PHI).
             log.warning("alert control_action %s for %r failed", action, target, exc_info=True)
-        finally:
-            if marked:
-                left = self._control_starts[target] - 1
-                if left:
-                    self._control_starts[target] = left
-                else:
-                    del self._control_starts[target]
 
     async def _handle(self, event: dict[str, Any]) -> None:
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)

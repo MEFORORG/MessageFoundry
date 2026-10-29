@@ -256,12 +256,12 @@ escalation chains (still deferred, ADR 0014 §3). The cross-node durable dedup o
   (`connection_restored`/`connection_started`) and which (`queue_buildup`/`storage_threshold`/`message_stall`)
   rely on the deferred staleness sweep or manual resolve until it lands. *Resolved 2026-10-27 (BACKLOG
   #1741):* the runner now raises `connection_started` when an operator starts or restarts an
-  inbound, or a `connection_stopped` rule restarts its own inbound after that inbound's start
-  failure, and the inbound genuinely comes up with no open cause on it or on an outbound of the
-  same name. So an inbound's bind-failure `connection_stopped` resolves itself on that recovery.
-  Every other start resolves nothing, at least an engine start, a committed reload, the scheduler
-  and every other alert rule restart, so an open stop keeps its instance, ack, suspend and count
-  across a service restart, a reload or a rule-driven crash loop, as before this item.
+  inbound, or starts one already listening, and the inbound is up with no open cause on it or on
+  an outbound of the same name. So an inbound's bind-failure `connection_stopped` resolves on an
+  operator's recovery. Every other start resolves nothing, at least an engine start, a committed
+  reload, the scheduler and every alert rule's restart, so an open stop keeps its instance, ack,
+  suspend, cooldown and count across a service restart, a reload or a rule-driven crash loop, as
+  before this item.
   At least these still need a manual resolve: an outbound's start failure, a halt whose name has no
   inbound, a halt no operator restarts, an inbound whose outbound namesake still has an open cause,
   and any alert raised in a cluster or under an engine shard that does not own the namesake

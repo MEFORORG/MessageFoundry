@@ -882,12 +882,7 @@ _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound":
 
 
 async def _alert_control_action(
-    engine: Engine,
-    action: str,
-    target: str,
-    *,
-    default_target: bool,
-    resolve_stop: bool = False,
+    engine: Engine, action: str, target: str, *, default_target: bool
 ) -> None:
     """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
 
@@ -903,11 +898,7 @@ async def _alert_control_action(
     the action's side and not on the other: then the event can only have come from that side. A
     name declared on both sides, or only on the other, is skipped with a WARNING that says to set
     ``control_target``. A config-load refusal cannot do this, because a rule does not know the
-    graph and a reload can change it.
-
-    ``resolve_stop`` says the restart answers its own inbound's start failure, so its start may
-    resolve that alert; every other rule restart resolves nothing (BACKLOG #1741,
-    :meth:`RegistryRunner.restart_inbound`)."""
+    graph and a reload can change it."""
     rr = engine.registry_runner
     if rr is None:
         return
@@ -943,7 +934,7 @@ async def _alert_control_action(
                 target,
             )
             return
-        await rr.restart_inbound(target, resolve_stop=resolve_stop)
+        await rr.restart_inbound(target)
     elif action == "restart_outbound":
         if rr.outbound_dr_failed(target):
             # Its build failed as it left the DR park (vault BACKLOG #3263). A reload or an
@@ -11804,15 +11795,9 @@ def create_managed_app(
             # runner. The sink dispatches this off-worker + never-raise, so exceptions here are logged, not fatal.
             if notifier is not None:
 
-                async def _alert_control(
-                    action: str, target: str, *, default_target: bool, resolve_stop: bool = False
-                ) -> None:
+                async def _alert_control(action: str, target: str, *, default_target: bool) -> None:
                     await _alert_control_action(
-                        engine,
-                        action,
-                        target,
-                        default_target=default_target,
-                        resolve_stop=resolve_stop,
+                        engine, action, target, default_target=default_target
                     )
 
                 notifier.set_control_callback(_alert_control)

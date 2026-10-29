@@ -139,12 +139,7 @@ from messagefoundry.parsing.sniff import (
     b64_head,
     text_sniff_head,
 )
-from messagefoundry.pipeline.alerts import (
-    REMINDER_SECONDS,
-    START_FAILURE_DETAIL,
-    AlertSink,
-    LoggingAlertSink,
-)
+from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
 from messagefoundry.pipeline.ingress_guards import (
@@ -1661,9 +1656,9 @@ class RegistryRunner:
         # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
-        # BACKLOG #1741: inbounds inside an operator's start or restart, or the alert rule's restart
-        # that answers a start failure, the only starts that raise connection_started (AlertSink.connection_started
-        # says why). Held only under the reload lock, so no other door's start sees it.
+        # BACKLOG #1741: inbounds inside an operator's start or restart, the only starts that raise
+        # connection_started (AlertSink.connection_started says why). Held only under the reload lock,
+        # so no other door's start sees it.
         self._resolving_starts: set[str] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
@@ -3304,26 +3299,17 @@ class RegistryRunner:
         async with self._reload_lock:
             await self._stop_inbound_unsafe(name)
 
-    async def restart_inbound(
-        self, name: str, *, operator: bool = False, resolve_stop: bool = False
-    ) -> None:
-        """Stop then start one inbound under one reload-lock span.
-
-        Its start raises ``connection_started`` only for an ``operator`` restart or with
-        ``resolve_stop=True``, which an alert rule's restart passes only when a
-        ``connection_stopped`` rule answers this same inbound's start failure. That flag counts only
-        while the inbound is still recorded failed when the lock is taken: a restart queued behind a
-        reload that already bound it may meet a later halt instead. Every other rule restart
-        resolves nothing, so a rule-driven crash loop keeps one open, escalating instance (BACKLOG
-        #1741). The mark is scoped to the start made inside the lock."""
+    async def restart_inbound(self, name: str, *, operator: bool = False) -> None:
+        """Stop then start one inbound under one reload-lock span. Only an ``operator`` restart raises
+        ``connection_started``; an alert rule's restart resolves nothing, so a rule-driven crash loop
+        keeps one open, escalating, throttled instance (BACKLOG #1741)."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
-            resolve = operator or (resolve_stop and self.inbound_failed(name) is not None)
             await self._stop_inbound_unsafe(name)
-            await self._resolving_start(name, resolve=resolve)
+            await self._resolving_start(name, resolve=operator)
 
     def _dr_refuses(self, name: str, *, operator: bool) -> bool:
         """Whether a passive DR standby refuses an engine start of inbound ``name`` (vault BACKLOG
@@ -4420,10 +4406,9 @@ class RegistryRunner:
         return _hold
 
     def _note_inbound_started(self, name: str) -> None:
-        """An inbound came up on a door that re-armed its internal stages: emit ``connection_started``
-        only when that door is an operator's start or restart, or the alert rule's restart that
-        answers a start failure (BACKLOG #1741). :meth:`AlertSink.connection_started` says why every
-        other start resolves nothing."""
+        """An inbound is up after a start: emit ``connection_started`` only when that start is an
+        operator's start or restart (BACKLOG #1741). :meth:`AlertSink.connection_started` says why
+        every other start resolves nothing."""
         if name in self._resolving_starts:
             self._emit_inbound_started(name)
 
@@ -4545,6 +4530,10 @@ class RegistryRunner:
         not-deployed inbound is skipped silently there, not treated as a fault), so this raise is the
         operator/API path: deploying is a config change, not a runtime action."""
         if name in self._sources:
+            # BACKLOG #1741: an operator's Start on a listening inbound still resolves its open stop.
+            # The cause checks in _emit_inbound_started hold back a lane a STOP still halts.
+            if self._running:
+                self._note_inbound_started(name)
             return
         if not self._deployed(name, "inbound"):
             raise NotDeployedError(name)
@@ -4753,9 +4742,7 @@ class RegistryRunner:
             exc_info=exc,
         )
         try:
-            self._alert_sink.connection_stopped(
-                alert_name, detail=f"{START_FAILURE_DETAIL} {reason}"
-            )
+            self._alert_sink.connection_stopped(alert_name, detail=f"failed to start: {reason}")
         except Exception:
             log.exception("alert sink raised on connection_stopped for %r", alert_name)
 
