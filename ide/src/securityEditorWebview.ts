@@ -147,8 +147,8 @@ export function securityEditorScript(token: string, fields: unknown): string {
       }
       // Unset, not each select's first option: a Yes/No that shows "Yes" before any state has said
       // so is a value nobody read, and a tristate's '' option is a real value (derived), not unset.
-      // Done once every select is on the page, so no insertion can pick an option again. A new
-      // input is already empty.
+      // Done after each select has all its options, because adding or removing an option makes the
+      // select choose one again. A new input is already empty.
       for (const s of root.querySelectorAll('select')) { s.selectedIndex = -1; }
     }
 
@@ -190,9 +190,11 @@ export function securityEditorScript(token: string, fields: unknown): string {
     // state left is CLEARED, not only hidden (owner ruling R4, 2026-10-29, BACKLOG #1123): the
     // defaults collectUpdates() compares against, every control's value including an edit nobody
     // saved, and each field's 'loosened' mark. The form is rebuilt unset rather than re-rendered
-    // from the last good state, which is itself an earlier message. So the next well-formed state
-    // is rendered from itself alone, and nothing is left for a Save to send. textContent (through
-    // show): the problem names a switch, and no part of a message is ever parsed as markup here.
+    // from the last good state, which is itself an earlier message. What that adds is the time
+    // between this refusal and the next state: the page holds no value, default or mark from
+    // before it, and Save has nothing to send. (render() already sets all three, so the next state
+    // would replace them either way.) textContent (through show): the problem names a switch, and
+    // no part of a message is ever parsed as markup here.
     function refuse(problem) {
       rendered = false;
       $('save').disabled = true;
@@ -200,7 +202,7 @@ export function securityEditorScript(token: string, fields: unknown): string {
       buildForm();
       $('form').style.display = 'none';
       refusal = 'These settings cannot be shown. The state sent to this form is malformed: ' + problem +
-        '. Save is off until a well-formed state arrives.';
+        '. Any change not yet saved was cleared, and Save is off until a well-formed state arrives.';
       show(refusal);
     }
 

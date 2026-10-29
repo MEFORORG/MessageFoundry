@@ -934,7 +934,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
   });
 
   test("Security Settings: Save stays off until a state renders, and a discarded state turns it off again", () => {
-    // Before a state renders, the form holds placeholders, and saving them would write them as
+    // Before a state renders, every control is unset, and saving that would write most switches as
     // explicit values. A discard must not leave the form looking loaded AND saveable.
     const p = security.load();
     const doc = p.window.document;
@@ -1301,6 +1301,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       assert.deepStrictEqual(p.warnings, [STATE_WARNING], `${why}: the state was not discarded`);
       const shown = refusalShown(p);
       assert.ok(shown.startsWith(REFUSAL), `${why}: no refusal, got "${shown}"`);
+      assert.ok(shown.includes("Any change not yet saved was cleared"), `${why}: the refusal hides that edits went`);
       assert.deepStrictEqual(setControls(p), [], `${why}: a control still holds a value from before the refusal`);
       assert.deepStrictEqual(heldDefaults(p), [], `${why}: collectUpdates() would still compare against old defaults`);
       assert.deepStrictEqual(loosenedFields(p), [], `${why}: a loosened mark outlived the refusal`);
@@ -1314,7 +1315,9 @@ suite("webview receivers discard a malformed payload and render a well-formed on
 
   test("Security Settings: the state after a refusal renders from itself alone", () => {
     // A page that was refused, then sent a well-formed state, must match a page sent that state on
-    // its own: same controls, same loosened marks, same Save. Nothing from before the refusal leaks.
+    // its own: same controls, same loosened marks, same Save. A REGRESSION GUARD on render(), not on
+    // refuse(): it passes on the code before the refusal cleared anything, because render() sets
+    // every control, mark and default. The cases above are what pin the clearing.
     const next = variant(STATE_OK, (c) => {
       c.state.values.production_instance = true;
       c.state.values.delete_message_bodies_after_days = 0;
