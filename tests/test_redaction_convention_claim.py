@@ -11,9 +11,10 @@ convention binds*, and the other places point there.
 This pins the absence of the old claim, in the shapes the controls below hold, over ``docs/``,
 ``messagefoundry/``, ``tests/``, ``packaging/``, ``harness/`` and ``scripts/``. It is a lexical floor:
 a paraphrase that never says "the control" passes it. It also pins that the statement the pointers
-cite is still in section 7. A correction note may quote the old wording verbatim: a match inside a
-quote that opens right after ``read`` or ``said`` in a dated ``CORRECTED`` note
-(:data:`_QUOTED_RETRACTION`) is a quoted retraction, not the claim.
+cite is still in section 7. A correction note may quote the old wording, with any double quotes
+inside it made single: a match wholly inside a double-quoted span that opens right after ``read`` or
+``said`` following a ``CORRECTED`` or ``Corrected`` marker, and closes just after the match, is a
+quoted retraction, not the claim (:func:`_is_quoted_retraction`).
 """
 
 from __future__ import annotations
@@ -47,29 +48,46 @@ def _folded(text: str) -> str:
     return " ".join(_LINE_MARKER.sub("", text).split())
 
 
-#: How far back a correction marker may sit and still own a quoted claim: room for the marker's
-#: date and a lead-in such as ``this read``, never a whole paragraph.
+#: How far back a correction marker may sit and still own a quoted claim: room for the marker, its
+#: date or context and a lead-in such as ``this read``, never a whole paragraph.
 _CORRECTED_REACH = 200
-#: A quoted retraction, in the house shape ``**CORRECTED 2026-10-28:** this read "..."``: a
-#: ``CORRECTED`` or ``Corrected`` marker with its date (case-sensitive, so prose saying "the corrected
-#: wording read" is not one, and ``UNCORRECTED`` is not one either), then in the same sentence
-#: ``read`` or ``said`` with the quote opening RIGHT AFTER the verb, still open where the claim
-#: starts. A quote opened anywhere else, such as the one around the convention's own name in
-#: ``this said X; the "never put PHI ..." convention remains the control``, does not exempt a claim.
+#: How far past the claim its retraction quote must close: room for a tail such as ``for both``.
+_CLOSE_REACH = 40
+#: The opening of a quoted retraction, read back from where the claim starts: a ``CORRECTED`` or
+#: ``Corrected`` marker, then ``read`` or ``said`` (in any case) with a double quote opening RIGHT
+#: AFTER the verb and still open at the claim. The marker is case-sensitive, so prose saying "the
+#: corrected wording read" is not one; the letter guard before it, not its case, is what keeps
+#: ``UNCORRECTED`` out. A quote opened anywhere else, such as the one around the convention's own
+#: name in ``this said X; the "never put PHI ..." convention remains the control``, is not one.
 _QUOTED_RETRACTION = re.compile(
-    r"\b(?:CORRECTED|Corrected)[*_\s]*\d{4}-\d{2}-\d{2}\b[^.\"]*?\b(?:read|said)[\s:*_]*\"[^\"]*$"
+    r"(?<![A-Za-z])(?:CORRECTED|Corrected)(?![a-z])"
+    rf".{{0,{_CORRECTED_REACH}}}?"
+    r"(?<![A-Za-z])(?i:read|said)(?![a-z])[\s:*_]*\"[^\"]*$"
 )
+
+
+def _is_quoted_retraction(folded: str, m: re.Match[str]) -> bool:
+    """Whether the claim ``m`` sits wholly inside a retraction's quote.
+
+    The quote must still be open at the claim's END (no double quote inside the match, which
+    ``_CLAIM``'s ``\\W{0,4}`` would otherwise accept) and must close within :data:`_CLOSE_REACH`
+    after it, so an unclosed quote cannot exempt a claim made in a later sentence. The opening is
+    searched with ``pos``, not on a slice, so a window that cuts ``UNCORRECTED`` keeps its left
+    context."""
+    if '"' in m.group(0):
+        return False
+    close = folded.find('"', m.end())
+    if close == -1 or close - m.end() > _CLOSE_REACH:
+        return False
+    lo = max(0, m.start() - _CORRECTED_REACH)
+    return _QUOTED_RETRACTION.search(folded, lo, m.start()) is not None
 
 
 def _claims(text: str) -> list[str]:
     if not _MAYBE.search(text):
         return []
     folded = _folded(text)
-    return [
-        m.group(0)
-        for m in _CLAIM.finditer(folded)
-        if not _QUOTED_RETRACTION.search(folded[max(0, m.start() - _CORRECTED_REACH) : m.start()])
-    ]
+    return [m.group(0) for m in _CLAIM.finditer(folded) if not _is_quoted_retraction(folded, m)]
 
 
 @pytest.mark.parametrize(
@@ -94,12 +112,33 @@ def _claims(text: str) -> list[str]:
         # control is the dated CORRECTED note in test_the_scan_passes_other_prose
         'Corrected 2026-10-01: this said the gate was per route; the "never put PHI in an exception '
         'message" convention remains the control.',
-        # a lowercase "corrected" in prose is no marker (PR 2595 review); same control
+        # a lowercase "corrected" in prose is no marker (PR 2595 review), dated or not; same control
         'the corrected wording read "the convention above remains the control for both".',
+        'corrected 2026-10-28: this read "the convention above remains the control for both".',
+        # the convention name's quote closed INSIDE the claim, right after the verb
+        '**CORRECTED 2026-10-28:** this said "never put PHI in an exception message" is the control',
+        # a retraction quote never closed by a double quote does not reach a later sentence
+        '**CORRECTED 2026-10-28:** this read "per route”. Neither is a completeness claim; the '
+        "convention above remains the control for both.",
     ],
 )
 def test_the_scan_finds_each_shipped_wording(shipped: str) -> None:
     assert _claims(shipped), shipped
+
+
+def test_a_window_cut_through_uncorrected_is_no_marker() -> None:
+    # Pad so the reach window opens two characters into "UNCORRECTED", at "CORRECTED".
+    head = 'UNCORRECTED 2026-10-28: this read "'
+    text = (
+        head
+        + "x" * (_CORRECTED_REACH + 1 - len(head))
+        + ' the convention above remains the control"'
+    )
+    claim = text.index("the convention above")
+    assert text[claim - _CORRECTED_REACH :].startswith("CORRECTED")
+    assert _claims(text)
+    # control: the same text with a real marker is a quoted retraction
+    assert _claims(text.replace("UNCORRECTED", "--CORRECTED")) == []
 
 
 @pytest.mark.parametrize(
@@ -116,6 +155,16 @@ def test_the_scan_finds_each_shipped_wording(shipped: str) -> None:
         # the same, quoting the convention-name arm (inner quotes single, so the outer one stays open)
         "**CORRECTED 2026-10-28:** this said \"the 'never put PHI in an exception message' "
         'convention remains the control".',
+        # the tree's other correction shapes: undated, a context in brackets, a capital verb,
+        # underscore emphasis, and a quoted term before the verb
+        '**CORRECTED:** this read "the convention above remains the control for both".',
+        'CORRECTED (review of a87fcb2932): this comment said "the convention above remains the '
+        'control for both".',
+        '**CORRECTED 2026-10-28:** Read "the convention above remains the control for both".',
+        '_Corrected 2026-10-01:_ this said "the convention above remains the control for both".',
+        '**CORRECTED 2026-10-28:** this _read_ "the convention above remains the control for both".',
+        '**CORRECTED 2026-10-28:** the "Who binds" note read "the convention above remains the '
+        'control for both".',
     ],
 )
 def test_the_scan_passes_other_prose(prose: str) -> None:
