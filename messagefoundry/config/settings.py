@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Final, Literal, get_args
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -663,6 +663,11 @@ def _check_vault_revocation_attestation(flag: bool, reason: str | None, *, secti
         raise ValueError(f"{reason_name} must not contain control characters or lone surrogates")
 
 
+#: Ceiling for ``[store].schema_lock_timeout`` (s): the largest whole-second ``sp_getapplock``
+#: ``@LockTimeout``, a T-SQL ``int`` of milliseconds (BACKLOG #1726).
+_SCHEMA_LOCK_TIMEOUT_MAX: Final[float] = float((2**31 - 1) // 1000)
+
+
 class StoreSettings(_Section):
     backend: StoreBackend = StoreBackend.SQLITE
 
@@ -996,6 +1001,10 @@ class StoreSettings(_Section):
     # #2283) and for a fixed multiple of it on SQL Server, longer but still bounded (BACKLOG #3023);
     # docs/CONNECTIONS.md has both, and says what else this knob does not reach.
     acquire_timeout: float = 30.0
+    # Upper bound (seconds) on a server-DB store open's wait for the schema lock (BACKLOG #1726).
+    # Must be > 0 and at most _SCHEMA_LOCK_TIMEOUT_MAX. Why it exists and what it does not bound:
+    # docs/CONFIGURATION.md.
+    schema_lock_timeout: float = 600.0
     # POSTGRES ONLY, refused on the other backends (see _db_schema_backend). 'db_schema' avoids
     # shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA.
     db_schema: str | None = None
@@ -1097,6 +1106,19 @@ class StoreSettings(_Section):
         # this setting exists to remove, so there is deliberately no way to configure it back.
         if value <= 0:
             raise ValueError("acquire_timeout must be > 0 (the pool wait is always bounded)")
+        return value
+
+    @field_validator("schema_lock_timeout")
+    @classmethod
+    def _positive_schema_lock_timeout(cls, value: float) -> float:
+        # No "0 disables" value, as with acquire_timeout: on SQL Server an unbounded wait could hang
+        # a store open, and a service stop behind it, forever (BACKLOG #1726). The ceiling is the
+        # largest sp_getapplock @LockTimeout (a T-SQL int of ms), so both backends wait what is set.
+        if not 0 < value <= _SCHEMA_LOCK_TIMEOUT_MAX:
+            raise ValueError(
+                "schema_lock_timeout must be > 0 and at most "
+                f"{_SCHEMA_LOCK_TIMEOUT_MAX:.0f} s (the wait is always bounded)"
+            )
         return value
 
     @field_validator("warm_pool_target")
