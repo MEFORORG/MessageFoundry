@@ -25,6 +25,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -46,6 +47,8 @@ from messagefoundry.redaction import safe_text
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.crypto import (
     REFUSED_BODY_DIGEST_KDF,
+    Cipher,
+    audit_body_digests,
     generate_key,
     make_cipher,
     refused_body_digest,
@@ -422,21 +425,48 @@ def test_the_digest_confirms_the_body_only_with_its_key() -> None:
     guess = wire[:-1] + b"B"  # the same head, a different last byte
     old_key, new_key = generate_key(), generate_key()
     record = refused_body_digest(make_cipher(old_key), wire)
-    assert verify_refused_body_digest(make_cipher(old_key), wire, record)
-    assert not verify_refused_body_digest(make_cipher(old_key), guess, record)
-    # Another key, or none, confirms nothing.
-    assert not verify_refused_body_digest(make_cipher(new_key), wire, record)
-    assert not verify_refused_body_digest(_KEYLESS, wire, record)
+    assert verify_refused_body_digest(make_cipher(old_key), wire, record) is True
+    assert verify_refused_body_digest(make_cipher(old_key), guess, record) is False
+    # Another key, or none, cannot check it: an "unknown", never a "not this body".
+    assert verify_refused_body_digest(make_cipher(new_key), wire, record) is None
+    assert verify_refused_body_digest(_KEYLESS, wire, record) is None
     # A rotation keeps it checkable while the retired key stays configured.
-    assert verify_refused_body_digest(make_cipher(new_key, [old_key]), wire, record)
-    # A record that is not one, or names another scheme, is an answer, not a crash.
+    assert verify_refused_body_digest(make_cipher(new_key, [old_key]), wire, record) is True
+    # A record that is not one (a null body_hmac included), or names another scheme, is "unknown".
     assert record is not None
     for bad in (None, "x", {}, {**record, "kdf": "hkdf-sha256:other"}, {**record, "digest": "zz"}):
-        assert not verify_refused_body_digest(make_cipher(old_key), wire, bad)
+        assert verify_refused_body_digest(make_cipher(old_key), wire, bad) is None
 
 
-def test_a_keyless_store_records_no_digest_rather_than_a_plain_hash() -> None:
+def test_the_digest_is_not_the_edit_resend_audit_digest_of_the_same_bytes() -> None:
+    # Its own HKDF label: the same bytes under the same audit key digest differently, so a refused
+    # body's digest can never pass for an edit-resend audit digest, or the reverse.
+    cipher = make_cipher(generate_key())
+    wire = _parse_failure(3000)
+    refused = refused_body_digest(cipher, wire)
+    audit = audit_body_digests(cipher, body=wire.decode())
+    assert refused is not None and audit is not None
+    assert refused["key_id"] == audit["key_id"]  # one parent key
+    assert refused["digest"] != audit["body"] and refused["kdf"] != audit["kdf"]
+
+
+class _NoInHeapKey:
+    """A cipher that encrypts but holds no audit key in heap, as a Vault Transit cipher does. Only
+    the one method the digest reads."""
+
+    def audit_mac_key(self) -> None:
+        return None
+
+
+def test_a_store_with_no_in_heap_key_records_no_digest_rather_than_a_plain_hash() -> None:
     assert refused_body_digest(_KEYLESS, b"MSH|anything") is None
+    transit_like = cast(Cipher, _NoInHeapKey())
+    assert refused_body_digest(transit_like, b"MSH|anything") is None
+    allowance = RefusedBodyAllowance()
+    bounded = allowance.bound(
+        "IB_A", b"NOT-HL7", None, ContentType.TEXT.value, "e", cipher=transit_like
+    )
+    assert json.loads(bounded.metadata)[METADATA_KEY]["body_hmac"] is None
 
 
 async def test_a_keyed_store_records_the_keyed_digest_of_every_refusal(tmp_path: Path) -> None:
@@ -455,7 +485,7 @@ async def test_a_keyed_store_records_the_keyed_digest_of_every_refusal(tmp_path:
     assert [r["stored"] for r in recs] == ["whole", "head", "head"]
     first = recs[0]["body_hmac"]
     assert all(r["body_hmac"] == first for r in recs)
-    assert verify_refused_body_digest(make_cipher(key), body, first)
+    assert verify_refused_body_digest(make_cipher(key), body, first) is True
     assert "sha256" not in recs[0] and first["digest"] not in _plain_digests(body)
 
 

@@ -12,14 +12,11 @@ one. So a flood of refusals would have grown the store unmetered on a first depl
 What this bounds is the BYTES each refusal stores, never the count of refusals:
 
 * Every refused body's length is always recorded, in the message's engine-internal metadata under
-  :data:`METADATA_KEY`, and so is a KEYED digest of it, ``body_hmac``
-  (:func:`~messagefoundry.store.crypto.refused_body_digest`), whenever the store holds an in-heap
-  key. A plain hash would let anyone who can read the row confirm a guessed body, or the guessed
-  tail of a head, offline. The keyed digest lets a holder of the store key confirm whether a
-  candidate copy, such as the sender's own, is the body the row refused, which a head alone cannot
-  show (:func:`~messagefoundry.store.crypto.verify_refused_body_digest`). Nothing in the API or the
-  console shows or checks it today. On a store with no in-heap key (keyless, or Vault Transit),
-  ``body_hmac`` is recorded as ``null``: no digest, never a plain hash.
+  :data:`METADATA_KEY`, beside ``body_hmac``: a keyed digest of it
+  (:func:`~messagefoundry.store.crypto.refused_body_digest`), or ``null`` on a store with no
+  in-heap key, never a plain hash. docs/CONFIGURATION.md, under
+  ``[inbound].refused_body_allowance_bytes``, is the one statement of when it is recorded, why it is
+  keyed and what it is for.
 * The whole body is stored only while its inbound's rolling byte allowance covers it. Past that,
   the first ``head_bytes`` of it are stored, and the stored ``error`` says so. The API refuses to
   edit and resubmit a row stored that way (:func:`head_only_resubmit_refusal`), since its body is cut.

@@ -930,14 +930,35 @@ def reseal_rotation_fingerprints(
     return updates
 
 
-def _derive_body_digest_key(audit_key: bytes, info: bytes = _BODY_DIGEST_INFO) -> bytes:
-    """The body-digest key derived from one audit-chain key, under its own label. ``info`` is that
-    label: the edit-resend audit digest's by default, the refused-body digest's for that one."""
+def _derive_from_audit_key(audit_key: bytes, info: bytes) -> bytes:
+    """A 32-byte key HKDF-SHA256 derives from one audit-chain key under the label ``info``. Callers
+    go through a named wrapper, so no call site can pick up another digest's label by omission."""
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
     hkdf = HKDF(algorithm=hashes.SHA256(), length=_BODY_DIGEST_LEN, salt=None, info=info)
     return hkdf.derive(audit_key)
+
+
+def _derive_body_digest_key(audit_key: bytes) -> bytes:
+    """The body-digest key derived from one audit-chain key, under its own label."""
+    return _derive_from_audit_key(audit_key, _BODY_DIGEST_INFO)
+
+
+def _mac_matches(mac: HMAC, digest: str) -> bool | None:
+    """Whether ``mac`` matches the hex ``digest``, compared in constant time; ``None`` when
+    ``digest`` is not hex, so it could not be checked."""
+    try:
+        expected = bytes.fromhex(digest)
+    except ValueError:
+        return None
+    from cryptography.exceptions import InvalidSignature
+
+    try:
+        mac.verify(expected)
+    except InvalidSignature:
+        return False
+    return True
 
 
 def _bytes_mac(key: bytes, data: bytes) -> HMAC:
@@ -1026,25 +1047,12 @@ def verify_audit_body_digest(
     audit_key = cipher.audit_mac_keyring().get(key_id)
     if audit_key is None or not body or not isinstance(digest, str):
         return False
-    try:
-        expected = bytes.fromhex(digest)
-    except ValueError:
-        return False
-    from cryptography.exceptions import InvalidSignature
-
-    try:
-        _body_mac(_derive_body_digest_key(audit_key), body).verify(expected)
-    except InvalidSignature:
-        return False
-    return True
+    return _mac_matches(_body_mac(_derive_body_digest_key(audit_key), body), digest) is True
 
 
-# HKDF info label for the refused-body digest key (vault BACKLOG #2608). A body the listener refused
-# before ingress may be stored as its head only; its metadata then keeps a keyed digest of the whole
-# body as received. Keyed for the reason the edit-resend digest is: a plain hash beside a head would
-# let anyone who can read the row confirm a guessed tail offline. Its own label, not the edit-resend
-# one: this digest is over the received BYTES and that one over the stored TEXT, so a match between
-# the two would claim an equality of bodies it never checked.
+# HKDF info label for the refused-body digest key (vault BACKLOG #2608). Its own label, not the
+# edit-resend one: this digest is over the received BYTES and that one over the stored TEXT, so a
+# match between the two would claim an equality of bodies it never checked.
 _REFUSED_BODY_DIGEST_INFO = b"mefor/refused-body-digest/v1"
 #: The two HKDF-SHA256 steps a refused-body digest key takes from the DEK, as its record names them.
 REFUSED_BODY_DIGEST_KDF = (
@@ -1052,62 +1060,53 @@ REFUSED_BODY_DIGEST_KDF = (
 )
 
 
+def _derive_refused_body_digest_key(audit_key: bytes) -> bytes:
+    """The refused-body digest key derived from one audit-chain key, under its own label."""
+    return _derive_from_audit_key(audit_key, _REFUSED_BODY_DIGEST_INFO)
+
+
 def refused_body_digest(cipher: Cipher, wire: bytes) -> dict[str, str] | None:
     """A keyed digest of a body the listener refused before ingress, exactly as received (vault
-    BACKLOG #2608).
+    BACKLOG #2608). When the engine records it, and why it is keyed, is stated once in
+    docs/CONFIGURATION.md under ``[inbound].refused_body_allowance_bytes``.
 
     Returns ``{"alg", "kdf", "key_id", "digest"}``: HMAC-SHA256 under a key HKDF-SHA256 derives from
     the in-heap audit-chain key under ``mefor/refused-body-digest/v1``, and :func:`audit_key_id` of
     that audit key, so :func:`verify_refused_body_digest` still finds it after a rotation while the
     retired key stays configured. Returns ``None`` when there is no in-heap key: a keyless store, or
-    a Vault Transit cipher whose audit key never enters the engine. The caller records that as no
-    digest, never as a plain hash. An empty body digests like any other, since it is what came in.
-
-    Without the key a reader can neither recover nor test a body from the digest. With it, and a
-    candidate copy such as the sender's own, anyone can confirm whether that copy is the refused body,
-    which a row stored as its head cannot show on its own."""
+    a Vault Transit cipher whose audit key never enters the engine. An empty body digests like any
+    other, since it is what came in."""
     audit_key = cipher.audit_mac_key()
     if audit_key is None:
         return None
-    key = _derive_body_digest_key(audit_key, _REFUSED_BODY_DIGEST_INFO)
     return {
         "alg": BODY_DIGEST_ALG,
         "kdf": REFUSED_BODY_DIGEST_KDF,
         "key_id": audit_key_id(audit_key),
-        "digest": _bytes_mac(key, wire).finalize().hex(),
+        "digest": _bytes_mac(_derive_refused_body_digest_key(audit_key), wire).finalize().hex(),
     }
 
 
-def verify_refused_body_digest(cipher: Cipher, wire: bytes, record: object) -> bool:
+def verify_refused_body_digest(cipher: Cipher, wire: bytes, record: object) -> bool | None:
     """Whether ``wire`` is the body a :func:`refused_body_digest` ``record`` was taken of (vault
-    BACKLOG #2608).
+    BACKLOG #2608), compared in constant time.
 
-    ``record`` is the stored dict as read back. ``False`` for anything that is not one, a record that
-    names another scheme, an audit key the cipher's keyring does not hold (a keyless cipher holds
-    none), or a mismatch. The comparison is constant-time."""
+    ``True`` for a match and ``False`` for a mismatch. ``None`` when it cannot be checked, so a
+    caller never reads "unknown" as "not this body": ``record`` is not such a dict (a ``null``
+    ``body_hmac`` included), it names another scheme, or its audit key is not in the cipher's
+    keyring, as after the retired key is dropped from configuration, and always on a keyless
+    cipher."""
     if not isinstance(record, dict):
-        return False
+        return None
     if (record.get("alg"), record.get("kdf")) != (BODY_DIGEST_ALG, REFUSED_BODY_DIGEST_KDF):
-        return False
+        return None
     key_id, digest = record.get("key_id"), record.get("digest")
     if not isinstance(key_id, str) or not isinstance(digest, str):
-        return False
+        return None
     audit_key = cipher.audit_mac_keyring().get(key_id)
     if audit_key is None:
-        return False
-    try:
-        expected = bytes.fromhex(digest)
-    except ValueError:
-        return False
-    from cryptography.exceptions import InvalidSignature
-
-    try:
-        _bytes_mac(_derive_body_digest_key(audit_key, _REFUSED_BODY_DIGEST_INFO), wire).verify(
-            expected
-        )
-    except InvalidSignature:
-        return False
-    return True
+        return None
+    return _mac_matches(_bytes_mac(_derive_refused_body_digest_key(audit_key), wire), digest)
 
 
 def new_store_salt() -> bytes:

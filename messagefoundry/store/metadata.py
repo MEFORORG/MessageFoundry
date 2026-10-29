@@ -128,9 +128,9 @@ def user_metadata(metadata_json: str | None) -> str | None:
     purpose: edit-and-resubmit checks the engine-internal refused-body record and refuses a row stored
     as a head (``head_only_resubmit_refusal`` in ``pipeline/refused_body.py``, vault BACKLOG #2608).
     That refusal names the body's length and the head bound, never the digest or a byte of the body.
-    Returns
-    ``None`` for absent/empty/unparseable metadata or an empty user bag, so the wire field is ``null``
-    rather than ``"{}"`` when nothing was attached."""
+
+    Returns ``None`` for absent/empty/unparseable metadata or an empty user bag, so the wire field is
+    ``null`` rather than ``"{}"`` when nothing was attached."""
     if not metadata_json:
         return None
     try:

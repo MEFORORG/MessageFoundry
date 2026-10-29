@@ -2103,7 +2103,8 @@ class InboundSettings(_Section):
 
     # Vault BACKLOG #2608: the per-inbound refused-body allowance. A body a listener refuses before
     # ingress (at least decode, NUL, size, declared type, parse, strict validation, streaming detach) is
-    # recorded as an ERROR row, and its length and SHA-256 always are. The WHOLE body is stored only
+    # recorded as an ERROR row, and its length always is (with a keyed digest, never a plain hash;
+    # docs/CONFIGURATION.md says when). The WHOLE body is stored only
     # while its inbound's rolling byte allowance covers it; past that, the first
     # refused_body_head_bytes of it are. A body whose head is the whole of it is stored whole. This
     # bounds the bytes a reject flood stores, never the count of refusals, and never pauses intake, so
