@@ -40,7 +40,6 @@ class Entry:
 
     node_id: str
     reason: str
-    line: int
 
     @property
     def path(self) -> str:
@@ -57,14 +56,20 @@ def entries_from(text: str) -> list[Entry]:
     """The entries in ``text``, in order, with blanks and ``#`` comments dropped.
 
     Raises ``ValueError`` on a line that is not a node id plus a reason, on a reason that names no
-    ``#<n>`` row, and on a node id listed twice.
+    ``#<n>`` row, and on a node id listed twice. Also on a byte-order mark or a NUL anywhere,
+    because ci.yml's shell reader (`grep -vE` then `cut -d:`) would read either differently: a BOM
+    turns the first comment line into an "entry" whose words become pytest arguments, and a NUL
+    flips grep into binary mode for the whole file.
     """
+    for bad, name in (("\ufeff", "a byte-order mark"), ("\x00", "a NUL")):
+        if bad in text:
+            raise ValueError(
+                f"{QUARANTINE.name} carries {name}, which ci.yml's shell reader misreads"
+            )
     kept: list[Entry] = []
     seen: set[str] = set()
     for number, physical in enumerate(text.split("\n"), start=1):
-        # A byte-order mark an editor put in front of the first line is not part of it.
-        line = physical.removeprefix("\ufeff") if number == 1 else physical
-        line = line.removesuffix("\r").strip()
+        line = physical.removesuffix("\r").strip()
         if not line or line.startswith("#"):
             continue
         found = _LINE.fullmatch(line)
@@ -82,7 +87,7 @@ def entries_from(text: str) -> list[Entry]:
         if node in seen:
             raise ValueError(f"{QUARANTINE.name} line {number}: {node} is listed twice")
         seen.add(node)
-        kept.append(Entry(node, reason, number))
+        kept.append(Entry(node, reason))
     return kept
 
 
@@ -114,9 +119,8 @@ def mark_quarantined(items: Iterable[Any], tests_dir: Path) -> None:
     tests/test_conftest_name_collision_guard.py), and the test of this hook needs to drive it.
     Scoped to files directly in ``tests_dir``, as the tooling partition is.
     """
-    quarantined = (
-        node_ids()
-    )  # raises if the list is absent or malformed -- see the module docstring
+    # Raises if the list is absent or malformed -- see the module docstring.
+    quarantined = node_ids()
     for item in items:
         path = getattr(item, "path", None)
         if (

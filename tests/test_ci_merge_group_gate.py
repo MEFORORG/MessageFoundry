@@ -87,7 +87,8 @@ _SELF_GATED_ON_QUEUE = {
     "load-test",
     "load-test-sqlserver",
     "windows-service-smoke",
-    # BACKLOG #4773, owner ruling 2026-10-29: the quarantined timing tests keep running in the queue.
+    # BACKLOG #4773: the quarantine job copies the `Tests (pytest)` step's condition, queue included.
+    # That is this change's choice, not the ruling's, and it is advisory there (job continue-on-error).
     "timing-quarantine",
 }
 

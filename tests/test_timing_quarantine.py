@@ -115,6 +115,7 @@ def test_the_marking_function_marks_exactly_the_listed_tests() -> None:
     param = _item(_ROOT / first.path, f"{first.node_id}[case-1]")
     elsewhere = _item(_ROOT / "packaging" / Path(first.path).name, first.node_id)
     timing_quarantine.mark_quarantined([*listed, sibling, param, elsewhere], _TESTS)
+    assert len(listed) >= 1, "no stand-in items were built, so the check below proves nothing"
     unmarked = [i.nodeid for i in listed if "timing_quarantine" not in i.marks]
     assert not unmarked, f"the hook left these listed tests unmarked: {unmarked}"
     assert "timing_quarantine" not in sibling.marks, "the hook marked an unlisted sibling test"
@@ -153,16 +154,35 @@ def test_the_marker_is_registered() -> None:
     assert any(m.startswith("timing_quarantine:") for m in markers)
 
 
-def test_the_quarantine_job_runs_the_marker_on_the_engine_legs_own_matrix() -> None:
-    """The `test` job's matrix carries ubuntu-latest and windows-2025 (and windows-2022) here, so
-    reading the same output runs the list wherever the engine legs ran it, with the same per-test
-    caps. tests/test_ci_step_margin.py pins what those legs are."""
+def _quarantine_step(job: dict[str, Any]) -> dict[str, Any]:
+    step: dict[str, Any] = next(
+        s for s in job["steps"] if "-m timing_quarantine " in str(s.get("run", ""))
+    )
+    return step
+
+
+def _install_run(job: dict[str, Any]) -> str:
+    found = [s for s in job["steps"] if str(s.get("name", "")).startswith("Install project")]
+    assert len(found) == 1, f"expected one `Install project` step, found {len(found)}"
+    # The commands only: the `test` job's run body carries its own comment lines.
+    lines = (line.strip() for line in str(found[0]["run"]).splitlines())
+    return "\n".join(line for line in lines if line and not line.startswith("#"))
+
+
+def test_the_quarantine_job_runs_the_marker_where_and_as_the_engine_legs_did() -> None:
+    """Same matrix, runner, extras and per-test caps as the `test` job.
+
+    The `test` job's matrix carries ubuntu-latest, windows-2022 and windows-2025 here, so reading
+    the same output runs the list wherever the engine legs ran it. The same install line keeps a
+    test from being skipped here for an extra the engine legs had.
+    Falsified by dropping `vault,sftp` from this job's install line: RED. Restored.
+    """
     jobs = _ci_jobs()
     job = jobs[_JOB]
     assert job["strategy"]["matrix"] == jobs["test"]["strategy"]["matrix"]
     assert job["runs-on"] == jobs["test"]["runs-on"]
-    step = next(s for s in job["steps"] if "-m timing_quarantine " in str(s.get("run", "")))
-    env = step.get("env") or {}
+    assert _install_run(job) == _install_run(jobs["test"])
+    env = _quarantine_step(job).get("env") or {}
     assert env.get("PYTEST_TIMEOUT") == "${{ matrix.pytest_timeout }}", env
     assert env.get("FAULT_TIMEOUT") == "${{ matrix.fault_timeout }}", env
 
@@ -170,11 +190,12 @@ def test_the_quarantine_job_runs_the_marker_on_the_engine_legs_own_matrix() -> N
 def test_the_quarantine_job_gates_no_merge_and_cannot_fail_the_run() -> None:
     """The ruling removed these tests from the merge gate; this keeps the job from putting it back.
 
-    A failed job fails the whole CI run, and failure-signal.yml keys on the run's conclusion, so the
-    pytest step must be `continue-on-error` and report through a warning instead.
+    A failed job fails the whole CI run unless the JOB carries `continue-on-error`, and
+    failure-signal.yml keys on the run's conclusion. A step-level flag would cover one step and
+    leave the apt and install steps able to fail the run, so the flag is checked on the job.
 
-    Falsified by adding the job to ci-gate's needs, and separately by dropping `continue-on-error`:
-    RED both times. Restored.
+    Falsified by adding the job to ci-gate's needs, and separately by moving `continue-on-error`
+    from the job to the test step: RED both times. Restored.
     """
     jobs = _ci_jobs()
     assert _JOB not in needs_of(jobs["ci-gate"]), "ci-gate must not need the quarantine job"
@@ -183,9 +204,9 @@ def test_the_quarantine_job_gates_no_merge_and_cannot_fail_the_run() -> None:
     assert required, "required-contexts.txt parsed to nothing, so this check proves nothing"
     reporting = [c for c in required if resolve(c) == ("ci.yml", _JOB)]
     assert not reporting, f"{reporting} resolve to the quarantine job; the ruling keeps it advisory"
-    step = next(s for s in jobs[_JOB]["steps"] if "-m timing_quarantine " in str(s.get("run", "")))
-    assert step.get("continue-on-error") is True
-    assert "::warning" in str(step["run"]) and "GITHUB_STEP_SUMMARY" in str(step["run"])
+    assert jobs[_JOB].get("continue-on-error") is True
+    run = str(_quarantine_step(jobs[_JOB])["run"])
+    assert "::warning" in run and "GITHUB_STEP_SUMMARY" in run
 
 
 def test_no_quarantined_test_is_in_the_tooling_tier() -> None:
@@ -203,6 +224,9 @@ def test_no_quarantined_test_is_in_the_tooling_tier() -> None:
         ("tests/test_x.py::test_y  flaky, no row\n", "names no #<row>"),
         ("tests/test_x.py::test_y[a]  #1\n", "an entry is"),
         ("tests/test_x.py::test_y  #1\ntests/test_x.py::test_y  #2\n", "listed twice"),
+        # The two inputs ci.yml's shell reader would read differently from this one.
+        ("\ufeff# header\ntests/test_x.py::test_y  #1\n", "a byte-order mark"),
+        ("# a\x00b\ntests/test_x.py::test_y  #1\n", "a NUL"),
     ],
 )
 def test_the_reader_refuses_a_malformed_list(text: str, complaint: str) -> None:
@@ -210,8 +234,8 @@ def test_the_reader_refuses_a_malformed_list(text: str, complaint: str) -> None:
         timing_quarantine.entries_from(text)
 
 
-def test_the_reader_keeps_a_class_method_and_tolerates_a_bom_and_crlf() -> None:
-    text = "﻿# header\r\n\r\ntests/test_x.py::TestA::test_b  timing; row #12\r\n"
+def test_the_reader_keeps_a_class_method_and_tolerates_crlf() -> None:
+    text = "# header\r\n\r\ntests/test_x.py::TestA::test_b  timing; row #12\r\n"
     [entry] = timing_quarantine.entries_from(text)
     assert entry.path == "tests/test_x.py"
     assert entry.qualname == ("TestA", "test_b")

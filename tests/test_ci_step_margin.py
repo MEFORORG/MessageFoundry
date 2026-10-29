@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
+from _bash_resolver import probe_env, require_bash
 
 from scripts.ci.step_margin import (
     DEFAULT_MIN_MARGIN,
@@ -903,43 +906,69 @@ def test_the_margin_check_keys_on_the_STEPS_OWN_CONCLUSION_never_the_jobs() -> N
         assert "job.status" not in joined and "job.conclusion" not in joined
 
 
-#: The one spelling that makes the engine check advisory in the queue and nowhere else, under the
-#: owner ruling of 2026-10-29 quoted beside the step in ci.yml.
-_MERGE_GROUP_ONLY = "${{ github.event_name == 'merge_group' }}"
+@pytest.fixture(scope="module")
+def bash(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return Path(require_bash(tmp_path_factory.mktemp("resolve-bash")))
 
 
-def test_the_engine_margin_check_is_advisory_in_merge_group_and_blocking_on_pull_request() -> None:
-    """The owner ruling of 2026-10-29, pinned until #3515's re-measure reverts it.
+@pytest.mark.parametrize(
+    ("event", "script_rc", "step_rc", "warns"),
+    [
+        ("pull_request", 1, 1, False),  # a LOW margin still blocks before enqueue
+        ("merge_group", 1, 0, True),  # ... and is a warning in the queue
+        ("merge_group", 2, 2, False),  # a gate that could not measure still fails, queue or not
+        ("merge_group", 0, 0, False),
+        ("push", 1, 1, False),
+    ],
+)
+def test_the_engine_margin_check_is_advisory_only_for_a_low_margin_in_merge_group(
+    bash: Path, tmp_path: Path, event: str, script_rc: int, step_rc: int, warns: bool
+) -> None:
+    """The owner ruling of 2026-10-29 (quoted beside the step in ci.yml), pinned until #3515's
+    re-measure reverts it. Runs the step's REAL run body under the runner's own `bash -eo
+    pipefail`, with `python` stubbed to the script's exit code, so the pin is on behaviour rather
+    than on a spelling.
 
-    The condition must name merge_group and nothing wider: a bare `true`, or an expression that
-    also matches pull_request, would stop the check gating before enqueue, which is the run the
-    ruling keeps blocking. So the whole expression is compared, not searched for a substring.
-
-    The run body must still speak when the advisory branch fires, or a queue miss would leave
-    nothing but a step-level red under a green job.
-
-    Falsified by setting `continue-on-error: true`, and separately by deleting the `::warning`
+    Falsified by widening the branch to `"$rc" -ne 0`, and separately by deleting the `::warning`
     line: RED both times. Restored.
     """
     check = _margin_check("test")
-    condition = check.get("continue-on-error")
-    print(f"[step-margin] engine check continue-on-error: {condition!r}")
-    assert condition == _MERGE_GROUP_ONLY, (
-        f"the engine margin check must be advisory only in merge_group; it reads {condition!r}"
+    assert "continue-on-error" not in check, "continue-on-error would also pass exit 2 in the queue"
+    assert (check.get("env") or {}).get("EVENT_NAME") == "${{ github.event_name }}"
+    summary = tmp_path / "summary.md"
+    summary.write_text("", encoding="utf-8")
+    env = probe_env(
+        bash,
+        dict(
+            os.environ,
+            EVENT_NAME=event,
+            LEG="ubuntu-latest",
+            STEP_CAP="46",
+            TESTS_OUTCOME="success",
+            GITHUB_STEP_SUMMARY=summary.as_posix(),
+        ),
     )
-    env = check.get("env") or {}
-    assert env.get("EVENT_NAME") == "${{ github.event_name }}", env
-    run = str(check.get("run", ""))
-    assert '"$EVENT_NAME" = "merge_group"' in run
-    assert "::warning" in run and "GITHUB_STEP_SUMMARY" in run
-    assert run.rstrip().endswith("exit $rc"), "the step must still exit non-zero on a miss"
+    stub = f"python() {{ return {script_rc}; }}\n"
+    done = subprocess.run(
+        [str(bash), "-eo", "pipefail", "-c", stub + str(check["run"])],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+    )
+    print(f"[step-margin] {event} rc {script_rc}: step {done.returncode}; {done.stdout.strip()!r}")
+    assert done.returncode == step_rc, done.stdout + done.stderr
+    assert ("::warning" in done.stdout) is warns, done.stdout
+    assert ("WARNING" in summary.read_text(encoding="utf-8")) is warns
 
 
 def test_the_web_console_margin_check_stays_blocking_on_every_event() -> None:
-    """The ruling names the engine suite's check only. Falsified by copying the engine step's
-    `continue-on-error` onto this one: RED. Restored."""
+    """The ruling names the engine suite's check only. Falsified by adding a merge_group branch or
+    a `continue-on-error` to this step: RED. Restored."""
     check = _margin_check("webconsole")
     assert "continue-on-error" not in check, check.get("continue-on-error")
+    assert "merge_group" not in str(check.get("run", ""))
 
 
 def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_suite() -> None:

@@ -1022,7 +1022,8 @@ jobs:
       #
       # The remaining margin is a SHARED budget across every PR that lands, and it is now ACCOUNTED
       # FOR: `scripts/ci/step_margin.py` runs after the gated step below and reds the leg when a
-      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1). It used to run
+      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1). In
+      # merge_group the engine leg only warns, until #3515; the margin step says why. It used to run
       # after BOTH gated steps; the web console suite moved to its own `webconsole` job and took its
       # half of the check with it, so each job now measures the one gated step it owns. Three PRs
       # each adding a minute of Windows time is still individually blameless -- the difference is that
@@ -1179,15 +1180,17 @@ jobs:
       # pull_request run saw. Two PRs that each pass alone can together breach the margin, and only
       # the queue run sees that sum; while this is advisory it lands, and the next pull_request run
       # is the first blocking check to red, on a change that did not cause it.
-      # `continue-on-error` keeps the job, and so the required `test` context, green; the step's own
-      # outcome stays `failure`, and the run body below adds a warning annotation and a summary line,
-      # so the miss stays visible. `ci-gate` does not need `test` at all: each `test` leg is its own
-      # required context, judged by its job conclusion. REVERT THIS (drop `continue-on-error` and the
-      # merge_group branch below) when #3515's re-measure of the cap lands.
+      # ONLY THE VERDICT IS ADVISORY, NOT THE INSTRUMENT. In merge_group the run body below turns exit
+      # 1 (LOW margin) into a warning annotation plus a summary line and exits 0, so the job, and so
+      # the required `test` context, stays green while the miss stays visible. Exit 2 (the script
+      # could not measure: a missing mark, a failed self-check control, no baseline row) still fails
+      # the step in the queue too, because the ruling is about the cap, not a broken gate. Not
+      # `continue-on-error`, which would have let exit 2 through as well. `ci-gate` does not need
+      # `test` at all: each `test` leg is its own required context, judged by its job conclusion.
+      # REVERT THIS (drop the merge_group branch below) when #3515's re-measure of the cap lands.
       # tests/test_ci_step_margin.py pins the condition.
       - name: Step margin -- engine suite
         if: always()
-        continue-on-error: ${{ github.event_name == 'merge_group' }}
         env:
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
           STEP_CAP: ${{ matrix.step_timeout }}
@@ -1200,12 +1203,13 @@ jobs:
           python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
             --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
             --since before-tests --until now || rc=$?
-          if [ "$rc" -ne 0 ] && [ "$EVENT_NAME" = "merge_group" ]; then
-            msg="Step margin -- engine suite exited $rc on $LEG. ADVISORY in merge_group under the owner ruling of 2026-10-29 until #3515 re-measures the cap; it still blocks on pull_request."
+          if [ "$rc" -eq 1 ] && [ "$EVENT_NAME" = "merge_group" ]; then
+            msg="Step margin -- engine suite found a LOW margin on $LEG. ADVISORY in merge_group under the owner ruling of 2026-10-29 until #3515 re-measures the cap; it still blocks on pull_request."
             echo "::warning title=Step margin advisory (merge_group)::$msg"
             if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
               printf '\n**WARNING:** %s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
             fi
+            exit 0
           fi
           exit $rc
 
@@ -2463,11 +2467,12 @@ jobs:
   # tests/test_timing_quarantine.py asserts it stays out of both. Do not add it to
   # `.github/required-contexts.txt`.
   #
-  # AND ITS RED IS A WARNING, NOT A FAILED JOB. A failed job, required or not, fails the whole CI run,
-  # and failure-signal.yml keys on the RUN's conclusion: it would label the PR `ci-red` as if a
-  # required check went red, and on merge_group post that the queue ejected a PR the queue in fact
-  # merged. So the test step is `continue-on-error: true` and says what failed in a warning annotation,
-  # the step summary and the uploaded junit.
+  # AND ITS RED MUST NOT FAIL THE RUN. A failed job fails the whole CI run unless the job carries
+  # `continue-on-error`, and failure-signal.yml keys on the RUN's conclusion: it would label the PR
+  # `ci-red` as if a required check went red, and on merge_group post that the queue ejected a PR the
+  # queue in fact merged. So `continue-on-error: true` is on the JOB, not a step: any step's failure
+  # (the apt mirror, the install, the tests) still shows this job red, and none fails the run. The
+  # test step also writes a warning annotation, a summary line and the uploaded junit.
   #
   # THE MATRIX IS THE `test` JOB'S OWN, read from `changes`, so these tests run on every leg the engine
   # suite would have run them on (ubuntu-latest, windows-2022 and windows-2025 here; ubuntu only on a
@@ -2482,6 +2487,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ${{ matrix.hosted }}
+    continue-on-error: true
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -2520,17 +2526,20 @@ jobs:
             pyproject.toml
             requirements.lock
 
-      - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
+      # THE `test` JOB'S OWN INSTALL LINE, extras included, so a quarantined test meets the environment
+      # it met on the engine legs and is not skipped here for a missing extra.
+      # tests/test_timing_quarantine.py pins the two lines equal.
+      - name: Install project (the engine test legs' extras)
         run: |
-          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp]" -e packaging/messagefoundry-webconsole
 
-      # The file list is read from the entry lines here; tests/_timing_quarantine.py's own rules keep a
-      # path free of spaces and quotes, so the unquoted expansion below splits only between paths. An
-      # EMPTY list must not reach pytest, which would then collect all of `testpaths`; the change that
-      # empties it retires this job, and tests/test_timing_quarantine.py reds until it does. Anything
-      # else that selects nothing makes pytest exit 5, which this step reports like a failure.
+      # The file list is read from the entry lines here; tests/_timing_quarantine.py refuses a line
+      # this shell reader would split differently (a space, a quote, a BOM, a NUL), so the unquoted
+      # expansion below splits only between paths. grep's exit 1 (no entry line) is the only failure
+      # tolerated, and it is an error too: an EMPTY list must not reach pytest, which would then
+      # collect all of `testpaths`, and the change that empties it retires this job. Anything else
+      # that selects nothing makes pytest exit 5, which this step reports like a failure.
       - name: Quarantined timing tests (pytest)
-        continue-on-error: true
         timeout-minutes: 20
         env:
           QT_QPA_PLATFORM: offscreen
@@ -2539,11 +2548,17 @@ jobs:
           PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
           LEG: ${{ matrix.os }}
         run: |
-          files="$(grep -vE '^[[:space:]]*(#|$)' tests/timing_quarantine.txt | cut -d: -f1 | sort -u || true)"
-          if [ -z "$files" ]; then
-            echo "::notice::tests/timing_quarantine.txt lists no tests; nothing to run."
-            exit 0
+          grc=0
+          entries="$(grep -vE '^[[:space:]]*(#|$)' tests/timing_quarantine.txt)" || grc=$?
+          if [ "$grc" -gt 1 ]; then
+            echo "::error::could not read tests/timing_quarantine.txt (grep exit $grc)"
+            exit 2
           fi
+          if [ -z "$entries" ]; then
+            echo "::error::tests/timing_quarantine.txt lists no tests; retire this job with the last entry."
+            exit 1
+          fi
+          files="$(printf '%s\n' "$entries" | cut -d: -f1)"
           rc=0
           # shellcheck disable=SC2086
           pytest -q -m timing_quarantine $files -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --junitxml=timing-quarantine-junit.xml --durations=20 || rc=$?
