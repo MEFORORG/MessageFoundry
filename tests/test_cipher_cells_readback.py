@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import shutil
 import sqlite3
 from pathlib import Path
@@ -592,13 +593,45 @@ def _set(db: Path, table: str, column: str, rowid: int, value: object) -> None:
         conn.close()
 
 
+def _like_that_skips_blobs(pattern: object, value: object) -> bool:
+    """SQLite's ``like(pattern, value)`` as a build with ``SQLITE_LIKE_DOESNT_MATCH_BLOBS`` runs it:
+    a BLOB never matches. Ubuntu's SQLite is built that way and the Windows one is not, so this
+    puts the Linux behaviour on every platform. ``%`` and ``_`` are the only wildcards the walk's
+    patterns use; case is ignored for ASCII, as SQLite ignores it."""
+    if value is None or pattern is None:
+        return False
+    if isinstance(value, bytes):
+        return False
+    rx = "".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in str(pattern))
+    return re.fullmatch(rx, str(value), flags=re.DOTALL | re.IGNORECASE | re.ASCII) is not None
+
+
+@pytest.fixture(params=["native-like", "like-skips-blobs"])
+def like_build(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run a restore-verify test under this platform's own LIKE, and again under a LIKE that never
+    matches a BLOB, whatever SQLite this machine was built with."""
+    if request.param == "like-skips-blobs":
+        real = connect_readonly  # what dr_backup imported from cipher_cells
+
+        def connect(path: str | Path, *, busy_timeout: float) -> sqlite3.Connection:
+            conn = real(path, busy_timeout=busy_timeout)
+            conn.create_function("like", 2, _like_that_skips_blobs, deterministic=True)
+            # The control: the override is in force, so a BLOB no longer matches.
+            assert conn.execute("SELECT x'6d66656e633a' LIKE 'mfenc:%'").fetchone()[0] == 0
+            return conn
+
+        monkeypatch.setattr(dr_backup, "connect_readonly", connect)
+    return str(request.param)
+
+
 @pytest.mark.parametrize("damaged", [False, True], ids=["intact", "flipped"])
 def test_a_sealed_value_stored_as_a_blob_fails_as_a_blob(
-    tmp_path: Path, _template: tuple[Path, StoreSettings], damaged: bool
+    tmp_path: Path, _template: tuple[Path, StoreSettings], damaged: bool, like_build: str
 ) -> None:
-    """LIKE matches a BLOB that starts with the marker, so the walk selects it as sealed. The
-    store's reader cannot take a BLOB as a sealed cell, so it fails, intact or not, and says why:
-    read as ``str(bytes)`` it once looked unmarked and a damaged one passed."""
+    """A sealed value stored as a BLOB is selected as sealed whether or not this SQLite's LIKE
+    matches a BLOB, and fails: the store's reader cannot take a BLOB as a sealed cell, intact or
+    not. Read as ``str(bytes)`` it once looked unmarked, and where LIKE skips a BLOB it was never
+    read at all, so a damaged one passed the restore-verify (engine PR 2608, the ubuntu leg)."""
     db, settings = _copy(_template, tmp_path)
     rowid, value = _first_sealed(db, "messages", "raw")
     if damaged:

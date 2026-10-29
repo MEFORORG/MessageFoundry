@@ -257,10 +257,21 @@ def _surface_sealed(conn: sqlite3.Connection, spec: CipherCell, tables: set[str]
     ):
         return True
     marked = conn.execute(
-        f"SELECT 1 FROM {spec.table} WHERE {spec.column} LIKE ? LIMIT 1",  # declared constants
+        f"SELECT 1 FROM {spec.table} WHERE {_sealed_sql(spec.column)} LIMIT 1",  # declared constants
         (f"{MARKER_PREFIX}%",),
     ).fetchone()
     return marked is not None
+
+
+def _sealed_sql(column: str) -> str:
+    """The SQL test that calls a value of ``column`` sealed, with one ``?`` for the marker pattern.
+
+    ``LIKE 'mfenc:%'`` alone is not the same test on every platform. A SQLite built with
+    ``SQLITE_LIKE_DOESNT_MATCH_BLOBS``, as Ubuntu's is, never matches a BLOB, while the Windows
+    build matches one by its bytes. So a BLOB is called sealed by its type, on every build: no
+    writer stores one in a cipher-covered column, and :func:`_open` fails it without a decrypt.
+    That fails closed, where a BLOB the test skipped would never be read at all."""
+    return f"(typeof({column}) = 'blob' OR {column} LIKE ?)"
 
 
 def _schema_version(conn: sqlite3.Connection) -> int:
@@ -281,9 +292,11 @@ def read_cipher_cells(
     cells fails its tag here as it would at a live read, and then put through the cell's ``check``.
     A cell :func:`cell_present` says the store lacks is skipped: an older store predates it.
 
-    A value is sealed when SQLite's ``LIKE 'mfenc:%'`` matches it, the test the restore-verify has
-    always selected with. That match ignores case and reads a BLOB as text, so a sealed value that
-    is a BLOB, or whose marker is in another case, fails without a decrypt (see :func:`_open`).
+    A value is sealed when it is a BLOB or SQLite's ``LIKE 'mfenc:%'`` matches it (see
+    :func:`_sealed_sql`): the LIKE is the test the restore-verify has always selected with, and it
+    ignores case, but whether it matches a BLOB depends on how SQLite was built, so a BLOB is
+    judged by its type instead. A sealed value that is a BLOB, or whose marker is in another case,
+    fails without a decrypt (see :func:`_open`).
 
     The rows of each cell are read in ``rowid`` order, ``chunk_rows`` at a time. Each chunk is one
     statement, read one row at a time and opened as it is read, and its readings are yielded only
@@ -315,10 +328,11 @@ def read_cipher_cells(
         if unmarked and not _surface_sealed(conn, spec, tables):
             unsealed_kind = "legacy"
         # Table, column and key names are declared constants; only values are parameters. The
-        # marker test is selected, not applied to the value in Python, so a BLOB is judged by the
-        # same LIKE that selects it.
-        picked = ", ".join(("rowid", f"{column} LIKE ?", *spec.locator, *spec.aad_columns, column))
-        chosen = f"{column} IS NOT NULL AND {column} != ''" if unmarked else f"{column} LIKE ?"
+        # sealed test is selected, not applied to the value in Python, so a value is judged by the
+        # same test that selects it.
+        sealed_sql = _sealed_sql(column)
+        picked = ", ".join(("rowid", sealed_sql, *spec.locator, *spec.aad_columns, column))
+        chosen = f"{column} IS NOT NULL AND {column} != ''" if unmarked else sealed_sql
         marker: tuple[object, ...] = (f"{MARKER_PREFIX}%",)
         params = marker if unmarked else marker * 2
         first = f"SELECT {picked} FROM {table} WHERE {chosen} ORDER BY rowid LIMIT ?"
