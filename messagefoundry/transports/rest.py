@@ -529,9 +529,11 @@ def _redact_url(url: str) -> str:
     an unencoded ``/``, ``?`` or ``#`` ends the authority early, so the username is read as the host
     and the password's tail, with the real host, as the path. ``svc:12/ss@host`` and an ``@`` that is
     only an email in a query look the same to a parser, so neither names a host, as ``_peer_label``
-    does in ``config/wiring.py``. The ``@`` is read after unquoting, so ``%40`` counts. A host that
-    holds ``@`` or ``:`` once unquoted is withheld too: ``svc%3APW%40host`` is a userinfo urllib
-    unquotes, and ``hostname`` would print it whole. An IPv6 literal, zone and all, keeps its host.
+    does in ``config/wiring.py``. The ``@`` is read after unquoting, so ``%40`` counts. A host or
+    port that holds ``@`` once unquoted, or a host that holds ``:``, is withheld too:
+    ``svc%3APW%40host`` is a userinfo urllib unquotes, and ``hostname`` would print it whole; in
+    ``svc:PW%40proxy:3128`` the ``%40`` sits in the port field and ``hostname`` is the username.
+    An IPv6 literal, zone and all, keeps its host.
 
     A URL ``urlsplit`` cannot parse renders as ``<redacted>`` alone: its ``ValueError`` quotes the
     whole netloc."""
@@ -553,9 +555,13 @@ def _host_hides_userinfo(p: urllib.parse.SplitResult) -> bool:
     is userinfo written with ``%40`` or ``%3A``, and ``hostname`` is the username and some of the
     password. The port counts: in ``svc:PW%40proxy:3128`` the ``%40`` lands in the port field and
     ``hostname`` is ``svc``. An IPv6 literal holds ``:``, so a bracketed host never counts for it."""
-    host_port = p.netloc.rpartition("@")[2]
-    return "@" in urllib.parse.unquote(host_port) or (
-        not host_port.startswith("[") and ":" in urllib.parse.unquote(p.hostname or "")
+    return "@" in urllib.parse.unquote(p.netloc.rpartition("@")[2]) or _host_holds_encoded_colon(p)
+
+
+def _host_holds_encoded_colon(p: urllib.parse.SplitResult) -> bool:
+    """Does an unbracketed host hold ``:`` once unquoted? No host name holds one."""
+    return not p.netloc.rpartition("@")[2].startswith("[") and ":" in urllib.parse.unquote(
+        p.hostname or ""
     )
 
 
@@ -646,7 +652,7 @@ def refuse_url_credentials(
     # A password head written with ``%3A`` and then ``%5D`` hides its port from both readers above,
     # since the dialling reader takes the ``]`` for an IPv6 literal's end (BACKLOG #2686). No host
     # name holds a ``:``, so an encoded one outside brackets is refused whatever follows it.
-    if _host_hides_userinfo(p):
+    if _host_holds_encoded_colon(p):
         raise error(
             f"{setting} has a ':' written as %3A in its host. A password written into the URL can "
             f"cause this; set credentials in {use} instead"

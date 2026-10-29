@@ -24,8 +24,8 @@ THREE LAYERS, each tested here, then two sites the construction refusal does not
 5. The ``[egress]`` allowlist, which runs BEFORE connector construction, neither raises with nor
    echoes a credential.
 6. BACKLOG #2686: a constructor that reads the scheme before the credential screen refuses a URL
-   ``urlsplit`` cannot parse without echoing it, and the proxy arm's label withholds a host that
-   hides a userinfo.
+   ``urlsplit`` cannot parse without echoing it, and every HTTP-family allowlist refusal withholds
+   a host that may be a userinfo head.
 
 Synthetic values only. Nothing here opens a socket: ``http.client`` raises ``InvalidURL`` before it
 connects.
@@ -710,6 +710,12 @@ def test_no_allowlist_refusal_prints_the_head_of_a_userinfo_the_screen_passes(
                 _dest(ConnectorType.REST, ok, oauth2_token_url=url), egress
             ),
         ),
+        (
+            "smart",
+            lambda: check_egress_allowed(
+                _dest(ConnectorType.REST, ok, smart_token_url=url), egress
+            ),
+        ),
         ("lookup", lambda: check_fhir_lookup_allowed("FL_2686", {"url": url}, egress)),
     ]
     for arm, run in arms:
@@ -809,7 +815,7 @@ def test_the_proxy_egress_arm_refuses_an_unparseable_proxy_without_echoing_it(
 ) -> None:
     """The proxy arm has no ``refuse_url_credentials`` in front. It says the URL cannot be parsed,
     rather than reporting an allowlist miss that no entry could clear, and it still writes the
-    ``egress denied`` WARNING every other egress refusal writes (hold finding on engine PR 2591)."""
+    ``egress denied`` WARNING this arm's allowlist refusals write (hold finding on engine PR 2591)."""
     egress = EgressSettings(
         allowed_http=["endpoint.example.invalid"], allowed_proxy=["proxy.example.invalid:3128"]
     )
