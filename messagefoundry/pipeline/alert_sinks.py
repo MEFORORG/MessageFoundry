@@ -96,8 +96,8 @@ class ControlCallback(Protocol):
 
     ``self_restart`` is True when a ``connection_stopped`` rule restarts its own inbound
     (``_SELF_RESTART_ACTION``), so the start that restart makes must not resolve that same alert
-    (BACKLOG #1741). The callback passes it to the runner's restart, which scopes the skip to the
-    start it makes under its reload lock."""
+    (BACKLOG #1741). The callback passes ``resolve_stop=not self_restart`` to the runner's restart,
+    whose start resolves only when that flag is set."""
 
     def __call__(
         self, action: str, target: str, *, default_target: bool, self_restart: bool = False
@@ -137,7 +137,8 @@ class _AlertStateStore(Protocol):
 #: Auto-resolution map (ADR 0044 D2): an inverse lifecycle event type resolves the matching open
 #: instance(s) of the failure event type it cancels. ``connection_restored`` cancels the
 #: ``connection_error`` raised on ``connection_lost``; ``connection_started``, which the runner emits
-#: once an inbound genuinely comes up (BACKLOG #1741), clears a ``connection_stopped``. Keyed by the
+#: when an operator's start or an alert rule's restart brings an inbound up (BACKLOG #1741;
+#: ``AlertSink.connection_started`` says when), clears a ``connection_stopped``. Keyed by the
 #: inverse event's ``type`` → the failure event ``type`` it resolves.
 _AUTO_RESOLVE: dict[str, str] = {
     "connection_restored": "connection_error",
@@ -162,13 +163,14 @@ _AUTO_RESOLVE: dict[str, str] = {
 }
 
 #: BACKLOG #1741: the control action a ``connection_stopped`` rule dispatches as a SELF-RESTART when
-#: it aims at its own inbound. The sink passes ``self_restart=True`` to the control callback, and
-#: the runner's ``restart_inbound(resolve_stop=False)`` then raises no ``connection_started`` for
-#: the start it makes inside its reload lock. The instance stays open, so its #81 occurrence count,
+#: it aims at its own inbound. The sink passes ``self_restart=True`` to the control callback, which
+#: then calls ``restart_inbound`` with ``resolve_stop=False``, so that restart's start raises no
+#: ``connection_started``. The instance stays open, so its #81 occurrence count,
 #: its tier and any suspend entry carry on, and a rule-driven crash loop still reaches its
-#: ``after_count`` tier; ADR 0133 D1's reset-on-auto-resolve stays true. A start another door makes,
-#: even while that restart waits for the lock, still resolves, and so does the restart that answers
-#: a start failure (``START_FAILURE_DETAIL``): a failed restart raises no new alert, so it is no loop.
+#: ``after_count`` tier; ADR 0133 D1's reset-on-auto-resolve stays true. An operator's start, even
+#: while that restart waits for the lock, still resolves, and so does the restart that answers a
+#: start failure (``START_FAILURE_DETAIL``): a failed restart raises no new alert, so it is no loop.
+#: An engine door's start never resolves (``AlertSink.connection_started`` lists them).
 _SELF_RESTART_ACTION = "restart_inbound"
 
 _T = TypeVar("_T")

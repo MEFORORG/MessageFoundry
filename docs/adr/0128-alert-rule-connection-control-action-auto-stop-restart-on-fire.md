@@ -98,7 +98,8 @@ wants transportless remediation configures at least one transport (documented; a
 mode is a possible follow-up).
 
 **Amendment (BACKLOG #1741).** A `connection_stopped` window can end early. When alert-state is
-wired, a `connection_started` that the runner raises once an inbound genuinely comes up resolves the open
+wired, a `connection_started` that the runner raises once an operator's start or an alert rule's restart
+genuinely brings an inbound up (never an engine start, reload or scheduler start) resolves the open
 `connection_stopped` instance and ends that key's window, so a later stop is a new incident that pages and
 acts at once. It does not end the window while any alert rule's `restart_inbound` of that inbound is in
 flight, whichever rule dispatched it and whichever door made the start, so a loop of rule restarts,

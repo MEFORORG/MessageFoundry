@@ -1661,12 +1661,10 @@ class RegistryRunner:
         # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
-        # BACKLOG #1741: inbounds a reload in progress started, whose connection_started waits for
-        # the swap to commit (reload says why). None outside a reload.
-        self._started_pending: list[str] | None = None
-        # BACKLOG #1741: inbounds inside a restart_inbound(resolve_stop=False), whose start raises no
-        # connection_started. Held only under the reload lock, so no other door's start sees it.
-        self._unresolving_starts: set[str] = set()
+        # BACKLOG #1741: inbounds inside an operator's start or restart, or an alert rule's restart
+        # that resolves, the only starts that raise connection_started (AlertSink.connection_started
+        # says why). Held only under the reload lock, so no other door's start sees it.
+        self._resolving_starts: set[str] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
         # resolved in _start_pooled_dispatchers AFTER trying to open the sync pools + build the per-stage
@@ -3268,11 +3266,22 @@ class RegistryRunner:
         the lock (start, reload) use :meth:`_start_inbound_unsafe`.
 
         On a passive DR standby only an ``operator`` start binds; an engine door such as the
-        scheduler or an alert rule does nothing (:meth:`_dr_refuses`)."""
+        scheduler or an alert rule does nothing (:meth:`_dr_refuses`). Only an ``operator`` start
+        raises ``connection_started`` (BACKLOG #1741, :meth:`_note_inbound_started`)."""
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
+            await self._resolving_start(name, resolve=operator)
+
+    async def _resolving_start(self, name: str, *, resolve: bool) -> None:
+        """:meth:`_checked_inbound_start`, marking ``name`` so its start raises ``connection_started``
+        when ``resolve`` (BACKLOG #1741). The caller holds the reload lock."""
+        if resolve:
+            self._resolving_starts.add(name)
+        try:
             await self._checked_inbound_start(name)
+        finally:
+            self._resolving_starts.discard(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
         """:meth:`_start_inbound_unsafe` after the lane check. A refused CA records the inbound
@@ -3296,26 +3305,22 @@ class RegistryRunner:
             await self._stop_inbound_unsafe(name)
 
     async def restart_inbound(
-        self, name: str, *, operator: bool = False, resolve_stop: bool = True
+        self, name: str, *, operator: bool = False, resolve_stop: bool = False
     ) -> None:
         """Stop then start one inbound under one reload-lock span.
 
-        ``resolve_stop=False`` is the restart a ``connection_stopped`` rule dispatched for this
-        same inbound: its own start raises no ``connection_started``, so a rule-driven crash loop
-        keeps one open, escalating instance (BACKLOG #1741). The skip is scoped to the start made
-        inside the lock, so a start another door makes while this call waits for it still counts."""
+        Its start raises ``connection_started`` only for an ``operator`` restart or with
+        ``resolve_stop=True``, which an alert rule's restart passes unless a ``connection_stopped``
+        rule dispatched it for this same inbound's halt: that self-restart keeps one open, escalating
+        instance through a rule-driven crash loop (BACKLOG #1741). The mark is scoped to the start
+        made inside the lock."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
-            if not resolve_stop:
-                self._unresolving_starts.add(name)
-            try:
-                await self._stop_inbound_unsafe(name)
-                await self._checked_inbound_start(name)
-            finally:
-                self._unresolving_starts.discard(name)
+            await self._stop_inbound_unsafe(name)
+            await self._resolving_start(name, resolve=operator or resolve_stop)
 
     def _dr_refuses(self, name: str, *, operator: bool) -> bool:
         """Whether a passive DR standby refuses an engine start of inbound ``name`` (vault BACKLOG
@@ -4413,14 +4418,11 @@ class RegistryRunner:
 
     def _note_inbound_started(self, name: str) -> None:
         """An inbound came up on a door that re-armed its internal stages: emit ``connection_started``
-        now, or after the swap when a reload is in progress, or not at all inside a
-        ``restart_inbound(resolve_stop=False)`` (BACKLOG #1741)."""
-        if name in self._unresolving_starts:
-            return
-        if self._started_pending is not None:
-            self._started_pending.append(name)
-            return
-        self._emit_inbound_started(name)
+        only when that door is an operator's start or restart, or an alert rule's restart that
+        resolves (BACKLOG #1741). :meth:`AlertSink.connection_started` says why an engine door's
+        start resolves nothing."""
+        if name in self._resolving_starts:
+            self._emit_inbound_started(name)
 
     def _emit_inbound_started(self, name: str) -> None:
         """Raise ``connection_started`` for inbound ``name``, so a sink with alert-state resolves the
@@ -4439,7 +4441,7 @@ class RegistryRunner:
         halt pauses an outbound through the same door and leaves no other record once an inbound
         start's own probe clears the latch, so the two cannot be told apart here. A skipped resolve
         leaves an alert open for an operator, which is the safe direction, and nothing retries it.
-        Never raises: an alert failure must not break a start or the tail of a committed reload."""
+        Never raises: an alert failure must not break a start."""
         try:
             blocked = (
                 not self.inbound_running(name)
@@ -5467,11 +5469,6 @@ class RegistryRunner:
                 self._record_fhir_lookup_failed(
                     lookup_name, failed_lookups[lookup_name], lookup_exc
                 )
-            # BACKLOG #1741: a fresh start re-armed every internal stage, so a connection_stopped an
-            # earlier run left open for an inbound that is now listening is stale, a bind failure an
-            # operator fixed and then restarted the service for among them.
-            for name in list(self._sources):
-                self._emit_inbound_started(name)
             # #147 (ADR 0095): spawn one active-window scheduler task per SCHEDULED connection. Each
             # AUTO-STARTs/STOPs its connection through the same start_inbound/stop_inbound (or
             # start_outbound/stop_outbound) path the API uses — a schedule-park is a clean stop, never a
@@ -7199,7 +7196,6 @@ class RegistryRunner:
             old_lookup_executor = self._lookup_executor
             old_fhir_lookup_executor = self._fhir_lookup_executor
 
-            self._started_pending = []
             try:
                 # 1. Quiesce intake: stop every inbound source so no NEW messages are accepted. Any
                 #    message already in flight completes under its arrival-time registry (snapshotted
@@ -7351,9 +7347,6 @@ class RegistryRunner:
                 # 3. Reconcile outbound connectors/workers (intake already live).
                 await self._reconcile_outbounds(old, new_registry)
             except BaseException as exc:
-                # BACKLOG #1741: the starts this reload made are undone below, so none resolves an
-                # alert. The rollback's own restarts emit directly, for the inbounds they bring back.
-                self._started_pending = None
                 # Roll back to the previous graph's intake so a failed reload leaves the engine
                 # accepting exactly what it did before (the realistic failure is an inbound bind).
                 # BaseException, not Exception (vault BACKLOG #2753): a CANCELLED reload, such as one
@@ -7397,12 +7390,6 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
-            # BACKLOG #1741: the swap committed, so a held start is read against the graph that stays.
-            # Before step 3a, so a schedule change it makes to an outbound namesake is not seen.
-            started = self._started_pending or ()
-            self._started_pending = None
-            for name in started:
-                self._emit_inbound_started(name)
             # The swap committed, so nothing can put the previous graph's executor back any more.
             self._retire_lookup_executor(old_lookup_executor)
             # vault BACKLOG #2371: the swap committed, so a lane the pre-check passed loses any old

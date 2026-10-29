@@ -236,8 +236,12 @@ class AlertSink(Protocol):
         0044) can **auto-resolve** the open ``connection_stopped`` instance for ``name``, such as an
         inbound's bind failure. Auto-resolve-only, never a rule-targetable alert type. The default
         :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is always a
-        bare inbound name, so it never resolves a prefixed stand-in instance. At least these
-        starts never raise it: an outbound's own start; a start where the runner cannot see every
+        bare inbound name, so it never resolves a prefixed stand-in instance. Only two doors raise
+        it: an operator's start or restart of the inbound, and an alert rule's ``restart_inbound``.
+        An engine door's start never does, at least the engine's own ``start()``, a committed
+        reload, a reload's rollback and the scheduler: a fresh process cannot see an earlier run's
+        causes, so an open stop keeps its instance, ack, suspend and escalation count across them.
+        On those two doors, at least these starts never raise it: an outbound's own start; a start where the runner cannot see every
         cause (on a clustered node, or on an engine shard that does not own the outbound
         namesake); a start while the outbound namesake is under an operator-style pause, which a
         log-write halt's pause looks like; and the start inside a ``restart_inbound`` that a

@@ -177,22 +177,22 @@ async def test_a_held_outbound_halt_keeps_the_inbound_namesake_from_resolving(
     runner = _runner(reg, store, sink)
     await runner.start()
     try:
-        assert sink.started == ["SHARED"]  # a clean start emits once, after the workers spawned
+        assert sink.started == []  # an engine start() resolves nothing
         runner._hold_for_operator("SHARED", "outbound")
         await runner.restart_inbound("SHARED", operator=True)
         assert runner.inbound_running("SHARED")
-        assert sink.started == ["SHARED"]
+        assert sink.started == []
         runner._release_operator_hold("SHARED", "outbound")
         await runner.stop_outbound("SHARED")
         await runner.restart_inbound("SHARED", operator=True)
-        assert sink.started == ["SHARED"]
+        assert sink.started == []
         await runner.start_outbound("SHARED")
         await runner.restart_inbound("SHARED", operator=True)
-        assert sink.started == ["SHARED", "SHARED"]
+        assert sink.started == ["SHARED"]
         # A build that failed as the outbound left the DR park is a cause.
         runner._dr_unbuilt["SHARED"] = True
         await runner.restart_inbound("SHARED", operator=True)
-        assert sink.started == ["SHARED", "SHARED"]
+        assert sink.started == ["SHARED"]
     finally:
         await runner.stop()
 
@@ -230,7 +230,7 @@ async def test_a_held_inbound_halt_or_log_refusal_does_not_emit(
         await runner.stop()
 
 
-async def test_reload_emits_after_commit_and_a_rollback_drops_its_starts(
+async def test_neither_a_reload_nor_its_rollback_resolves_a_bind_failure(
     store: MessageStore, held_port: tuple[int, socket.socket], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     port, blocker = held_port
@@ -244,19 +244,21 @@ async def test_reload_emits_after_commit_and_a_rollback_drops_its_starts(
         async def _boom(*_a: object, **_k: object) -> None:
             raise RuntimeError("step 3 failed")
 
-        # A reload that binds the failed inbound and then rolls back leaves it down, so its start
-        # must resolve nothing.
+        # A reload is an engine door, as start() is (the Lander's hold on PR 2603): neither a
+        # rolled-back nor a committed one resolves, so the alert stays open as it does on main
+        # until an operator starts or restarts the inbound.
         monkeypatch.setattr(runner, "_reconcile_outbounds", _boom)
         with pytest.raises(RuntimeError, match="step 3 failed"):
             await runner.reload(_registry(port))
         assert not runner.inbound_running("SHARED")
         assert sink.started == []
-        assert runner._started_pending is None
         monkeypatch.undo()
         await runner.reload(_registry(port))
         assert runner.inbound_running("SHARED")
+        assert sink.started == []
+        await runner.restart_inbound("SHARED", operator=True)
         assert sink.started == ["SHARED"]
-        assert runner._started_pending is None
+        assert runner._resolving_starts == set()
     finally:
         await runner.stop()
 
@@ -286,10 +288,10 @@ async def test_per_lane_emits_only_when_the_start_respawns_the_halted_workers(
     runner = _runner(reg, store, sink, claim_mode="per_lane")
     await runner.start()
     try:
-        assert sink.started == ["IB"]
+        assert sink.started == []
         runner._hold_for_operator("IB", "inbound")
         await runner.restart_inbound("IB", operator=True)
-        assert sink.started == ["IB"]  # both workers alive: nothing re-armed, the hold stands
+        assert sink.started == []  # both workers alive: nothing re-armed, the hold stands
         # The halt: the router worker has returned, as a STOP makes it.
         task = runner._router_workers["IB"]
         task.cancel()
@@ -297,7 +299,7 @@ async def test_per_lane_emits_only_when_the_start_respawns_the_halted_workers(
             await task
         await runner.restart_inbound("IB", operator=True)
         assert ("inbound", "IB") not in runner._stop_held
-        assert sink.started == ["IB", "IB"]
+        assert sink.started == ["IB"]
     finally:
         await runner.stop()
 
@@ -423,7 +425,7 @@ async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
             assert sink._suspended.get("connection_stopped:IB") == until
         assert restarts == ["IB"] * 6
         # An operator start nobody's rule asked for still resolves it, and drops the count.
-        await runner.restart_inbound("IB")
+        await runner.restart_inbound("IB", operator=True)
         await _settle(sink)
         assert await _open(store) == set()
         assert "connection_stopped:IB" not in sink._occurrences
@@ -524,9 +526,13 @@ async def test_restart_inbound_with_resolve_stop_off_raises_no_start(
         sink.started.clear()
         await runner.restart_inbound("IB", resolve_stop=False)
         assert runner.inbound_running("IB") and sink.started == []
-        assert runner._unresolving_starts == set()
+        assert runner._resolving_starts == set()
+        # An engine door's restart resolves nothing; an alert rule's resolving one does.
         await runner.restart_inbound("IB")
+        assert sink.started == []
+        await runner.restart_inbound("IB", resolve_stop=True)
         assert sink.started == ["IB"]
+        assert runner._resolving_starts == set()
     finally:
         await runner.stop()
 
@@ -558,12 +564,12 @@ async def test_a_rule_naming_its_own_inbound_is_a_self_restart_too(
     assert calls == [(control_target, not resolves)]
 
 
-async def test_a_start_another_door_makes_while_the_rules_restart_waits_resolves(
+async def test_an_operator_start_while_the_rules_restart_waits_resolves(
     store: MessageStore,
 ) -> None:
     # The rule's restart is queued behind the reload lock while another door, holding it, brings
-    # the inbound up. That start is genuine, so the alert resolves; only the start the restart
-    # itself makes is skipped.
+    # the inbound up. An operator's start is a genuine recovery, so the alert resolves; only the
+    # start the restart itself makes is skipped. An engine door's start would resolve nothing.
     from types import SimpleNamespace
 
     from messagefoundry.api.app import _alert_control_action
@@ -591,7 +597,7 @@ async def test_a_start_another_door_makes_while_the_rules_restart_waits_resolves
             for _ in range(5):
                 await asyncio.sleep(0)  # the restart is now waiting for the lock
             assert sink._control_tasks
-            await runner._start_inbound_unsafe("IB")  # a reload or scheduler door's start
+            await runner._resolving_start("IB", resolve=True)  # start_inbound(operator=True)
         await _settle(sink, sink._control_tasks)
         await _settle(sink)
         assert runner.inbound_running("IB")
@@ -711,3 +717,49 @@ async def test_rules_restarting_each_others_inbound_keep_the_cooldown(
         await sink.aclose()
     assert restarts == ["IB_B", "IB_A"]
     assert [e["connection"] for e in pages.events] == ["IB_A", "IB_B"]
+
+
+async def test_an_internal_stage_stop_stays_open_across_a_fresh_start_and_a_reload(
+    store: MessageStore,
+) -> None:
+    # The Lander's hold on PR 2603: an engine start() or a committed reload is not an operator's
+    # recovery. A fresh process sees none of an earlier run's causes, so a recurring router STOP an
+    # earlier run left open keeps its instance and its count, as it does on main. Only an
+    # operator's start or restart resolves it.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    # The earlier run: the router halted twice and the alert opened.
+    first = NotifierAlertSink([], store=store)
+    for _ in range(2):
+        first.connection_stopped("IB", detail="router halted on internal error")
+    await _settle(first)
+    (before,) = await store.list_active_alert_instances(allowed_channels=None)
+    # The service restarts: a new sink and runner over the same store.
+    sink = NotifierAlertSink([], store=store)
+    runner = _runner(reg, store, sink)
+    await runner.start()
+    try:
+        assert runner.inbound_running("IB")
+        await _settle(sink)
+        assert await _open(store) == {("connection_stopped", "IB")}
+        await runner.reload(reg)
+        assert runner.inbound_running("IB")
+        await _settle(sink)
+        # An engine door's start under the lock, as the scheduler's or a rollback's is.
+        async with runner._reload_lock:
+            await runner._stop_inbound_unsafe("IB")
+            await runner._start_inbound_unsafe("IB")
+        await _settle(sink)
+        (after,) = await store.list_active_alert_instances(allowed_channels=None)
+        assert (after.id, after.event_type, after.connection, after.count) == (
+            before.id,
+            "connection_stopped",
+            "IB",
+            2,
+        )
+        await runner.restart_inbound("IB", operator=True)
+        await _settle(sink)
+        assert await _open(store) == set()
+    finally:
+        await runner.stop()
