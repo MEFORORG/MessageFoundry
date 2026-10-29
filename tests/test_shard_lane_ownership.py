@@ -202,6 +202,7 @@ class _RecordingAlertSink:
         self.errors.append((name, kind))
 
     def connection_restored(self, name: str) -> None: ...
+    def connection_started(self, name: str) -> None: ...
 
 
 async def _until(pred, *, timeout: float = 5.0) -> None:
