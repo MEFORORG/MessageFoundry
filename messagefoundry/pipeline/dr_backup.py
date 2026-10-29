@@ -86,6 +86,7 @@ from messagefoundry.store.cipher_cells import (
     keyed_store_mismatch,
     read_cipher_cells,
     store_tables,
+    with_first_failure,
 )
 from messagefoundry.store.crypto import (
     StoreKeylessError,
@@ -1430,8 +1431,9 @@ def _verify_archive_blocking(
     ``PRAGMA integrity_check``; (4) compare per-table row counts to the manifest. ``full`` additionally
     re-opens the snapshot through the real ``open_store`` path (cipher + migrations) and decrypts +
     authenticates every cipher-covered cell in it — heavier. That leg returns its own
-    ``KEY_MISMATCH`` when the settings resolve no key for a snapshot that holds sealed cells, so an
-    archive that is fine and a key configuration that is not are not both reported as ``FAIL``.
+    ``KEY_MISMATCH`` when the settings resolve no key for a snapshot that holds sealed cells or is
+    recorded as keyed (see :func:`_full_open_check`), so an archive that is fine and a key
+    configuration that is not are not both reported as ``FAIL``.
 
     Steps 2 to 4 write the decrypted archive into a ``mefor-verify-*`` staging directory, locked for
     the run (see :func:`_open_staging`), which is discarded on every exit path by
@@ -2457,10 +2459,12 @@ def _full_open_check(
     Returns ``(status, message, decrypted_cells)`` — the ``VerifyResult`` status this leg earned, so the
     caller can hand it straight on. Heavier; only run for ``full_restore_verify``.
 
-    ``KEY_MISMATCH`` is reserved for the one cause the keyring is unambiguously to blame for: the
-    snapshot holds sealed (``mfenc:``) cells and these settings resolve **no** key for them, so nothing
-    could have opened them. An operator reading that fixes their key configuration; reading ``FAIL``
-    they would go looking for a bad archive, and the archive is fine. A cell that will not decrypt under
+    ``KEY_MISMATCH`` is reserved for the one cause the keyring is unambiguously to blame for: these
+    settings resolve **no** key for a snapshot that needs one, because it holds sealed (``mfenc:``)
+    cells or its ``keyed_surface`` rows record it as keyed, so nothing could have read it. An
+    operator reading that fixes their key configuration; reading ``FAIL`` they would go looking for
+    a bad archive. A BLOB found before the decision is named in the reason too, since no key will
+    clear it (:func:`_decrypt_check`). A cell that will not decrypt under
     a keyring that DOES hold keys stays ``FAIL``, because :class:`CipherError` cannot tell a corrupted
     ciphertext from a key that was never supplied (see its own docstring) and corruption is the reading
     that must not be talked down.
@@ -2600,7 +2604,9 @@ def _decrypt_check(
     key opened, then a failure. Under a key no keyless reading can come, so this pass stops at the
     first value that does not open. With no key it reads on past a BLOB, which fails under any
     cipher, so a sealed value later in the walk still decides KEY_MISMATCH, as ``cipher-audit``
-    decides it, whichever row comes first.
+    decides it, whichever row comes first. That agreement is this pass's: in a full verify the
+    store's own open runs first, and its warm-up of ``state`` and ``reference`` can decide before
+    this pass reads anything.
     """
     import sqlite3
 
@@ -2620,19 +2626,20 @@ def _decrypt_check(
                 # resolved no key for it. Nothing could have opened it, so the keyring is
                 # unambiguously the cause. Keylessness is the CIPHER's, never a plaintext's: a
                 # decrypted value may itself begin with the marker. A BLOB never comes here.
-                return "KEY_MISMATCH", reading.failure(source="snapshot"), cells
-            if reading.kind == "blob":
+                mismatch = with_first_failure(reading.failure(source="snapshot"), first_blob)
+                return "KEY_MISMATCH", mismatch, cells
+            elif reading.kind == "blob":
                 # FAIL under any cipher, and never the keyring's: no key makes a BLOB readable.
                 if cipher.encrypts:
                     return "FAIL", reading.failure(source="snapshot"), cells
                 first_blob = first_blob or reading.failure(source="snapshot")
-            if reading.kind == "failed":
+            elif reading.kind == "failed":
                 # Only under a key: a keyless walk never decrypts. FAIL, not KEY_MISMATCH:
                 # CipherError cannot separate a corrupted ciphertext from a key that was never
                 # supplied, so the softer verdict on a bit-flipped PHI cell is the reading that
                 # must not be talked down.
                 return "FAIL", reading.failure(source="snapshot"), cells
-            if reading.kind == "opened":
+            elif reading.kind == "opened":
                 cells += 1
         if first_blob is not None:
             return "FAIL", first_blob, cells

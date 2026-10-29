@@ -52,6 +52,7 @@ __all__ = [
     "keyed_store_mismatch",
     "read_cipher_cells",
     "store_tables",
+    "with_first_failure",
 ]
 
 
@@ -286,9 +287,10 @@ def _sealed_test(column: str) -> tuple[str, tuple[object, ...]]:
     Every BLOB is called sealed, by its type, ``x''`` included, and the walk reports it as a
     ``"blob"`` reading under any cipher, without a decrypt: it fails closed on a BLOB on every
     build. At least the store's own writer, ``_enc``, binds text, so a BLOB is a planted or damaged
-    row. Under a key the reader cannot open one; with no key it hands one back as bytes, and at
-    least the ``state`` and ``reference`` readers then raise. Either way no key is the remedy, so a
-    BLOB is never reported as a key mismatch."""
+    row, and the walk fails it for that, whatever the store's reader would do with it. That varies:
+    under a key the reader cannot open one; with no key it hands one back as bytes, which some
+    readers take (a JSON-shaped ``state`` BLOB loads) and others refuse. No key is the remedy, so
+    a BLOB is never reported as a key mismatch."""
     sql = f"(typeof({column}) = 'blob' OR lower(substr({column}, 1, ?)) = ?)"
     return sql, (len(MARKER_PREFIX), MARKER_PREFIX.lower())
 
@@ -454,6 +456,8 @@ class CellTally:
     present: bool = True
     opened: int = 0
     failed: int = 0
+    #: BLOBs, apart from ``failed``: a data fault, not a key or ciphertext one.
+    blob: int = 0
     unmarked: int = 0
     legacy: int = 0
     first_failure: str | None = None
@@ -481,6 +485,10 @@ class CipherAudit:
         return sum(t.failed for t in self.tallies)
 
     @property
+    def blob(self) -> int:
+        return sum(t.blob for t in self.tallies)
+
+    @property
     def unmarked(self) -> int:
         return sum(t.unmarked for t in self.tallies)
 
@@ -491,6 +499,12 @@ class CipherAudit:
     @property
     def absent(self) -> list[str]:
         return [t.name for t in self.tallies if not t.present]
+
+
+def with_first_failure(mismatch: str, first: str | None) -> str:
+    """A key-mismatch line that keeps a failure the walk met before it: the mismatch decides the
+    verdict, and the failure, which no key will clear, must not wait for a second run to show."""
+    return mismatch if first is None else f"{mismatch}; also found before it: {first}"
 
 
 def keyed_store_mismatch(
@@ -508,9 +522,10 @@ def keyed_store_mismatch(
     ).fetchone()
     if keyed is None:
         return None
+    # Read from the file, so bounded and escaped like a locator: a planted row cannot forge a line.
     return (
-        f"{keyed[0]}.{keyed[1]} is recorded as keyed in this {source}, but the store settings "
-        f"resolved no key to read it (keyless open of a keyed {source})"
+        f"{_shown(keyed[0])}.{_shown(keyed[1])} is recorded as keyed in this {source}, but the "
+        f"store settings resolved no key to read it (keyless open of a keyed {source})"
     )
 
 
@@ -539,21 +554,26 @@ def audit_cipher_cells(
     if audit.key_mismatch is not None:
         return audit
     tally = {(t.table, t.column): t for t in audit.tallies}
+    first: str | None = None
     for reading in read_cipher_cells(
         conn, cipher, cells=wanted, chunk_rows=chunk_rows, unmarked=True
     ):
         found = tally[(reading.cell.table, reading.cell.column)]
         if reading.kind == "keyless":
-            audit.key_mismatch = reading.failure()
+            audit.key_mismatch = with_first_failure(reading.failure(), first)
             break
         if reading.kind == "opened":
             found.opened += 1
         elif reading.kind in ("failed", "blob"):
             if reading.error is not None and _is_outage(reading.error):
                 raise reading.error
-            found.failed += 1
+            if reading.kind == "blob":
+                found.blob += 1
+            else:
+                found.failed += 1
             if found.first_failure is None:
                 found.first_failure = reading.failure()
+            first = first or found.first_failure
         elif reading.kind == "legacy":
             found.legacy += 1
         else:

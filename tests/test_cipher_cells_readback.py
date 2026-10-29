@@ -709,9 +709,10 @@ def _keyless_store(db: Path) -> None:
 
 
 def _plant(db: Path, sql: str, params: tuple[object, ...]) -> None:
+    """Run one write; a write that touched no row is a fixture that no longer tests anything."""
     conn = sqlite3.connect(db)
     try:
-        conn.execute(sql, params)
+        assert conn.execute(sql, params).rowcount > 0, f"planted nothing: {sql}"
         conn.commit()
     finally:
         conn.close()
@@ -748,15 +749,16 @@ def _verdicts(
     settings: StoreSettings,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-) -> tuple[str, str]:
-    """(restore-verify's decrypt pass, cipher-audit) statuses for one file under one shell."""
-    status, _message, _cells = dr_backup._decrypt_check(db, settings)
+) -> tuple[tuple[str, str], tuple[str, str]]:
+    """((status, reason) of restore-verify's decrypt pass, the same of cipher-audit) for one file
+    under one shell. The decrypt pass, not the full verify, whose store open runs first."""
+    status, message, _cells = dr_backup._decrypt_check(db, settings)
     if settings.encryption_key is None:
         monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     else:
         _keyed(monkeypatch, settings)
     _rc, payload = _audit(db, monkeypatch, capsys)
-    return status, str(payload["status"])
+    return (status, message), (str(payload["status"]), str(payload["reason"]))
 
 
 @pytest.mark.usefixtures("sqlite_like_build")
@@ -788,9 +790,15 @@ def test_restore_verify_and_cipher_audit_agree_whatever_the_row_order(
             "INSERT INTO keyed_surface (surface_table, surface_column, keyed_at) VALUES (?, ?, 0)",
             ("messages", "raw"),
         )
-    restore, audit = _verdicts(db, StoreSettings(path=str(db)), monkeypatch, capsys)
+    (restore, said), (audit, reason) = _verdicts(
+        db, StoreSettings(path=str(db)), monkeypatch, capsys
+    )
     expected = "FAIL" if order == "blob-only" and not keyed_record else "KEY_MISMATCH"
     assert restore == audit == expected, (restore, audit)
+    if order == "blob-first" and not keyed_record:
+        # The mismatch decides, and the BLOB it met first, which no key clears, is still named.
+        assert "also found before it" in said and "holds a BLOB" in said, said
+        assert "also found before it" in reason and "holds a BLOB" in reason, reason
 
 
 @pytest.mark.usefixtures("sqlite_like_build")
@@ -818,9 +826,22 @@ def test_a_keyed_snapshot_holding_only_unmarked_blobs_fails_both(
     finally:
         conn.close()
     shell = settings if with_key else settings.model_copy(update={"encryption_key": None})
-    restore, audit = _verdicts(db, shell, monkeypatch, capsys)
+    (restore, _said), (audit, _reason) = _verdicts(db, shell, monkeypatch, capsys)
     assert restore == audit, (restore, audit)
     assert restore == ("FAIL" if with_key else "KEY_MISMATCH"), restore
+
+
+def test_a_planted_keyed_record_cannot_forge_a_report_line(tmp_path: Path) -> None:
+    """The keyed-record line quotes ``keyed_surface`` text from the file, so it is escaped."""
+    db = tmp_path / "msg.db"
+    _keyless_store(db)
+    _plant(
+        db,
+        "INSERT INTO keyed_surface (surface_table, surface_column, keyed_at) VALUES (?, ?, 0)",
+        ("x\nPASS: archive verified", "raw"),
+    )
+    status, message, _ = dr_backup._decrypt_check(db, StoreSettings(path=str(db)))
+    assert status == "KEY_MISMATCH" and "\n" not in message, message
 
 
 @pytest.mark.usefixtures("sqlite_like_build")

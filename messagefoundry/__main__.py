@@ -10203,10 +10203,13 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             "read, and the counts are not reported: treat the store as unaudited until a run that "
             "finishes says otherwise"
         )
-    elif audit.failed:
+    elif audit.failed or audit.blob:
         status, code = "FAIL", 1
         first = next(t.first_failure for t in audit.tallies if t.first_failure)
-        reason = f"{audit.failed} value(s) read as sealed did not open; the first: {first}"
+        reason = (
+            f"{audit.failed} sealed value(s) did not open, and {audit.blob} BLOB(s) sit where the "
+            f"store writes only text; the first: {first}"
+        )
     elif audit.unmarked and not store.allow_unmarked_ciphertext:
         status, code = "FAIL", 1
         first = next(t.first_unmarked for t in audit.tallies if t.first_unmarked)
@@ -10246,6 +10249,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 "keyed": cipher.encrypts,
                 "opened": audit.opened if counted else None,
                 "failed": audit.failed if counted else None,
+                "blob": audit.blob if counted else None,
                 "unmarked": audit.unmarked if counted else None,
                 "legacy": audit.legacy if counted else None,
                 "cells": [
@@ -10254,6 +10258,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                         "present": t.present,
                         "opened": t.opened,
                         "failed": t.failed,
+                        "blob": t.blob,
                         "unmarked": t.unmarked,
                         "legacy": t.legacy,
                         "first_failure": t.first_failure,
@@ -10271,8 +10276,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 print(f"  {t.name} not in this store, not read")
                 continue
             print(
-                f"  {t.name} opened={t.opened} failed={t.failed} unmarked={t.unmarked} "
-                f"legacy={t.legacy}"
+                f"  {t.name} opened={t.opened} failed={t.failed} blob={t.blob} "
+                f"unmarked={t.unmarked} legacy={t.legacy}"
             )
             for line in (t.first_failure, t.first_unmarked):
                 if line:
