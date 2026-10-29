@@ -2065,9 +2065,10 @@ def _make_client(
 #: ``[tls].crl_file``, would name a lever that cannot work there (SDS-3.7).
 _EXPIRY_RELAXED_WAYS_ACROSS = (
     "This hop sets tls_allow_expired, so a CRL cannot admit it. A [tls].crl_file, if set, still "
-    "refuses a leaf certificate it lists, but the relaxation skips the CRL's validity window at "
-    "the handshake, and a CA may drop an expired certificate from its CRL, which is the "
-    "certificate this setting accepts. Set tls_revocation_attested=true with a "
+    "refuses a leaf certificate it lists, but do not attest on its strength: the relaxation "
+    "skips the CRL's validity window at the handshake, and a CA may drop an expired "
+    "certificate from its CRL, which is the certificate this setting accepts. Set "
+    "tls_revocation_attested=true with a "
     "tls_revocation_attested_reason on this connection, or remove tls_allow_expired so a "
     "[tls].crl_file on this hop can admit it."
 )

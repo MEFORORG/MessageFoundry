@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import ssl
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,6 +46,7 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
     build_smtp_tls_context,
     context_checks_revocation,
+    relax_verify_expiry,
 )
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.transports import dicom as dicom_module
@@ -61,6 +63,11 @@ from messagefoundry.transports.rest import (
     opener_tls_context,
 )
 from tests.test_direct_transport import _mint_ca, _mint_leaf, _write_key, _write_pem
+from tests.test_hop_refusal_revocation import (
+    _crl_coverage_ca,
+    _crl_coverage_server,
+    _handshake,
+)
 from tests.test_revocation_audit_names_connection import _build_check, _shipped
 
 ENFORCING = HopPosture(enforcing=True)
@@ -695,15 +702,63 @@ def test_a_crl_does_not_admit_an_ftps_hop_that_ignores_certificate_expiry(bare_c
         # The refusal offers only levers that can cross it: not the CRL it already has.
         assert "tls_allow_expired" in str(exc.value)
         assert "Configure [tls].crl_file" not in str(exc.value)
-        assert "so a CRL cannot admit it" in str(exc.value)
+        assert remotefile_module._EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
         with pytest.raises(InsecureHopRefused, match="revocation") as exc:
             RemoteFileDestination(_ftps(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
-        assert "so a CRL cannot admit it" in str(exc.value)
+        assert remotefile_module._EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
         assert "Configure [tls].crl_file" not in str(exc.value)
         # The control: the same hop without the relaxation is admitted by that CRL.
         RemoteFileSource(_poll(REMOTE, policy=_crl_policy(bare_crl)))
         # And the attestation still crosses it.
         RemoteFileSource(_poll(REMOTE, allow_expired=True, attested=True))
+
+
+def test_a_crl_still_refuses_a_listed_leaf_on_a_context_that_skips_validity_checks(
+    tmp_path: Path,
+) -> None:
+    """What the expiry-relaxed refusal says a CRL still does, as a measurement. ``tls_allow_expired``
+    adds ``X509_V_FLAG_NO_CHECK_TIME``, and a leaf the CRL lists is still refused under it, with a
+    fresh CRL and with one past ``nextUpdate`` that the same flag lets through. Synthetic PKI."""
+    host = "revoked-leaf.test"
+    ca_key, ca = _crl_coverage_ca("mefor-2193-revoked-leaf-ca")
+    server = _crl_coverage_server(ca_key, ca, host, tmp_path)
+    leaf = x509.load_pem_x509_certificate((tmp_path / f"{host}.crt").read_bytes())
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+    pem = serialization.Encoding.PEM
+
+    def client(*, next_update: datetime.datetime, relaxed: bool) -> ssl.SSLContext:
+        crl = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(ca.subject)
+            .last_update(now - 30 * day)
+            .next_update(next_update)
+            .add_revoked_certificate(
+                x509.RevokedCertificateBuilder()
+                .serial_number(leaf.serial_number)
+                .revocation_date(now - 2 * day)
+                .build()
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+        bundle = tmp_path / f"ca_and_crl_{int(next_update.timestamp())}_{relaxed}.pem"
+        bundle.write_bytes(ca.public_bytes(pem) + crl.public_bytes(pem))
+        ctx = ssl.create_default_context(cafile=str(bundle))
+        assert ctx.cert_store_stats()["crl"] == 1
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+        if relaxed:
+            relax_verify_expiry(ctx, host=host)
+        return ctx
+
+    fresh, lapsed = now + 30 * day, now - day
+    # The control: without the relaxation the lapsed CRL refuses first, so the listing is untested.
+    assert _handshake(client(next_update=lapsed, relaxed=False), server, host) == "CRL has expired"
+    assert (
+        _handshake(client(next_update=fresh, relaxed=True), server, host) == "certificate revoked"
+    )
+    assert (
+        _handshake(client(next_update=lapsed, relaxed=True), server, host) == "certificate revoked"
+    )
 
 
 @pytest.mark.parametrize("shape", ["missing", "not a crl"])
