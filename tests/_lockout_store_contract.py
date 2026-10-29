@@ -51,6 +51,7 @@ webauthn nor the harness extra.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -126,8 +127,15 @@ async def _lock_cycle(
     return float(locked)
 
 
-async def _assert_lockout_contract(store: Any) -> None:
-    """The behaviour every backend owes ``increment_login_failure`` and the lockout writers."""
+#: What a backend leg passes to plant a passkey cell the escalation's read cannot use: an awaitable
+#: ``corrupt(user_id)`` per case name, each writing straight to the backend's own table.
+PasskeyCorrupters = dict[str, Callable[[str], Awaitable[None]]]
+
+
+async def _assert_lockout_contract(store: Any, *, corrupt_passkeys: PasskeyCorrupters) -> None:
+    """The behaviour every backend owes ``increment_login_failure`` and the lockout writers.
+    ``corrupt_passkeys`` drives the unreadable-passkey arm, which needs raw SQL on each backend."""
+    await _assert_an_unreadable_passkey_set_counts_at_the_fixed_length(store, corrupt_passkeys)
     await _assert_single_counter_policy(store)
     await _assert_escalation(store)
     await _assert_passkey_escalates_the_sign_in_lock(store)
@@ -399,6 +407,65 @@ async def _assert_passkey_escalates_the_sign_in_lock(store: Any) -> None:
     )
 
     for user_id in ("lock-pk", "lock-pk-ad"):
+        await store.delete_all_webauthn_credentials(user_id)
+        await store.delete_user(user_id)
+
+
+async def _assert_an_unreadable_passkey_set_counts_at_the_fixed_length(
+    store: Any, corrupt_passkeys: PasskeyCorrupters
+) -> None:
+    """BACKLOG #3937 item 8 follow-up, on every backend: the escalation reads the passkey set
+    inside the failed sign-in's own transaction, so a passkey cell that cannot be read there, at
+    fetch time (a cell the driver cannot decode) or at parse time (a value that is not the
+    store's), must never roll the count back. Every failure still counts and the lock arms on
+    every cycle, at the fixed length: a passkey that cannot be read is no way past, so it does not
+    escalate. RED when: the read error escapes the increment (the count is lost and the account
+    never locks), or the unreadable set escalates."""
+    from messagefoundry.store.store import passkey_is_way_past
+    from tests._webauthn_store_contract import _cred
+
+    # Three cycles: an escalation would double the second and third.
+    expected_fixed = [LOCKOUT_SECONDS] * 3
+    for case, corrupt in corrupt_passkeys.items():
+        user_id = f"lock-pk-bad-{case}"
+        await store.create_user(
+            user_id=user_id,
+            username=user_id,
+            auth_provider="local",
+            password_hash="h",
+            now=1.0,
+            password_generated=False,
+        )
+        await store.add_webauthn_credential(
+            _cred(
+                user_id,
+                "resident",
+                id_hash=credential_id_hash(user_id.encode()),
+                rp_id="t",
+                # Discoverable, the control: read cleanly it would escalate, so only the
+                # unreadable path keeps the fixed length, and a corruption that did not land
+                # fails the arm.
+                discoverable=True,
+            )
+        )
+        await corrupt(user_id)
+        start, seen = 10_000.0, []
+        for cycle in range(1, len(expected_fixed) + 1):
+            locked = await _lock_cycle(
+                store,
+                user_id,
+                start=start,
+                counter="sign_in",
+                passkey_escalates=passkey_is_way_past,
+            )
+            user = await store.get_user(user_id)
+            assert user is not None
+            assert (user.failed_attempts, user.lock_cycles) == (THRESHOLD, cycle), (
+                f"{case}: cycle {cycle} lost a failure"
+            )
+            seen.append(locked - (start + THRESHOLD - 1))
+            start = locked + 1.0
+        assert seen == expected_fixed, f"{case}: an unreadable passkey set escalated the lock"
         await store.delete_all_webauthn_credentials(user_id)
         await store.delete_user(user_id)
 

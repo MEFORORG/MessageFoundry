@@ -2938,6 +2938,12 @@ def sets_a_later_sign_in_lock(row: UserRecord | UserRow, threshold: int, now: fl
     return reaches >= threshold and row.lock_cycles >= 1
 
 
+#: The prefix of the ``sqlite3.OperationalError`` the stdlib raises for a TEXT cell it cannot
+#: decode while fetching a row (CPython ``Modules/_sqlite/cursor.c``). The rest of the message
+#: quotes the cell, so it is matched and never logged.
+_SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
+
+
 async def escalation_passkeys(
     counter: LockoutCounter,
     *,
@@ -2954,11 +2960,16 @@ async def escalation_passkeys(
     ``read_passkeys`` run, so a racing failure cannot make the gate stale, a passkey write waits,
     and a wrong password below the threshold costs no passkey read.
 
-    A passkey row that does not parse answers ``None``, logged: the lock then keeps the fixed
-    length, and the count still lands. Raising here would roll the count back, and a malformed row
-    would then stop the account ever locking. ``ValueError`` is caught beside
-    :class:`PasskeyRowMalformed` for a value the driver cannot decode while fetching, before any
-    row is parsed (a ``UnicodeDecodeError`` on SQL Server)."""
+    A set that cannot be read answers ``None``, logged: the failure still counts, and the lock keeps
+    the fixed length. That is a row that does not parse (:class:`PasskeyRowMalformed`), or a cell
+    the driver cannot decode while fetching, before any row is parsed: sqlite3 raises an
+    ``OperationalError`` told apart only by its message, and pyodbc a ``UnicodeDecodeError``
+    (asyncpg is expected to raise the same; no test plants the cell there, since a UTF8 database
+    refuses it at write time). Raising here would roll the count back, and the account would then
+    never lock. It does not escalate either: ADR 0197 escalates only where the owner has a way
+    past, and a passkey that cannot be read signs nobody in, so a doubling lock would only arm a
+    username-only attacker against the owner. Any other error is raised, and rolls the write back
+    as it would anywhere else."""
     if counter != "sign_in" or passkey_escalates is None:
         return None
     record = await read_record()
@@ -2966,13 +2977,19 @@ async def escalation_passkeys(
         return None
     try:
         return await read_passkeys()
-    except (PasskeyRowMalformed, ValueError) as exc:
-        log.warning(
-            "a passkey row of user %s did not parse (%s); its sign-in lock keeps its fixed length",
-            record.row.id,
-            type(exc).__name__,
-        )
-        return None
+    except (PasskeyRowMalformed, UnicodeDecodeError) as exc:
+        failure = type(exc).__name__
+    except sqlite3.OperationalError as exc:
+        if not str(exc).startswith(_SQLITE_DECODE_FAILURE):
+            raise
+        failure = type(exc).__name__
+    # The class name only: a decode error's message and arguments quote the cell.
+    log.warning(
+        "the passkeys of user %s could not be read (%s); its sign-in lock keeps its fixed length",
+        record.row.id,
+        failure,
+    )
+    return None
 
 
 @dataclass(frozen=True)
@@ -3162,7 +3179,8 @@ def lockout_increment(
     write, hold one that ``passkey_escalates`` counts (:func:`discoverable_way_past`, trusted only
     where it matches the locked row's digest on a ``sealed`` store; BACKLOG #3937 item 8). The
     backend reads the set only where :func:`escalation_passkeys` says it can matter, and passes
-    ``None`` otherwise; ``None`` for either counts no passkey, the fixed length callers had before."""
+    ``None`` otherwise, a set it could not read included; ``None`` for either counts no passkey,
+    the fixed length callers had before."""
     attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
 
     def passkey_way_past(r: UserAuthzRecord) -> bool:
@@ -7127,7 +7145,8 @@ def lockout_escalates(
     (:func:`escalation_verdict`); an unknown verdict, a cell that moved meanwhile, or no verdict at
     all leave the flag standing, as before that rule. ``passkey_way_past`` is asked of the passkey
     set read in the same transaction as the write (:func:`lockout_increment`, BACKLOG #3937 item
-    8). The count itself stays atomic."""
+    8); a set that cannot be read there counts no passkey, so the failure counts at the fixed
+    length (:func:`escalation_passkeys`). The count itself stays atomic."""
     if auth_provider != "local":
         return False
     return counter == "second_step" or totp_enabled or passkey_way_past
@@ -15593,10 +15612,12 @@ class MessageStore:
         return updated
 
     async def _account_passkeys(self, user_id: str) -> list[WebAuthnCredential]:
-        rows = await self._db.execute(
+        # Closed on the way out, a failed fetch included: escalation_passkeys survives a cell that
+        # does not decode, and an open statement would hold back a WAL checkpoint until GC.
+        async with self._db.execute(
             "SELECT * FROM webauthn_credentials WHERE user_id=?", (user_id,)
-        )
-        return [WebAuthnCredential.from_mapping(dict(r)) for r in await rows.fetchall()]
+        ) as rows:
+            return [WebAuthnCredential.from_mapping(dict(r)) for r in await rows.fetchall()]
 
     async def _write_passkeys(
         self,

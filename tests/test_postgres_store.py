@@ -1109,7 +1109,15 @@ async def test_lockout_store_contract(store) -> None:
     contract above states."""
     from tests._lockout_store_contract import _assert_lockout_contract
 
-    await _assert_lockout_contract(store)
+    async def corrupt(user_id: str) -> None:
+        # A UTF8 database refuses a cell it cannot decode at write time, so only the parse arm can
+        # be planted here; the fetch-time arm runs on SQLite and SQL Server.
+        async with store._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE webauthn_credentials SET transports='not json' WHERE user_id=$1", user_id
+            )
+
+    await _assert_lockout_contract(store, corrupt_passkeys={"parse": corrupt})
 
 
 async def test_login_address_store_contract(store) -> None:
