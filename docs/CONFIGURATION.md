@@ -1287,15 +1287,14 @@ It differs from `subprocess` in at least these ways:
 - **`wall_seconds` counts the lookups.** The cap bounds the whole call, including the time the engine
   spends serving its lookups, so raise it for a feed whose lookups are slow. When the cap runs out
   during a lookup, the call fails at once and its worker is recycled. A lookup that has already
-  reached its runner runs on to its own timeout in the engine, and its result is discarded. One
-  that has not reached it is normally not started, though one that was a moment from its runner
-  call when the cap ran out can still start, and then counts like any other. While a lookup runs on
-  this way, a later lookup on the same connection from that inbound waits for it, until a quarter of its own call's cap (at most 2
-  seconds) is left, and is refused if it is still waiting then, leaving that quarter for the Handler
-  to handle the refusal. That bounds what the engine's broker waits on, not the
-  database: a `db_lookup` its runner gave up on can still be running there, and a reload starts with
-  no record of a lookup still running.
-- **It needs a config directory.** A graph built in code with none cannot start a worker. Under
+  reached its runner runs on to its own timeout in the engine, and its result is discarded. One that
+  has not reached it is normally not started. One that was a moment from its runner call when the
+  cap ran out can still start; it is then recorded and holds the connection like any other. While a
+  lookup runs on this way, a later lookup on the same connection from that inbound waits for it,
+  until a quarter of its own call's cap (at most 2 seconds) is left. It is refused if it is still
+  waiting then, which leaves that quarter for the Handler to handle the refusal. That bounds what
+  the engine's broker waits on, not the database: a `db_lookup` its runner gave up on can still be
+  running there, and a reload starts with no record of a lookup still running.- **It needs a config directory.** A graph built in code with none cannot start a worker. Under
   `subprocess` such a graph quietly runs in-process; under `isolated` the runner refuses to be built
   instead, because in-process its lookups would not go through the broker.
 

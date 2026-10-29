@@ -1074,6 +1074,7 @@ def test_a_helper_past_its_deadline_never_calls_the_runner(
                 for thread in set(threading.enumerate()) - earlier
                 if thread.name.startswith("mf-sandbox-lookup-")
             ]
+            assert len(a_helpers) == 1  # the sync point below depends on finding A's helper
             go.clear()
             with pytest.raises(SandboxError, match="wall cap"):
                 _bodies(registry, "h_db", session)  # B: its helper is held before the runner

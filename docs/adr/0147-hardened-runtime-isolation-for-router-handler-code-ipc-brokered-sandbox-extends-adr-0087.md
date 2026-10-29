@@ -195,8 +195,10 @@ It refuses one bound to a Router or `accepts=` dispatch, and one whose `[egress]
 `[egress].allowed_http` is empty. A refused or failed lookup is the Handler's error, routed to
 `ERROR`/dead-letter post-ACK (AC-5, for the broker). `wall_seconds` bounds the whole dispatch, the
 brokered lookups and the writes of their replies included. What happens to a lookup the cap cuts
-off, and to a later lookup on the same connection, is stated once, in `docs/CONFIGURATION.md`
-section `[sandbox]`. At most one runner call runs per connection and session.
+off, and to a later lookup on the same connection, is stated in
+[CONFIGURATION.md, `[sandbox]`](../CONFIGURATION.md#sandbox). The broker runs at most one runner call
+per connection and session. That does not bound the database: a query the runner itself gave up on
+can still be running, and a reload starts a session with no record of it.
 
 **Not built:** decision (2), the OS confinement: AC-3 (Landlock and seccomp), AC-4 (the AppContainer
 token), and AC-7 (no opening or signalling the parent or a sibling). The first two open boxes above,
