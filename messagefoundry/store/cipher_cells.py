@@ -8,12 +8,12 @@ store, and until this module no caller outside it could read them back. This mod
 and the columns each writer binds into ``cell_aad``, in the order it binds them, and joins both kinds
 into :data:`SQLITE_CIPHER_CELLS`. The full restore-verify reads every sealed value in them back
 through the cipher, so a ciphertext whose tag no longer authenticates fails the verify instead of
-surfacing at first use. It selects values by their marker, so a value whose marker itself is damaged
-is not reached by that pass.
+surfacing at first use. It selects the values :func:`_sealed_sql` calls sealed, so a text value
+whose marker itself is damaged is not reached by that pass.
 
 :func:`read_cipher_cells` is the one walk over those cells. The restore-verify stops at its first
 failure; :func:`audit_cipher_cells`, behind ``messagefoundry cipher-audit``, reads a LIVE store with
-it to the end and also counts, in a keyed store, the non-blank values that carry no marker at all,
+it to the end and also counts, in a keyed store, the non-blank text values that carry no marker,
 which is where a damaged marker lands.
 
 It is READ-ONLY: nothing here writes a cell, and the store's own passes do not consume it. Driving
@@ -192,7 +192,7 @@ class CellReading:
     ``kind`` is ``"opened"`` when the value decrypted and authenticated, ``"failed"`` when it did
     not or its reader would refuse it (``error`` says why), and ``"keyless"`` when it is sealed and
     the cipher holds no key, so nothing could have opened it. Two kinds are reported only when the
-    walk is asked for unmarked values: ``"unmarked"``, a non-blank value with no marker on a surface
+    walk is asked for unmarked values: ``"unmarked"``, a non-blank text value with no marker on a surface
     the store has sealed, which it refuses at read, and ``"legacy"``, the same on a surface no keyed
     open has sealed yet, which the next keyed open seals. ``values`` are the cell's ``locator``
     values: never a plaintext, and never a key column that can itself be PHI."""
@@ -256,22 +256,32 @@ def _surface_sealed(conn: sqlite3.Connection, spec: CipherCell, tables: set[str]
         ).fetchone()
     ):
         return True
+    # The store's own test, LIKE as `_surface_holds_ciphertext` spells it, not `_sealed_sql`: this
+    # answers what the store will do, so it must read the surface the way the store reads it.
     marked = conn.execute(
-        f"SELECT 1 FROM {spec.table} WHERE {_sealed_sql(spec.column)} LIMIT 1",  # declared constants
+        f"SELECT 1 FROM {spec.table} WHERE {spec.column} LIKE ? LIMIT 1",  # declared constants
         (f"{MARKER_PREFIX}%",),
     ).fetchone()
     return marked is not None
 
 
-def _sealed_sql(column: str) -> str:
-    """The SQL test that calls a value of ``column`` sealed, with one ``?`` for the marker pattern.
+#: The parameters :func:`_sealed_sql`'s placeholders take, in order.
+_SEALED_PARAMS: tuple[object, ...] = (len(MARKER_PREFIX), MARKER_PREFIX)
 
-    ``LIKE 'mfenc:%'`` alone is not the same test on every platform. A SQLite built with
-    ``SQLITE_LIKE_DOESNT_MATCH_BLOBS``, as Ubuntu's is, never matches a BLOB, while the Windows
-    build matches one by its bytes. So a BLOB is called sealed by its type, on every build: no
-    writer stores one in a cipher-covered column, and :func:`_open` fails it without a decrypt.
-    That fails closed, where a BLOB the test skipped would never be read at all."""
-    return f"(typeof({column}) = 'blob' OR {column} LIKE ?)"
+
+def _sealed_sql(column: str) -> str:
+    """The SQL test that calls a value of ``column`` sealed; it takes :data:`_SEALED_PARAMS`.
+
+    A text value is sealed when it starts with the marker in any ASCII case, as ``LIKE 'mfenc:%'``
+    reads it on a default build. LIKE itself is not used, because what it does depends on the
+    build and the connection: ``SQLITE_LIKE_DOESNT_MATCH_BLOBS`` (Ubuntu's SQLite has it, the
+    Windows one does not) makes it skip every BLOB, and ``SQLITE_CASE_SENSITIVE_LIKE`` or ``PRAGMA
+    case_sensitive_like`` makes it skip ``MFENC:``. A value it skipped would never be read at all.
+
+    A BLOB is called sealed by its type. At least the store's own writer, ``_enc``, binds text,
+    so a BLOB in a cipher-covered column is not a value the store's reader can open, and
+    :func:`_open` fails it without a decrypt: the walk fails closed on it, on every build."""
+    return f"(typeof({column}) = 'blob' OR lower(substr({column}, 1, ?)) = ?)"
 
 
 def _schema_version(conn: sqlite3.Connection) -> int:
@@ -292,11 +302,8 @@ def read_cipher_cells(
     cells fails its tag here as it would at a live read, and then put through the cell's ``check``.
     A cell :func:`cell_present` says the store lacks is skipped: an older store predates it.
 
-    A value is sealed when it is a BLOB or SQLite's ``LIKE 'mfenc:%'`` matches it (see
-    :func:`_sealed_sql`): the LIKE is the test the restore-verify has always selected with, and it
-    ignores case, but whether it matches a BLOB depends on how SQLite was built, so a BLOB is
-    judged by its type instead. A sealed value that is a BLOB, or whose marker is in another case,
-    fails without a decrypt (see :func:`_open`).
+    Which values are sealed is :func:`_sealed_sql`'s; :func:`_open` says which of them fail
+    without a decrypt.
 
     The rows of each cell are read in ``rowid`` order, ``chunk_rows`` at a time. Each chunk is one
     statement, read one row at a time and opened as it is read, and its readings are yielded only
@@ -306,7 +313,7 @@ def read_cipher_cells(
     :class:`CipherWalkInterrupted`. A decrypt that failed because the key service did
     (:func:`_is_outage`) ends the walk after its reading is yielded.
 
-    ``unmarked`` also yields every non-blank value with no marker, in a keyed store only, as
+    ``unmarked`` also yields every non-blank text value with no marker, in a keyed store only, as
     ``"unmarked"`` or ``"legacy"`` by whether the store has sealed that surface (see
     :class:`CellReading`). A walk selecting by the marker alone never reads such a value, which is
     where a damaged or stripped marker, or a planted row, lands. NULL and ``''`` are never reported:
@@ -333,8 +340,7 @@ def read_cipher_cells(
         sealed_sql = _sealed_sql(column)
         picked = ", ".join(("rowid", sealed_sql, *spec.locator, *spec.aad_columns, column))
         chosen = f"{column} IS NOT NULL AND {column} != ''" if unmarked else sealed_sql
-        marker: tuple[object, ...] = (f"{MARKER_PREFIX}%",)
-        params = marker if unmarked else marker * 2
+        params = _SEALED_PARAMS if unmarked else _SEALED_PARAMS * 2
         first = f"SELECT {picked} FROM {table} WHERE {chosen} ORDER BY rowid LIMIT ?"
         after = f"SELECT {picked} FROM {table} WHERE {chosen} AND rowid > ? ORDER BY rowid LIMIT ?"
         width = len(spec.locator)
@@ -351,10 +357,13 @@ def read_cipher_cells(
                 if not sealed:
                     readings.append(CellReading(spec, unsealed_kind, where))
                 elif keyless:
-                    # LIKE ignores case; the marker does not. A keyless store's plaintext that only
-                    # resembles it is not a sealed cell.
+                    # The sealed test ignores case and takes any BLOB; the marker does neither. A
+                    # keyless store's plaintext that only resembles it is not a sealed cell, but a
+                    # BLOB that starts with the marker's bytes is, valid UTF-8 or not.
                     text = _as_text(stored)
-                    if text is not None and cipher.is_encrypted(text):
+                    if (text is not None and cipher.is_encrypted(text)) or (
+                        isinstance(stored, bytes) and stored.startswith(MARKER_PREFIX.encode())
+                    ):
                         readings.append(CellReading(spec, "keyless", where))
                 else:
                     reading = _open(spec, cipher, stored, key, where)
@@ -414,13 +423,17 @@ def _open(
     key: list[object],
     where: tuple[object, ...],
 ) -> CellReading:
-    """Open one value the marker test called sealed, and run its cell's check; the plaintext goes
-    no further. A value the store's reader could not take as a sealed cell fails here without a
-    decrypt: a BLOB, or a marker in another case, which the cipher would otherwise hand to its
-    unmarked-value rule and, under ``allow_unmarked_ciphertext``, return with no tag checked."""
+    """Open one value :func:`_sealed_sql` called sealed, and run its cell's check; the plaintext
+    goes no further. A value the store's reader could not take as a sealed cell fails here without
+    a decrypt: a BLOB, marked or not, or a marker in another case, which the cipher would otherwise
+    hand to its unmarked-value rule and, under ``allow_unmarked_ciphertext``, return with no tag
+    checked."""
     if not isinstance(stored, str):
         return CellReading(
-            spec, "failed", where, CipherError("the sealed value is stored as a BLOB, not text")
+            spec,
+            "failed",
+            where,
+            CipherError("the value is stored as a BLOB, not text, which the store cannot open"),
         )
     if not stored.startswith(MARKER_PREFIX):
         return CellReading(

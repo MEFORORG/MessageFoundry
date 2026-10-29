@@ -21,11 +21,13 @@ import json
 import re
 import shutil
 import sqlite3
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+import messagefoundry.store.cipher_cells as cipher_cells_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import BackupSettings, StoreSettings
 from messagefoundry.pipeline import dr_backup
@@ -593,45 +595,65 @@ def _set(db: Path, table: str, column: str, rowid: int, value: object) -> None:
         conn.close()
 
 
+_MARKER_RX = re.compile(re.escape(MARKER_PREFIX) + ".*", re.DOTALL | re.IGNORECASE | re.ASCII)
+
+
 def _like_that_skips_blobs(pattern: object, value: object) -> bool:
-    """SQLite's ``like(pattern, value)`` as a build with ``SQLITE_LIKE_DOESNT_MATCH_BLOBS`` runs it:
-    a BLOB never matches. Ubuntu's SQLite is built that way and the Windows one is not, so this
-    puts the Linux behaviour on every platform. ``%`` and ``_`` are the only wildcards the walk's
-    patterns use; case is ignored for ASCII, as SQLite ignores it."""
-    if value is None or pattern is None:
-        return False
-    if isinstance(value, bytes):
-        return False
-    rx = "".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in str(pattern))
-    return re.fullmatch(rx, str(value), flags=re.DOTALL | re.IGNORECASE | re.ASCII) is not None
+    """``like(pattern, value)`` as a ``SQLITE_LIKE_DOESNT_MATCH_BLOBS`` build runs it, for the one
+    pattern a walk could use: a BLOB never matches."""
+    assert pattern == f"{MARKER_PREFIX}%", pattern
+    return isinstance(value, str) and _MARKER_RX.fullmatch(value) is not None
 
 
-@pytest.fixture(params=["native-like", "like-skips-blobs"])
-def like_build(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
-    """Run a restore-verify test under this platform's own LIKE, and again under a LIKE that never
-    matches a BLOB, whatever SQLite this machine was built with."""
-    if request.param == "like-skips-blobs":
-        real = connect_readonly  # what dr_backup imported from cipher_cells
-
-        def connect(path: str | Path, *, busy_timeout: float) -> sqlite3.Connection:
-            conn = real(path, busy_timeout=busy_timeout)
-            conn.create_function("like", 2, _like_that_skips_blobs, deterministic=True)
-            # The control: the override is in force, so a BLOB no longer matches.
-            assert conn.execute("SELECT x'6d66656e633a' LIKE 'mfenc:%'").fetchone()[0] == 0
-            return conn
-
-        monkeypatch.setattr(dr_backup, "connect_readonly", connect)
-    return str(request.param)
+#: The ways a connection's LIKE can differ from this machine's default build (see ``_sealed_sql``
+#: in store/cipher_cells.py), each with a probe that is true when it is in force.
+_LIKE_BUILDS: dict[str, tuple[Callable[[sqlite3.Connection], None], str]] = {
+    "like-skips-blobs": (
+        lambda c: c.create_function("like", 2, _like_that_skips_blobs, deterministic=True),
+        "SELECT NOT (x'6d66656e633a' LIKE 'mfenc:%')",
+    ),
+    "case-sensitive-like": (
+        lambda c: c.execute("PRAGMA case_sensitive_like = ON").close(),
+        "SELECT NOT ('MFENC:' LIKE 'mfenc:%')",
+    ),
+}
 
 
+@pytest.fixture(params=["native-like", *_LIKE_BUILDS])
+def sqlite_like_build(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Run a test under this machine's own LIKE, then under each other LIKE a SQLite build or
+    connection can have, whatever this machine's SQLite was built with. Every connection the walk
+    opens, the restore-verify's and ``cipher-audit``'s, gets the variant."""
+    if request.param == "native-like":
+        yield
+        return
+    install, probe = _LIKE_BUILDS[str(request.param)]
+    opened: list[sqlite3.Connection] = []
+
+    def connect(path: str | Path, *, busy_timeout: float) -> sqlite3.Connection:
+        conn = connect_readonly(path, busy_timeout=busy_timeout)
+        install(conn)
+        assert conn.execute(probe).fetchone()[0] == 1, "the LIKE variant is not in force"
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(dr_backup, "connect_readonly", connect)
+    monkeypatch.setattr(cipher_cells_module, "connect_readonly", connect)
+    yield
+    # The control: the variant reached the walk, so this run is not a second native one.
+    assert opened, "the walk never opened a connection through the patched connect_readonly"
+
+
+@pytest.mark.usefixtures("sqlite_like_build")
 @pytest.mark.parametrize("damaged", [False, True], ids=["intact", "flipped"])
 def test_a_sealed_value_stored_as_a_blob_fails_as_a_blob(
-    tmp_path: Path, _template: tuple[Path, StoreSettings], damaged: bool, like_build: str
+    tmp_path: Path, _template: tuple[Path, StoreSettings], damaged: bool
 ) -> None:
-    """A sealed value stored as a BLOB is selected as sealed whether or not this SQLite's LIKE
-    matches a BLOB, and fails: the store's reader cannot take a BLOB as a sealed cell, intact or
-    not. Read as ``str(bytes)`` it once looked unmarked, and where LIKE skips a BLOB it was never
-    read at all, so a damaged one passed the restore-verify (engine PR 2608, the ubuntu leg)."""
+    """A sealed value stored as a BLOB is selected as sealed under every LIKE, and fails: the
+    store's reader cannot take a BLOB as a sealed cell, intact or not. Where LIKE skipped a BLOB a
+    damaged one passed the restore-verify unread (engine PR 2608, the ubuntu leg)."""
     db, settings = _copy(_template, tmp_path)
     rowid, value = _first_sealed(db, "messages", "raw")
     if damaged:
@@ -644,6 +666,32 @@ def test_a_sealed_value_stored_as_a_blob_fails_as_a_blob(
     assert status == "FAIL" and "messages.raw" in message and "BLOB" in message, message
 
 
+def test_a_keyless_walk_names_a_blob_marker_that_is_not_utf8(tmp_path: Path) -> None:
+    """A keyless restore-verify of a store whose one sealed value is a BLOB starting with the
+    marker's bytes, then bytes that are not UTF-8: that is a sealed cell no key opened, not
+    plaintext, so the verdict is KEY_MISMATCH rather than PASS."""
+    db = tmp_path / "msg.db"
+    settings = StoreSettings(path=str(db))
+
+    async def write() -> None:
+        store = await _open(db, settings)
+        try:
+            await store.enqueue_message(channel_id="IB_SYNTH", raw=_RAW, deliveries=[("OB", "X")])
+        finally:
+            await store.close()
+
+    asyncio.run(write())
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE messages SET raw = ?", (MARKER_PREFIX.encode() + b"v4:\xff\xfe",))
+        conn.commit()
+    finally:
+        conn.close()
+    status, message, _ = dr_backup._decrypt_check(db, settings)
+    assert status == "KEY_MISMATCH" and "messages.raw" in message, message
+
+
+@pytest.mark.usefixtures("sqlite_like_build")
 def test_a_marker_in_another_case_fails_even_under_the_opt_out(
     tmp_path: Path,
     _template: tuple[Path, StoreSettings],

@@ -10071,7 +10071,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     it. This walks the same cell inventory the full restore-verify does
     (:data:`~messagefoundry.store.cipher_cells.SQLITE_CIPHER_CELLS`) on a read-only connection, in
     short chunks, so it can run beside the service. It reports per-cell counts and each cell's first
-    failing row by its locator, never a value. In a keyed store it also counts the non-blank values
+    failing row by its locator, never a value. In a keyed store it also counts the non-blank text values
     that carry no marker, which a walk selecting by the marker never reads: a FAIL on a surface the
     store has sealed, which refuses them at read, and reported only on one no keyed open has sealed
     yet. A VACUUM part way, or the key service going unreachable, stops it with a FAIL rather than
