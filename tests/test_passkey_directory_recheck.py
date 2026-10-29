@@ -334,6 +334,7 @@ async def test_a_locked_directory_account_is_refused_as_locked_before_any_lookup
         lockout_seconds=900.0,
         max_lockout_seconds=86_400.0,
         totp_usable=_opened_totp_state,
+        passkey_escalates=None,
     )
     p.directory.answer = DirectoryAnswer.DISABLED
 
@@ -352,6 +353,7 @@ async def _lock_second_step(store: MessageStore, user_id: str) -> None:
         lockout_seconds=900.0,
         max_lockout_seconds=86_400.0,
         totp_usable=_opened_totp_state,
+        passkey_escalates=None,
     )
 
 

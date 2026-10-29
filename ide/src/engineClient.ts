@@ -5,6 +5,7 @@
 // the Node built-ins (no global `fetch` dependency, no npm deps) — same zero-dep style as cli.ts.
 import * as http from "node:http";
 import * as https from "node:https";
+import type * as tls from "node:tls";
 
 import { serveCommandLine } from "./engineControlModel";
 import {
@@ -177,6 +178,12 @@ export const TLS_13_SUITES: readonly string[] = [
 
 /** Both suite lists as the one OpenSSL cipher string Node's `ciphers` option takes. */
 export const TLS_CIPHERS = TLS_12_SUITES.concat(TLS_13_SUITES).join(":");
+
+/**
+ * What {@link tlsOptions} returns. `https.request` hands its options to `tls.connect`, which reads
+ * `minDHSize`, but `@types/node` does not list that field on `https.RequestOptions`.
+ */
+export type EngineTlsOptions = https.RequestOptions & Pick<tls.ConnectionOptions, "minDHSize">;
 
 /**
  * Extra trust anchors, keyed by `host:port` (see {@link engineHostKey}) — BACKLOG #1695.
@@ -380,15 +387,33 @@ async function withRenewalRetry<T>(
  * and now paid on purpose: a TLS terminator in front of the engine that speaks only CBC suites will
  * fail the handshake, and the fix is on that terminator. The list names TLS 1.3 suites too, which
  * take effect on plain Node and not under the desktop's Electron; {@link TLS_13_SUITES} says more.
+ *
+ * `minDHSize` is 2048 (BACKLOG #300), where Node's default is 1024. It bounds the group the one DHE
+ * suite in {@link TLS_12_SUITES} may run over, rather than dropping that suite (owner ruling of
+ * 2026-10-27). What it guards against is a server that negotiates that suite, such as a TLS
+ * terminator in front of the engine. OpenSSL 3.2 and later already refuse a group under 2048 bits
+ * at their default security level. The option holds the floor where that level is lower: by
+ * default before 3.2, or where a system OpenSSL configuration lowers it.
+ * `test/suite/engine-client-dh.test.ts` lowers the level and shows the option refusing.
+ *
+ * Node checks it on each full handshake. Its https agent does not key its socket pool or session
+ * cache on it, so a socket another caller opened to the same engine without it could be reused;
+ * every request this client builds carries it. VS Code's desktop runtime, Electron with BoringSSL,
+ * is taken to negotiate no DHE suite, so there the option has nothing to act on. The value is a
+ * literal so the crypto inventory's token carries it.
  */
-export function tlsOptions(url: URL): https.RequestOptions {
+export function tlsOptions(url: URL): EngineTlsOptions {
   if (url.protocol !== "https:") {
     return {};
   }
   // engineHostKey on BOTH sides of the Map (via anchorFor). Spelling the normalization inline here
   // would let a later change to one side make every lookup silently miss.
   const ca = anchorFor(url.href);
-  const base: https.RequestOptions = { minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS };
+  const base: EngineTlsOptions = {
+    minVersion: TLS_MIN_VERSION,
+    ciphers: TLS_CIPHERS,
+    minDHSize: 2048,
+  };
   return ca === undefined ? base : { ...base, ca };
 }
 
@@ -563,7 +588,7 @@ function postReply(
       headers["Authorization"] = `Bearer ${token}`;
     }
     const transport = url.protocol === "https:" ? https : http;
-    const options: https.RequestOptions = { method: "POST", headers, ...tlsOptions(url) };
+    const options: EngineTlsOptions = { method: "POST", headers, ...tlsOptions(url) };
     const req = transport.request(url, options, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => chunks.push(c));
@@ -643,7 +668,7 @@ function getOnce<T>(
     }
     const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
     const transport = url.protocol === "https:" ? https : http;
-    const options: https.RequestOptions = { method: "GET", headers, ...tlsOptions(url) };
+    const options: EngineTlsOptions = { method: "GET", headers, ...tlsOptions(url) };
     const req = transport.request(url, options, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => chunks.push(c));

@@ -154,8 +154,8 @@ def crl_reload_refused_detail(
     ]
     if start_refuses:
         # "At least": the time is when one cause of a refusal ends, not a promise that a start
-        # loads the file then. A proven bad signature, or a private copy a start cannot make,
-        # still refuses after it (vault BACKLOG #3506); the remedy that follows says when.
+        # loads the file then. A private copy a start cannot make, for one, still refuses after
+        # it (vault BACKLOG #3506).
         parts.append(
             "A start refuses this file too at least until its CRL takes effect, so do not restart "
             "before then."
@@ -229,7 +229,9 @@ class AlertSink(Protocol):
         (auto-resolved on the next clean head via ADR-0044 durable state when wired). Distinct from
         :meth:`connection_stopped` (the ``stop``-policy terminal) so an operator can route a "still
         retrying, look at the dependency" signal apart from a halted lane. ``name`` is the stage-lane
-        label; ``detail`` is a PHI-free reason (stage + streak). Emitted by the ``StageDispatcher``."""
+        label; ``detail`` is a PHI-free reason (stage + streak). Emitted by the ``StageDispatcher``.
+        Under ``retry_forever`` it also fires for a serializer HOLDING its lane while the re-pend of
+        its claimed rows keeps failing (BACKLOG #1611), which the ADR 0070 streak cannot reach."""
         ...
 
     def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:

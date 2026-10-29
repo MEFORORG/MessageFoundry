@@ -23,8 +23,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.auth import oidc
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.audit_visibility import (
-    DIRECTORY_LOCKED_REFUSAL_DETAIL,
-    HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE,
+    DIRECTORY_LOGIN_LOCKED_ACTION,
 )
 from messagefoundry.auth.service import (
     DIRECTORY_ROLE_MAP_UNSEALED,
@@ -217,7 +216,9 @@ async def test_a_sign_in_past_the_floor_records_no_exemption(
 # BACKLOG #3220: a refusal after the exemption applied carries the marker too, so the review the
 # loosening entry asks for also sees exempted attempts that failed. Each refusal is driven twice:
 # inside the floor with an exempt amr (marked), and past the floor with the same amr (the control:
-# the floor never applied, so there is nothing to mark).
+# the floor never applied, so there is nothing to mark). BACKLOG #3726: the lock refusal is written
+# under its own action, which readers without users:manage never read (owner ruling 2026-09-28), so
+# the marker can ride it; it used to share auth.login_failed, hidden by exact text, and took none.
 async def _refuse_sign_in(service: AuthService, store: MessageStore, refusal: str) -> None:
     if refusal == "disabled":  # refused in _complete_ad_login, through _refuse_directory_row
         user = await store.get_user_by_username("jdoe")
@@ -225,6 +226,10 @@ async def _refuse_sign_in(service: AuthService, store: MessageStore, refusal: st
         await store.set_user_disabled(user.id, disabled=True)
     elif refusal == "not_in_directory":  # refused in _authenticate_oidc itself
         service._ldap._principal = None  # type: ignore[union-attr]
+    elif refusal == "locked":  # refused in _complete_ad_login, under its own action
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await store.record_login_failure(user.id, failed_attempts=5, locked_until=time.time() + 600)
 
 
 async def _refusal_detail(store: MessageStore, action: str, reason: str) -> dict[str, Any]:
@@ -234,7 +239,9 @@ async def _refusal_detail(store: MessageStore, action: str, reason: str) -> dict
     return detail
 
 
-@pytest.mark.parametrize("refusal", ["disabled", "not_in_directory", "federated_subject_not_bound"])
+@pytest.mark.parametrize(
+    "refusal", ["disabled", "not_in_directory", "federated_subject_not_bound", "locked"]
+)
 @pytest.mark.parametrize(("elapsed", "marked"), [(FLOOR - 0.001, True), (FLOOR + 0.001, False)])
 async def test_a_refused_sign_in_carries_the_marker_only_when_the_exemption_applied(
     rsa_key: rsa.RSAPrivateKey,
@@ -257,42 +264,16 @@ async def test_a_refused_sign_in_carries_the_marker_only_when_the_exemption_appl
             service, clock, ("mfa", EXEMPT, "x-token-only"), elapsed=elapsed
         )
         assert not out.ok and out.reason == refusal, out
-        detail = await _refusal_detail(store, "auth.login_failed", refusal)
+        action = DIRECTORY_LOGIN_LOCKED_ACTION if refusal == "locked" else "auth.login_failed"
+        detail = await _refusal_detail(store, action, refusal)
         if marked:
             # Configured values only: the token's other amr values never reach the row.
             assert detail["callback_floor_exempt_amr"] == [EXEMPT]
         else:
             assert "callback_floor_exempt_amr" not in detail
-    finally:
-        await store.close()
-
-
-async def test_a_refused_exempted_sign_in_against_a_locked_account_keeps_the_hidden_lock_text(
-    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The lock refusal is hidden from readers without users:manage by its exact text, so it takes
-    no marker: a marker would make the row visible and show them the lock (owner ruling
-    2026-09-28). Checked against the exclusion's row set, not through a store read."""
-    store = await MessageStore.open(":memory:")
-    try:
-        service, clock = await _floored(
-            store, rsa_key, monkeypatch, oidc_callback_floor_exempt_amr=[EXEMPT]
-        )
-        user = await store.get_user_by_username("jdoe")
-        assert user is not None
-        await store.record_login_failure(user.id, failed_attempts=5, locked_until=time.time() + 600)
-        out = await _sign_in_too_early(service, clock, ("mfa", EXEMPT))
-        assert not out.ok and out.reason == "locked", out
-        [row] = [
-            r
-            for r in await _audit_rows(store, "auth.login_failed")
-            if json.loads(str(r["detail"])).get("reason") == "locked"
-        ]
-        assert row["detail"] == DIRECTORY_LOCKED_REFUSAL_DETAIL
-        assert (
-            "auth.login_failed",
-            row["detail"],
-        ) in HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.rows
+        # No lock stand-in under the visible action: it would show the lock and feed the burst.
+        failed = await _audit_rows(store, "auth.login_failed")
+        assert all(json.loads(str(r["detail"])).get("reason") != "locked" for r in failed)
     finally:
         await store.close()
 

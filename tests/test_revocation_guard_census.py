@@ -107,6 +107,7 @@ _GUARD_ROOTS = frozenset(
 _GUARDS = _GUARD_ROOTS | frozenset(
     {
         "refuse_unrevoked_verified_hop",
+        "_guard_ftps_revocation",  # transports/remotefile.py, both FTPS directions (BACKLOG #2193)
         "_refuse_store_revocation",
         "_refuse_forward_revocation",
         "_refuse_idp_revocation",
@@ -193,7 +194,9 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/transports/mllp.py::MLLPDestination.__init__": Guarded(),
     "messagefoundry/transports/remotefile.py::_FtpClient.__init__": Guarded(
         by="messagefoundry/transports/remotefile.py::RemoteFileDestination.__init__",
-        note="the FTPS upload. The inbound FTPS poll builds the same client and is " + _UNGATED,
+        note="the FTPS upload. The inbound FTPS poll builds the same client, and "
+        "RemoteFileSource.__init__ calls the same _guard_ftps_revocation (BACKLOG #2193); Guarded "
+        "names one caller, so the poll's call is pinned by the behaviour tests",
     ),
     "messagefoundry/transports/rest.py::RestDestination.__init__": Guarded(),
     "messagefoundry/transports/smart.py::_TokenEndpointProvider._open_token_hop": Guarded(

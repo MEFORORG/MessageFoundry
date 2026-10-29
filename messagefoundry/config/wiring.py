@@ -1210,7 +1210,9 @@ def FhirLookup(
     :func:`env`. TLS is on by default. ``verify_tls=False`` to an off-box host is refused unless
     ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
     ``[security].enforcement = warn``, and never crosses a cleartext ``http`` url (that takes
-    ``tls_hop_attested`` or ``cleartext_accepted``, below). The pure
+    ``tls_hop_attested`` or ``cleartext_accepted``, below). Neither declaration lifts a refusal of a
+    lookup that sends a credential, over ``verify_tls=False`` or over cleartext ``http`` off this
+    machine (vault BACKLOG #3230, #3533 item 4). The pure
     ``parsing/fhir/`` codec parses the reply, so a ``FhirLookup``-declaring graph needs the optional
     ``messagefoundry[fhir]`` extra.
 
@@ -1696,6 +1698,9 @@ def _is_secret_header(name: str, value: object = None) -> bool:
     #3230). Since vault BACKLOG #3533 that refusal also takes any name off its own allowlist. For
     that refusal, narrowing the NAME arm here changes only how a refused header is labelled, and
     narrowing the VALUE arm narrows it for the allowlisted names. Either still narrows the masking.
+    **Over cleartext http off this machine there is no allowlist** (vault BACKLOG #3533 item 4):
+    this function alone decides whether a static or per-message header is a credential the hop
+    refuses, so narrowing EITHER arm lets that header cross there in the clear.
     """
     if _looks_like_a_credential_value(value):
         return True
@@ -4379,8 +4384,9 @@ def Sftp(
     uploads to ``remote_dir``/``filename`` (write to a temp name then rename, so a poller never sees a
     partial). Needs the ``[sftp]`` extra (``pip install 'messagefoundry[sftp]'``; paramiko is lazily
     imported). **Host-key verification is ON by default** (system + ``known_hosts``; an unknown key is
-    refused) — ``MEFOR_ALLOW_INSECURE_TLS`` accepts an unknown key only at
-    ``[security].enforcement = warn``. Put secrets (``password``/
+    refused). ``MEFOR_ALLOW_INSECURE_TLS`` at ``[security].enforcement = warn`` accepts an unknown
+    key for a key-only login, and never saves it. A ``password`` login to an unknown key is refused
+    with no escape (vault BACKLOG #3230, #3533 item 8). Put secrets (``password``/
     ``private_key``) in ``env()``; ``private_key`` must be unencrypted, and ``key_password`` is
     refused (BACKLOG #1352). The host is gated by ``[egress].allowed_remote``
     (both directions). At-least-once: an upload may re-send and a poll may re-emit, so downstreams
@@ -5498,6 +5504,17 @@ class Registry:
     # not-deployed target (ADR 0111) and must decide that identically on every shard. Names and a
     # flag only, not the connections, for the same reason as `all_loopback_inbound`.
     all_pt_inbound: Mapping[str, bool] | None = None
+    # EVERY inbound's DIRECTORY settings in the deployment (NAME -> connector type + only the settings
+    # it reads its watch and `.error` directories from, before env() resolution; None for a connector
+    # that declares directories but not their settings), pinned beside the shard identity by
+    # pipeline.sharding (None on an unfiltered graph / single-shard config, where `inbound` IS the
+    # whole config). Read only by the `.processed` archive sweep's guard (BACKLOG #1188): a sibling
+    # shard's watch directory is a fact about the CONFIG, and an archive directory that overlaps it
+    # would otherwise age out that shard's undelivered drops. Never a whole spec: a credential setting
+    # does not travel with it, and every other reader of `inbound` keeps seeing only this shard's.
+    all_inbound_guard_settings: (
+        Mapping[str, tuple[ConnectorType, Mapping[str, Any] | None]] | None
+    ) = None
     # The directory :func:`load_config` read this graph from, or None for a graph built in code. A
     # `[sandbox].mode=subprocess` worker re-loads its Router/Handler functions from here, so after
     # an operator reload from another root the workers load the root the running graph came from,
@@ -6263,7 +6280,8 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     -- this is. It lists what is DECLARED, not only hops where a refusal was actually lifted.
 
     It walks **all three** tables the pair is authorable on: ``inbound`` (an mTLS listener, the
-    ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and
+    ``check_inbound_revocation`` refusal, or an FTPS poller, the ``RevocationHopGuard`` its
+    constructor runs, BACKLOG #2193), ``outbound`` (the ``RevocationHopGuard``) and
     ``fhir_lookups`` (a lookup's https read and the SMART token hop it signs in to). All three carry
     it as typed fields, like ``cleartext_accepted``, and this reads those fields: a copy in a
     ``FhirLookupSpec``'s
@@ -7155,7 +7173,9 @@ def inbound(
     listener that sets ``tls_ca_file`` without ``tls_crl_file``. It needs a written
     ``tls_revocation_attested_reason``, recorded in the WARNING audit line logged whenever the
     attestation suppresses that refusal. Prefer ``tls_crl_file``, which checks revocation in the engine.
-    Also a ``connections.toml`` key."""
+    On an ``Ftp(tls=True)`` poller, which dials out, the same pair attests the partner SERVER's
+    certificates instead, and crosses the refusal of an off-box poll with no ``[tls].crl_file`` on
+    its context (BACKLOG #2193). Also a ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_inbound(
         build_inbound_connection(
